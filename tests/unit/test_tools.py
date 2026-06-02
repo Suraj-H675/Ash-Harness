@@ -1,0 +1,189 @@
+import shlex
+import sys
+from pathlib import Path
+
+import pytest
+
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.tools.command import RunCommandTool, decode_stream, quote_powershell_literal_path
+from ash.tools.filesystem import (
+    BINARY_FILE_ERROR,
+    EXISTS_ERROR,
+    ReadFileTool,
+    ReplaceFileContentTool,
+    WriteFileTool,
+)
+
+
+@pytest.fixture
+def project_root(tmp_path: Path) -> Path:
+    root = tmp_path / "project"
+    root.mkdir()
+    return root
+
+
+@pytest.fixture
+def guard(project_root: Path) -> SafetyGuard:
+    return SafetyGuard(project_root)
+
+
+@pytest.mark.asyncio
+async def test_read_file_returns_numbered_line_slice(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "notes.txt"
+    target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+    result = await ReadFileTool(guard).run(
+        file_path="notes.txt",
+        start_line=2,
+        end_line=3,
+    )
+
+    assert result.success is True
+    assert result.output == "2: two\n3: three"
+    assert result.error is None
+    assert result.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_read_file_blocks_binary_null_byte(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "image.bin"
+    target.write_bytes(b"ASH\x00binary")
+
+    result = await ReadFileTool(guard).run(file_path="image.bin")
+
+    assert result.success is False
+    assert result.error == BINARY_FILE_ERROR
+
+
+@pytest.mark.asyncio
+async def test_write_file_creates_parent_directories_and_respects_overwrite(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    tool = WriteFileTool(guard)
+
+    created = await tool.run(file_path="src/app.py", content="print('ok')\n")
+    blocked = await tool.run(file_path="src/app.py", content="print('again')\n")
+    overwritten = await tool.run(
+        file_path="src/app.py",
+        content="print('again')\n",
+        overwrite=True,
+    )
+
+    assert created.success is True
+    assert blocked.success is False
+    assert blocked.error == EXISTS_ERROR
+    assert overwritten.success is True
+    assert (project_root / "src" / "app.py").read_text(encoding="utf-8") == "print('again')\n"
+
+
+@pytest.mark.asyncio
+async def test_write_file_blocks_paths_outside_project(
+    guard: SafetyGuard,
+) -> None:
+    with pytest.raises(SafetyViolation):
+        await WriteFileTool(guard).run(file_path="../outside.txt", content="nope")
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_confined_to_line_bounds_and_normalizes_crlf(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_bytes(b"one\r\ntwo\r\nthree\r\n")
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        start_line=2,
+        end_line=2,
+        target_content="two\r\n",
+        replacement_content="TWO",
+    )
+
+    assert result.success is True
+    assert target.read_text(encoding="utf-8") == "one\nTWO\nthree\n"
+    assert list(target.parent.glob(".doc.txt.*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_does_not_search_outside_requested_bounds(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_text("target\nmiddle\ntarget\n", encoding="utf-8")
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        start_line=2,
+        end_line=2,
+        target_content="target",
+        replacement_content="changed",
+    )
+
+    assert result.success is False
+    assert "target_content does not match" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == "target\nmiddle\ntarget\n"
+
+
+@pytest.mark.asyncio
+async def test_run_command_executes_with_scoped_cwd(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    marker = project_root / "marker.txt"
+    marker.write_text("hello", encoding="utf-8")
+    command = (
+        f"{shlex.quote(sys.executable)} -c "
+        f"{shlex.quote('from pathlib import Path; print(Path(\"marker.txt\").read_text())')}"
+    )
+
+    result = await RunCommandTool(guard).run(command_line=command, cwd=".")
+
+    assert result.success is True
+    assert result.output.strip() == "hello"
+    assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_run_command_enforces_timeout(guard: SafetyGuard) -> None:
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote('import time; time.sleep(2)')}"
+
+    result = await RunCommandTool(guard).run(command_line=command, timeout_seconds=1)
+
+    assert result.success is False
+    assert result.error == "Error: Command timed out after 1 seconds."
+
+
+@pytest.mark.asyncio
+async def test_run_command_blocks_unsafe_commands(guard: SafetyGuard) -> None:
+    with pytest.raises(SafetyViolation):
+        await RunCommandTool(guard).run(command_line="rm -rf /")
+
+
+@pytest.mark.asyncio
+async def test_run_command_requires_literal_path_for_windows_file_cmdlets(
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ash.tools.command.platform.system", lambda: "Windows")
+
+    with pytest.raises(SafetyViolation, match="-LiteralPath"):
+        await RunCommandTool(guard).run(command_line="Get-Content 'C:\\Program Files (x86)\\app.txt'")
+
+
+def test_decode_stream_falls_back_to_cp1252() -> None:
+    assert decode_stream(b"\x93quoted\x94") == "\u201cquoted\u201d"
+
+
+def test_quote_powershell_literal_path_escapes_single_quotes() -> None:
+    assert quote_powershell_literal_path("C:\\Users\\O'Brien\\file.txt") == (
+        "-LiteralPath 'C:\\Users\\O''Brien\\file.txt'"
+    )
