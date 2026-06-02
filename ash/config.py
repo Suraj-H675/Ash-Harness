@@ -1,0 +1,89 @@
+"""Configuration loading for Ash."""
+
+from pathlib import Path
+from typing import Any
+
+from pydantic import Field
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
+
+
+class AshConfig(BaseSettings):
+    """Runtime settings loaded from environment variables and ash.toml."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ASH_",
+        toml_file="ash.toml",
+        extra="ignore",
+    )
+
+    provider: str = Field(
+        "anthropic",
+        description="Primary model provider: 'anthropic' or 'openai' or 'ollama'",
+    )
+    model_name: str = Field(
+        "claude-3-5-sonnet-20241022",
+        description="Model identifier to invoke.",
+    )
+    temperature: float = Field(0.0, description="Model generation temperature.")
+    api_key: str = Field(..., description="API Access key.")
+
+    max_context_tokens: int = Field(
+        128000,
+        description="Maximum total tokens in the input context window.",
+    )
+    max_completion_tokens: int = Field(
+        4000,
+        description="Maximum tokens generated in response completion.",
+    )
+    max_tool_result_tokens: int = Field(
+        20000,
+        description="Limit for single tool response strings before middle truncation.",
+    )
+
+    safety_tier: str = Field(
+        "interactive",
+        description="Safety enforcement mode: 'interactive' or 'auto_approve' or 'dry_run'",
+    )
+    workspace_root: Path = Field(
+        default_factory=Path.cwd,
+        description="Scoped base folder containing project target code.",
+    )
+    command_blocklist: list[str] = Field(
+        default=["format", "rm -rf", "Remove-Item"],
+        description="Command patterns that immediately fail SafetyGuard checks.",
+    )
+
+    db_directory: Path = Field(
+        default=Path.home() / ".ash" / "db",
+        description="Folder path housing local SQLite persistence files.",
+    )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Use env vars before ash.toml, while preserving init kwargs as highest priority."""
+
+        return (
+            init_settings,
+            env_settings,
+            TomlConfigSettingsSource(settings_cls),
+            dotenv_settings,
+            file_secret_settings,
+        )
+
+    @classmethod
+    def load(cls, **overrides: Any) -> "AshConfig":
+        """Load configuration with optional explicit field overrides."""
+
+        return cls(**overrides)
