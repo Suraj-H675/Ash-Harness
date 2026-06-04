@@ -32,8 +32,10 @@ from ash.core.session import (
     ToolCallRecord,
 )
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from ash.repo.repomap import RepoMap
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult
+from ash.tools.git import auto_commit_turn
 from ash.ui.parser import Event, StreamingXMLParser
 from ash.ui.terminal import TerminalUI
 
@@ -126,6 +128,9 @@ class AshLoop:
         system_prompt: str | None = None,
         token_counter: TokenCounterLike | None = None,
         max_turn_iterations: int = DEFAULT_MAX_TURN_ITERATIONS,
+        repo_map: RepoMap | None = None,
+        auto_commit: bool = False,
+        auto_commit_paths: list[Path] | None = None,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -137,6 +142,9 @@ class AshLoop:
         self.system_prompt = system_prompt or _default_system_prompt(project_root)
         self.token_counter = token_counter
         self.max_turn_iterations = max_turn_iterations
+        self.repo_map = repo_map
+        self.auto_commit = auto_commit
+        self.auto_commit_paths = list(auto_commit_paths or [])
         self.current_session: Session | None = None
 
     # --- session lifecycle ------------------------------------------------
@@ -228,6 +236,19 @@ class AshLoop:
                 f"{final_text}\n\n"
                 "[Turn reached max iterations without a final text response.]"
             ).strip()
+
+        if self.auto_commit:
+            commit_result = await auto_commit_turn(
+                self.project_root,
+                message=f"ash: turn complete ({len(final_text)} chars)",
+                paths=self.auto_commit_paths or None,
+                safety_guard=self.safety_guard,
+            )
+            if not commit_result.success and commit_result.error:
+                # Surface commit failures to the user but don't fail the turn.
+                self.ui.print_thought(
+                    f"auto_commit failed: {commit_result.error}"
+                )
 
         return final_text
 
@@ -369,7 +390,19 @@ class AshLoop:
     def _build_messages(self, session: Session) -> list[dict[str, Any]]:
         """Build the messages payload for the provider."""
 
-        messages: list[dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+        system_content = self.system_prompt
+        if self.repo_map is not None:
+            # Rank against any workspace files touched in this turn so far
+            # (best-effort: just the user message we just persisted).
+            active = [Path(p) for p in (self.auto_commit_paths or [])]
+            try:
+                ranked = self.repo_map.rank(active or [self.project_root])
+                repo_section = self.repo_map.render(ranked, top_files=5, symbols_per_file=6)
+            except Exception as exc:  # noqa: BLE001 — repo map is best-effort
+                repo_section = f"(repo map unavailable: {exc})"
+            system_content = f"{system_content}\n\n{repo_section}"
+
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system_content}]
         for message in session.messages:
             messages.append({"role": message.role, "content": message.content})
         return messages
