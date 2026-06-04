@@ -96,6 +96,26 @@ class StreamingXMLParser:
             self._accumulated_text = ""
             return events, True
 
+        if "<response>" in self._buffer:
+            # The model wraps its final user-facing text in <response> tags.
+            # We strip the wrappers and emit the inner content as a token
+            # so the loop can deliver it to the terminal/REPL.
+            pre, post = self._buffer.split("<response>", 1)
+            events: list[Event] = []
+            if pre:
+                events.append(("token", pre))
+            if "</response>" in post:
+                inner, rest = post.split("</response>", 1)
+                if inner:
+                    events.append(("token", inner))
+                self._state = _State.TEXT
+                self._buffer = rest
+            else:
+                # Tag opened but not yet closed — wait for the rest.
+                self._buffer = post
+                return events, False
+            return events, True
+
         if "<call_tool" in self._buffer:
             pre, post = self._buffer.split("<call_tool", 1)
             events = []
@@ -116,6 +136,15 @@ class StreamingXMLParser:
             chunk = self._buffer[:idx]
             self._buffer = self._buffer[idx:]
             return [("token", chunk)], True
+        # Buffer starts with `<`. If it's a known orphan closer we can drop
+        # it and continue; otherwise wait for more input.
+        if self._buffer.startswith("</response>"):
+            self._buffer = self._buffer[len("</response>"):]
+            return [], True
+        if self._buffer.startswith("</thought>"):
+            # Stray closer without a matching opener — drop it.
+            self._buffer = self._buffer[len("</thought>"):]
+            return [], True
         return [], False
 
     def _process_thought_state(self) -> tuple[list[Event], bool]:
