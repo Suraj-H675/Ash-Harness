@@ -177,3 +177,61 @@ class TerminalUI:
 
         if live is not None:
             live.start()
+
+    # --- sprint planning surface (Sprint 12 / V5) -----------------------
+
+    def show_plan(self, execution: Any) -> bool:
+        """Render a sprint plan and ask the user to approve / edit / reject.
+
+        Returns ``True`` when the user approves, ``False`` otherwise.
+        Edits are out of scope for V5 — we treat ``e`` as a synonym
+        of ``n`` (reject) and log it; the planner can be re-invoked.
+        """
+
+        from ash.core.planner import render_sprint_markdown
+
+        live = getattr(self, "_active_live", None)
+        if live is not None:
+            live.stop()
+
+        body = Text()
+        body.append("Goal: ", style="bold")
+        body.append(execution.contract.goal)
+        body.append("\n\n")
+        body.append("Definition of Done:\n", style="bold")
+        for item in execution.contract.definition_of_done:
+            body.append(f"  - {item}\n")
+        if not execution.contract.definition_of_done:
+            body.append("  (none)\n")
+        body.append("\nFiles in Scope:\n", style="bold")
+        for path in execution.contract.files_in_scope:
+            body.append(f"  - {path}\n")
+        if not execution.contract.files_in_scope:
+            body.append("  - (none)\n")
+        body.append("\nChecklist:\n", style="bold")
+        if execution.items:
+            for item in execution.items:
+                mark = "☑" if item.status.value in {"done", "skipped"} else "☐"
+                body.append(f"  {mark} [{item.section}] {item.description}\n")
+        else:
+            body.append("  (empty)\n")
+        self.console.print(
+            Panel(body, border_style="cyan", title=f"sprint {execution.contract.contract_id[:8]}")
+        )
+
+        try:
+            answer = self._input_stream.readline().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if live is not None:
+            live.start()
+
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"e", "edit"}:
+            # Edits are out of scope for V5; surface that to the user
+            # but still treat as a non-approval so they can re-plan.
+            self.console.print(
+                "[yellow]Edit mode is not implemented yet — rejecting the plan.[/yellow]"
+            )
+        return False
