@@ -131,6 +131,8 @@ class AshLoop:
         repo_map: RepoMap | None = None,
         auto_commit: bool = False,
         auto_commit_paths: list[Path] | None = None,
+        planner: "Planner | None" = None,
+        enable_sprint_planning: bool = False,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -145,6 +147,8 @@ class AshLoop:
         self.repo_map = repo_map
         self.auto_commit = auto_commit
         self.auto_commit_paths = list(auto_commit_paths or [])
+        self.planner = planner
+        self.enable_sprint_planning = enable_sprint_planning
         self.current_session: Session | None = None
 
     # --- session lifecycle ------------------------------------------------
@@ -172,6 +176,40 @@ class AshLoop:
             await self.start_session()
         assert self.current_session is not None
         session = self.current_session
+
+        # 0. Optional V5 sprint planning phase. Triggered only when the
+        # loop is configured with a planner AND the user input looks
+        # like a multi-step request. On approval, the sprint is
+        # persisted to SQLite and the contract's goal replaces the raw
+        # user input for the execution turn. On rejection, the turn
+        # short-circuits with a polite "plan rejected" message.
+        if self.enable_sprint_planning and self.planner is not None:
+            from ash.core.sprint import (
+                SprintExecution,
+                SprintState,
+                looks_like_sprint_request,
+            )
+
+            if looks_like_sprint_request(user_input):
+                execution = await self._planning_phase(user_input)
+                self.session_store.save_sprint(session.session_id, execution)
+                approved = self.ui.show_plan(execution)
+                if not approved:
+                    execution.abort("rejected by user")
+                    self.session_store.save_sprint(session.session_id, execution)
+                    return (
+                        f"Plan rejected. Sprint {execution.contract.contract_id[:8]} aborted; "
+                        "no further actions taken."
+                    )
+                execution.start()
+                self.session_store.save_sprint(session.session_id, execution)
+                # Feed the contract goal into the model so the planning
+                # artifacts are visible during execution.
+                user_input = (
+                    f"{execution.contract.goal}\n\n"
+                    f"Approved sprint plan ({len(execution.items)} steps):\n"
+                    + "\n".join(f"- {it.description}" for it in execution.items)
+                )
 
         # 1. Persist the user message.
         user_message = Message(
@@ -251,6 +289,30 @@ class AshLoop:
                 )
 
         return final_text
+
+    # --- sprint planning helpers (Sprint 12 / V5) ---------------------
+
+    async def _planning_phase(self, user_input: str) -> "SprintExecution":
+        """Call the planner to decompose ``user_input`` into a contract."""
+
+        from ash.core.planner import Planner
+
+        assert self.planner is not None
+        repo_excerpt = ""
+        if self.repo_map is not None:
+            try:
+                ranked = self.repo_map.rank([self.project_root])
+                repo_excerpt = self.repo_map.render(ranked, top_files=3, symbols_per_file=4)
+            except Exception:  # noqa: BLE001
+                repo_excerpt = ""
+        if not isinstance(self.planner, Planner):
+            # Defensive: only Planner is supported in V5.
+            raise TypeError(f"Unsupported planner type: {type(self.planner).__name__}")
+        return await self.planner.decompose(
+            user_input,
+            project_root=self.project_root,
+            repo_map_excerpt=repo_excerpt,
+        )
 
     # --- streaming & parsing ---------------------------------------------
 
