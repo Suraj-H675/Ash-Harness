@@ -17,27 +17,30 @@ emits new tool calls. A :class:`CircuitBreaker` halts the loop after
 
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from ash.core.recovery import CircuitBreaker, CircuitBreakerError
+from ash.core.recovery import CircuitBreaker
 from ash.core.session import (
     Message,
     Session,
     SessionStore,
     ToolCallRecord,
 )
-from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from ash.providers.base import ProviderABC, TokenCounterLike
 from ash.repo.repomap import RepoMap
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult
 from ash.tools.git import auto_commit_turn
 from ash.ui.parser import Event, StreamingXMLParser
 from ash.ui.terminal import TerminalUI
+
+if TYPE_CHECKING:
+    from ash.core.planner import Planner
+    from ash.core.sprint import SprintExecution
 
 
 DEFAULT_MAX_TURN_ITERATIONS = 10
@@ -185,8 +188,6 @@ class AshLoop:
         # short-circuits with a polite "plan rejected" message.
         if self.enable_sprint_planning and self.planner is not None:
             from ash.core.sprint import (
-                SprintExecution,
-                SprintState,
                 looks_like_sprint_request,
             )
 
@@ -218,6 +219,9 @@ class AshLoop:
             timestamp=_utc_now(),
         )
         self.session_store.save_message(session.session_id, user_message)
+        # Keep the in-memory session mirror in sync so subsequent
+        # _build_messages() calls in the same turn see the history.
+        session.messages.append(user_message)
 
         # 2. Stream/execute loop bounded by max_turn_iterations.
         final_text = ""
@@ -232,6 +236,7 @@ class AshLoop:
                 timestamp=_utc_now(),
             )
             self.session_store.save_message(session.session_id, assistant_message)
+            session.messages.append(assistant_message)
 
             if not tool_calls:
                 final_text = assistant_text
@@ -264,6 +269,7 @@ class AshLoop:
                     metadata={"call_id": call["call_id"]},
                 )
                 self.session_store.save_message(session.session_id, tool_message)
+                session.messages.append(tool_message)
 
             # The assistant produced tool calls; loop and let the model
             # observe the results on the next completion.
@@ -284,9 +290,7 @@ class AshLoop:
             )
             if not commit_result.success and commit_result.error:
                 # Surface commit failures to the user but don't fail the turn.
-                self.ui.print_thought(
-                    f"auto_commit failed: {commit_result.error}"
-                )
+                self.ui.print_thought(f"auto_commit failed: {commit_result.error}")
 
         return final_text
 
@@ -302,7 +306,9 @@ class AshLoop:
         if self.repo_map is not None:
             try:
                 ranked = self.repo_map.rank([self.project_root])
-                repo_excerpt = self.repo_map.render(ranked, top_files=3, symbols_per_file=4)
+                repo_excerpt = self.repo_map.render(
+                    ranked, top_files=3, symbols_per_file=4
+                )
             except Exception:  # noqa: BLE001
                 repo_excerpt = ""
         if not isinstance(self.planner, Planner):
@@ -344,12 +350,12 @@ class AshLoop:
         tool_calls: list[dict[str, Any]],
     ) -> None:
         kind, payload = event
-        if kind == "token":
+        if kind == "token" and isinstance(payload, str):
             self.ui.print_token(payload)
             text_chunks.append(payload)
-        elif kind == "thought":
+        elif kind == "thought" and isinstance(payload, str):
             self.ui.print_thought(payload)
-        elif kind == "tool_call":
+        elif kind == "tool_call" and isinstance(payload, dict):
             tool_call = {
                 "name": payload["name"],
                 "arguments": dict(payload["arguments"]),
@@ -459,7 +465,9 @@ class AshLoop:
             active = [Path(p) for p in (self.auto_commit_paths or [])]
             try:
                 ranked = self.repo_map.rank(active or [self.project_root])
-                repo_section = self.repo_map.render(ranked, top_files=5, symbols_per_file=6)
+                repo_section = self.repo_map.render(
+                    ranked, top_files=5, symbols_per_file=6
+                )
             except Exception as exc:  # noqa: BLE001 — repo map is best-effort
                 repo_section = f"(repo map unavailable: {exc})"
             system_content = f"{system_content}\n\n{repo_section}"

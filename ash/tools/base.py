@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from ash.safety.guard import SafetyGuard
 

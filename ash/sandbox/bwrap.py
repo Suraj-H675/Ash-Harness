@@ -18,17 +18,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from ash.sandbox._base import SANDBOX_TIER_BWRAP, SandboxBackend, SandboxBackendUnavailable
+from ash.sandbox._base import (
+    SANDBOX_TIER_BWRAP,
+    SandboxBackend,
+    SandboxBackendUnavailable,
+)
 
 
 # Bwrap flags we always pass for hardened defaults.
 _BWRAP_BASE_FLAGS: tuple[str, ...] = (
     "--unshare-user-try",  # create a new user namespace if allowed
-    "--unshare-pid",         # new PID namespace
-    "--unshare-uts",         # new UTS namespace (hostname isolation)
-    "--unshare-ipc",         # new IPC namespace
-    "--die-with-parent",     # kill the sandbox if the parent dies
-    "--new-session",         # new session
+    "--unshare-pid",  # new PID namespace
+    "--unshare-uts",  # new UTS namespace (hostname isolation)
+    "--unshare-ipc",  # new IPC namespace
+    "--die-with-parent",  # kill the sandbox if the parent dies
+    "--new-session",  # new session
 )
 
 
@@ -96,7 +100,8 @@ class BubblewrapSandbox(SandboxBackend):
         # loaders; the list is intentionally conservative.
         for ro in ("/usr", "/bin", "/lib", "/lib64", "/etc", "/dev"):
             if Path(ro).exists():
-                args.extend(["--ro-bind", ro, ro])
+                ro_str = str(Path(ro))
+                args.extend(["--ro-bind", ro_str, ro_str])
 
         # Workspace (read-write) — required for any meaningful work.
         if self.workspace_root is not None:
@@ -112,10 +117,11 @@ class BubblewrapSandbox(SandboxBackend):
         args.extend(["--bind", str(scratch), str(scratch)])
 
         # Additional read-only paths the caller wants to expose.
-        for ro in self.read_only_paths:
-            ro_path = Path(ro).resolve()
-            if ro_path.exists():
-                args.extend(["--ro-bind", str(ro_path), str(ro_path)])
+        for ro_entry in self.read_only_paths:
+            ro_resolved: Path = Path(str(ro_entry)).resolve()
+            if ro_resolved.exists():
+                ro_str = str(ro_resolved)
+                args.extend(["--ro-bind", ro_str, ro_str])
 
         if not self.network:
             # Block all network namespaces by clearing net namespace.

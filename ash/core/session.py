@@ -380,8 +380,12 @@ class SessionStore:
                     str(execution.state),
                     json.dumps(execution.contract.to_dict()),
                     _serialize_datetime(execution.created_at),
-                    _serialize_datetime(execution.started_at) if execution.started_at else None,
-                    _serialize_datetime(execution.completed_at) if execution.completed_at else None,
+                    _serialize_datetime(execution.started_at)
+                    if execution.started_at
+                    else None,
+                    _serialize_datetime(execution.completed_at)
+                    if execution.completed_at
+                    else None,
                     execution.abort_reason,
                 ),
             )
@@ -445,8 +449,12 @@ class SessionStore:
                 contract=contract,
                 state=SprintState(row["state"]),
                 created_at=_deserialize_datetime(row["created_at"]),
-                started_at=_deserialize_datetime(row["started_at"]) if row["started_at"] else None,
-                completed_at=_deserialize_datetime(row["completed_at"]) if row["completed_at"] else None,
+                started_at=_deserialize_datetime(row["started_at"])
+                if row["started_at"]
+                else None,
+                completed_at=_deserialize_datetime(row["completed_at"])
+                if row["completed_at"]
+                else None,
                 abort_reason=row["abort_reason"] or "",
             )
 

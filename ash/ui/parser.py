@@ -101,20 +101,20 @@ class StreamingXMLParser:
             # We strip the wrappers and emit the inner content as a token
             # so the loop can deliver it to the terminal/REPL.
             pre, post = self._buffer.split("<response>", 1)
-            events: list[Event] = []
+            resp_events: list[Event] = []
             if pre:
-                events.append(("token", pre))
+                resp_events.append(("token", pre))
             if "</response>" in post:
                 inner, rest = post.split("</response>", 1)
                 if inner:
-                    events.append(("token", inner))
+                    resp_events.append(("token", inner))
                 self._state = _State.TEXT
                 self._buffer = rest
             else:
                 # Tag opened but not yet closed — wait for the rest.
                 self._buffer = post
-                return events, False
-            return events, True
+                return resp_events, False
+            return resp_events, True
 
         if "<call_tool" in self._buffer:
             pre, post = self._buffer.split("<call_tool", 1)
@@ -139,11 +139,11 @@ class StreamingXMLParser:
         # Buffer starts with `<`. If it's a known orphan closer we can drop
         # it and continue; otherwise wait for more input.
         if self._buffer.startswith("</response>"):
-            self._buffer = self._buffer[len("</response>"):]
+            self._buffer = self._buffer[len("</response>") :]
             return [], True
         if self._buffer.startswith("</thought>"):
             # Stray closer without a matching opener — drop it.
-            self._buffer = self._buffer[len("</thought>"):]
+            self._buffer = self._buffer[len("</thought>") :]
             return [], True
         return [], False
 
@@ -175,26 +175,28 @@ class StreamingXMLParser:
             if match is None:
                 return [], False
             self._current_tool_name = match.group(1)
-            self._buffer = self._buffer[match.end():]
+            self._buffer = self._buffer[match.end() :]
             return self._process_tool_state()
 
         arg_match = self._ARG_OPEN_PATTERN.search(self._buffer)
         if arg_match is not None:
             self._current_arg_name = arg_match.group(1)
             self._state = _State.ARG
-            self._buffer = self._buffer[arg_match.end():]
+            self._buffer = self._buffer[arg_match.end() :]
             self._accumulated_text = ""
             return [], True
 
         if "</call_tool>" in self._buffer:
             _, post = self._buffer.split("</call_tool>", 1)
-            events: list[Event] = [(
-                "tool_call",
-                {
-                    "name": self._current_tool_name,
-                    "arguments": dict(self._current_args),
-                },
-            )]
+            events: list[Event] = [
+                (
+                    "tool_call",
+                    {
+                        "name": self._current_tool_name,
+                        "arguments": dict(self._current_args),
+                    },
+                )
+            ]
             self._state = _State.TEXT
             self._buffer = post
             self._current_tool_name = None

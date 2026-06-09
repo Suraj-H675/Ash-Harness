@@ -9,10 +9,6 @@ the model finishes a turn (and any tools ran).
 from __future__ import annotations
 
 import asyncio
-import os
-import platform
-import shlex
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -40,7 +36,9 @@ class AutoCommitArgs(BaseModel):
 
 class AutoCommitTool(BaseTool):
     name = "auto_commit"
-    description = "Stage paths and create a git commit capturing the current turn's changes."
+    description = (
+        "Stage paths and create a git commit capturing the current turn's changes."
+    )
     args_schema = AutoCommitArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:
@@ -49,7 +47,11 @@ class AutoCommitTool(BaseTool):
         try:
             workspace_root = self.safety_guard.project_root
         except AttributeError as exc:  # pragma: no cover - safety_guard required
-            return ToolResult(success=False, output="", error=f"SafetyGuard missing project_root: {exc}")
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"SafetyGuard missing project_root: {exc}",
+            )
 
         # Stage the requested paths (or all tracked files when none given).
         if args.paths:
@@ -119,9 +121,6 @@ async def _run_git(cwd: Path, args: Sequence[str]) -> tuple[int, str, str]:
     """Run ``git <args>`` in ``cwd`` and return (exit, stdout, stderr)."""
 
     cmd = ["git", *args]
-    creationflags = 0
-    if platform.system() == "Windows":  # pragma: no cover - host dependent
-        creationflags = subprocess.CREATE_NO_WINDOW
 
     process = await asyncio.create_subprocess_exec(
         *cmd,
@@ -158,7 +157,10 @@ async def auto_commit_turn(
 ) -> ToolResult:
     """Convenience wrapper used by the loop to record a per-turn commit."""
 
-    body = message or f"ash: turn complete at {datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+    body = (
+        message
+        or f"ash: turn complete at {datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+    )
     guard = safety_guard or SafetyGuard(project_root=workspace_root)
     tool = AutoCommitTool(guard)
     payload: dict[str, Any] = {"message": body}
@@ -170,8 +172,3 @@ async def auto_commit_turn(
 # Provide a free function for use outside the tool registry.
 async def auto_commit(safety_guard: SafetyGuard, **kwargs: Any) -> ToolResult:
     return await AutoCommitTool(safety_guard).run(**kwargs)
-
-
-# Quiet shlex import lint while keeping the symbol available for future use.
-_ = shlex
-_ = os

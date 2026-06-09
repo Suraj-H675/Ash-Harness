@@ -27,7 +27,7 @@ from ash.core.sprint import (
     SprintExecution,
     SprintState,
 )
-from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from ash.providers.base import ProviderABC, TokenCounterLike
 
 
 # --- architect mode system prompt (Section 2.1 of the spec) --------------
@@ -194,9 +194,15 @@ def parse_sprint_response(raw: str, *, fallback_goal: str) -> SprintExecution:
 
     definition_of_done = tuple(_bullet_lines(fields.get("Definition of Done", "")))
     files_in_scope = tuple(_to_paths(_bullet_lines(fields.get("Files in Scope", ""))))
-    files_off_limits = tuple(_to_paths(_bullet_lines(fields.get("Files Off Limits", ""))))
-    test_command = _first_nonempty_line(fields.get("Test Command", "")) or "pytest tests/"
-    rollback_plan = _first_nonempty_line(fields.get("Rollback Plan", "")) or "git revert HEAD"
+    files_off_limits = tuple(
+        _to_paths(_bullet_lines(fields.get("Files Off Limits", "")))
+    )
+    test_command = (
+        _first_nonempty_line(fields.get("Test Command", "")) or "pytest tests/"
+    )
+    rollback_plan = (
+        _first_nonempty_line(fields.get("Rollback Plan", "")) or "git revert HEAD"
+    )
 
     items = _parse_checklist(fields.get("Checklist", ""))
     estimated_steps = len(items)
@@ -251,7 +257,11 @@ def render_sprint_markdown(execution: SprintExecution) -> str:
     for section, items in by_section.items():
         lines.append(f"### {section}")
         for item in items:
-            mark = "x" if item.status in {ChecklistStatus.DONE, ChecklistStatus.SKIPPED} else " "
+            mark = (
+                "x"
+                if item.status in {ChecklistStatus.DONE, ChecklistStatus.SKIPPED}
+                else " "
+            )
             lines.append(f"- [{mark}] {item.description}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
@@ -275,7 +285,9 @@ def _split_sections(raw: str) -> dict[str, str]:
 
 
 def _bullet_lines(block: str) -> list[str]:
-    return [m.group(1).strip() for m in _BULLET_ITEM.finditer(block) if m.group(1).strip()]
+    return [
+        m.group(1).strip() for m in _BULLET_ITEM.finditer(block) if m.group(1).strip()
+    ]
 
 
 def _to_paths(items: Sequence[str]) -> list[Path]:

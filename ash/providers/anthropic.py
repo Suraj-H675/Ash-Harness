@@ -62,7 +62,9 @@ class AnthropicProvider(ProviderABC):
                 "Install it with `pip install anthropic` or inject a client."
             ) from exc
 
-        self._client = AsyncAnthropic(api_key=self._api_key) if self._api_key else AsyncAnthropic()
+        self._client = (
+            AsyncAnthropic(api_key=self._api_key) if self._api_key else AsyncAnthropic()
+        )
         return self._client
 
     async def stream_chat(

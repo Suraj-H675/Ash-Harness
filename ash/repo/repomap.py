@@ -94,7 +94,11 @@ def _module_to_path(module: str, project_root: Path) -> Path | None:
 
     parts = module.split(".")
     for suffix in (".py", Path(".py") / "__init__.py"):
-        candidate = project_root.joinpath(*parts).with_suffix(suffix) if isinstance(suffix, str) else project_root.joinpath(*parts) / "__init__.py"
+        candidate = (
+            project_root.joinpath(*parts).with_suffix(suffix)
+            if isinstance(suffix, str)
+            else project_root.joinpath(*parts) / "__init__.py"
+        )
         if candidate.exists():
             return candidate
     return None
@@ -109,7 +113,7 @@ def _extract_references(symbols: Iterable[Symbol]) -> set[str]:
             continue
         text = symbol.name
         if text.startswith("import "):
-            tail = text[len("import "):]
+            tail = text[len("import ") :]
             for piece in tail.split(","):
                 head = piece.strip().split(" as ")[0].strip()
                 if head:
@@ -211,17 +215,25 @@ class RepoMap:
             node = self._node_for_path(path)
             if node is None:
                 continue
-            lines.append(f"\n### {path.relative_to(self.project_root)} (ppr={score:.3f})")
+            lines.append(
+                f"\n### {path.relative_to(self.project_root)} (ppr={score:.3f})"
+            )
             top_symbols = node.symbols[:symbols_per_file]
             if not top_symbols:
                 lines.append("  (no symbols extracted)")
                 continue
             for symbol in top_symbols:
-                prefix = f"  {symbol.parent}.{symbol.name}" if symbol.parent else f"  {symbol.name}"
+                prefix = (
+                    f"  {symbol.parent}.{symbol.name}"
+                    if symbol.parent
+                    else f"  {symbol.name}"
+                )
                 if symbol.kind == "import" or symbol.kind == "import_from":
                     lines.append(f"  {prefix}  # import L{symbol.start_line}")
                 else:
-                    lines.append(f"  {prefix}  # {symbol.kind} L{symbol.start_line}-{symbol.end_line}")
+                    lines.append(
+                        f"  {prefix}  # {symbol.kind} L{symbol.start_line}-{symbol.end_line}"
+                    )
         return "\n".join(lines)
 
     # --- internal -------------------------------------------------------
@@ -243,7 +255,11 @@ class RepoMap:
         for path in paths:
             symbols = tuple(self._extractor.extract(path))
             refs = _extract_references(symbols)
-            files.append(FileNode(path=path.resolve(), symbols=symbols, referenced_modules=tuple(refs)))
+            files.append(
+                FileNode(
+                    path=path.resolve(), symbols=symbols, referenced_modules=tuple(refs)
+                )
+            )
             module_name = _normalize_module_name(path, self.project_root)
             if module_name is not None:
                 module_index[module_name] = path.resolve()

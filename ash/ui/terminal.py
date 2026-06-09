@@ -52,7 +52,7 @@ class TerminalUI:
         to one bound to stdout.
     """
 
-    def __init__(
+    def __init__(  # noqa: D107
         self,
         safety_tier: str = "interactive",
         *,
@@ -66,24 +66,29 @@ class TerminalUI:
         self._approval_callback = approval_callback
         self.console = console or Console()
         self._input_stream = input_stream or sys.stdin
+        self._active_buffers: _LiveBuffers | None = None
+        self._active_live: Live | None = None
 
     # --- streaming surface ------------------------------------------------
 
     def begin_turn(self) -> Live:
         """Return a :class:`rich.live.Live` context the loop can update."""
 
-        buffers = _LiveBuffers.fresh()
+        buffers: _LiveBuffers = _LiveBuffers.fresh()
         self._active_buffers = buffers
 
         def _render() -> Panel:
+            assert self._active_buffers is not None
             return Panel(
-                buffers.response,
+                self._active_buffers.response,
                 title="ash",
                 border_style="cyan",
                 padding=(0, 1),
             )
 
-        live = Live(_render(), console=self.console, refresh_per_second=12, transient=False)
+        live = Live(
+            _render(), console=self.console, refresh_per_second=12, transient=False
+        )
         self._active_live = live
         return live
 
@@ -162,7 +167,7 @@ class TerminalUI:
             live.stop()
 
         body = Text()
-        body.append(f"Tool: ", style="bold")
+        body.append("Tool: ", style="bold")
         body.append(tool_name, style="cyan")
         body.append("\nArgs:\n")
         for key, value in arguments.items():
@@ -187,8 +192,6 @@ class TerminalUI:
         Edits are out of scope for V5 — we treat ``e`` as a synonym
         of ``n`` (reject) and log it; the planner can be re-invoked.
         """
-
-        from ash.core.planner import render_sprint_markdown
 
         live = getattr(self, "_active_live", None)
         if live is not None:
@@ -216,7 +219,11 @@ class TerminalUI:
         else:
             body.append("  (empty)\n")
         self.console.print(
-            Panel(body, border_style="cyan", title=f"sprint {execution.contract.contract_id[:8]}")
+            Panel(
+                body,
+                border_style="cyan",
+                title=f"sprint {execution.contract.contract_id[:8]}",
+            )
         )
 
         try:

@@ -75,7 +75,7 @@ class FTS5Index:
                     """,
                     (file_path, chunk.content, symbol_tags),
                 )
-                if first_rowid == 0:
+                if first_rowid == 0 and cursor.lastrowid is not None:
                     first_rowid = int(cursor.lastrowid)
 
             if first_rowid and sha256 is not None:
@@ -106,13 +106,15 @@ class FTS5Index:
                 "DELETE FROM fts_index WHERE file_path = ?",
                 (file_path,),
             )
-            meta_cursor = conn.execute(
+            conn.execute(
                 "DELETE FROM document_metadata WHERE file_path = ?",
                 (file_path,),
             )
             return fts_cursor.rowcount
 
-    def query(self, query_str: str, limit: int = DEFAULT_QUERY_LIMIT) -> list[dict[str, Any]]:
+    def query(
+        self, query_str: str, limit: int = DEFAULT_QUERY_LIMIT
+    ) -> list[dict[str, Any]]:
         """Run a BM25-ranked FTS5 query and return matching chunks as dicts."""
 
         with closing(get_db_connection(self.db_path)) as conn:
