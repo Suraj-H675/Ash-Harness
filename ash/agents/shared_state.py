@@ -82,7 +82,9 @@ class SharedState:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False because the connection is used by the
         # orchestrator thread and any spawned subagent threads.
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=busy_timeout_ms / 1000)
+        self._conn = sqlite3.connect(
+            self.db_path, check_same_thread=False, timeout=busy_timeout_ms / 1000
+        )
         self._conn.row_factory = sqlite3.Row
         self._write_lock = threading.Lock()
         self._init_db()
@@ -252,7 +254,7 @@ class SharedState:
                 """,
                 (sender_id, recipient_id, message_type, payload),
             )
-            return int(cur.lastrowid)
+            return int(cur.lastrowid) if cur.lastrowid is not None else 0
 
     def fetch_messages(
         self,
@@ -294,7 +296,12 @@ class SharedState:
     ) -> int:
         """Send the same message to every registered agent. Returns the count sent."""
 
-        recipients = [row["agent_id"] for row in self._conn.execute("SELECT agent_id FROM agent_status").fetchall()]
+        recipients = [
+            row["agent_id"]
+            for row in self._conn.execute(
+                "SELECT agent_id FROM agent_status"
+            ).fetchall()
+        ]
         count = 0
         for recipient in recipients:
             if recipient == sender_id:
@@ -345,7 +352,9 @@ class SharedState:
 
     def list_sprints(self) -> list[SharedSprint]:
         with closing(self._conn.cursor()) as cur:
-            rows = cur.execute("SELECT * FROM sprints ORDER BY created_at DESC").fetchall()
+            rows = cur.execute(
+                "SELECT * FROM sprints ORDER BY created_at DESC"
+            ).fetchall()
         return [
             SharedSprint(
                 sprint_id=r["sprint_id"],

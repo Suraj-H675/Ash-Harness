@@ -50,7 +50,9 @@ def normalize_allowed_directories(
     return normalized
 
 
-def path_is_in_scope(target_path: Path, project_root: Path, allowed_directories: list[Path]) -> bool:
+def path_is_in_scope(
+    target_path: Path, project_root: Path, allowed_directories: list[Path]
+) -> bool:
     """Return whether a resolved path is inside project root and an allowed directory."""
 
     return is_relative_to(target_path, project_root) and any(

@@ -17,9 +17,9 @@ from __future__ import annotations
 import importlib.util
 import sys
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterator
 
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool
@@ -56,7 +56,9 @@ class ToolRegistry:
 
     def register(self, tool: BaseTool) -> None:
         if not isinstance(tool, BaseTool):
-            raise TypeError(f"register() requires a BaseTool, got {type(tool).__name__}")
+            raise TypeError(
+                f"register() requires a BaseTool, got {type(tool).__name__}"
+            )
         with self._lock:
             self._tools[tool.name] = tool
 
@@ -193,18 +195,22 @@ class ToolRegistry:
             sys.modules.pop(module_name, None)
             raise
         from ash.tools.skills import (
+            SkillParseError,
             build_tool_from_python_module,
             parse_python_skill,
         )
 
         # Re-parse so the docstring-driven V7 metadata is honoured.
+        parsed_name: str | None = None
+        parsed_description: str | None = None
+        parsed_trigger: str | None = None
         try:
             parsed = parse_python_skill(path)
             parsed_name = parsed.name
             parsed_description = parsed.description
             parsed_trigger = parsed.trigger
         except SkillParseError:
-            parsed_name = parsed_description = parsed_trigger = None
+            pass
 
         tool = build_tool_from_python_module(
             module,

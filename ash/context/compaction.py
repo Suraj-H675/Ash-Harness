@@ -42,7 +42,9 @@ def sliding_window_chunk(
     if window_size <= 0:
         raise ValueError("window_size must be positive")
     if overlap < 0 or overlap >= window_size:
-        raise ValueError("overlap must be non-negative and strictly less than window_size")
+        raise ValueError(
+            "overlap must be non-negative and strictly less than window_size"
+        )
 
     if not content:
         return []

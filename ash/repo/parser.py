@@ -140,9 +140,18 @@ class SymbolExtractor:
             return
 
         # Walk into block-like containers so nested defs are still found.
-        if kind in {"if_statement", "for_statement", "while_statement", "try_statement",
-                    "with_statement", "match_statement", "elif_clause", "else_clause",
-                    "decorated_definition", "expression_statement"}:
+        if kind in {
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "try_statement",
+            "with_statement",
+            "match_statement",
+            "elif_clause",
+            "else_clause",
+            "decorated_definition",
+            "expression_statement",
+        }:
             for child in node.children:
                 self._collect(child, file_path, parent=parent, out=out)
             return
@@ -150,8 +159,11 @@ class SymbolExtractor:
         # `decorated_definition` carries the inner def/class as its first
         # named child — descend into whatever it holds.
         for child in node.children:
-            if child.type in {"class_definition", "function_definition",
-                              "decorated_definition"}:
+            if child.type in {
+                "class_definition",
+                "function_definition",
+                "decorated_definition",
+            }:
                 self._collect(child, file_path, parent=parent, out=out)
 
     # --- helpers ---------------------------------------------------------
@@ -160,6 +172,8 @@ class SymbolExtractor:
     def _first_child_name(node: Node, child_type: str) -> str | None:
         for child in node.children:
             if child.type == child_type:
+                if child.text is None:
+                    return None
                 return child.text.decode("utf-8", errors="replace")
         return None
 
@@ -171,6 +185,8 @@ class SymbolExtractor:
     def _render_import(node: Node) -> str:
         """Best-effort string for ``import a.b.c as d``."""
 
+        if node.text is None:
+            return ""
         text = node.text.decode("utf-8", errors="replace")
         return text.strip()
 
@@ -178,5 +194,7 @@ class SymbolExtractor:
     def _render_import_from(node: Node) -> str:
         """Best-effort string for ``from a.b import c, d as e``."""
 
+        if node.text is None:
+            return ""
         text = node.text.decode("utf-8", errors="replace")
         return text.strip()

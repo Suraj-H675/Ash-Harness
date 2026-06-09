@@ -32,7 +32,9 @@ POWERSHELL_FILE_CMDLETS = (
 
 class RunCommandArgs(BaseModel):
     command_line: str = Field(..., description="The shell command string to execute.")
-    cwd: str | None = Field(None, description="Directory path context to run the command in.")
+    cwd: str | None = Field(
+        None, description="Directory path context to run the command in."
+    )
     timeout_seconds: int = Field(
         DEFAULT_TIMEOUT_SECONDS,
         ge=1,
@@ -63,7 +65,11 @@ class RunCommandTool(BaseTool):
         if args.cwd is not None:
             cwd_path = self.safety_guard.validate_path(args.cwd)
             if not cwd_path.is_dir():
-                return ToolResult(success=False, output="", error=f"Error: cwd is not a directory: {args.cwd}")
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Error: cwd is not a directory: {args.cwd}",
+                )
             cwd = str(cwd_path)
 
         # Tier 2+ (bwrap / docker) wants a real argv so the sandbox
@@ -77,7 +83,11 @@ class RunCommandTool(BaseTool):
         if sandboxed:
             assert self.sandbox_manager is not None
             try:
-                argv = shlex.split(args.command_line) if not platform.system() == "Windows" else None
+                argv = (
+                    shlex.split(args.command_line)
+                    if not platform.system() == "Windows"
+                    else None
+                )
             except ValueError as exc:
                 return ToolResult(
                     success=False,
@@ -105,9 +115,7 @@ class RunCommandTool(BaseTool):
         if error_truncated:
             truncated = True
         if not result.fallback_used and result.tier >= SANDBOX_TIER_BWRAP:
-            annotation = (
-                f"[sandbox tier={result.tier} backend={result.backend_name}]"
-            )
+            annotation = f"[sandbox tier={result.tier} backend={result.backend_name}]"
             if error:
                 error = f"{annotation} {error}"
             else:
@@ -180,7 +188,9 @@ class RunCommandTool(BaseTool):
 
         lowered = command_line.casefold()
         if contains_forbidden_windows_chain(command_line):
-            raise SafetyViolation("Windows command chains are forbidden for this command.")
+            raise SafetyViolation(
+                "Windows command chains are forbidden for this command."
+            )
         if not any(cmdlet in lowered for cmdlet in POWERSHELL_FILE_CMDLETS):
             return
         if "-literalpath" not in lowered:
@@ -189,9 +199,7 @@ class RunCommandTool(BaseTool):
             )
 
 
-async def run_command(
-    safety_guard: SafetyGuard, **kwargs: Any
-) -> ToolResult:
+async def run_command(safety_guard: SafetyGuard, **kwargs: Any) -> ToolResult:
     return await RunCommandTool(safety_guard).run(**kwargs)
 
 

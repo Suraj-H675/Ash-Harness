@@ -26,9 +26,15 @@ EXISTS_ERROR = (
 
 
 class ReadFileArgs(BaseModel):
-    file_path: str = Field(..., description="Absolute or relative path to the file to read.")
-    start_line: int = Field(1, ge=1, description="1-indexed starting line number (inclusive).")
-    end_line: int | None = Field(None, ge=1, description="1-indexed ending line number (inclusive).")
+    file_path: str = Field(
+        ..., description="Absolute or relative path to the file to read."
+    )
+    start_line: int = Field(
+        1, ge=1, description="1-indexed starting line number (inclusive)."
+    )
+    end_line: int | None = Field(
+        None, ge=1, description="1-indexed ending line number (inclusive)."
+    )
 
 
 class WriteFileArgs(BaseModel):
@@ -72,15 +78,23 @@ class ReadFileTool(BaseTool):
         resolved_path = self.safety_guard.validate_path(args.file_path)
 
         if not resolved_path.exists():
-            return ToolResult(success=False, output="", error=f"Error: File not found: {args.file_path}")
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Error: File not found: {args.file_path}",
+            )
         if not resolved_path.is_file():
-            return ToolResult(success=False, output="", error=f"Error: Not a file: {args.file_path}")
+            return ToolResult(
+                success=False, output="", error=f"Error: Not a file: {args.file_path}"
+            )
         if _is_binary_file(resolved_path):
             return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
 
         lines = resolved_path.read_text(encoding="utf-8").splitlines()
         if args.end_line is not None and args.end_line < args.start_line:
-            return ToolResult(success=False, output="", error="Error: end_line must be >= start_line.")
+            return ToolResult(
+                success=False, output="", error="Error: end_line must be >= start_line."
+            )
 
         start_index = args.start_line - 1
         end_index = args.end_line if args.end_line is not None else len(lines)
@@ -96,7 +110,9 @@ class ReadFileTool(BaseTool):
             for line_number, line in enumerate(selected, start=args.start_line)
         )
         if truncated:
-            output = f"{output}\n[Warning: Output truncated. Too many lines in file read.]"
+            output = (
+                f"{output}\n[Warning: Output truncated. Too many lines in file read.]"
+            )
 
         return ToolResult(
             success=True,
@@ -123,9 +139,17 @@ class WriteFileTool(BaseTool):
         parent.mkdir(parents=True, exist_ok=True)
 
         if resolved_path.exists() and not os.access(resolved_path, os.W_OK):
-            return ToolResult(success=False, output="", error=f"Error: File is not writable: {args.file_path}")
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Error: File is not writable: {args.file_path}",
+            )
         if not os.access(parent, os.W_OK):
-            return ToolResult(success=False, output="", error=f"Error: Directory is not writable: {parent}")
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Error: Directory is not writable: {parent}",
+            )
 
         resolved_path.write_text(args.content, encoding="utf-8", newline="")
         return ToolResult(
@@ -136,19 +160,29 @@ class WriteFileTool(BaseTool):
 
 class ReplaceFileContentTool(BaseTool):
     name = "replace_file_content"
-    description = "Replace exact content within a bounded line range of a workspace file."
+    description = (
+        "Replace exact content within a bounded line range of a workspace file."
+    )
     args_schema = ReplaceFileContentArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ReplaceFileContentArgs(**kwargs)
         if args.end_line < args.start_line:
-            return ToolResult(success=False, output="", error="Error: end_line must be >= start_line.")
+            return ToolResult(
+                success=False, output="", error="Error: end_line must be >= start_line."
+            )
 
         resolved_path = self.safety_guard.validate_path(args.file_path)
         if not resolved_path.exists():
-            return ToolResult(success=False, output="", error=f"Error: File not found: {args.file_path}")
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Error: File not found: {args.file_path}",
+            )
         if not resolved_path.is_file():
-            return ToolResult(success=False, output="", error=f"Error: Not a file: {args.file_path}")
+            return ToolResult(
+                success=False, output="", error=f"Error: Not a file: {args.file_path}"
+            )
         if _is_binary_file(resolved_path):
             return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
 
@@ -159,11 +193,17 @@ class ReplaceFileContentTool(BaseTool):
         start_index = args.start_line - 1
         end_index = args.end_line
         if start_index >= len(lines) or end_index > len(lines):
-            return ToolResult(success=False, output="", error="Error: Line range is outside file bounds.")
+            return ToolResult(
+                success=False,
+                output="",
+                error="Error: Line range is outside file bounds.",
+            )
 
         segment = "".join(lines[start_index:end_index])
         normalized_segment = _strip_trailing_newlines(_normalize_line_endings(segment))
-        normalized_target = _strip_trailing_newlines(_normalize_line_endings(args.target_content))
+        normalized_target = _strip_trailing_newlines(
+            _normalize_line_endings(args.target_content)
+        )
 
         if normalized_segment != normalized_target:
             return ToolResult(
@@ -182,8 +222,7 @@ class ReplaceFileContentTool(BaseTool):
         return ToolResult(
             success=True,
             output=(
-                f"Replaced lines {args.start_line}-{args.end_line} "
-                f"in {resolved_path}."
+                f"Replaced lines {args.start_line}-{args.end_line} in {resolved_path}."
             ),
         )
 

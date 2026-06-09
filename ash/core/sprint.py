@@ -243,7 +243,11 @@ class SprintExecution:
 
         if not self.items:
             return 0, 0
-        done = sum(1 for i in self.items if i.status in {ChecklistStatus.DONE, ChecklistStatus.SKIPPED})
+        done = sum(
+            1
+            for i in self.items
+            if i.status in {ChecklistStatus.DONE, ChecklistStatus.SKIPPED}
+        )
         return done, len(self.items)
 
     @property
@@ -257,7 +261,9 @@ class SprintExecution:
             "items": [i.to_dict() for i in self.items],
             "created_at": self.created_at.isoformat(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "completed_at": self.completed_at.isoformat()
+            if self.completed_at
+            else None,
             "abort_reason": self.abort_reason,
         }
 

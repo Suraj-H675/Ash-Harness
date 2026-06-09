@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, create_model
 
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult
@@ -63,7 +63,9 @@ class SkillContext:
     def get_tool(self, name: str) -> BaseTool | None:
         return self._tools.get(name)
 
-    async def run_command(self, command_line: str, *, cwd: str | None = None, timeout: int = 60) -> str:
+    async def run_command(
+        self, command_line: str, *, cwd: str | None = None, timeout: int = 60
+    ) -> str:
         tool = self._tools.get("run_command")
         if tool is None:
             from ash.tools.command import RunCommandTool
@@ -76,7 +78,9 @@ class SkillContext:
             raise SkillExecutionError(result.error or "command failed", result=result)
         return result.output
 
-    async def read_file(self, file_path: str, *, start_line: int = 1, end_line: int | None = None) -> str:
+    async def read_file(
+        self, file_path: str, *, start_line: int = 1, end_line: int | None = None
+    ) -> str:
         tool = self._tools.get("read_file")
         if tool is None:
             from ash.tools.filesystem import ReadFileTool
@@ -89,7 +93,9 @@ class SkillContext:
             raise SkillExecutionError(result.error or "read failed", result=result)
         return result.output
 
-    async def write_file(self, file_path: str, content: str, *, overwrite: bool = False) -> None:
+    async def write_file(
+        self, file_path: str, content: str, *, overwrite: bool = False
+    ) -> None:
         tool = self._tools.get("write_file")
         if tool is None:
             from ash.tools.filesystem import WriteFileTool
@@ -139,10 +145,12 @@ def parse_markdown_skill(path: Path) -> _MarkdownSkill:
             if ":" in line:
                 key, _, value = line.partition(":")
                 front[key.strip().lower()] = value.strip()
-        body = text[fm_match.end():]
+        body = text[fm_match.end() :]
 
     name = front.get("name") or _first_h1(body) or path.stem
-    description = front.get("description") or _section_after(body, "Description", fallback="")
+    description = front.get("description") or _section_after(
+        body, "Description", fallback=""
+    )
     trigger = front.get("trigger", "")
     args = _parse_args_section(body)
     code_match = _CODE_FENCE_RE.search(body)
@@ -197,7 +205,10 @@ def _parse_args_section(body: str) -> tuple[tuple[str, str, str, str], ...]:
     if not block:
         return ()
     args: list[tuple[str, str, str, str]] = []
-    bullet_re = re.compile(r"^\s*-\s*`?(?P<name>[A-Za-z_][A-Za-z0-9_]*)`?\s*:\s*(?P<rest>.+?)\s*$", re.MULTILINE)
+    bullet_re = re.compile(
+        r"^\s*-\s*`?(?P<name>[A-Za-z_][A-Za-z0-9_]*)`?\s*:\s*(?P<rest>.+?)\s*$",
+        re.MULTILINE,
+    )
     for line_match in bullet_re.finditer(block):
         name = line_match.group("name")
         rest = line_match.group("rest")
@@ -205,15 +216,17 @@ def _parse_args_section(body: str) -> tuple[tuple[str, str, str, str], ...]:
         type_match = re.match(r"`?([A-Za-z_][A-Za-z0-9_\[\], ]*)`?", rest)
         py_type = (type_match.group(1) if type_match else "str").strip()
         default = ""
-        default_match = re.search(r"=\s*(\[[^\]]*\]|'[^']*'|\"[^\"]*\"|\d+(?:\.\d+)?|True|False|None)", rest)
+        default_match = re.search(
+            r"=\s*(\[[^\]]*\]|'[^']*'|\"[^\"]*\"|\d+(?:\.\d+)?|True|False|None)", rest
+        )
         if default_match:
             default = default_match.group(1)
         # Description is everything after the type (and optional default).
         desc = rest
         if default_match:
-            desc = (desc[: default_match.start()] + desc[default_match.end():]).strip()
+            desc = (desc[: default_match.start()] + desc[default_match.end() :]).strip()
         if type_match:
-            desc = desc[type_match.end():].lstrip(" -:").strip()
+            desc = desc[type_match.end() :].lstrip(" -:").strip()
         args.append((name, py_type, default, desc))
     return tuple(args)
 
@@ -230,7 +243,9 @@ class _PythonSkill:
     source_path: Path | None = None
 
 
-_PY_DOCSTRING_META_RE = re.compile(r"^\s*(?P<key>[A-Za-z_]+)\s*:\s*(?P<value>.+?)\s*$", re.MULTILINE)
+_PY_DOCSTRING_META_RE = re.compile(
+    r"^\s*(?P<key>[A-Za-z_]+)\s*:\s*(?P<value>.+?)\s*$", re.MULTILINE
+)
 
 
 def parse_python_skill(path: Path) -> _PythonSkill:
@@ -256,7 +271,10 @@ def parse_python_skill(path: Path) -> _PythonSkill:
     # Find an `async def execute(...)` (or sync `def execute`) function.
     execute_node = None
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "execute":
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "execute"
+        ):
             execute_node = node
             break
     if execute_node is None:
@@ -313,19 +331,19 @@ def build_tool_from_python_module(
         or getattr(execute, "__name__", "skill")
     )
     if parsed_description is not None:
-        tool_description = parsed_description
+        tool_description: str = parsed_description
     else:
-        tool_description = (
-            getattr(module, "__ash_description__", None)
-            or (execute.__doc__ or "").strip().splitlines()[0:1]
-        )
-        tool_description = tool_description[0] if tool_description else "Python skill"
+        fallback = getattr(module, "__ash_description__", None)
+        if not fallback:
+            doc_first_line = (execute.__doc__ or "").strip().splitlines()[:1]
+            fallback = doc_first_line[0] if doc_first_line else ""
+        tool_description = fallback or "Python skill"
 
     tool_args_schema = _build_args_schema_from_signature(execute)
 
     class _PythonSkillTool(BaseTool):
-        name = tool_name
-        description = tool_description
+        name = tool_name  # type: ignore[assignment,misc]
+        description = tool_description  # type: ignore[assignment,misc]
         args_schema = tool_args_schema
 
         async def run(self, **kwargs: Any) -> ToolResult:
@@ -335,11 +353,13 @@ def build_tool_from_python_module(
                 project_root=_get_project_root(),
             )
             try:
-                result = await execute(context, **kwargs)
+                result = await execute(context, **kwargs)  # type: ignore[misc]
             except SkillExecutionError as exc:
                 return ToolResult(success=False, output="", error=str(exc))
             except Exception as exc:  # noqa: BLE001
-                return ToolResult(success=False, output="", error=f"skill raised: {exc}")
+                return ToolResult(
+                    success=False, output="", error=f"skill raised: {exc}"
+                )
             if isinstance(result, ToolResult):
                 return result
             return ToolResult(success=True, output=str(result))
@@ -441,7 +461,9 @@ def _compile_markdown_skill(path: Path, safety_guard: SafetyGuard) -> BaseTool:
         # When the schema is the empty marker, dump() returns an empty
         # dict so we don't pollute the executor with phantom fields.
         passed_kwargs = (
-            {} if type(validated).__name__.endswith("Args") and not validated.model_fields else validated.model_dump()
+            {}
+            if type(validated).__name__.endswith("Args") and not validated.model_fields
+            else validated.model_dump()
         )
         try:
             result = await _executor(**passed_kwargs)
@@ -481,7 +503,7 @@ def _build_args_model(
         else:
             fields[name] = (annotation, ...)
     model_name = _safe_model_name(default_name)
-    return create_model(model_name, **fields)  # type: ignore[return-value]
+    return create_model(model_name, **fields)  # type: ignore[call-overload]
 
 
 def _build_args_schema_from_signature(fn: Callable[..., Any]) -> type[BaseModel]:
@@ -500,7 +522,9 @@ def _build_args_schema_from_signature(fn: Callable[..., Any]) -> type[BaseModel]
     for pname, param in sig.parameters.items():
         if pname == "context":
             continue
-        annotation = param.annotation if param.annotation is not inspect.Parameter.empty else str
+        annotation = (
+            param.annotation if param.annotation is not inspect.Parameter.empty else str
+        )
         if param.default is inspect.Parameter.empty:
             fields[pname] = (annotation, ...)
         else:
@@ -510,7 +534,7 @@ def _build_args_schema_from_signature(fn: Callable[..., Any]) -> type[BaseModel]
             _safe_model_name(getattr(fn, "__name__", "skill") + "Args")
         )
     model_name = _safe_model_name(getattr(fn, "__name__", "skill"))
-    return create_model(model_name, **fields)  # type: ignore[return-value]
+    return create_model(model_name, **fields)  # type: ignore[call-overload]
 
 
 def _resolve_python_type(type_name: str) -> Any:
@@ -595,7 +619,9 @@ def write_python_skill(
     skill_dir.mkdir(parents=True, exist_ok=True)
     path = skill_dir / f"{name}.py"
     body = textwrap.dedent(body).strip("\n")
-    docstring = f'"""\nname: {name}\ndescription: {description}\ntrigger: {trigger}\n"""'
+    docstring = (
+        f'"""\nname: {name}\ndescription: {description}\ntrigger: {trigger}\n"""'
+    )
     contents = f"{docstring}\n\n{body}\n"
     path.write_text(contents, encoding="utf-8")
     return path
@@ -608,7 +634,9 @@ _TOOLS_PROVIDER: Callable[[], list[BaseTool]] | None = None
 _ROOT_PROVIDER: Callable[[], Path] | None = None
 
 
-def configure_runtime(*, tools_provider: Callable[[], list[BaseTool]], root_provider: Callable[[], Path]) -> None:
+def configure_runtime(
+    *, tools_provider: Callable[[], list[BaseTool]], root_provider: Callable[[], Path]
+) -> None:
     """Inject the runtime context used by compiled skills.
 
     Called by the loop / entry point so compiled markdown skills can

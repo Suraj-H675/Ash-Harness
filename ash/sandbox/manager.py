@@ -185,9 +185,7 @@ class SandboxManager:
             )
 
         if isinstance(backend, _ScopedBackend):
-            return await _run_scoped(
-                backend, command, cwd, deadline, fallback=False
-            )
+            return await _run_scoped(backend, command, cwd, deadline, fallback=False)
 
         # Tier 2/3 path: build the wrapped argv, then exec.
         try:
@@ -220,20 +218,22 @@ class SandboxManager:
 
     def _build_backend(self, tier: SandboxTier) -> SandboxBackend:
         if tier == SANDBOX_TIER_DOCKER:
-            backend = DockerSandbox(workspace_root=self.workspace_root, network=self.network)
-            if not backend.is_available():
+            docker_backend = DockerSandbox(
+                workspace_root=self.workspace_root, network=self.network
+            )
+            if not docker_backend.is_available():
                 raise SandboxBackendUnavailable("docker backend unavailable")
-            return backend
+            return docker_backend
         if tier == SANDBOX_TIER_BWRAP:
             if sys.platform.startswith("linux"):
-                backend = BubblewrapSandbox(
+                bwrap_backend = BubblewrapSandbox(
                     workspace_root=self.workspace_root,
                     read_only_paths=self.extra_read_only_paths,
                     network=self.network,
                 )
-                if not backend.is_available():
+                if not bwrap_backend.is_available():
                     raise SandboxBackendUnavailable("bwrap backend unavailable")
-                return backend
+                return bwrap_backend
             if has_sandbox_exec():
                 return _SandboxExecBackend()
         return _ScopedBackend()

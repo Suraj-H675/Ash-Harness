@@ -73,7 +73,7 @@ class SafetyGuard:
     def __init__(
         self,
         project_root: Path,
-        allowed_directories: list[Path] | None = None,
+        allowed_directories: list[str | Path] | None = None,
         blocklist_commands: list[str] | None = None,
     ) -> None:
         self.project_root = normalize_project_root(project_root)

@@ -16,12 +16,10 @@ publish status updates (``idle`` / ``working`` / ``completed`` /
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable, Sequence
+from typing import Any, Iterable, Sequence, cast
 
 from ash.agents.shared_state import AgentStatus, IPCMessage, SharedState
 from ash.agents.subprocess_agent import (
@@ -52,7 +50,9 @@ class SubagentSpec:
 
     def __post_init__(self) -> None:
         if self.role not in AGENT_ROLES:
-            raise ValueError(f"Unknown role {self.role!r}; expected one of {AGENT_ROLES}")
+            raise ValueError(
+                f"Unknown role {self.role!r}; expected one of {AGENT_ROLES}"
+            )
         if not self.agent_id:
             self.agent_id = f"{self.role}-{uuid.uuid4().hex[:8]}"
 
@@ -136,7 +136,9 @@ class SubagentOrchestrator:
                 state = "aborted"
             self.shared_state.update_sprint_state(sprint_id, state)
             self.shared_state.update_status(
-                self.lead_agent_id, "completed", current_task=f"batch done ({len(reports)} reports)"
+                self.lead_agent_id,
+                "completed",
+                current_task=f"batch done ({len(reports)} reports)",
             )
 
         return OrchestratorResult(
@@ -151,7 +153,6 @@ class SubagentOrchestrator:
     async def _run_agents(self, specs: Sequence[SubagentSpec]) -> list[AgentReport]:
         semaphore = asyncio.Semaphore(self.max_concurrency)
         reports: list[AgentReport] = []
-        pending: list[AgentReport] = []
         tasks: list[asyncio.Task[AgentReport]] = []
 
         for spec in specs:
@@ -228,21 +229,27 @@ class SubagentOrchestrator:
         or ``idle`` when the deadline elapses.
         """
 
-        interval = poll_interval_seconds if poll_interval_seconds is not None else self.poll_interval_seconds
+        interval = (
+            poll_interval_seconds
+            if poll_interval_seconds is not None
+            else self.poll_interval_seconds
+        )
         deadline = time.monotonic() + timeout_seconds
         agent_ids = list(agent_ids)
         while True:
             statuses = {st.agent_id: st for st in self.shared_state.list_agents()}
             final = {aid: statuses.get(aid) for aid in agent_ids}
-            if all(
-                final[aid] is not None and final[aid].status in {"completed", "failed"}
-                for aid in agent_ids
-            ):
-                return {aid: final[aid] for aid in agent_ids}  # type: ignore[return-value]
+            all_done = all(
+                st is not None and st.status in {"completed", "failed"}
+                for st in (final[aid] for aid in agent_ids)
+            )
+            if all_done:
+                return {aid: cast(AgentStatus, final[aid]) for aid in agent_ids}
             if time.monotonic() >= deadline:
                 timed_out = [
-                    aid for aid in agent_ids
-                    if final[aid] is None or final[aid].status not in {"completed", "failed"}
+                    aid
+                    for aid, st in final.items()
+                    if st is None or st.status not in {"completed", "failed"}
                 ]
                 raise TimeoutError(
                     f"Agents did not finish within {timeout_seconds}s: {timed_out}"
@@ -252,7 +259,9 @@ class SubagentOrchestrator:
     # --- IPC helpers ----------------------------------------------------
 
     def _drain_lead_inbox(self) -> list[IPCMessage]:
-        msgs = self.shared_state.fetch_messages(self.lead_agent_id, undelivered_only=True)
+        msgs = self.shared_state.fetch_messages(
+            self.lead_agent_id, undelivered_only=True
+        )
         if msgs:
             self.shared_state.mark_delivered(m.message_id for m in msgs)
         return msgs
@@ -291,7 +300,11 @@ def fanout_for_goal(
 
     if phases is None:
         phases = (
-            ("researcher", f"Research the codebase to support: {goal}", f"researched: {goal}"),
+            (
+                "researcher",
+                f"Research the codebase to support: {goal}",
+                f"researched: {goal}",
+            ),
             ("coder", f"Implement: {goal}", f"implemented: {goal}"),
             ("tester", f"Test: {goal}", f"tested: {goal}"),
             ("reviewer", f"Review: {goal}", f"reviewed: {goal}"),

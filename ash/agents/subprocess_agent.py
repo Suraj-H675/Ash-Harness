@@ -20,7 +20,6 @@ so the orchestrator can poll without blocking. It also pushes a final
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import subprocess
 import sys
@@ -156,7 +155,9 @@ class SubprocessAgent:
         """
 
         self.register()
-        self.shared_state.update_status(self.agent_id, "working", current_task=self.task)
+        self.shared_state.update_status(
+            self.agent_id, "working", current_task=self.task
+        )
         try:
             result = await self.runner(
                 {
@@ -167,7 +168,9 @@ class SubprocessAgent:
                 }
             )
         except Exception as exc:  # noqa: BLE001
-            self.shared_state.update_status(self.agent_id, "failed", current_task=str(exc))
+            self.shared_state.update_status(
+                self.agent_id, "failed", current_task=str(exc)
+            )
             report = AgentReport(
                 agent_id=self.agent_id,
                 role=self.role,
@@ -179,7 +182,9 @@ class SubprocessAgent:
         else:
             report = _coerce_report(result, self)
             status = "completed" if report.success else "failed"
-            self.shared_state.update_status(self.agent_id, status, current_task=report.summary[:200])
+            self.shared_state.update_status(
+                self.agent_id, status, current_task=report.summary[:200]
+            )
 
         # Push the report to the IPC channel.
         self.shared_state.send_message(
@@ -209,9 +214,7 @@ class SubprocessAgent:
 
         driver_path = Path(__file__).with_name("_agent_driver.py")
         if not driver_path.exists():
-            raise FileNotFoundError(
-                f"Subprocess agent driver missing at {driver_path}"
-            )
+            raise FileNotFoundError(f"Subprocess agent driver missing at {driver_path}")
         cmd: list[str] = [
             python_executable or sys.executable,
             str(driver_path),
@@ -247,7 +250,9 @@ def _coerce_report(result: AgentReport | str, agent: SubprocessAgent) -> AgentRe
             success=True,
             summary=result,
         )
-    raise TypeError(f"Task runner returned {type(result).__name__}; expected AgentReport or str")
+    raise TypeError(
+        f"Task runner returned {type(result).__name__}; expected AgentReport or str"
+    )
 
 
 def _report_to_payload(report: AgentReport) -> dict[str, Any]:

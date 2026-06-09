@@ -22,7 +22,6 @@ import math
 import sqlite3
 import struct
 from abc import ABC, abstractmethod
-from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -161,7 +160,9 @@ class ONNXLocalEmbedding(EmbeddingAdapter):
     DIMENSION = 384
     DEFAULT_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-    def __init__(self, model_path: Path | str | None = None, *, dimension: int = DIMENSION) -> None:
+    def __init__(
+        self, model_path: Path | str | None = None, *, dimension: int = DIMENSION
+    ) -> None:
         if dimension <= 0:
             raise ValueError("dimension must be positive")
         self._model_path = Path(model_path) if model_path is not None else None
@@ -180,7 +181,7 @@ class ONNXLocalEmbedding(EmbeddingAdapter):
         self._load_attempted = True
 
         try:
-            import onnxruntime  # type: ignore[import-not-found]
+            import onnxruntime  # type: ignore[import-not-found,import-untyped]
         except ImportError as exc:  # pragma: no cover - host dependent
             raise EmbeddingBackendUnavailable(
                 "onnxruntime is not installed; install the 'vector' extra."
@@ -279,7 +280,9 @@ class OpenAIEmbedding(EmbeddingAdapter):
             raise EmbeddingBackendUnavailable(
                 "The 'openai' package is not installed; install it for OpenAI embeddings."
             ) from exc
-        self._client = AsyncOpenAI(api_key=self._api_key) if self._api_key else AsyncOpenAI()
+        self._client = (
+            AsyncOpenAI(api_key=self._api_key) if self._api_key else AsyncOpenAI()
+        )
         return self._client
 
     async def get_embedding(self, text: str) -> list[float]:
@@ -360,8 +363,12 @@ class InMemoryVectorIndex(VectorIndex):
     ) -> None:
         if not (len(ids) == len(embeddings) == len(documents)):
             raise ValueError("ids, embeddings, and documents must be the same length")
-        meta_iter: Iterable[dict[str, Any]] = metadatas if metadatas is not None else [{}] * len(ids)
-        for chunk_id, emb, doc, meta in zip(ids, embeddings, documents, meta_iter, strict=True):
+        meta_iter: Iterable[dict[str, Any]] = (
+            metadatas if metadatas is not None else [{}] * len(ids)
+        )
+        for chunk_id, emb, doc, meta in zip(
+            ids, embeddings, documents, meta_iter, strict=True
+        ):
             record = {
                 "id": chunk_id,
                 "embedding": [float(x) for x in emb],
@@ -446,7 +453,9 @@ class ChromaIndex(VectorIndex):
         metadatas: Sequence[dict[str, Any]] | None = None,
     ) -> None:
         self._ensure_ready()
-        meta_list: list[dict[str, Any]] = list(metadatas) if metadatas is not None else [{} for _ in ids]
+        meta_list: list[dict[str, Any]] = (
+            list(metadatas) if metadatas is not None else [{} for _ in ids]
+        )
         # Chroma requires non-empty metadata dicts and JSON-serializable values.
         clean_meta: list[dict[str, Any]] = []
         for meta in meta_list:
@@ -512,7 +521,9 @@ def _to_chroma_value(value: Any) -> str | int | float | bool:
 class FTS5FallbackIndex:
     """Wrap :class:`FTS5Index` so it conforms to the search pipeline contract."""
 
-    def __init__(self, fts_index: FTS5Index | None = None, db_path: Path | str | None = None) -> None:
+    def __init__(
+        self, fts_index: FTS5Index | None = None, db_path: Path | str | None = None
+    ) -> None:
         if fts_index is None and db_path is None:
             raise ValueError("Provide either fts_index or db_path")
         if fts_index is None:
@@ -520,14 +531,16 @@ class FTS5FallbackIndex:
             fts_index = FTS5Index(db_path)
         self._index = fts_index
 
-    def add(self, chunks: Sequence[Chunk], file_path: str, sha256: str | None = None) -> int:
+    def add(
+        self, chunks: Sequence[Chunk], file_path: str, sha256: str | None = None
+    ) -> int:
         return self._index.index_document(file_path, list(chunks), sha256=sha256)
 
     def query(self, query_text: str, top_k: int = 5) -> list[VectorHit]:
         rows = self._index.query(query_text, limit=top_k)
         return [
             VectorHit(
-                chunk_key=f"{row.get('file_path','')}:unknown",
+                chunk_key=f"{row.get('file_path', '')}:unknown",
                 file_path=str(row.get("file_path", "")),
                 content=str(row.get("content", "")),
                 score=float(row.get("rank", 0.0) or 0.0),
@@ -537,7 +550,9 @@ class FTS5FallbackIndex:
         ]
 
 
-def fts5_query(db_path: Path | str, query_text: str, top_k: int = 5) -> list[dict[str, Any]]:
+def fts5_query(
+    db_path: Path | str, query_text: str, top_k: int = 5
+) -> list[dict[str, Any]]:
     """
     Run a raw BM25-ranked FTS5 query against the supplied database.
 
