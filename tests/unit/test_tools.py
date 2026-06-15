@@ -153,6 +153,24 @@ async def test_run_command_executes_with_scoped_cwd(
 
 
 @pytest.mark.asyncio
+async def test_run_command_defaults_to_project_root_cwd(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    marker = project_root / "marker.txt"
+    marker.write_text("from-root", encoding="utf-8")
+    command = (
+        f"{shlex.quote(sys.executable)} -c "
+        f"{shlex.quote('from pathlib import Path; print(Path(\"marker.txt\").read_text())')}"
+    )
+
+    result = await RunCommandTool(guard).run(command_line=command)
+
+    assert result.success is True
+    assert result.output.strip() == "from-root"
+
+
+@pytest.mark.asyncio
 async def test_run_command_enforces_timeout(guard: SafetyGuard) -> None:
     command = f"{shlex.quote(sys.executable)} -c {shlex.quote('import time; time.sleep(2)')}"
 
@@ -187,3 +205,51 @@ def test_quote_powershell_literal_path_escapes_single_quotes() -> None:
     assert quote_powershell_literal_path("C:\\Users\\O'Brien\\file.txt") == (
         "-LiteralPath 'C:\\Users\\O''Brien\\file.txt'"
     )
+
+
+def test_auto_commit_tool_is_in_default_tools():
+    """auto_commit should be in the default tools dict."""
+    from ash.__main__ import _build_tools
+    from ash.safety.guard import SafetyGuard
+    from pathlib import Path
+
+    guard = SafetyGuard(project_root=Path("/tmp"))
+    tools = _build_tools(guard)
+    assert "auto_commit" in tools, "auto_commit must be in default tools dict"
+    assert tools["auto_commit"].name == "auto_commit"
+
+@pytest.mark.asyncio
+async def test_auto_commit_tool_runs_successfully(tmp_path):
+    """AutoCommitTool should create a commit when called with valid args."""
+    from ash.tools.git import AutoCommitTool
+    from ash.safety.guard import SafetyGuard
+    import subprocess
+
+    # Initialize a git repo
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=tmp_path, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=tmp_path, check=True, capture_output=True
+    )
+
+    # Create a file and commit
+    (tmp_path / "test.txt").write_text("hello")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=tmp_path, check=True, capture_output=True
+    )
+
+    # Write a new file
+    (tmp_path / "new.txt").write_text("world")
+
+    guard = SafetyGuard(project_root=tmp_path)
+    tool = AutoCommitTool(guard)
+    result = await tool.run(message="add new file", paths=["new.txt"])
+
+    assert result.success, f"auto_commit failed: {result.error}"
+    assert "commit" in result.output.lower() or "create" in result.output.lower()
