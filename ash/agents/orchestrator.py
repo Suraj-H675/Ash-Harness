@@ -19,6 +19,7 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, Sequence, cast
 
 from ash.agents.shared_state import AgentStatus, IPCMessage, SharedState
@@ -30,6 +31,7 @@ from ash.agents.subprocess_agent import (
     make_simple_text_task,
     payload_to_report,
 )
+from ash.core.planner import Planner
 
 
 LEAD_AGENT_ID = "lead"
@@ -47,6 +49,7 @@ class SubagentSpec:
     token_budget: int = 4000
     return_budget: int = 2000
     metadata: dict[str, Any] = field(default_factory=dict)
+    mode: str = "execute"  # "architect" | "execute" | "general"
 
     def __post_init__(self) -> None:
         if self.role not in AGENT_ROLES:
@@ -285,6 +288,9 @@ def fanout_for_goal(
     goal: str,
     *,
     phases: Sequence[tuple[str, str, str | None]] | None = None,
+    use_architect_mode: bool = False,
+    planner: Planner | None = None,
+    project_root: Path | None = None,
 ) -> list[SubagentSpec]:
     """
     Build a default 4-agent fan-out: Researcher → Coder → Tester → Reviewer.
@@ -293,7 +299,21 @@ def fanout_for_goal(
     ``(role, task, runner_reply)``. When ``runner_reply`` is None the
     default text runner is used. Passing your own phase list lets
     callers customise the worker pipeline without subclassing.
+
+    When ``use_architect_mode=True``, the first phase uses the architect
+    runner (calls :meth:`Planner.decompose`) and the second phase uses
+    the default text runner. Requires ``planner`` and ``project_root``.
     """
+
+    if phases is None and use_architect_mode:
+        if planner is None or project_root is None:
+            raise ValueError(
+                "use_architect_mode=True requires planner and project_root"
+            )
+        phases = (
+            ("general", f"Analyze and plan: {goal}", "architect"),  # mode="architect"
+            ("general", f"Execute: {goal}", "execute"),  # mode="execute"
+        )
 
     if phases is None:
         phases = (
@@ -307,14 +327,40 @@ def fanout_for_goal(
             ("reviewer", f"Review: {goal}", f"reviewed: {goal}"),
         )
     specs: list[SubagentSpec] = []
-    for role, task, reply in phases:
-        runner = make_simple_text_task(reply) if reply is not None else None
+    for role, task, mode in phases:
+        if mode == "architect":
+            if planner is None or project_root is None:
+                raise ValueError("architect phase requires planner and project_root")
+            runner = make_architect_task(planner, project_root)
+        elif mode == "execute" or mode is None:
+            runner = None  # use default text runner
+        else:
+            runner = None
         specs.append(
             SubagentSpec(
                 role=role,
                 task=task,
                 runner=runner,
+                mode=mode or "execute",
                 tool_allowlist=SubagentOrchestrator.default_role_allowlist(role),
             )
         )
     return specs
+
+
+def make_architect_task(planner: Planner, project_root: Path) -> TaskFn:
+    """Build a runner that calls :meth:`Planner.decompose` and returns a sprint contract."""
+
+    async def runner(ctx: dict[str, Any]) -> AgentReport:
+        task = ctx["task"]
+        execution = await planner.decompose(task, project_root=project_root)
+        return AgentReport(
+            agent_id=ctx["agent_id"],
+            role="architect",
+            task=task,
+            success=True,
+            summary=f"Planned: {execution.contract.goal}",
+            artifacts={"contract": execution.contract.to_dict()},
+        )
+
+    return runner
