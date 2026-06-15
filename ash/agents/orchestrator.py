@@ -165,6 +165,9 @@ class SubagentOrchestrator:
                 token_budget=spec.token_budget,
                 return_budget=spec.return_budget,
                 metadata=spec.metadata,
+                enforcement_guard=lambda tool_name: (
+                    tool_name in (spec.tool_allowlist or set())
+                ),
             )
             async with semaphore:
                 return await agent.run_in_process()
