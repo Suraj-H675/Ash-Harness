@@ -1,5 +1,4 @@
 import asyncio
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -162,3 +161,23 @@ async def test_write_transaction_serializes_concurrent_writes(tmp_path: Path) ->
 
     assert entered == ["first-start", "first-end", "second-start", "second-end"]
     assert labels == ["first", "second"]
+
+
+def test_get_recent_session_summaries(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "test.db")
+    s1 = store.create_session(str(tmp_path))
+    s2 = store.create_session(str(tmp_path))
+
+    store.save_message(
+        s1.session_id,
+        Message(role="user", content="hello", timestamp=datetime.now(timezone.utc)),
+    )
+    store.save_message(
+        s2.session_id,
+        Message(role="user", content="goodbye", timestamp=datetime.now(timezone.utc)),
+    )
+
+    summaries = store.get_recent_session_summaries(str(tmp_path), limit=2)
+    assert len(summaries) == 2
+    assert any("hello" in s for s in summaries)
+    assert any("goodbye" in s for s in summaries)
