@@ -40,6 +40,7 @@ from ash.ui.parser import Event, StreamingXMLParser
 from ash.ui.terminal import TerminalUI
 
 if TYPE_CHECKING:
+    from ash.context.turn import TurnContext
     from ash.core.planner import Planner
     from ash.core.sprint import SprintExecution
     from ash.hooks import HookRegistry
@@ -154,6 +155,7 @@ class AshLoop:
         on_tool_approval: ToolApprovalCallback | None = None,
         enable_memory_recall: bool = False,
         hooks: "HookRegistry | None" = None,
+        turn_context: "TurnContext | None" = None,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -174,6 +176,7 @@ class AshLoop:
         self.on_tool_approval = on_tool_approval
         self.enable_memory_recall = enable_memory_recall
         self.hooks = hooks
+        self.turn_context = turn_context
         self.current_session: Session | None = None
 
     # --- session lifecycle ------------------------------------------------
@@ -221,6 +224,13 @@ class AshLoop:
         if self.current_session is None:
             raise RuntimeError("start_session() returned None")
         session = self.current_session
+
+        from ash.context.turn import TurnContext
+
+        self.turn_context = TurnContext(
+            session_id=session.session_id,
+            turn_id=str(uuid4()),
+        )
 
         # 0. Optional V5 sprint planning phase. Triggered only when the
         # loop is configured with a planner AND the user input looks
