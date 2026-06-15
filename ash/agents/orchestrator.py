@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence, cast
 
@@ -68,6 +68,7 @@ class OrchestratorResult:
     sprint_id: str
     reports: list[AgentReport] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+    consolidated_report: AgentReport | None = None  # ADD THIS FIELD
 
     @property
     def all_succeeded(self) -> bool:
@@ -144,10 +145,12 @@ class SubagentOrchestrator:
                 current_task=f"batch done ({len(reports)} reports)",
             )
 
+        consolidated = await self.consolidate_results(reports, goal)
         return OrchestratorResult(
             goal=goal,
             sprint_id=sprint_id,
             reports=reports,
+            consolidated_report=consolidated,
             elapsed_seconds=elapsed,
         )
 
@@ -214,6 +217,28 @@ class SubagentOrchestrator:
         """Return the current ``agent_status`` snapshot."""
 
         return self.shared_state.list_agents()
+
+    async def consolidate_results(
+        self,
+        reports: list[AgentReport],
+        goal: str,
+    ) -> AgentReport:
+        """Synthesize multiple agent reports into a single coherent response."""
+        if len(reports) == 1:
+            return reports[0]
+
+        consolidated = AgentReport(
+            agent_id="consolidator",
+            role="consolidator",
+            task=goal,
+            success=all(r.success for r in reports),
+            summary=f"Consolidated {len(reports)} agent reports",
+            artifacts={
+                "reports": [asdict(r) for r in reports],
+                "all_succeeded": all(r.success for r in reports),
+            },
+        )
+        return consolidated
 
     async def await_completion(
         self,
