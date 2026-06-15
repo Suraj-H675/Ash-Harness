@@ -105,6 +105,7 @@ class SubprocessAgent:
         token_budget: int = 4000,
         return_budget: int = 2000,
         metadata: dict[str, Any] | None = None,
+        enforcement_guard: Callable[[str], bool] | None = None,
     ) -> None:
         if role not in AGENT_ROLES:
             raise ValueError(f"Unknown role {role!r}; expected one of {AGENT_ROLES}")
@@ -117,12 +118,19 @@ class SubprocessAgent:
         self.token_budget = token_budget
         self.return_budget = return_budget
         self._metadata: dict[str, Any] = dict(metadata or {})
+        self._enforcement_guard = enforcement_guard
 
     # --- metadata -------------------------------------------------------
 
     @property
     def metadata(self) -> dict[str, Any]:
         return dict(self._metadata)
+
+    def is_tool_allowed(self, tool_name: str) -> bool:
+        """Check if a tool is in this agent's allowlist. Returns True if no allowlist set."""
+        if not self.tool_allowlist:
+            return True
+        return tool_name in self.tool_allowlist
 
     # --- registration --------------------------------------------------
 
@@ -220,14 +228,28 @@ class SubprocessAgent:
             str(driver_path),
             "--agent-id",
             self.agent_id,
+            "--db-path",
+            self.shared_state.db_path,
+            "--role",
+            self.role,
+            "--task",
+            self.task,
         ]
         cmd.extend(extra_args)
+        env = os.environ.copy()
+        project_root = str(Path(__file__).resolve().parents[2])
+        existing_pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = (
+            f"{project_root}{os.pathsep}{existing_pythonpath}"
+            if existing_pythonpath
+            else project_root
+        )
         return subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=os.environ.copy(),
+            env=env,
         )
 
     # --- reporting helpers ---------------------------------------------
