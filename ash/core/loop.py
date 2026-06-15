@@ -488,6 +488,8 @@ class AshLoop:
             try:
                 await self._apply_middlewares_before(tool_name, arguments, tool)
                 tool_result: ToolResult = await tool.run(**arguments)
+                if self.hooks is not None:
+                    await self.hooks.fire_post_tool(tool_name, arguments, tool_result)
                 tool_result = await self._apply_middlewares_after(
                     tool_name, arguments, tool_result
                 )

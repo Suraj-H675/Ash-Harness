@@ -57,3 +57,23 @@ async def test_session_start_hook_injects_prompt():
     await registry.fire_session_start()
 
     assert started == [True]
+
+
+@pytest.mark.asyncio
+async def test_post_tool_hook_fires():
+    registry = HookRegistry()
+    results = []
+
+    async def capture_result(name, args, result):
+        results.append((name, args, result))
+
+    registry.register_post_tool(
+        PostToolUseHook(
+            matcher=re.compile(r"Write|Edit", re.IGNORECASE),
+            callback=capture_result,
+        )
+    )
+
+    await registry.fire_post_tool("write_file", {"file_path": "x"}, {"success": True})
+    assert len(results) == 1
+    assert results[0][0] == "write_file"
