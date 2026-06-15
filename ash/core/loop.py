@@ -42,6 +42,7 @@ from ash.ui.terminal import TerminalUI
 if TYPE_CHECKING:
     from ash.core.planner import Planner
     from ash.core.sprint import SprintExecution
+    from ash.hooks import HookRegistry
 
 _log = get_logger(__name__)
 
@@ -152,6 +153,7 @@ class AshLoop:
         tool_middlewares: list[ToolMiddleware] | None = None,
         on_tool_approval: ToolApprovalCallback | None = None,
         enable_memory_recall: bool = False,
+        hooks: "HookRegistry | None" = None,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -171,6 +173,7 @@ class AshLoop:
         self.tool_middlewares: list[ToolMiddleware] = list(tool_middlewares or [])
         self.on_tool_approval = on_tool_approval
         self.enable_memory_recall = enable_memory_recall
+        self.hooks = hooks
         self.current_session: Session | None = None
 
     # --- session lifecycle ------------------------------------------------
@@ -196,6 +199,12 @@ class AshLoop:
                 self.system_prompt = (
                     f"{self.system_prompt}\n\n## Recent Context\n{memory_context}"
                 )
+
+        if self.hooks is not None:
+            await self.hooks.fire_session_start()
+            injected = self.hooks.get_injected_prompt()
+            if injected:
+                self.system_prompt = f"{self.system_prompt}\n\n{injected}"
 
         session = self.session_store.create_session(str(self.project_root))
         self.current_session = session

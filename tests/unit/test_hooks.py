@@ -43,3 +43,17 @@ async def test_session_start_hook_fires():
     await registry.fire_session_start()
 
     assert started == [True]
+
+
+@pytest.mark.asyncio
+async def test_session_start_hook_injects_prompt():
+    registry = HookRegistry()
+    started = []
+
+    async def on_start():
+        started.append(True)
+
+    registry.register_session_start(SessionStartHook(callback=on_start))
+    await registry.fire_session_start()
+
+    assert started == [True]
