@@ -30,13 +30,20 @@ from ash.core.session import (
     SessionStore,
     ToolCallRecord,
 )
+from ash.logging import get_logger
 from ash.providers.base import ProviderABC, TokenCounterLike
 from ash.repo.repomap import RepoMap
 from ash.safety.guard import SafetyGuard
-from ash.tools.base import BaseTool, ToolResult
+from ash.tools.base import BaseTool, ToolMiddleware, ToolMiddlewareSkip, ToolResult
 from ash.tools.git import auto_commit_turn
 from ash.ui.parser import Event, StreamingXMLParser
 from ash.ui.terminal import TerminalUI
+
+if TYPE_CHECKING:
+    from ash.core.planner import Planner
+    from ash.core.sprint import SprintExecution
+
+_log = get_logger(__name__)
 
 if TYPE_CHECKING:
     from ash.core.planner import Planner
@@ -136,6 +143,7 @@ class AshLoop:
         auto_commit_paths: list[Path] | None = None,
         planner: "Planner | None" = None,
         enable_sprint_planning: bool = False,
+        tool_middlewares: list[ToolMiddleware] | None = None,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -152,6 +160,7 @@ class AshLoop:
         self.auto_commit_paths = list(auto_commit_paths or [])
         self.planner = planner
         self.enable_sprint_planning = enable_sprint_planning
+        self.tool_middlewares: list[ToolMiddleware] = list(tool_middlewares or [])
         self.current_session: Session | None = None
 
     # --- session lifecycle ------------------------------------------------
@@ -175,9 +184,11 @@ class AshLoop:
     async def run_turn(self, user_input: str) -> str:
         """Run a single user turn to completion and return the final text."""
 
+        _log.info("turn started")
         if self.current_session is None:
             await self.start_session()
-        assert self.current_session is not None
+        if self.current_session is None:
+            raise RuntimeError("start_session() returned None")
         session = self.current_session
 
         # 0. Optional V5 sprint planning phase. Triggered only when the
@@ -249,6 +260,7 @@ class AshLoop:
 
             # If the breaker tripped, surface a final message and stop.
             if self.circuit_breaker.is_tripped:
+                _log.warning("circuit breaker tripped — halting turn")
                 final_text = (
                     f"{assistant_text}\n\n"
                     "[Circuit breaker tripped — see prior tool errors. Halting turn.]"
@@ -290,8 +302,9 @@ class AshLoop:
             )
             if not commit_result.success and commit_result.error:
                 # Surface commit failures to the user but don't fail the turn.
-                self.ui.print_thought(f"auto_commit failed: {commit_result.error}")
+                self.ui.console.print(f"auto_commit failed: {commit_result.error}")
 
+        _log.info(f"turn complete, {len(final_text)} chars returned")
         return final_text
 
     # --- sprint planning helpers (Sprint 12 / V5) ---------------------
@@ -301,7 +314,8 @@ class AshLoop:
 
         from ash.core.planner import Planner
 
-        assert self.planner is not None
+        if self.planner is None:
+            raise RuntimeError("planner is None but sprint planning is enabled")
         repo_excerpt = ""
         if self.repo_map is not None:
             try:
@@ -334,8 +348,11 @@ class AshLoop:
 
         with self.ui.begin_turn():
             async for chunk in self.provider.stream_chat(messages):
-                for event in parser.feed(chunk.content):
-                    self._handle_event(event, text_chunks, tool_calls)
+                for fragment in (chunk.content, chunk.tool_call_delta):
+                    if not fragment:
+                        continue
+                    for event in parser.feed(fragment):
+                        self._handle_event(event, text_chunks, tool_calls)
             # Drain the parser's remaining buffer at end-of-stream.
             for event in parser.feed(""):
                 self._handle_event(event, text_chunks, tool_calls)
@@ -365,6 +382,25 @@ class AshLoop:
 
     # --- tool execution ---------------------------------------------------
 
+    async def _apply_middlewares_before(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        tool: BaseTool,
+    ) -> None:
+        for mw in self.tool_middlewares:
+            await mw.before_tool(tool_name, arguments, tool)
+
+    async def _apply_middlewares_after(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: ToolResult,
+    ) -> ToolResult:
+        for mw in self.tool_middlewares:
+            await mw.after_tool(tool_name, arguments, result)
+        return result
+
     async def _execute_tool_calls(
         self,
         tool_calls: list[dict[str, Any]],
@@ -376,6 +412,7 @@ class AshLoop:
         for call in tool_calls:
             tool_name = call["name"]
             arguments = call["arguments"]
+            _log.debug(f"executing tool {tool_name!r} with args {arguments}")
             record = ToolCallRecord(
                 call_id=call["call_id"],
                 tool_name=tool_name,
@@ -415,7 +452,15 @@ class AshLoop:
                 continue
 
             try:
+                await self._apply_middlewares_before(tool_name, arguments, tool)
                 tool_result: ToolResult = await tool.run(**arguments)
+                tool_result = await self._apply_middlewares_after(
+                    tool_name, arguments, tool_result
+                )
+            except ToolMiddlewareSkip:
+                tool_result = ToolResult(
+                    success=True, output="skipped by middleware", error=None
+                )
             except Exception as exc:  # noqa: BLE001 — we want any error captured
                 record.executed = True
                 record.error = str(exc)
