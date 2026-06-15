@@ -63,6 +63,11 @@ class AshConfig(BaseSettings):
         description="Folder path housing local SQLite persistence files.",
     )
 
+    mcp_servers: dict[str, Any] = Field(
+        default_factory=dict,
+        description="MCP server configurations loaded from .mcp.json.",
+    )
+
     @classmethod
     def settings_customise_sources(
         cls,
@@ -87,3 +92,21 @@ class AshConfig(BaseSettings):
         """Load configuration with optional explicit field overrides."""
 
         return cls(**overrides)
+
+    def model_post_init(self, *args: Any, **kwargs: Any) -> None:
+        """Load MCP servers from .mcp.json if not already populated."""
+        if not self.mcp_servers:
+            from ash.mcp.server import MCPServerConfig, load_mcp_servers
+
+            mcp_path = self.workspace_root / ".mcp.json"
+            if mcp_path.exists():
+                raw = load_mcp_servers(mcp_path)
+                self.mcp_servers = {
+                    name: MCPServerConfig(
+                        name=cfg.name,
+                        command=cfg.command,
+                        args=cfg.args,
+                        env=cfg.env,
+                    )
+                    for name, cfg in raw.items()
+                }
