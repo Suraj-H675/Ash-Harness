@@ -438,3 +438,36 @@ async def test_max_concurrency_is_respected(shared_state):
     await orchestrator.run_batch("concurrency test", specs)
 
     assert max_concurrent_seen <= 3, f"Saw {max_concurrent_seen} concurrent, expected ≤3"
+
+
+# ---------------------------------------------------------------------------
+# H-9: Architect/Editor Dual-Model Mode
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_architect_mode_produces_sprint_contract(shared_state, tmp_path):
+    from ash.agents.orchestrator import fanout_for_goal
+    from ash.core.planner import Planner
+    from ash.providers.base import ProviderABC, StreamChunk
+
+    class DummyProvider(ProviderABC):
+        model_name = "test"
+
+        def count_tokens(self, text):
+            return 0
+
+        async def stream_chat(self, messages, temperature=0.0):
+            yield StreamChunk(content="## Goal\nTest\n\n## Definition of Done\n- done", is_done=True)
+
+    planner = Planner(DummyProvider())
+    specs = fanout_for_goal(
+        "add user login",
+        use_architect_mode=True,
+        planner=planner,
+        project_root=tmp_path,
+    )
+    assert len(specs) == 2
+    assert specs[0].mode == "architect"
+    assert specs[1].mode == "execute"
+    assert specs[0].runner is not None  # architect has a real runner
+    assert specs[1].runner is None      # execute uses default text runner
