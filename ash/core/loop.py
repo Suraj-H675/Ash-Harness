@@ -151,6 +151,7 @@ class AshLoop:
         enable_sprint_planning: bool = False,
         tool_middlewares: list[ToolMiddleware] | None = None,
         on_tool_approval: ToolApprovalCallback | None = None,
+        enable_memory_recall: bool = False,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -169,6 +170,7 @@ class AshLoop:
         self.enable_sprint_planning = enable_sprint_planning
         self.tool_middlewares: list[ToolMiddleware] = list(tool_middlewares or [])
         self.on_tool_approval = on_tool_approval
+        self.enable_memory_recall = enable_memory_recall
         self.current_session: Session | None = None
 
     # --- session lifecycle ------------------------------------------------
@@ -183,6 +185,18 @@ class AshLoop:
             except KeyError:
                 # Fall through to creating a fresh session.
                 pass
+
+        # New session: optionally recall recent context from prior sessions
+        if self.enable_memory_recall:
+            recent = self.session_store.get_recent_session_summaries(
+                str(self.project_root), limit=3
+            )
+            if recent:
+                memory_context = self._build_memory_context(recent)
+                self.system_prompt = (
+                    f"{self.system_prompt}\n\n## Recent Context\n{memory_context}"
+                )
+
         session = self.session_store.create_session(str(self.project_root))
         self.current_session = session
         return session
@@ -510,6 +524,13 @@ class AshLoop:
         return results
 
     # --- prompt assembly --------------------------------------------------
+
+    def _build_memory_context(self, recent_summaries: list[str]) -> str:
+        """Format N most recent session transcripts as a context string."""
+        lines = ["The following sessions are prior context for this project:"]
+        for i, summary in enumerate(recent_summaries, 1):
+            lines.append(f"\n--- Prior Session {i} ---\n{summary[:2000]}")
+        return "".join(lines)
 
     def _build_messages(self, session: Session) -> list[dict[str, Any]]:
         """Build the messages payload for the provider."""

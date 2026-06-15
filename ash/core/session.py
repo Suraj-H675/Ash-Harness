@@ -492,3 +492,25 @@ class SessionStore:
                 (session_id,),
             ).fetchall()
         return [r["sprint_id"] for r in rows]
+
+    def get_recent_session_summaries(
+        self,
+        project_path: str,
+        limit: int = 5,
+    ) -> list[str]:
+        """Return plain-text content of the N most recent sessions for a project."""
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            rows = conn.execute(
+                """
+                SELECT s.session_id,
+                       GROUP_CONCAT(m.content, '\n') as messages
+                FROM sessions s
+                JOIN messages m ON m.session_id = s.session_id
+                WHERE s.project_path = ?
+                GROUP BY s.session_id
+                ORDER BY s.created_at DESC
+                LIMIT ?
+                """,
+                (project_path, limit),
+            ).fetchall()
+        return [row["messages"] for row in rows]
