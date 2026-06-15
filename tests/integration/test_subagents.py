@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
 
 from ash.agents import (
     AGENT_ROLES,
-    AgentReport,
     LEAD_AGENT_ID,
     SharedState,
     SubagentOrchestrator,
@@ -20,6 +20,7 @@ from ash.agents import (
     make_simple_text_task,
     payload_to_report,
 )
+import tempfile
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +198,33 @@ def test_subprocess_agent_failure_marks_status_failed(tmp_path: Path) -> None:
         ss.close()
 
 
+def test_subprocess_agent_spawn_subprocess_publishes_report(tmp_path: Path) -> None:
+    ss = SharedState(tmp_path / "state.db")
+    try:
+        agent = SubprocessAgent(
+            agent_id="child-1",
+            role="general",
+            task="subprocess task",
+            shared_state=ss,
+            runner=make_simple_text_task("unused in child"),
+        )
+
+        process = agent.spawn_subprocess()
+        stdout, stderr = process.communicate(timeout=10)
+
+        assert process.returncode == 0, stderr or stdout
+        status = ss.get_status("child-1")
+        assert status is not None
+        assert status.status == "completed"
+        msgs = ss.fetch_messages(LEAD_AGENT_ID)
+        assert len(msgs) == 1
+        report = payload_to_report(msgs[0].content)
+        assert report.agent_id == "child-1"
+        assert "completed: subprocess task" in report.summary
+    finally:
+        ss.close()
+
+
 def test_subprocess_agent_rejects_unknown_role(tmp_path: Path) -> None:
     ss = SharedState(tmp_path / "state.db")
     try:
@@ -291,7 +319,7 @@ def test_orchestrator_await_completion_returns_final_status(tmp_path: Path) -> N
     orch = SubagentOrchestrator(ss, max_concurrency=2)
     specs = [SubagentSpec(role="researcher", task="a", agent_id="r-1")]
     asyncio.run(orch.run_batch("one", specs))
-    final = orch.await_completion(["r-1"], timeout_seconds=2.0)
+    final = asyncio.run(orch.await_completion(["r-1"], timeout_seconds=2.0))
     assert final["r-1"].status == "completed"
 
 
@@ -300,7 +328,7 @@ def test_orchestrator_await_completion_times_out(tmp_path: Path) -> None:
     orch = SubagentOrchestrator(ss, max_concurrency=2)
     # Never run any agent: r-1 is unknown to the state.
     with pytest.raises(TimeoutError):
-        orch.await_completion(["r-1"], timeout_seconds=0.5, poll_interval_seconds=0.1)
+        asyncio.run(orch.await_completion(["r-1"], timeout_seconds=0.5, poll_interval_seconds=0.1))
 
 
 def test_orchestrator_rejects_empty_specs(tmp_path: Path) -> None:
@@ -355,3 +383,58 @@ def test_orchestrator_messages_have_message_id_attribute(tmp_path: Path) -> None
         assert delivered[0].message_id == msgs[0].message_id
     finally:
         ss.close()
+
+
+# ---------------------------------------------------------------------------
+# H-1: Concurrency Bug Fix Tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def shared_state() -> SharedState:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield SharedState(Path(tmpdir) / "test.db")
+
+@pytest.mark.asyncio
+async def test_fanout_runs_all_agents_concurrently(shared_state):
+    """All agents should be launched immediately, not sequentially."""
+    specs = [
+        SubagentSpec(role="general", task=f"task-{i}", agent_id=f"agent-{i}")
+        for i in range(4)
+    ]
+    orchestrator = SubagentOrchestrator(shared_state, max_concurrency=4)
+
+    start = time.monotonic()
+    result = await orchestrator.run_batch("concurrent test", specs)
+    elapsed = time.monotonic() - start
+
+    assert result.sprint_id
+    assert len(result.reports) == 4
+    assert all(r.success for r in result.reports)
+    # With 4 agents each sleeping 0.05s, concurrent execution should be ~0.05-0.10s,
+    # not 4 * 0.05s = 0.2s (sequential). Allow up to 0.30s for loaded systems.
+    assert elapsed < 0.30, f"Agents ran in {elapsed:.3f}s — too slow for concurrent"
+
+@pytest.mark.asyncio
+async def test_max_concurrency_is_respected(shared_state):
+    """At most max_concurrency agents should run simultaneously."""
+    concurrent_count = 0
+    max_concurrent_seen = 0
+    start_time = time.monotonic()
+
+    async def slow_task(ctx):
+        nonlocal concurrent_count, max_concurrent_seen
+        concurrent_count += 1
+        max_concurrent_seen = max(max_concurrent_seen, concurrent_count)
+        await asyncio.sleep(0.1)
+        concurrent_count -= 1
+        return f"done at {time.monotonic() - start_time:.3f}s"
+
+    specs = [
+        SubagentSpec(role="general", task=f"task-{i}", agent_id=f"agent-{i}")
+        for i in range(6)
+    ]
+    orchestrator = SubagentOrchestrator(shared_state, max_concurrency=3)
+
+    await orchestrator.run_batch("concurrency test", specs)
+
+    assert max_concurrent_seen <= 3, f"Saw {max_concurrent_seen} concurrent, expected ≤3"

@@ -1,5 +1,38 @@
+# Environment and secrets
 .env
+.env.local
+.env.*.local
+
+# Local configuration (contains API keys)
+ash.toml
+
+# Virtual environment
 .venv/
-.pytest_cache/
+
+# Python cache
 __pycache__/
 *.py[cod]
+.pytest_cache/
+
+# Type checking and linting caches
+.mypy_cache/
+.ruff_cache/
+
+# Sandboxes (temporary isolation dirs)
+ash-sandbox-*/
+
+# Development/artifacts directories
+.agents/
+.codex/
+
+# Project documentation and plans (internal only)
+ARCHITECTURAL_SPECIFICATION.md
+ASH_MASTER_PLAN_V2.md
+CLAUDE.md
+CONTEXT_AND_MEMORY_SPECIFICATION.md
+GOAL_SPRINTS.md
+SYSTEM_PROMPTS_AND_TEMPLATES.md
+TOOL_SPECIFICATIONS.md
+
+# Template files
+.env.example
