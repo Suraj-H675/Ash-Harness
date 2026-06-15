@@ -153,10 +153,8 @@ class SubagentOrchestrator:
     async def _run_agents(self, specs: Sequence[SubagentSpec]) -> list[AgentReport]:
         semaphore = asyncio.Semaphore(self.max_concurrency)
         reports: list[AgentReport] = []
-        tasks: list[asyncio.Task[AgentReport]] = []
 
-        for spec in specs:
-            await semaphore.acquire()
+        async def _run_one(spec: SubagentSpec) -> AgentReport:
             agent = SubprocessAgent(
                 agent_id=spec.agent_id,
                 role=spec.role,
@@ -168,21 +166,18 @@ class SubagentOrchestrator:
                 return_budget=spec.return_budget,
                 metadata=spec.metadata,
             )
+            async with semaphore:
+                return await agent.run_in_process()
 
-            async def _run(agent: SubprocessAgent) -> AgentReport:
-                report = await agent.run_in_process()
-                semaphore.release()
-                return report
+        # Launch ALL tasks immediately — each one acquires the semaphore
+        # internally via `async with semaphore`. No serialized acquire in the loop.
+        tasks = [asyncio.create_task(_run_one(spec)) for spec in specs]
 
-            tasks.append(asyncio.create_task(_run(agent)))
-
-        # Poll-based collection: as each task finishes, drain its IPC
-        # report from the lead inbox so callers see results in order.
+        # Collect results as they complete (not in submission order).
         for finished in asyncio.as_completed(tasks):
             try:
                 report = await finished
             except Exception as exc:  # noqa: BLE001
-                # Asyncio task raised unexpectedly — synthesize a failure report.
                 report = AgentReport(
                     agent_id="<unknown>",
                     role="general",
@@ -191,7 +186,6 @@ class SubagentOrchestrator:
                     summary=f"orchestrator caught: {exc}",
                 )
             reports.append(report)
-            # Drain the lead inbox so the report's IPC message does not linger.
             self._drain_lead_inbox()
 
         return reports
@@ -215,7 +209,7 @@ class SubagentOrchestrator:
 
         return self.shared_state.list_agents()
 
-    def await_completion(
+    async def await_completion(
         self,
         agent_ids: Iterable[str],
         *,
@@ -254,7 +248,7 @@ class SubagentOrchestrator:
                 raise TimeoutError(
                     f"Agents did not finish within {timeout_seconds}s: {timed_out}"
                 )
-            time.sleep(interval)
+            await asyncio.sleep(interval)
 
     # --- IPC helpers ----------------------------------------------------
 
