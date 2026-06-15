@@ -471,3 +471,20 @@ async def test_architect_mode_produces_sprint_contract(shared_state, tmp_path):
     assert specs[1].mode == "execute"
     assert specs[0].runner is not None  # architect has a real runner
     assert specs[1].runner is None      # execute uses default text runner
+
+
+# ---------------------------------------------------------------------------
+# H-10: Subagent Result Consolidation Step
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_consolidate_reports_multiple_agents(shared_state):
+    orchestrator = SubagentOrchestrator(shared_state, max_concurrency=4)
+    specs = [
+        SubagentSpec(role="researcher", task="research X", agent_id=f"r-{i}")
+        for i in range(3)
+    ]
+    result = await orchestrator.run_batch("research task", specs)
+    assert result.consolidated_report is not None
+    assert result.consolidated_report.role == "consolidator"
+    assert len(result.consolidated_report.artifacts["reports"]) == 3
