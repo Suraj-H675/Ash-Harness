@@ -19,6 +19,7 @@ Tables (per ARCHITECTURAL_SPECIFICATION.md section 3.3):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import threading
@@ -87,6 +88,7 @@ class SharedState:
         )
         self._conn.row_factory = sqlite3.Row
         self._write_lock = threading.Lock()
+        self._async_lock = asyncio.Lock()
         self._init_db()
 
     # --- lifecycle -------------------------------------------------------
@@ -180,6 +182,26 @@ class SharedState:
                 (status, current_task, agent_id),
             )
 
+    async def update_status_async(
+        self,
+        agent_id: str,
+        status: AgentStatusValue,
+        current_task: str = "",
+    ) -> None:
+        """Async-safe version of update_status for use from asyncio tasks."""
+        if status not in {"idle", "working", "failed", "completed"}:
+            raise ValueError(f"Invalid status: {status!r}")
+        async with self._async_lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    UPDATE agent_status
+                    SET status = ?, current_task = ?, last_heartbeat = CURRENT_TIMESTAMP
+                    WHERE agent_id = ?
+                    """,
+                    (status, current_task, agent_id),
+                )
+
     def heartbeat(self, agent_id: str) -> None:
         """Touch the last_heartbeat timestamp for an agent."""
 
@@ -188,6 +210,28 @@ class SharedState:
                 "UPDATE agent_status SET last_heartbeat = CURRENT_TIMESTAMP WHERE agent_id = ?",
                 (agent_id,),
             )
+
+    async def register_agent_async(
+        self,
+        agent_id: str,
+        role: str = "general",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Async-safe version of register_agent for use from asyncio tasks."""
+        meta_json = json.dumps(metadata or {})
+        async with self._async_lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO agent_status (agent_id, role, status, current_task, metadata_json)
+                    VALUES (?, ?, 'idle', '', ?)
+                    ON CONFLICT(agent_id) DO UPDATE SET
+                        role = excluded.role,
+                        metadata_json = excluded.metadata_json,
+                        last_heartbeat = CURRENT_TIMESTAMP
+                    """,
+                    (agent_id, role, meta_json),
+                )
 
     def get_status(self, agent_id: str) -> AgentStatus | None:
         with closing(self._conn.cursor()) as cur:
@@ -255,6 +299,27 @@ class SharedState:
                 (sender_id, recipient_id, message_type, payload),
             )
             return int(cur.lastrowid) if cur.lastrowid is not None else 0
+
+    async def send_message_async(
+        self,
+        sender_id: str,
+        recipient_id: str,
+        message_type: str,
+        content: dict[str, Any],
+    ) -> int:
+        """Async-safe version of send_message for use from asyncio tasks."""
+        payload = json.dumps(content, ensure_ascii=False)
+        async with self._async_lock:
+            with self._conn:
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO ipc_messages
+                        (sender_id, recipient_id, message_type, content_json)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (sender_id, recipient_id, message_type, payload),
+                )
+                return int(cur.lastrowid) if cur.lastrowid is not None else 0
 
     def fetch_messages(
         self,
@@ -326,6 +391,20 @@ class SharedState:
             )
         return sprint_id
 
+    async def create_sprint_async(self, lead_agent_id: str, goal: str) -> str:
+        """Async-safe version of create_sprint for use from asyncio tasks."""
+        sprint_id = str(uuid.uuid4())
+        async with self._async_lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO sprints (sprint_id, lead_agent_id, sprint_goal, state)
+                    VALUES (?, ?, ?, 'planning')
+                    """,
+                    (sprint_id, lead_agent_id, goal),
+                )
+        return sprint_id
+
     def update_sprint_state(self, sprint_id: str, state: SprintStateValue) -> None:
         if state not in {"planning", "active", "complete", "aborted"}:
             raise ValueError(f"Invalid sprint state: {state!r}")
@@ -334,6 +413,19 @@ class SharedState:
                 "UPDATE sprints SET state = ? WHERE sprint_id = ?",
                 (state, sprint_id),
             )
+
+    async def update_sprint_state_async(
+        self, sprint_id: str, state: SprintStateValue
+    ) -> None:
+        """Async-safe version of update_sprint_state for use from asyncio tasks."""
+        if state not in {"planning", "active", "complete", "aborted"}:
+            raise ValueError(f"Invalid sprint state: {state!r}")
+        async with self._async_lock:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE sprints SET state = ? WHERE sprint_id = ?",
+                    (state, sprint_id),
+                )
 
     def get_sprint(self, sprint_id: str) -> SharedSprint | None:
         with closing(self._conn.cursor()) as cur:
