@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from uuid import uuid4
 
 from ash.core.recovery import CircuitBreaker
@@ -48,6 +48,12 @@ _log = get_logger(__name__)
 if TYPE_CHECKING:
     from ash.core.planner import Planner
     from ash.core.sprint import SprintExecution
+
+
+ToolApprovalCallback = Callable[
+    [str, dict[str, Any]],  # tool_name, arguments
+    Awaitable[bool],  # True = approve, False = deny
+]
 
 
 DEFAULT_MAX_TURN_ITERATIONS = 10
@@ -144,6 +150,7 @@ class AshLoop:
         planner: "Planner | None" = None,
         enable_sprint_planning: bool = False,
         tool_middlewares: list[ToolMiddleware] | None = None,
+        on_tool_approval: ToolApprovalCallback | None = None,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -161,6 +168,7 @@ class AshLoop:
         self.planner = planner
         self.enable_sprint_planning = enable_sprint_planning
         self.tool_middlewares: list[ToolMiddleware] = list(tool_middlewares or [])
+        self.on_tool_approval = on_tool_approval
         self.current_session: Session | None = None
 
     # --- session lifecycle ------------------------------------------------
@@ -422,7 +430,10 @@ class AshLoop:
                 timestamp=_utc_now(),
             )
 
-            approved = self.ui.request_tool_approval(tool_name, arguments)
+            if self.on_tool_approval is not None:
+                approved = await self.on_tool_approval(tool_name, arguments)
+            else:
+                approved = self.ui.request_tool_approval(tool_name, arguments)
             record.approved = approved
             if not approved:
                 record.executed = False
