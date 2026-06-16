@@ -482,3 +482,42 @@ def _tmp_db() -> Path:
     from pathlib import Path
 
     return Path(tempfile.mkdtemp(prefix="ash-provider-")) / "s.db"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI provider tests (M-11)
+# ---------------------------------------------------------------------------
+
+
+def test_openai_provider_initializes():
+    from ash.providers.openai import OpenAIProvider
+
+    provider = OpenAIProvider(model_name="gpt-4o", api_key="test-key")
+    assert provider.model_name == "gpt-4o"
+    assert provider.count_tokens("hello world") > 0
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_stream_chat_signature():
+    from ash.providers.openai import OpenAIProvider
+    from ash.providers.base import ProviderABC
+
+    provider = OpenAIProvider(model_name="gpt-4o", api_key="test-key")
+    assert isinstance(provider, ProviderABC)
+    # Verify abstract methods are implemented
+    assert hasattr(provider, "stream_chat")
+    assert hasattr(provider, "count_tokens")
+    assert hasattr(provider, "model_name")
+
+
+# ---------------------------------------------------------------------------
+# Ollama provider tests (M-12)
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_provider_initializes():
+    from ash.providers.ollama import OllamaProvider
+
+    provider = OllamaProvider(model_name="llama3", base_url="http://localhost:11434")
+    assert provider.model_name == "llama3"
+    assert provider.count_tokens("hello") > 0

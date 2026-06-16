@@ -157,6 +157,7 @@ class AshLoop:
         enable_memory_recall: bool = False,
         hooks: "HookRegistry | None" = None,
         turn_context: "TurnContext | None" = None,
+        memory_nudge_interval: int = 0,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -178,6 +179,8 @@ class AshLoop:
         self.enable_memory_recall = enable_memory_recall
         self.hooks = hooks
         self.turn_context = turn_context
+        self.memory_nudge_interval = memory_nudge_interval
+        self._turns_since_nudge = 0
         self.current_session: Session | None = None
 
     # --- session lifecycle ------------------------------------------------
@@ -323,6 +326,19 @@ class AshLoop:
                 )
                 self.session_store.save_message(session.session_id, tool_message)
                 session.messages.append(tool_message)
+
+            # Memory nudge check — injected periodically after tool results.
+            self._turns_since_nudge += 1
+            if (
+                self.memory_nudge_interval > 0
+                and self._turns_since_nudge >= self.memory_nudge_interval
+            ):
+                nudge = self._build_memory_nudge()
+                if nudge:
+                    session.messages.append(
+                        Message(role="system", content=nudge, timestamp=_utc_now())
+                    )
+                self._turns_since_nudge = 0
 
             # The assistant produced tool calls; loop and let the model
             # observe the results on the next completion.
@@ -559,6 +575,13 @@ class AshLoop:
         for i, summary in enumerate(recent_summaries, 1):
             lines.append(f"\n--- Prior Session {i} ---\n{summary[:2000]}")
         return "".join(lines)
+
+    def _build_memory_nudge(self) -> str:
+        if not self.current_session:
+            return ""
+        recent = self.current_session.messages[-10:]
+        summary = f"[Memory nudge — {len(recent)} messages in recent turns]"
+        return summary
 
     def _build_messages(self, session: Session) -> list[dict[str, Any]]:
         """Build the messages payload for the provider."""
