@@ -106,6 +106,7 @@ class SubprocessAgent:
         return_budget: int = 2000,
         metadata: dict[str, Any] | None = None,
         enforcement_guard: Callable[[str], bool] | None = None,
+        sandbox_tier: int = 1,
     ) -> None:
         if role not in AGENT_ROLES:
             raise ValueError(f"Unknown role {role!r}; expected one of {AGENT_ROLES}")
@@ -119,6 +120,7 @@ class SubprocessAgent:
         self.return_budget = return_budget
         self._metadata: dict[str, Any] = dict(metadata or {})
         self._enforcement_guard = enforcement_guard
+        self.sandbox_tier = sandbox_tier
 
     # --- metadata -------------------------------------------------------
 
