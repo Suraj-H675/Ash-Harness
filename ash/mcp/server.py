@@ -17,6 +17,17 @@ class MCPServerConfig:
     command: str
     args: list[str]
     env: dict[str, str]
+    transport: str = "stdio"  # "stdio" | "sse" | "http" | "websocket"
+    url: str = ""  # for SSE/HTTP/WebSocket
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "command", expand_env_vars(self.command))
+        object.__setattr__(self, "args", [expand_env_vars(str(a)) for a in self.args])
+        object.__setattr__(
+            self, "env", {k: expand_env_vars(v) for k, v in self.env.items()}
+        )
+        object.__setattr__(self, "transport", self.transport)
+        object.__setattr__(self, "url", expand_env_vars(self.url))
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> MCPServerConfig:
@@ -25,6 +36,8 @@ class MCPServerConfig:
             command=data["command"],
             args=data.get("args", []),
             env=data.get("env", {}),
+            transport=data.get("transport", "stdio"),
+            url=data.get("url", ""),
         )
 
 
