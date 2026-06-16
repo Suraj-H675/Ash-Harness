@@ -331,7 +331,7 @@ class SubagentOrchestrator:
             "coder": ("read_file", "write_file", "replace_file_content"),
             "tester": ("read_file", "run_command", "search_code"),
             "reviewer": ("read_file", "search_code"),
-            "general": (),
+            "general": ("spawn_agent",),
         }.get(role, ())
 
 

@@ -47,6 +47,8 @@ def _build_provider(config: AshConfig) -> ProviderABC:
 
 
 def _build_tools(safety_guard: SafetyGuard) -> dict[str, Any]:
+    from ash.tools.agent import SpawnAgentTool
+
     return {
         ReadFileTool(safety_guard).name: ReadFileTool(safety_guard),
         WriteFileTool(safety_guard).name: WriteFileTool(safety_guard),
@@ -54,6 +56,7 @@ def _build_tools(safety_guard: SafetyGuard) -> dict[str, Any]:
         WholeEditTool(safety_guard).name: WholeEditTool(safety_guard),
         RunCommandTool(safety_guard).name: RunCommandTool(safety_guard),
         AutoCommitTool(safety_guard).name: AutoCommitTool(safety_guard),
+        SpawnAgentTool(safety_guard, None).name: SpawnAgentTool(safety_guard, None),
     }
 
 
