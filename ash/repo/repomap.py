@@ -213,39 +213,25 @@ class RepoMap:
                 return True
         return False
 
-    def render(
-        self,
-        ranked: list[tuple[Path, float]],
-        *,
-        top_files: int = 5,
-        symbols_per_file: int = 8,
-    ) -> str:
-        """Render a Markdown summary of the top files and their symbols."""
+    def to_dot_graph(self, ranked: list[Path]) -> str:
+        """Render the dependency graph as a Graphviz DOT string.
 
-        lines: list[str] = ["## Repository Map"]
-        for path, score in ranked[:top_files]:
-            node = self._node_for_path(path)
-            if node is None:
+        Users can pipe the result to ``dot -Tpng`` to visualize the graph.
+        """
+        lines = ["digraph repo {", "  rankdir=LR;"]
+        for src_path in ranked:
+            src_idx = self._index.get(src_path.resolve())
+            if src_idx is None:
                 continue
-            lines.append(
-                f"\n### {path.relative_to(self.project_root)} (ppr={score:.3f})"
-            )
-            top_symbols = node.symbols[:symbols_per_file]
-            if not top_symbols:
-                lines.append("  (no symbols extracted)")
+            src_label = str(src_path.relative_to(self.project_root))
+            if self._adjacency is None:
                 continue
-            for symbol in top_symbols:
-                prefix = (
-                    f"  {symbol.parent}.{symbol.name}"
-                    if symbol.parent
-                    else f"  {symbol.name}"
-                )
-                if symbol.kind == "import" or symbol.kind == "import_from":
-                    lines.append(f"  {prefix}  # import L{symbol.start_line}")
-                else:
-                    lines.append(
-                        f"  {prefix}  # {symbol.kind} L{symbol.start_line}-{symbol.end_line}"
-                    )
+            for dep_idx in range(self._adjacency.shape[0]):
+                if self._adjacency[src_idx, dep_idx] > 0:
+                    dep_path = self._files[dep_idx].path
+                    dep_label = str(dep_path.relative_to(self.project_root))
+                    lines.append(f'  "{src_label}" -> "{dep_label}";')
+        lines.append("}")
         return "\n".join(lines)
 
     # --- internal -------------------------------------------------------

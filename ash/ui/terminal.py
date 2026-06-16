@@ -17,7 +17,9 @@ from typing import Any, Callable, TextIO
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
+from rich.progress import BarColumn, Progress, TextColumn
 from rich.text import Text
+from rich.group import Group
 
 
 ApprovalCallback = Callable[[str, dict[str, Any]], bool]
@@ -59,6 +61,7 @@ class TerminalUI:
         approval_callback: ApprovalCallback | None = None,
         console: Console | None = None,
         input_stream: TextIO | None = None,
+        show_token_meter: bool = False,
     ) -> None:
         if safety_tier not in {"interactive", "auto_approve", "dry_run"}:
             raise ValueError(f"Unknown safety tier: {safety_tier!r}")
@@ -68,19 +71,58 @@ class TerminalUI:
         self._input_stream = input_stream or sys.stdin
         self._active_buffers: _LiveBuffers | None = None
         self._active_live: Live | None = None
+        self.show_token_meter = show_token_meter
+        self._token_progress = (
+            Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total}"),
+            )
+            if show_token_meter
+            else None
+        )
+        self._token_task = None
 
     # --- streaming surface ------------------------------------------------
+
+    def _render_token_meter(self, current_tokens: int, max_tokens: int) -> str:
+        """Render a single-line ASCII token meter.
+
+        Example output when current=3000, max=100000:
+        [Token ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 3000/100000 (3.0%)]
+        """
+        bar_width = 30
+        pct = min(current_tokens / max_tokens, 1.0) if max_tokens > 0 else 0.0
+        filled = int(bar_width * pct)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        label = f"[Token {bar} {current_tokens}/{max_tokens} ({pct * 100:.1f}%)]"
+        return label
 
     def begin_turn(self) -> Live:
         """Return a :class:`rich.live.Live` context the loop can update."""
 
         buffers: _LiveBuffers = _LiveBuffers.fresh()
         self._active_buffers = buffers
+        if self._token_progress is not None:
+            self._token_task = self._token_progress.add_task(
+                "[dim]Tokens", total=100000, completed=0
+            )
+        else:
+            self._token_task = None
 
         def _render() -> Panel:
             assert self._active_buffers is not None
+            content = self._active_buffers.response
+            if self.show_token_meter and self._token_task is not None:
+                token_text = Text(
+                    self._render_token_meter(
+                        self._token_task.completed, self._token_task.total
+                    ),
+                    style="dim",
+                )
+                content = Group(content, "\n", token_text)
             return Panel(
-                self._active_buffers.response,
+                content,
                 title="ash",
                 border_style="cyan",
                 padding=(0, 1),
@@ -126,6 +168,17 @@ class TerminalUI:
             live.refresh()
         self._active_buffers = None
         self._active_live = None
+        if self._token_progress is not None:
+            self._token_progress.stop()
+        self._token_task = None
+
+    def update_token_count(self, current: int, maximum: int | None = None) -> None:
+        """Update the token progress bar with current / maximum counts."""
+        if self._token_task is None or self._token_progress is None:
+            return
+        self._token_task.completed = current
+        if maximum is not None:
+            self._token_task.total = maximum
 
     def _refresh_live(self) -> None:
         live = getattr(self, "_active_live", None)

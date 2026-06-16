@@ -52,6 +52,7 @@ class SubagentSpec:
     metadata: dict[str, Any] = field(default_factory=dict)
     mode: str = "execute"  # "architect" | "execute" | "general"
     sandbox_tier: int = SANDBOX_TIER_SCOPED  # default: scoped (Tier 1)
+    workspace_root: Path | None = None  # None = use project default
 
     def __post_init__(self) -> None:
         if self.role not in AGENT_ROLES:
@@ -60,6 +61,22 @@ class SubagentSpec:
             )
         if not self.agent_id:
             self.agent_id = f"{self.role}-{uuid.uuid4().hex[:8]}"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SubagentSpec:
+        ws_root = data.get("workspace_root")
+        return cls(
+            role=data["role"],
+            task=data["task"],
+            agent_id=data.get("agent_id", ""),
+            tool_allowlist=tuple(data.get("tool_allowlist", [])),
+            token_budget=data.get("token_budget", 4000),
+            return_budget=data.get("return_budget", 2000),
+            metadata=data.get("metadata", {}),
+            mode=data.get("mode", "execute"),
+            sandbox_tier=data.get("sandbox_tier", 1),
+            workspace_root=Path(ws_root) if ws_root else None,
+        )
 
 
 @dataclass
@@ -156,6 +173,14 @@ class SubagentOrchestrator:
             elapsed_seconds=elapsed,
         )
 
+    async def run_batch_from_config(
+        self,
+        goal: str,
+        config: list[dict[str, Any]],
+    ) -> OrchestratorResult:
+        specs = [SubagentSpec.from_dict(d) for d in config]
+        return await self.run_batch(goal, specs)
+
     # --- internals ------------------------------------------------------
 
     async def _run_agents(self, specs: Sequence[SubagentSpec]) -> list[AgentReport]:
@@ -177,6 +202,7 @@ class SubagentOrchestrator:
                     tool_name in (spec.tool_allowlist or set())
                 ),
                 sandbox_tier=spec.sandbox_tier,
+                workspace_root=spec.workspace_root,
             )
             async with semaphore:
                 return await agent.run_in_process()
