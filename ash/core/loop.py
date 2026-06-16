@@ -163,6 +163,7 @@ class AshLoop:
         skill_nudge_interval: int = 0,
         continuous_mode: bool = False,
         max_continuous_turns: int = 10,
+        safety_tier: str = "interactive",
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -192,6 +193,7 @@ class AshLoop:
         self.continuous_mode = continuous_mode
         self.max_continuous_turns = max_continuous_turns
         self._continuous_turns = 0
+        self.safety_tier = safety_tier
         self.current_session: Session | None = None
 
     # --- session lifecycle ------------------------------------------------
@@ -499,6 +501,8 @@ class AshLoop:
 
             if self.on_tool_approval is not None:
                 approved = await self.on_tool_approval(tool_name, arguments)
+            elif self.safety_tier == "auto_approve":
+                approved = True
             else:
                 approved = self.ui.request_tool_approval(tool_name, arguments)
             record.approved = approved
