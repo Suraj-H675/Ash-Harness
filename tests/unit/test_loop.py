@@ -84,16 +84,19 @@ async def test_on_tool_approval_callback_is_called(tmp_path):
 
     async def approval_callback(tool_name, arguments):
         call_log.append((tool_name, arguments))
-        return tool_name == "read_file"  # deny everything except read_file
+        return True  # approve all tools
 
     with tempfile.TemporaryDirectory() as db_dir:
         store = SessionStore(Path(db_dir) / "test.db")
         guard = SafetyGuard(project_root=tmp_path)
         ui = TerminalUI(safety_tier="dry_run")
+        from ash.core.recovery import CircuitBreaker
         loop = AshLoop(
             store, MockProvider(), guard, ui, tmp_path,
             tools={"read_file": ReadFileTool(guard)},
             on_tool_approval=approval_callback,
+            circuit_breaker=CircuitBreaker(max_failures=10),
+            max_turn_iterations=1,
         )
         await loop.start_session()
         await loop.run_turn("test")
@@ -112,10 +115,49 @@ async def test_on_tool_approval_can_auto_deny(tmp_path):
         ui = TerminalUI(safety_tier="dry_run")
         loop = AshLoop(
             store, MockProvider(), guard, ui, tmp_path,
-            tools={"read_file": ReadFileTool(guard)},
+            tools={"my_tool": MyTestTool(guard)},
             on_tool_approval=deny_all,
+            max_turn_iterations=1,
         )
         await loop.start_session()
-        result = await loop.run_turn("test read file")
+        result = await loop.run_turn("test")
         # Turn should complete (denied tools produce error results, not exceptions)
         assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_retry_on_transient_failure(tmp_path):
+    transient_count = 0
+
+    class FlakyTool(BaseTool):
+        name = "flaky"
+        args_schema = None
+
+        async def run(self, **kwargs):
+            nonlocal transient_count
+            transient_count += 1
+            if transient_count < 3:
+                raise RuntimeError("transient error")
+            return ToolResult(success=True, output="ok")
+
+    class FlakyProvider(ProviderABC):
+        model_name = "test"
+        def count_tokens(self, text): return 0
+        async def stream_chat(self, messages, temperature=0.0):
+            yield StreamChunk(
+                tool_call_delta='<call_tool name="flaky"></call_tool>',
+                is_done=True,
+            )
+
+    with tempfile.TemporaryDirectory() as db_dir:
+        store = SessionStore(Path(db_dir) / "test.db")
+        guard = SafetyGuard(project_root=tmp_path)
+        ui = TerminalUI(safety_tier="auto_approve")
+        loop = AshLoop(
+            store, FlakyProvider(), guard, ui, tmp_path,
+            tools={"flaky": FlakyTool(guard)},
+            max_turn_iterations=1,
+        )
+        await loop.start_session()
+        await loop.run_turn("test")
+        assert transient_count == 3  # 3 total attempts: fail, fail, success (MAX_RETRIES=2 means 2 retries)

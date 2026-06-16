@@ -17,6 +17,7 @@ emits new tool calls. A :class:`CircuitBreaker` halts the loop after
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -497,7 +498,14 @@ class AshLoop:
 
             try:
                 await self._apply_middlewares_before(tool_name, arguments, tool)
-                tool_result: ToolResult = await tool.run(**arguments)
+                result_dict = await _execute_with_retry(tool, tool_name, arguments)
+                tool_result = ToolResult(
+                    success=result_dict["success"],
+                    output=result_dict["output"],
+                    error=result_dict["error"],
+                    truncated=result_dict.get("truncated", False),
+                    token_count=result_dict.get("token_count", 0),
+                )
                 if self.hooks is not None:
                     await self.hooks.fire_post_tool(tool_name, arguments, tool_result)
                 tool_result = await self._apply_middlewares_after(
@@ -574,3 +582,36 @@ class AshLoop:
         for message in session.messages:
             messages.append({"role": message.role, "content": message.content})
         return messages
+
+
+MAX_RETRIES = 2
+BASE_DELAY_SECONDS = 1.0
+
+
+async def _execute_with_retry(
+    tool: "BaseTool",
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    last_error: str | None = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            tool_result: "ToolResult" = await tool.run(**arguments)
+            return {
+                "success": tool_result.success,
+                "output": tool_result.output,
+                "error": tool_result.error,
+                "truncated": tool_result.truncated,
+                "token_count": tool_result.token_count,
+            }
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < MAX_RETRIES:
+                delay = BASE_DELAY_SECONDS * (2**attempt)
+                await asyncio.sleep(delay)
+            continue
+    return {
+        "success": False,
+        "output": "",
+        "error": f"Failed after {MAX_RETRIES + 1} attempts: {last_error}",
+    }

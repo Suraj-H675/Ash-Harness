@@ -353,6 +353,16 @@ class SharedState:
             )
             return int(cur.rowcount)
 
+    def send_to_agent(
+        self,
+        sender_id: str,
+        recipient_id: str,
+        message_type: str,
+        content: Any,
+    ) -> int:
+        """Send a message directly from one agent to another."""
+        return self.send_message(sender_id, recipient_id, message_type, {"content": content})
+
     def broadcast(
         self,
         sender_id: str,

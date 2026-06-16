@@ -48,3 +48,25 @@ async def test_concurrent_send_and_fetch(state):
 
     messages = state.fetch_messages("lead", undelivered_only=False)
     assert len(messages) == 10
+
+
+def test_agent_to_agent_messages(state):
+    state.register_agent("agent-a", role="general")
+    state.register_agent("agent-b", role="general")
+
+    state.send_to_agent("agent-a", "agent-b", "test", "hello from a")
+    messages = state.fetch_messages("agent-b", undelivered_only=False)
+    assert len(messages) == 1
+    assert messages[0].content == {"content": "hello from a"}
+
+
+def test_broadcast(state):
+    state.register_agent("agent-a", role="general")
+    state.register_agent("agent-b", role="general")
+    state.register_agent("agent-c", role="general")
+
+    state.broadcast("agent-a", "ping", "checkin")
+    for agent_id in ["agent-b", "agent-c"]:
+        msgs = state.fetch_messages(agent_id, undelivered_only=False)
+        assert len(msgs) == 1
+        assert msgs[0].content == "checkin"

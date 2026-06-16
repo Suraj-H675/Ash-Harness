@@ -32,6 +32,7 @@ from ash.agents.subprocess_agent import (
     payload_to_report,
 )
 from ash.core.planner import Planner
+from ash.sandbox._base import SANDBOX_TIER_SCOPED, SANDBOX_TIER_SANDBOX_EXEC
 
 
 LEAD_AGENT_ID = "lead"
@@ -50,6 +51,7 @@ class SubagentSpec:
     return_budget: int = 2000
     metadata: dict[str, Any] = field(default_factory=dict)
     mode: str = "execute"  # "architect" | "execute" | "general"
+    sandbox_tier: int = SANDBOX_TIER_SCOPED  # default: scoped (Tier 1)
 
     def __post_init__(self) -> None:
         if self.role not in AGENT_ROLES:
@@ -174,6 +176,7 @@ class SubagentOrchestrator:
                 enforcement_guard=lambda tool_name: (
                     tool_name in (spec.tool_allowlist or set())
                 ),
+                sandbox_tier=spec.sandbox_tier,
             )
             async with semaphore:
                 return await agent.run_in_process()
@@ -351,6 +354,12 @@ def fanout_for_goal(
             ("tester", f"Test: {goal}", f"tested: {goal}"),
             ("reviewer", f"Review: {goal}", f"reviewed: {goal}"),
         )
+    ROLE_SANDBOX_TIER: dict[str, int] = {
+        "researcher": SANDBOX_TIER_SCOPED,  # needs network access (Tier 1)
+        "coder": SANDBOX_TIER_SANDBOX_EXEC,  # needs bubblewrap isolation (Tier 2)
+        "tester": SANDBOX_TIER_SCOPED,  # runs tests, network OK (Tier 1)
+        "reviewer": SANDBOX_TIER_SCOPED,  # read-only (Tier 1)
+    }
     specs: list[SubagentSpec] = []
     for role, task, mode in phases:
         if mode == "architect":
@@ -368,6 +377,7 @@ def fanout_for_goal(
                 runner=runner,
                 mode=mode or "execute",
                 tool_allowlist=SubagentOrchestrator.default_role_allowlist(role),
+                sandbox_tier=ROLE_SANDBOX_TIER.get(role, SANDBOX_TIER_SCOPED),
             )
         )
     return specs
