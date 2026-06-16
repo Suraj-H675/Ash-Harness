@@ -107,6 +107,7 @@ class SubprocessAgent:
         metadata: dict[str, Any] | None = None,
         enforcement_guard: Callable[[str], bool] | None = None,
         sandbox_tier: int = 1,
+        workspace_root: Path | None = None,
     ) -> None:
         if role not in AGENT_ROLES:
             raise ValueError(f"Unknown role {role!r}; expected one of {AGENT_ROLES}")
@@ -121,6 +122,7 @@ class SubprocessAgent:
         self._metadata: dict[str, Any] = dict(metadata or {})
         self._enforcement_guard = enforcement_guard
         self.sandbox_tier = sandbox_tier
+        self.workspace_root = workspace_root
 
     # --- metadata -------------------------------------------------------
 
@@ -246,6 +248,8 @@ class SubprocessAgent:
             if existing_pythonpath
             else project_root
         )
+        if self.workspace_root is not None:
+            env["ASH_WORKSPACE_ROOT"] = str(self.workspace_root)
         return subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,

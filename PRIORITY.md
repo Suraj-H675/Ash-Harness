@@ -2944,10 +2944,23 @@ Add a `to_dot_graph()` method to `RepoMap`:
 
 ```python
 def to_dot_graph(self, ranked: list[Path]) -> str:
+    """Render the dependency graph as a Graphviz DOT string.
+
+    Users can pipe the result to ``dot -Tpng`` to visualize the graph.
+    """
     lines = ["digraph repo {", "  rankdir=LR;"]
-    for src, deps in self._adjacency.items():
-        for dep in deps:
-            lines.append(f'  "{src}" -> "{dep}";')
+    for src_path in ranked:
+        src_idx = self._index.get(src_path.resolve())
+        if src_idx is None:
+            continue
+        src_label = str(src_path.relative_to(self.project_root))
+        if self._adjacency is None:
+            continue
+        for dep_idx in range(self._adjacency.shape[0]):
+            if self._adjacency[src_idx, dep_idx] > 0:
+                dep_path = self._files[dep_idx].path
+                dep_label = str(dep_path.relative_to(self.project_root))
+                lines.append(f'  "{src_label}" -> "{dep_label}";')
     lines.append("}")
     return "\n".join(lines)
 ```
