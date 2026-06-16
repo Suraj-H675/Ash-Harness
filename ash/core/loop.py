@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from uuid import uuid4
 
-from ash.core.recovery import CircuitBreaker
+from ash.core.recovery import CircuitBreaker, CircuitBreakerError
 from ash.core.session import (
     Message,
     Session,
@@ -298,10 +298,9 @@ class AshLoop:
             # Execute tool calls (sequential within a turn for V1; the spec
             # mentions asyncio.gather for parallel independent tools but V1
             # is single-shot to keep the harness simple).
-            results = await self._execute_tool_calls(tool_calls, session)
-
-            # If the breaker tripped, surface a final message and stop.
-            if self.circuit_breaker.is_tripped:
+            try:
+                results = await self._execute_tool_calls(tool_calls, session)
+            except CircuitBreakerError:
                 _log.warning("circuit breaker tripped — halting turn")
                 final_text = (
                     f"{assistant_text}\n\n"
