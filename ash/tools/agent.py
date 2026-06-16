@@ -20,18 +20,14 @@ class SpawnAgentArgs(BaseModel):
 class SpawnAgentTool(BaseTool):
     name = "spawn_agent"
     description = "Spawn a new subagent to handle a subtask."
-    args_schema = type(
-        "SpawnAgentArgs",
-        (BaseModel,),
-        {"role": (str, ...), "task": (str, ...), "agent_id": (str | None, None)},
-    )
+    args_schema: type[BaseModel] = SpawnAgentArgs
 
     def __init__(self, safety_guard: SafetyGuard, shared_state: "SharedState") -> None:
         super().__init__(safety_guard)
         self._shared_state = shared_state
 
     async def run(self, **kwargs: Any) -> ToolResult:
-        args = SpawnAgentArgs(**kwargs)
+        args = self.args_schema(**kwargs)
         agent = SubprocessAgent(
             agent_id=args.agent_id or f"spawned-{uuid.uuid4().hex[:8]}",
             role=args.role,

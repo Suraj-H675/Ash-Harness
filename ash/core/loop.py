@@ -32,6 +32,7 @@ from ash.core.session import (
     ToolCallRecord,
 )
 from ash.logging import get_logger
+from ash.mcp.server import MCPServerManager, load_mcp_servers
 from ash.providers.base import ProviderABC, TokenCounterLike
 from ash.repo.repomap import RepoMap
 from ash.safety.guard import SafetyGuard
@@ -45,6 +46,12 @@ if TYPE_CHECKING:
     from ash.core.planner import Planner
     from ash.core.sprint import SprintExecution
     from ash.hooks import HookRegistry
+    from ash.memory.vector import (
+        Chunk,
+        EmbeddingAdapter,
+        VectorHit,
+        VectorSearchPipeline,
+    )
     from ash.tools.registry import ToolRegistry
 
 _log = get_logger(__name__)
@@ -164,6 +171,13 @@ class AshLoop:
         continuous_mode: bool = False,
         max_continuous_turns: int = 10,
         safety_tier: str = "interactive",
+        enable_semantic_memory: bool = False,
+        memory_backend: str = "auto",
+        embedding_provider: str = "auto",
+        openai_api_key: str = "",
+        onnx_model_path: Path | None = None,
+        chroma_persist_dir: Path | None = None,
+        mcp_config_path: Path | None = None,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -194,7 +208,38 @@ class AshLoop:
         self.max_continuous_turns = max_continuous_turns
         self._continuous_turns = 0
         self.safety_tier = safety_tier
+        self.enable_semantic_memory = enable_semantic_memory
+        self._vector_pipeline: "VectorSearchPipeline | None" = None
+        self._pending_memory_context: str = ""
+        if enable_semantic_memory:
+            self._init_vector_pipeline(
+                memory_backend=memory_backend,
+                embedding_provider=embedding_provider,
+                openai_api_key=openai_api_key,
+                onnx_model_path=onnx_model_path,
+                chroma_persist_dir=chroma_persist_dir,
+            )
         self.current_session: Session | None = None
+        self._mcp_manager: MCPServerManager | None = None
+        if mcp_config_path is not None and mcp_config_path.exists():
+            self._mcp_manager = MCPServerManager()
+            servers = load_mcp_servers(mcp_config_path)
+            for name, config in servers.items():
+                try:
+                    self._mcp_manager.start_server(config)
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("Failed to start MCP server %s: %s", name, exc)
+
+    def __del__(self) -> None:
+        if self._mcp_manager is not None:
+            self._mcp_manager.stop_all()
+
+    async def __aenter__(self) -> "AshLoop":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        if self._mcp_manager is not None:
+            self._mcp_manager.stop_all()
 
     # --- session lifecycle ------------------------------------------------
 
@@ -295,6 +340,14 @@ class AshLoop:
         # 2. Stream/execute loop bounded by max_turn_iterations.
         final_text = ""
         for _ in range(self.max_turn_iterations):
+            # Optionally search semantic memory and inject relevant context.
+            self._pending_memory_context = ""
+            if self.enable_semantic_memory and self._vector_pipeline is not None:
+                hits = await self.semantic_search(user_input, top_k=3)
+                if hits:
+                    self._pending_memory_context = "\n\n".join(
+                        f"// From {hit.file_path}:\n{hit.content[:500]}" for hit in hits
+                    )
             messages = self._build_messages(session)
             assistant_text, tool_calls = await self._stream_one_completion(messages)
 
@@ -633,6 +686,78 @@ class AshLoop:
         suggestions = [f"- {s.name}: {s.description}" for s in skill_index[:3]]
         return "[Skill nudge] Consider using:\n" + "\n".join(suggestions)
 
+    # --- semantic memory -----------------------------------------------------
+
+    def _init_vector_pipeline(
+        self,
+        memory_backend: str,
+        embedding_provider: str,
+        openai_api_key: str,
+        onnx_model_path: Path | None,
+        chroma_persist_dir: Path | None,
+    ) -> None:
+        """Initialize the vector search pipeline based on config."""
+        from ash.memory import (
+            VectorSearchPipeline,
+            InMemoryVectorIndex,
+            DeterministicEmbedding,
+        )
+
+        adapter: "EmbeddingAdapter"
+        if embedding_provider == "onnx":
+            from ash.memory import ONNXLocalEmbedding
+
+            adapter = ONNXLocalEmbedding(
+                model_path=onnx_model_path or Path(".ash/model.onnx")
+            )
+        elif embedding_provider == "openai":
+            from ash.memory import OpenAIEmbedding
+
+            adapter = OpenAIEmbedding(api_key=openai_api_key)
+        else:
+            adapter = DeterministicEmbedding()
+
+        vector_index = InMemoryVectorIndex()
+        self._vector_pipeline = VectorSearchPipeline(
+            adapter=adapter,
+            vector_index=vector_index,
+        )
+
+    async def index_file_for_memory(self, file_path: Path) -> None:
+        """Index a file into the semantic memory pipeline."""
+        if self._vector_pipeline is None:
+            return
+
+        chunks = self._chunk_file(file_path)
+        await self._vector_pipeline.index_chunks(chunks, str(file_path))
+
+    async def semantic_search(self, query: str, top_k: int = 5) -> list["VectorHit"]:
+        """Search semantic memory for relevant context."""
+        if self._vector_pipeline is None:
+            return []
+        hits, _ = await self._vector_pipeline.search(query, top_k=top_k)
+        return hits
+
+    def _chunk_file(self, file_path: Path) -> list["Chunk"]:
+        """Split a file into memory-indexable chunks."""
+
+        content = file_path.read_text(errors="replace")
+        lines = content.splitlines()
+        chunks: list[Chunk] = []
+        for i in range(0, len(lines), 50):
+            chunk_lines = lines[i : i + 50]
+            chunks.append(
+                Chunk(
+                    file_path=str(file_path),
+                    start=i + 1,
+                    end=i + len(chunk_lines),
+                    content="\n".join(chunk_lines),
+                )
+            )
+        return chunks
+
+    # --- message building ---------------------------------------------------
+
     def _build_messages(self, session: Session) -> list[dict[str, Any]]:
         """Build the messages payload for the provider."""
 
@@ -649,6 +774,9 @@ class AshLoop:
             except Exception as exc:  # noqa: BLE001 — repo map is best-effort
                 repo_section = f"(repo map unavailable: {exc})"
             system_content = f"{system_content}\n\n{repo_section}"
+
+        if self._pending_memory_context:
+            system_content = f"{system_content}\n\n## Relevant Context\n{self._pending_memory_context}"
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_content}]
         for message in session.messages:
