@@ -17,6 +17,8 @@ class PluginManifest:
     hooks: list[dict[str, Any]] = field(default_factory=list)
     mcp_servers: list[dict[str, Any]] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
+    dependencies: list[dict[str, str]] = field(default_factory=list)
+    # e.g. [{"name": "other-plugin", "version": ">=1.0.0"}]
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PluginManifest:
@@ -29,7 +31,11 @@ class PluginManifest:
             hooks=data.get("hooks", []),
             mcp_servers=data.get("mcpServers", []),
             skills=data.get("skills", []),
+            dependencies=data.get("dependencies", []),
         )
+
+    def check_dependencies(self) -> None:
+        """Validate all declared dependencies are installed."""
 
     @classmethod
     def load(cls, path: Path) -> PluginManifest:

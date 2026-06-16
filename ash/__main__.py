@@ -20,7 +20,12 @@ from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC
 from ash.safety.guard import SafetyGuard
 from ash.tools.command import RunCommandTool
-from ash.tools.filesystem import ReadFileTool, ReplaceFileContentTool, WholeEditTool, WriteFileTool
+from ash.tools.filesystem import (
+    ReadFileTool,
+    ReplaceFileContentTool,
+    WholeEditTool,
+    WriteFileTool,
+)
 from ash.tools.git import AutoCommitTool
 from ash.ui.terminal import TerminalUI
 
@@ -28,12 +33,15 @@ from ash.ui.terminal import TerminalUI
 def _build_provider(config: AshConfig) -> ProviderABC:
     if config.provider == "openai":
         from ash.providers.openai import OpenAIProvider
+
         return OpenAIProvider(model_name=config.model_name, api_key=config.api_key)
     elif config.provider == "anthropic":
         from ash.providers.anthropic import AnthropicProvider
+
         return AnthropicProvider(model_name=config.model_name, api_key=config.api_key)
     elif config.provider == "ollama":
         from ash.providers.ollama import OllamaProvider
+
         return OllamaProvider(model_name=config.model_name)
     raise ValueError(f"Unsupported provider: {config.provider!r}")
 
@@ -71,6 +79,10 @@ async def _repl(loop: AshLoop) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ash", description="Ash coding harness REPL")
+    subparsers = parser.add_subparsers(dest="command")
+    mcp_subparser = subparsers.add_parser("mcp")
+    mcp_subparser.add_argument("action", choices=["add", "list", "remove"])
+    mcp_subparser.add_argument("server_name", nargs="?")
     parser.add_argument(
         "--db-directory",
         type=Path,
@@ -83,6 +95,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Restore an existing session by id instead of creating a new one.",
     )
     args = parser.parse_args(argv)
+
+    if args.command == "mcp":
+        from ash.mcp.server import load_mcp_servers
+
+        servers = load_mcp_servers()
+        if args.action == "list":
+            for name, cfg in servers.items():
+                print(f"{name}: {cfg.command} {' '.join(cfg.args)}")
+            return 0
+        print(f"mcp {args.action}: {args.server_name or '(no server specified)'}")
+        return 0
 
     config = AshConfig.load()
     if args.db_directory is not None:
