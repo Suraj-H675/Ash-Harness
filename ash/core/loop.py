@@ -161,6 +161,8 @@ class AshLoop:
         memory_nudge_interval: int = 0,
         tools_registry: "ToolRegistry | None" = None,
         skill_nudge_interval: int = 0,
+        continuous_mode: bool = False,
+        max_continuous_turns: int = 10,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -187,6 +189,9 @@ class AshLoop:
         self.tools_registry = tools_registry
         self.skill_nudge_interval = skill_nudge_interval
         self._iterations_since_skill_use = 0
+        self.continuous_mode = continuous_mode
+        self.max_continuous_turns = max_continuous_turns
+        self._continuous_turns = 0
         self.current_session: Session | None = None
 
     # --- session lifecycle ------------------------------------------------
@@ -302,6 +307,13 @@ class AshLoop:
 
             if not tool_calls:
                 final_text = assistant_text
+                if (
+                    self.continuous_mode
+                    and self._continuous_turns < self.max_continuous_turns
+                ):
+                    self._continuous_turns += 1
+                    follow_up = "Continue the previous task. What is the next step?"
+                    return await self.run_turn(follow_up)
                 break
 
             # Execute tool calls (sequential within a turn for V1; the spec
