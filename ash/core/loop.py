@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from ash.core.planner import Planner
     from ash.core.sprint import SprintExecution
     from ash.hooks import HookRegistry
+    from ash.tools.registry import ToolRegistry
 
 _log = get_logger(__name__)
 
@@ -158,6 +159,8 @@ class AshLoop:
         hooks: "HookRegistry | None" = None,
         turn_context: "TurnContext | None" = None,
         memory_nudge_interval: int = 0,
+        tools_registry: "ToolRegistry | None" = None,
+        skill_nudge_interval: int = 0,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -181,6 +184,9 @@ class AshLoop:
         self.turn_context = turn_context
         self.memory_nudge_interval = memory_nudge_interval
         self._turns_since_nudge = 0
+        self.tools_registry = tools_registry
+        self.skill_nudge_interval = skill_nudge_interval
+        self._iterations_since_skill_use = 0
         self.current_session: Session | None = None
 
     # --- session lifecycle ------------------------------------------------
@@ -565,6 +571,25 @@ class AshLoop:
                 # as a failure for the breaker.
                 self.circuit_breaker.record_failure(tool_name)
 
+            # Skill nudge check — suggest skills after N iterations of disuse.
+            was_skill = self.tools_registry is not None and any(
+                e.name == tool_name for e in self.tools_registry.skill_index()
+            )
+            if was_skill:
+                self._iterations_since_skill_use = 0
+            else:
+                self._iterations_since_skill_use += 1
+                if (
+                    self.skill_nudge_interval > 0
+                    and self._iterations_since_skill_use >= self.skill_nudge_interval
+                ):
+                    nudge = self._build_skill_nudge()
+                    if nudge and self.current_session:
+                        self.current_session.messages.append(
+                            Message(role="system", content=nudge, timestamp=_utc_now())
+                        )
+                    self._iterations_since_skill_use = 0
+
         return results
 
     # --- prompt assembly --------------------------------------------------
@@ -582,6 +607,15 @@ class AshLoop:
         recent = self.current_session.messages[-10:]
         summary = f"[Memory nudge — {len(recent)} messages in recent turns]"
         return summary
+
+    def _build_skill_nudge(self) -> str:
+        if self.tools_registry is None:
+            return ""
+        skill_index = self.tools_registry.skill_index()
+        if not skill_index:
+            return ""
+        suggestions = [f"- {s.name}: {s.description}" for s in skill_index[:3]]
+        return "[Skill nudge] Consider using:\n" + "\n".join(suggestions)
 
     def _build_messages(self, session: Session) -> list[dict[str, Any]]:
         """Build the messages payload for the provider."""
