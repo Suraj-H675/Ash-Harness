@@ -68,6 +68,12 @@ class ReplaceFileContentArgs(BaseModel):
     )
 
 
+class WholeEditArgs(BaseModel):
+    file_path: str = Field(..., description="Absolute or relative path to the file.")
+    content: str = Field(..., description="Complete new file content.")
+    reason: str = Field("", description="Why the entire file is being replaced.")
+
+
 class ReadFileTool(BaseTool):
     name = "read_file"
     description = "Read line-delimited text content from a workspace file."
@@ -224,6 +230,30 @@ class ReplaceFileContentTool(BaseTool):
             output=(
                 f"Replaced lines {args.start_line}-{args.end_line} in {resolved_path}."
             ),
+        )
+
+
+class WholeEditTool(BaseTool):
+    name = "whole_edit"
+    description = (
+        "Replace the complete content of a file with new content. "
+        "Use when the change is too large or complex for replace_file_content. "
+        "The entire file content is replaced."
+    )
+    args_schema = WholeEditArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = WholeEditArgs(**kwargs)
+        resolved_path = self.safety_guard.validate_path(args.file_path)
+
+        parent = resolved_path.parent
+        if not parent.exists():
+            parent.mkdir(parents=True, exist_ok=True)
+
+        resolved_path.write_text(args.content, encoding="utf-8", newline="")
+        return ToolResult(
+            success=True,
+            output=f"Whole-edit applied to {resolved_path} ({len(args.content)} chars).",
         )
 
 

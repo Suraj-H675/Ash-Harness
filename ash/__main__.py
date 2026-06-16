@@ -20,7 +20,7 @@ from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC
 from ash.safety.guard import SafetyGuard
 from ash.tools.command import RunCommandTool
-from ash.tools.filesystem import ReadFileTool, ReplaceFileContentTool, WriteFileTool
+from ash.tools.filesystem import ReadFileTool, ReplaceFileContentTool, WholeEditTool, WriteFileTool
 from ash.tools.git import AutoCommitTool
 from ash.ui.terminal import TerminalUI
 
@@ -43,6 +43,7 @@ def _build_tools(safety_guard: SafetyGuard) -> dict[str, Any]:
         ReadFileTool(safety_guard).name: ReadFileTool(safety_guard),
         WriteFileTool(safety_guard).name: WriteFileTool(safety_guard),
         ReplaceFileContentTool(safety_guard).name: ReplaceFileContentTool(safety_guard),
+        WholeEditTool(safety_guard).name: WholeEditTool(safety_guard),
         RunCommandTool(safety_guard).name: RunCommandTool(safety_guard),
         AutoCommitTool(safety_guard).name: AutoCommitTool(safety_guard),
     }

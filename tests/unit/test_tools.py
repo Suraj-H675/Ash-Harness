@@ -11,6 +11,7 @@ from ash.tools.filesystem import (
     EXISTS_ERROR,
     ReadFileTool,
     ReplaceFileContentTool,
+    WholeEditTool,
     WriteFileTool,
 )
 
@@ -205,6 +206,23 @@ def test_quote_powershell_literal_path_escapes_single_quotes() -> None:
     assert quote_powershell_literal_path("C:\\Users\\O'Brien\\file.txt") == (
         "-LiteralPath 'C:\\Users\\O''Brien\\file.txt'"
     )
+
+
+@pytest.mark.asyncio
+async def test_whole_edit_tool(tmp_path: Path) -> None:
+    test_file = tmp_path / "big.py"
+    test_file.write_text("old content")
+
+    guard = SafetyGuard(project_root=tmp_path)
+    tool = WholeEditTool(guard)
+    result = await tool.run(
+        file_path=str(test_file),
+        content="new content\nwith more lines\n" * 100,
+        reason="major refactor",
+    )
+
+    assert result.success, f"whole_edit failed: {result.error}"
+    assert test_file.read_text() == "new content\nwith more lines\n" * 100
 
 
 def test_auto_commit_tool_is_in_default_tools():
