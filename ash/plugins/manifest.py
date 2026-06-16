@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.metadata
+import importlib.util
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from packaging.specifiers import SpecifierSet
+from packaging.version import parse
 
 
 @dataclass
@@ -34,8 +40,38 @@ class PluginManifest:
             dependencies=data.get("dependencies", []),
         )
 
-    def check_dependencies(self) -> None:
-        """Validate all declared dependencies are installed."""
+    def check_dependencies(self) -> list[str]:
+        """Validate all declared dependencies are installed.
+
+        Returns a list of error messages for unmet dependencies.
+        Returns an empty list if all dependencies are satisfied.
+        """
+        errors: list[str] = []
+        for dep in self.dependencies:
+            name = dep.get("name", "")
+            version_spec = dep.get("version", "")
+            if not name:
+                continue
+            # Try to import the plugin package
+            try:
+                spec = importlib.util.find_spec(name)
+                if spec is None:
+                    errors.append(f"Missing dependency: {name} ({version_spec})")
+                    continue
+                # If version spec is given (e.g. ">=1.0.0"), check it
+                if version_spec:
+                    try:
+                        installed = importlib.metadata.version(name)
+                        if not SpecifierSet(version_spec).contains(parse(installed)):
+                            errors.append(
+                                f"{name} {installed} does not satisfy {version_spec}"
+                            )
+                    except Exception:
+                        # If version checking fails, skip
+                        pass
+            except Exception:
+                errors.append(f"Missing dependency: {name} ({version_spec})")
+        return errors
 
     @classmethod
     def load(cls, path: Path) -> PluginManifest:

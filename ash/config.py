@@ -80,6 +80,23 @@ class AshConfig(BaseSettings):
         ],
         description="Glob patterns to exclude from RepoMap analysis.",
     )
+    memory_backend: str = Field(
+        "auto",
+        description="Memory backend: 'auto' (in-memory), 'chroma' (persistent), or 'fts5' (lexical-only)",
+    )
+    chroma_persist_dir: Path = Field(
+        Path(".ash/chroma"),
+        description="Directory for ChromaDB persistent storage",
+    )
+    embedding_provider: str = Field(
+        "auto",
+        description="Embedding provider: 'auto' (deterministic), 'onnx' (local), 'openai' (remote)",
+    )
+    openai_api_key: str = Field("", description="API key for OpenAI embeddings")
+    onnx_model_path: Path = Field(
+        Path(".ash/model.onnx"),
+        description="Path to ONNX MiniLM model for local embeddings",
+    )
 
     @classmethod
     def settings_customise_sources(
