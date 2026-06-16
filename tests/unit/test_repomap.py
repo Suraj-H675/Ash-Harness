@@ -97,3 +97,18 @@ def test_repomap_skips_ignored_directories(tmp_path: Path) -> None:
     rm = RepoMap(tmp_path)
     names = {p.name for p in (n.path for n in rm.files)}
     assert names == {"keep.py"}
+
+
+def test_repomap_excludes_node_modules(tmp_path: Path) -> None:
+    from ash.repo.repomap import RepoMap
+
+    (tmp_path / "src.py").write_text("x = 1")
+    node_modules = tmp_path / "node_modules"
+    node_modules.mkdir()
+    (node_modules / "dep.js").write_text("module.exports = {}")
+
+    repo_map = RepoMap(project_root=tmp_path, exclude_patterns=["node_modules/**"])
+    ranked = repo_map.rank([tmp_path])
+    paths = [str(p) for p in ranked]
+    assert not any("node_modules" in p for p in paths)
+    assert any("src.py" in p for p in paths)

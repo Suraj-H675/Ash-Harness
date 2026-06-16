@@ -17,7 +17,6 @@ from typing import Any
 from ash.config import AshConfig
 from ash.core.loop import AshLoop
 from ash.core.session import SessionStore
-from ash.providers.anthropic import AnthropicProvider
 from ash.providers.base import ProviderABC
 from ash.safety.guard import SafetyGuard
 from ash.tools.command import RunCommandTool
@@ -27,8 +26,15 @@ from ash.ui.terminal import TerminalUI
 
 
 def _build_provider(config: AshConfig) -> ProviderABC:
-    if config.provider == "anthropic":
+    if config.provider == "openai":
+        from ash.providers.openai import OpenAIProvider
+        return OpenAIProvider(model_name=config.model_name, api_key=config.api_key)
+    elif config.provider == "anthropic":
+        from ash.providers.anthropic import AnthropicProvider
         return AnthropicProvider(model_name=config.model_name, api_key=config.api_key)
+    elif config.provider == "ollama":
+        from ash.providers.ollama import OllamaProvider
+        return OllamaProvider(model_name=config.model_name)
     raise ValueError(f"Unsupported provider: {config.provider!r}")
 
 

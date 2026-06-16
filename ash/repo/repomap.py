@@ -15,6 +15,7 @@ Given a workspace, the map:
 
 from __future__ import annotations
 
+import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -145,10 +146,12 @@ class RepoMap:
         *,
         extractor: SymbolExtractor | None = None,
         max_files: int = 500,
+        exclude_patterns: list[str] | None = None,
     ) -> None:
         self.project_root = project_root
         self._extractor = extractor or SymbolExtractor()
         self._max_files = max_files
+        self._exclude_patterns = exclude_patterns or []
         self._files: list[FileNode] = []
         self._module_index: dict[str, Path] = {}
         self._index: dict[Path, int] = {}
@@ -199,7 +202,16 @@ class RepoMap:
             key=lambda pair: pair[1],
             reverse=True,
         )
-        return ordered
+        return [p for p in ordered if not self._is_excluded(p[0])]
+
+    def _is_excluded(self, path: Path) -> bool:
+        path_str = str(path)
+        for pattern in self._exclude_patterns:
+            if fnmatch.fnmatch(path_str, pattern) or fnmatch.fnmatch(
+                path_str, f"**/{pattern}"
+            ):
+                return True
+        return False
 
     def render(
         self,

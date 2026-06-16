@@ -41,10 +41,9 @@ class OpenAITokenCounter:
 
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
-        try:
-            self._encoder = tiktoken.encoding_for_model(model_name)
-        except KeyError:
-            self._encoder = tiktoken.get_encoding(DEFAULT_OPENAI_FALLBACK_ENCODING)
+        # Use cl100k_base directly to avoid hanging on remote model downloads.
+        # This encoding is used by gpt-4o, gpt-4-turbo, gpt-3.5-turbo, etc.
+        self._encoder = tiktoken.get_encoding(DEFAULT_OPENAI_FALLBACK_ENCODING)
 
     def count(self, text: str) -> int:
         if not text:

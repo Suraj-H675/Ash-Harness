@@ -68,6 +68,19 @@ class AshConfig(BaseSettings):
         description="MCP server configurations loaded from .mcp.json.",
     )
 
+    repo_map_exclude_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "node_modules/**",
+            ".git/**",
+            "__pycache__/**",
+            "*.pyc",
+            ".venv/**",
+            "dist/**",
+            "build/**",
+        ],
+        description="Glob patterns to exclude from RepoMap analysis.",
+    )
+
     @classmethod
     def settings_customise_sources(
         cls,
