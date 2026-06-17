@@ -19,7 +19,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TextColumn
 from rich.text import Text
-from rich.group import Group
+from rich.columns import Columns
 
 
 ApprovalCallback = Callable[[str, dict[str, Any]], bool]
@@ -120,7 +120,7 @@ class TerminalUI:
                     ),
                     style="dim",
                 )
-                content = Group(content, "\n", token_text)
+                content = Columns([content, token_text], column_first=False)
             return Panel(
                 content,
                 title="ash",
