@@ -1,19 +1,19 @@
 """Subagent orchestration for V6 (Sprint 13)."""
 
-from ash.agents.orchestrator import (
+from agents.orchestrator import (
     LEAD_AGENT_ID,
     OrchestratorResult,
     SubagentOrchestrator,
     SubagentSpec,
     fanout_for_goal,
 )
-from ash.agents.shared_state import (
+from agents.shared_state import (
     AgentStatus,
     IPCMessage,
     SharedSprint,
     SharedState,
 )
-from ash.agents.subprocess_agent import (
+from agents.subprocess_agent import (
     AGENT_ROLES,
     AgentReport,
     SubprocessAgent,

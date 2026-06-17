@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Any, AsyncGenerator
 import openai  # type: ignore[import-not-found]
 
-from ash.context.tokens import OpenAITokenCounter
-from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from context.tokens import OpenAITokenCounter
+from providers.base import ProviderABC, StreamChunk, TokenCounterLike
 
 
 class OpenAIProvider(ProviderABC):

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from ash.core.session import (
+from core.session import (
     Message,
     SessionStore,
     ToolCallRecord,

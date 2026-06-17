@@ -1,7 +1,7 @@
 # tests/unit/test_shared_state.py
 import asyncio
 import pytest
-from ash.agents.shared_state import SharedState
+from agents.shared_state import SharedState
 import tempfile
 from pathlib import Path
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ash.repo.parser import SymbolExtractor
+from repo.parser import SymbolExtractor
 
 
 def test_extract_imports_functions_classes_and_methods(tmp_path: Path) -> None:

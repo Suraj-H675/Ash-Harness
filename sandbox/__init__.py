@@ -11,7 +11,7 @@ falls back to the next-lower tier so user workflows are never blocked
 by missing sandboxing infrastructure.
 """
 
-from ash.sandbox._base import (
+from sandbox._base import (
     SANDBOX_TIER_BWRAP,
     SANDBOX_TIER_DOCKER,
     SANDBOX_TIER_SANDBOX_EXEC,
@@ -20,9 +20,9 @@ from ash.sandbox._base import (
     SandboxBackendUnavailable,
     SandboxTier,
 )
-from ash.sandbox.bwrap import BubblewrapSandbox
-from ash.sandbox.docker import DockerSandbox
-from ash.sandbox.manager import (
+from sandbox.bwrap import BubblewrapSandbox
+from sandbox.docker import DockerSandbox
+from sandbox.manager import (
     SandboxManager,
     SandboxResult,
     has_bwrap,

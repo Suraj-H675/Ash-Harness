@@ -10,10 +10,10 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from ash.safety.guard import SafetyGuard, SafetyViolation
-from ash.sandbox._base import SANDBOX_TIER_BWRAP
-from ash.sandbox.manager import SandboxManager, SandboxResult
-from ash.tools.base import BaseTool, ToolResult, count_output_tokens
+from safety.guard import SafetyGuard, SafetyViolation
+from sandbox._base import SANDBOX_TIER_BWRAP
+from sandbox.manager import SandboxManager, SandboxResult
+from tools.base import BaseTool, ToolResult, count_output_tokens
 
 
 DEFAULT_TIMEOUT_SECONDS = 300

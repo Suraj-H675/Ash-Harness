@@ -15,8 +15,8 @@ from typing import Any, Sequence
 
 from pydantic import BaseModel, Field
 
-from ash.safety.guard import SafetyGuard
-from ash.tools.base import BaseTool, ToolResult
+from safety.guard import SafetyGuard
+from tools.base import BaseTool, ToolResult
 
 
 DEFAULT_COMMIT_AUTHOR = "ash <ash@local>"

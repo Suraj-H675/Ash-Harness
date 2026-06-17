@@ -7,14 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from ash.context.compaction import (
+from context.compaction import (
     DEFAULT_OVERLAP,
     DEFAULT_WINDOW_SIZE,
     Chunk,
     sliding_window_chunk,
 )
-from ash.core.session import get_db_connection
-from ash.memory.fts5 import FTS5Index, query_lexical_fallback
+from core.session import get_db_connection
+from memory.fts5 import FTS5Index, query_lexical_fallback
 
 
 # --- Chunker Tests ---

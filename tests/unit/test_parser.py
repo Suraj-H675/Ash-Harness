@@ -4,7 +4,7 @@ from typing import Iterable
 
 import pytest
 
-from ash.ui.parser import StreamingXMLParser
+from ui.parser import StreamingXMLParser
 
 
 def _drive(parser: StreamingXMLParser, *chunks: str) -> list[tuple[str, object]]:

@@ -10,8 +10,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from ash.safety.guard import SafetyGuard
-from ash.tools.base import BaseTool, ToolResult, count_output_tokens
+from safety.guard import SafetyGuard
+from tools.base import BaseTool, ToolResult, count_output_tokens
 
 
 BINARY_DETECTION_BYTES = 8192

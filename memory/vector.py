@@ -26,8 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from ash.context.compaction import Chunk
-from ash.memory.fts5 import FTS5Index, query_lexical_fallback
+from context.compaction import Chunk
+from memory.fts5 import FTS5Index, query_lexical_fallback
 
 
 # ---------------------------------------------------------------------------

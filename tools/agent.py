@@ -5,10 +5,10 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from ash.agents.shared_state import SharedState
-from ash.agents.subprocess_agent import SubprocessAgent, make_simple_text_task
-from ash.safety.guard import SafetyGuard
-from ash.tools.base import BaseTool, ToolResult
+from agents.shared_state import SharedState
+from agents.subprocess_agent import SubprocessAgent, make_simple_text_task
+from safety.guard import SafetyGuard
+from tools.base import BaseTool, ToolResult
 
 
 class SpawnAgentArgs(BaseModel):

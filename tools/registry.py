@@ -21,8 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-from ash.safety.guard import SafetyGuard
-from ash.tools.base import BaseTool
+from safety.guard import SafetyGuard
+from tools.base import BaseTool
 
 
 @dataclass(frozen=True)
@@ -120,7 +120,7 @@ class ToolRegistry:
         if refresh:
             self._skill_index.clear()
 
-        from ash.tools.skills import (
+        from tools.skills import (
             parse_markdown_skill_index,
             parse_python_skill_index,
         )
@@ -155,7 +155,7 @@ class ToolRegistry:
         path = Path(entry.path)
         if not path.exists():
             return None
-        from ash.tools.skills import compile_skill
+        from tools.skills import compile_skill
 
         tool = compile_skill(path, self._safety_guard)
         self.register(tool)
@@ -194,7 +194,7 @@ class ToolRegistry:
         except Exception:
             sys.modules.pop(module_name, None)
             raise
-        from ash.tools.skills import (
+        from tools.skills import (
             SkillParseError,
             build_tool_from_python_module,
             parse_python_skill,

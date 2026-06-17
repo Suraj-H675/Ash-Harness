@@ -6,8 +6,8 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from ash.agents.shared_state import SharedState
-from ash.agents.subprocess_agent import SubprocessAgent, make_simple_text_task
+from agents.shared_state import SharedState
+from agents.subprocess_agent import SubprocessAgent, make_simple_text_task
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,7 +1,7 @@
 # tests/unit/test_rate_limiter.py
 import asyncio
 import pytest
-from ash.providers.rate_limiter import TokenBucketRateLimiter
+from providers.rate_limiter import TokenBucketRateLimiter
 
 def test_consume_returns_true_when_tokens_available():
     limiter = TokenBucketRateLimiter(capacity=10, fill_rate=1.0)

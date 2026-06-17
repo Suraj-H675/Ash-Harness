@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Any, AsyncGenerator
 import httpx
 
-from ash.context.tokens import AnthropicTokenCounter
-from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from context.tokens import AnthropicTokenCounter
+from providers.base import ProviderABC, StreamChunk, TokenCounterLike
 
 
 class OllamaProvider(ProviderABC):

@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ash.context.compaction import Chunk
-from ash.core.session import get_db_connection
+from context.compaction import Chunk
+from core.session import get_db_connection
 
 
 DEFAULT_QUERY_LIMIT = 5

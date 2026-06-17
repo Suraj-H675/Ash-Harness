@@ -1,6 +1,6 @@
 """Long-term memory and search indices for Ash."""
 
-from ash.memory.vector import (
+from memory.vector import (
     VectorSearchPipeline,
     VectorHit,
     InMemoryVectorIndex,
@@ -12,8 +12,8 @@ from ash.memory.vector import (
     EmbeddingBackendUnavailable,
     VectorBackendUnavailable,
 )
-from ash.memory.markdown_store import MarkdownMemoryStore
-from ash.memory.fts5 import FTS5Index
+from memory.markdown_store import MarkdownMemoryStore
+from memory.fts5 import FTS5Index
 
 __all__ = [
     "VectorSearchPipeline",

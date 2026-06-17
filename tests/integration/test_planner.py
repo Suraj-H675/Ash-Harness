@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from ash.core.planner import Planner, parse_sprint_response, render_sprint_markdown
-from ash.core.session import SessionStore
-from ash.core.sprint import (
+from core.planner import Planner, parse_sprint_response, render_sprint_markdown
+from core.session import SessionStore
+from core.sprint import (
     ChecklistItem,
     ChecklistStatus,
     SprintContract,
@@ -18,9 +18,9 @@ from ash.core.sprint import (
     SprintState,
     looks_like_sprint_request,
 )
-from ash.providers.base import StreamChunk
-from ash.safety.guard import SafetyGuard
-from ash.ui.terminal import TerminalUI
+from providers.base import StreamChunk
+from safety.guard import SafetyGuard
+from ui.terminal import TerminalUI
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +312,7 @@ def test_state_machine_valid_transitions() -> None:
 
 
 def test_state_machine_rejects_invalid_transitions() -> None:
-    from ash.core.sprint import SprintTransitionError
+    from core.sprint import SprintTransitionError
 
     exec = SprintExecution(contract=SprintContract(goal="x"))
     with pytest.raises(SprintTransitionError):
@@ -325,7 +325,7 @@ def test_state_machine_rejects_invalid_transitions() -> None:
 
 
 def test_state_machine_abort_reachable_from_any_non_terminal_state() -> None:
-    from ash.core.sprint import SprintTransitionError
+    from core.sprint import SprintTransitionError
 
     # From PLANNING
     e1 = SprintExecution(contract=SprintContract(goal="x"))

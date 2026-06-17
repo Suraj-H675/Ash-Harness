@@ -7,7 +7,7 @@ import json
 import subprocess
 from typing import Any, AsyncGenerator
 
-from ash.mcp.server import MCPServerConfig
+from mcp.server import MCPServerConfig
 
 
 class MCPClient:

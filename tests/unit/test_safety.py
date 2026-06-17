@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from ash.safety.guard import SafetyGuard, SafetyViolation
+from safety.guard import SafetyGuard, SafetyViolation
 
 
 def test_validate_path_allows_paths_inside_project_root(tmp_path: Path) -> None:

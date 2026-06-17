@@ -14,33 +14,33 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ash.config import AshConfig
-from ash.core.loop import AshLoop
-from ash.core.session import SessionStore
-from ash.providers.base import ProviderABC
-from ash.safety.guard import SafetyGuard
-from ash.tools.command import RunCommandTool
-from ash.tools.filesystem import (
+from config import AshConfig
+from core.loop import AshLoop
+from core.session import SessionStore
+from providers.base import ProviderABC
+from safety.guard import SafetyGuard
+from tools.command import RunCommandTool
+from tools.filesystem import (
     ReadFileTool,
     ReplaceFileContentTool,
     WholeEditTool,
     WriteFileTool,
 )
-from ash.tools.git import AutoCommitTool
-from ash.ui.terminal import TerminalUI
+from tools.git import AutoCommitTool
+from ui.terminal import TerminalUI
 
 
 def _build_provider(config: AshConfig) -> ProviderABC:
     if config.provider == "openai":
-        from ash.providers.openai import OpenAIProvider
+        from providers.openai import OpenAIProvider
 
         return OpenAIProvider(model_name=config.model_name, api_key=config.api_key)
     elif config.provider == "anthropic":
-        from ash.providers.anthropic import AnthropicProvider
+        from providers.anthropic import AnthropicProvider
 
         return AnthropicProvider(model_name=config.model_name, api_key=config.api_key)
     elif config.provider == "ollama":
-        from ash.providers.ollama import OllamaProvider
+        from providers.ollama import OllamaProvider
 
         return OllamaProvider(model_name=config.model_name)
     raise ValueError(f"Unsupported provider: {config.provider!r}")
@@ -49,7 +49,7 @@ def _build_provider(config: AshConfig) -> ProviderABC:
 def _build_tools(
     safety_guard: SafetyGuard, project_root: Path | None = None
 ) -> dict[str, Any]:
-    from ash.tools.agent import SpawnAgentTool
+    from tools.agent import SpawnAgentTool
 
     root = project_root if project_root is not None else safety_guard.project_root
     return {
@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "mcp":
-        from ash.mcp.server import load_mcp_servers
+        from mcp.server import load_mcp_servers
 
         servers = load_mcp_servers()
         if args.action == "list":

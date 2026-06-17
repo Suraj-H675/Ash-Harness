@@ -1,7 +1,7 @@
 # tests/unit/test_hooks.py
 import pytest
 import re
-from ash.hooks.registry import (
+from hooks.registry import (
     HookRegistry,
     PostToolUseHook,
     PreToolUseHook,

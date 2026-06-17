@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from ash.sandbox._base import (
+from sandbox._base import (
     SANDBOX_TIER_BWRAP,
     SandboxBackend,
     SandboxBackendUnavailable,
