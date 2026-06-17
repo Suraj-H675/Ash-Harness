@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from ash.safety.guard import SafetyGuard, SafetyViolation
-from ash.tools.command import RunCommandTool, decode_stream, quote_powershell_literal_path
-from ash.tools.filesystem import (
+from safety.guard import SafetyGuard, SafetyViolation
+from tools.command import RunCommandTool, decode_stream, quote_powershell_literal_path
+from tools.filesystem import (
     BINARY_FILE_ERROR,
     EXISTS_ERROR,
     ReadFileTool,
@@ -227,8 +227,8 @@ async def test_whole_edit_tool(tmp_path: Path) -> None:
 
 def test_auto_commit_tool_is_in_default_tools():
     """auto_commit should be in the default tools dict."""
-    from ash.__main__ import _build_tools
-    from ash.safety.guard import SafetyGuard
+    from __main__ import _build_tools
+    from safety.guard import SafetyGuard
     from pathlib import Path
 
     guard = SafetyGuard(project_root=Path("/tmp"))
@@ -239,8 +239,8 @@ def test_auto_commit_tool_is_in_default_tools():
 @pytest.mark.asyncio
 async def test_auto_commit_tool_runs_successfully(tmp_path):
     """AutoCommitTool should create a commit when called with valid args."""
-    from ash.tools.git import AutoCommitTool
-    from ash.safety.guard import SafetyGuard
+    from tools.git import AutoCommitTool
+    from safety.guard import SafetyGuard
     import subprocess
 
     # Initialize a git repo

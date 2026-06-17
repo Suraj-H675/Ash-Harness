@@ -22,7 +22,7 @@ from typing import Iterable
 
 import numpy as np
 
-from ash.repo.parser import Symbol, SymbolExtractor
+from repo.parser import Symbol, SymbolExtractor
 
 
 # Top-level file extensions we treat as parseable Python source.

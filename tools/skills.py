@@ -32,9 +32,9 @@ from typing import Any, Callable, Mapping, Sequence
 
 from pydantic import BaseModel, create_model
 
-from ash.safety.guard import SafetyGuard
-from ash.tools.base import BaseTool, ToolResult
-from ash.tools.registry import SkillIndexEntry
+from safety.guard import SafetyGuard
+from tools.base import BaseTool, ToolResult
+from tools.registry import SkillIndexEntry
 
 
 # --- SkillContext ----------------------------------------------------------
@@ -68,7 +68,7 @@ class SkillContext:
     ) -> str:
         tool = self._tools.get("run_command")
         if tool is None:
-            from ash.tools.command import RunCommandTool
+            from tools.command import RunCommandTool
 
             tool = RunCommandTool(self.safety_guard)
         result: ToolResult = await tool.run(
@@ -83,7 +83,7 @@ class SkillContext:
     ) -> str:
         tool = self._tools.get("read_file")
         if tool is None:
-            from ash.tools.filesystem import ReadFileTool
+            from tools.filesystem import ReadFileTool
 
             tool = ReadFileTool(self.safety_guard)
         result: ToolResult = await tool.run(
@@ -98,7 +98,7 @@ class SkillContext:
     ) -> None:
         tool = self._tools.get("write_file")
         if tool is None:
-            from ash.tools.filesystem import WriteFileTool
+            from tools.filesystem import WriteFileTool
 
             tool = WriteFileTool(self.safety_guard)
         result: ToolResult = await tool.run(

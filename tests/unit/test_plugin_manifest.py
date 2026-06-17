@@ -1,7 +1,7 @@
 # tests/unit/test_plugin_manifest.py
 import json
 import pytest
-from ash.plugins.manifest import PluginManifest
+from plugins.manifest import PluginManifest
 from pathlib import Path
 
 

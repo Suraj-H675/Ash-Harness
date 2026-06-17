@@ -126,7 +126,7 @@ class AshConfig(BaseSettings):
     def model_post_init(self, *args: Any, **kwargs: Any) -> None:
         """Load MCP servers from .mcp.json if not already populated."""
         if not self.mcp_servers:
-            from ash.mcp.server import MCPServerConfig, load_mcp_servers
+            from mcp.server import MCPServerConfig, load_mcp_servers
 
             mcp_path = self.workspace_root / ".mcp.json"
             if mcp_path.exists():

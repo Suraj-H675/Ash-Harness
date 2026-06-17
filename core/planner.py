@@ -20,14 +20,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from ash.core.sprint import (
+from core.sprint import (
     ChecklistItem,
     ChecklistStatus,
     SprintContract,
     SprintExecution,
     SprintState,
 )
-from ash.providers.base import ProviderABC, TokenCounterLike
+from providers.base import ProviderABC, TokenCounterLike
 
 
 # --- architect mode system prompt (Section 2.1 of the spec) --------------

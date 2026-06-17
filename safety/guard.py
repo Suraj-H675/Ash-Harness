@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Tuple
 
-from ash.safety.path_scope import (
+from safety.path_scope import (
     normalize_allowed_directories,
     normalize_project_root,
     path_is_in_scope,

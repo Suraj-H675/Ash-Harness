@@ -1,7 +1,7 @@
 # tests/unit/test_mcp.py
 import json
 import pytest
-from ash.mcp.server import load_mcp_servers, expand_env_vars
+from mcp.server import load_mcp_servers, expand_env_vars
 from pathlib import Path
 
 

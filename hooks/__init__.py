@@ -1,6 +1,6 @@
 """Ash hooks package."""
 
-from ash.hooks.registry import (
+from hooks.registry import (
     Hook,
     HookRegistry,
     HookResult,

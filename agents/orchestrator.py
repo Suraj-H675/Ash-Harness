@@ -22,8 +22,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence, cast
 
-from ash.agents.shared_state import AgentStatus, IPCMessage, SharedState
-from ash.agents.subprocess_agent import (
+from agents.shared_state import AgentStatus, IPCMessage, SharedState
+from agents.subprocess_agent import (
     AGENT_ROLES,
     AgentReport,
     SubprocessAgent,
@@ -31,8 +31,8 @@ from ash.agents.subprocess_agent import (
     make_simple_text_task,
     payload_to_report,
 )
-from ash.core.planner import Planner
-from ash.sandbox._base import SANDBOX_TIER_SCOPED, SANDBOX_TIER_SANDBOX_EXEC
+from core.planner import Planner
+from sandbox._base import SANDBOX_TIER_SCOPED, SANDBOX_TIER_SANDBOX_EXEC
 
 
 LEAD_AGENT_ID = "lead"

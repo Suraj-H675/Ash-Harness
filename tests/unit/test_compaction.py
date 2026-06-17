@@ -1,7 +1,7 @@
 # tests/unit/test_compaction.py
 import pytest
-from ash.context.compaction import Chunk, sliding_window_chunk
-from ash.core.session import Message
+from context.compaction import Chunk, sliding_window_chunk
+from core.session import Message
 from datetime import datetime, timezone
 
 def test_chunk_key_format():

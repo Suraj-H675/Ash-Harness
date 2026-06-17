@@ -19,14 +19,14 @@ from typing import Any, AsyncGenerator
 
 import pytest
 
-from ash.core.loop import AshLoop
-from ash.core.session import SessionStore
-from ash.providers.base import StreamChunk
-from ash.safety.guard import SafetyGuard
-from ash.sandbox import SANDBOX_TIER_SCOPED, SandboxManager
-from ash.tools.command import RunCommandTool
-from ash.tools.filesystem import ReadFileTool, ReplaceFileContentTool, WriteFileTool
-from ash.ui.terminal import TerminalUI
+from core.loop import AshLoop
+from core.session import SessionStore
+from providers.base import StreamChunk
+from safety.guard import SafetyGuard
+from sandbox import SANDBOX_TIER_SCOPED, SandboxManager
+from tools.command import RunCommandTool
+from tools.filesystem import ReadFileTool, ReplaceFileContentTool, WriteFileTool
+from ui.terminal import TerminalUI
 
 
 # ---------------------------------------------------------------------------

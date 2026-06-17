@@ -1,6 +1,6 @@
 # tests/unit/test_terminal_ui.py
 import pytest
-from ash.ui.terminal import TerminalUI
+from ui.terminal import TerminalUI
 from pathlib import Path
 
 def test_terminal_ui_initializes_with_safety_tier():

@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["ash", "agents", "context", "core", "hooks", "lsp", "mcp", "memory", "plugins", "providers", "repo", "safety", "sandbox", "server", "tools", "ui"]
+packages = ["agents", "context", "core", "hooks", "lsp", "mcp", "memory", "plugins", "providers", "repo", "safety", "sandbox", "server", "tools", "ui"]
 
 [project.optional-dependencies]
 vector = [

@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ash.agents.subprocess_agent import AgentReport
-    from ash.tools.registry import ToolRegistry
+    from agents.subprocess_agent import AgentReport
+    from tools.registry import ToolRegistry
 
 
 @dataclass

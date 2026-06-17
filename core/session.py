@@ -423,7 +423,7 @@ class SessionStore:
 
         # Imported here to avoid a circular import: planner/sprint depend
         # on session typing, session persistence depends on sprint types.
-        from ash.core.sprint import (
+        from core.sprint import (
             ChecklistItem,
             ChecklistStatus,
             SprintContract,

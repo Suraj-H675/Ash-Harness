@@ -1,12 +1,12 @@
 # tests/unit/test_loop.py
 import pytest
-from ash.core.loop import AshLoop
-from ash.tools.base import BaseTool, ToolResult, ToolMiddleware, ToolMiddlewareSkip
-from ash.core.session import SessionStore
-from ash.providers.base import ProviderABC, StreamChunk
-from ash.safety.guard import SafetyGuard
-from ash.ui.terminal import TerminalUI
-from ash.tools.filesystem import ReadFileTool
+from core.loop import AshLoop
+from tools.base import BaseTool, ToolResult, ToolMiddleware, ToolMiddlewareSkip
+from core.session import SessionStore
+from providers.base import ProviderABC, StreamChunk
+from safety.guard import SafetyGuard
+from ui.terminal import TerminalUI
+from tools.filesystem import ReadFileTool
 from pathlib import Path
 from unittest.mock import AsyncMock
 import tempfile
@@ -90,7 +90,7 @@ async def test_on_tool_approval_callback_is_called(tmp_path):
         store = SessionStore(Path(db_dir) / "test.db")
         guard = SafetyGuard(project_root=tmp_path)
         ui = TerminalUI(safety_tier="dry_run")
-        from ash.core.recovery import CircuitBreaker
+        from core.recovery import CircuitBreaker
         loop = AshLoop(
             store, MockProvider(), guard, ui, tmp_path,
             tools={"read_file": ReadFileTool(guard)},

@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from ash.config import AshConfig
+from config import AshConfig
 
 
 ENV_KEYS = [

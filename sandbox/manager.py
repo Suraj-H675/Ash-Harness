@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
-from ash.sandbox._base import (
+from sandbox._base import (
     SANDBOX_TIER_BWRAP,
     SANDBOX_TIER_DOCKER,
     SANDBOX_TIER_SCOPED,
@@ -29,12 +29,12 @@ from ash.sandbox._base import (
     SandboxBackendUnavailable,
     SandboxTier,
 )
-from ash.sandbox.bwrap import BubblewrapSandbox, probe_bwrap
-from ash.sandbox.docker import DockerSandbox, probe_docker
+from sandbox.bwrap import BubblewrapSandbox, probe_bwrap
+from sandbox.docker import DockerSandbox, probe_docker
 
 
 # Re-export the tier constants for backwards compatibility with code
-# that imports them from ash.sandbox.manager.
+# that imports them from sandbox.manager.
 __all__ = [
     "SANDBOX_TIER_BWRAP",
     "SANDBOX_TIER_DOCKER",

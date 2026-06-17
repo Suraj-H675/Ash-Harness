@@ -5,10 +5,10 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import BaseModel
 
-from ash.safety.guard import SafetyGuard
+from safety.guard import SafetyGuard
 
 if TYPE_CHECKING:
-    from ash.tools.base import BaseTool
+    from tools.base import BaseTool
 
 
 class ToolResult(BaseModel):

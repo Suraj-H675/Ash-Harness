@@ -24,41 +24,41 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from uuid import uuid4
 
-from ash.core.recovery import CircuitBreaker, CircuitBreakerError
-from ash.core.session import (
+from core.recovery import CircuitBreaker, CircuitBreakerError
+from core.session import (
     Message,
     Session,
     SessionStore,
     ToolCallRecord,
 )
-from ash.ash_logging import get_logger
-from ash.mcp.server import MCPServerManager, load_mcp_servers
-from ash.providers.base import ProviderABC, TokenCounterLike
-from ash.repo.repomap import RepoMap
-from ash.safety.guard import SafetyGuard
-from ash.tools.base import BaseTool, ToolMiddleware, ToolMiddlewareSkip, ToolResult
-from ash.tools.git import auto_commit_turn
-from ash.ui.parser import Event, StreamingXMLParser
-from ash.ui.terminal import TerminalUI
+from ash_logging import get_logger
+from mcp.server import MCPServerManager, load_mcp_servers
+from providers.base import ProviderABC, TokenCounterLike
+from repo.repomap import RepoMap
+from safety.guard import SafetyGuard
+from tools.base import BaseTool, ToolMiddleware, ToolMiddlewareSkip, ToolResult
+from tools.git import auto_commit_turn
+from ui.parser import Event, StreamingXMLParser
+from ui.terminal import TerminalUI
 
 if TYPE_CHECKING:
-    from ash.context.turn import TurnContext
-    from ash.core.planner import Planner
-    from ash.core.sprint import SprintExecution
-    from ash.hooks import HookRegistry
-    from ash.memory.vector import (
+    from context.turn import TurnContext
+    from core.planner import Planner
+    from core.sprint import SprintExecution
+    from hooks import HookRegistry
+    from memory.vector import (
         Chunk,
         EmbeddingAdapter,
         VectorHit,
         VectorSearchPipeline,
     )
-    from ash.tools.registry import ToolRegistry
+    from tools.registry import ToolRegistry
 
 _log = get_logger(__name__)
 
 if TYPE_CHECKING:
-    from ash.core.planner import Planner
-    from ash.core.sprint import SprintExecution
+    from core.planner import Planner
+    from core.sprint import SprintExecution
 
 
 ToolApprovalCallback = Callable[
@@ -203,7 +203,7 @@ class AshLoop:
         self._turns_since_nudge = 0
         self.tools_registry = tools_registry
         if tools_registry is not None:
-            from ash.tools.skills import configure_runtime
+            from tools.skills import configure_runtime
             configure_runtime(
                 tools_provider=lambda: list(tools_registry.as_dict().values()),
                 root_provider=lambda: self.project_root,
@@ -293,7 +293,7 @@ class AshLoop:
             raise RuntimeError("start_session() returned None")
         session = self.current_session
 
-        from ash.context.turn import TurnContext
+        from context.turn import TurnContext
 
         self.turn_context = TurnContext(
             session_id=session.session_id,
@@ -307,7 +307,7 @@ class AshLoop:
         # user input for the execution turn. On rejection, the turn
         # short-circuits with a polite "plan rejected" message.
         if self.enable_sprint_planning and self.planner is not None:
-            from ash.core.sprint import (
+            from core.sprint import (
                 looks_like_sprint_request,
             )
 
@@ -448,7 +448,7 @@ class AshLoop:
     async def _planning_phase(self, user_input: str) -> "SprintExecution":
         """Call the planner to decompose ``user_input`` into a contract."""
 
-        from ash.core.planner import Planner
+        from core.planner import Planner
 
         if self.planner is None:
             raise RuntimeError("planner is None but sprint planning is enabled")
@@ -703,7 +703,7 @@ class AshLoop:
         chroma_persist_dir: Path | None,
     ) -> None:
         """Initialize the vector search pipeline based on config."""
-        from ash.memory import (
+        from memory import (
             VectorSearchPipeline,
             InMemoryVectorIndex,
             DeterministicEmbedding,
@@ -711,13 +711,13 @@ class AshLoop:
 
         adapter: "EmbeddingAdapter"
         if embedding_provider == "onnx":
-            from ash.memory import ONNXLocalEmbedding
+            from memory import ONNXLocalEmbedding
 
             adapter = ONNXLocalEmbedding(
                 model_path=onnx_model_path or Path(".ash/model.onnx")
             )
         elif embedding_provider == "openai":
-            from ash.memory import OpenAIEmbedding
+            from memory import OpenAIEmbedding
 
             adapter = OpenAIEmbedding(api_key=openai_api_key)
         else:

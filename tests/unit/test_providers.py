@@ -25,7 +25,7 @@ from typing import Any, AsyncGenerator, Callable, Sequence
 
 import pytest
 
-from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from providers.base import ProviderABC, StreamChunk, TokenCounterLike
 
 
 # ---------------------------------------------------------------------------
@@ -401,12 +401,12 @@ def test_loop_drives_provider_through_tool_callbacks() -> None:
     the tool response in the next turn's messages.
     """
 
-    from ash.core.loop import AshLoop
-    from ash.core.session import SessionStore
-    from ash.providers.base import StreamChunk
-    from ash.safety.guard import SafetyGuard
-    from ash.tools.base import BaseTool, ToolResult
-    from ash.ui.terminal import TerminalUI
+    from core.loop import AshLoop
+    from core.session import SessionStore
+    from providers.base import StreamChunk
+    from safety.guard import SafetyGuard
+    from tools.base import BaseTool, ToolResult
+    from ui.terminal import TerminalUI
 
     class _EchoTool(BaseTool):
         name = "echo"
@@ -490,7 +490,7 @@ def _tmp_db() -> Path:
 
 
 def test_openai_provider_initializes():
-    from ash.providers.openai import OpenAIProvider
+    from providers.openai import OpenAIProvider
 
     provider = OpenAIProvider(model_name="gpt-4o", api_key="test-key")
     assert provider.model_name == "gpt-4o"
@@ -499,8 +499,8 @@ def test_openai_provider_initializes():
 
 @pytest.mark.asyncio
 async def test_openai_provider_stream_chat_signature():
-    from ash.providers.openai import OpenAIProvider
-    from ash.providers.base import ProviderABC
+    from providers.openai import OpenAIProvider
+    from providers.base import ProviderABC
 
     provider = OpenAIProvider(model_name="gpt-4o", api_key="test-key")
     assert isinstance(provider, ProviderABC)
@@ -516,7 +516,7 @@ async def test_openai_provider_stream_chat_signature():
 
 
 def test_ollama_provider_initializes():
-    from ash.providers.ollama import OllamaProvider
+    from providers.ollama import OllamaProvider
 
     provider = OllamaProvider(model_name="llama3", base_url="http://localhost:11434")
     assert provider.model_name == "llama3"

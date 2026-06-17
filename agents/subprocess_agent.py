@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
-from ash.agents.shared_state import SharedState
+from agents.shared_state import SharedState
 
 
 # --- public enums and dataclasses -----------------------------------------
@@ -241,7 +241,7 @@ class SubprocessAgent:
         ]
         cmd.extend(extra_args)
         env = os.environ.copy()
-        project_root = str(Path(__file__).resolve().parents[2])
+        project_root = str(Path(__file__).resolve().parents[1])
         existing_pythonpath = env.get("PYTHONPATH")
         env["PYTHONPATH"] = (
             f"{project_root}{os.pathsep}{existing_pythonpath}"
