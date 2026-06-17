@@ -34,14 +34,33 @@ class OpenAIProvider(ProviderABC):
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
     ) -> AsyncGenerator[StreamChunk, None]:
-        stream = await self._client.chat.completions.create(
-            model=self._model_name,
-            messages=messages,
-            temperature=temperature,
-            stream=True,
-        )
+        try:
+            stream = await self._client.chat.completions.create(
+                model=self._model_name,
+                messages=messages,
+                temperature=temperature,
+                stream=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"OpenAI API error: {exc}") from exc
         async for chunk in stream:
             delta = chunk.choices[0].delta
             content = delta.content or ""
             is_done = chunk.choices[0].finish_reason is not None
-            yield StreamChunk(content=content, is_done=is_done, model=self._model_name)
+            # Extract token usage from the final chunk's usage dict.
+            prompt_tokens = 0
+            completion_tokens = 0
+            stop_reason = None
+            if hasattr(chunk, "usage") and chunk.usage is not None:
+                prompt_tokens = chunk.usage.prompt_tokens or 0
+                completion_tokens = chunk.usage.completion_tokens or 0
+            if is_done:
+                stop_reason = chunk.choices[0].finish_reason
+            yield StreamChunk(
+                content=content,
+                is_done=is_done,
+                model=self._model_name,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                stop_reason=stop_reason,
+            )

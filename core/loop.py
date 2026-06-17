@@ -31,7 +31,7 @@ from ash.core.session import (
     SessionStore,
     ToolCallRecord,
 )
-from ash.logging import get_logger
+from ash.ash_logging import get_logger
 from ash.mcp.server import MCPServerManager, load_mcp_servers
 from ash.providers.base import ProviderABC, TokenCounterLike
 from ash.repo.repomap import RepoMap
@@ -202,6 +202,12 @@ class AshLoop:
         self.memory_nudge_interval = memory_nudge_interval
         self._turns_since_nudge = 0
         self.tools_registry = tools_registry
+        if tools_registry is not None:
+            from ash.tools.skills import configure_runtime
+            configure_runtime(
+                tools_provider=lambda: list(tools_registry.as_dict().values()),
+                root_provider=lambda: self.project_root,
+            )
         self.skill_nudge_interval = skill_nudge_interval
         self._iterations_since_skill_use = 0
         self.continuous_mode = continuous_mode

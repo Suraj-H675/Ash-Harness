@@ -51,9 +51,11 @@ class RunCommandTool(BaseTool):
         self,
         safety_guard: SafetyGuard,
         *,
+        project_root: Path | None = None,
         sandbox_manager: SandboxManager | None = None,
     ) -> None:
         super().__init__(safety_guard)
+        self.project_root = project_root if project_root is not None else safety_guard.project_root
         self.sandbox_manager = sandbox_manager
 
     async def run(self, **kwargs: Any) -> ToolResult:
@@ -71,6 +73,8 @@ class RunCommandTool(BaseTool):
                     error=f"Error: cwd is not a directory: {args.cwd}",
                 )
             cwd = str(cwd_path)
+        elif self.project_root is not None:
+            cwd = str(self.project_root)
 
         # Tier 2+ (bwrap / docker) wants a real argv so the sandbox
         # binary can exec it directly. Tier 1 (scoped) keeps the

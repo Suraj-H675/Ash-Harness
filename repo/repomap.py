@@ -213,6 +213,44 @@ class RepoMap:
                 return True
         return False
 
+    def render(
+        self,
+        ranked: list[tuple[Path, float]],
+        *,
+        top_files: int = 10,
+        symbols_per_file: int = 5,
+    ) -> str:
+        """Render a markdown repository map snippet from ranked files.
+
+        Produces a ``## Repository Map`` section listing the top-N files
+        and their top-K symbols, suitable for injection into the system prompt.
+        """
+
+        lines = ["## Repository Map", ""]
+        selected = ranked[:top_files]
+        if not selected:
+            lines.append("*No files found.*")
+            return "\n".join(lines)
+
+        for path, score in selected:
+            node = self._node_for_path(path)
+            rel = str(path.relative_to(self.project_root))
+            lines.append(f"### {rel} _(score: {score:.4f})_")
+            if node is None or not node.symbols:
+                lines.append("*No symbols extracted.*")
+            else:
+                # Show functions/methods/classes, skip plain imports.
+                interesting = [
+                    s for s in node.symbols
+                    if s.kind in {"function", "method", "class"}
+                ]
+                for sym in interesting[:symbols_per_file]:
+                    kind = sym.kind
+                    parent = f" (in {sym.parent})" if sym.parent else ""
+                    lines.append(f"- **{sym.name}** `{kind}`{parent}")
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
+
     def to_dot_graph(self, ranked: list[Path]) -> str:
         """Render the dependency graph as a Graphviz DOT string.
 

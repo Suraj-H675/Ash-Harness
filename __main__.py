@@ -46,15 +46,20 @@ def _build_provider(config: AshConfig) -> ProviderABC:
     raise ValueError(f"Unsupported provider: {config.provider!r}")
 
 
-def _build_tools(safety_guard: SafetyGuard) -> dict[str, Any]:
+def _build_tools(
+    safety_guard: SafetyGuard, project_root: Path | None = None
+) -> dict[str, Any]:
     from ash.tools.agent import SpawnAgentTool
 
+    root = project_root if project_root is not None else safety_guard.project_root
     return {
         ReadFileTool(safety_guard).name: ReadFileTool(safety_guard),
         WriteFileTool(safety_guard).name: WriteFileTool(safety_guard),
         ReplaceFileContentTool(safety_guard).name: ReplaceFileContentTool(safety_guard),
         WholeEditTool(safety_guard).name: WholeEditTool(safety_guard),
-        RunCommandTool(safety_guard).name: RunCommandTool(safety_guard),
+        RunCommandTool(safety_guard, project_root=root).name: RunCommandTool(
+            safety_guard, project_root=root
+        ),
         AutoCommitTool(safety_guard).name: AutoCommitTool(safety_guard),
         SpawnAgentTool(safety_guard, None).name: SpawnAgentTool(safety_guard, None),
     }
@@ -122,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     provider = _build_provider(config)
     ui = TerminalUI(safety_tier=config.safety_tier)
-    tools = _build_tools(safety_guard)
+    tools = _build_tools(safety_guard, config.workspace_root)
 
     loop = AshLoop(
         session_store=session_store,

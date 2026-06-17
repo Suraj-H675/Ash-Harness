@@ -93,7 +93,6 @@ class EmbeddingAdapter(ABC):
         """Return the embedding of ``text`` as a list of floats."""
 
         raise NotImplementedError
-        return []  # pragma: no cover - keeps async signature explicit
 
     async def get_embeddings(self, texts: Sequence[str]) -> list[list[float]]:
         """Default batched implementation; subclasses may override for speed."""
