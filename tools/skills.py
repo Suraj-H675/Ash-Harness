@@ -462,7 +462,7 @@ def _compile_markdown_skill(path: Path, safety_guard: SafetyGuard) -> BaseTool:
         # dict so we don't pollute the executor with phantom fields.
         passed_kwargs = (
             {}
-            if type(validated).__name__.endswith("Args") and not validated.model_fields
+            if type(validated).__name__.endswith("Args") and not args_model.model_fields
             else validated.model_dump()
         )
         try:

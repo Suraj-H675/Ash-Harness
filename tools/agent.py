@@ -28,6 +28,12 @@ class SpawnAgentTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = self.args_schema(**kwargs)
+        if self._shared_state is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error="spawn_agent tool: shared_state not initialized (SubprocessAgent requires a SharedState instance)",
+            )
         agent = SubprocessAgent(
             agent_id=args.agent_id or f"spawned-{uuid.uuid4().hex[:8]}",
             role=args.role,
