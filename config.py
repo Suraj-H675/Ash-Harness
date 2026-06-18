@@ -23,14 +23,13 @@ class AshConfig(BaseSettings):
 
     provider: str = Field(
         "anthropic",
-        description="Primary model provider: 'anthropic' or 'openai' or 'ollama'",
+        description="Primary model provider: 'anthropic', 'openai', 'ollama', 'deepseek', 'groq', or 'openai-compatible'",
     )
-    model_name: str = Field(
-        "claude-3-5-sonnet-20241022",
-        description="Model identifier to invoke.",
+    model: str = Field(
+        "claude-3-7-sonnet-20250219",
+        description="Model name within the selected provider.",
     )
     temperature: float = Field(0.0, description="Model generation temperature.")
-    api_key: str = Field(..., description="API Access key.")
 
     max_context_tokens: int = Field(
         128000,
@@ -124,7 +123,22 @@ class AshConfig(BaseSettings):
         return cls(**overrides)
 
     def model_post_init(self, *args: Any, **kwargs: Any) -> None:
-        """Load MCP servers from .mcp.json if not already populated."""
+        """Handle backward compat and load MCP servers."""
+        import os
+
+        # Backward compat: if ANTHROPIC_API_KEY is not set but ASH_API_KEY is,
+        # promote it so _build_provider() finds the right key.
+        if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ASH_API_KEY"):
+            os.environ["ANTHROPIC_API_KEY"] = os.environ["ASH_API_KEY"]
+
+        # Backward compat: ASH_MODEL_NAME → ASH_MODEL. Pydantic already resolved
+        # `model` before this runs, so retroactively override it.
+        if not os.environ.get("ASH_MODEL") and os.environ.get("ASH_MODEL_NAME"):
+            os.environ["ASH_MODEL"] = os.environ["ASH_MODEL_NAME"]
+            # Override the already-resolved field value using Pydantic's internals.
+            object.__setattr__(self, "model", os.environ["ASH_MODEL_NAME"])
+
+        # Load MCP servers from .mcp.json if not already populated.
         if not self.mcp_servers:
             from mcp.server import MCPServerConfig, load_mcp_servers
 

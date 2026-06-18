@@ -34,11 +34,13 @@ class AnthropicProvider(ProviderABC):
         model_name: str,
         api_key: str,
         *,
+        base_url: str | None = None,
         client: Any | None = None,
         token_counter: TokenCounterLike | None = None,
     ) -> None:
         self._model_name = model_name
         self._api_key = api_key
+        self._base_url = base_url
         self._client = client
         self._owns_client = client is None
         self._token_counter = token_counter or AnthropicTokenCounter()
@@ -62,9 +64,12 @@ class AnthropicProvider(ProviderABC):
                 "Install it with `pip install anthropic` or inject a client."
             ) from exc
 
-        self._client = (
-            AsyncAnthropic(api_key=self._api_key) if self._api_key else AsyncAnthropic()
-        )
+        kwargs: dict[str, Any] = {}
+        if self._api_key:
+            kwargs["api_key"] = self._api_key
+        if self._base_url:
+            kwargs["base_url"] = self._base_url
+        self._client = AsyncAnthropic(**kwargs) if kwargs else AsyncAnthropic()
         return self._client
 
     async def stream_chat(

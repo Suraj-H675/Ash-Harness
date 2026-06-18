@@ -29,16 +29,24 @@ class OllamaProvider(ProviderABC):
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)
 
+    def configure_max_tokens(self, max_tokens: int) -> None:
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+        self._max_tokens = max_tokens
+
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
     ) -> AsyncGenerator[StreamChunk, None]:
+        options: dict[str, Any] = {"temperature": temperature}
+        if hasattr(self, "_max_tokens"):
+            options["num_predict"] = self._max_tokens
         payload = {
             "model": self._model_name,
             "messages": messages,
             "stream": True,
-            "options": {"temperature": temperature},
+            "options": options,
         }
         try:
             async with self._client.stream(

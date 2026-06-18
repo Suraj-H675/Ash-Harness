@@ -1,29 +1,35 @@
-"""OpenAI GPT provider adapter for Ash."""
+"""Groq chat completion provider for Ash.
+
+API compatible with OpenAI SDK via custom base URL.
+Base URL: https://api.groq.com/openai/v1
+"""
 
 from __future__ import annotations
 
 from typing import Any, AsyncGenerator
+
 import openai  # type: ignore[import-not-found]
 
-from context.tokens import OpenAITokenCounter
+from context.tokens import AnthropicTokenCounter
 from providers.base import ProviderABC, StreamChunk, TokenCounterLike
 
 
-class OpenAIProvider(ProviderABC):
+class GroqProvider(ProviderABC):
     def __init__(
         self,
-        model_name: str = "gpt-4o",
-        api_key: str | None = None,
+        model_name: str = "llama-3-70b-8192",
+        api_key: str = "",
         *,
         base_url: str | None = None,
         token_counter: TokenCounterLike | None = None,
     ) -> None:
         self._model_name = model_name
         self._api_key = api_key
-        self._token_counter = token_counter or OpenAITokenCounter(model_name)
+        self._base_url = base_url or "https://api.groq.com/openai/v1"
+        self._token_counter = token_counter or AnthropicTokenCounter()
         self._client = openai.AsyncOpenAI(
             api_key=api_key,
-            base_url=base_url if base_url else None,
+            base_url=self._base_url,
         )
 
     @property
@@ -54,12 +60,11 @@ class OpenAIProvider(ProviderABC):
         try:
             stream = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"OpenAI API error: {exc}") from exc
+            raise RuntimeError(f"Groq API error: {exc}") from exc
         async for chunk in stream:
             delta = chunk.choices[0].delta
             content = delta.content or ""
             is_done = chunk.choices[0].finish_reason is not None
-            # Extract token usage from the final chunk's usage dict.
             prompt_tokens = 0
             completion_tokens = 0
             stop_reason = None

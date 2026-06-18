@@ -178,6 +178,7 @@ class AshLoop:
         onnx_model_path: Path | None = None,
         chroma_persist_dir: Path | None = None,
         mcp_config_path: Path | None = None,
+        config: "AshConfig | None" = None,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -208,6 +209,7 @@ class AshLoop:
                 tools_provider=lambda: list(tools_registry.as_dict().values()),
                 root_provider=lambda: self.project_root,
             )
+        self._config = config
         self.skill_nudge_interval = skill_nudge_interval
         self._iterations_since_skill_use = 0
         self.continuous_mode = continuous_mode
@@ -788,6 +790,33 @@ class AshLoop:
         for message in session.messages:
             messages.append({"role": message.role, "content": message.content})
         return messages
+
+    # --- provider switching -------------------------------------------------
+
+    def switch_provider(self, provider: str, model: str) -> None:
+        """Switch to a different provider and model. Rebuilds provider instance."""
+        from __main__ import _build_provider  # lazy import to avoid circular
+
+        if self._config is None:
+            raise RuntimeError("AshLoop was not constructed with a config object")
+
+        new_config = self._config.model_copy(update={"provider": provider, "model": model})
+        self.provider = _build_provider(new_config)
+        self._config = new_config
+        # Re-configure skills runtime with new provider.
+        if self.tools_registry is not None:
+            from tools.skills import configure_runtime
+
+            configure_runtime(
+                tools_provider=lambda: list(self.tools_registry.as_dict().values()),
+                root_provider=lambda: self.project_root,
+            )
+
+    def switch_model(self, model: str) -> None:
+        """Switch model within the current provider."""
+        if self._config is None:
+            raise RuntimeError("AshLoop was not constructed with a config object")
+        self.switch_provider(self._config.provider, model)
 
 
 MAX_RETRIES = 2

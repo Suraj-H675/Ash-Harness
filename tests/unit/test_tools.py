@@ -227,7 +227,7 @@ async def test_whole_edit_tool(tmp_path: Path) -> None:
 
 def test_auto_commit_tool_is_in_default_tools():
     """auto_commit should be in the default tools dict."""
-    from __main__ import _build_tools
+    from ash.__main__ import _build_tools
     from safety.guard import SafetyGuard
     from pathlib import Path
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -30,19 +31,114 @@ from tools.git import AutoCommitTool
 from ui.terminal import TerminalUI
 
 
-def _build_provider(config: AshConfig) -> ProviderABC:
-    if config.provider == "openai":
-        from providers.openai import OpenAIProvider
+AVAILABLE_MODELS: dict[str, list[str]] = {
+    "anthropic": [
+        "claude-3-7-sonnet-20250219",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+        "claude-opus-4-20250514",
+    ],
+    "openai": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o3",
+        "o4-mini",
+    ],
+    "ollama": [
+        "llama3",
+        "qwen2.5-coder:7b",
+    ],
+    "deepseek": [
+        "deepseek-chat",
+        "deepseek-reasoner",
+    ],
+    "groq": [
+        "llama-3-70b-8192",
+        "mixtral-8x7b-32768",
+    ],
+    "openai-compatible": [
+        "<your-model>",
+    ],
+}
 
-        return OpenAIProvider(model_name=config.model_name, api_key=config.api_key)
-    elif config.provider == "anthropic":
+
+def _build_provider(config: AshConfig) -> ProviderABC:
+    if config.provider == "anthropic":
         from providers.anthropic import AnthropicProvider
 
-        return AnthropicProvider(model_name=config.model_name, api_key=config.api_key)
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        base_url = os.environ.get("ANTHROPIC_API_BASE") or None
+        prov = AnthropicProvider(
+            model_name=config.model,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        prov.configure_max_tokens(config.max_completion_tokens)
+        return prov
+
+    elif config.provider == "openai":
+        from providers.openai import OpenAIProvider
+
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        base_url = os.environ.get("OPENAI_API_BASE") or None
+        prov = OpenAIProvider(
+            model_name=config.model,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        prov.configure_max_tokens(config.max_completion_tokens)
+        return prov
+
     elif config.provider == "ollama":
         from providers.ollama import OllamaProvider
 
-        return OllamaProvider(model_name=config.model_name)
+        base_url = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
+        prov = OllamaProvider(
+            model_name=config.model,
+            base_url=base_url,
+        )
+        prov.configure_max_tokens(config.max_completion_tokens)
+        return prov
+
+    elif config.provider == "deepseek":
+        from providers.deepseek import DeepSeekProvider
+
+        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        base_url = os.environ.get("DEEPSEEK_API_BASE") or None
+        prov = DeepSeekProvider(
+            model_name=config.model,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        prov.configure_max_tokens(config.max_completion_tokens)
+        return prov
+
+    elif config.provider == "groq":
+        from providers.groq import GroqProvider
+
+        api_key = os.environ.get("GROQ_API_KEY", "")
+        base_url = os.environ.get("GROQ_API_BASE") or None
+        prov = GroqProvider(
+            model_name=config.model,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        prov.configure_max_tokens(config.max_completion_tokens)
+        return prov
+
+    elif config.provider == "openai-compatible":
+        from providers.openai import OpenAIProvider
+
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        base_url = os.environ.get("OPENAI_API_BASE", "")
+        prov = OpenAIProvider(
+            model_name=config.model,
+            api_key=api_key,
+            base_url=base_url if base_url else None,
+        )
+        prov.configure_max_tokens(config.max_completion_tokens)
+        return prov
+
     raise ValueError(f"Unsupported provider: {config.provider!r}")
 
 
@@ -65,8 +161,57 @@ def _build_tools(
     }
 
 
-async def _repl(loop: AshLoop) -> int:
-    print("ash — type 'exit' to quit", flush=True)
+def _print_providers(config: AshConfig) -> None:
+    print("\nAvailable providers:")
+    for prov in AVAILABLE_MODELS:
+        marker = " (current)" if prov == config.provider else ""
+        print(f"  {prov}{marker}")
+    print()
+
+
+def _print_model_list(config: AshConfig) -> None:
+    print("\nAvailable models:")
+    for prov, models in AVAILABLE_MODELS.items():
+        marker = " (current)" if prov == config.provider else ""
+        print(f"  {prov}{marker}: {', '.join(models)}")
+    print()
+
+
+def _interactive_model_picker(config: AshConfig, loop: AshLoop) -> None:
+    """Show numbered list of all provider-model pairs, let user pick one."""
+    print("\nAvailable models:")
+    numbered: list[tuple[str, str]] = []
+    for i, (prov, models) in enumerate(AVAILABLE_MODELS.items(), 1):
+        for j, model in enumerate(models, 1):
+            marker = " ← current" if prov == config.provider and model == config.model else ""
+            print(f"  [{i}-{j}] {prov}/{model}{marker}")
+            numbered.append((prov, model))
+
+    choice = input("Pick [provider-model, or 'c' to cancel]: ").strip()
+    if choice.lower() == "c":
+        return
+    try:
+        parts = choice.split("-")
+        prov_idx = int(parts[0]) - 1
+        model_idx = int(parts[1]) - 1
+        prov_keys = list(AVAILABLE_MODELS.keys())
+        prov = prov_keys[prov_idx]
+        model = AVAILABLE_MODELS[prov][model_idx]
+    except (ValueError, IndexError, KeyError):
+        print("Invalid selection.")
+        return
+
+    loop.switch_provider(prov, model)
+    config.provider = prov
+    config.model = model
+    print(f"Switched to {prov}/{model}\n")
+
+
+async def _repl(loop: AshLoop, config: AshConfig) -> int:
+    print(
+        "ash — '/model' to switch, '/providers' to list, '/models' to list models, 'exit' to quit",
+        flush=True,
+    )
     while True:
         try:
             user_input = input("> ").strip()
@@ -77,6 +222,41 @@ async def _repl(loop: AshLoop) -> int:
             continue
         if user_input.lower() in {"exit", "quit"}:
             return 0
+
+        # /model with no args → interactive picker
+        if user_input == "/model":
+            _interactive_model_picker(config, loop)
+            continue
+
+        # /model <modelname> → switch model within current provider
+        if user_input.startswith("/model "):
+            arg = user_input[7:].strip()
+            # If it contains a slash, treat as provider/model
+            if "/" in arg:
+                prov, model = arg.split("/", 1)
+            else:
+                prov = config.provider
+                model = arg
+            try:
+                loop.switch_provider(prov, model)
+                config.provider = prov
+                config.model = model
+                print(f"Switched to {prov}/{model}", flush=True)
+            except Exception as exc:
+                print(f"Error: {exc}", file=sys.stderr, flush=True)
+            continue
+
+        # /providers → list
+        if user_input == "/providers":
+            _print_providers(config)
+            continue
+
+        # /models → list
+        if user_input == "/models":
+            _print_model_list(config)
+            continue
+
+        # Normal turn
         try:
             response = await loop.run_turn(user_input)
         except Exception as exc:  # noqa: BLE001
@@ -136,14 +316,17 @@ def main(argv: list[str] | None = None) -> int:
         ui=ui,
         project_root=config.workspace_root,
         tools=tools,
+        config=config,
     )
 
-    return asyncio.run(_bootstrap_and_repl(loop, session_id=args.session))
+    return asyncio.run(_bootstrap_and_repl(loop, config, session_id=args.session))
 
 
-async def _bootstrap_and_repl(loop: AshLoop, *, session_id: str | None) -> int:
+async def _bootstrap_and_repl(
+    loop: AshLoop, config: AshConfig, *, session_id: str | None
+) -> int:
     await loop.start_session(session_id)
-    return await _repl(loop)
+    return await _repl(loop, config)
 
 
 if __name__ == "__main__":

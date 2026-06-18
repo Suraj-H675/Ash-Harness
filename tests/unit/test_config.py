@@ -8,9 +8,8 @@ from config import AshConfig
 
 ENV_KEYS = [
     "ASH_PROVIDER",
-    "ASH_MODEL_NAME",
+    "ASH_MODEL",
     "ASH_TEMPERATURE",
-    "ASH_API_KEY",
     "ASH_MAX_CONTEXT_TOKENS",
     "ASH_MAX_COMPLETION_TOKENS",
     "ASH_MAX_TOOL_RESULT_TOKENS",
@@ -36,9 +35,8 @@ def test_config_loads_all_fields_from_ash_toml(tmp_path: Path, monkeypatch: pyte
         "\n".join(
             [
                 'provider = "openai"',
-                'model_name = "gpt-4.1"',
+                'model = "gpt-4o"',
                 "temperature = 0.7",
-                'api_key = "toml-key"',
                 "max_context_tokens = 64000",
                 "max_completion_tokens = 3000",
                 "max_tool_result_tokens = 12000",
@@ -55,9 +53,8 @@ def test_config_loads_all_fields_from_ash_toml(tmp_path: Path, monkeypatch: pyte
     config = AshConfig.load()
 
     assert config.provider == "openai"
-    assert config.model_name == "gpt-4.1"
+    assert config.model == "gpt-4o"
     assert config.temperature == 0.7
-    assert config.api_key == "toml-key"
     assert config.max_context_tokens == 64000
     assert config.max_completion_tokens == 3000
     assert config.max_tool_result_tokens == 12000
@@ -80,9 +77,8 @@ def test_environment_variables_override_ash_toml(
         "\n".join(
             [
                 'provider = "anthropic"',
-                'model_name = "claude-3-5-sonnet-20241022"',
+                'model = "claude-3-5-sonnet-20241022"',
                 "temperature = 0.0",
-                'api_key = "toml-key"',
                 "max_context_tokens = 128000",
                 "max_completion_tokens = 4000",
                 "max_tool_result_tokens = 20000",
@@ -97,9 +93,8 @@ def test_environment_variables_override_ash_toml(
     monkeypatch.chdir(tmp_path)
 
     monkeypatch.setenv("ASH_PROVIDER", "ollama")
-    monkeypatch.setenv("ASH_MODEL_NAME", "llama3.1")
+    monkeypatch.setenv("ASH_MODEL", "llama3.1")
     monkeypatch.setenv("ASH_TEMPERATURE", "0.2")
-    monkeypatch.setenv("ASH_API_KEY", "env-key")
     monkeypatch.setenv("ASH_MAX_CONTEXT_TOKENS", "32000")
     monkeypatch.setenv("ASH_MAX_COMPLETION_TOKENS", "2048")
     monkeypatch.setenv("ASH_MAX_TOOL_RESULT_TOKENS", "8000")
@@ -111,9 +106,8 @@ def test_environment_variables_override_ash_toml(
     config = AshConfig.load()
 
     assert config.provider == "ollama"
-    assert config.model_name == "llama3.1"
+    assert config.model == "llama3.1"
     assert config.temperature == 0.2
-    assert config.api_key == "env-key"
     assert config.max_context_tokens == 32000
     assert config.max_completion_tokens == 2048
     assert config.max_tool_result_tokens == 8000
@@ -123,8 +117,42 @@ def test_environment_variables_override_ash_toml(
     assert config.db_directory == env_db
 
 
-def test_api_key_is_required_without_env_or_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_config_loads_without_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """AshConfig no longer requires an api_key field — keys come from env vars."""
     monkeypatch.chdir(tmp_path)
 
-    with pytest.raises(ValidationError):
-        AshConfig.load()
+    # Should load without ValidationError (no required api_key field)
+    config = AshConfig.load()
+    assert config.provider == "anthropic"
+    assert config.model == "claude-3-7-sonnet-20250219"
+
+
+def test_backward_compat_ash_api_key_promoted_to_anthropic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASH_API_KEY should be promoted to ANTHROPIC_API_KEY for backward compat."""
+    import os
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ASH_API_KEY", "sk-ant-backcompat-key")
+
+    config = AshConfig.load()
+
+    # The promotion happens in model_post_init — ANTHROPIC_API_KEY should now be set
+    assert os.environ.get("ANTHROPIC_API_KEY") == "sk-ant-backcompat-key"
+
+
+def test_backward_compat_ash_model_name_promoted_to_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASH_MODEL_NAME should be promoted to ASH_MODEL for backward compat."""
+    import os
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ASH_MODEL_NAME", "claude-3-5-sonnet-20241022")
+
+    config = AshConfig.load()
+
+    # The promotion happens in model_post_init — ASH_MODEL should now be set
+    assert os.environ.get("ASH_MODEL") == "claude-3-5-sonnet-20241022"
+    assert config.model == "claude-3-5-sonnet-20241022"
