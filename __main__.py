@@ -184,34 +184,39 @@ def _print_model_list(config: AshConfig) -> None:
 
 
 def _interactive_model_picker(config: AshConfig, loop: AshLoop) -> None:
-    """Show numbered list of all provider-model pairs, let user pick one."""
+    """Show models grouped by provider, let user pick by provider number."""
     # Determine current
     try:
         current_provider, current_model = _parse_model_string(config.model)
     except ValueError:
         current_provider, current_model = "anthropic", config.model
 
-    print("\nAvailable models:")
-    numbered: list[str] = []
+    # Group by provider
+    grouped: dict[str, list[tuple[int, str]]] = {}
     for i, model_str in enumerate(AVAILABLE_MODELS, 1):
         prov, mod = _parse_model_string(model_str)
-        marker = " ← current" if prov == current_provider and mod == current_model else ""
-        print(f"  [{i}] {prov}/{mod}{marker}")
-        numbered.append(model_str)
+        grouped.setdefault(prov, []).append((i, mod, model_str))
 
-    choice = input("Pick a number (or 'c' to cancel): ").strip()
+    print("\nAvailable models:")
+    for prov, entries in grouped.items():
+        print(f"\n{prov.capitalize()}:")
+        for num, mod, _ in entries:
+            marker = " ← current" if prov == current_provider and mod == current_model else ""
+            print(f"  [{num}] {mod}{marker}")
+
+    choice = input("\nPick a number (or 'c' to cancel): ").strip()
     if choice.lower() == "c":
         return
     try:
         idx = int(choice) - 1
-        model_str = numbered[idx]
+        model_str = AVAILABLE_MODELS[idx]
     except (ValueError, IndexError):
         print("Invalid selection.")
         return
 
     try:
         loop.switch_model(model_str)
-        # config.provider is a read-only @property — do not assign to it
+        config.model = model_str
         print(f"Switched to {model_str}\n")
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -249,7 +254,7 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
                 continue
             try:
                 loop.switch_model(model_str)
-                # config.provider is a read-only @property — do not assign to it
+                config.model = model_str
                 print(f"Switched to {model_str}", flush=True)
             except Exception as exc:
                 print(f"Error: {exc}", file=sys.stderr, flush=True)

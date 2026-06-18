@@ -175,3 +175,16 @@ def test_backward_compat_ash_provider_prepends_ash_model(
     assert os.environ.get("ASH_MODEL") == "groq/llama-3.3-70b-versatile"
     assert config.model == "groq/llama-3.3-70b-versatile"
     assert config.provider == "groq"
+
+
+def test_ash_model_provider_format_used_as_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASH_MODEL already containing '/' is used as-is, no modification."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ASH_MODEL", "anthropic/claude-3-7-sonnet-20250219")
+
+    config = AshConfig.load()
+
+    assert config.model == "anthropic/claude-3-7-sonnet-20250219"
+    assert config.provider == "anthropic"
