@@ -7,7 +7,6 @@ from config import AshConfig
 
 
 ENV_KEYS = [
-    "ASH_PROVIDER",
     "ASH_MODEL",
     "ASH_TEMPERATURE",
     "ASH_MAX_CONTEXT_TOKENS",
@@ -34,8 +33,7 @@ def test_config_loads_all_fields_from_ash_toml(tmp_path: Path, monkeypatch: pyte
     (tmp_path / "ash.toml").write_text(
         "\n".join(
             [
-                'provider = "openai"',
-                'model = "gpt-4o"',
+                'model = "openai/gpt-4o"',
                 "temperature = 0.7",
                 "max_context_tokens = 64000",
                 "max_completion_tokens = 3000",
@@ -53,7 +51,7 @@ def test_config_loads_all_fields_from_ash_toml(tmp_path: Path, monkeypatch: pyte
     config = AshConfig.load()
 
     assert config.provider == "openai"
-    assert config.model == "gpt-4o"
+    assert config.model == "openai/gpt-4o"
     assert config.temperature == 0.7
     assert config.max_context_tokens == 64000
     assert config.max_completion_tokens == 3000
@@ -76,8 +74,7 @@ def test_environment_variables_override_ash_toml(
     (tmp_path / "ash.toml").write_text(
         "\n".join(
             [
-                'provider = "anthropic"',
-                'model = "claude-3-5-sonnet-20241022"',
+                'model = "anthropic/claude-3-5-sonnet-20241022"',
                 "temperature = 0.0",
                 "max_context_tokens = 128000",
                 "max_completion_tokens = 4000",
@@ -92,8 +89,9 @@ def test_environment_variables_override_ash_toml(
     )
     monkeypatch.chdir(tmp_path)
 
-    monkeypatch.setenv("ASH_PROVIDER", "ollama")
+    # ASH_MODEL without '/' gets ASH_PROVIDER prepended
     monkeypatch.setenv("ASH_MODEL", "llama3.1")
+    monkeypatch.setenv("ASH_PROVIDER", "ollama")
     monkeypatch.setenv("ASH_TEMPERATURE", "0.2")
     monkeypatch.setenv("ASH_MAX_CONTEXT_TOKENS", "32000")
     monkeypatch.setenv("ASH_MAX_COMPLETION_TOKENS", "2048")
@@ -105,8 +103,9 @@ def test_environment_variables_override_ash_toml(
 
     config = AshConfig.load()
 
+    # ASH_MODEL="llama3.1" + ASH_PROVIDER="ollama" → "ollama/llama3.1"
     assert config.provider == "ollama"
-    assert config.model == "llama3.1"
+    assert config.model == "ollama/llama3.1"
     assert config.temperature == 0.2
     assert config.max_context_tokens == 32000
     assert config.max_completion_tokens == 2048
@@ -124,7 +123,7 @@ def test_config_loads_without_api_key(tmp_path: Path, monkeypatch: pytest.Monkey
     # Should load without ValidationError (no required api_key field)
     config = AshConfig.load()
     assert config.provider == "anthropic"
-    assert config.model == "claude-3-7-sonnet-20250219"
+    assert config.model == "anthropic/claude-3-7-sonnet-20250219"
 
 
 def test_backward_compat_ash_api_key_promoted_to_anthropic(
@@ -145,7 +144,8 @@ def test_backward_compat_ash_api_key_promoted_to_anthropic(
 def test_backward_compat_ash_model_name_promoted_to_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """ASH_MODEL_NAME should be promoted to ASH_MODEL for backward compat."""
+    """ASH_MODEL_NAME should be promoted to ASH_MODEL for backward compat.
+    Without ASH_PROVIDER set, defaults to anthropic."""
     import os
 
     monkeypatch.chdir(tmp_path)
@@ -153,6 +153,25 @@ def test_backward_compat_ash_model_name_promoted_to_model(
 
     config = AshConfig.load()
 
-    # The promotion happens in model_post_init — ASH_MODEL should now be set
-    assert os.environ.get("ASH_MODEL") == "claude-3-5-sonnet-20241022"
-    assert config.model == "claude-3-5-sonnet-20241022"
+    # Promoted to ASH_MODEL with anthropic as default provider
+    assert os.environ.get("ASH_MODEL") == "anthropic/claude-3-5-sonnet-20241022"
+    assert config.model == "anthropic/claude-3-5-sonnet-20241022"
+    assert config.provider == "anthropic"
+
+
+def test_backward_compat_ash_provider_prepends_ash_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASH_MODEL without '/' gets ASH_PROVIDER prepended."""
+    import os
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ASH_PROVIDER", "groq")
+    monkeypatch.setenv("ASH_MODEL", "llama-3.3-70b-versatile")
+
+    config = AshConfig.load()
+
+    # Prepended to form provider/model string
+    assert os.environ.get("ASH_MODEL") == "groq/llama-3.3-70b-versatile"
+    assert config.model == "groq/llama-3.3-70b-versatile"
+    assert config.provider == "groq"

@@ -21,13 +21,9 @@ class AshConfig(BaseSettings):
         extra="ignore",
     )
 
-    provider: str = Field(
-        "anthropic",
-        description="Primary model provider: 'anthropic', 'openai', 'ollama', 'deepseek', 'groq', or 'openai-compatible'",
-    )
     model: str = Field(
-        "claude-3-7-sonnet-20250219",
-        description="Model name within the selected provider.",
+        "anthropic/claude-3-7-sonnet-20250219",
+        description="Model in provider/model string format (e.g. anthropic/claude-3-7-sonnet-20250219, ollama/qwen2.5-coder:7b)",
     )
     temperature: float = Field(0.0, description="Model generation temperature.")
 
@@ -97,6 +93,16 @@ class AshConfig(BaseSettings):
         description="Path to ONNX MiniLM model for local embeddings",
     )
 
+    @property
+    def provider(self) -> str:
+        """Parse provider from the model string."""
+        return self.model.split("/", 1)[0]
+
+    @property
+    def model_name(self) -> str:
+        """Parse model name from the model string."""
+        return self.model.split("/", 1)[1]
+
     @classmethod
     def settings_customise_sources(
         cls,
@@ -131,12 +137,20 @@ class AshConfig(BaseSettings):
         if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ASH_API_KEY"):
             os.environ["ANTHROPIC_API_KEY"] = os.environ["ASH_API_KEY"]
 
-        # Backward compat: ASH_MODEL_NAME → ASH_MODEL. Pydantic already resolved
-        # `model` before this runs, so retroactively override it.
+        # Backward compat: ASH_MODEL_NAME → ASH_MODEL with provider prefix.
+        # Old ASH_MODEL_NAME set but no ASH_MODEL — promote, defaulting to anthropic.
         if not os.environ.get("ASH_MODEL") and os.environ.get("ASH_MODEL_NAME"):
-            os.environ["ASH_MODEL"] = os.environ["ASH_MODEL_NAME"]
-            # Override the already-resolved field value using Pydantic's internals.
-            object.__setattr__(self, "model", os.environ["ASH_MODEL_NAME"])
+            provider_val = os.environ.get("ASH_PROVIDER", "anthropic")
+            os.environ["ASH_MODEL"] = f"{provider_val}/{os.environ['ASH_MODEL_NAME']}"
+            object.__setattr__(self, "model", os.environ["ASH_MODEL"])
+
+        # Backward compat: ASH_MODEL without "/" → prepend ASH_PROVIDER if set.
+        model_val = os.environ.get("ASH_MODEL", "")
+        provider_val = os.environ.get("ASH_PROVIDER", "")
+        if model_val and "/" not in model_val and provider_val:
+            new_model = f"{provider_val}/{model_val}"
+            os.environ["ASH_MODEL"] = new_model
+            object.__setattr__(self, "model", new_model)
 
         # Load MCP servers from .mcp.json if not already populated.
         if not self.mcp_servers:

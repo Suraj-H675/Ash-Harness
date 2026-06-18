@@ -31,117 +31,114 @@ from tools.git import AutoCommitTool
 from ui.terminal import TerminalUI
 
 
-AVAILABLE_MODELS: dict[str, list[str]] = {
-    "anthropic": [
-        "claude-3-7-sonnet-20250219",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-5-haiku-20241022",
-        "claude-opus-4-20250514",
-    ],
-    "openai": [
-        "gpt-4o",
-        "gpt-4o-mini",
-        "o3",
-        "o4-mini",
-    ],
-    "ollama": [
-        "llama3",
-        "qwen2.5-coder:7b",
-    ],
-    "deepseek": [
-        "deepseek-chat",
-        "deepseek-reasoner",
-    ],
-    "groq": [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "qwen/qwen3.3-32b",
-        "groq/compound-mini",
-    ],
-    "openai-compatible": [
-        "<your-model>",
-    ],
-}
+AVAILABLE_MODELS: list[str] = [
+    "anthropic/claude-3-7-sonnet-20250219",
+    "anthropic/claude-3-5-sonnet-20241022",
+    "anthropic/claude-3-5-haiku-20241022",
+    "anthropic/claude-opus-4-20250514",
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
+    "openai/o3",
+    "openai/o4-mini",
+    "ollama/llama3",
+    "ollama/qwen2.5-coder:7b",
+    "deepseek/deepseek-chat",
+    "deepseek/deepseek-reasoner",
+    "groq/llama-3.3-70b-versatile",
+    "groq/llama-3.1-8b-instant",
+    "groq/qwen3.3-32b",
+    "groq/compound-mini",
+    "openai-compatible/<your-model>",
+]
+
+
+def _parse_model_string(model: str) -> tuple[str, str]:
+    """Parse 'provider/model' string into (provider, model_name)."""
+    if "/" not in model:
+        raise ValueError(f"Model string must be in 'provider/model' format, got: {model!r}")
+    provider, model_name = model.split("/", 1)
+    return provider, model_name
 
 
 def _build_provider(config: AshConfig) -> ProviderABC:
-    if config.provider == "anthropic":
+    provider, model_name = _parse_model_string(config.model)
+    if provider == "anthropic":
         from providers.anthropic import AnthropicProvider
 
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         base_url = os.environ.get("ANTHROPIC_API_BASE") or None
         prov = AnthropicProvider(
-            model_name=config.model,
+            model_name=model_name,
             api_key=api_key,
             base_url=base_url,
         )
         prov.configure_max_tokens(config.max_completion_tokens)
         return prov
 
-    elif config.provider == "openai":
+    elif provider == "openai":
         from providers.openai import OpenAIProvider
 
         api_key = os.environ.get("OPENAI_API_KEY", "")
         base_url = os.environ.get("OPENAI_API_BASE") or None
         prov = OpenAIProvider(
-            model_name=config.model,
+            model_name=model_name,
             api_key=api_key,
             base_url=base_url,
         )
         prov.configure_max_tokens(config.max_completion_tokens)
         return prov
 
-    elif config.provider == "ollama":
+    elif provider == "ollama":
         from providers.ollama import OllamaProvider
 
         base_url = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
         prov = OllamaProvider(
-            model_name=config.model,
+            model_name=model_name,
             base_url=base_url,
         )
         prov.configure_max_tokens(config.max_completion_tokens)
         return prov
 
-    elif config.provider == "deepseek":
+    elif provider == "deepseek":
         from providers.deepseek import DeepSeekProvider
 
         api_key = os.environ.get("DEEPSEEK_API_KEY", "")
         base_url = os.environ.get("DEEPSEEK_API_BASE") or None
         prov = DeepSeekProvider(
-            model_name=config.model,
+            model_name=model_name,
             api_key=api_key,
             base_url=base_url,
         )
         prov.configure_max_tokens(config.max_completion_tokens)
         return prov
 
-    elif config.provider == "groq":
+    elif provider == "groq":
         from providers.groq import GroqProvider
 
         api_key = os.environ.get("GROQ_API_KEY", "")
         base_url = os.environ.get("GROQ_API_BASE") or None
         prov = GroqProvider(
-            model_name=config.model,
+            model_name=model_name,
             api_key=api_key,
             base_url=base_url,
         )
         prov.configure_max_tokens(config.max_completion_tokens)
         return prov
 
-    elif config.provider == "openai-compatible":
+    elif provider == "openai-compatible":
         from providers.openai import OpenAIProvider
 
         api_key = os.environ.get("OPENAI_API_KEY", "")
         base_url = os.environ.get("OPENAI_API_BASE", "")
         prov = OpenAIProvider(
-            model_name=config.model,
+            model_name=model_name,
             api_key=api_key,
             base_url=base_url if base_url else None,
         )
         prov.configure_max_tokens(config.max_completion_tokens)
         return prov
 
-    raise ValueError(f"Unsupported provider: {config.provider!r}")
+    raise ValueError(f"Unknown provider in model string: {provider!r}")
 
 
 def _build_tools(
@@ -163,55 +160,66 @@ def _build_tools(
     }
 
 
-def _print_providers(config: AshConfig) -> None:
-    print("\nAvailable providers:")
-    for prov in AVAILABLE_MODELS:
-        marker = " (current)" if prov == config.provider else ""
-        print(f"  {prov}{marker}")
-    print()
-
-
 def _print_model_list(config: AshConfig) -> None:
+    """Show models grouped by provider."""
+    # Determine current provider/model
+    try:
+        current_provider, current_model = _parse_model_string(config.model)
+    except ValueError:
+        current_provider, current_model = "anthropic", config.model
+
+    # Group by provider
+    grouped: dict[str, list[str]] = {}
+    for m in AVAILABLE_MODELS:
+        prov, mod = _parse_model_string(m)
+        grouped.setdefault(prov, []).append(mod)
+
     print("\nAvailable models:")
-    for prov, models in AVAILABLE_MODELS.items():
-        marker = " (current)" if prov == config.provider else ""
-        print(f"  {prov}{marker}: {', '.join(models)}")
+    for prov, models in grouped.items():
+        print(f"\n{prov.capitalize()}:")
+        for model in models:
+            marker = " (current)" if prov == current_provider and model == current_model else ""
+            print(f"  {model}{marker}")
     print()
 
 
 def _interactive_model_picker(config: AshConfig, loop: AshLoop) -> None:
     """Show numbered list of all provider-model pairs, let user pick one."""
-    print("\nAvailable models:")
-    numbered: list[tuple[str, str]] = []
-    for i, (prov, models) in enumerate(AVAILABLE_MODELS.items(), 1):
-        for j, model in enumerate(models, 1):
-            marker = " ← current" if prov == config.provider and model == config.model else ""
-            print(f"  [{i}-{j}] {prov}/{model}{marker}")
-            numbered.append((prov, model))
+    # Determine current
+    try:
+        current_provider, current_model = _parse_model_string(config.model)
+    except ValueError:
+        current_provider, current_model = "anthropic", config.model
 
-    choice = input("Pick [provider-model, or 'c' to cancel]: ").strip()
+    print("\nAvailable models:")
+    numbered: list[str] = []
+    for i, model_str in enumerate(AVAILABLE_MODELS, 1):
+        prov, mod = _parse_model_string(model_str)
+        marker = " ← current" if prov == current_provider and mod == current_model else ""
+        print(f"  [{i}] {prov}/{mod}{marker}")
+        numbered.append(model_str)
+
+    choice = input("Pick a number (or 'c' to cancel): ").strip()
     if choice.lower() == "c":
         return
     try:
-        parts = choice.split("-")
-        prov_idx = int(parts[0]) - 1
-        model_idx = int(parts[1]) - 1
-        prov_keys = list(AVAILABLE_MODELS.keys())
-        prov = prov_keys[prov_idx]
-        model = AVAILABLE_MODELS[prov][model_idx]
-    except (ValueError, IndexError, KeyError):
+        idx = int(choice) - 1
+        model_str = numbered[idx]
+    except (ValueError, IndexError):
         print("Invalid selection.")
         return
 
-    loop.switch_provider(prov, model)
-    config.provider = prov
-    config.model = model
-    print(f"Switched to {prov}/{model}\n")
+    try:
+        loop.switch_model(model_str)
+        # config.provider is a read-only @property — do not assign to it
+        print(f"Switched to {model_str}\n")
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
 
 
 async def _repl(loop: AshLoop, config: AshConfig) -> int:
     print(
-        "ash — '/model' to switch, '/providers' to list, '/models' to list models, 'exit' to quit",
+        "ash — '/model' to switch, '/models' to list models, 'exit' to quit",
         flush=True,
     )
     while True:
@@ -230,27 +238,21 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
             _interactive_model_picker(config, loop)
             continue
 
-        # /model <modelname> → switch model within current provider
+        # /model provider/model → switch to full string
         if user_input.startswith("/model "):
-            arg = user_input[7:].strip()
-            # If it contains a slash, treat as provider/model
-            if "/" in arg:
-                prov, model = arg.split("/", 1)
-            else:
-                prov = config.provider
-                model = arg
+            model_str = user_input[7:].strip()
+            if "/" not in model_str:
+                print(
+                    "Error: model must be in provider/model format (e.g. anthropic/claude-3-7-sonnet)",
+                    file=sys.stderr,
+                )
+                continue
             try:
-                loop.switch_provider(prov, model)
-                config.provider = prov
-                config.model = model
-                print(f"Switched to {prov}/{model}", flush=True)
+                loop.switch_model(model_str)
+                # config.provider is a read-only @property — do not assign to it
+                print(f"Switched to {model_str}", flush=True)
             except Exception as exc:
                 print(f"Error: {exc}", file=sys.stderr, flush=True)
-            continue
-
-        # /providers → list
-        if user_input == "/providers":
-            _print_providers(config)
             continue
 
         # /models → list

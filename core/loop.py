@@ -800,7 +800,8 @@ class AshLoop:
         if self._config is None:
             raise RuntimeError("AshLoop was not constructed with a config object")
 
-        new_config = self._config.model_copy(update={"provider": provider, "model": model})
+        model_str = f"{provider}/{model}"
+        new_config = self._config.model_copy(update={"model": model_str})
         self.provider = _build_provider(new_config)
         self._config = new_config
         # Re-configure skills runtime with new provider.
@@ -813,10 +814,22 @@ class AshLoop:
             )
 
     def switch_model(self, model: str) -> None:
-        """Switch model within the current provider."""
+        """Switch to a model string. If model contains '/', treat as provider/model.
+        Otherwise, prepend the current provider."""
+        from __main__ import _build_provider  # lazy import to avoid circular
+
         if self._config is None:
             raise RuntimeError("AshLoop was not constructed with a config object")
-        self.switch_provider(self._config.provider, model)
+
+        if "/" in model:
+            # Full provider/model string
+            new_config = self._config.model_copy(update={"model": model})
+        else:
+            # Model-only — prepend current provider
+            current_provider = self._config.model.split("/", 1)[0]
+            new_config = self._config.model_copy(update={"model": f"{current_provider}/{model}"})
+        self.provider = _build_provider(new_config)
+        self._config = new_config
 
 
 MAX_RETRIES = 2
