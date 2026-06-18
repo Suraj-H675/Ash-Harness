@@ -253,13 +253,15 @@ def test_circuit_breaker_trips_after_repeated_failures(
         max_turn_iterations=10,
     )
 
-    # Three consecutive failures should trip and surface a CircuitBreakerError.
-    with pytest.raises(CircuitBreakerError):
-        asyncio.run(loop.run_turn("keep trying"))
+    # Three consecutive failures should trip the breaker.
+    # The loop catches CircuitBreakerError internally and returns a message.
+    result = asyncio.run(loop.run_turn("keep trying"))
 
     # Three tool calls were attempted before the trip.
     assert read_tool.calls == 3
     assert cb.is_tripped
+    # Loop returns a friendly message instead of propagating the error.
+    assert "circuit breaker" in result.lower()
 
 
 def test_unknown_tool_breaks_loop_without_tripping_breaker(
