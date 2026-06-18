@@ -15,6 +15,20 @@ ENV_KEYS = [
     "ASH_WORKSPACE_ROOT",
     "ASH_COMMAND_BLOCKLIST",
     "ASH_DB_DIRECTORY",
+    # Provider API keys — clear these so they don't pollute tests
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_API_BASE",
+    "OPENAI_API_KEY",
+    "OPENAI_API_BASE",
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_API_BASE",
+    "GROQ_API_KEY",
+    "GROQ_API_BASE",
+    "OLLAMA_API_BASE",
+    # Backward compat
+    "ASH_API_KEY",
+    "ASH_MODEL_NAME",
+    "ASH_PROVIDER",
 ]
 
 

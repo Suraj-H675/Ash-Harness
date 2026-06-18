@@ -39,10 +39,10 @@ class _FakeGetpass:
 class TestHasProviderConfigured:
     """Tests for _has_provider_configured."""
 
-    def test_true_when_model_has_slash(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Model in provider/model format counts as configured."""
+    def test_true_when_api_key_set_for_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """provider/model + matching API key = configured."""
         mock_config = MagicMock(model="anthropic/claude-3-5-sonnet")
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
@@ -54,8 +54,8 @@ class TestHasProviderConfigured:
             assert _has_provider_configured(mock_config) is True
 
     def test_true_when_api_key_in_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """API key in env vars counts as configured."""
-        mock_config = MagicMock(model="")
+        """API key in env vars + provider/model format = configured."""
+        mock_config = MagicMock(model="anthropic/claude-3-5-sonnet")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
@@ -70,8 +70,9 @@ class TestHasProviderConfigured:
     def test_true_when_custom_providers_exist(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Custom providers in ash.toml count as configured."""
-        mock_config = MagicMock(model="")
+        """Custom provider in config.custom_providers = configured."""
+        mock_config = MagicMock(model="my-minimax/MiniMax-M2.7")
+        mock_config.custom_providers = {"my-minimax": {"base_url": "https://api.minimax.io/v1"}}
         for key in (
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
@@ -81,10 +82,7 @@ class TestHasProviderConfigured:
             monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("HOME", "/tmp")
 
-        with patch(
-            "cli.setup.load_config",
-            return_value={"custom_providers": {"my-minimax": {}}},
-        ):
+        with patch("cli.setup.load_config", return_value={}):
             from cli.setup import _has_provider_configured
 
             assert _has_provider_configured(mock_config) is True
