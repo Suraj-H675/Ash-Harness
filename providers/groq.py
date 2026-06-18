@@ -17,20 +17,22 @@ from providers.base import ProviderABC, StreamChunk, TokenCounterLike
 class GroqProvider(ProviderABC):
     def __init__(
         self,
-        model_name: str = "llama-3-70b-8192",
+        model_name: str = "llama-3.3-70b-versatile",
         api_key: str = "",
         *,
         base_url: str | None = None,
         token_counter: TokenCounterLike | None = None,
     ) -> None:
+        if not api_key:
+            raise ValueError(
+                "Groq API key is required. "
+                "Set the GROQ_API_KEY environment variable or pass api_key."
+            )
         self._model_name = model_name
         self._api_key = api_key
         self._base_url = base_url or "https://api.groq.com/openai/v1"
         self._token_counter = token_counter or AnthropicTokenCounter()
-        self._client = openai.AsyncOpenAI(
-            api_key=api_key,
-            base_url=self._base_url,
-        )
+        self._client = openai.AsyncOpenAI(api_key=api_key, base_url=self._base_url)
 
     @property
     def model_name(self) -> str:

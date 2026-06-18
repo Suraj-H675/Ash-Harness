@@ -23,14 +23,16 @@ class DeepSeekProvider(ProviderABC):
         base_url: str | None = None,
         token_counter: TokenCounterLike | None = None,
     ) -> None:
+        if not api_key:
+            raise ValueError(
+                "DeepSeek API key is required. "
+                "Set the DEEPSEEK_API_KEY environment variable or pass api_key."
+            )
         self._model_name = model_name
         self._api_key = api_key
-        self._base_url = base_url
+        self._base_url = base_url or "https://api.deepseek.com/v1"
         self._token_counter = token_counter or AnthropicTokenCounter()
-        self._client = openai.AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url if base_url else None,
-        )
+        self._client = openai.AsyncOpenAI(api_key=api_key, base_url=self._base_url)
 
     @property
     def model_name(self) -> str:

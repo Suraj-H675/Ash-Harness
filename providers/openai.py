@@ -18,13 +18,16 @@ class OpenAIProvider(ProviderABC):
         base_url: str | None = None,
         token_counter: TokenCounterLike | None = None,
     ) -> None:
+        if not api_key:
+            raise ValueError(
+                "OpenAI API key is required. "
+                "Set the OPENAI_API_KEY environment variable or pass api_key."
+            )
         self._model_name = model_name
         self._api_key = api_key
+        self._base_url = base_url
         self._token_counter = token_counter or OpenAITokenCounter(model_name)
-        self._client = openai.AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url if base_url else None,
-        )
+        self._client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
 
     @property
     def model_name(self) -> str:
@@ -59,7 +62,6 @@ class OpenAIProvider(ProviderABC):
             delta = chunk.choices[0].delta
             content = delta.content or ""
             is_done = chunk.choices[0].finish_reason is not None
-            # Extract token usage from the final chunk's usage dict.
             prompt_tokens = 0
             completion_tokens = 0
             stop_reason = None
