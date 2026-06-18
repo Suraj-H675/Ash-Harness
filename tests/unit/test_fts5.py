@@ -1,6 +1,5 @@
 """Tests for sliding-window chunker and FTS5 lexical search (Sprint 6)."""
 
-import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -120,11 +119,7 @@ def test_chunker_covers_every_line_in_input() -> None:
 
     chunks = sliding_window_chunk(content, "preserve.py")
 
-    covered = {
-        line
-        for chunk in chunks
-        for line in chunk.content.splitlines()
-    }
+    covered = {line for chunk in chunks for line in chunk.content.splitlines()}
 
     assert covered == set(lines)
 
@@ -182,7 +177,9 @@ def test_fts5_index_document_inserts_chunks(fts5_index: FTS5Index) -> None:
     assert "greet" in results[0]["content"]
 
 
-def test_fts5_index_document_with_sha256_updates_metadata(fts5_index: FTS5Index) -> None:
+def test_fts5_index_document_with_sha256_updates_metadata(
+    fts5_index: FTS5Index,
+) -> None:
     chunks = _chunks("a.py", "alpha content")
     sha = "abc123def456"
 

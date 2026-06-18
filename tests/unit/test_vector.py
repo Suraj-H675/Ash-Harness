@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -201,7 +200,9 @@ def test_in_memory_index_empty_returns_no_hits() -> None:
 def test_chroma_index_round_trip(tmp_path: Path) -> None:
     if not vector_extras_available():
         pytest.skip("chromadb not installed in this environment")
-    index = ChromaIndex(persist_directory=tmp_path / "chroma", collection_name="ash_test")
+    index = ChromaIndex(
+        persist_directory=tmp_path / "chroma", collection_name="ash_test"
+    )
     index.add(
         ids=["d1", "d2", "d3"],
         embeddings=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -225,7 +226,12 @@ def test_chroma_index_round_trip(tmp_path: Path) -> None:
 def test_fts5_fallback_returns_top_chunks(tmp_path: Path) -> None:
     fts = FTS5Index(tmp_path / "fts.db")
     chunks = [
-        Chunk(file_path="alpha.py", start_line=1, end_line=2, content="def foo(): pass\nclass Bar: pass"),
+        Chunk(
+            file_path="alpha.py",
+            start_line=1,
+            end_line=2,
+            content="def foo(): pass\nclass Bar: pass",
+        ),
         Chunk(file_path="beta.py", start_line=1, end_line=1, content="x = 42"),
     ]
     fts.index_document("alpha.py", [chunks[0]])
@@ -240,7 +246,9 @@ def test_fts5_fallback_returns_top_chunks(tmp_path: Path) -> None:
 
 def test_fts5_query_helper_returns_rows(tmp_path: Path) -> None:
     fts = FTS5Index(tmp_path / "fts2.db")
-    chunks = [Chunk(file_path="g.py", start_line=1, end_line=1, content="print('hello')")]
+    chunks = [
+        Chunk(file_path="g.py", start_line=1, end_line=1, content="print('hello')")
+    ]
     fts.index_document("g.py", chunks)
     rows = fts5_query(tmp_path / "fts2.db", "hello", top_k=5)
     assert isinstance(rows, list)
@@ -256,7 +264,9 @@ def test_pipeline_serves_vector_path_when_index_available() -> None:
     async def runner() -> tuple[list, str]:
         adapter = DeterministicEmbedding()
         index = InMemoryVectorIndex()
-        pipeline = VectorSearchPipeline(adapter=adapter, vector_index=index, lexical_index=None)
+        pipeline = VectorSearchPipeline(
+            adapter=adapter, vector_index=index, lexical_index=None
+        )
         chunks = [
             Chunk(file_path="a.py", start_line=1, end_line=1, content="alpha"),
             Chunk(file_path="b.py", start_line=1, end_line=1, content="beta"),
@@ -270,11 +280,17 @@ def test_pipeline_serves_vector_path_when_index_available() -> None:
     assert hits[0].content == "alpha"
 
 
-def test_pipeline_falls_back_to_lexical_when_vector_backend_unavailable(tmp_path: Path) -> None:
+def test_pipeline_falls_back_to_lexical_when_vector_backend_unavailable(
+    tmp_path: Path,
+) -> None:
     fts = FTS5Index(tmp_path / "fb.db")
     fts.index_document(
         "a.py",
-        [Chunk(file_path="a.py", start_line=1, end_line=1, content="def hello(): pass")],
+        [
+            Chunk(
+                file_path="a.py", start_line=1, end_line=1, content="def hello(): pass"
+            )
+        ],
     )
     fallback = FTS5FallbackIndex(fts)
 
@@ -304,7 +320,11 @@ def test_pipeline_falls_back_when_embedding_adapter_unavailable(tmp_path: Path) 
     fts = FTS5Index(tmp_path / "fb2.db")
     fts.index_document(
         "a.py",
-        [Chunk(file_path="a.py", start_line=1, end_line=1, content="def greet(): pass")],
+        [
+            Chunk(
+                file_path="a.py", start_line=1, end_line=1, content="def greet(): pass"
+            )
+        ],
     )
     fallback = FTS5FallbackIndex(fts)
 

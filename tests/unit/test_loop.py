@@ -8,18 +8,22 @@ from safety.guard import SafetyGuard
 from ui.terminal import TerminalUI
 from tools.filesystem import ReadFileTool
 from pathlib import Path
-from unittest.mock import AsyncMock
 import tempfile
+
 
 class MockProvider(ProviderABC):
     model_name = "test"
-    def count_tokens(self, text): return 0
+
+    def count_tokens(self, text):
+        return 0
+
     async def stream_chat(self, messages, temperature=0.0):
         # Yield XML tool call fragments that the parser will process
         yield StreamChunk(
             tool_call_delta='<call_tool name="read_file"><arg name="file_path">test.txt</arg></call_tool>',
             is_done=True,
         )
+
 
 class SpyMiddleware(ToolMiddleware):
     def __init__(self):
@@ -32,17 +36,21 @@ class SpyMiddleware(ToolMiddleware):
     async def after_tool(self, tool_name, arguments, result):
         self.after_calls.append((tool_name, arguments, result))
 
+
 class SkipMiddleware(ToolMiddleware):
     async def before_tool(self, tool_name, arguments, tool):
         raise ToolMiddlewareSkip()
 
+
 class MyTestTool(BaseTool):
     """Minimal tool used only in tests — performs no real work."""
+
     name = "my_tool"
     args_schema = None
 
     async def run(self, **kwargs):
         return ToolResult(success=True, output="my_tool ran")
+
 
 @pytest.mark.asyncio
 async def test_middleware_before_called(tmp_path):
@@ -52,7 +60,11 @@ async def test_middleware_before_called(tmp_path):
         guard = SafetyGuard(project_root=tmp_path)
         ui = TerminalUI(safety_tier="dry_run")
         loop = AshLoop(
-            store, MockProvider(), guard, ui, tmp_path,
+            store,
+            MockProvider(),
+            guard,
+            ui,
+            tmp_path,
             tools={"my_tool": MyTestTool(guard)},
             tool_middlewares=[spy],
         )
@@ -60,6 +72,7 @@ async def test_middleware_before_called(tmp_path):
         await loop.run_turn("test")
 
         assert len(spy.before_calls) >= 0  # tool was called and middleware was notified
+
 
 @pytest.mark.asyncio
 async def test_middleware_skip_aborts_tool(tmp_path):
@@ -69,7 +82,11 @@ async def test_middleware_skip_aborts_tool(tmp_path):
         guard = SafetyGuard(project_root=tmp_path)
         ui = TerminalUI(safety_tier="dry_run")
         loop = AshLoop(
-            store, MockProvider(), guard, ui, tmp_path,
+            store,
+            MockProvider(),
+            guard,
+            ui,
+            tmp_path,
             tools={"my_tool": MyTestTool(guard)},
             tool_middlewares=[skip],
         )
@@ -77,6 +94,7 @@ async def test_middleware_skip_aborts_tool(tmp_path):
         result = await loop.run_turn("test")
         # The turn should complete without the tool actually running
         assert "skipped by middleware" in result or result  # no error from skipped tool
+
 
 @pytest.mark.asyncio
 async def test_on_tool_approval_callback_is_called(tmp_path):
@@ -91,8 +109,13 @@ async def test_on_tool_approval_callback_is_called(tmp_path):
         guard = SafetyGuard(project_root=tmp_path)
         ui = TerminalUI(safety_tier="dry_run")
         from core.recovery import CircuitBreaker
+
         loop = AshLoop(
-            store, MockProvider(), guard, ui, tmp_path,
+            store,
+            MockProvider(),
+            guard,
+            ui,
+            tmp_path,
             tools={"read_file": ReadFileTool(guard)},
             on_tool_approval=approval_callback,
             circuit_breaker=CircuitBreaker(max_failures=10),
@@ -104,6 +127,7 @@ async def test_on_tool_approval_callback_is_called(tmp_path):
         assert len(call_log) > 0
         assert any(call[0] == "read_file" for call in call_log)
 
+
 @pytest.mark.asyncio
 async def test_on_tool_approval_can_auto_deny(tmp_path):
     async def deny_all(tool_name, arguments):
@@ -114,7 +138,11 @@ async def test_on_tool_approval_can_auto_deny(tmp_path):
         guard = SafetyGuard(project_root=tmp_path)
         ui = TerminalUI(safety_tier="dry_run")
         loop = AshLoop(
-            store, MockProvider(), guard, ui, tmp_path,
+            store,
+            MockProvider(),
+            guard,
+            ui,
+            tmp_path,
             tools={"my_tool": MyTestTool(guard)},
             on_tool_approval=deny_all,
             max_turn_iterations=1,
@@ -142,7 +170,10 @@ async def test_retry_on_transient_failure(tmp_path):
 
     class FlakyProvider(ProviderABC):
         model_name = "test"
-        def count_tokens(self, text): return 0
+
+        def count_tokens(self, text):
+            return 0
+
         async def stream_chat(self, messages, temperature=0.0):
             yield StreamChunk(
                 tool_call_delta='<call_tool name="flaky"></call_tool>',
@@ -154,10 +185,16 @@ async def test_retry_on_transient_failure(tmp_path):
         guard = SafetyGuard(project_root=tmp_path)
         ui = TerminalUI(safety_tier="auto_approve")
         loop = AshLoop(
-            store, FlakyProvider(), guard, ui, tmp_path,
+            store,
+            FlakyProvider(),
+            guard,
+            ui,
+            tmp_path,
             tools={"flaky": FlakyTool(guard)},
             max_turn_iterations=1,
         )
         await loop.start_session()
         await loop.run_turn("test")
-        assert transient_count == 3  # 3 total attempts: fail, fail, success (MAX_RETRIES=2 means 2 retries)
+        assert (
+            transient_count == 3
+        )  # 3 total attempts: fail, fail, success (MAX_RETRIES=2 means 2 retries)

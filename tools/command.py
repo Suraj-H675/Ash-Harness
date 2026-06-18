@@ -55,7 +55,9 @@ class RunCommandTool(BaseTool):
         sandbox_manager: SandboxManager | None = None,
     ) -> None:
         super().__init__(safety_guard)
-        self.project_root = project_root if project_root is not None else safety_guard.project_root
+        self.project_root = (
+            project_root if project_root is not None else safety_guard.project_root
+        )
         self.sandbox_manager = sandbox_manager
 
     async def run(self, **kwargs: Any) -> ToolResult:

@@ -19,7 +19,6 @@ from core.sprint import (
     looks_like_sprint_request,
 )
 from providers.base import StreamChunk
-from safety.guard import SafetyGuard
 from ui.terminal import TerminalUI
 
 
@@ -143,7 +142,10 @@ git revert HEAD and re-run the suite
         "JWT tokens expire after 1 hour",
         "All tests pass",
     )
-    assert [str(p) for p in contract.files_in_scope] == ["auth/models.py", "auth/views.py"]
+    assert [str(p) for p in contract.files_in_scope] == [
+        "auth/models.py",
+        "auth/views.py",
+    ]
     assert [str(p) for p in contract.files_off_limits] == ["config/secrets.py"]
     assert contract.test_command == "pytest tests/auth/"
     assert "git revert HEAD" in contract.rollback_plan
@@ -163,7 +165,9 @@ def test_parse_sprint_response_with_missing_checklist_returns_empty_items() -> N
 
 
 def test_parse_sprint_response_uses_fallback_when_goal_missing() -> None:
-    exec = parse_sprint_response("## Checklist\n### X\n- [ ] only item\n", fallback_goal="from fallback")
+    exec = parse_sprint_response(
+        "## Checklist\n### X\n- [ ] only item\n", fallback_goal="from fallback"
+    )
     assert exec.contract.goal == "from fallback"
     assert len(exec.items) == 1
 
@@ -240,8 +244,20 @@ def test_sprint_save_and_load_round_trip(tmp_path: Path) -> None:
     session = store.create_session(str(tmp_path))
 
     items = [
-        ChecklistItem(idx=1, section="Impl", description="step a", status=ChecklistStatus.DONE, notes="ok"),
-        ChecklistItem(idx=2, section="Impl", description="step b", status=ChecklistStatus.SKIPPED, notes=""),
+        ChecklistItem(
+            idx=1,
+            section="Impl",
+            description="step a",
+            status=ChecklistStatus.DONE,
+            notes="ok",
+        ),
+        ChecklistItem(
+            idx=2,
+            section="Impl",
+            description="step b",
+            status=ChecklistStatus.SKIPPED,
+            notes="",
+        ),
     ]
     contract = SprintContract(
         goal="add foo",
@@ -351,9 +367,15 @@ def test_progress_counts_done_and_skipped() -> None:
     exec = SprintExecution(contract=SprintContract(goal="x"))
     exec.set_items(
         [
-            ChecklistItem(idx=1, section="A", description="a", status=ChecklistStatus.DONE),
-            ChecklistItem(idx=2, section="A", description="b", status=ChecklistStatus.SKIPPED),
-            ChecklistItem(idx=3, section="A", description="c", status=ChecklistStatus.PENDING),
+            ChecklistItem(
+                idx=1, section="A", description="a", status=ChecklistStatus.DONE
+            ),
+            ChecklistItem(
+                idx=2, section="A", description="b", status=ChecklistStatus.SKIPPED
+            ),
+            ChecklistItem(
+                idx=3, section="A", description="c", status=ChecklistStatus.PENDING
+            ),
         ]
     )
     done, total = exec.progress

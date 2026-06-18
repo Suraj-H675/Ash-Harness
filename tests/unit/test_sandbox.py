@@ -24,7 +24,6 @@ from sandbox import (
 )
 from sandbox.bwrap import probe_bwrap
 from sandbox.docker import probe_docker
-from sandbox.manager import _run_scoped
 from tools.command import RunCommandTool
 
 
@@ -34,7 +33,9 @@ from tools.command import RunCommandTool
 
 
 def test_has_bwrap_matches_probe() -> None:
-    assert has_bwrap() is (probe_bwrap() is not None and sys.platform.startswith("linux"))
+    assert has_bwrap() is (
+        probe_bwrap() is not None and sys.platform.startswith("linux")
+    )
 
 
 def test_has_docker_matches_probe() -> None:
@@ -55,42 +56,52 @@ def test_has_sandbox_exec_only_on_macos() -> None:
 
 
 def test_manager_picks_highest_available_tier(tmp_path: Path) -> None:
-    with patch("sandbox.manager.has_docker", return_value=False), \
-         patch("sandbox.manager.has_bwrap", return_value=True):
+    with (
+        patch("sandbox.manager.has_docker", return_value=False),
+        patch("sandbox.manager.has_bwrap", return_value=True),
+    ):
         mgr = SandboxManager(workspace_root=tmp_path)
         assert mgr.tier == SANDBOX_TIER_BWRAP
         assert mgr.backend_name == "bubblewrap"
 
 
 def test_manager_prefers_docker_when_available(tmp_path: Path) -> None:
-    with patch("sandbox.manager.has_docker", return_value=True), \
-         patch("sandbox.manager.has_bwrap", return_value=True):
+    with (
+        patch("sandbox.manager.has_docker", return_value=True),
+        patch("sandbox.manager.has_bwrap", return_value=True),
+    ):
         mgr = SandboxManager(workspace_root=tmp_path)
         assert mgr.tier == SANDBOX_TIER_DOCKER
         assert mgr.backend_name == "docker"
 
 
 def test_manager_falls_back_to_scoped_when_nothing_available(tmp_path: Path) -> None:
-    with patch("sandbox.manager.has_docker", return_value=False), \
-         patch("sandbox.manager.has_bwrap", return_value=False), \
-         patch("sandbox.manager.has_sandbox_exec", return_value=False):
+    with (
+        patch("sandbox.manager.has_docker", return_value=False),
+        patch("sandbox.manager.has_bwrap", return_value=False),
+        patch("sandbox.manager.has_sandbox_exec", return_value=False),
+    ):
         mgr = SandboxManager(workspace_root=tmp_path)
         assert mgr.tier == SANDBOX_TIER_SCOPED
         assert mgr.backend_name == "scoped"
 
 
 def test_manager_respects_preferred_tier(tmp_path: Path) -> None:
-    with patch("sandbox.manager.has_docker", return_value=True), \
-         patch("sandbox.manager.has_bwrap", return_value=True):
+    with (
+        patch("sandbox.manager.has_docker", return_value=True),
+        patch("sandbox.manager.has_bwrap", return_value=True),
+    ):
         mgr = SandboxManager(workspace_root=tmp_path, preferred_tier=2)
         assert mgr.tier == SANDBOX_TIER_BWRAP
         assert mgr.backend_name == "bubblewrap"
 
 
 def test_manager_capabilities_reports_each_backend(tmp_path: Path) -> None:
-    with patch("sandbox.manager.has_docker", return_value=False), \
-         patch("sandbox.manager.has_bwrap", return_value=True), \
-         patch("sandbox.manager.has_sandbox_exec", return_value=False):
+    with (
+        patch("sandbox.manager.has_docker", return_value=False),
+        patch("sandbox.manager.has_bwrap", return_value=True),
+        patch("sandbox.manager.has_sandbox_exec", return_value=False),
+    ):
         mgr = SandboxManager(workspace_root=tmp_path)
         caps = mgr.capabilities()
         assert caps == {
@@ -102,15 +113,19 @@ def test_manager_capabilities_reports_each_backend(tmp_path: Path) -> None:
 
 
 def test_manager_is_fully_isolated_only_at_tier_2_plus(tmp_path: Path) -> None:
-    with patch("sandbox.manager.has_docker", return_value=False), \
-         patch("sandbox.manager.has_bwrap", return_value=True), \
-         patch("sandbox.manager.has_sandbox_exec", return_value=False):
+    with (
+        patch("sandbox.manager.has_docker", return_value=False),
+        patch("sandbox.manager.has_bwrap", return_value=True),
+        patch("sandbox.manager.has_sandbox_exec", return_value=False),
+    ):
         mgr = SandboxManager(workspace_root=tmp_path)
         assert mgr.is_fully_isolated() is True
 
-    with patch("sandbox.manager.has_docker", return_value=False), \
-         patch("sandbox.manager.has_bwrap", return_value=False), \
-         patch("sandbox.manager.has_sandbox_exec", return_value=False):
+    with (
+        patch("sandbox.manager.has_docker", return_value=False),
+        patch("sandbox.manager.has_bwrap", return_value=False),
+        patch("sandbox.manager.has_sandbox_exec", return_value=False),
+    ):
         mgr = SandboxManager(workspace_root=tmp_path)
         assert mgr.is_fully_isolated() is False
 
@@ -191,7 +206,9 @@ def test_docker_wrap_includes_security_flags(tmp_path: Path) -> None:
     fake = tmp_path / "docker"
     fake.write_text("#!/bin/sh\n")
     fake.chmod(0o755)
-    backend = DockerSandbox(workspace_root=tmp_path, docker_path=str(fake), network=False)
+    backend = DockerSandbox(
+        workspace_root=tmp_path, docker_path=str(fake), network=False
+    )
     argv = backend.wrap(["echo", "hi"])
     assert argv[0] == str(fake)
     assert "run" in argv
@@ -211,7 +228,9 @@ def test_docker_with_network_omits_none_flag(tmp_path: Path) -> None:
     fake = tmp_path / "docker"
     fake.write_text("#!/bin/sh\n")
     fake.chmod(0o755)
-    backend = DockerSandbox(workspace_root=tmp_path, docker_path=str(fake), network=True)
+    backend = DockerSandbox(
+        workspace_root=tmp_path, docker_path=str(fake), network=True
+    )
     argv = backend.wrap(["echo", "hi"])
     assert "--network=none" not in argv
 
@@ -221,12 +240,16 @@ def test_docker_with_network_omits_none_flag(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_run_falls_back_to_scoped_when_docker_unavailable_mid_flight(tmp_path: Path) -> None:
+def test_run_falls_back_to_scoped_when_docker_unavailable_mid_flight(
+    tmp_path: Path,
+) -> None:
     # Force tier 3 detection, then make the Docker backend raise at
     # wrap-time to exercise the fallback path.
-    with patch("sandbox.manager.has_docker", return_value=True), \
-         patch("sandbox.manager.has_bwrap", return_value=False), \
-         patch("sandbox.manager.has_sandbox_exec", return_value=False):
+    with (
+        patch("sandbox.manager.has_docker", return_value=True),
+        patch("sandbox.manager.has_bwrap", return_value=False),
+        patch("sandbox.manager.has_sandbox_exec", return_value=False),
+    ):
         mgr = SandboxManager(workspace_root=tmp_path)
 
     # The Docker backend should fail when actually wrapping because no
@@ -241,9 +264,11 @@ def test_run_falls_back_to_scoped_when_docker_unavailable_mid_flight(tmp_path: P
 
 
 def test_run_with_scoped_tier_executes_directly(tmp_path: Path) -> None:
-    with patch("sandbox.manager.has_docker", return_value=False), \
-         patch("sandbox.manager.has_bwrap", return_value=False), \
-         patch("sandbox.manager.has_sandbox_exec", return_value=False):
+    with (
+        patch("sandbox.manager.has_docker", return_value=False),
+        patch("sandbox.manager.has_bwrap", return_value=False),
+        patch("sandbox.manager.has_sandbox_exec", return_value=False),
+    ):
         mgr = SandboxManager(workspace_root=tmp_path)
 
     async def runner() -> object:
@@ -280,9 +305,7 @@ def test_run_with_real_bwrap_actually_isolates(tmp_path: Path) -> None:
 
     # Try to read the outside file from inside the sandbox.
     async def runner() -> object:
-        return await mgr.run(
-            ["cat", str(outside)], cwd=workspace, timeout=15
-        )
+        return await mgr.run(["cat", str(outside)], cwd=workspace, timeout=15)
 
     result = asyncio.run(runner())
     # The sandbox should make the file unreadable (No such file or
@@ -325,9 +348,11 @@ def test_run_command_falls_back_when_sandbox_unavailable(tmp_path: Path) -> None
 
     guard = SafetyGuard(project_root=tmp_path)
     # Manager that detects Docker (which isn't installed) so wrap fails.
-    with patch("sandbox.manager.has_docker", return_value=True), \
-         patch("sandbox.manager.has_bwrap", return_value=False), \
-         patch("sandbox.manager.has_sandbox_exec", return_value=False):
+    with (
+        patch("sandbox.manager.has_docker", return_value=True),
+        patch("sandbox.manager.has_bwrap", return_value=False),
+        patch("sandbox.manager.has_sandbox_exec", return_value=False),
+    ):
         mgr = SandboxManager(workspace_root=tmp_path)
     assert mgr.tier == SANDBOX_TIER_DOCKER  # by detection
     tool = RunCommandTool(guard, sandbox_manager=mgr)

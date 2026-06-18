@@ -41,9 +41,11 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
         }
 
     assert {"sessions", "messages", "tool_calls", "audit_logs"}.issubset(table_names)
-    assert {"idx_messages_session", "idx_tool_calls_session", "idx_audit_session"}.issubset(
-        index_names
-    )
+    assert {
+        "idx_messages_session",
+        "idx_tool_calls_session",
+        "idx_audit_session",
+    }.issubset(index_names)
 
 
 def test_message_storage_round_trips_in_insert_order(tmp_path: Path) -> None:
@@ -156,7 +158,9 @@ async def test_write_transaction_serializes_concurrent_writes(tmp_path: Path) ->
     with get_db_connection(db_path) as conn:
         labels = [
             row["label"]
-            for row in conn.execute("SELECT label FROM writes ORDER BY id ASC").fetchall()
+            for row in conn.execute(
+                "SELECT label FROM writes ORDER BY id ASC"
+            ).fetchall()
         ]
 
     assert entered == ["first-start", "first-end", "second-start", "second-end"]

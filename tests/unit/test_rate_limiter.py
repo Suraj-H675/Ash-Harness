@@ -3,17 +3,20 @@ import asyncio
 import pytest
 from providers.rate_limiter import TokenBucketRateLimiter
 
+
 def test_consume_returns_true_when_tokens_available():
     limiter = TokenBucketRateLimiter(capacity=10, fill_rate=1.0)
     success, wait = limiter.consume(5)
     assert success is True
     assert wait == 0.0
 
+
 def test_consume_returns_wait_when_insufficient_tokens():
     limiter = TokenBucketRateLimiter(capacity=5, fill_rate=0.0)
     success, wait = limiter.consume(10)
     assert success is False
     assert wait == float("inf")
+
 
 @pytest.mark.asyncio
 async def test_acquire_blocks_until_tokens_available():

@@ -76,7 +76,9 @@ def test_allowed_directories_cannot_expand_beyond_project_root(tmp_path: Path) -
     project_root = tmp_path / "project"
     project_root.mkdir()
 
-    with pytest.raises(SafetyViolation, match="Allowed directory is outside project root"):
+    with pytest.raises(
+        SafetyViolation, match="Allowed directory is outside project root"
+    ):
         SafetyGuard(project_root, allowed_directories=[tmp_path])
 
 

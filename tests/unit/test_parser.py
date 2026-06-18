@@ -2,7 +2,6 @@
 
 from typing import Iterable
 
-import pytest
 
 from ui.parser import StreamingXMLParser
 
@@ -63,10 +62,10 @@ def test_fragmented_tool_call_assembles_across_many_feeds() -> None:
     parser = StreamingXMLParser()
 
     _drive(parser, "<call_t")
-    _drive(parser, "ool name=\"read_file\"")
+    _drive(parser, 'ool name="read_file"')
 
     assert _drive(parser, ">") == []  # open tag complete, no args yet
-    assert _drive(parser, "<arg name=\"file_path\">") == []
+    assert _drive(parser, '<arg name="file_path">') == []
     # Spec accumulates arg value silently until </arg>; no events yet.
     assert _drive(parser, "notes.") == []
     assert _drive(parser, "txt") == []
@@ -136,7 +135,7 @@ def test_tool_call_with_multiple_args() -> None:
         '<arg name="file_path">a.py</arg>'
         '<arg name="content">print("hi")</arg>'
         '<arg name="overwrite">true</arg>'
-        '</call_tool>',
+        "</call_tool>",
     )
 
     assert events == [
@@ -167,7 +166,7 @@ def test_partial_tag_at_chunk_boundary_does_not_split_tag() -> None:
 
     # Buffer reaches an exact `<` at the chunk boundary; parser must wait.
     assert _drive(parser, "hello <") == [("token", "hello ")]
-    assert _drive(parser, "call_tool name=\"x\"></call_tool>") == [
+    assert _drive(parser, 'call_tool name="x"></call_tool>') == [
         ("tool_call", {"name": "x", "arguments": {}})
     ]
 
@@ -177,8 +176,7 @@ def test_multiple_tool_calls_in_single_feed() -> None:
 
     events = _drive(
         parser,
-        '<call_tool name="a"></call_tool>'
-        '<call_tool name="b"></call_tool>',
+        '<call_tool name="a"></call_tool><call_tool name="b"></call_tool>',
     )
 
     assert events == [
@@ -194,7 +192,7 @@ def test_special_characters_in_arg_value_are_preserved() -> None:
         parser,
         '<call_tool name="run_command">'
         '<arg name="command_line">echo "hi &amp; bye" | grep hi</arg>'
-        '</call_tool>',
+        "</call_tool>",
     )
 
     payload = events[0][1]
@@ -243,9 +241,7 @@ def test_state_persists_across_feed_calls() -> None:
     for char in payload:
         events.extend(parser.feed(char))
 
-    assert events == [
-        ("tool_call", {"name": "x", "arguments": {"k": "v"}})
-    ]
+    assert events == [("tool_call", {"name": "x", "arguments": {"k": "v"}})]
 
 
 def test_unicode_content_in_text_and_thought() -> None:
@@ -283,7 +279,7 @@ def test_consumer_can_iterate_during_streaming() -> None:
 
     # Simulate a live stream: each chunk drives a separate feed call.
     stream: Iterable[str] = iter(
-        ["He", "llo <call_tool name=\"r\"><arg name=\"p\"", ">path.txt</arg></call_tool>"]
+        ["He", 'llo <call_tool name="r"><arg name="p"', ">path.txt</arg></call_tool>"]
     )
     for chunk in stream:
         for event in parser.feed(chunk):

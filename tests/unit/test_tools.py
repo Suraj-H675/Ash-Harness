@@ -81,7 +81,9 @@ async def test_write_file_creates_parent_directories_and_respects_overwrite(
     assert blocked.success is False
     assert blocked.error == EXISTS_ERROR
     assert overwritten.success is True
-    assert (project_root / "src" / "app.py").read_text(encoding="utf-8") == "print('again')\n"
+    assert (project_root / "src" / "app.py").read_text(
+        encoding="utf-8"
+    ) == "print('again')\n"
 
 
 @pytest.mark.asyncio
@@ -143,7 +145,7 @@ async def test_run_command_executes_with_scoped_cwd(
     marker.write_text("hello", encoding="utf-8")
     command = (
         f"{shlex.quote(sys.executable)} -c "
-        f"{shlex.quote('from pathlib import Path; print(Path(\"marker.txt\").read_text())')}"
+        f"{shlex.quote('from pathlib import Path; print(Path("marker.txt").read_text())')}"
     )
 
     result = await RunCommandTool(guard).run(command_line=command, cwd=".")
@@ -162,7 +164,7 @@ async def test_run_command_defaults_to_project_root_cwd(
     marker.write_text("from-root", encoding="utf-8")
     command = (
         f"{shlex.quote(sys.executable)} -c "
-        f"{shlex.quote('from pathlib import Path; print(Path(\"marker.txt\").read_text())')}"
+        f"{shlex.quote('from pathlib import Path; print(Path("marker.txt").read_text())')}"
     )
 
     result = await RunCommandTool(guard).run(command_line=command)
@@ -173,7 +175,9 @@ async def test_run_command_defaults_to_project_root_cwd(
 
 @pytest.mark.asyncio
 async def test_run_command_enforces_timeout(guard: SafetyGuard) -> None:
-    command = f"{shlex.quote(sys.executable)} -c {shlex.quote('import time; time.sleep(2)')}"
+    command = (
+        f"{shlex.quote(sys.executable)} -c {shlex.quote('import time; time.sleep(2)')}"
+    )
 
     result = await RunCommandTool(guard).run(command_line=command, timeout_seconds=1)
 
@@ -195,7 +199,9 @@ async def test_run_command_requires_literal_path_for_windows_file_cmdlets(
     monkeypatch.setattr("ash.tools.command.platform.system", lambda: "Windows")
 
     with pytest.raises(SafetyViolation, match="-LiteralPath"):
-        await RunCommandTool(guard).run(command_line="Get-Content 'C:\\Program Files (x86)\\app.txt'")
+        await RunCommandTool(guard).run(
+            command_line="Get-Content 'C:\\Program Files (x86)\\app.txt'"
+        )
 
 
 def test_decode_stream_falls_back_to_cp1252() -> None:
@@ -236,6 +242,7 @@ def test_auto_commit_tool_is_in_default_tools():
     assert "auto_commit" in tools, "auto_commit must be in default tools dict"
     assert tools["auto_commit"].name == "auto_commit"
 
+
 @pytest.mark.asyncio
 async def test_auto_commit_tool_runs_successfully(tmp_path):
     """AutoCommitTool should create a commit when called with valid args."""
@@ -247,11 +254,15 @@ async def test_auto_commit_tool_runs_successfully(tmp_path):
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
-        cwd=tmp_path, check=True, capture_output=True
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
     )
     subprocess.run(
         ["git", "config", "user.name", "Test"],
-        cwd=tmp_path, check=True, capture_output=True
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
     )
 
     # Create a file and commit
@@ -259,7 +270,9 @@ async def test_auto_commit_tool_runs_successfully(tmp_path):
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
         ["git", "commit", "-m", "initial"],
-        cwd=tmp_path, check=True, capture_output=True
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
     )
 
     # Write a new file

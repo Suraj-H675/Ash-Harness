@@ -361,7 +361,9 @@ class SharedState:
         content: Any,
     ) -> int:
         """Send a message directly from one agent to another."""
-        return self.send_message(sender_id, recipient_id, message_type, {"content": content})
+        return self.send_message(
+            sender_id, recipient_id, message_type, {"content": content}
+        )
 
     def broadcast(
         self,

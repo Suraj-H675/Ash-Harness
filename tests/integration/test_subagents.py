@@ -146,9 +146,12 @@ def test_shared_state_sprints_round_trip(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_subprocess_agent_in_process_publishes_status_and_report(tmp_path: Path) -> None:
+def test_subprocess_agent_in_process_publishes_status_and_report(
+    tmp_path: Path,
+) -> None:
     ss = SharedState(tmp_path / "state.db")
     try:
+
         async def runner(ctx):
             return f"hello from {ctx['agent_id']}"
 
@@ -184,6 +187,7 @@ def test_subprocess_agent_in_process_publishes_status_and_report(tmp_path: Path)
 def test_subprocess_agent_failure_marks_status_failed(tmp_path: Path) -> None:
     ss = SharedState(tmp_path / "state.db")
     try:
+
         async def bad(ctx):
             raise RuntimeError("boom")
 
@@ -230,7 +234,10 @@ def test_subprocess_agent_rejects_unknown_role(tmp_path: Path) -> None:
     try:
         with pytest.raises(ValueError):
             SubprocessAgent(
-                agent_id="x", role="wizard", task="t", shared_state=ss,
+                agent_id="x",
+                role="wizard",
+                task="t",
+                shared_state=ss,
                 runner=make_simple_text_task("nope"),
             )
     finally:
@@ -240,6 +247,7 @@ def test_subprocess_agent_rejects_unknown_role(tmp_path: Path) -> None:
 def test_subprocess_agent_make_simple_text_task() -> None:
     async def runner():
         return await make_simple_text_task("ok")({})
+
     assert asyncio.run(runner()) == "ok"
 
 
@@ -273,7 +281,12 @@ def test_orchestrator_marks_sprint_aborted_on_partial_failure(tmp_path: Path) ->
         raise RuntimeError("nope")
 
     specs = [
-        SubagentSpec(role="coder", task="write", runner=make_simple_text_task("wrote"), agent_id="c-1"),
+        SubagentSpec(
+            role="coder",
+            task="write",
+            runner=make_simple_text_task("wrote"),
+            agent_id="c-1",
+        ),
         SubagentSpec(role="tester", task="test", runner=failing, agent_id="t-1"),
     ]
     result = asyncio.run(orch.run_batch("mixed", specs))
@@ -328,7 +341,11 @@ def test_orchestrator_await_completion_times_out(tmp_path: Path) -> None:
     orch = SubagentOrchestrator(ss, max_concurrency=2)
     # Never run any agent: r-1 is unknown to the state.
     with pytest.raises(TimeoutError):
-        asyncio.run(orch.await_completion(["r-1"], timeout_seconds=0.5, poll_interval_seconds=0.1))
+        asyncio.run(
+            orch.await_completion(
+                ["r-1"], timeout_seconds=0.5, poll_interval_seconds=0.1
+            )
+        )
 
 
 def test_orchestrator_rejects_empty_specs(tmp_path: Path) -> None:
@@ -356,7 +373,10 @@ def test_orchestrator_respects_max_concurrency(tmp_path: Path) -> None:
 
     ss = SharedState(tmp_path / "state.db")
     orch = SubagentOrchestrator(ss, max_concurrency=1)
-    specs = [SubagentSpec(role="researcher", task=f"t{i}", agent_id=f"r-{i}") for i in range(4)]
+    specs = [
+        SubagentSpec(role="researcher", task=f"t{i}", agent_id=f"r-{i}")
+        for i in range(4)
+    ]
     result = asyncio.run(orch.run_batch("serial", specs))
     assert result.all_succeeded is True
     assert len(result.reports) == 4
@@ -389,10 +409,12 @@ def test_orchestrator_messages_have_message_id_attribute(tmp_path: Path) -> None
 # H-1: Concurrency Bug Fix Tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def shared_state() -> SharedState:
     with tempfile.TemporaryDirectory() as tmpdir:
         yield SharedState(Path(tmpdir) / "test.db")
+
 
 @pytest.mark.asyncio
 async def test_fanout_runs_all_agents_concurrently(shared_state):
@@ -413,6 +435,7 @@ async def test_fanout_runs_all_agents_concurrently(shared_state):
     # With 4 agents each sleeping 0.05s, concurrent execution should be ~0.05-0.10s,
     # not 4 * 0.05s = 0.2s (sequential). Allow up to 0.30s for loaded systems.
     assert elapsed < 0.30, f"Agents ran in {elapsed:.3f}s — too slow for concurrent"
+
 
 @pytest.mark.asyncio
 async def test_max_concurrency_is_respected(shared_state):
@@ -437,12 +460,15 @@ async def test_max_concurrency_is_respected(shared_state):
 
     await orchestrator.run_batch("concurrency test", specs)
 
-    assert max_concurrent_seen <= 3, f"Saw {max_concurrent_seen} concurrent, expected ≤3"
+    assert max_concurrent_seen <= 3, (
+        f"Saw {max_concurrent_seen} concurrent, expected ≤3"
+    )
 
 
 # ---------------------------------------------------------------------------
 # H-9: Architect/Editor Dual-Model Mode
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_architect_mode_produces_sprint_contract(shared_state, tmp_path):
@@ -457,7 +483,9 @@ async def test_architect_mode_produces_sprint_contract(shared_state, tmp_path):
             return 0
 
         async def stream_chat(self, messages, temperature=0.0):
-            yield StreamChunk(content="## Goal\nTest\n\n## Definition of Done\n- done", is_done=True)
+            yield StreamChunk(
+                content="## Goal\nTest\n\n## Definition of Done\n- done", is_done=True
+            )
 
     planner = Planner(DummyProvider())
     specs = fanout_for_goal(
@@ -470,12 +498,13 @@ async def test_architect_mode_produces_sprint_contract(shared_state, tmp_path):
     assert specs[0].mode == "architect"
     assert specs[1].mode == "execute"
     assert specs[0].runner is not None  # architect has a real runner
-    assert specs[1].runner is None      # execute uses default text runner
+    assert specs[1].runner is None  # execute uses default text runner
 
 
 # ---------------------------------------------------------------------------
 # H-10: Subagent Result Consolidation Step
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_consolidate_reports_multiple_agents(shared_state):

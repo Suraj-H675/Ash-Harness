@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import json
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
@@ -12,7 +11,7 @@ import pytest
 
 from core.loop import AshLoop
 from core.recovery import CircuitBreaker, CircuitBreakerError
-from core.session import Session, SessionStore
+from core.session import SessionStore
 from providers.base import StreamChunk
 from safety.guard import SafetyGuard
 from tools.base import BaseTool, ToolResult
@@ -64,7 +63,9 @@ class CountingReadTool(BaseTool):
     description = "Fake read_file that returns a fixed string."
     args_schema = type("Args", (), {"__call__": lambda self, **kw: None})
 
-    def __init__(self, safety_guard: SafetyGuard, output: str = "hello world", fail: bool = False) -> None:
+    def __init__(
+        self, safety_guard: SafetyGuard, output: str = "hello world", fail: bool = False
+    ) -> None:
         super().__init__(safety_guard)
         self.output = output
         self.fail = fail
@@ -150,7 +151,7 @@ def test_tool_call_turn_executes_and_loops_back_to_provider(
     provider = FakeProvider(
         scripts=[
             [
-                '<thought>reading</thought>',
+                "<thought>reading</thought>",
                 '<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>',
             ],
             ["File contents were: <response>done</response>"],
@@ -188,7 +189,9 @@ def test_tool_call_record_persisted_with_approval_and_result(
 ) -> None:
     provider = FakeProvider(
         scripts=[
-            ['<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'],
+            [
+                '<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'
+            ],
             ["<response>finished</response>"],
         ]
     )
@@ -223,10 +226,18 @@ def test_circuit_breaker_trips_after_repeated_failures(
     # should trip after max_failures consecutive failures of the same tool.
     provider = FakeProvider(
         scripts=[
-            ['<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'],
-            ['<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'],
-            ['<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'],
-            ['<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'],
+            [
+                '<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'
+            ],
+            [
+                '<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'
+            ],
+            [
+                '<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'
+            ],
+            [
+                '<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'
+            ],
         ]
     )
     read_tool = CountingReadTool(safety_guard, fail=True)
@@ -327,7 +338,9 @@ def test_denial_does_not_execute_tool(
 ) -> None:
     provider = FakeProvider(
         scripts=[
-            ['<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'],
+            [
+                '<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'
+            ],
             ["<response>denied path</response>"],
         ]
     )

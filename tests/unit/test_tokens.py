@@ -1,6 +1,5 @@
 """Tests for token counting and rate limiting (Sprint 5)."""
 
-import asyncio
 import time
 
 import pytest

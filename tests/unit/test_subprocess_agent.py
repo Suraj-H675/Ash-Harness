@@ -6,10 +6,12 @@ from sandbox._base import SANDBOX_TIER_SCOPED
 import tempfile
 from pathlib import Path
 
+
 @pytest.fixture
 def shared_state() -> SharedState:
     with tempfile.TemporaryDirectory() as tmpdir:
         yield SharedState(Path(tmpdir) / "test.db")
+
 
 def test_is_tool_allowed_respects_allowlist(shared_state):
     agent = SubprocessAgent(
@@ -23,6 +25,7 @@ def test_is_tool_allowed_respects_allowlist(shared_state):
     assert agent.is_tool_allowed("read_file") is True
     assert agent.is_tool_allowed("write_file") is False
     assert agent.is_tool_allowed("run_command") is False
+
 
 def test_is_tool_allowed_allows_all_when_no_allowlist(shared_state):
     agent = SubprocessAgent(
@@ -40,6 +43,7 @@ def test_is_tool_allowed_allows_all_when_no_allowlist(shared_state):
 
 def test_subagent_spec_sandbox_tier_default():
     from agents.orchestrator import SubagentSpec
+
     spec = SubagentSpec(role="coder", task="test")
     assert spec.sandbox_tier == SANDBOX_TIER_SCOPED  # default
 
@@ -47,5 +51,8 @@ def test_subagent_spec_sandbox_tier_default():
 def test_subagent_spec_sandbox_tier_override():
     from agents.orchestrator import SubagentSpec
     from sandbox._base import SANDBOX_TIER_SANDBOX_EXEC
-    spec = SubagentSpec(role="coder", task="test", sandbox_tier=SANDBOX_TIER_SANDBOX_EXEC)
+
+    spec = SubagentSpec(
+        role="coder", task="test", sandbox_tier=SANDBOX_TIER_SANDBOX_EXEC
+    )
     assert spec.sandbox_tier == SANDBOX_TIER_SANDBOX_EXEC

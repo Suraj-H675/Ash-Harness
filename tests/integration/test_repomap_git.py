@@ -69,8 +69,12 @@ def workspace(tmp_path: Path) -> Path:
 @pytest.fixture
 def git_workspace(workspace: Path) -> Path:
     subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
-    subprocess.run(["git", "config", "user.email", "ash@test"], cwd=workspace, check=True)
-    subprocess.run(["git", "config", "user.name", "Ash Test"], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "ash@test"], cwd=workspace, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Ash Test"], cwd=workspace, check=True
+    )
     return workspace
 
 
@@ -120,7 +124,10 @@ def test_auto_commit_creates_commit_on_turn_completion(
         ["git", "add", "tracked.py"], cwd=git_workspace, check=True, capture_output=True
     )
     subprocess.run(
-        ["git", "commit", "-q", "-m", "seed"], cwd=git_workspace, check=True, capture_output=True
+        ["git", "commit", "-q", "-m", "seed"],
+        cwd=git_workspace,
+        check=True,
+        capture_output=True,
     )
 
     (git_workspace / "new_file.py").write_text("y = 2\n")
@@ -157,9 +164,14 @@ def test_auto_commit_disabled_by_default(
     git_workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
 ) -> None:
     (git_workspace / "seed.py").write_text("z = 1\n")
-    subprocess.run(["git", "add", "seed.py"], cwd=git_workspace, check=True, capture_output=True)
     subprocess.run(
-        ["git", "commit", "-q", "-m", "seed"], cwd=git_workspace, check=True, capture_output=True
+        ["git", "add", "seed.py"], cwd=git_workspace, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "seed"],
+        cwd=git_workspace,
+        check=True,
+        capture_output=True,
     )
     (git_workspace / "untracked.py").write_text("w = 2\n")
 

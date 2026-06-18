@@ -241,8 +241,7 @@ class RepoMap:
             else:
                 # Show functions/methods/classes, skip plain imports.
                 interesting = [
-                    s for s in node.symbols
-                    if s.kind in {"function", "method", "class"}
+                    s for s in node.symbols if s.kind in {"function", "method", "class"}
                 ]
                 for sym in interesting[:symbols_per_file]:
                     kind = sym.kind

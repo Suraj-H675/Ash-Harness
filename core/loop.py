@@ -205,6 +205,7 @@ class AshLoop:
         self.tools_registry = tools_registry
         if tools_registry is not None:
             from tools.skills import configure_runtime
+
             configure_runtime(
                 tools_provider=lambda: list(tools_registry.as_dict().values()),
                 root_provider=lambda: self.project_root,
@@ -827,7 +828,9 @@ class AshLoop:
         else:
             # Model-only — prepend current provider
             current_provider = self._config.model.split("/", 1)[0]
-            new_config = self._config.model_copy(update={"model": f"{current_provider}/{model}"})
+            new_config = self._config.model_copy(
+                update={"model": f"{current_provider}/{model}"}
+            )
         self.provider = _build_provider(new_config)
         self._config = new_config
 

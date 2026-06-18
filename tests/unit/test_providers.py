@@ -19,9 +19,8 @@ will see the tests fail in this file.
 from __future__ import annotations
 
 import asyncio
-import math
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Callable, Sequence
+from typing import Any, AsyncGenerator, Callable
 
 import pytest
 
@@ -62,7 +61,9 @@ class _BaseFakeProvider(ProviderABC):
             {
                 "messages": [dict(m) for m in messages],
                 "temperature": temperature,
-                "prompt_tokens": sum(self.count_tokens(m.get("content", "")) for m in messages),
+                "prompt_tokens": sum(
+                    self.count_tokens(m.get("content", "")) for m in messages
+                ),
             }
         )
         idx = min(self._call_count, len(self._scripts) - 1)
@@ -222,7 +223,9 @@ def test_base_fake_provider_yields_done_marker() -> None:
     async def runner() -> list[StreamChunk]:
         provider = _BaseFakeProvider(scripts=[["hi"]])
         chunks: list[StreamChunk] = []
-        async for chunk in provider.stream_chat([{"role": "user", "content": "say hi"}]):
+        async for chunk in provider.stream_chat(
+            [{"role": "user", "content": "say hi"}]
+        ):
             chunks.append(chunk)
         return chunks
 
@@ -403,7 +406,6 @@ def test_loop_drives_provider_through_tool_callbacks() -> None:
 
     from core.loop import AshLoop
     from core.session import SessionStore
-    from providers.base import StreamChunk
     from safety.guard import SafetyGuard
     from tools.base import BaseTool, ToolResult
     from ui.terminal import TerminalUI
@@ -424,9 +426,7 @@ def test_loop_drives_provider_through_tool_callbacks() -> None:
         provider = _BaseFakeProvider(
             scripts=[
                 # First call: model emits a tool call.
-                [
-                    '<call_tool name="echo"><arg name="text">hello</arg></call_tool>'
-                ],
+                ['<call_tool name="echo"><arg name="text">hello</arg></call_tool>'],
                 # Second call: model emits a final response.
                 ["<response>echoed: hello</response>"],
             ]
@@ -462,7 +462,10 @@ def test_loop_drives_provider_through_tool_callbacks() -> None:
     # the rendered tool response.
     assert any(m["role"] == "tool" and "hello" in m["content"] for m in second_call)
     # The first call's messages include the original user prompt.
-    assert any(m["role"] == "user" and "say hello" in m["content"] for m in provider.received_messages[0])
+    assert any(
+        m["role"] == "user" and "say hello" in m["content"]
+        for m in provider.received_messages[0]
+    )
 
 
 # ---------------------------------------------------------------------------

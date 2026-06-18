@@ -13,8 +13,6 @@ from safety.guard import SafetyGuard
 from tools.base import BaseTool, ToolResult
 from tools.registry import SkillIndexEntry, ToolRegistry
 from tools.skills import (
-    SkillContext,
-    SkillExecutionError,
     SkillParseError,
     compile_skill,
     configure_runtime,
@@ -95,7 +93,12 @@ def test_parse_markdown_skill_full(tmp_path: Path) -> None:
     assert skill.name == "run_migrations"
     assert skill.description.startswith("Run database migrations")
     assert "migrate" in skill.trigger
-    assert ("directory", "str", "\"migrations\"", "Folder containing the alembic config.") in skill.args
+    assert (
+        "directory",
+        "str",
+        '"migrations"',
+        "Folder containing the alembic config.",
+    ) in skill.args
     assert ("target", "str", "", "Revision id to upgrade to.") in skill.args
     assert "async def execute" in skill.code
 
@@ -451,8 +454,8 @@ def test_write_python_skill_writes_and_registry_reloads(tmp_path: Path) -> None:
     )
     assert path.exists()
     text = path.read_text()
-    assert 'name: dynamic_skill' in text
-    assert 'description: self-written' in text
+    assert "name: dynamic_skill" in text
+    assert "description: self-written" in text
 
     # The new file is visible to discover_skills (it indexes it), but
     # the tool is not loaded into the registry's tool map yet.
