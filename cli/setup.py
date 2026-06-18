@@ -154,6 +154,9 @@ def _flow_anthropic(current: str) -> None:
         "claude-3-5-haiku-20241022",
     ]
     model = _prompt_model_list(models, current)
+    if model is None:
+        print("  Cancelled.")
+        return
 
     # Save ASH_MODEL env var
     save_env_value("ASH_MODEL", f"anthropic/{model}")
@@ -181,6 +184,9 @@ def _flow_openai(current: str) -> None:
         print("Could not fetch models. Using default list.")
         models = ["gpt-4o", "gpt-4o-mini", "o3", "o4-mini"]
     model = _prompt_model_list(models, current)
+    if model is None:
+        print("  Cancelled.")
+        return
 
     save_env_value("ASH_MODEL", f"openai/{model}")
     _verify_openai(api_key, base_url_override, model)
@@ -206,6 +212,9 @@ def _flow_deepseek(current: str) -> None:
         print("Could not fetch models. Using default list.")
         models = ["deepseek-chat", "deepseek-reasoner"]
     model = _prompt_model_list(models, current)
+    if model is None:
+        print("  Cancelled.")
+        return
 
     save_env_value("ASH_MODEL", f"deepseek/{model}")
     _verify_openai(api_key, base_url_override, model)
@@ -229,6 +238,9 @@ def _flow_groq(current: str) -> None:
             "compound-mini",
         ]
     model = _prompt_model_list(models, current)
+    if model is None:
+        print("  Cancelled.")
+        return
 
     save_env_value("ASH_MODEL", f"groq/{model}")
     _verify_openai(api_key, "https://api.groq.com/openai/v1", model)
@@ -249,6 +261,10 @@ def _flow_ollama(current: str) -> None:
         models = ["llama3", "qwen2.5-coder:7b"]
 
     model = _prompt_model_list(models, current)
+    if model is None:
+        print("  Cancelled.")
+        return
+
     save_env_value("ASH_MODEL", f"ollama/{model}")
     print(f"  Configured Ollama with model: {model}")
 
@@ -422,24 +438,34 @@ def _verify_openai(
 
 
 def _has_provider_configured(config) -> bool:
-    """Return True if Ash has any provider + model configured."""
+    """Return True if Ash has a working provider + API key combination.
+
+    A model string with "/" is not enough — we must also have a way to
+    actually call the API (an API key, or ollama which needs no key).
+    """
     model_str = getattr(config, "model", "") or ""
-    if model_str and "/" in model_str:
+    if not model_str or "/" not in model_str:
+        return False
+
+    provider = model_str.split("/", 1)[0]
+
+    # Ollama needs no API key
+    if provider == "ollama":
         return True
 
-    # Also check env vars for known providers
-    for key in (
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "GROQ_API_KEY",
-    ):
-        if get_env_value(key):
+    # Known providers: check for their specific API key
+    key_map = {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "groq": "GROQ_API_KEY",
+    }
+    if provider in key_map:
+        if get_env_value(key_map[provider]):
             return True
 
-    # Check for custom providers
-    custom = load_config().get("custom_providers", {})
-    if custom:
+    # Custom provider: must have entry in custom_providers
+    if provider in config.custom_providers:
         return True
 
     return False
@@ -536,17 +562,19 @@ def _prompt_optional_url(env_var: str, default: str) -> Optional[str]:
     return existing or None
 
 
-def _prompt_model_list(models: list[str], current: str) -> str:
-    """Show a numbered list of models, let user pick or type. Returns model name."""
+def _prompt_model_list(models: list[str], current: str) -> Optional[str]:
+    """Show a numbered list of models, let user pick or type. Returns model name or None to cancel."""
     print("\n  Available models:")
     for i, m in enumerate(models, 1):
         marker = " (current)" if m == current else ""
         print(f"    [{i}] {m}{marker}")
 
     while True:
-        val = input("\n  Select a model (number or name): ").strip()
+        val = input("\n  Select a model (number or name, 'c' to cancel): ").strip()
         if not val:
             continue
+        if val.lower() in ("c", "q", "cancel"):
+            return None
         if val.isdigit():
             idx = int(val) - 1
             if 0 <= idx < len(models):
@@ -557,12 +585,14 @@ def _prompt_model_list(models: list[str], current: str) -> str:
 
 
 def _prompt_choice(prompt: str, options: list[str], default: int) -> Optional[int]:
-    """Ask user to pick from numbered options. Returns 0-based index or None."""
+    """Ask user to pick from numbered options. Returns 0-based index or None to cancel."""
     options_str = "/".join(f"'{o}'" for o in options)
     while True:
-        val = input(f"\n  {prompt} ({options_str}) [{default + 1}]: ").strip()
+        val = input(f"\n  {prompt} ({options_str}) [{default + 1}], 'c' to cancel: ").strip()
         if not val:
             return default
+        if val.lower() in ("c", "q", "cancel"):
+            return None
         if val.isdigit():
             idx = int(val) - 1
             if 0 <= idx < len(options):

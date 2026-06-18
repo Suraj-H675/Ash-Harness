@@ -22,6 +22,11 @@ ENV_KEYS = [
 def clear_ash_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
+    # Also clear ~/.ash/ so tests don't bleed state between runs
+    ash_dir = Path.home() / ".ash"
+    for f in (ash_dir / ".env", ash_dir / "ash.toml"):
+        if f.exists():
+            f.unlink()
 
 
 def test_config_loads_all_fields_from_ash_toml(
