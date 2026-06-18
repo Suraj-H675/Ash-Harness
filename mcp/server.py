@@ -61,27 +61,32 @@ class MCPServerManager:
 
     def start_server(self, config: MCPServerConfig) -> MCPServerInstance:
         """Start an MCP server as a subprocess."""
+        if config.transport in ("sse", "http", "websocket"):
+            # Network transports: server is already running externally.
+            # Just store the config — no subprocess to manage.
+            instance = MCPServerInstance(
+                name=config.name,
+                config=config,
+                process=None,  # type: ignore[assignment]
+                transport=config.transport,
+            )
+            self._servers[config.name] = instance
+            return instance
+
+        if config.transport != "stdio":
+            raise ValueError(f"Unknown MCP transport: {config.transport}")
+
         env = {**os.environ, **config.env}
 
-        if config.transport == "stdio":
-            proc = subprocess.Popen(
-                [config.command] + config.args,
-                env=env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        elif config.transport in ("sse", "http", "websocket"):
-            # For network transports, the server is already running;
-            # just store the config for the client to connect to.
-            proc = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(86400)"],
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        else:
-            raise ValueError(f"Unknown MCP transport: {config.transport}")
+        # Spawn subprocess. stderr=DEVNULL avoids deadlock when the subprocess
+        # writes to stderr — we never read it, so PIPE would fill and block.
+        proc = subprocess.Popen(
+            [config.command] + config.args,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
 
         instance = MCPServerInstance(
             name=config.name,
@@ -89,7 +94,14 @@ class MCPServerManager:
             process=proc,
             transport=config.transport,
         )
-        self._servers[config.name] = instance
+        try:
+            self._servers[config.name] = instance
+        except Exception:
+            # Defensive: if dict insertion fails, reap the subprocess immediately.
+            proc.terminate()
+            proc.wait(timeout=5)
+            raise
+
         return instance
 
     def stop_server(self, name: str) -> None:
@@ -97,12 +109,14 @@ class MCPServerManager:
         instance = self._servers.get(name)
         if instance is None:
             return
-        if instance.process is not None and instance.process.poll() is None:
-            instance.process.terminate()
+        proc = instance.process
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
             try:
-                instance.process.wait(timeout=5)
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                instance.process.kill()
+                proc.kill()
+                proc.wait()  # Reap the zombie — wait() after kill() is mandatory
         del self._servers[name]
 
     def stop_all(self) -> None:

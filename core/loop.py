@@ -750,6 +750,8 @@ class AshLoop:
     def _chunk_file(self, file_path: Path) -> list["Chunk"]:
         """Split a file into memory-indexable chunks."""
 
+        from context.compaction import Chunk
+
         content = file_path.read_text(errors="replace")
         lines = content.splitlines()
         chunks: list[Chunk] = []
@@ -758,8 +760,8 @@ class AshLoop:
             chunks.append(
                 Chunk(
                     file_path=str(file_path),
-                    start=i + 1,
-                    end=i + len(chunk_lines),
+                    start_line=i + 1,
+                    end_line=i + len(chunk_lines),
                     content="\n".join(chunk_lines),
                 )
             )
