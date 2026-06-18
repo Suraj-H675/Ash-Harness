@@ -13,11 +13,12 @@ from pydantic_settings import (
 
 
 class AshConfig(BaseSettings):
-    """Runtime settings loaded from environment variables and ash.toml."""
+    """Runtime settings loaded from environment variables, ~/.ash/.env, and ~/.ash/ash.toml."""
 
     model_config = SettingsConfigDict(
         env_prefix="ASH_",
-        toml_file="ash.toml",
+        toml_file=str(Path.home() / ".ash" / "ash.toml"),
+        env_file=str(Path.home() / ".ash" / ".env"),
         extra="ignore",
     )
 
@@ -61,6 +62,11 @@ class AshConfig(BaseSettings):
     mcp_servers: dict[str, Any] = Field(
         default_factory=dict,
         description="MCP server configurations loaded from .mcp.json.",
+    )
+
+    custom_providers: dict[str, dict] = Field(
+        default_factory=dict,
+        description="Custom OpenAI-compatible providers: name -> {base_url, api_key, models[]}",
     )
 
     repo_map_exclude_patterns: list[str] = Field(
@@ -112,7 +118,7 @@ class AshConfig(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Use env vars before ash.toml, while preserving init kwargs as highest priority."""
+        """Use env vars before ~/.ash/ash.toml, while preserving init kwargs as highest priority."""
 
         return (
             init_settings,

@@ -31,6 +31,17 @@ from tools.git import AutoCommitTool
 from ui.terminal import TerminalUI
 
 
+KNOWN_PROVIDERS = frozenset(
+    {
+        "anthropic",
+        "openai",
+        "deepseek",
+        "groq",
+        "ollama",
+        "openai-compatible",
+    }
+)
+
 AVAILABLE_MODELS: list[str] = [
     "anthropic/claude-3-7-sonnet-20250219",
     "anthropic/claude-3-5-sonnet-20241022",
@@ -55,7 +66,9 @@ AVAILABLE_MODELS: list[str] = [
 def _parse_model_string(model: str) -> tuple[str, str]:
     """Parse 'provider/model' string into (provider, model_name)."""
     if "/" not in model:
-        raise ValueError(f"Model string must be in 'provider/model' format, got: {model!r}")
+        raise ValueError(
+            f"Model string must be in 'provider/model' format, got: {model!r}"
+        )
     provider, model_name = model.split("/", 1)
     return provider, model_name
 
@@ -138,6 +151,18 @@ def _build_provider(config: AshConfig) -> ProviderABC:
         prov.configure_max_tokens(config.max_completion_tokens)
         return prov
 
+    elif provider in config.custom_providers:
+        from providers.openai import OpenAIProvider
+
+        cp = config.custom_providers[provider]
+        prov = OpenAIProvider(
+            model_name=model_name,
+            api_key=cp.get("api_key", ""),
+            base_url=cp.get("base_url"),
+        )
+        prov.configure_max_tokens(config.max_completion_tokens)
+        return prov
+
     raise ValueError(f"Unknown provider in model string: {provider!r}")
 
 
@@ -178,7 +203,11 @@ def _print_model_list(config: AshConfig) -> None:
     for prov, models in grouped.items():
         print(f"\n{prov.capitalize()}:")
         for model in models:
-            marker = " (current)" if prov == current_provider and model == current_model else ""
+            marker = (
+                " (current)"
+                if prov == current_provider and model == current_model
+                else ""
+            )
             print(f"  {model}{marker}")
     print()
 
@@ -201,7 +230,11 @@ def _interactive_model_picker(config: AshConfig, loop: AshLoop) -> None:
     for prov, entries in grouped.items():
         print(f"\n{prov.capitalize()}:")
         for num, mod, _ in entries:
-            marker = " ← current" if prov == current_provider and mod == current_model else ""
+            marker = (
+                " ← current"
+                if prov == current_provider and mod == current_model
+                else ""
+            )
             print(f"  [{num}] {mod}{marker}")
 
     choice = input("\nPick a number (or 'c' to cancel): ").strip()
@@ -238,9 +271,16 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
         if user_input.lower() in {"exit", "quit"}:
             return 0
 
-        # /model with no args → interactive picker
+        # /model with no args → interactive picker (from setup wizard)
         if user_input == "/model":
-            _interactive_model_picker(config, loop)
+            from cli.setup import setup_model_provider
+
+            old_model = config.model
+            setup_model_provider(config)
+            # Reload config after wizard may have written new ASH_MODEL
+            config = AshConfig.load()
+            if config.model != old_model:
+                loop.switch_model(config.model)
             continue
 
         # /model provider/model → switch to full string
@@ -277,6 +317,26 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ash", description="Ash coding harness REPL")
     subparsers = parser.add_subparsers(dest="command")
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="Configure Ash (provider, API key, model)",
+    )
+    setup_parser.add_argument(
+        "section",
+        nargs="?",
+        choices=["model", "providers", "all"],
+        help="Which section to configure",
+    )
+    setup_parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Skip optional configuration",
+    )
+    setup_parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Run in non-interactive mode (fail if input needed)",
+    )
     mcp_subparser = subparsers.add_parser("mcp")
     mcp_subparser.add_argument("action", choices=["add", "list", "remove"])
     mcp_subparser.add_argument("server_name", nargs="?")
@@ -293,6 +353,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.command == "setup":
+        from cli.setup import cmd_setup
+
+        return cmd_setup(args)
+
     if args.command == "mcp":
         from mcp.server import load_mcp_servers
 
@@ -305,6 +370,27 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     config = AshConfig.load()
+
+    # First-run detection: prompt to run setup if no provider configured
+    from cli.setup import _has_provider_configured
+
+    if not _has_provider_configured(config):
+        print(
+            "Ash is not configured yet. "
+            "Run 'ash setup' to configure your provider and API key.",
+            flush=True,
+        )
+        reply = input(
+            "Press Enter to continue to REPL anyway, or type 'setup' to run the setup wizard: "
+        ).strip()
+        if reply.lower() in ("setup", "y", "yes"):
+            from cli.setup import cmd_setup
+
+            cmd_setup(
+                argparse.Namespace(section="model", quick=True, non_interactive=False)
+            )
+            config = AshConfig.load()
+
     if args.db_directory is not None:
         config = AshConfig.load(db_directory=args.db_directory)
 

@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
 from config import AshConfig
 
@@ -25,12 +24,15 @@ def clear_ash_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
-def test_config_loads_all_fields_from_ash_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_config_loads_all_fields_from_ash_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     workspace = tmp_path / "workspace"
     db_directory = tmp_path / "db"
     workspace.mkdir()
 
-    (tmp_path / "ash.toml").write_text(
+    toml_path = tmp_path / "ash.toml"
+    toml_path.write_text(
         "\n".join(
             [
                 'model = "openai/gpt-4o"',
@@ -46,9 +48,14 @@ def test_config_loads_all_fields_from_ash_toml(tmp_path: Path, monkeypatch: pyte
         ),
         encoding="utf-8",
     )
-    monkeypatch.chdir(tmp_path)
-
-    config = AshConfig.load()
+    # Patch toml_file so AshConfig.load() reads from our tmp_path file.
+    # The class-level toml_file is ~/.ash/ash.toml (absolute), so chdir has no effect.
+    original_toml_file = AshConfig.model_config.get("toml_file")
+    AshConfig.model_config["toml_file"] = str(toml_path)
+    try:
+        config = AshConfig.load()
+    finally:
+        AshConfig.model_config["toml_file"] = original_toml_file
 
     assert config.provider == "openai"
     assert config.model == "openai/gpt-4o"
@@ -116,7 +123,9 @@ def test_environment_variables_override_ash_toml(
     assert config.db_directory == env_db
 
 
-def test_config_loads_without_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_config_loads_without_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AshConfig no longer requires an api_key field — keys come from env vars."""
     monkeypatch.chdir(tmp_path)
 
