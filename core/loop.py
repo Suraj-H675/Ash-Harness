@@ -498,25 +498,64 @@ class AshLoop:
 
     # --- streaming & parsing ---------------------------------------------
 
+    def _tools_to_openai_format(
+        self, tools: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Convert Ash tools dict to OpenAI tools format for API tool calling."""
+        result = []
+        for tool in tools.values():
+            if not hasattr(tool, "name") or not hasattr(tool, "description"):
+                continue
+            schema: dict[str, Any] = {}
+            if hasattr(tool, "args_schema") and tool.args_schema is not None:
+                args_schema = tool.args_schema
+                # Support both Pydantic v2 (model_json_schema) and v1-style models.
+                if hasattr(args_schema, "model_json_schema"):
+                    schema = args_schema.model_json_schema()
+                elif hasattr(args_schema, "schema"):
+                    schema = args_schema.schema()
+            result.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": schema,
+                    },
+                }
+            )
+        return result
+
     async def _stream_one_completion(
         self,
         messages: list[dict[str, Any]],
     ) -> tuple[str, list[dict[str, Any]], int, int]:
         """Stream one completion, returning (text, tool_calls, prompt_tokens, completion_tokens)."""
 
+        # Build OpenAI-format tools list for providers that support native tool_calls.
+        openai_tools = (
+            self._tools_to_openai_format(self.tools)
+            if self.tools
+            else None
+        )
+
         parser = StreamingXMLParser()
         text_chunks: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         prompt_tokens = 0
         completion_tokens = 0
+        native_tool_calls_from_api: list[dict[str, Any]] = []
 
         with self.ui.begin_turn():
-            async for chunk in self.provider.stream_chat(messages):
+            async for chunk in self.provider.stream_chat(messages, tools=openai_tools):
                 for fragment in (chunk.content, chunk.tool_call_delta):
                     if not fragment:
                         continue
                     for event in parser.feed(fragment):
                         self._handle_event(event, text_chunks, tool_calls)
+                # Collect native tool calls from the API (these carry real IDs).
+                if chunk.native_tool_calls:
+                    native_tool_calls_from_api.extend(chunk.native_tool_calls)
                 # Capture usage from the final chunk (when is_done=True).
                 if chunk.is_done:
                     prompt_tokens = chunk.prompt_tokens
@@ -525,6 +564,12 @@ class AshLoop:
             for event in parser.feed(""):
                 self._handle_event(event, text_chunks, tool_calls)
             self.ui.finalize_turn()
+
+        # If the API returned native tool calls (OpenAI-compatible with tool_calls
+        # support), use those instead of the XML-parsed ones — they carry the
+        # real tool_call_id that the API requires on tool-result messages.
+        if native_tool_calls_from_api:
+            tool_calls = native_tool_calls_from_api
 
         return "".join(text_chunks), tool_calls, prompt_tokens, completion_tokens
 

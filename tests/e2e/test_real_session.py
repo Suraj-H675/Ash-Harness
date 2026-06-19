@@ -48,7 +48,7 @@ class SessionProvider:
         return len(text.split())
 
     async def stream_chat(
-        self, messages: list[dict[str, Any]], temperature: float = 0.0
+        self, messages: list[dict[str, Any]], temperature: float = 0.0, tools=None
     ) -> AsyncGenerator[StreamChunk, None]:
         self.received_messages.append(list(messages))
         if self._call_count >= len(self._scripts):

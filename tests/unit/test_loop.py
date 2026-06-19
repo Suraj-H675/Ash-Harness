@@ -17,7 +17,7 @@ class MockProvider(ProviderABC):
     def count_tokens(self, text):
         return 0
 
-    async def stream_chat(self, messages, temperature=0.0):
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
         # Yield XML tool call fragments that the parser will process
         yield StreamChunk(
             tool_call_delta='<call_tool name="read_file"><arg name="file_path">test.txt</arg></call_tool>',
@@ -174,7 +174,7 @@ async def test_retry_on_transient_failure(tmp_path):
         def count_tokens(self, text):
             return 0
 
-        async def stream_chat(self, messages, temperature=0.0):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
             yield StreamChunk(
                 tool_call_delta='<call_tool name="flaky"></call_tool>',
                 is_done=True,

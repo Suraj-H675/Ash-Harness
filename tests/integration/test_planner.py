@@ -40,7 +40,7 @@ class FakeProvider:
     def count_tokens(self, text: str) -> int:
         return len(text.split())
 
-    async def stream_chat(self, messages, temperature: float = 0.0):
+    async def stream_chat(self, messages, temperature: float = 0.0, tools=None):
         self.received_messages.append(list(messages))
         if self._call_count >= len(self._scripts):
             yield StreamChunk(content="", is_done=True)

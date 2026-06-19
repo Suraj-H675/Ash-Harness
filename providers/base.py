@@ -26,8 +26,9 @@ class StreamChunk(BaseModel):
     stop_reason: str | None = None
     model: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-
+    # Fully-formed tool calls from providers that support native
+    # OpenAI tool_calls streaming (includes real id for tool_call_id).
+    native_tool_calls: list[dict[str, Any]] | None = None
 @runtime_checkable
 class TokenCounterLike(Protocol):
     """Anything with a ``count(text) -> int`` method."""
@@ -49,6 +50,7 @@ class ProviderABC(ABC):
         self,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         """Yield provider response deltas as the model emits them."""
 

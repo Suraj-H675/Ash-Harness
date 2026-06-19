@@ -38,6 +38,7 @@ class OllamaProvider(ProviderABC):
         self,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         options: dict[str, Any] = {"temperature": temperature}
         if hasattr(self, "_max_tokens"):

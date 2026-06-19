@@ -9,6 +9,18 @@ from context.tokens import OpenAITokenCounter
 from providers.base import ProviderABC, StreamChunk, TokenCounterLike
 
 
+class _PartialToolCall:
+    """Accumulates a streaming tool call's name + arguments until complete."""
+
+    __slots__ = ("id", "name", "arguments", "arguments_buffer")
+
+    def __init__(self, id: str, name: str) -> None:
+        self.id = id
+        self.name = name
+        self.arguments = ""
+        self.arguments_buffer = ""
+
+
 class OpenAIProvider(ProviderABC):
     def __init__(
         self,
@@ -45,6 +57,7 @@ class OpenAIProvider(ProviderABC):
         self,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         kwargs: dict[str, Any] = {
             "model": self._model_name,
@@ -52,12 +65,20 @@ class OpenAIProvider(ProviderABC):
             "temperature": temperature,
             "stream": True,
         }
+        if tools:
+            kwargs["tools"] = tools
         if hasattr(self, "_max_tokens"):
             kwargs["max_tokens"] = self._max_tokens
         try:
             stream = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"OpenAI API error: {exc}") from exc
+
+        # Buffer for accumulating streaming tool calls.
+        partials: dict[int, _PartialToolCall] = {}
+        # Completed native tool calls ready to emit.
+        completed: list[dict[str, Any]] = []
+
         async for chunk in stream:
             delta = chunk.choices[0].delta
             content = delta.content or ""
@@ -65,11 +86,37 @@ class OpenAIProvider(ProviderABC):
             prompt_tokens = 0
             completion_tokens = 0
             stop_reason = None
-            if hasattr(chunk, "usage") and chunk.usage is not None:
-                prompt_tokens = chunk.usage.prompt_tokens or 0
-                completion_tokens = chunk.usage.completion_tokens or 0
+
+            # Process native tool_calls from the delta.
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in partials:
+                        # New tool call — capture name immediately, buffer args.
+                        partials[idx] = _PartialToolCall(
+                            id=tc.function.id or f"call_{idx}",
+                            name=tc.function.name or "",
+                        )
+                    partial = partials[idx]
+                    if tc.function.arguments:
+                        partial.arguments += tc.function.arguments
+
+            # On terminal chunk, finalise every partial tool call.
             if is_done:
+                if hasattr(chunk, "usage") and chunk.usage is not None:
+                    prompt_tokens = chunk.usage.prompt_tokens or 0
+                    completion_tokens = chunk.usage.completion_tokens or 0
                 stop_reason = chunk.choices[0].finish_reason
+                for partial in partials.values():
+                    completed.append(
+                        {
+                            "id": partial.id,
+                            "name": partial.name,
+                            "arguments": partial.arguments,
+                        }
+                    )
+                partials.clear()
+
             yield StreamChunk(
                 content=content,
                 is_done=is_done,
@@ -77,4 +124,9 @@ class OpenAIProvider(ProviderABC):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 stop_reason=stop_reason,
+                # Surface complete native tool calls so the loop can use their
+                # real IDs instead of generating random UUIDs.
+                native_tool_calls=completed if completed else None,
             )
+            # Clear emitted calls so they are not yielded again.
+            completed.clear()

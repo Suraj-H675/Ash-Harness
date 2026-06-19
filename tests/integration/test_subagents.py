@@ -482,7 +482,7 @@ async def test_architect_mode_produces_sprint_contract(shared_state, tmp_path):
         def count_tokens(self, text):
             return 0
 
-        async def stream_chat(self, messages, temperature=0.0):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
             yield StreamChunk(
                 content="## Goal\nTest\n\n## Definition of Done\n- done", is_done=True
             )

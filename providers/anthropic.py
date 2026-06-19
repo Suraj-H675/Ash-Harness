@@ -76,6 +76,7 @@ class AnthropicProvider(ProviderABC):
         self,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         client = self._resolve_client()
 

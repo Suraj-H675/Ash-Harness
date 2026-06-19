@@ -117,7 +117,7 @@ def test_semantic_memory_injects_into_system_prompt(tmp_path: Path) -> None:
 
     provider = MagicMock(spec=ProviderABC)
     # Simulate a streaming response with no tool calls.
-    async def mock_stream(messages):
+    async def mock_stream(messages, temperature=0.0, tools=None):
         yield MagicMock(content="Hello, I can help you.", tool_call_delta=None)
         return
         yield  # make it a generator
@@ -155,7 +155,7 @@ def test_semantic_memory_injects_into_system_prompt(tmp_path: Path) -> None:
     # Run a turn with a query that should match the indexed file.
     captured_messages: list[dict[str, Any]] = []
 
-    async def capturing_stream(messages):
+    async def capturing_stream(messages, temperature=0.0, tools=None):
         captured_messages.extend(messages)
         yield MagicMock(content="Hi.", tool_call_delta=None)
 

@@ -50,6 +50,7 @@ class DeepSeekProvider(ProviderABC):
         self,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         kwargs: dict[str, Any] = {
             "model": self._model_name,
@@ -57,12 +58,18 @@ class DeepSeekProvider(ProviderABC):
             "temperature": temperature,
             "stream": True,
         }
+        if tools:
+            kwargs["tools"] = tools
         if hasattr(self, "_max_tokens"):
             kwargs["max_tokens"] = self._max_tokens
         try:
             stream = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"DeepSeek API error: {exc}") from exc
+
+        partials: dict[int, Any] = {}
+        completed: list[dict[str, Any]] = []
+
         async for chunk in stream:
             delta = chunk.choices[0].delta
             content = delta.content or ""
@@ -70,11 +77,24 @@ class DeepSeekProvider(ProviderABC):
             prompt_tokens = 0
             completion_tokens = 0
             stop_reason = None
-            if hasattr(chunk, "usage") and chunk.usage is not None:
-                prompt_tokens = chunk.usage.prompt_tokens or 0
-                completion_tokens = chunk.usage.completion_tokens or 0
+
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in partials:
+                        partials[idx] = {"id": tc.function.id or f"call_{idx}", "name": tc.function.name or "", "arguments": ""}
+                    if tc.function.arguments:
+                        partials[idx]["arguments"] += tc.function.arguments
+
             if is_done:
+                if hasattr(chunk, "usage") and chunk.usage is not None:
+                    prompt_tokens = chunk.usage.prompt_tokens or 0
+                    completion_tokens = chunk.usage.completion_tokens or 0
                 stop_reason = chunk.choices[0].finish_reason
+                for partial in partials.values():
+                    completed.append(partial)
+                partials.clear()
+
             yield StreamChunk(
                 content=content,
                 is_done=is_done,
@@ -82,4 +102,6 @@ class DeepSeekProvider(ProviderABC):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 stop_reason=stop_reason,
+                native_tool_calls=completed if completed else None,
             )
+            completed.clear()

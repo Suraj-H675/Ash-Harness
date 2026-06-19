@@ -54,6 +54,7 @@ class _BaseFakeProvider(ProviderABC):
         self,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         self.received_messages.append(list(messages))
         self.received_temperatures.append(temperature)
@@ -136,6 +137,7 @@ class RateLimitedProvider(ProviderABC):
         self,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         self.received_messages.append(list(messages))
         if not self._state.admit(self._clock()):
@@ -194,6 +196,7 @@ class ContextOverflowProvider(ProviderABC):
         self,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         self.received_messages.append(list(messages))
         total_tokens = sum(self.count_tokens(m.get("content", "")) for m in messages)

@@ -45,6 +45,7 @@ class FakeProvider:
         self,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         self.received_messages.append(list(messages))
         if self._call_count >= len(self._scripts):
