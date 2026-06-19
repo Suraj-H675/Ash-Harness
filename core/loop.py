@@ -791,7 +791,11 @@ class AshLoop:
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_content}]
         for message in session.messages:
-            messages.append({"role": message.role, "content": message.content})
+            msg_dict: dict[str, Any] = {"role": message.role.value if hasattr(message.role, "value") else message.role, "content": message.content}
+            # OpenAI requires tool_call_id on role=tool messages.
+            if message.role == "tool" and message.metadata.get("call_id"):
+                msg_dict["tool_call_id"] = message.metadata["call_id"]
+            messages.append(msg_dict)
         return messages
 
     # --- provider switching -------------------------------------------------
