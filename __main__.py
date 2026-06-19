@@ -412,6 +412,7 @@ def main(argv: list[str] | None = None) -> int:
         project_root=config.workspace_root,
         tools=tools,
         config=config,
+        safety_tier=config.safety_tier,
     )
 
     return asyncio.run(_bootstrap_and_repl(loop, config, session_id=args.session))

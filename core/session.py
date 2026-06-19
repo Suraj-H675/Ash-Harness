@@ -102,6 +102,43 @@ class SessionStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = _normalize_db_path(db_path)
         self._init_db()
+        self._migrate_if_needed()
+
+    def _migrate_if_needed(self) -> None:
+        """Add token-tracking columns to sessions and messages tables.
+
+        Idempotent: columns are only added if they do not already exist.
+        """
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            # Sessions columns
+            for col_spec in (
+                ("total_tokens", "INTEGER DEFAULT 0"),
+                ("total_cost_inr", "REAL DEFAULT 0"),
+                ("total_prompt_tokens", "INTEGER DEFAULT 0"),
+                ("total_completion_tokens", "INTEGER DEFAULT 0"),
+            ):
+                col_name, col_type = col_spec
+                try:
+                    conn.execute(
+                        f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+
+            # Messages columns
+            for col_spec in (
+                ("token_count", "INTEGER DEFAULT 0"),
+                ("prompt_tokens", "INTEGER DEFAULT 0"),
+                ("completion_tokens", "INTEGER DEFAULT 0"),
+            ):
+                col_name, col_type = col_spec
+                try:
+                    conn.execute(
+                        f"ALTER TABLE messages ADD COLUMN {col_name} {col_type}"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
 
     def _init_db(self) -> None:
         """Create session and audit tables if they do not exist."""
@@ -112,7 +149,11 @@ class SessionStore:
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
                     project_path TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    total_tokens INTEGER DEFAULT 0,
+                    total_cost_inr REAL DEFAULT 0,
+                    total_prompt_tokens INTEGER DEFAULT 0,
+                    total_completion_tokens INTEGER DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS messages (
@@ -122,6 +163,9 @@ class SessionStore:
                     content TEXT NOT NULL,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     metadata_json TEXT,
+                    token_count INTEGER DEFAULT 0,
+                    prompt_tokens INTEGER DEFAULT 0,
+                    completion_tokens INTEGER DEFAULT 0,
                     FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
                 );
 
@@ -284,14 +328,21 @@ class SessionStore:
             ],
         )
 
-    def save_message(self, session_id: str, message: Message) -> None:
+    def save_message(
+        self,
+        session_id: str,
+        message: Message,
+        token_count: int = 0,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+    ) -> None:
         """Append a single message to a session."""
 
         with closing(get_db_connection(self.db_path)) as conn, conn:
             conn.execute(
                 """
-                INSERT INTO messages (session_id, role, content, timestamp, metadata_json)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO messages (session_id, role, content, timestamp, metadata_json, token_count, prompt_tokens, completion_tokens)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -299,6 +350,37 @@ class SessionStore:
                     message.content,
                     _serialize_datetime(message.timestamp),
                     json.dumps(message.metadata),
+                    token_count,
+                    prompt_tokens,
+                    completion_tokens,
+                ),
+            )
+
+    def save_session_token_stats(
+        self,
+        session_id: str,
+        total_prompt_tokens: int,
+        total_completion_tokens: int,
+        total_cost_inr: float,
+    ) -> None:
+        """Update aggregated token stats on a session."""
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET total_tokens = ?,
+                    total_cost_inr = ?,
+                    total_prompt_tokens = ?,
+                    total_completion_tokens = ?
+                WHERE session_id = ?
+                """,
+                (
+                    total_prompt_tokens + total_completion_tokens,
+                    total_cost_inr,
+                    total_prompt_tokens,
+                    total_completion_tokens,
+                    session_id,
                 ),
             )
 

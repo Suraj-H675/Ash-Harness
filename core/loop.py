@@ -348,6 +348,8 @@ class AshLoop:
 
         # 2. Stream/execute loop bounded by max_turn_iterations.
         final_text = ""
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
         for _ in range(self.max_turn_iterations):
             # Optionally search semantic memory and inject relevant context.
             self._pending_memory_context = ""
@@ -358,7 +360,11 @@ class AshLoop:
                         f"// From {hit.file_path}:\n{hit.content[:500]}" for hit in hits
                     )
             messages = self._build_messages(session)
-            assistant_text, tool_calls = await self._stream_one_completion(messages)
+            (assistant_text, tool_calls, turn_prompt_tokens, turn_completion_tokens) = (
+                await self._stream_one_completion(messages)
+            )
+            total_prompt_tokens += turn_prompt_tokens
+            total_completion_tokens += turn_completion_tokens
 
             # Persist the assistant turn.
             assistant_message = Message(
@@ -432,6 +438,23 @@ class AshLoop:
                 "[Turn reached max iterations without a final text response.]"
             ).strip()
 
+        # Save accumulated token usage to session DB.
+        prompt = int(total_prompt_tokens) if total_prompt_tokens else 0
+        completion = int(total_completion_tokens) if total_completion_tokens else 0
+        if prompt > 0 or completion > 0:
+            # Groq pricing (June 2025): $0.59/M input, $2.40/M output; 1 USD ≈ 83 INR
+            usd_per_input_token = 0.59 / 1_000_000
+            usd_per_output_token = 2.40 / 1_000_000
+            input_cost_usd = prompt * usd_per_input_token
+            output_cost_usd = completion * usd_per_output_token
+            total_cost_inr = (input_cost_usd + output_cost_usd) * 83
+            self.session_store.save_session_token_stats(
+                session.session_id,
+                prompt,
+                completion,
+                total_cost_inr,
+            )
+
         if self.auto_commit:
             commit_result = await auto_commit_turn(
                 self.project_root,
@@ -478,12 +501,14 @@ class AshLoop:
     async def _stream_one_completion(
         self,
         messages: list[dict[str, Any]],
-    ) -> tuple[str, list[dict[str, Any]]]:
-        """Stream one completion, returning (text, tool_calls)."""
+    ) -> tuple[str, list[dict[str, Any]], int, int]:
+        """Stream one completion, returning (text, tool_calls, prompt_tokens, completion_tokens)."""
 
         parser = StreamingXMLParser()
         text_chunks: list[str] = []
         tool_calls: list[dict[str, Any]] = []
+        prompt_tokens = 0
+        completion_tokens = 0
 
         with self.ui.begin_turn():
             async for chunk in self.provider.stream_chat(messages):
@@ -492,12 +517,16 @@ class AshLoop:
                         continue
                     for event in parser.feed(fragment):
                         self._handle_event(event, text_chunks, tool_calls)
+                # Capture usage from the final chunk (when is_done=True).
+                if chunk.is_done:
+                    prompt_tokens = chunk.prompt_tokens
+                    completion_tokens = chunk.completion_tokens
             # Drain the parser's remaining buffer at end-of-stream.
             for event in parser.feed(""):
                 self._handle_event(event, text_chunks, tool_calls)
             self.ui.finalize_turn()
 
-        return "".join(text_chunks), tool_calls
+        return "".join(text_chunks), tool_calls, prompt_tokens, completion_tokens
 
     def _handle_event(
         self,
@@ -563,7 +592,7 @@ class AshLoop:
 
             if self.on_tool_approval is not None:
                 approved = await self.on_tool_approval(tool_name, arguments)
-            elif self.safety_tier == "auto_approve":
+            elif self.safety_tier in ("auto_approve", "dry_run"):
                 approved = True
             else:
                 approved = self.ui.request_tool_approval(tool_name, arguments)
