@@ -102,6 +102,6 @@ class DeepSeekProvider(ProviderABC):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 stop_reason=stop_reason,
-                native_tool_calls=completed if completed else None,
+                native_tool_calls=list(completed) if completed else None,
             )
             completed.clear()

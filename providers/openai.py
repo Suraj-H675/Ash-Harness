@@ -12,13 +12,12 @@ from providers.base import ProviderABC, StreamChunk, TokenCounterLike
 class _PartialToolCall:
     """Accumulates a streaming tool call's name + arguments until complete."""
 
-    __slots__ = ("id", "name", "arguments", "arguments_buffer")
+    __slots__ = ("id", "name", "arguments")
 
     def __init__(self, id: str, name: str) -> None:
         self.id = id
         self.name = name
         self.arguments = ""
-        self.arguments_buffer = ""
 
 
 class OpenAIProvider(ProviderABC):
@@ -126,7 +125,9 @@ class OpenAIProvider(ProviderABC):
                 stop_reason=stop_reason,
                 # Surface complete native tool calls so the loop can use their
                 # real IDs instead of generating random UUIDs.
-                native_tool_calls=completed if completed else None,
+                # Yield a COPY so completed.clear() after yield doesn't affect
+                # the StreamChunk's reference.
+                native_tool_calls=list(completed) if completed else None,
             )
             # Clear emitted calls so they are not yielded again.
             completed.clear()
