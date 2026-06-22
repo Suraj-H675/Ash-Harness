@@ -689,6 +689,21 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
                 )
                 print(result.output or result.error or "No changes.", flush=True)
                 continue
+            if command.name == "review":
+                from cli.review import build_review_prompt, collect_review_changes
+
+                try:
+                    label, changes = await collect_review_changes(
+                        loop.project_root, arguments
+                    )
+                except ValueError as exc:
+                    print(f"Error: {exc}", file=sys.stderr, flush=True)
+                    continue
+                if not changes.strip():
+                    print(f"No changes found for {label}.", flush=True)
+                    continue
+                user_input = build_review_prompt(label, changes)
+                parsed_command = None
             if command.name == "permissions":
                 from safety.policy import PermissionMode, PermissionPolicy
                 from safety.grants import load_tool_grants, set_tool_grant

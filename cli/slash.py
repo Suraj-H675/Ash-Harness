@@ -17,16 +17,24 @@ class SlashCommand:
 COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("help", "Show available commands", "/help"),
     SlashCommand("status", "Show session and runtime status", "/status"),
-    SlashCommand("model", "Choose or switch the active model", "/model [provider/model]"),
+    SlashCommand(
+        "model", "Choose or switch the active model", "/model [provider/model]"
+    ),
     SlashCommand("models", "List known models", "/models"),
     SlashCommand("new", "Start a new session", "/new", aliases=("clear",)),
     SlashCommand("sessions", "List or search recent sessions", "/sessions [query]"),
     SlashCommand("resume", "Resume a session by ID", "/resume <session-id>"),
     SlashCommand("rename", "Rename the current session", "/rename <title>"),
-    SlashCommand("fork", "Fork the session at a message boundary", "/fork [message-count]"),
-    SlashCommand("rewind", "Rewind transcript to a message boundary", "/rewind <message-count>"),
+    SlashCommand(
+        "fork", "Fork the session at a message boundary", "/fork [message-count]"
+    ),
+    SlashCommand(
+        "rewind", "Rewind transcript to a message boundary", "/rewind <message-count>"
+    ),
     SlashCommand("undo", "Undo Ash's latest direct file edits", "/undo"),
-    SlashCommand("export", "Export a redacted transcript", "/export [jsonl|markdown] [path]"),
+    SlashCommand(
+        "export", "Export a redacted transcript", "/export [jsonl|markdown] [path]"
+    ),
     SlashCommand("import", "Import an Ash JSONL transcript", "/import <path>"),
     SlashCommand("context", "Show current context usage", "/context"),
     SlashCommand("compact", "Compact older conversation history", "/compact"),
@@ -35,18 +43,33 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("commands", "List custom Markdown commands", "/commands"),
     SlashCommand("agents", "Show or stop subagents", "/agents [stop AGENT_ID]"),
     SlashCommand("diff", "Show the current Git diff", "/diff [--staged] [path]"),
-    SlashCommand("permissions", "Inspect/change mode or grants", "/permissions [mode|allow TOOL|revoke TOOL]"),
+    SlashCommand(
+        "review",
+        "Review Git changes with the active model",
+        "/review [worktree|staged|commit REF|branch BASE]",
+    ),
+    SlashCommand(
+        "permissions",
+        "Inspect/change mode or grants",
+        "/permissions [mode|allow TOOL|revoke TOOL]",
+    ),
     SlashCommand("sandbox", "Show active sandbox capabilities", "/sandbox"),
     SlashCommand("doctor", "Run local diagnostics", "/doctor"),
-    SlashCommand("mcp", "Inspect live MCP servers and capabilities", "/mcp [status|tools|resources|prompts]"),
-    SlashCommand("memory", "Inspect, index, search, or clear memory", "/memory [status|index PATH|search QUERY|clear]"),
+    SlashCommand(
+        "mcp",
+        "Inspect live MCP servers and capabilities",
+        "/mcp [status|tools|resources|prompts]",
+    ),
+    SlashCommand(
+        "memory",
+        "Inspect, index, search, or clear memory",
+        "/memory [status|index PATH|search QUERY|clear]",
+    ),
     SlashCommand("exit", "Exit Ash", "/exit", aliases=("quit",)),
 )
 
 _COMMAND_LOOKUP = {
-    alias: command
-    for command in COMMANDS
-    for alias in (command.name, *command.aliases)
+    alias: command for command in COMMANDS for alias in (command.name, *command.aliases)
 }
 
 

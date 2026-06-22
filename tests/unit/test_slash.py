@@ -26,3 +26,4 @@ def test_help_lists_core_session_commands() -> None:
     assert "/sessions [query]" in rendered
     assert "/resume <session-id>" in rendered
     assert "/status" in rendered
+    assert "/review [worktree|staged|commit REF|branch BASE]" in rendered
