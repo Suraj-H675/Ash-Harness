@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -23,8 +23,8 @@ class AshConfig(BaseSettings):
     )
 
     model: str = Field(
-        "anthropic/claude-3-7-sonnet-20250219",
-        description="Model in provider/model string format (e.g. anthropic/claude-3-7-sonnet-20250219, ollama/qwen2.5-coder:7b)",
+        "anthropic/claude-sonnet-4-6",
+        description="Model in provider/model string format (e.g. anthropic/claude-sonnet-4-6, ollama/qwen3-coder)",
     )
     temperature: float = Field(0.0, description="Model generation temperature.")
 
@@ -40,10 +40,36 @@ class AshConfig(BaseSettings):
         20000,
         description="Limit for single tool response strings before middle truncation.",
     )
+    model_pricing_usd_per_million: dict[str, dict[str, float]] = Field(
+        default_factory=dict,
+        description=(
+            "Optional explicit model pricing: provider/model -> "
+            "{input: USD per million tokens, output: USD per million tokens}."
+        ),
+    )
+    fallback_models: list[str] = Field(
+        default_factory=list,
+        description="Ordered provider/model fallbacks used before output begins.",
+    )
+    context_compaction_threshold: float = Field(
+        0.80,
+        ge=0.1,
+        le=1.0,
+        description="Fraction of the usable input window that triggers compaction.",
+    )
+    context_recent_messages: int = Field(
+        12,
+        ge=2,
+        description="Recent messages retained verbatim during compaction.",
+    )
 
     safety_tier: str = Field(
         "interactive",
-        description="Safety enforcement mode: 'interactive' or 'auto_approve' or 'dry_run'",
+        description="Permission mode: interactive, auto_edit, plan, auto_approve, or dry_run.",
+    )
+    allow_unsafe_auto_approve: bool = Field(
+        False,
+        description="Allow full auto mode without an OS-level sandbox.",
     )
     workspace_root: Path = Field(
         default_factory=Path.cwd,
@@ -58,6 +84,11 @@ class AshConfig(BaseSettings):
         default=Path.home() / ".ash" / "db",
         description="Folder path housing local SQLite persistence files.",
     )
+    session_retention_days: int = Field(
+        0,
+        ge=0,
+        description="Delete sessions older than this many days; 0 disables cleanup.",
+    )
 
     mcp_servers: dict[str, Any] = Field(
         default_factory=dict,
@@ -66,7 +97,7 @@ class AshConfig(BaseSettings):
 
     custom_providers: dict[str, dict] = Field(
         default_factory=dict,
-        description="Custom OpenAI-compatible providers: name -> {base_url, api_key, models[]}",
+        description="Custom OpenAI-compatible providers with base URL, key env name, and models.",
     )
 
     repo_map_exclude_patterns: list[str] = Field(
@@ -83,7 +114,7 @@ class AshConfig(BaseSettings):
     )
     memory_backend: str = Field(
         "auto",
-        description="Memory backend: 'auto' (in-memory), 'chroma' (persistent), or 'fts5' (lexical-only)",
+        description="Memory backend: auto, chroma, fts5, or off.",
     )
     chroma_persist_dir: Path = Field(
         Path(".ash/chroma"),
@@ -98,6 +129,41 @@ class AshConfig(BaseSettings):
         Path(".ash/model.onnx"),
         description="Path to ONNX MiniLM model for local embeddings",
     )
+
+    @field_validator("memory_backend")
+    @classmethod
+    def validate_memory_backend(cls, value: str) -> str:
+        if value not in {"auto", "chroma", "fts5", "off"}:
+            raise ValueError("memory_backend must be auto, chroma, fts5, or off")
+        return value
+
+    @field_validator("model")
+    @classmethod
+    def validate_model_string(cls, value: str) -> str:
+        """Require a non-empty ``provider/model`` identifier."""
+
+        import os
+
+        if "/" not in value and os.environ.get("ASH_PROVIDER"):
+            value = f"{os.environ['ASH_PROVIDER']}/{value}"
+        provider, separator, model_name = value.partition("/")
+        if not separator or not provider.strip() or not model_name.strip():
+            raise ValueError(
+                "model must use provider/model format, for example "
+                "'anthropic/claude-sonnet-4-5' or 'ollama/qwen2.5-coder:7b'"
+            )
+        return f"{provider.strip()}/{model_name.strip()}"
+
+    @field_validator("safety_tier")
+    @classmethod
+    def validate_safety_tier(cls, value: str) -> str:
+        from safety.policy import PermissionMode
+
+        try:
+            return PermissionMode(value).value
+        except ValueError as exc:
+            allowed = ", ".join(mode.value for mode in PermissionMode)
+            raise ValueError(f"safety_tier must be one of: {allowed}") from exc
 
     @property
     def provider(self) -> str:
@@ -138,6 +204,11 @@ class AshConfig(BaseSettings):
         """Handle backward compat and load MCP servers."""
         import os
 
+        from cli.config import load_env
+
+        for key, value in load_env().items():
+            os.environ.setdefault(key, value)
+
         # Backward compat: if ANTHROPIC_API_KEY is not set but ASH_API_KEY is,
         # promote it so _build_provider() finds the right key.
         if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ASH_API_KEY"):
@@ -158,19 +229,5 @@ class AshConfig(BaseSettings):
             os.environ["ASH_MODEL"] = new_model
             object.__setattr__(self, "model", new_model)
 
-        # Load MCP servers from .mcp.json if not already populated.
-        if not self.mcp_servers:
-            from mcp.server import MCPServerConfig, load_mcp_servers
-
-            mcp_path = self.workspace_root / ".mcp.json"
-            if mcp_path.exists():
-                raw = load_mcp_servers(mcp_path)
-                self.mcp_servers = {
-                    name: MCPServerConfig(
-                        name=cfg.name,
-                        command=cfg.command,
-                        args=cfg.args,
-                        env=cfg.env,
-                    )
-                    for name, cfg in raw.items()
-                }
+        # Project MCP configuration is deliberately loaded later by AshLoop,
+        # after the CLI has established workspace trust.

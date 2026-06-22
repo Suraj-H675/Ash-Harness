@@ -340,6 +340,11 @@ class VectorIndex(ABC):
 
         raise NotImplementedError
 
+    @abstractmethod
+    def clear(self) -> None:
+        """Delete every indexed record."""
+        raise NotImplementedError
+
 
 class InMemoryVectorIndex(VectorIndex):
     """
@@ -407,6 +412,9 @@ class InMemoryVectorIndex(VectorIndex):
 
     def __len__(self) -> int:
         return len(self._records)
+
+    def clear(self) -> None:
+        self._records.clear()
 
 
 class ChromaIndex(VectorIndex):
@@ -499,6 +507,15 @@ class ChromaIndex(VectorIndex):
             )
         return hits
 
+    def clear(self) -> None:
+        self._ensure_ready()
+        if self._client is None:
+            raise VectorBackendUnavailable("Chroma client is unavailable")
+        self._client.delete_collection(self._collection_name)
+        self._collection = self._client.get_or_create_collection(
+            self._collection_name
+        )
+
 
 class VectorBackendUnavailable(RuntimeError):
     """Raised when the configured vector backend cannot be used."""
@@ -548,6 +565,9 @@ class FTS5FallbackIndex:
             for row in rows
         ]
 
+    def clear(self) -> None:
+        self._index.clear()
+
 
 def fts5_query(
     db_path: Path | str, query_text: str, top_k: int = 5
@@ -590,10 +610,12 @@ class VectorSearchPipeline:
         adapter: EmbeddingAdapter,
         vector_index: VectorIndex,
         lexical_index: FTS5FallbackIndex | None = None,
+        vector_enabled: bool = True,
     ) -> None:
         self._adapter = adapter
         self._vector_index = vector_index
         self._lexical_index = lexical_index
+        self._vector_enabled = vector_enabled
 
     @property
     def adapter(self) -> EmbeddingAdapter:
@@ -612,6 +634,10 @@ class VectorSearchPipeline:
 
         if not chunks:
             return 0
+        if self._lexical_index is not None:
+            self._lexical_index.add(chunks, file_path)
+        if not self._vector_enabled:
+            return len(chunks)
         texts = [chunk.content for chunk in chunks]
         embeddings = await self._adapter.get_embeddings(texts)
         ids: list[str] = []
@@ -647,6 +673,10 @@ class VectorSearchPipeline:
         """
 
         try:
+            if not self._vector_enabled:
+                if self._lexical_index is None:
+                    return [], "lexical"
+                return self._lexical_index.query(query_text, top_k=top_k), "lexical"
             query_embedding = await self._adapter.get_embedding(query_text)
             hits = self._vector_index.query(query_embedding, top_k=top_k)
             return hits, "vector"
@@ -654,6 +684,11 @@ class VectorSearchPipeline:
             if self._lexical_index is None:
                 return [], "lexical"
             return self._lexical_index.query(query_text, top_k=top_k), "lexical"
+
+    def clear(self) -> None:
+        self._vector_index.clear()
+        if self._lexical_index is not None:
+            self._lexical_index.clear()
 
 
 # ---------------------------------------------------------------------------

@@ -11,13 +11,15 @@ automated tests and CI can drive the loop.
 from __future__ import annotations
 
 import sys
+import difflib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, TextIO
 
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, TextColumn
+from rich.progress import BarColumn, Progress, TaskID, TextColumn
 from rich.text import Text
 from rich.columns import Columns
 
@@ -62,8 +64,15 @@ class TerminalUI:
         console: Console | None = None,
         input_stream: TextIO | None = None,
         show_token_meter: bool = False,
+        workspace_root: Path | None = None,
     ) -> None:
-        if safety_tier not in {"interactive", "auto_approve", "dry_run"}:
+        if safety_tier not in {
+            "interactive",
+            "auto_edit",
+            "plan",
+            "auto_approve",
+            "dry_run",
+        }:
             raise ValueError(f"Unknown safety tier: {safety_tier!r}")
         self.safety_tier = safety_tier
         self._approval_callback = approval_callback
@@ -71,7 +80,9 @@ class TerminalUI:
         self._input_stream = input_stream or sys.stdin
         self._active_buffers: _LiveBuffers | None = None
         self._active_live: Live | None = None
+        self._session_approvals: set[str] = set()
         self.show_token_meter = show_token_meter
+        self.workspace_root = workspace_root.resolve() if workspace_root else None
         self._token_progress = (
             Progress(
                 TextColumn("[progress.description]{task.description}"),
@@ -81,7 +92,15 @@ class TerminalUI:
             if show_token_meter
             else None
         )
-        self._token_task = None
+        self._token_task: TaskID | None = None
+        self._current_tokens = 0
+        self._maximum_tokens = 100000
+
+    @property
+    def has_approval_callback(self) -> bool:
+        """Whether an embedding host supplied an explicit decision callback."""
+
+        return self._approval_callback is not None
 
     # --- streaming surface ------------------------------------------------
 
@@ -112,11 +131,11 @@ class TerminalUI:
 
         def _render() -> Panel:
             assert self._active_buffers is not None
-            content = self._active_buffers.response
+            content: Any = self._active_buffers.response
             if self.show_token_meter and self._token_task is not None:
                 token_text = Text(
                     self._render_token_meter(
-                        self._token_task.completed, self._token_task.total
+                        self._current_tokens, self._maximum_tokens
                     ),
                     style="dim",
                 )
@@ -176,9 +195,14 @@ class TerminalUI:
         """Update the token progress bar with current / maximum counts."""
         if self._token_task is None or self._token_progress is None:
             return
-        self._token_task.completed = current
+        self._current_tokens = current
         if maximum is not None:
-            self._token_task.total = maximum
+            self._maximum_tokens = maximum
+        self._token_progress.update(
+            self._token_task,
+            completed=current,
+            total=self._maximum_tokens,
+        )
 
     def _refresh_live(self) -> None:
         live = getattr(self, "_active_live", None)
@@ -192,6 +216,9 @@ class TerminalUI:
 
         if self._approval_callback is not None:
             return bool(self._approval_callback(tool_name, arguments))
+        if tool_name in self._session_approvals:
+            self._render_approval_notice(tool_name, arguments, auto=True)
+            return True
 
         if self.safety_tier == "auto_approve":
             self._render_approval_notice(tool_name, arguments, auto=True)
@@ -205,6 +232,9 @@ class TerminalUI:
             answer = self._input_stream.readline().strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False
+        if answer in {"a", "always", "session"}:
+            self._session_approvals.add(tool_name)
+            return True
         return answer in {"y", "yes"}
 
     def _render_approval_notice(
@@ -227,14 +257,74 @@ class TerminalUI:
             body.append(f"  {key} = ", style="dim")
             body.append(repr(value))
             body.append("\n")
+        preview = self._edit_preview(tool_name, arguments)
+        if preview:
+            body.append("\nDiff preview:\n", style="bold")
+            body.append(preview, style="dim")
         if auto:
             body.append("\n[auto-approved]", style="green")
         else:
-            body.append("\nApprove? [y/N] ", style="bold yellow")
+            body.append(
+                "\nApprove once [y], for this session [a], or deny [N]? ",
+                style="bold yellow",
+            )
         self.console.print(Panel(body, border_style="yellow", title="approval"))
 
         if live is not None:
             live.start()
+
+    def _edit_preview(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        if tool_name == "apply_patch":
+            patch = arguments.get("patch")
+            if isinstance(patch, str):
+                lines = patch.splitlines()
+                return "\n".join(lines[:200] + (["[diff preview truncated]"] if len(lines) > 200 else []))
+        if tool_name == "replace_file_content":
+            before = arguments.get("target_content")
+            after = arguments.get("replacement_content")
+            if isinstance(before, str) and isinstance(after, str):
+                return "\n".join(
+                    difflib.unified_diff(
+                        before.splitlines(),
+                        after.splitlines(),
+                        fromfile="target",
+                        tofile="replacement",
+                        lineterm="",
+                    )
+                )
+        if self.workspace_root is None or tool_name not in {
+            "write_file",
+            "whole_edit",
+        }:
+            return ""
+        raw_path = arguments.get("file_path")
+        content = arguments.get("content")
+        if not isinstance(raw_path, str) or not isinstance(content, str):
+            return ""
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = self.workspace_root / path
+        path = path.resolve()
+        try:
+            relative = path.relative_to(self.workspace_root)
+        except ValueError:
+            return "[preview unavailable: path is outside workspace]"
+        try:
+            before = path.read_text(encoding="utf-8") if path.is_file() else ""
+        except (OSError, UnicodeError):
+            return "[preview unavailable: existing file is not readable text]"
+        lines = list(
+            difflib.unified_diff(
+                before.splitlines(),
+                content.splitlines(),
+                fromfile=f"a/{relative.as_posix()}",
+                tofile=f"b/{relative.as_posix()}",
+                lineterm="",
+            )
+        )
+        if len(lines) > 200:
+            lines = lines[:200] + ["[diff preview truncated]"]
+        return "\n".join(lines)
 
     # --- sprint planning surface (Sprint 12 / V5) -----------------------
 

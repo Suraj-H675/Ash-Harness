@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import re
+import inspect
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-HookResult = (
-    str | Awaitable[str] | None
-)  # session-start hooks may return injected prompt text
+HookResult = str | None
+HookCallbackResult = str | Awaitable[str] | None
+
+
+class HookBlock(RuntimeError):
+    """Raised by a trusted pre-tool hook to deny a tool call."""
 
 
 class Hook(ABC):
@@ -28,10 +33,13 @@ class PreToolUseHook(Hook):
     callback: Callable[[str, dict[str, Any]], Awaitable[None]]
 
     async def run(
-        self, tool_name: str, arguments: dict[str, Any], **kwargs: Any
+        self, **kwargs: Any
     ) -> HookResult:
+        tool_name = str(kwargs["tool_name"])
+        arguments = kwargs["arguments"]
         if self.matcher.search(tool_name):
             await self.callback(tool_name, arguments)
+        return None
 
 
 @dataclass
@@ -42,27 +50,34 @@ class PostToolUseHook(Hook):
     callback: Callable[[str, dict[str, Any], Any], Awaitable[None]]
 
     async def run(
-        self, tool_name: str, arguments: dict[str, Any], result: Any, **kwargs: Any
+        self, **kwargs: Any
     ) -> HookResult:
+        tool_name = str(kwargs["tool_name"])
+        arguments = kwargs["arguments"]
+        result = kwargs["result"]
         if self.matcher.search(tool_name):
             await self.callback(tool_name, arguments, result)
+        return None
 
 
 @dataclass
 class SessionStartHook(Hook):
     """Called when a new session starts. May return a string to inject into the system prompt."""
 
-    callback: Callable[[], HookResult]  # may return str | Awaitable[str] | None
+    callback: Callable[[], HookCallbackResult]
 
     async def run(self, **kwargs: Any) -> HookResult:
         result = self.callback()
-        if hasattr(result, "__await__"):  # handle async callback
+        if inspect.isawaitable(result):
             return await result
-        return result  # type: ignore[return-value]
+        return result
 
 
 class HookRegistry:
-    def __init__(self) -> None:
+    def __init__(self, *, timeout_seconds: float = 10.0) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("hook timeout must be positive")
+        self.timeout_seconds = timeout_seconds
         self._pre_tool: list[PreToolUseHook] = []
         self._post_tool: list[PostToolUseHook] = []
         self._session_start: list[SessionStartHook] = []
@@ -79,18 +94,26 @@ class HookRegistry:
 
     async def fire_pre_tool(self, tool_name: str, arguments: dict[str, Any]) -> None:
         for hook in self._pre_tool:
-            await hook.run(tool_name=tool_name, arguments=arguments)
+            await asyncio.wait_for(
+                hook.run(tool_name=tool_name, arguments=arguments),
+                timeout=self.timeout_seconds,
+            )
 
     async def fire_post_tool(
         self, tool_name: str, arguments: dict[str, Any], result: Any
     ) -> None:
         for hook in self._post_tool:
-            await hook.run(tool_name=tool_name, arguments=arguments, result=result)
+            await asyncio.wait_for(
+                hook.run(tool_name=tool_name, arguments=arguments, result=result),
+                timeout=self.timeout_seconds,
+            )
 
     async def fire_session_start(self) -> None:
         self._injected_prompt = ""  # reset at start of each session
         for hook in self._session_start:
-            prompt_addition = await hook.run() or ""
+            prompt_addition = await asyncio.wait_for(
+                hook.run(), timeout=self.timeout_seconds
+            ) or ""
             if prompt_addition:
                 self._injected_prompt += (
                     ("\n" + prompt_addition)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import re
 from typing import Protocol
 
 import tiktoken
@@ -37,18 +39,35 @@ class AnthropicTokenCounter:
 
 
 class OpenAITokenCounter:
-    """Exact token counter for OpenAI models via tiktoken."""
+    """OpenAI token counter with an offline-safe approximation fallback."""
 
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
-        # Use cl100k_base directly to avoid hanging on remote model downloads.
-        # This encoding is used by gpt-4o, gpt-4-turbo, gpt-3.5-turbo, etc.
-        self._encoder = tiktoken.get_encoding(DEFAULT_OPENAI_FALLBACK_ENCODING)
+        self.using_approximation = True
+        self._encoder: object = _ApproximateEncoder()
+        if os.environ.get("ASH_ENABLE_TIKTOKEN_DOWNLOAD") == "1":
+            try:
+                self._encoder = tiktoken.get_encoding(
+                    DEFAULT_OPENAI_FALLBACK_ENCODING
+                )
+                self.using_approximation = False
+            except Exception:
+                # Token usage returned by the provider remains authoritative.
+                self._encoder = _ApproximateEncoder()
 
     def count(self, text: str) -> int:
         if not text:
             return 0
-        return len(self._encoder.encode(text))
+        return len(self._encoder.encode(text))  # type: ignore[attr-defined]
+
+
+class _ApproximateEncoder:
+    """Small offline tokenizer used only for input-budget estimates."""
+
+    _TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+
+    def encode(self, text: str) -> list[str]:
+        return self._TOKEN_PATTERN.findall(text)
 
 
 def get_token_counter(provider: str, model_name: str) -> TokenCounter:

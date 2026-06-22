@@ -16,10 +16,72 @@ from typing import Any, Sequence
 from pydantic import BaseModel, Field
 
 from safety.guard import SafetyGuard
-from tools.base import BaseTool, ToolResult
+from tools.base import BaseTool, ToolResult, count_output_tokens
 
 
 DEFAULT_COMMIT_AUTHOR = "ash <ash@local>"
+DEFAULT_GIT_OUTPUT_LIMIT = 100_000
+
+
+class GitStatusArgs(BaseModel):
+    include_untracked: bool = True
+
+
+class GitDiffArgs(BaseModel):
+    staged: bool = False
+    path: str = ""
+
+
+class GitLogArgs(BaseModel):
+    limit: int = Field(20, ge=1, le=100)
+
+
+class GitStatusTool(BaseTool):
+    name = "git_status"
+    description = "Show machine-readable Git worktree and branch status."
+    args_schema = GitStatusArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = GitStatusArgs(**kwargs)
+        command = ["status", "--short", "--branch"]
+        if not args.include_untracked:
+            command.append("--untracked-files=no")
+        return await _git_result(self.safety_guard.project_root, command)
+
+
+class GitDiffTool(BaseTool):
+    name = "git_diff"
+    description = "Show a unified Git diff for the workspace or one path."
+    args_schema = GitDiffArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = GitDiffArgs(**kwargs)
+        command = ["diff"]
+        if args.staged:
+            command.append("--cached")
+        command.extend(["--no-ext-diff", "--"])
+        if args.path:
+            path = self.safety_guard.validate_path(args.path)
+            command.append(str(path.relative_to(self.safety_guard.project_root)))
+        return await _git_result(self.safety_guard.project_root, command)
+
+
+class GitLogTool(BaseTool):
+    name = "git_log"
+    description = "Show recent commits without invoking a pager."
+    args_schema = GitLogArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = GitLogArgs(**kwargs)
+        return await _git_result(
+            self.safety_guard.project_root,
+            [
+                "log",
+                f"-{args.limit}",
+                "--date=iso-strict",
+                "--pretty=format:%h%x09%ad%x09%an%x09%s",
+            ],
+        )
 
 
 class AutoCommitArgs(BaseModel):
@@ -136,6 +198,20 @@ async def _run_git(cwd: Path, args: Sequence[str]) -> tuple[int, str, str]:
     )
 
 
+async def _git_result(cwd: Path, args: Sequence[str]) -> ToolResult:
+    code, stdout, stderr = await _run_git(cwd, args)
+    output = stdout
+    truncated = len(output) > DEFAULT_GIT_OUTPUT_LIMIT
+    if truncated:
+        output = output[:DEFAULT_GIT_OUTPUT_LIMIT] + "\n[output truncated]"
+    if code != 0:
+        return ToolResult(success=False, output=output, error=stderr.strip())
+    return ToolResult(
+        success=True,
+        output=output.rstrip(),
+        token_count=count_output_tokens(output),
+        truncated=truncated,
+    )
 def _name_from_author(author: str) -> str:
     if "<" in author:
         return author.split("<", 1)[0].strip()

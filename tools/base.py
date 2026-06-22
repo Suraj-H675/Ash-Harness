@@ -1,15 +1,11 @@
 """Base contracts for Ash tools."""
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import Any
 
 from pydantic import BaseModel
 
 from safety.guard import SafetyGuard
-
-if TYPE_CHECKING:
-    from tools.base import BaseTool
-
 
 class ToolResult(BaseModel):
     success: bool
@@ -20,9 +16,9 @@ class ToolResult(BaseModel):
 
 
 class BaseTool(ABC):
-    name: ClassVar[str]
-    description: ClassVar[str]
-    args_schema: ClassVar[type[BaseModel]]
+    name: str
+    description: str
+    args_schema: type[BaseModel]
 
     def __init__(self, safety_guard: SafetyGuard) -> None:
         self.safety_guard = safety_guard
@@ -33,6 +29,9 @@ class BaseTool(ABC):
 
     def validate_args(self, **kwargs: Any) -> BaseModel:
         return self.args_schema(**kwargs)
+
+    async def aclose(self) -> None:
+        """Release optional tool resources."""
 
 
 class ToolMiddleware(ABC):

@@ -52,6 +52,115 @@ class MyTestTool(BaseTool):
         return ToolResult(success=True, output="my_tool ran")
 
 
+class NativeToolProvider(ProviderABC):
+    model_name = "native-test"
+
+    def __init__(self):
+        self.calls = 0
+        self.received_messages = []
+
+    def count_tokens(self, text):
+        return len(text)
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        self.received_messages.append(messages)
+        self.calls += 1
+        if self.calls == 1:
+            yield StreamChunk(
+                is_done=True,
+                native_tool_calls=[
+                    {
+                        "id": "call-native-1",
+                        "name": "capture",
+                        "arguments": '{"text":"hello"}',
+                    }
+                ],
+            )
+        else:
+            yield StreamChunk(content="done", is_done=True)
+
+
+class CaptureTool(BaseTool):
+    name = "capture"
+    args_schema = None
+
+    def __init__(self, safety_guard):
+        super().__init__(safety_guard)
+        self.arguments = None
+
+    async def run(self, **kwargs):
+        self.arguments = kwargs
+        return ToolResult(success=True, output=kwargs["text"])
+
+
+@pytest.mark.asyncio
+async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
+    provider = NativeToolProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    store = SessionStore(tmp_path / "native.db")
+    loop = AshLoop(
+        store,
+        provider,
+        tool.safety_guard,
+        TerminalUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={tool.name: tool},
+    )
+
+    await loop.start_session()
+    response = await loop.run_turn("use the capture tool")
+
+    assert response == "done"
+    assert tool.arguments == {"text": "hello"}
+    second_request = provider.received_messages[1]
+    assistant = next(
+        message
+        for message in second_request
+        if message["role"] == "assistant" and message.get("tool_calls")
+    )
+    assert assistant["tool_calls"][0]["call_id"] == "call-native-1"
+    tool_message = next(
+        message for message in second_request if message["role"] == "tool"
+    )
+    assert tool_message["tool_call_id"] == "call-native-1"
+
+
+@pytest.mark.asyncio
+async def test_dry_run_never_executes_native_tool_calls(tmp_path):
+    provider = NativeToolProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    loop = AshLoop(
+        SessionStore(tmp_path / "dry-run.db"),
+        provider,
+        tool.safety_guard,
+        TerminalUI(safety_tier="dry_run"),
+        tmp_path,
+        tools={tool.name: tool},
+        safety_tier="dry_run",
+    )
+
+    await loop.start_session()
+    await loop.run_turn("do not execute this")
+
+    assert tool.arguments is None
+
+
+@pytest.mark.asyncio
+async def test_resume_unknown_session_does_not_silently_create_one(tmp_path):
+    provider = NativeToolProvider()
+    guard = SafetyGuard(project_root=tmp_path)
+    loop = AshLoop(
+        SessionStore(tmp_path / "missing.db"),
+        provider,
+        guard,
+        TerminalUI(safety_tier="dry_run"),
+        tmp_path,
+    )
+
+    with pytest.raises(KeyError, match="Session not found"):
+        await loop.start_session("missing")
+
+
 @pytest.mark.asyncio
 async def test_middleware_before_called(tmp_path):
     spy = SpyMiddleware()

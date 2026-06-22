@@ -1,0 +1,87 @@
+"""Non-interactive event UI for scripts and CI."""
+
+from __future__ import annotations
+
+import json
+import sys
+from contextlib import nullcontext
+from typing import Any, TextIO
+
+from rich.console import Console
+
+
+class HeadlessUI:
+    """Consume loop UI events without terminal control sequences."""
+
+    def __init__(
+        self,
+        *,
+        output_format: str = "text",
+        stream: TextIO | None = None,
+    ) -> None:
+        if output_format not in {"text", "json", "stream-json"}:
+            raise ValueError(f"Unsupported output format: {output_format}")
+        self.output_format = output_format
+        self.stream = stream or sys.stdout
+        self.console = Console(file=sys.stderr, force_terminal=False, no_color=True)
+
+    @property
+    def has_approval_callback(self) -> bool:
+        return False
+
+    def begin_turn(self):
+        return nullcontext()
+
+    def finalize_turn(self) -> None:
+        return None
+
+    def print_token(self, text: str) -> None:
+        if self.output_format == "stream-json" and text:
+            self._emit({"type": "assistant.delta", "text": text})
+
+    def print_thought(self, text: str) -> None:
+        if self.output_format == "stream-json" and text:
+            self._emit({"type": "reasoning.delta", "text": text})
+
+    def update_token_count(self, current: int, maximum: int | None = None) -> None:
+        if self.output_format == "stream-json":
+            self._emit(
+                {"type": "context.usage", "current": current, "maximum": maximum}
+            )
+
+    def request_tool_approval(self, tool_name: str, arguments: dict[str, Any]) -> bool:
+        if self.output_format == "stream-json":
+            self._emit(
+                {
+                    "type": "tool.denied",
+                    "tool": tool_name,
+                    "arguments": arguments,
+                    "reason": "headless mode cannot prompt for approval",
+                }
+            )
+        return False
+
+    def show_plan(self, execution: Any) -> bool:
+        if self.output_format == "stream-json":
+            self._emit(
+                {
+                    "type": "plan.denied",
+                    "plan_id": execution.contract.contract_id,
+                    "reason": "headless mode cannot approve a generated plan",
+                }
+            )
+        return False
+
+    def emit_result(self, payload: dict[str, Any]) -> None:
+        if self.output_format in {"json", "stream-json"}:
+            event = {"type": "turn.completed", **payload}
+            self._emit(event)
+        else:
+            print(payload["response"], file=self.stream, flush=True)
+
+    def _emit(self, payload: dict[str, Any]) -> None:
+        print(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            file=self.stream,
+            flush=True,
+        )

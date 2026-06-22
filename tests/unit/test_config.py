@@ -33,14 +33,28 @@ ENV_KEYS = [
 
 
 @pytest.fixture(autouse=True)
-def clear_ash_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def clear_ash_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from cli import config as cli_config
+
     for key in ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
-    # Also clear ~/.ash/ so tests don't bleed state between runs
-    ash_dir = Path.home() / ".ash"
-    for f in (ash_dir / ".env", ash_dir / "ash.toml"):
-        if f.exists():
-            f.unlink()
+
+    ash_dir = tmp_path / ".ash"
+    monkeypatch.setattr(cli_config, "ASH_DIR", ash_dir)
+    monkeypatch.setattr(cli_config, "ENV_FILE", ash_dir / ".env")
+    monkeypatch.setattr(cli_config, "CONFIG_FILE", ash_dir / "ash.toml")
+    original_toml_file = AshConfig.model_config.get("toml_file")
+    original_env_file = AshConfig.model_config.get("env_file")
+    AshConfig.model_config["toml_file"] = str(ash_dir / "ash.toml")
+    AshConfig.model_config["env_file"] = str(ash_dir / ".env")
+    try:
+        yield
+    finally:
+        AshConfig.model_config["toml_file"] = original_toml_file
+        AshConfig.model_config["env_file"] = original_env_file
 
 
 def test_config_loads_all_fields_from_ash_toml(
@@ -151,7 +165,7 @@ def test_config_loads_without_api_key(
     # Should load without ValidationError (no required api_key field)
     config = AshConfig.load()
     assert config.provider == "anthropic"
-    assert config.model == "anthropic/claude-3-7-sonnet-20250219"
+    assert config.model == "anthropic/claude-sonnet-4-6"
 
 
 def test_backward_compat_ash_api_key_promoted_to_anthropic(
@@ -163,7 +177,7 @@ def test_backward_compat_ash_api_key_promoted_to_anthropic(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("ASH_API_KEY", "sk-ant-backcompat-key")
 
-    config = AshConfig.load()
+    AshConfig.load()
 
     # The promotion happens in model_post_init — ANTHROPIC_API_KEY should now be set
     assert os.environ.get("ANTHROPIC_API_KEY") == "sk-ant-backcompat-key"
@@ -216,3 +230,8 @@ def test_ash_model_provider_format_used_as_is(
 
     assert config.model == "anthropic/claude-3-7-sonnet-20250219"
     assert config.provider == "anthropic"
+
+
+def test_model_requires_provider_prefix() -> None:
+    with pytest.raises(ValueError, match="provider/model"):
+        AshConfig(model="claude")

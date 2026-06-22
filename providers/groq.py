@@ -12,9 +12,11 @@ import openai  # type: ignore[import-not-found]
 
 from context.tokens import AnthropicTokenCounter
 from providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from providers.openai import prepare_openai_messages
 
 
 class GroqProvider(ProviderABC):
+    provider_family = "groq"
     def __init__(
         self,
         model_name: str = "llama-3.3-70b-versatile",
@@ -54,7 +56,7 @@ class GroqProvider(ProviderABC):
     ) -> AsyncGenerator[StreamChunk, None]:
         kwargs: dict[str, Any] = {
             "model": self._model_name,
-            "messages": messages,
+            "messages": prepare_openai_messages(messages),
             "temperature": temperature,
             "stream": True,
         }
@@ -82,7 +84,7 @@ class GroqProvider(ProviderABC):
                 for tc in delta.tool_calls:
                     idx = tc.index
                     if idx not in partials:
-                        partials[idx] = {"id": tc.function.id or f"call_{idx}", "name": tc.function.name or "", "arguments": ""}
+                        partials[idx] = {"id": tc.id or f"call_{idx}", "name": tc.function.name or "", "arguments": ""}
                     if tc.function.arguments:
                         partials[idx]["arguments"] += tc.function.arguments
 
@@ -105,3 +107,6 @@ class GroqProvider(ProviderABC):
                 native_tool_calls=list(completed) if completed else None,
             )
             completed.clear()
+
+    async def aclose(self) -> None:
+        await self._client.close()

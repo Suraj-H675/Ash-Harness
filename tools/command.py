@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import platform
 import re
-import shlex
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -14,6 +14,7 @@ from safety.guard import SafetyGuard, SafetyViolation
 from sandbox._base import SANDBOX_TIER_BWRAP
 from sandbox.manager import SandboxManager, SandboxResult
 from tools.base import BaseTool, ToolResult, count_output_tokens
+from sandbox.process_utils import process_group_options, terminate_process_tree
 
 
 DEFAULT_TIMEOUT_SECONDS = 300
@@ -88,20 +89,7 @@ class RunCommandTool(BaseTool):
 
         if sandboxed:
             assert self.sandbox_manager is not None
-            try:
-                argv = (
-                    shlex.split(args.command_line)
-                    if not platform.system() == "Windows"
-                    else None
-                )
-            except ValueError as exc:
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=f"Error: failed to tokenize command for sandbox: {exc}",
-                )
-            if not argv:
-                argv = [args.command_line]
+            argv = ["/bin/sh", "-c", args.command_line]
             return await self._run_sandboxed(argv, args.timeout_seconds, cwd)
 
         return await self._run_scoped(args.command_line, args.timeout_seconds, cwd)
@@ -122,10 +110,7 @@ class RunCommandTool(BaseTool):
             truncated = True
         if not result.fallback_used and result.tier >= SANDBOX_TIER_BWRAP:
             annotation = f"[sandbox tier={result.tier} backend={result.backend_name}]"
-            if error:
-                error = f"{annotation} {error}"
-            else:
-                output = f"{annotation}\n{output}" if output else annotation
+            output = f"{annotation}\n{output}" if output else annotation
         return ToolResult(
             success=result.exit_code == 0,
             output=output,
@@ -150,6 +135,7 @@ class RunCommandTool(BaseTool):
                     cwd=cwd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    **process_group_options(),
                 )
             else:
                 process = await asyncio.create_subprocess_shell(
@@ -157,6 +143,7 @@ class RunCommandTool(BaseTool):
                     cwd=cwd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    **process_group_options(),
                 )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 process.communicate(),
@@ -164,13 +151,16 @@ class RunCommandTool(BaseTool):
             )
         except asyncio.TimeoutError:
             if "process" in locals():
-                process.kill()
-                await process.wait()
+                await terminate_process_tree(process)
             return ToolResult(
                 success=False,
                 output="",
                 error=f"Error: Command timed out after {timeout_seconds} seconds.",
             )
+        except asyncio.CancelledError:
+            if "process" in locals():
+                await terminate_process_tree(process)
+            raise
 
         stdout = decode_stream(stdout_bytes)
         stderr = decode_stream(stderr_bytes)

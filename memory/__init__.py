@@ -11,6 +11,7 @@ from memory.vector import (
     OpenAIEmbedding,
     EmbeddingBackendUnavailable,
     VectorBackendUnavailable,
+    FTS5FallbackIndex,
 )
 from memory.markdown_store import MarkdownMemoryStore
 from memory.fts5 import FTS5Index
@@ -26,6 +27,7 @@ __all__ = [
     "OpenAIEmbedding",
     "EmbeddingBackendUnavailable",
     "VectorBackendUnavailable",
+    "FTS5FallbackIndex",
     "MarkdownMemoryStore",
     "FTS5Index",
 ]

@@ -72,11 +72,11 @@ class PluginManifest:
                         errors.append(
                             f"{name} {installed_version} does not satisfy {version_spec}"
                         )
-                except packaging.specifiers.InvalidSpecifier:
+                except InvalidSpecifier:
                     errors.append(
                         f"Invalid version specifier '{version_spec}' for {name}"
                     )
-                except packaging.version.InvalidVersion:
+                except InvalidVersion:
                     # Installed package has malformed metadata version string.
                     errors.append(
                         f"{name} has invalid version string '{installed_version}'"

@@ -10,6 +10,25 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def restore_config_paths():
+    from cli import config as cli_config
+
+    original = (
+        cli_config.ASH_DIR,
+        cli_config.ENV_FILE,
+        cli_config.CONFIG_FILE,
+    )
+    try:
+        yield
+    finally:
+        (
+            cli_config.ASH_DIR,
+            cli_config.ENV_FILE,
+            cli_config.CONFIG_FILE,
+        ) = original
+
+
 class TestAtomicWrite:
     """Verify that save_env_value is truly atomic."""
 
@@ -313,3 +332,21 @@ class _FakeStdin(io.TextIOBase):
 
 def io_open_mock(isatty: bool) -> io.TextIOBase:
     return _FakeStdin(isatty)
+
+
+def test_ash_config_loads_saved_provider_key_into_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cli import config as cli_config
+    from config import AshConfig
+
+    cli_config.ASH_DIR = tmp_path / ".ash"
+    cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+    cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+    cli_config.save_env_value("ANTHROPIC_API_KEY", "saved-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    AshConfig()
+
+    assert os.environ["ANTHROPIC_API_KEY"] == "saved-key"

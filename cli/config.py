@@ -22,22 +22,34 @@ from typing import Any
 ASH_DIR = Path.home() / ".ash"
 ENV_FILE = ASH_DIR / ".env"
 CONFIG_FILE = ASH_DIR / "ash.toml"
+_INITIAL_PATHS = (ASH_DIR, ENV_FILE, CONFIG_FILE)
+
+
+def _paths() -> tuple[Path, Path, Path]:
+    """Resolve paths lazily while preserving explicit test/application overrides."""
+
+    configured = (ASH_DIR, ENV_FILE, CONFIG_FILE)
+    if configured != _INITIAL_PATHS:
+        return configured
+    ash_dir = Path.home() / ".ash"
+    return ash_dir, ash_dir / ".env", ash_dir / "ash.toml"
 
 
 def ensure_ash_dir() -> Path:
     """Create ~/.ash/ directory if it does not exist. Returns the path."""
-    ASH_DIR.mkdir(parents=True, exist_ok=True)
-    return ASH_DIR
+    ash_dir, _, _ = _paths()
+    ash_dir.mkdir(parents=True, exist_ok=True)
+    return ash_dir
 
 
 def get_env_path() -> Path:
     """Return ~/.ash/.env."""
-    return ENV_FILE
+    return _paths()[1]
 
 
 def get_config_path() -> Path:
     """Return ~/.ash/ash.toml."""
-    return CONFIG_FILE
+    return _paths()[2]
 
 
 # ---------------------------------------------------------------------------
@@ -51,14 +63,15 @@ def save_env_value(key: str, value: str) -> None:
     Preserves existing keys. Sets os.environ[key] = value so providers
     pick up the change immediately.
     """
-    ensure_ash_dir()
+    ash_dir = ensure_ash_dir()
+    env_file = get_env_path()
     # Set in environment immediately so providers see it
     os.environ[key] = value
 
     # Read existing lines
     lines: list[str] = []
-    if ENV_FILE.exists():
-        with ENV_FILE.open() as f:
+    if env_file.exists():
+        with env_file.open() as f:
             for raw_line in f:
                 stripped = raw_line.strip()
                 # Skip empty lines and comments
@@ -77,7 +90,7 @@ def save_env_value(key: str, value: str) -> None:
     new_line = f"{key}={value}\n"
 
     # Atomic write via mkstemp + replace
-    fd, tmp = tempfile.mkstemp(dir=str(ASH_DIR), suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=str(ash_dir), suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             f.writelines(lines)
@@ -86,8 +99,8 @@ def save_env_value(key: str, value: str) -> None:
             f.write(new_line)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, ENV_FILE)
-        os.chmod(ENV_FILE, 0o600)
+        os.replace(tmp, env_file)
+        os.chmod(env_file, 0o600)
     except Exception:
         # Clean up temp file on failure
         try:
@@ -103,10 +116,11 @@ def get_env_value(key: str) -> str | None:
     if key in os.environ:
         return os.environ[key]
 
-    if not ENV_FILE.exists():
+    env_file = get_env_path()
+    if not env_file.exists():
         return None
 
-    with ENV_FILE.open() as f:
+    with env_file.open() as f:
         for line in f:
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
@@ -121,9 +135,10 @@ def get_env_value(key: str) -> str | None:
 def load_env() -> dict[str, str]:
     """Load all key=value pairs from ~/.ash/.env (ignores comments/blank lines)."""
     env: dict[str, str] = {}
-    if not ENV_FILE.exists():
+    env_file = get_env_path()
+    if not env_file.exists():
         return env
-    with ENV_FILE.open() as f:
+    with env_file.open() as f:
         for line in f:
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
@@ -144,20 +159,21 @@ def save_config(config: dict[str, Any]) -> None:
 
     Writes atomically via tempfile.mkstemp + os.replace.
     """
-    ensure_ash_dir()
+    ash_dir = ensure_ash_dir()
+    config_file = get_config_path()
     import toml  # type: ignore[import-untyped]
 
     # Serialize to string via toml library
     toml_str = toml.dumps(config)
 
-    fd, tmp = tempfile.mkstemp(dir=str(ASH_DIR), suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=str(ash_dir), suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(toml_str)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, CONFIG_FILE)
-        os.chmod(CONFIG_FILE, 0o600)
+        os.replace(tmp, config_file)
+        os.chmod(config_file, 0o600)
     except Exception:
         try:
             os.unlink(tmp)
@@ -168,12 +184,13 @@ def save_config(config: dict[str, Any]) -> None:
 
 def load_config() -> dict[str, Any]:
     """Load custom_providers from ~/.ash/ash.toml. Returns {} if file missing."""
-    if not CONFIG_FILE.exists():
+    config_file = get_config_path()
+    if not config_file.exists():
         return {}
     try:
         import toml  # type: ignore[import-untyped]
 
-        with CONFIG_FILE.open() as f:
+        with config_file.open() as f:
             return toml.load(f)
     except Exception:
         return {}

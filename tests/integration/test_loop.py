@@ -10,7 +10,7 @@ from typing import Any, AsyncGenerator
 import pytest
 
 from core.loop import AshLoop
-from core.recovery import CircuitBreaker, CircuitBreakerError
+from core.recovery import CircuitBreaker
 from core.session import SessionStore
 from providers.base import StreamChunk
 from safety.guard import SafetyGuard

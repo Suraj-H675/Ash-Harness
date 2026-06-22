@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any, AsyncGenerator, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
+from providers.capabilities import ProviderCapabilities, infer_capabilities
 
 
 class StreamChunk(BaseModel):
@@ -29,6 +30,8 @@ class StreamChunk(BaseModel):
     # Fully-formed tool calls from providers that support native
     # OpenAI tool_calls streaming (includes real id for tool_call_id).
     native_tool_calls: list[dict[str, Any]] | None = None
+
+
 @runtime_checkable
 class TokenCounterLike(Protocol):
     """Anything with a ``count(text) -> int`` method."""
@@ -44,6 +47,8 @@ class ProviderABC(ABC):
     standard ``{"role": ..., "content": ...}`` shape so the loop does not
     have to know provider-specific message encoding.
     """
+
+    provider_family = "custom"
 
     @abstractmethod
     async def stream_chat(
@@ -72,3 +77,10 @@ class ProviderABC(ABC):
         """Identifier of the model this adapter is bound to."""
 
         raise NotImplementedError
+
+    async def aclose(self) -> None:
+        """Release provider resources. Stateless providers may do nothing."""
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return infer_capabilities(self.provider_family, self.model_name)

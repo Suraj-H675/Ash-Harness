@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, AsyncGenerator
 import openai  # type: ignore[import-not-found]
 
@@ -20,7 +21,37 @@ class _PartialToolCall:
         self.arguments = ""
 
 
+def prepare_openai_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Translate Ash's canonical tool-call history to OpenAI chat messages."""
+
+    prepared: list[dict[str, Any]] = []
+    for message in messages:
+        item = {
+            key: value
+            for key, value in message.items()
+            if key in {"role", "content", "name", "tool_call_id"}
+        }
+        canonical_calls = message.get("tool_calls")
+        if canonical_calls:
+            item["tool_calls"] = [
+                {
+                    "id": call["call_id"],
+                    "type": "function",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": json.dumps(call.get("arguments", {})),
+                    },
+                }
+                for call in canonical_calls
+            ]
+        prepared.append(item)
+    return prepared
+
+
 class OpenAIProvider(ProviderABC):
+    provider_family = "openai"
     def __init__(
         self,
         model_name: str = "gpt-4o",
@@ -60,7 +91,7 @@ class OpenAIProvider(ProviderABC):
     ) -> AsyncGenerator[StreamChunk, None]:
         kwargs: dict[str, Any] = {
             "model": self._model_name,
-            "messages": messages,
+            "messages": prepare_openai_messages(messages),
             "temperature": temperature,
             "stream": True,
         }
@@ -93,7 +124,7 @@ class OpenAIProvider(ProviderABC):
                     if idx not in partials:
                         # New tool call — capture name immediately, buffer args.
                         partials[idx] = _PartialToolCall(
-                            id=tc.function.id or f"call_{idx}",
+                            id=tc.id or f"call_{idx}",
                             name=tc.function.name or "",
                         )
                     partial = partials[idx]
@@ -131,3 +162,6 @@ class OpenAIProvider(ProviderABC):
             )
             # Clear emitted calls so they are not yielded again.
             completed.clear()
+
+    async def aclose(self) -> None:
+        await self._client.close()

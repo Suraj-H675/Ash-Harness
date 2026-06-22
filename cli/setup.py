@@ -146,13 +146,10 @@ def _flow_anthropic(current: str) -> None:
     if api_key is None:
         return
 
-    # Known Claude models
-    models = [
-        "claude-opus-4-20250514",
-        "claude-3-7-sonnet-20250219",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-5-haiku-20241022",
-    ]
+    models = _probe_anthropic_models(api_key)
+    if not models:
+        print("Could not fetch models. Using current documented aliases.")
+        models = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"]
     model = _prompt_model_list(models, current)
     if model is None:
         print("  Cancelled.")
@@ -182,7 +179,7 @@ def _flow_openai(current: str) -> None:
     models = _probe_models("https://api.openai.com/v1", api_key)
     if not models:
         print("Could not fetch models. Using default list.")
-        models = ["gpt-4o", "gpt-4o-mini", "o3", "o4-mini"]
+        models = ["gpt-5.2", "gpt-5.2-codex", "gpt-5-mini", "gpt-4.1"]
     model = _prompt_model_list(models, current)
     if model is None:
         print("  Cancelled.")
@@ -287,8 +284,11 @@ def _flow_openai_compatible() -> None:
         return
 
     api_key = input("  API key (optional, press Enter to skip): ").strip()
+    key_env = "ASH_PROVIDER_" + "".join(
+        character if character.isalnum() else "_" for character in name.upper()
+    ) + "_API_KEY"
     if api_key:
-        save_env_value("OPENAI_API_KEY", api_key)
+        save_env_value(key_env, api_key)
 
     # Probe models
     models = _probe_models(base_url, api_key or None)
@@ -318,7 +318,7 @@ def _flow_openai_compatible() -> None:
     custom = load_config().get("custom_providers", {})
     custom[name] = {
         "base_url": base_url,
-        "api_key": api_key,
+        "key_env": key_env,
         "models": models,
     }
     save_config({"custom_providers": custom})
@@ -332,6 +332,28 @@ def _flow_openai_compatible() -> None:
 # ---------------------------------------------------------------------------
 # API probing
 # ---------------------------------------------------------------------------
+
+
+def _probe_anthropic_models(api_key: str) -> list[str]:
+    """Call Anthropic's model-list endpoint and return newest-first IDs."""
+    try:
+        response = httpx.get(
+            "https://api.anthropic.com/v1/models",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            timeout=10,
+        )
+        if response.status_code == 200:
+            return [
+                str(item["id"])
+                for item in response.json().get("data", [])
+                if isinstance(item, dict) and item.get("id")
+            ]
+    except Exception:
+        pass
+    return []
 
 
 def _probe_models(base_url: str, api_key: Optional[str]) -> list[str]:

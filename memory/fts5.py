@@ -120,6 +120,11 @@ class FTS5Index:
         with closing(get_db_connection(self.db_path)) as conn:
             return query_lexical_fallback(conn, query_str, limit=limit)
 
+    def clear(self) -> None:
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            conn.execute("DELETE FROM fts_index")
+            conn.execute("DELETE FROM document_metadata")
+
 
 def query_lexical_fallback(
     db_conn: sqlite3.Connection,

@@ -13,6 +13,7 @@ to Tier 1.
 from __future__ import annotations
 
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -157,6 +158,33 @@ def tempfile_workspace_scratch(workspace_root: Path | None) -> str:
 
 
 def probe_bwrap() -> str | None:
-    """Return the path to ``bwrap`` if installed, else ``None``."""
+    """Return a usable ``bwrap`` path, not merely an installed binary.
 
-    return shutil.which("bwrap")
+    Container hosts frequently expose the executable while denying the user or
+    network namespaces Ash needs. A short capability probe prevents selecting a
+    backend that will fail every command at runtime.
+    """
+
+    path = shutil.which("bwrap")
+    if path is None or not sys.platform.startswith("linux"):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                path,
+                "--unshare-user-try",
+                "--unshare-pid",
+                "--unshare-net",
+                "--ro-bind",
+                "/",
+                "/",
+                "--",
+                "true",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return path if result.returncode == 0 else None

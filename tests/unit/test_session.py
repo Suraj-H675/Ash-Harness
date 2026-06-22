@@ -185,3 +185,29 @@ def test_get_recent_session_summaries(tmp_path: Path) -> None:
     assert len(summaries) == 2
     assert any("hello" in s for s in summaries)
     assert any("goodbye" in s for s in summaries)
+
+
+def test_list_and_rename_sessions(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    first = store.create_session(str(tmp_path))
+    second = store.create_session(str(tmp_path / "other"))
+    store.save_message(
+        first.session_id,
+        Message(role="user", content="hello", timestamp=datetime.now(timezone.utc)),
+    )
+    store.rename_session(first.session_id, "  feature   work  ")
+
+    project_sessions = store.list_sessions(project_path=str(tmp_path))
+    assert [item.session_id for item in project_sessions] == [first.session_id]
+    assert project_sessions[0].title == "feature work"
+    assert project_sessions[0].message_count == 1
+    assert store.list_sessions(query="feature")[0].session_id == first.session_id
+    assert second.session_id in {
+        item.session_id for item in store.list_sessions(limit=10)
+    }
+
+
+def test_rename_unknown_session_fails(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    with pytest.raises(KeyError, match="Session not found"):
+        store.rename_session("missing", "name")

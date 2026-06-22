@@ -77,3 +77,19 @@ async def test_post_tool_hook_fires():
     await registry.fire_post_tool("write_file", {"file_path": "x"}, {"success": True})
     assert len(results) == 1
     assert results[0][0] == "write_file"
+
+
+@pytest.mark.asyncio
+async def test_hook_timeout_is_enforced():
+    import asyncio
+
+    registry = HookRegistry(timeout_seconds=0.01)
+
+    async def slow(name, args):
+        await asyncio.sleep(1)
+
+    registry.register_pre_tool(
+        PreToolUseHook(matcher=re.compile(".*"), callback=slow)
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await registry.fire_pre_tool("read_file", {})

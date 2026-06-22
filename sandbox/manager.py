@@ -31,6 +31,7 @@ from sandbox._base import (
 )
 from sandbox.bwrap import BubblewrapSandbox, probe_bwrap
 from sandbox.docker import DockerSandbox, probe_docker
+from sandbox.process_utils import process_group_options, terminate_process_tree
 
 
 # Re-export the tier constants for backwards compatibility with code
@@ -272,14 +273,14 @@ async def _run_scoped(
         cwd=str(cwd) if cwd is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **process_group_options(),
     )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             process.communicate(), timeout=deadline
         )
     except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
+        await terminate_process_tree(process)
         return SandboxResult(
             exit_code=-1,
             stdout="",
@@ -289,6 +290,9 @@ async def _run_scoped(
             fallback_used=fallback,
             duration_seconds=time.monotonic() - start,
         )
+    except asyncio.CancelledError:
+        await terminate_process_tree(process)
+        raise
     return SandboxResult(
         exit_code=process.returncode if process.returncode is not None else -1,
         stdout=stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else "",
@@ -316,14 +320,14 @@ async def _run_subprocess(
         cwd=str(cwd) if cwd is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **process_group_options(),
     )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             process.communicate(), timeout=deadline
         )
     except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
+        await terminate_process_tree(process)
         return SandboxResult(
             exit_code=-1,
             stdout="",
@@ -333,6 +337,9 @@ async def _run_subprocess(
             fallback_used=False,
             duration_seconds=time.monotonic() - start,
         )
+    except asyncio.CancelledError:
+        await terminate_process_tree(process)
+        raise
     return SandboxResult(
         exit_code=process.returncode if process.returncode is not None else -1,
         stdout=stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else "",

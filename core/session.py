@@ -7,7 +7,7 @@ import json
 import sqlite3
 import threading
 from contextlib import asynccontextmanager, closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 from uuid import uuid4
@@ -40,8 +40,22 @@ class Session(BaseModel):
     session_id: str
     project_path: str
     created_at: datetime
+    title: str = ""
+    updated_at: datetime | None = None
+    context_summary: str = ""
+    model: str = ""
     messages: list[Message] = Field(default_factory=list)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
+
+
+class SessionSummary(BaseModel):
+    session_id: str
+    project_path: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    message_count: int = 0
+    model: str = ""
 
 
 _db_write_locks: dict[str, asyncio.Lock] = {}
@@ -115,8 +129,13 @@ class SessionStore:
             for col_spec in (
                 ("total_tokens", "INTEGER DEFAULT 0"),
                 ("total_cost_inr", "REAL DEFAULT 0"),
+                ("total_cost_usd", "REAL DEFAULT 0"),
                 ("total_prompt_tokens", "INTEGER DEFAULT 0"),
                 ("total_completion_tokens", "INTEGER DEFAULT 0"),
+                ("title", "TEXT DEFAULT ''"),
+                ("updated_at", "TIMESTAMP"),
+                ("context_summary", "TEXT DEFAULT ''"),
+                ("model", "TEXT DEFAULT ''"),
             ):
                 col_name, col_type = col_spec
                 try:
@@ -150,8 +169,13 @@ class SessionStore:
                     session_id TEXT PRIMARY KEY,
                     project_path TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    title TEXT DEFAULT '',
+                    updated_at TIMESTAMP,
+                    context_summary TEXT DEFAULT '',
+                    model TEXT DEFAULT '',
                     total_tokens INTEGER DEFAULT 0,
                     total_cost_inr REAL DEFAULT 0,
+                    total_cost_usd REAL DEFAULT 0,
                     total_prompt_tokens INTEGER DEFAULT 0,
                     total_completion_tokens INTEGER DEFAULT 0
                 );
@@ -210,6 +234,35 @@ class SessionStore:
 
                 CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_logs(session_id);
 
+                CREATE TABLE IF NOT EXISTS turn_journal (
+                    turn_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('started','completed','interrupted')),
+                    user_input TEXT NOT NULL,
+                    started_at TIMESTAMP NOT NULL,
+                    completed_at TIMESTAMP,
+                    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_turn_journal_session
+                    ON turn_journal(session_id, status);
+
+                CREATE TABLE IF NOT EXISTS file_checkpoints (
+                    checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    existed INTEGER NOT NULL CHECK(existed IN (0, 1)),
+                    before_content BLOB,
+                    before_mode INTEGER,
+                    after_sha256 TEXT,
+                    restored INTEGER NOT NULL DEFAULT 0 CHECK(restored IN (0, 1)),
+                    created_at TIMESTAMP NOT NULL,
+                    UNIQUE(session_id, turn_id, path),
+                    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS sprints (
                     sprint_id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
@@ -240,25 +293,32 @@ class SessionStore:
                 """
             )
 
-    def create_session(self, project_path: str) -> Session:
+    def create_session(self, project_path: str, *, model: str = "") -> Session:
         """Create a new session record in SQLite and return its model."""
 
         session = Session(
             session_id=str(uuid4()),
             project_path=project_path,
             created_at=_utc_now(),
+            updated_at=_utc_now(),
+            model=model,
         )
+        updated_at = session.updated_at or session.created_at
 
         with closing(get_db_connection(self.db_path)) as conn, conn:
             conn.execute(
                 """
-                INSERT INTO sessions (session_id, project_path, created_at)
-                VALUES (?, ?, ?)
+                INSERT INTO sessions (
+                    session_id, project_path, created_at, updated_at, model
+                )
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     session.session_id,
                     session.project_path,
                     _serialize_datetime(session.created_at),
+                    _serialize_datetime(updated_at),
+                    session.model,
                 ),
             )
 
@@ -270,7 +330,8 @@ class SessionStore:
         with closing(get_db_connection(self.db_path)) as conn, conn:
             session_row = conn.execute(
                 """
-                SELECT session_id, project_path, created_at
+                SELECT session_id, project_path, created_at, title, updated_at,
+                       context_summary, model
                 FROM sessions
                 WHERE session_id = ?
                 """,
@@ -304,6 +365,12 @@ class SessionStore:
             session_id=session_row["session_id"],
             project_path=session_row["project_path"],
             created_at=_deserialize_datetime(session_row["created_at"]),
+            title=session_row["title"] or "",
+            updated_at=_deserialize_datetime(
+                session_row["updated_at"] or session_row["created_at"]
+            ),
+            context_summary=session_row["context_summary"] or "",
+            model=session_row["model"] or "",
             messages=[
                 Message(
                     role=row["role"],
@@ -355,29 +422,360 @@ class SessionStore:
                     completion_tokens,
                 ),
             )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                (_serialize_datetime(message.timestamp), session_id),
+            )
+
+    def list_sessions(
+        self,
+        *,
+        project_path: str | None = None,
+        limit: int = 20,
+        query: str = "",
+    ) -> list[SessionSummary]:
+        """List recent sessions, optionally filtered by project and title."""
+
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_path is not None:
+            clauses.append("s.project_path = ?")
+            params.append(project_path)
+        if query:
+            clauses.append("(s.title LIKE ? OR s.session_id LIKE ?)")
+            pattern = f"%{query}%"
+            params.extend((pattern, pattern))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        with closing(get_db_connection(self.db_path)) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT s.session_id, s.project_path, s.title, s.created_at,
+                       COALESCE(s.updated_at, s.created_at) AS updated_at,
+                       COUNT(m.message_id) AS message_count, s.model
+                FROM sessions s
+                LEFT JOIN messages m ON m.session_id = s.session_id
+                {where}
+                GROUP BY s.session_id
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [
+            SessionSummary(
+                session_id=row["session_id"],
+                project_path=row["project_path"],
+                title=row["title"] or "",
+                created_at=_deserialize_datetime(row["created_at"]),
+                updated_at=_deserialize_datetime(row["updated_at"]),
+                message_count=int(row["message_count"]),
+                model=row["model"] or "",
+            )
+            for row in rows
+        ]
+
+    def cleanup_sessions(
+        self, retention_days: int, *, project_path: str | None = None
+    ) -> int:
+        """Delete old sessions and compact the database explicitly."""
+        if retention_days < 1:
+            raise ValueError("retention_days must be positive")
+        cutoff = _utc_now() - timedelta(days=retention_days)
+        clause = " AND project_path = ?" if project_path is not None else ""
+        params: tuple[Any, ...] = (
+            (_serialize_datetime(cutoff), project_path)
+            if project_path is not None
+            else (_serialize_datetime(cutoff),)
+        )
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            cursor = conn.execute(
+                "DELETE FROM sessions WHERE COALESCE(updated_at, created_at) < ?"
+                + clause,
+                params,
+            )
+            deleted = cursor.rowcount
+        with closing(get_db_connection(self.db_path)) as conn:
+            conn.execute("VACUUM")
+        return deleted
+
+    def start_turn(self, session_id: str, turn_id: str, user_input: str) -> None:
+        """Persist intent before provider or tool work starts."""
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            conn.execute(
+                "INSERT INTO turn_journal "
+                "(turn_id, session_id, status, user_input, started_at) "
+                "VALUES (?, ?, 'started', ?, ?)",
+                (turn_id, session_id, user_input, _serialize_datetime(_utc_now())),
+            )
+
+    def complete_turn(self, turn_id: str) -> None:
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            conn.execute(
+                "UPDATE turn_journal SET status = 'completed', completed_at = ? "
+                "WHERE turn_id = ?",
+                (_serialize_datetime(_utc_now()), turn_id),
+            )
+
+    def reconcile_interrupted_turns(self, session_id: str) -> int:
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE turn_journal SET status = 'interrupted', completed_at = ? "
+                "WHERE session_id = ? AND status = 'started'",
+                (_serialize_datetime(_utc_now()), session_id),
+            )
+            return cursor.rowcount
+
+    def rewind_session(self, session_id: str, message_count: int) -> Session:
+        """Delete transcript records after a confirmed message boundary."""
+        session = self.load_session(session_id)
+        if message_count < 0 or message_count > len(session.messages):
+            raise ValueError(
+                f"message_count must be between 0 and {len(session.messages)}"
+            )
+        retained = session.messages[:message_count]
+        cutoff = retained[-1].timestamp if retained else None
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            ids = conn.execute(
+                "SELECT message_id FROM messages WHERE session_id = ? "
+                "ORDER BY message_id LIMIT -1 OFFSET ?",
+                (session_id, message_count),
+            ).fetchall()
+            conn.executemany(
+                "DELETE FROM messages WHERE message_id = ?",
+                [(row["message_id"],) for row in ids],
+            )
+            if cutoff is None:
+                conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (session_id,))
+            else:
+                conn.execute(
+                    "DELETE FROM tool_calls WHERE session_id = ? AND timestamp > ?",
+                    (session_id, _serialize_datetime(cutoff)),
+                )
+            conn.execute(
+                "UPDATE sessions SET context_summary = '', updated_at = ? "
+                "WHERE session_id = ?",
+                (_serialize_datetime(_utc_now()), session_id),
+            )
+        return self.load_session(session_id)
+
+    def save_file_checkpoint(
+        self,
+        session_id: str,
+        turn_id: str,
+        tool_name: str,
+        path: str,
+        *,
+        existed: bool,
+        before_content: bytes | None,
+        before_mode: int | None,
+    ) -> None:
+        """Save the first pre-edit state for one path in a turn."""
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO file_checkpoints
+                    (session_id, turn_id, tool_name, path, existed,
+                     before_content, before_mode, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    turn_id,
+                    tool_name,
+                    path,
+                    int(existed),
+                    before_content,
+                    before_mode,
+                    _serialize_datetime(_utc_now()),
+                ),
+            )
+
+    def finish_file_checkpoint(
+        self, session_id: str, turn_id: str, path: str, after_sha256: str
+    ) -> None:
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            conn.execute(
+                "UPDATE file_checkpoints SET after_sha256 = ? "
+                "WHERE session_id = ? AND turn_id = ? AND path = ?",
+                (after_sha256, session_id, turn_id, path),
+            )
+
+    def latest_file_checkpoints(self, session_id: str) -> list[sqlite3.Row]:
+        """Return the latest unrestored completed checkpoint group."""
+        with closing(get_db_connection(self.db_path)) as conn:
+            turn = conn.execute(
+                "SELECT turn_id FROM file_checkpoints "
+                "WHERE session_id = ? AND restored = 0 AND after_sha256 IS NOT NULL "
+                "ORDER BY checkpoint_id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if turn is None:
+                return []
+            return conn.execute(
+                "SELECT * FROM file_checkpoints "
+                "WHERE session_id = ? AND turn_id = ? AND restored = 0 "
+                "ORDER BY checkpoint_id",
+                (session_id, turn["turn_id"]),
+            ).fetchall()
+
+    def mark_file_checkpoints_restored(self, session_id: str, turn_id: str) -> None:
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            conn.execute(
+                "UPDATE file_checkpoints SET restored = 1 "
+                "WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            )
+
+    def rename_session(self, session_id: str, title: str) -> None:
+        """Set a human-readable session title."""
+
+        normalized = " ".join(title.split())
+        if not normalized:
+            raise ValueError("session title cannot be empty")
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?",
+                (normalized, _serialize_datetime(_utc_now()), session_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Session not found: {session_id}")
+
+    def save_context_summary(self, session_id: str, summary: str) -> None:
+        """Persist the working compaction summary without deleting history."""
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE sessions SET context_summary = ?, updated_at = ? "
+                "WHERE session_id = ?",
+                (summary, _serialize_datetime(_utc_now()), session_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Session not found: {session_id}")
+
+    def fork_session(
+        self, session_id: str, *, message_count: int | None = None
+    ) -> Session:
+        """Create a new session containing a prefix of another transcript."""
+
+        source = self.load_session(session_id)
+        count = len(source.messages) if message_count is None else message_count
+        if count < 0 or count > len(source.messages):
+            raise ValueError(
+                f"message_count must be between 0 and {len(source.messages)}"
+            )
+        fork = self.create_session(source.project_path, model=source.model)
+        title = f"{source.title or source.session_id[:8]} (fork)"
+        self.rename_session(fork.session_id, title)
+        for message in source.messages[:count]:
+            self.save_message(fork.session_id, message)
+        if source.context_summary and count == len(source.messages):
+            self.save_context_summary(fork.session_id, source.context_summary)
+        return self.load_session(fork.session_id)
+
+    def export_session(self, session_id: str, *, format: str = "jsonl") -> str:
+        """Serialize a redacted session transcript for local export."""
+
+        from core.redaction import redact_text, redact_value
+
+        session = self.load_session(session_id)
+        if format == "jsonl":
+            records = [
+                {
+                    "schema_version": 1,
+                    "type": "session",
+                    "session_id": session.session_id,
+                    "project_path": session.project_path,
+                    "model": session.model,
+                    "title": session.title,
+                    "created_at": session.created_at.isoformat(),
+                }
+            ]
+            records.extend(
+                {
+                    "schema_version": 1,
+                    "type": "message",
+                    "role": message.role,
+                    "content": redact_text(message.content),
+                    "timestamp": message.timestamp.isoformat(),
+                    "metadata": redact_value(message.metadata),
+                }
+                for message in session.messages
+            )
+            return "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n"
+        if format == "markdown":
+            heading = redact_text(session.title or f"Ash session {session.session_id}")
+            sections = [f"# {heading}", f"Model: `{session.model or 'unknown'}`"]
+            sections.extend(
+                f"## {message.role.title()}\n\n{redact_text(message.content)}"
+                for message in session.messages
+            )
+            return "\n\n".join(sections) + "\n"
+        raise ValueError("format must be 'jsonl' or 'markdown'")
+
+    def import_session_jsonl(self, content: str, *, project_path: str) -> Session:
+        """Import Ash's versioned JSONL format into the current project."""
+        try:
+            records = [json.loads(line) for line in content.splitlines() if line.strip()]
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid session JSONL: {exc}") from exc
+        if not records or not isinstance(records[0], dict):
+            raise ValueError("session JSONL is empty")
+        header = records[0]
+        if header.get("schema_version") != 1 or header.get("type") != "session":
+            raise ValueError("unsupported session export schema")
+        session = self.create_session(project_path, model=str(header.get("model", "")))
+        title = str(header.get("title", "")).strip()
+        if title:
+            self.rename_session(session.session_id, f"{title} (imported)")
+        for record in records[1:]:
+            if not isinstance(record, dict) or record.get("type") != "message":
+                raise ValueError("session export contains an invalid record")
+            role = record.get("role")
+            if role not in {"system", "user", "assistant", "tool"}:
+                raise ValueError(f"invalid imported message role: {role!r}")
+            try:
+                timestamp = _deserialize_datetime(str(record["timestamp"]))
+            except (KeyError, ValueError) as exc:
+                raise ValueError("imported message has an invalid timestamp") from exc
+            metadata = record.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise ValueError("imported message metadata must be an object")
+            self.save_message(
+                session.session_id,
+                Message(
+                    role=role,
+                    content=str(record.get("content", "")),
+                    timestamp=timestamp,
+                    metadata=metadata,
+                ),
+            )
+        return self.load_session(session.session_id)
 
     def save_session_token_stats(
         self,
         session_id: str,
         total_prompt_tokens: int,
         total_completion_tokens: int,
-        total_cost_inr: float,
+        turn_cost_usd: float,
     ) -> None:
-        """Update aggregated token stats on a session."""
+        """Accumulate one turn's token and explicitly configured cost totals."""
 
         with closing(get_db_connection(self.db_path)) as conn, conn:
             conn.execute(
                 """
                 UPDATE sessions
-                SET total_tokens = ?,
-                    total_cost_inr = ?,
-                    total_prompt_tokens = ?,
-                    total_completion_tokens = ?
+                SET total_tokens = COALESCE(total_tokens, 0) + ?,
+                    total_cost_usd = COALESCE(total_cost_usd, 0) + ?,
+                    total_prompt_tokens = COALESCE(total_prompt_tokens, 0) + ?,
+                    total_completion_tokens = COALESCE(total_completion_tokens, 0) + ?
                 WHERE session_id = ?
                 """,
                 (
                     total_prompt_tokens + total_completion_tokens,
-                    total_cost_inr,
+                    turn_cost_usd,
                     total_prompt_tokens,
                     total_completion_tokens,
                     session_id,

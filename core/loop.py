@@ -21,7 +21,7 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, ContextManager, Protocol
 from uuid import uuid4
 
 from core.recovery import CircuitBreaker, CircuitBreakerError
@@ -31,17 +31,21 @@ from core.session import (
     SessionStore,
     ToolCallRecord,
 )
+from core.redaction import redact_text, redact_value
 from ash_logging import get_logger
-from mcp.server import MCPServerManager, load_mcp_servers
+from mcp.server import load_mcp_servers
 from providers.base import ProviderABC, TokenCounterLike
+from providers.capabilities import ProviderCapabilities
 from repo.repomap import RepoMap
 from safety.guard import SafetyGuard
+from safety.policy import PermissionPolicy, PolicyAction, READ_ONLY_TOOLS
 from tools.base import BaseTool, ToolMiddleware, ToolMiddlewareSkip, ToolResult
 from tools.git import auto_commit_turn
 from ui.parser import Event, StreamingXMLParser
-from ui.terminal import TerminalUI
+from rich.console import Console
 
 if TYPE_CHECKING:
+    from config import AshConfig
     from context.turn import TurnContext
     from core.planner import Planner
     from core.sprint import SprintExecution
@@ -67,7 +71,32 @@ ToolApprovalCallback = Callable[
 ]
 
 
+class LoopUI(Protocol):
+    console: Console
+
+    @property
+    def has_approval_callback(self) -> bool: ...
+
+    def begin_turn(self) -> ContextManager[Any]: ...
+    def finalize_turn(self) -> None: ...
+    def print_token(self, text: str) -> None: ...
+    def print_thought(self, text: str) -> None: ...
+    def request_tool_approval(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> bool: ...
+    def show_plan(self, execution: Any) -> bool: ...
+
+
 DEFAULT_MAX_TURN_ITERATIONS = 10
+
+
+def _provider_capabilities(provider: Any) -> ProviderCapabilities:
+    capabilities = getattr(provider, "capabilities", None)
+    return (
+        capabilities
+        if isinstance(capabilities, ProviderCapabilities)
+        else ProviderCapabilities()
+    )
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are Ash, a terminal-native AI coding harness. You are pairing with a developer to write, edit, test, and debug code in the local workspace.
@@ -139,6 +168,26 @@ def _render_tool_response(call_id: str, tool_name: str, result: dict[str, Any]) 
     )
 
 
+def _normalize_native_tool_call(call: dict[str, Any]) -> dict[str, Any]:
+    """Convert a provider-native tool call into Ash's canonical shape."""
+
+    call_id = str(call.get("call_id") or call.get("id") or uuid4())
+    name = str(call.get("name") or "")
+    arguments = call.get("arguments", {})
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {"__invalid_json__": arguments}
+    if not isinstance(arguments, dict):
+        arguments = {"value": arguments}
+    return {
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }
+
+
 class AshLoop:
     """V1 minimal agent loop."""
 
@@ -147,12 +196,13 @@ class AshLoop:
         session_store: SessionStore,
         provider: ProviderABC,
         safety_guard: SafetyGuard,
-        ui: TerminalUI,
+        ui: LoopUI,
         project_root: Path,
         *,
         tools: dict[str, BaseTool] | None = None,
         circuit_breaker: CircuitBreaker | None = None,
         system_prompt: str | None = None,
+        additional_instructions: str = "",
         token_counter: TokenCounterLike | None = None,
         max_turn_iterations: int = DEFAULT_MAX_TURN_ITERATIONS,
         repo_map: RepoMap | None = None,
@@ -188,6 +238,8 @@ class AshLoop:
         self.tools: dict[str, BaseTool] = dict(tools or {})
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self.system_prompt = system_prompt or _default_system_prompt(project_root)
+        if additional_instructions:
+            self.system_prompt = f"{self.system_prompt}\n\n{additional_instructions}"
         self.token_counter = token_counter
         self.max_turn_iterations = max_turn_iterations
         self.repo_map = repo_map
@@ -211,12 +263,14 @@ class AshLoop:
                 root_provider=lambda: self.project_root,
             )
         self._config = config
+        self._last_context_tokens = 0
         self.skill_nudge_interval = skill_nudge_interval
         self._iterations_since_skill_use = 0
         self.continuous_mode = continuous_mode
         self.max_continuous_turns = max_continuous_turns
         self._continuous_turns = 0
         self.safety_tier = safety_tier
+        self.permission_policy = PermissionPolicy(safety_tier)
         self.enable_semantic_memory = enable_semantic_memory
         self._vector_pipeline: "VectorSearchPipeline | None" = None
         self._pending_memory_context: str = ""
@@ -229,39 +283,54 @@ class AshLoop:
                 chroma_persist_dir=chroma_persist_dir,
             )
         self.current_session: Session | None = None
-        self._mcp_manager: MCPServerManager | None = None
+        self.recovered_turns = 0
+        self._mcp_runtime: Any | None = None
+        self._mcp_configs = {}
         if mcp_config_path is not None and mcp_config_path.exists():
-            self._mcp_manager = MCPServerManager()
-            servers = load_mcp_servers(mcp_config_path)
-            for name, config in servers.items():
-                try:
-                    self._mcp_manager.start_server(config)
-                except Exception as exc:  # noqa: BLE001
-                    _log.warning("Failed to start MCP server %s: %s", name, exc)
+            self._mcp_configs = load_mcp_servers(mcp_config_path)
 
     def __del__(self) -> None:
-        if self._mcp_manager is not None:
-            self._mcp_manager.stop_all()
+        # Async resources are released by ``aclose``; no subprocess work is
+        # attempted from the garbage collector.
+        return None
 
     async def __aenter__(self) -> "AshLoop":
         return self
 
     async def __aexit__(self, *args: Any) -> None:
-        if self._mcp_manager is not None:
-            self._mcp_manager.stop_all()
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Deterministically release provider and subprocess resources."""
+
+        if self._mcp_runtime is not None:
+            await self._mcp_runtime.close()
+            self._mcp_runtime = None
+        await asyncio.gather(
+            *(tool.aclose() for tool in self.tools.values()),
+            return_exceptions=True,
+        )
+        await self.provider.aclose()
 
     # --- session lifecycle ------------------------------------------------
 
     async def start_session(self, session_id: str | None = None) -> Session:
         """Create a new session or restore one by id."""
 
+        if self._mcp_configs and self._mcp_runtime is None:
+            from mcp.runtime import MCPRuntime
+
+            self._mcp_runtime = MCPRuntime(self._mcp_configs, self.safety_guard)
+            self.tools.update(await self._mcp_runtime.start())
+            for name, error in self._mcp_runtime.errors.items():
+                _log.warning("MCP server %s unavailable: %s", name, error)
+
         if session_id is not None:
-            try:
-                self.current_session = self.session_store.load_session(session_id)
-                return self.current_session
-            except KeyError:
-                # Fall through to creating a fresh session.
-                pass
+            self.current_session = self.session_store.load_session(session_id)
+            self.recovered_turns = self.session_store.reconcile_interrupted_turns(
+                session_id
+            )
+            return self.current_session
 
         # New session: optionally recall recent context from prior sessions
         if self.enable_memory_recall:
@@ -280,7 +349,9 @@ class AshLoop:
             if injected:
                 self.system_prompt = f"{self.system_prompt}\n\n{injected}"
 
-        session = self.session_store.create_session(str(self.project_root))
+        session = self.session_store.create_session(
+            str(self.project_root), model=self.provider.model_name
+        )
         self.current_session = session
         return session
 
@@ -302,6 +373,9 @@ class AshLoop:
             session_id=session.session_id,
             turn_id=str(uuid4()),
         )
+        self.session_store.start_turn(
+            session.session_id, self.turn_context.turn_id, user_input
+        )
 
         # 0. Optional V5 sprint planning phase. Triggered only when the
         # loop is configured with a planner AND the user input looks
@@ -321,6 +395,7 @@ class AshLoop:
                 if not approved:
                     execution.abort("rejected by user")
                     self.session_store.save_sprint(session.session_id, execution)
+                    self.session_store.complete_turn(self.turn_context.turn_id)
                     return (
                         f"Plan rejected. Sprint {execution.contract.contract_id[:8]} aborted; "
                         "no further actions taken."
@@ -341,7 +416,12 @@ class AshLoop:
             content=user_input,
             timestamp=_utc_now(),
         )
-        self.session_store.save_message(session.session_id, user_message)
+        self.session_store.save_message(
+            session.session_id,
+            user_message.model_copy(
+                update={"content": redact_text(user_message.content)}
+            ),
+        )
         # Keep the in-memory session mirror in sync so subsequent
         # _build_messages() calls in the same turn see the history.
         session.messages.append(user_message)
@@ -371,8 +451,17 @@ class AshLoop:
                 role="assistant",
                 content=assistant_text,
                 timestamp=_utc_now(),
+                metadata={"tool_calls": tool_calls} if tool_calls else {},
             )
-            self.session_store.save_message(session.session_id, assistant_message)
+            self.session_store.save_message(
+                session.session_id,
+                assistant_message.model_copy(
+                    update={
+                        "content": redact_text(assistant_message.content),
+                        "metadata": redact_value(assistant_message.metadata),
+                    }
+                ),
+            )
             session.messages.append(assistant_message)
 
             if not tool_calls:
@@ -383,12 +472,12 @@ class AshLoop:
                 ):
                     self._continuous_turns += 1
                     follow_up = "Continue the previous task. What is the next step?"
+                    self.session_store.complete_turn(self.turn_context.turn_id)
                     return await self.run_turn(follow_up)
                 break
 
-            # Execute tool calls (sequential within a turn for V1; the spec
-            # mentions asyncio.gather for parallel independent tools but V1
-            # is single-shot to keep the harness simple).
+            # Independent read-only calls may execute concurrently; all other
+            # calls retain deterministic sequential side-effect ordering.
             try:
                 results = await self._execute_tool_calls(tool_calls, session)
             except CircuitBreakerError:
@@ -442,17 +531,20 @@ class AshLoop:
         prompt = int(total_prompt_tokens) if total_prompt_tokens else 0
         completion = int(total_completion_tokens) if total_completion_tokens else 0
         if prompt > 0 or completion > 0:
-            # Groq pricing (June 2025): $0.59/M input, $2.40/M output; 1 USD ≈ 83 INR
-            usd_per_input_token = 0.59 / 1_000_000
-            usd_per_output_token = 2.40 / 1_000_000
-            input_cost_usd = prompt * usd_per_input_token
-            output_cost_usd = completion * usd_per_output_token
-            total_cost_inr = (input_cost_usd + output_cost_usd) * 83
+            pricing: dict[str, float] = {}
+            if self._config is not None:
+                pricing = self._config.model_pricing_usd_per_million.get(
+                    self._config.model, {}
+                )
+            turn_cost_usd = (
+                prompt * float(pricing.get("input", 0.0))
+                + completion * float(pricing.get("output", 0.0))
+            ) / 1_000_000
             self.session_store.save_session_token_stats(
                 session.session_id,
                 prompt,
                 completion,
-                total_cost_inr,
+                turn_cost_usd,
             )
 
         if self.auto_commit:
@@ -467,6 +559,7 @@ class AshLoop:
                 self.ui.console.print(f"auto_commit failed: {commit_result.error}")
 
         _log.info(f"turn complete, {len(final_text)} chars returned")
+        self.session_store.complete_turn(self.turn_context.turn_id)
         return final_text
 
     # --- sprint planning helpers (Sprint 12 / V5) ---------------------
@@ -535,7 +628,7 @@ class AshLoop:
         # Build OpenAI-format tools list for providers that support native tool_calls.
         openai_tools = (
             self._tools_to_openai_format(self.tools)
-            if self.tools
+            if self.tools and _provider_capabilities(self.provider).native_tools
             else None
         )
 
@@ -546,30 +639,35 @@ class AshLoop:
         completion_tokens = 0
         native_tool_calls_from_api: list[dict[str, Any]] = []
 
-        with self.ui.begin_turn():
-            async for chunk in self.provider.stream_chat(messages, tools=openai_tools):
-                for fragment in (chunk.content, chunk.tool_call_delta):
-                    if not fragment:
-                        continue
-                    for event in parser.feed(fragment):
-                        self._handle_event(event, text_chunks, tool_calls)
-                # Collect native tool calls from the API (these carry real IDs).
-                if chunk.native_tool_calls:
-                    native_tool_calls_from_api.extend(chunk.native_tool_calls)
-                # Capture usage from the final chunk (when is_done=True).
-                if chunk.is_done:
-                    prompt_tokens = chunk.prompt_tokens
-                    completion_tokens = chunk.completion_tokens
-            # Drain the parser's remaining buffer at end-of-stream.
-            for event in parser.feed(""):
-                self._handle_event(event, text_chunks, tool_calls)
+        try:
+            with self.ui.begin_turn():
+                async for chunk in self.provider.stream_chat(messages, tools=openai_tools):
+                    for fragment in (chunk.content, chunk.tool_call_delta):
+                        if not fragment:
+                            continue
+                        for event in parser.feed(fragment):
+                            self._handle_event(event, text_chunks, tool_calls)
+                    # Collect native tool calls from the API (these carry real IDs).
+                    if chunk.native_tool_calls:
+                        native_tool_calls_from_api.extend(chunk.native_tool_calls)
+                    # Capture usage from the final chunk (when is_done=True).
+                    if chunk.is_done:
+                        prompt_tokens = chunk.prompt_tokens
+                        completion_tokens = chunk.completion_tokens
+                # Drain the parser's remaining buffer at end-of-stream.
+                for event in parser.feed(""):
+                    self._handle_event(event, text_chunks, tool_calls)
+        finally:
             self.ui.finalize_turn()
 
         # If the API returned native tool calls (OpenAI-compatible with tool_calls
         # support), use those instead of the XML-parsed ones — they carry the
         # real tool_call_id that the API requires on tool-result messages.
         if native_tool_calls_from_api:
-            tool_calls = native_tool_calls_from_api
+            tool_calls = [
+                _normalize_native_tool_call(call)
+                for call in native_tool_calls_from_api
+            ]
 
         return "".join(text_chunks), tool_calls, prompt_tokens, completion_tokens
 
@@ -621,36 +719,57 @@ class AshLoop:
     ) -> list[dict[str, Any]]:
         """Execute approved tool calls, gating each on the safety guard."""
 
+        if len(tool_calls) > 1 and all(
+            call.get("name") in READ_ONLY_TOOLS for call in tool_calls
+        ):
+            grouped = await asyncio.gather(
+                *(self._execute_tool_calls([call], session) for call in tool_calls)
+            )
+            return [result for group in grouped for result in group]
+
         results: list[dict[str, Any]] = []
         for call in tool_calls:
             tool_name = call["name"]
             arguments = call["arguments"]
-            _log.debug(f"executing tool {tool_name!r} with args {arguments}")
+            _log.debug(
+                "executing tool {!r} with argument keys {}",
+                tool_name,
+                sorted(arguments),
+            )
             record = ToolCallRecord(
                 call_id=call["call_id"],
                 tool_name=tool_name,
-                arguments=arguments,
+                arguments=redact_value(arguments),
                 approved=False,
                 executed=False,
                 timestamp=_utc_now(),
             )
 
+            decision = self.permission_policy.evaluate(tool_name, arguments)
             if self.on_tool_approval is not None:
                 approved = await self.on_tool_approval(tool_name, arguments)
-            elif self.safety_tier in ("auto_approve", "dry_run"):
+            elif self.ui.has_approval_callback:
+                approved = self.ui.request_tool_approval(tool_name, arguments)
+            elif decision.action == PolicyAction.ALLOW:
                 approved = True
+            elif decision.action == PolicyAction.DENY:
+                approved = False
             else:
                 approved = self.ui.request_tool_approval(tool_name, arguments)
             record.approved = approved
             if not approved:
                 record.executed = False
-                record.error = "Denied by user"
+                record.error = (
+                    decision.reason
+                    if decision.action == PolicyAction.DENY
+                    else "Denied by user"
+                )
                 self.session_store.save_tool_call(session.session_id, record)
                 results.append(
                     {
                         "success": False,
                         "output": "",
-                        "error": "Denied by user",
+                        "error": record.error,
                     }
                 )
                 continue
@@ -670,6 +789,8 @@ class AshLoop:
                 continue
 
             try:
+                if self.hooks is not None:
+                    await self.hooks.fire_pre_tool(tool_name, arguments)
                 await self._apply_middlewares_before(tool_name, arguments, tool)
                 result_dict = await _execute_with_retry(tool, tool_name, arguments)
                 tool_result = ToolResult(
@@ -800,10 +921,28 @@ class AshLoop:
         else:
             adapter = DeterministicEmbedding()
 
-        vector_index = InMemoryVectorIndex()
+        vector_index: Any
+        lexical_index = None
+        if memory_backend == "chroma":
+            from memory import ChromaIndex
+
+            vector_index = ChromaIndex(
+                chroma_persist_dir or Path(".ash/chroma")
+            )
+        else:
+            vector_index = InMemoryVectorIndex()
+        if memory_backend == "fts5":
+            from memory import FTS5FallbackIndex
+
+            base = chroma_persist_dir or Path(".ash/chroma")
+            lexical_index = FTS5FallbackIndex(
+                db_path=base.parent / "memory-fts5.db"
+            )
         self._vector_pipeline = VectorSearchPipeline(
             adapter=adapter,
             vector_index=vector_index,
+            lexical_index=lexical_index,
+            vector_enabled=memory_backend != "fts5",
         )
 
     async def index_file_for_memory(self, file_path: Path) -> None:
@@ -843,7 +982,12 @@ class AshLoop:
 
     # --- message building ---------------------------------------------------
 
-    def _build_messages(self, session: Session) -> list[dict[str, Any]]:
+    def _build_messages(
+        self,
+        session: Session,
+        *,
+        force_compaction: bool = False,
+    ) -> list[dict[str, Any]]:
         """Build the messages payload for the provider."""
 
         system_content = self.system_prompt
@@ -865,18 +1009,60 @@ class AshLoop:
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_content}]
         for message in session.messages:
-            msg_dict: dict[str, Any] = {"role": message.role.value if hasattr(message.role, "value") else message.role, "content": message.content}
+            msg_dict: dict[str, Any] = {
+                "role": message.role,
+                "content": message.content,
+            }
+            if message.role == "assistant" and message.metadata.get("tool_calls"):
+                msg_dict["tool_calls"] = message.metadata["tool_calls"]
             # OpenAI requires tool_call_id on role=tool messages.
             if message.role == "tool" and message.metadata.get("call_id"):
                 msg_dict["tool_call_id"] = message.metadata["call_id"]
             messages.append(msg_dict)
+        if self._config is not None:
+            from context.history import HistoryCompactor
+
+            compactor = HistoryCompactor(
+                max_context_tokens=min(
+                    self._config.max_context_tokens,
+                    _provider_capabilities(self.provider).context_window
+                    or self._config.max_context_tokens,
+                ),
+                completion_reserve=self._config.max_completion_tokens,
+                threshold=self._config.context_compaction_threshold,
+                recent_messages=self._config.context_recent_messages,
+                max_tool_output_chars=self._config.max_tool_result_tokens * 4,
+            )
+            result = compactor.compact(
+                messages,
+                count_tokens=self.provider.count_tokens,
+                previous_summary=session.context_summary,
+                force=force_compaction,
+            )
+            self._last_context_tokens = result.estimated_tokens
+            if result.compacted and result.summary != session.context_summary:
+                session.context_summary = result.summary
+                self.session_store.save_context_summary(
+                    session.session_id,
+                    result.summary,
+                )
+            return result.messages
         return messages
+
+    def compact_current_context(self) -> tuple[int, bool]:
+        """Force compaction for the active session and return token estimate."""
+
+        if self.current_session is None:
+            raise RuntimeError("No active session")
+        before = self.current_session.context_summary
+        self._build_messages(self.current_session, force_compaction=True)
+        return self._last_context_tokens, self.current_session.context_summary != before
 
     # --- provider switching -------------------------------------------------
 
     def switch_provider(self, provider: str, model: str) -> None:
         """Switch to a different provider and model. Rebuilds provider instance."""
-        from __main__ import _build_provider  # lazy import to avoid circular
+        from ash.cli import _build_provider  # lazy import to avoid circular
 
         if self._config is None:
             raise RuntimeError("AshLoop was not constructed with a config object")
@@ -889,15 +1075,16 @@ class AshLoop:
         if self.tools_registry is not None:
             from tools.skills import configure_runtime
 
+            registry = self.tools_registry
             configure_runtime(
-                tools_provider=lambda: list(self.tools_registry.as_dict().values()),
+                tools_provider=lambda: list(registry.as_dict().values()),
                 root_provider=lambda: self.project_root,
             )
 
     def switch_model(self, model: str) -> None:
         """Switch to a model string. If model contains '/', treat as provider/model.
         Otherwise, prepend the current provider."""
-        from __main__ import _build_provider  # lazy import to avoid circular
+        from ash.cli import _build_provider  # lazy import to avoid circular
 
         if self._config is None:
             raise RuntimeError("AshLoop was not constructed with a config object")

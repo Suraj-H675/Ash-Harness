@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -161,7 +162,7 @@ def test_semantic_memory_injects_into_system_prompt(tmp_path: Path) -> None:
 
     provider.stream_chat = capturing_stream
 
-    result = asyncio.run(loop.run_turn("what does greet do?"))
+    asyncio.run(loop.run_turn("what does greet do?"))
 
     # The system prompt passed to the provider should include
     # injected context from semantic memory.

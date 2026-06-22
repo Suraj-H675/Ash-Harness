@@ -10,6 +10,7 @@ from providers.base import ProviderABC, StreamChunk, TokenCounterLike
 
 
 class OllamaProvider(ProviderABC):
+    provider_family = "ollama"
     def __init__(
         self,
         model_name: str = "llama3",
@@ -54,7 +55,8 @@ class OllamaProvider(ProviderABC):
                 "POST", f"{self._base_url}/api/chat", json=payload
             ) as resp:
                 if resp.status_code != 200:
-                    text = await resp.atext()
+                    await resp.aread()
+                    text = resp.text
                     raise RuntimeError(f"Ollama API error {resp.status_code}: {text}")
                 async for line in resp.aiter_lines():
                     if not line.strip():
@@ -84,3 +86,6 @@ class OllamaProvider(ProviderABC):
                     )
         except httpx.HTTPError as exc:
             raise RuntimeError(f"Ollama connection error: {exc}") from exc
+
+    async def aclose(self) -> None:
+        await self._client.aclose()

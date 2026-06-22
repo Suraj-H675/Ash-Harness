@@ -21,8 +21,8 @@ __pycache__/
 # Package build artifacts
 *.egg-info/
 
-# Project documentation
-docs/
-
 # OS files
-.DS_Store__ash_test__
+.DS_Store
+
+# Local harness test artifacts
+__ash_test__/

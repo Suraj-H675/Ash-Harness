@@ -18,7 +18,78 @@ class ProviderBackendUnavailable(ImportError):
     """Raised when the optional ``anthropic`` SDK is not installed."""
 
 
+def prepare_anthropic_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Translate Ash's canonical history to Anthropic message blocks."""
+
+    system_blocks: list[str] = []
+    conversation: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content", "")
+        if role == "system":
+            system_blocks.append(str(content))
+            continue
+        if role == "assistant" and message.get("tool_calls"):
+            blocks: list[dict[str, Any]] = []
+            if content:
+                blocks.append({"type": "text", "text": str(content)})
+            blocks.extend(
+                {
+                    "type": "tool_use",
+                    "id": call["call_id"],
+                    "name": call["name"],
+                    "input": call.get("arguments", {}),
+                }
+                for call in message["tool_calls"]
+            )
+            conversation.append({"role": "assistant", "content": blocks})
+            continue
+        if role == "tool":
+            block = {
+                "type": "tool_result",
+                "tool_use_id": message.get("tool_call_id", ""),
+                "content": str(content),
+            }
+            if (
+                conversation
+                and conversation[-1]["role"] == "user"
+                and isinstance(conversation[-1]["content"], list)
+                and all(
+                    item.get("type") == "tool_result"
+                    for item in conversation[-1]["content"]
+                )
+            ):
+                conversation[-1]["content"].append(block)
+            else:
+                conversation.append({"role": "user", "content": [block]})
+            continue
+        conversation.append({"role": role, "content": content})
+    return "\n\n".join(system_blocks), conversation
+
+
+def prepare_anthropic_tools(
+    tools: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """Translate OpenAI-style function declarations to Anthropic tools."""
+
+    if not tools:
+        return None
+    return [
+        {
+            "name": tool["function"]["name"],
+            "description": tool["function"].get("description", ""),
+            "input_schema": tool["function"].get(
+                "parameters", {"type": "object", "properties": {}}
+            ),
+        }
+        for tool in tools
+    ]
+
+
 class AnthropicProvider(ProviderABC):
+    provider_family = "anthropic"
     """Streaming adapter for Anthropic Claude models.
 
     The adapter is constructed with a model name, an API key, and an
@@ -80,25 +151,18 @@ class AnthropicProvider(ProviderABC):
     ) -> AsyncGenerator[StreamChunk, None]:
         client = self._resolve_client()
 
-        # The Anthropic API splits system messages from the conversation
-        # turn list. Extract any system role up front.
-        system_blocks: list[str] = []
-        conversation: list[dict[str, Any]] = []
-        for message in messages:
-            role = message.get("role")
-            content = message.get("content", "")
-            if role == "system":
-                system_blocks.append(content)
-            else:
-                conversation.append({"role": role, "content": content})
+        system_prompt, conversation = prepare_anthropic_messages(messages)
 
         request_kwargs: dict[str, Any] = {
             "model": self._model_name,
             "messages": conversation,
             "temperature": temperature,
         }
-        if system_blocks:
-            request_kwargs["system"] = "\n\n".join(system_blocks)
+        if system_prompt:
+            request_kwargs["system"] = system_prompt
+        anthropic_tools = prepare_anthropic_tools(tools)
+        if anthropic_tools:
+            request_kwargs["tools"] = anthropic_tools
 
         # Cap output to keep runaway generations bounded; the spec exposes
         # ``max_completion_tokens`` on the AshConfig for the loop to wire.
@@ -114,6 +178,16 @@ class AnthropicProvider(ProviderABC):
             final_message = await stream.get_final_message()
             usage = getattr(final_message, "usage", None)
             stop_reason = getattr(final_message, "stop_reason", None)
+            native_tool_calls = []
+            for block in getattr(final_message, "content", []) or []:
+                if getattr(block, "type", None) == "tool_use":
+                    native_tool_calls.append(
+                        {
+                            "id": block.id,
+                            "name": block.name,
+                            "arguments": block.input,
+                        }
+                    )
             yield StreamChunk(
                 content="",
                 is_done=True,
@@ -121,6 +195,7 @@ class AnthropicProvider(ProviderABC):
                 completion_tokens=getattr(usage, "output_tokens", 0) or 0,
                 stop_reason=stop_reason,
                 model=self._model_name,
+                native_tool_calls=native_tool_calls or None,
             )
 
     def configure_max_tokens(self, max_tokens: int) -> None:
@@ -129,3 +204,12 @@ class AnthropicProvider(ProviderABC):
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         self._max_tokens = max_tokens
+
+    async def aclose(self) -> None:
+        if self._client is not None and self._owns_client:
+            close = getattr(self._client, "close", None)
+            if close is not None:
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+            self._client = None

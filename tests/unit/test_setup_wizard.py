@@ -188,7 +188,7 @@ class TestOpenaiCompatibleFlow:
     def test_saves_custom_provider_to_toml(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """_flow_openai_compatible should save base_url, api_key to ash.toml."""
+        """Custom endpoint metadata is saved without embedding its API key."""
         monkeypatch.setenv("HOME", str(tmp_path))
         # provider name, base URL, API key (optional), model name
         monkeypatch.setattr(
@@ -214,7 +214,11 @@ class TestOpenaiCompatibleFlow:
                 assert "my-minimax" in call_args["custom_providers"]
                 cp = call_args["custom_providers"]["my-minimax"]
                 assert cp["base_url"] == "https://api.minimax.io/v1"
-                assert cp["api_key"] == "sk-cp-test"
+                assert cp["key_env"] == "ASH_PROVIDER_MY_MINIMAX_API_KEY"
+                assert "api_key" not in cp
+                env_text = (tmp_path / ".ash" / ".env").read_text()
+                assert "ASH_PROVIDER_MY_MINIMAX_API_KEY=sk-cp-test\n" in env_text
+                assert "ASH_MODEL=my-minimax/MiniMax-M2.7\n" in env_text
 
 
 class TestProbeModels:

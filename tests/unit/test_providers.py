@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable
 
 import pytest
+from pathlib import Path
 
 from providers.base import ProviderABC, StreamChunk, TokenCounterLike
 
@@ -501,6 +502,66 @@ def test_openai_provider_initializes():
     provider = OpenAIProvider(model_name="gpt-4o", api_key="test-key")
     assert provider.model_name == "gpt-4o"
     assert provider.count_tokens("hello world") > 0
+
+
+def test_openai_message_translation_preserves_tool_call_ids():
+    from providers.openai import prepare_openai_messages
+
+    prepared = prepare_openai_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "call_id": "call-1",
+                        "name": "read_file",
+                        "arguments": {"file_path": "README.md"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "contents",
+                "tool_call_id": "call-1",
+            },
+        ]
+    )
+
+    assert prepared[0]["tool_calls"][0]["id"] == "call-1"
+    assert prepared[0]["tool_calls"][0]["function"]["name"] == "read_file"
+    assert prepared[1]["tool_call_id"] == "call-1"
+
+
+def test_anthropic_message_translation_uses_tool_blocks():
+    from providers.anthropic import prepare_anthropic_messages
+
+    system, prepared = prepare_anthropic_messages(
+        [
+            {"role": "system", "content": "system"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "call_id": "call-1",
+                        "name": "read_file",
+                        "arguments": {"file_path": "README.md"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "contents",
+                "tool_call_id": "call-1",
+            },
+        ]
+    )
+
+    assert system == "system"
+    assert prepared[0]["content"][0]["type"] == "tool_use"
+    assert prepared[1]["content"][0]["type"] == "tool_result"
+    assert prepared[1]["content"][0]["tool_use_id"] == "call-1"
 
 
 @pytest.mark.asyncio
