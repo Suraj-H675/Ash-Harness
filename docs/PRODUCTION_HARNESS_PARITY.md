@@ -215,7 +215,7 @@ Research is clean-room: proprietary or leaked source is not used.
 |---|---|---|
 | One-shot prompt (`ash -p`) | Verified locally | Session-aware one-shot mode with meaningful exit codes |
 | JSON output | Verified locally | Machine-clean completion/error objects |
-| Streaming JSONL | Partial | Typed token/reasoning/context/completion events; all tool lifecycle events remain |
+| Streaming JSONL | Verified locally | Typed token, reasoning, context, tool lifecycle, completion, and error events |
 | Stdin prompts | Verified locally | Piped stdin and `-p -` enter machine-clean one-shot mode |
 | CI mode | Missing | Deterministic noninteractive approvals and no ANSI |
 | SDK/library API | Verified locally | Async create/prompt/session/lifecycle API independent of the TUI |
