@@ -933,6 +933,19 @@ def main(argv: list[str] | None = None) -> int:
         "update", help="Check GitHub for a newer Ash release"
     )
     update_parser.add_argument("--json", action="store_true")
+    storage_parser = subparsers.add_parser(
+        "storage", help="Check, back up, or restore the session database"
+    )
+    storage_subparsers = storage_parser.add_subparsers(
+        dest="storage_action", required=True
+    )
+    storage_check = storage_subparsers.add_parser("check")
+    storage_check.add_argument("--json", action="store_true")
+    storage_backup = storage_subparsers.add_parser("backup")
+    storage_backup.add_argument("destination", nargs="?", type=Path)
+    storage_restore = storage_subparsers.add_parser("restore")
+    storage_restore.add_argument("backup", type=Path)
+    storage_restore.add_argument("--yes", action="store_true")
     serve_parser = subparsers.add_parser(
         "serve", help="Run the authenticated local Ash HTTP API"
     )
@@ -1069,6 +1082,47 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Error: {exc}", file=sys.stderr)
             return 1
         print(render_update_status(update_status, json_output=args.json))
+        return 0
+
+    if args.command == "storage":
+        from cli.storage import (
+            backup_database,
+            check_database,
+            render_storage_check,
+            restore_database,
+        )
+
+        storage_config = AshConfig.load(
+            **({"db_directory": args.db_directory} if args.db_directory else {})
+        )
+        database = storage_config.db_directory / "sessions.db"
+        if args.storage_action == "check":
+            check = check_database(database)
+            print(render_storage_check(check, json_output=args.json))
+            return 0 if check.ok else 1
+        if args.storage_action == "backup":
+            try:
+                backup_path = backup_database(database, args.destination)
+            except (OSError, RuntimeError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            print(f"Backup created: {backup_path}")
+            return 0
+        confirmed = args.yes
+        if not confirmed and sys.stdin.isatty():
+            confirmed = input(
+                "Stop other Ash processes and restore this session backup? [y/N] "
+            ).strip().casefold() in {"y", "yes"}
+        try:
+            restored, preserved = restore_database(
+                database, args.backup, confirmed=confirmed
+            )
+        except (OSError, RuntimeError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Restored: {restored}")
+        for path in preserved:
+            print(f"Preserved previous data: {path}")
         return 0
 
     if args.command == "serve":
