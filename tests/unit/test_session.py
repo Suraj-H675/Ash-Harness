@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import pytest
 from core.session import (
     Message,
     SessionStore,
+    SessionStorageError,
     ToolCallRecord,
     get_db_connection,
     write_transaction,
@@ -46,6 +48,73 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
         "idx_tool_calls_session",
         "idx_audit_session",
     }.issubset(index_names)
+    with get_db_connection(db_path) as conn:
+        assert (
+            conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            == 1
+        )
+
+
+def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                project_path TEXT NOT NULL,
+                created_at TIMESTAMP
+            );
+            CREATE TABLE messages (
+                message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT,
+                content TEXT NOT NULL,
+                timestamp TIMESTAMP,
+                metadata_json TEXT
+            );
+            INSERT INTO sessions VALUES ('legacy', '/workspace', '2026-01-01T00:00:00+00:00');
+            """
+        )
+
+    store = SessionStore(db_path)
+
+    assert store.load_session("legacy").session_id == "legacy"
+    backups = list(tmp_path.glob("legacy.db.before-v1-migration.*.backup"))
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as conn:
+        assert conn.execute("SELECT session_id FROM sessions").fetchone()[0] == "legacy"
+
+
+def test_newer_database_schema_is_refused(tmp_path: Path) -> None:
+    db_path = tmp_path / "future.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TIMESTAMP NOT NULL
+            );
+            INSERT INTO schema_migrations VALUES (999, '2026-01-01T00:00:00+00:00');
+            """
+        )
+
+    with pytest.raises(SessionStorageError, match="newer"):
+        SessionStore(db_path)
+
+
+def test_manual_backup_is_consistent_and_never_overwrites(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session("/workspace")
+    destination = tmp_path / "manual.backup"
+
+    assert store.backup(destination) == destination
+    assert (
+        SessionStore(destination).load_session(session.session_id).session_id
+        == session.session_id
+    )
+    with pytest.raises(SessionStorageError, match="already exists"):
+        store.backup(destination)
 
 
 def test_message_storage_round_trips_in_insert_order(tmp_path: Path) -> None:

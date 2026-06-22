@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import threading
 from contextlib import asynccontextmanager, closing
@@ -16,6 +17,11 @@ from pydantic import BaseModel, Field
 
 
 Role = Literal["system", "user", "assistant", "tool"]
+CURRENT_SCHEMA_VERSION = 1
+
+
+class SessionStorageError(RuntimeError):
+    """Session database cannot be opened or migrated safely."""
 
 
 class Message(BaseModel):
@@ -78,6 +84,17 @@ def _deserialize_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(
+        row["name"] == column for row in conn.execute(f"PRAGMA table_info({table})")
+    )
+
+
+def _restrict_file_permissions(path: Path) -> None:
+    if os.name != "nt" and path.exists():
+        path.chmod(0o600)
+
+
 def get_db_connection(db_path: str | Path) -> sqlite3.Connection:
     """Open a SQLite connection configured for WAL persistence."""
 
@@ -115,16 +132,52 @@ async def write_transaction(db_path: str | Path) -> AsyncIterator[sqlite3.Connec
 class SessionStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = _normalize_db_path(db_path)
-        self._init_db()
-        self._migrate_if_needed()
+        path = Path(self.db_path)
+        existed = path.is_file() and path.stat().st_size > 0
+        try:
+            version = self._schema_version()
+            if version > CURRENT_SCHEMA_VERSION:
+                raise SessionStorageError(
+                    f"Session database schema {version} is newer than this Ash version "
+                    f"supports ({CURRENT_SCHEMA_VERSION})"
+                )
+            if existed and version < CURRENT_SCHEMA_VERSION:
+                self.backup(reason=f"before-v{CURRENT_SCHEMA_VERSION}-migration")
+            self._init_db()
+            self._migrate_if_needed(version)
+            _restrict_file_permissions(path)
+        except SessionStorageError:
+            raise
+        except (OSError, sqlite3.DatabaseError) as exc:
+            raise SessionStorageError(
+                f"Could not initialize session database {path}: {exc}. "
+                "Run 'ash storage check' and restore a backup if needed."
+            ) from exc
 
-    def _migrate_if_needed(self) -> None:
-        """Add token-tracking columns to sessions and messages tables.
+    def _schema_version(self) -> int:
+        if not Path(self.db_path).exists():
+            return 0
+        with closing(get_db_connection(self.db_path)) as conn:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'schema_migrations'"
+            ).fetchone()
+            if table is None:
+                return 0
+            row = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations"
+            ).fetchone()
+            return int(row["version"])
 
-        Idempotent: columns are only added if they do not already exist.
+    def _migrate_if_needed(self, from_version: int) -> None:
+        """Apply ordered, transactional migrations after a safety backup.
+
+        Version 0 covers databases created before explicit schema tracking.
         """
 
         with closing(get_db_connection(self.db_path)) as conn, conn:
+            if from_version >= 1:
+                return
             # Sessions columns
             for col_spec in (
                 ("total_tokens", "INTEGER DEFAULT 0"),
@@ -138,12 +191,10 @@ class SessionStore:
                 ("model", "TEXT DEFAULT ''"),
             ):
                 col_name, col_type = col_spec
-                try:
+                if not _column_exists(conn, "sessions", col_name):
                     conn.execute(
                         f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}"
                     )
-                except sqlite3.OperationalError:
-                    pass  # column already exists
 
             # Messages columns
             for col_spec in (
@@ -152,12 +203,46 @@ class SessionStore:
                 ("completion_tokens", "INTEGER DEFAULT 0"),
             ):
                 col_name, col_type = col_spec
-                try:
+                if not _column_exists(conn, "messages", col_name):
                     conn.execute(
                         f"ALTER TABLE messages ADD COLUMN {col_name} {col_type}"
                     )
-                except sqlite3.OperationalError:
-                    pass  # column already exists
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (CURRENT_SCHEMA_VERSION, _serialize_datetime(_utc_now())),
+            )
+
+    def backup(
+        self, destination: str | Path | None = None, *, reason: str = "manual"
+    ) -> Path:
+        """Create a consistent SQLite backup without modifying the source."""
+
+        source_path = Path(self.db_path)
+        if not source_path.is_file():
+            raise SessionStorageError(f"Session database does not exist: {source_path}")
+        if destination is None:
+            timestamp = _utc_now().strftime("%Y%m%dT%H%M%S%fZ")
+            destination_path = source_path.with_name(
+                f"{source_path.name}.{reason}.{timestamp}.backup"
+            )
+        else:
+            destination_path = Path(destination).expanduser().resolve()
+        if destination_path == source_path:
+            raise SessionStorageError(
+                "Backup destination must differ from the database"
+            )
+        if destination_path.exists():
+            raise SessionStorageError(
+                f"Backup destination already exists: {destination_path}"
+            )
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            closing(get_db_connection(source_path)) as source,
+            closing(sqlite3.connect(destination_path)) as target,
+        ):
+            source.backup(target)
+        _restrict_file_permissions(destination_path)
+        return destination_path
 
     def _init_db(self) -> None:
         """Create session and audit tables if they do not exist."""
@@ -290,6 +375,11 @@ class SessionStore:
 
                 CREATE INDEX IF NOT EXISTS idx_sprints_session ON sprints(session_id);
                 CREATE INDEX IF NOT EXISTS idx_checklist_sprint ON checklist_items(sprint_id);
+
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TIMESTAMP NOT NULL
+                );
                 """
             )
 
@@ -548,7 +638,9 @@ class SessionStore:
                 [(row["message_id"],) for row in ids],
             )
             if cutoff is None:
-                conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (session_id,))
+                conn.execute(
+                    "DELETE FROM tool_calls WHERE session_id = ?", (session_id,)
+                )
             else:
                 conn.execute(
                     "DELETE FROM tool_calls WHERE session_id = ? AND timestamp > ?",
@@ -704,7 +796,10 @@ class SessionStore:
                 }
                 for message in session.messages
             )
-            return "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n"
+            return (
+                "\n".join(json.dumps(record, ensure_ascii=False) for record in records)
+                + "\n"
+            )
         if format == "markdown":
             heading = redact_text(session.title or f"Ash session {session.session_id}")
             sections = [f"# {heading}", f"Model: `{session.model or 'unknown'}`"]
@@ -718,7 +813,9 @@ class SessionStore:
     def import_session_jsonl(self, content: str, *, project_path: str) -> Session:
         """Import Ash's versioned JSONL format into the current project."""
         try:
-            records = [json.loads(line) for line in content.splitlines() if line.strip()]
+            records = [
+                json.loads(line) for line in content.splitlines() if line.strip()
+            ]
         except json.JSONDecodeError as exc:
             raise ValueError(f"invalid session JSONL: {exc}") from exc
         if not records or not isinstance(records[0], dict):
