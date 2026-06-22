@@ -201,11 +201,11 @@ class TerminalUI:
 
     def update_token_count(self, current: int, maximum: int | None = None) -> None:
         """Update the token progress bar with current / maximum counts."""
-        if self._token_task is None or self._token_progress is None:
-            return
         self._current_tokens = current
         if maximum is not None:
             self._maximum_tokens = maximum
+        if self._token_task is None or self._token_progress is None:
+            return
         self._token_progress.update(
             self._token_task,
             completed=current,

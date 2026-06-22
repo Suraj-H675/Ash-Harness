@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from ash.sdk import AshResult
+from ash.sdk import AshEvent, AshResult
 from server.http import create_app
 
 
@@ -19,6 +19,20 @@ class FakeClient:
 
     async def close(self):
         return None
+
+    async def stream_prompt(self, text):
+        yield AshEvent("turn.started", {})
+        yield AshEvent("assistant.delta", {"text": text[:2]})
+        yield AshEvent("assistant.delta", {"text": text[2:]})
+        yield AshEvent(
+            "turn.completed",
+            {
+                "response": text,
+                "session_id": "session-1",
+                "model": "fake/model",
+                "context_tokens": 2,
+            },
+        )
 
 
 def test_http_server_requires_auth_and_runs_turn() -> None:
@@ -49,3 +63,23 @@ def test_http_server_rate_limits_authenticated_requests() -> None:
     with TestClient(app) as http:
         assert http.get("/v1/sessions", headers=headers).status_code == 200
         assert http.get("/v1/sessions", headers=headers).status_code == 429
+
+
+def test_http_server_forwards_live_sse_events() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    with (
+        TestClient(app) as http,
+        http.stream(
+            "POST", "/v1/turn/stream", json={"input": "hello"}, headers=headers
+        ) as response,
+    ):
+        body = "".join(response.iter_text())
+    assert response.status_code == 200
+    assert "event: turn.started" in body
+    assert body.count("event: assistant.delta") == 2
+    assert 'data: {"text":"he"}' in body
+    assert "event: turn.completed" in body

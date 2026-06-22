@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from contextlib import nullcontext
-from typing import Any, TextIO
+from typing import Any, Callable, TextIO
 
 from rich.console import Console
 
@@ -24,6 +24,7 @@ class HeadlessUI:
         self.output_format = output_format
         self.stream = stream or sys.stdout
         self.console = Console(file=sys.stderr, force_terminal=False, no_color=True)
+        self._listeners: set[Callable[[dict[str, Any]], None]] = set()
 
     @property
     def has_approval_callback(self) -> bool:
@@ -36,14 +37,19 @@ class HeadlessUI:
         return None
 
     def print_token(self, text: str) -> None:
+        if text:
+            self._notify({"type": "assistant.delta", "text": text})
         if self.output_format == "stream-json" and text:
             self._emit({"type": "assistant.delta", "text": text})
 
     def print_thought(self, text: str) -> None:
+        if text:
+            self._notify({"type": "reasoning.delta", "text": text})
         if self.output_format == "stream-json" and text:
             self._emit({"type": "reasoning.delta", "text": text})
 
     def update_token_count(self, current: int, maximum: int | None = None) -> None:
+        self._notify({"type": "context.usage", "current": current, "maximum": maximum})
         if self.output_format == "stream-json":
             self._emit(
                 {"type": "context.usage", "current": current, "maximum": maximum}
@@ -85,3 +91,19 @@ class HeadlessUI:
             file=self.stream,
             flush=True,
         )
+
+    def subscribe(
+        self, listener: Callable[[dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        """Subscribe to runtime events and return an idempotent unsubscribe callback."""
+
+        self._listeners.add(listener)
+
+        def unsubscribe() -> None:
+            self._listeners.discard(listener)
+
+        return unsubscribe
+
+    def _notify(self, payload: dict[str, Any]) -> None:
+        for listener in tuple(self._listeners):
+            listener(dict(payload))

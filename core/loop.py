@@ -81,6 +81,7 @@ class LoopUI(Protocol):
     def finalize_turn(self) -> None: ...
     def print_token(self, text: str) -> None: ...
     def print_thought(self, text: str) -> None: ...
+    def update_token_count(self, current: int, maximum: int | None = None) -> None: ...
     def request_tool_approval(
         self, tool_name: str, arguments: dict[str, Any]
     ) -> bool: ...
@@ -440,9 +441,12 @@ class AshLoop:
                         f"// From {hit.file_path}:\n{hit.content[:500]}" for hit in hits
                     )
             messages = self._build_messages(session)
-            (assistant_text, tool_calls, turn_prompt_tokens, turn_completion_tokens) = (
-                await self._stream_one_completion(messages)
-            )
+            (
+                assistant_text,
+                tool_calls,
+                turn_prompt_tokens,
+                turn_completion_tokens,
+            ) = await self._stream_one_completion(messages)
             total_prompt_tokens += turn_prompt_tokens
             total_completion_tokens += turn_completion_tokens
 
@@ -591,9 +595,7 @@ class AshLoop:
 
     # --- streaming & parsing ---------------------------------------------
 
-    def _tools_to_openai_format(
-        self, tools: dict[str, Any]
-    ) -> list[dict[str, Any]]:
+    def _tools_to_openai_format(self, tools: dict[str, Any]) -> list[dict[str, Any]]:
         """Convert Ash tools dict to OpenAI tools format for API tool calling."""
         result = []
         for tool in tools.values():
@@ -641,7 +643,9 @@ class AshLoop:
 
         try:
             with self.ui.begin_turn():
-                async for chunk in self.provider.stream_chat(messages, tools=openai_tools):
+                async for chunk in self.provider.stream_chat(
+                    messages, tools=openai_tools
+                ):
                     for fragment in (chunk.content, chunk.tool_call_delta):
                         if not fragment:
                             continue
@@ -665,8 +669,7 @@ class AshLoop:
         # real tool_call_id that the API requires on tool-result messages.
         if native_tool_calls_from_api:
             tool_calls = [
-                _normalize_native_tool_call(call)
-                for call in native_tool_calls_from_api
+                _normalize_native_tool_call(call) for call in native_tool_calls_from_api
             ]
 
         return "".join(text_chunks), tool_calls, prompt_tokens, completion_tokens
@@ -926,18 +929,14 @@ class AshLoop:
         if memory_backend == "chroma":
             from memory import ChromaIndex
 
-            vector_index = ChromaIndex(
-                chroma_persist_dir or Path(".ash/chroma")
-            )
+            vector_index = ChromaIndex(chroma_persist_dir or Path(".ash/chroma"))
         else:
             vector_index = InMemoryVectorIndex()
         if memory_backend == "fts5":
             from memory import FTS5FallbackIndex
 
             base = chroma_persist_dir or Path(".ash/chroma")
-            lexical_index = FTS5FallbackIndex(
-                db_path=base.parent / "memory-fts5.db"
-            )
+            lexical_index = FTS5FallbackIndex(db_path=base.parent / "memory-fts5.db")
         self._vector_pipeline = VectorSearchPipeline(
             adapter=adapter,
             vector_index=vector_index,
@@ -1022,12 +1021,13 @@ class AshLoop:
         if self._config is not None:
             from context.history import HistoryCompactor
 
+            maximum_context = min(
+                self._config.max_context_tokens,
+                _provider_capabilities(self.provider).context_window
+                or self._config.max_context_tokens,
+            )
             compactor = HistoryCompactor(
-                max_context_tokens=min(
-                    self._config.max_context_tokens,
-                    _provider_capabilities(self.provider).context_window
-                    or self._config.max_context_tokens,
-                ),
+                max_context_tokens=maximum_context,
                 completion_reserve=self._config.max_completion_tokens,
                 threshold=self._config.context_compaction_threshold,
                 recent_messages=self._config.context_recent_messages,
@@ -1040,6 +1040,10 @@ class AshLoop:
                 force=force_compaction,
             )
             self._last_context_tokens = result.estimated_tokens
+            self.ui.update_token_count(
+                result.estimated_tokens,
+                max(1, maximum_context - self._config.max_completion_tokens),
+            )
             if result.compacted and result.summary != session.context_summary:
                 session.context_summary = result.summary
                 self.session_store.save_context_summary(

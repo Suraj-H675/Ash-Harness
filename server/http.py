@@ -103,21 +103,8 @@ def create_app(
     @app.post("/v1/turn/stream", dependencies=[Depends(authorize)])
     async def stream_turn(payload: TurnRequest) -> StreamingResponse:
         async def events() -> AsyncIterator[str]:
-            yield _sse("turn.started", {})
-            try:
-                result = await client.prompt(payload.input)
-            except Exception as exc:  # noqa: BLE001
-                yield _sse("turn.error", {"error": str(exc)})
-                return
-            yield _sse(
-                "turn.completed",
-                {
-                    "response": result.response,
-                    "session_id": result.session_id,
-                    "model": result.model,
-                    "context_tokens": result.context_tokens,
-                },
-            )
+            async for event in client.stream_prompt(payload.input):
+                yield _sse(event.type, event.data)
 
         return StreamingResponse(events(), media_type="text/event-stream")
 

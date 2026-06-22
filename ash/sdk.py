@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from ash.cli import _build_provider, _build_tools
 from config import AshConfig
 from core.checkpoints import FileCheckpointMiddleware
 from core.loop import AshLoop
+from core.redaction import redact_text
 from core.secret_middleware import SecretRedactionMiddleware
 from core.session import SessionStore, SessionSummary
 from providers.base import ProviderABC
@@ -31,6 +33,12 @@ class AshResult:
     context_tokens: int
 
 
+@dataclass(frozen=True)
+class AshEvent:
+    type: str
+    data: dict[str, Any]
+
+
 class AshClient:
     """Own one Ash runtime and its provider, tools, sessions, and subprocesses."""
 
@@ -38,6 +46,7 @@ class AshClient:
         self.loop = loop
         self.config = config
         self._started = False
+        self._turn_lock = asyncio.Lock()
 
     @classmethod
     async def create(
@@ -105,6 +114,10 @@ class AshClient:
         return client
 
     async def start(self, session_id: str | None = None) -> str:
+        async with self._turn_lock:
+            return await self._start_unlocked(session_id)
+
+    async def _start_unlocked(self, session_id: str | None = None) -> str:
         if self._started and self.loop.current_session is not None:
             return self.loop.current_session.session_id
         session = await self.loop.start_session(session_id)
@@ -112,10 +125,14 @@ class AshClient:
         return session.session_id
 
     async def prompt(self, text: str) -> AshResult:
+        async with self._turn_lock:
+            return await self._prompt_unlocked(text)
+
+    async def _prompt_unlocked(self, text: str) -> AshResult:
         if not text.strip():
             raise ValueError("prompt cannot be empty")
         if not self._started:
-            await self.start()
+            await self._start_unlocked()
         response = await self.loop.run_turn(text)
         assert self.loop.current_session is not None
         return AshResult(
@@ -125,24 +142,80 @@ class AshClient:
             context_tokens=self.loop._last_context_tokens,
         )
 
+    async def stream_prompt(self, text: str) -> AsyncIterator[AshEvent]:
+        """Yield real runtime deltas and one terminal completion/error event."""
+
+        if not text.strip():
+            raise ValueError("prompt cannot be empty")
+        async with self._turn_lock:
+            ui = self.loop.ui
+            if not isinstance(ui, HeadlessUI):
+                raise RuntimeError("stream_prompt requires Ash's headless event UI")
+            queue: asyncio.Queue[AshEvent] = asyncio.Queue()
+
+            def receive(payload: dict[str, Any]) -> None:
+                event_type = str(payload.pop("type"))
+                queue.put_nowait(AshEvent(event_type, payload))
+
+            unsubscribe = ui.subscribe(receive)
+
+            async def run() -> None:
+                try:
+                    result = await self._prompt_unlocked(text)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    queue.put_nowait(
+                        AshEvent("turn.error", {"error": redact_text(str(exc))})
+                    )
+                    return
+                queue.put_nowait(
+                    AshEvent(
+                        "turn.completed",
+                        {
+                            "response": result.response,
+                            "session_id": result.session_id,
+                            "model": result.model,
+                            "context_tokens": result.context_tokens,
+                        },
+                    )
+                )
+
+            task = asyncio.create_task(run())
+            try:
+                yield AshEvent("turn.started", {})
+                while True:
+                    event = await queue.get()
+                    yield event
+                    if event.type in {"turn.completed", "turn.error"}:
+                        break
+            finally:
+                unsubscribe()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
     def sessions(self, *, query: str = "", limit: int = 20) -> list[SessionSummary]:
         return self.loop.session_store.list_sessions(
             project_path=str(self.loop.project_root), query=query, limit=limit
         )
 
     async def resume(self, session_id: str) -> str:
-        session = await self.loop.start_session(session_id)
-        self._started = True
-        return session.session_id
+        async with self._turn_lock:
+            session = await self.loop.start_session(session_id)
+            self._started = True
+            return session.session_id
 
     async def new_session(self) -> str:
-        session = await self.loop.start_session()
-        self._started = True
-        return session.session_id
+        async with self._turn_lock:
+            session = await self.loop.start_session()
+            self._started = True
+            return session.session_id
 
     async def close(self) -> None:
-        await self.loop.aclose()
-        self._started = False
+        async with self._turn_lock:
+            await self.loop.aclose()
+            self._started = False
 
     async def __aenter__(self) -> "AshClient":
         return self

@@ -4,7 +4,7 @@ import importlib
 import sys
 from importlib.metadata import PackageNotFoundError, version
 
-from ash.sdk import AshClient, AshResult
+from ash.sdk import AshClient, AshEvent, AshResult
 
 try:
     __version__ = version("ash")
@@ -35,4 +35,4 @@ for _package_name in _LEGACY_PACKAGES:
     sys.modules.setdefault(f"{__name__}.{_package_name}", _module)
     globals()[_package_name] = _module
 
-__all__ = ["__version__", "AshClient", "AshResult"]
+__all__ = ["__version__", "AshClient", "AshEvent", "AshResult"]
