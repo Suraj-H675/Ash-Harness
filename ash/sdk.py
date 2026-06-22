@@ -135,6 +135,11 @@ class AshClient:
         self._started = True
         return session.session_id
 
+    async def new_session(self) -> str:
+        session = await self.loop.start_session()
+        self._started = True
+        return session.session_id
+
     async def close(self) -> None:
         await self.loop.aclose()
         self._started = False
