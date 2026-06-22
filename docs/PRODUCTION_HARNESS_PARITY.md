@@ -107,7 +107,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Markdown/code rendering | Verified locally | Streamed Rich Markdown with fenced-code highlighting and bounded repaint frequency |
 | Diff preview | Partial | Bounded unified previews for writes/replacements/patches; side-by-side view remains |
 | Approval dialog | Partial | Allow once/session/persist, deny with feedback, editable scope |
-| Status line | Partial | Model, mode, cwd, session, and context are live; branch/cost/sandbox remain |
+| Status line | Verified locally | Cached model, mode, branch, context budget, cost, sandbox, session, and cwd state |
 | Themes | Partial | ANSI-safe no-color mode is wired; selectable light/dark themes remain |
 | Configurable keybindings | Verified locally | Cross-platform newline/editor actions with collision validation |
 | Vim input mode | Verified locally | Optional Emacs or Vim prompt-toolkit editing mode |
