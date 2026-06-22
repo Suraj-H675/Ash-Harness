@@ -9,11 +9,58 @@ from typing import Callable, TextIO
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.completion.base import Completer, Completion
+from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.enums import EditingMode
 
 from cli.slash import COMMANDS
+
+
+class AshCompleter(Completer):
+    """Complete slash commands and workspace-relative ``@`` paths."""
+
+    def __init__(self, commands: list[str], workspace_root: Path) -> None:
+        self._commands = WordCompleter(commands, sentence=True)
+        self._root = workspace_root.resolve()
+
+    def get_completions(self, document: Document, complete_event):
+        word = document.get_word_before_cursor(WORD=True)
+        if not word.startswith("@"):
+            yield from self._commands.get_completions(document, complete_event)
+            return
+        typed = word[1:].strip("\"'")
+        relative = Path(typed)
+        parent = (self._root / relative.parent).resolve()
+        try:
+            parent.relative_to(self._root)
+        except ValueError:
+            return
+        if not parent.is_dir():
+            return
+        prefix = relative.name.casefold()
+        try:
+            children = sorted(parent.iterdir(), key=lambda item: item.name.casefold())
+        except OSError:
+            return
+        for child in children[:200]:
+            if not child.name.casefold().startswith(prefix):
+                continue
+            resolved = child.resolve()
+            try:
+                rel = resolved.relative_to(self._root).as_posix()
+            except ValueError:
+                continue
+            if child.is_dir():
+                rel += "/"
+            replacement = f'@"{rel}"' if " " in rel else f"@{rel}"
+            yield Completion(
+                replacement,
+                start_position=-len(word),
+                display=replacement,
+                display_meta="directory" if child.is_dir() else "file",
+            )
 
 
 def _key_bindings(bindings_by_action: dict[str, list[str]]) -> KeyBindings:
@@ -49,6 +96,7 @@ class PromptInput:
         extra_commands: list[str] | None = None,
         input_mode: str = "emacs",
         keybindings: dict[str, list[str]] | None = None,
+        workspace_root: Path | None = None,
     ) -> None:
         if input_mode not in {"emacs", "vi"}:
             raise ValueError("input_mode must be emacs or vi")
@@ -70,7 +118,7 @@ class PromptInput:
             self._session = PromptSession(
                 history=FileHistory(str(path)),
                 auto_suggest=AutoSuggestFromHistory(),
-                completer=WordCompleter(words, sentence=True),
+                completer=AshCompleter(words, workspace_root or Path.cwd()),
                 complete_while_typing=True,
                 key_bindings=_key_bindings(
                     keybindings

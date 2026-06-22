@@ -355,6 +355,7 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
         extra_commands=[command.name for command in discovered_commands],
         input_mode=config.input_mode,
         keybindings=config.keybindings,
+        workspace_root=loop.project_root,
     )
     print(
         "ash - type /help for commands",
@@ -397,8 +398,10 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
             )
             continue
 
+        expand_mentions = False
         try:
             parsed_command = parse_slash_command(user_input)
+            expand_mentions = parsed_command is None
         except ValueError as exc:
             try:
                 custom = custom_commands.parse(user_input)
@@ -411,6 +414,7 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
             custom_command, custom_arguments = custom
             user_input = custom_command.expand(custom_arguments)
             parsed_command = None
+            expand_mentions = True
 
         if parsed_command is not None:
             command, arguments = parsed_command
@@ -872,6 +876,10 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
 
         # Normal turn
         try:
+            from cli.attachments import expand_file_mentions
+
+            if expand_mentions:
+                user_input = expand_file_mentions(user_input, loop.safety_guard)
             response = await loop.run_turn(user_input)
         except Exception as exc:  # noqa: BLE001
             print(f"Error: {exc}", file=sys.stderr, flush=True)
