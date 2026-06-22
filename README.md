@@ -35,6 +35,9 @@ ash mcp add local -- python server.py
 ash trust add .                  # allow project ASH.md, skills, hooks, MCP
 ash update                       # explicitly check GitHub releases
 ASH_SERVER_TOKEN=change-me-long-token ash serve
+ash storage check --json         # read-only session DB integrity check
+ash storage backup               # consistent timestamped backup
+ash storage restore BACKUP --yes # validated, non-destructive restore
 ```
 
 Inside the terminal, `/help` lists session, context, model, diff, review,

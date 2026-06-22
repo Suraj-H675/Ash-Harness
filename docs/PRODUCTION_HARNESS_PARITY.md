@@ -41,7 +41,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Local models | Partial | Ollama discovery, health checks, pull guidance, tool-capability detection |
 | Custom endpoints | Verified locally | Per-provider credentials are stored in mode-0600 env storage, not TOML |
 | Config precedence | Partial | CLI > env > project > user > defaults, with an explain command |
-| Config migration | Partial | Versioned and idempotent migrations with backups |
+| Config migration | Partial | Legacy file migration exists; explicit config schema versions and backups remain |
 | `ash doctor` | Verified locally | Human/JSON diagnostics; optional endpoint connectivity probe |
 | Update/version check | Verified locally | Explicit GitHub release check with no background telemetry or self-modification |
 | Uninstall/reset | Verified locally | Confirmed selective reset for config, sessions, cache, or all local state |
@@ -85,7 +85,7 @@ Research is clean-room: proprietary or leaked source is not used.
 
 | Capability | Ash status | Required production behavior |
 |---|---|---|
-| Durable sessions | Partial | SQLite migrations, close lifecycle, corruption handling |
+| Durable sessions | Verified locally | SQLite schema migrations, lifecycle, integrity checks, backup, and restore |
 | Resume by ID | Partial | Error if missing unless user explicitly requests a new session |
 | Session picker/list/search | Partial | Recent cwd-scoped session list with model/title/query; full-screen picker remains |
 | Session naming | Verified locally | Rename and stable persisted display names |
@@ -231,8 +231,8 @@ Research is clean-room: proprietary or leaked source is not used.
 | Telemetry | Missing | Off by default or explicit opt-in; local metrics still available |
 | Error taxonomy | Missing | Config/provider/tool/policy/sandbox/context/storage errors with remedies |
 | Graceful shutdown | Verified locally | Providers, MCP clients, command trees, background agents, SDK, and servers close deterministically |
-| Database migrations | Partial | Schema version table, transactional migrations, backups |
-| Corruption recovery | Missing | Integrity check, restore/export, non-destructive repair |
+| Database migrations | Verified locally | Schema version table, transactional ordered migration, future-version refusal, and backups |
+| Corruption recovery | Verified locally | Read-only integrity diagnostics plus validated backup and pre-restore preservation |
 | Offline test suite | Partial | No hidden home-directory mutation or live network dependency |
 | Cross-platform CI | Partial | Linux/macOS/Windows workflow added; remote runs are not yet observed |
 | Packaging CI | Verified locally | Wheel/sdist build, clean install, console and module command smoke tests pass |
