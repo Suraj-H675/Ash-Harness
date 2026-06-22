@@ -1,22 +1,147 @@
-"""HTTP server for remote control of Ash."""
+"""Authenticated HTTP/SSE adapter for the asynchronous Ash SDK."""
 
-from fastapi import FastAPI
+from __future__ import annotations
 
-app = FastAPI(title="Ash Remote Control")
+import asyncio
+import hmac
+import json
+import time
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from ash.sdk import AshClient
 
 
-@app.post("/turn")
-async def run_turn(input: dict) -> dict:
-    user_input = input.get("input", "")
-    result = await app.state.ash_loop.run_turn(user_input)
-    return {"result": result}
+class TurnRequest(BaseModel):
+    input: str = Field(..., min_length=1, max_length=1_000_000)
 
 
-@app.on_event("startup")
-async def startup() -> None:
-    """Wire ash_loop into app state. Caller must set app.state.ash_loop before starting."""
-    if not hasattr(app.state, "ash_loop") or app.state.ash_loop is None:
-        raise RuntimeError(
-            "app.state.ash_loop must be set to an AshLoop instance before starting the server. "
-            "Example: app.state.ash_loop = ash_loop"
-        )
+class ResumeRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+
+
+class SlidingWindowLimiter:
+    def __init__(self, requests_per_minute: int) -> None:
+        if requests_per_minute < 1:
+            raise ValueError("requests_per_minute must be positive")
+        self.limit = requests_per_minute
+        self._requests: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = asyncio.Lock()
+
+    async def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        async with self._lock:
+            entries = self._requests[key]
+            while entries and entries[0] <= now - 60:
+                entries.popleft()
+            if len(entries) >= self.limit:
+                return False
+            entries.append(now)
+            return True
+
+
+def create_app(
+    client: AshClient,
+    *,
+    bearer_token: str,
+    requests_per_minute: int = 60,
+    close_client_on_shutdown: bool = False,
+) -> FastAPI:
+    if len(bearer_token) < 16:
+        raise ValueError("HTTP bearer token must contain at least 16 characters")
+    limiter = SlidingWindowLimiter(requests_per_minute)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.ash_client = client
+        yield
+        if close_client_on_shutdown:
+            await client.close()
+
+    app = FastAPI(title="Ash API", version="1", lifespan=lifespan)
+
+    async def authorize(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> None:
+        scheme, _, supplied = (authorization or "").partition(" ")
+        if scheme.casefold() != "bearer" or not hmac.compare_digest(
+            supplied, bearer_token
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        key = request.client.host if request.client else "unknown"
+        if not await limiter.allow(key):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded",
+                headers={"Retry-After": "60"},
+            )
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok", "service": "ash"}
+
+    @app.post("/v1/turn", dependencies=[Depends(authorize)])
+    async def run_turn(payload: TurnRequest) -> dict:
+        result = await client.prompt(payload.input)
+        return {
+            "response": result.response,
+            "session_id": result.session_id,
+            "model": result.model,
+            "context_tokens": result.context_tokens,
+        }
+
+    @app.post("/v1/turn/stream", dependencies=[Depends(authorize)])
+    async def stream_turn(payload: TurnRequest) -> StreamingResponse:
+        async def events() -> AsyncIterator[str]:
+            yield _sse("turn.started", {})
+            try:
+                result = await client.prompt(payload.input)
+            except Exception as exc:  # noqa: BLE001
+                yield _sse("turn.error", {"error": str(exc)})
+                return
+            yield _sse(
+                "turn.completed",
+                {
+                    "response": result.response,
+                    "session_id": result.session_id,
+                    "model": result.model,
+                    "context_tokens": result.context_tokens,
+                },
+            )
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
+    @app.get("/v1/sessions", dependencies=[Depends(authorize)])
+    async def sessions(query: str = "", limit: int = 20) -> dict:
+        if not 1 <= limit <= 100:
+            raise HTTPException(status_code=422, detail="limit must be 1..100")
+        return {
+            "sessions": [
+                item.model_dump(mode="json")
+                for item in client.sessions(query=query, limit=limit)
+            ]
+        }
+
+    @app.post("/v1/sessions", dependencies=[Depends(authorize)])
+    async def new_session() -> dict[str, str]:
+        return {"session_id": await client.new_session()}
+
+    @app.post("/v1/sessions/resume", dependencies=[Depends(authorize)])
+    async def resume_session(payload: ResumeRequest) -> dict[str, str]:
+        return {"session_id": await client.resume(payload.session_id)}
+
+    return app
+
+
+def _sse(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
