@@ -108,14 +108,14 @@ Research is clean-room: proprietary or leaked source is not used.
 | Diff preview | Partial | Bounded unified previews for writes/replacements/patches; side-by-side view remains |
 | Approval dialog | Partial | Allow once/session/persist, deny with feedback, editable scope |
 | Status line | Partial | Model, mode, cwd, session, and context are live; branch/cost/sandbox remain |
-| Themes | Missing | Light/dark/ANSI-safe and no-color mode |
-| Configurable keybindings | Missing | Cross-platform defaults and collision validation |
-| Vim input mode | Missing | Optional editing mode |
+| Themes | Partial | ANSI-safe no-color mode is wired; selectable light/dark themes remain |
+| Configurable keybindings | Verified locally | Cross-platform newline/editor actions with collision validation |
+| Vim input mode | Verified locally | Optional Emacs or Vim prompt-toolkit editing mode |
 | External editor | Verified locally | Prompt-toolkit external-editor integration |
 | Image/file attachments | Missing | Drag/paste/path attach with model capability checks |
 | Prompt history search | Verified locally | Persistent prompt-toolkit file history and reverse search |
 | Desktop notifications | Missing | Optional completion/approval notifications |
-| Accessibility | Missing | Reduced motion, screen-reader-friendly output, color-independent state |
+| Accessibility | Partial | Reduced-redraw and no-color controls are wired; dedicated screen-reader output remains |
 
 ## 6. Commands And Modes
 
@@ -218,9 +218,9 @@ Research is clean-room: proprietary or leaked source is not used.
 | Streaming JSONL | Partial | Typed token/reasoning/context/completion events; all tool lifecycle events remain |
 | Stdin prompts | Verified locally | Piped stdin and `-p -` enter machine-clean one-shot mode |
 | CI mode | Missing | Deterministic noninteractive approvals and no ANSI |
-| SDK/library API | Missing | Stable async API separate from TUI |
-| JSON-RPC server | Placeholder/unwired | Complete methods, cancellation, auth, tests |
-| HTTP server | Placeholder/unwired | Auth, lifecycle, streaming, rate limits, deployment warning |
+| SDK/library API | Verified locally | Async create/prompt/session/lifecycle API independent of the TUI |
+| JSON-RPC server | Partial | Validated stdio methods, cancellation, lifecycle, and tests; remote transport remains |
+| HTTP server | Partial | Bearer auth, rate limits, lifecycle, session/turn routes, SSE lifecycle events, and safe CLI binding; live token events remain |
 | IDE/ACP integration | Missing | Protocol-based editor integration after CLI core is stable |
 
 ## 12. Reliability And Operations
@@ -230,7 +230,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Structured logging | Partial | Rotation, redaction, correlation IDs, debug bundle |
 | Telemetry | Missing | Off by default or explicit opt-in; local metrics still available |
 | Error taxonomy | Missing | Config/provider/tool/policy/sandbox/context/storage errors with remedies |
-| Graceful shutdown | Partial | Providers, MCP, command trees, and TUI close deterministically; agents remain |
+| Graceful shutdown | Verified locally | Providers, MCP clients, command trees, background agents, SDK, and servers close deterministically |
 | Database migrations | Partial | Schema version table, transactional migrations, backups |
 | Corruption recovery | Missing | Integrity check, restore/export, non-destructive repair |
 | Offline test suite | Partial | No hidden home-directory mutation or live network dependency |
