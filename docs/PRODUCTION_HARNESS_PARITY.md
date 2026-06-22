@@ -104,7 +104,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Multiline editor | Verified locally | Prompt-toolkit editor with persistent history and multiline bindings |
 | Responsive full-screen TUI | Missing | Narrow/wide layouts, scrollback, stable redraw, Windows terminal support |
 | Streaming transcript | Partial | Distinct assistant, tool, error, diff, and status events |
-| Markdown/code rendering | Missing | Syntax highlighting, copy-safe output, no layout corruption |
+| Markdown/code rendering | Verified locally | Streamed Rich Markdown with fenced-code highlighting and bounded repaint frequency |
 | Diff preview | Partial | Bounded unified previews for writes/replacements/patches; side-by-side view remains |
 | Approval dialog | Partial | Allow once/session/persist, deny with feedback, editable scope |
 | Status line | Partial | Model, mode, cwd, session, and context are live; branch/cost/sandbox remain |
