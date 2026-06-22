@@ -44,7 +44,9 @@ Inside the terminal, `/help` lists session, context, model, diff, review,
 permissions, sandbox, skills, plugins, export, and diagnostic commands.
 `/review` supports worktree, staged, commit, and branch-versus-base scopes.
 `Alt+Enter` or `Ctrl+J` inserts a newline; prompt history is stored under
-`~/.ash`.
+`~/.ash`. Type `@path` or `@"path with spaces"` to attach bounded workspace
+text or a directory listing to a prompt; secret, binary, oversized, and
+out-of-workspace paths are rejected.
 
 Project-controlled extensions are disabled until the workspace is trusted.
 API keys are stored in `~/.ash/.env` with restricted permissions. Custom

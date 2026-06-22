@@ -112,7 +112,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Configurable keybindings | Verified locally | Cross-platform newline/editor actions with collision validation |
 | Vim input mode | Verified locally | Optional Emacs or Vim prompt-toolkit editing mode |
 | External editor | Verified locally | Prompt-toolkit external-editor integration |
-| Image/file attachments | Missing | Drag/paste/path attach with model capability checks |
+| Image/file attachments | Partial | Safe bounded text/directory `@path` expansion and completion; image/provider blocks remain |
 | Prompt history search | Verified locally | Persistent prompt-toolkit file history and reverse search |
 | Desktop notifications | Missing | Optional completion/approval notifications |
 | Accessibility | Partial | Reduced-redraw and no-color controls are wired; dedicated screen-reader output remains |
@@ -139,7 +139,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/agents` | Placeholder | Spawn real workers, inspect status/output, steer, stop, resume |
 | `/doctor` | Verified locally | Runs the local health report in-session |
 | Shell escape (`!`) | Verified locally | Commands use the normal policy, sandbox, persistence, and audit path |
-| File mention/completion (`@`) | Missing | Fuzzy files, directories, symbols, images, MCP resources |
+| File mention/completion (`@`) | Partial | Workspace file/directory completion and bounded text expansion; fuzzy symbols/images/MCP remain |
 | Custom commands | Verified locally | User/trusted-project Markdown commands, arguments, namespacing, listing, completion |
 
 ## 7. Built-In Coding Tools
