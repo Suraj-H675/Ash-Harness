@@ -168,6 +168,33 @@ def test_config_loads_without_api_key(
     assert config.model == "anthropic/claude-sonnet-4-6"
 
 
+def test_terminal_preferences_are_validated() -> None:
+    config = AshConfig(
+        input_mode="VI",
+        no_color=True,
+        reduced_motion=True,
+        show_token_meter=True,
+        keybindings={"newline": ["c-o"], "open_editor": ["c-x c-e"]},
+    )
+    assert config.input_mode == "vi"
+    assert config.no_color is True
+    assert config.reduced_motion is True
+    assert config.show_token_meter is True
+    assert config.keybindings["newline"] == ["c-o"]
+
+
+def test_terminal_keybinding_collisions_are_rejected() -> None:
+    with pytest.raises(ValueError, match="assigned to both"):
+        AshConfig(
+            keybindings={"newline": ["c-j"], "open_editor": ["C-J"]},
+        )
+
+
+def test_unknown_terminal_input_mode_is_rejected() -> None:
+    with pytest.raises(ValueError, match="input_mode"):
+        AshConfig(input_mode="modal")
+
+
 def test_backward_compat_ash_api_key_promoted_to_anthropic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

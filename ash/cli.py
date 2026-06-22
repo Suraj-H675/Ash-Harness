@@ -353,6 +353,8 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
     prompt_input = PromptInput(
         status_provider=status_line,
         extra_commands=[command.name for command in discovered_commands],
+        input_mode=config.input_mode,
+        keybindings=config.keybindings,
     )
     print(
         "ash - type /help for commands",
@@ -1171,6 +1173,9 @@ def main(argv: list[str] | None = None) -> int:
         ui = TerminalUI(
             safety_tier=config.safety_tier,
             workspace_root=config.workspace_root,
+            show_token_meter=config.show_token_meter,
+            no_color=config.no_color,
+            reduced_motion=config.reduced_motion,
         )
     from sandbox import SandboxManager
 

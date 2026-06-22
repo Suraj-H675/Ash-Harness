@@ -67,6 +67,29 @@ class AshConfig(BaseSettings):
         "interactive",
         description="Permission mode: interactive, auto_edit, plan, auto_approve, or dry_run.",
     )
+    no_color: bool = Field(
+        False,
+        description="Disable ANSI colors in the interactive terminal UI.",
+    )
+    reduced_motion: bool = Field(
+        False,
+        description="Avoid live per-token redraws in the interactive terminal UI.",
+    )
+    show_token_meter: bool = Field(
+        False,
+        description="Show live context-token usage in the response panel.",
+    )
+    input_mode: str = Field(
+        "emacs",
+        description="Interactive editor mode: emacs or vi.",
+    )
+    keybindings: dict[str, list[str]] = Field(
+        default_factory=lambda: {
+            "newline": ["escape enter", "c-j"],
+            "open_editor": ["c-x c-e"],
+        },
+        description="Prompt actions mapped to prompt-toolkit key sequences.",
+    )
     allow_unsafe_auto_approve: bool = Field(
         False,
         description="Allow full auto mode without an OS-level sandbox.",
@@ -164,6 +187,40 @@ class AshConfig(BaseSettings):
         except ValueError as exc:
             allowed = ", ".join(mode.value for mode in PermissionMode)
             raise ValueError(f"safety_tier must be one of: {allowed}") from exc
+
+    @field_validator("input_mode")
+    @classmethod
+    def validate_input_mode(cls, value: str) -> str:
+        value = value.casefold()
+        if value not in {"emacs", "vi"}:
+            raise ValueError("input_mode must be emacs or vi")
+        return value
+
+    @field_validator("keybindings")
+    @classmethod
+    def validate_keybindings(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        allowed_actions = {"newline", "open_editor"}
+        unknown = set(value) - allowed_actions
+        if unknown:
+            raise ValueError(
+                f"unknown keybinding action(s): {', '.join(sorted(unknown))}"
+            )
+        normalized: dict[str, list[str]] = {}
+        owners: dict[tuple[str, ...], str] = {}
+        for action, sequences in value.items():
+            normalized[action] = []
+            for raw_sequence in sequences:
+                keys = tuple(raw_sequence.casefold().split())
+                if not keys:
+                    raise ValueError(f"empty key sequence for {action}")
+                owner = owners.get(keys)
+                if owner is not None:
+                    raise ValueError(
+                        f"key sequence {raw_sequence!r} is assigned to both {owner} and {action}"
+                    )
+                owners[keys] = action
+                normalized[action].append(" ".join(keys))
+        return normalized
 
     @property
     def provider(self) -> str:

@@ -64,6 +64,8 @@ class TerminalUI:
         console: Console | None = None,
         input_stream: TextIO | None = None,
         show_token_meter: bool = False,
+        no_color: bool = False,
+        reduced_motion: bool = False,
         workspace_root: Path | None = None,
     ) -> None:
         if safety_tier not in {
@@ -76,12 +78,13 @@ class TerminalUI:
             raise ValueError(f"Unknown safety tier: {safety_tier!r}")
         self.safety_tier = safety_tier
         self._approval_callback = approval_callback
-        self.console = console or Console()
+        self.console = console or Console(no_color=no_color)
         self._input_stream = input_stream or sys.stdin
         self._active_buffers: _LiveBuffers | None = None
         self._active_live: Live | None = None
         self._session_approvals: set[str] = set()
         self.show_token_meter = show_token_meter
+        self.reduced_motion = reduced_motion
         self.workspace_root = workspace_root.resolve() if workspace_root else None
         self._token_progress = (
             Progress(
@@ -206,7 +209,7 @@ class TerminalUI:
 
     def _refresh_live(self) -> None:
         live = getattr(self, "_active_live", None)
-        if live is not None:
+        if live is not None and not self.reduced_motion:
             live.refresh()
 
     # --- approval surface -------------------------------------------------
@@ -278,7 +281,10 @@ class TerminalUI:
             patch = arguments.get("patch")
             if isinstance(patch, str):
                 lines = patch.splitlines()
-                return "\n".join(lines[:200] + (["[diff preview truncated]"] if len(lines) > 200 else []))
+                return "\n".join(
+                    lines[:200]
+                    + (["[diff preview truncated]"] if len(lines) > 200 else [])
+                )
         if tool_name == "replace_file_content":
             before = arguments.get("target_content")
             after = arguments.get("replacement_content")

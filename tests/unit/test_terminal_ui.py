@@ -11,6 +11,13 @@ def test_terminal_ui_initializes_with_safety_tier():
     assert ui2.safety_tier == "auto_approve"
 
 
+def test_terminal_ui_supports_no_color_and_reduced_motion():
+    ui = TerminalUI(no_color=True, reduced_motion=True, show_token_meter=True)
+    assert ui.console.no_color is True
+    assert ui.reduced_motion is True
+    assert ui.show_token_meter is True
+
+
 def test_terminal_ui_dry_run_denies_all():
     ui = TerminalUI(safety_tier="dry_run")
     approved = ui.request_tool_approval("write_file", {"file_path": "x"})
