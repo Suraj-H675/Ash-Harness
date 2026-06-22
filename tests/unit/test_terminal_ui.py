@@ -65,3 +65,18 @@ def test_terminal_ui_builds_workspace_edit_preview(tmp_path):
     )
     assert "-old" in preview
     assert "+new" in preview
+
+
+def test_terminal_ui_renders_tool_lifecycle_without_arguments() -> None:
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False))
+    ui.emit_event(
+        {
+            "type": "tool.completed",
+            "tool": "read_file",
+            "success": True,
+            "arguments": {"file_path": "secret"},
+        }
+    )
+    assert "tool read_file [completed]" in output.getvalue()
+    assert "secret" not in output.getvalue()

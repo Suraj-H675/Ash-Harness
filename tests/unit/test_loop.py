@@ -93,16 +93,26 @@ class CaptureTool(BaseTool):
         return ToolResult(success=True, output=kwargs["text"])
 
 
+class EventUI(TerminalUI):
+    def __init__(self, safety_tier="auto_approve"):
+        super().__init__(safety_tier=safety_tier)
+        self.events = []
+
+    def emit_event(self, payload):
+        self.events.append(payload)
+
+
 @pytest.mark.asyncio
 async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
     provider = NativeToolProvider()
     tool = CaptureTool(SafetyGuard(project_root=tmp_path))
     store = SessionStore(tmp_path / "native.db")
+    ui = EventUI()
     loop = AshLoop(
         store,
         provider,
         tool.safety_guard,
-        TerminalUI(safety_tier="auto_approve"),
+        ui,
         tmp_path,
         tools={tool.name: tool},
     )
@@ -123,17 +133,24 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
         message for message in second_request if message["role"] == "tool"
     )
     assert tool_message["tool_call_id"] == "call-native-1"
+    assert [event["type"] for event in ui.events] == [
+        "tool.requested",
+        "tool.started",
+        "tool.completed",
+    ]
+    assert ui.events[-1]["output"] == "hello"
 
 
 @pytest.mark.asyncio
 async def test_dry_run_never_executes_native_tool_calls(tmp_path):
     provider = NativeToolProvider()
     tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    ui = EventUI("dry_run")
     loop = AshLoop(
         SessionStore(tmp_path / "dry-run.db"),
         provider,
         tool.safety_guard,
-        TerminalUI(safety_tier="dry_run"),
+        ui,
         tmp_path,
         tools={tool.name: tool},
         safety_tier="dry_run",
@@ -143,6 +160,10 @@ async def test_dry_run_never_executes_native_tool_calls(tmp_path):
     await loop.run_turn("do not execute this")
 
     assert tool.arguments is None
+    assert [event["type"] for event in ui.events[:2]] == [
+        "tool.requested",
+        "tool.denied",
+    ]
 
 
 @pytest.mark.asyncio

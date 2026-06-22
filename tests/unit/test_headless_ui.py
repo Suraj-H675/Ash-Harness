@@ -32,3 +32,16 @@ def test_stream_json_emits_deltas_and_completion() -> None:
 def test_headless_approval_fails_closed() -> None:
     ui = HeadlessUI(output_format="text", stream=io.StringIO())
     assert ui.request_tool_approval("run_command", {"command": "x"}) is False
+
+
+def test_stream_json_emits_tool_lifecycle_events() -> None:
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="stream-json", stream=stream)
+    observed = []
+    unsubscribe = ui.subscribe(observed.append)
+
+    ui.emit_event({"type": "tool.started", "call_id": "c1", "tool": "read_file"})
+    unsubscribe()
+
+    assert json.loads(stream.getvalue())["type"] == "tool.started"
+    assert observed == [{"type": "tool.started", "call_id": "c1", "tool": "read_file"}]

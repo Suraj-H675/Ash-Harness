@@ -222,6 +222,33 @@ class TerminalUI:
         if repaint:
             self._last_refresh = now
 
+    def emit_event(self, payload: dict[str, Any]) -> None:
+        """Render concise tool lifecycle state outside the assistant panel."""
+
+        event_type = payload.get("type")
+        if event_type not in {
+            "tool.started",
+            "tool.completed",
+            "tool.denied",
+            "tool.error",
+        }:
+            return
+        tool = str(payload.get("tool", "unknown"))
+        labels = {
+            "tool.started": ("started", "cyan"),
+            "tool.completed": (
+                "completed" if payload.get("success") else "failed",
+                "green" if payload.get("success") else "red",
+            ),
+            "tool.denied": ("denied", "yellow"),
+            "tool.error": ("error", "red"),
+        }
+        label, style = labels[event_type]
+        line = Text("tool ", style="dim")
+        line.append(tool, style="bold")
+        line.append(f" [{label}]", style=style)
+        self.console.print(line)
+
     # --- approval surface -------------------------------------------------
 
     def request_tool_approval(self, tool_name: str, arguments: dict[str, Any]) -> bool:

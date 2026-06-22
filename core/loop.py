@@ -82,6 +82,7 @@ class LoopUI(Protocol):
     def print_token(self, text: str) -> None: ...
     def print_thought(self, text: str) -> None: ...
     def update_token_count(self, current: int, maximum: int | None = None) -> None: ...
+    def emit_event(self, payload: dict[str, Any]) -> None: ...
     def request_tool_approval(
         self, tool_name: str, arguments: dict[str, Any]
     ) -> bool: ...
@@ -747,6 +748,12 @@ class AshLoop:
                 executed=False,
                 timestamp=_utc_now(),
             )
+            event_base = {
+                "call_id": record.call_id,
+                "tool": tool_name,
+                "arguments": record.arguments,
+            }
+            self.ui.emit_event({"type": "tool.requested", **event_base})
 
             decision = self.permission_policy.evaluate(tool_name, arguments)
             if self.on_tool_approval is not None:
@@ -768,6 +775,13 @@ class AshLoop:
                     else "Denied by user"
                 )
                 self.session_store.save_tool_call(session.session_id, record)
+                self.ui.emit_event(
+                    {
+                        "type": "tool.denied",
+                        **event_base,
+                        "reason": record.error,
+                    }
+                )
                 results.append(
                     {
                         "success": False,
@@ -782,6 +796,9 @@ class AshLoop:
                 record.error = f"Unknown tool: {tool_name}"
                 self.session_store.save_tool_call(session.session_id, record)
                 self.circuit_breaker.record_failure(tool_name)
+                self.ui.emit_event(
+                    {"type": "tool.error", **event_base, "error": record.error}
+                )
                 results.append(
                     {
                         "success": False,
@@ -791,6 +808,7 @@ class AshLoop:
                 )
                 continue
 
+            self.ui.emit_event({"type": "tool.started", **event_base})
             try:
                 if self.hooks is not None:
                     await self.hooks.fire_pre_tool(tool_name, arguments)
@@ -817,6 +835,13 @@ class AshLoop:
                 record.error = str(exc)
                 self.session_store.save_tool_call(session.session_id, record)
                 self.circuit_breaker.record_failure(tool_name)
+                self.ui.emit_event(
+                    {
+                        "type": "tool.error",
+                        **event_base,
+                        "error": redact_text(str(exc)),
+                    }
+                )
                 results.append(
                     {
                         "success": False,
@@ -830,6 +855,16 @@ class AshLoop:
             record.result = tool_result.output
             record.error = tool_result.error
             self.session_store.save_tool_call(session.session_id, record)
+            self.ui.emit_event(
+                {
+                    "type": "tool.completed",
+                    **event_base,
+                    "success": tool_result.success,
+                    "output": tool_result.output,
+                    "error": tool_result.error,
+                    "truncated": tool_result.truncated,
+                }
+            )
 
             results.append(
                 {

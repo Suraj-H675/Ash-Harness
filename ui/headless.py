@@ -56,15 +56,6 @@ class HeadlessUI:
             )
 
     def request_tool_approval(self, tool_name: str, arguments: dict[str, Any]) -> bool:
-        if self.output_format == "stream-json":
-            self._emit(
-                {
-                    "type": "tool.denied",
-                    "tool": tool_name,
-                    "arguments": arguments,
-                    "reason": "headless mode cannot prompt for approval",
-                }
-            )
         return False
 
     def show_plan(self, execution: Any) -> bool:
@@ -84,6 +75,11 @@ class HeadlessUI:
             self._emit(event)
         else:
             print(payload["response"], file=self.stream, flush=True)
+
+    def emit_event(self, payload: dict[str, Any]) -> None:
+        self._notify(payload)
+        if self.output_format == "stream-json":
+            self._emit(payload)
 
     def _emit(self, payload: dict[str, Any]) -> None:
         print(
