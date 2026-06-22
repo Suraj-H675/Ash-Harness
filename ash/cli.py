@@ -248,6 +248,7 @@ def _build_tools(
 def _print_model_list(config: AshConfig) -> None:
     """Show models grouped by provider."""
     from providers.capabilities import infer_capabilities
+
     # Determine current provider/model
     try:
         current_provider, current_model = _parse_model_string(config.model)
@@ -609,9 +610,7 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
                 )
                 continue
             if command.name == "skills":
-                result = await loop.tools["list_skills"].run(
-                    query=" ".join(arguments)
-                )
+                result = await loop.tools["list_skills"].run(query=" ".join(arguments))
                 print(result.output or "No matching skills.", flush=True)
                 continue
             if command.name == "plugins":
@@ -786,7 +785,9 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
             if command.name == "memory":
                 action = arguments[0] if arguments else "status"
                 if action == "status" and len(arguments) == 1 or not arguments:
-                    state = "enabled" if loop._vector_pipeline is not None else "disabled"
+                    state = (
+                        "enabled" if loop._vector_pipeline is not None else "disabled"
+                    )
                     print(f"Memory: {state}; backend={config.memory_backend}")
                     continue
                 if action == "index" and len(arguments) == 2:
@@ -815,7 +816,11 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
                 continue
 
         # /model with no args → interactive picker (from setup wizard)
-        if parsed_command is not None and parsed_command[0].name == "model" and not parsed_command[1]:
+        if (
+            parsed_command is not None
+            and parsed_command[0].name == "model"
+            and not parsed_command[1]
+        ):
             from cli.setup import setup_model_provider
 
             old_model = config.model
@@ -907,10 +912,25 @@ def main(argv: list[str] | None = None) -> int:
     reset_parser.add_argument("--cache", action="store_true")
     reset_parser.add_argument("--all", action="store_true")
     reset_parser.add_argument("--yes", action="store_true")
+    serve_parser = subparsers.add_parser(
+        "serve", help="Run the authenticated local Ash HTTP API"
+    )
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8765)
+    serve_parser.add_argument("--token-env", default="ASH_SERVER_TOKEN")
+    serve_parser.add_argument("--rate-limit", type=int, default=60)
+    serve_parser.add_argument("--allow-remote", action="store_true")
+    serve_parser.add_argument(
+        "--log-level",
+        choices=["critical", "error", "warning", "info", "debug"],
+        default="info",
+    )
     mcp_subparser = subparsers.add_parser("mcp")
     mcp_subparser.add_argument("action", choices=["add", "list", "remove"])
     mcp_subparser.add_argument("server_name", nargs="?")
-    mcp_subparser.add_argument("--transport", choices=["stdio", "http", "sse"], default="stdio")
+    mcp_subparser.add_argument(
+        "--transport", choices=["stdio", "http", "sse"], default="stdio"
+    )
     mcp_subparser.add_argument("--url", default="")
     mcp_subparser.add_argument("server_command", nargs=argparse.REMAINDER)
     parser.add_argument(
@@ -979,13 +999,14 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.action == "status":
             trusted = is_workspace_trusted(args.path)
-            print(f"{canonical_workspace(args.path)}: {'trusted' if trusted else 'untrusted'}")
+            print(
+                f"{canonical_workspace(args.path)}: {'trusted' if trusted else 'untrusted'}"
+            )
             return 0 if trusted else 1
         trusted = args.action == "add"
         set_workspace_trusted(args.path, trusted)
         print(
-            f"{canonical_workspace(args.path)}: "
-            f"{'trusted' if trusted else 'untrusted'}"
+            f"{canonical_workspace(args.path)}: {'trusted' if trusted else 'untrusted'}"
         )
         return 0
 
@@ -994,11 +1015,15 @@ def main(argv: list[str] | None = None) -> int:
 
         selected = args.config or args.sessions or args.cache or args.all
         if not selected:
-            print("Error: choose --config, --sessions, --cache, or --all", file=sys.stderr)
+            print(
+                "Error: choose --config, --sessions, --cache, or --all", file=sys.stderr
+            )
             return 2
         confirmed = args.yes
         if not confirmed and sys.stdin.isatty():
-            confirmed = input("Remove selected Ash local state? [y/N] ").strip().casefold() in {"y", "yes"}
+            confirmed = input(
+                "Remove selected Ash local state? [y/N] "
+            ).strip().casefold() in {"y", "yes"}
         if not confirmed:
             print("Reset cancelled.", file=sys.stderr)
             return 2
@@ -1011,6 +1036,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Removed {len(removed)} path(s).")
         return 0
 
+    if args.command == "serve":
+        from cli.serve import serve_http
+
+        try:
+            return asyncio.run(serve_http(args))
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+
     if args.command == "mcp":
         from mcp.server import MCPServerConfig, load_mcp_servers, save_mcp_servers
 
@@ -1020,7 +1054,11 @@ def main(argv: list[str] | None = None) -> int:
             if not servers:
                 print("No MCP servers configured.")
             for name, cfg in servers.items():
-                target = cfg.url if cfg.transport != "stdio" else f"{cfg.command} {' '.join(cfg.args)}"
+                target = (
+                    cfg.url
+                    if cfg.transport != "stdio"
+                    else f"{cfg.command} {' '.join(cfg.args)}"
+                )
                 print(f"{name} [{cfg.transport}]: {target}")
             return 0
         if not args.server_name:
@@ -1028,7 +1066,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if args.action == "remove":
             if args.server_name not in servers:
-                print(f"Error: MCP server {args.server_name!r} is not configured.", file=sys.stderr)
+                print(
+                    f"Error: MCP server {args.server_name!r} is not configured.",
+                    file=sys.stderr,
+                )
                 return 2
             del servers[args.server_name]
             save_mcp_servers(servers, path)
@@ -1038,7 +1079,9 @@ def main(argv: list[str] | None = None) -> int:
         if command_parts[:1] == ["--"]:
             command_parts = command_parts[1:]
         if args.transport == "stdio" and not command_parts:
-            print("Error: stdio MCP add requires '-- command [args...]'.", file=sys.stderr)
+            print(
+                "Error: stdio MCP add requires '-- command [args...]'.", file=sys.stderr
+            )
             return 2
         if args.transport != "stdio" and not args.url:
             print("Error: HTTP/SSE MCP add requires --url.", file=sys.stderr)
@@ -1097,9 +1140,13 @@ def main(argv: list[str] | None = None) -> int:
         and sys.stdin.isatty()
         and sys.stdout.isatty()
     ):
-        answer = input(
-            f"Trust project extensions in {config.workspace_root.resolve()}? [y/N] "
-        ).strip().casefold()
+        answer = (
+            input(
+                f"Trust project extensions in {config.workspace_root.resolve()}? [y/N] "
+            )
+            .strip()
+            .casefold()
+        )
         if answer in {"y", "yes"}:
             set_workspace_trusted(config.workspace_root, True)
             workspace_trusted = True
@@ -1265,9 +1312,7 @@ async def _bootstrap_and_headless(
             "context_tokens": loop._last_context_tokens,
         }
         if schema is not None:
-            payload["structured_output"] = validate_structured_output(
-                response, schema
-            )
+            payload["structured_output"] = validate_structured_output(response, schema)
         ui.emit_result(payload)
         return 0
     except Exception as exc:  # noqa: BLE001
@@ -1300,5 +1345,7 @@ def validate_structured_output(response: str, schema: dict[str, Any]) -> Any:
     try:
         jsonschema.validate(value, schema)
     except jsonschema.ValidationError as exc:
-        raise ValueError(f"Model output failed schema validation: {exc.message}") from exc
+        raise ValueError(
+            f"Model output failed schema validation: {exc.message}"
+        ) from exc
     return value
