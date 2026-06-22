@@ -12,16 +12,17 @@ from __future__ import annotations
 
 import sys
 import difflib
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 from rich.text import Text
-from rich.columns import Columns
 
 
 ApprovalCallback = Callable[[str, dict[str, Any]], bool]
@@ -30,11 +31,11 @@ ApprovalCallback = Callable[[str, dict[str, Any]], bool]
 @dataclass
 class _LiveBuffers:
     thought: Text
-    response: Text
+    response: str
 
     @classmethod
     def fresh(cls) -> "_LiveBuffers":
-        return cls(thought=Text(), response=Text())
+        return cls(thought=Text(), response="")
 
 
 class TerminalUI:
@@ -98,6 +99,7 @@ class TerminalUI:
         self._token_task: TaskID | None = None
         self._current_tokens = 0
         self._maximum_tokens = 100000
+        self._last_refresh = 0.0
 
     @property
     def has_approval_callback(self) -> bool:
@@ -132,29 +134,37 @@ class TerminalUI:
         else:
             self._token_task = None
 
-        def _render() -> Panel:
-            assert self._active_buffers is not None
-            content: Any = self._active_buffers.response
-            if self.show_token_meter and self._token_task is not None:
-                token_text = Text(
+        live = Live(
+            self._render_active_turn(),
+            console=self.console,
+            refresh_per_second=12,
+            transient=False,
+        )
+        self._active_live = live
+        self._last_refresh = 0.0
+        return live
+
+    def _render_active_turn(self) -> Panel:
+        buffers = self._active_buffers_required()
+        parts: list[Any] = []
+        if buffers.thought:
+            parts.append(buffers.thought)
+        parts.append(Markdown(buffers.response, hyperlinks=False))
+        if self.show_token_meter and self._token_task is not None:
+            parts.append(
+                Text(
                     self._render_token_meter(
                         self._current_tokens, self._maximum_tokens
                     ),
                     style="dim",
                 )
-                content = Columns([content, token_text], column_first=False)
-            return Panel(
-                content,
-                title="ash",
-                border_style="cyan",
-                padding=(0, 1),
             )
-
-        live = Live(
-            _render(), console=self.console, refresh_per_second=12, transient=False
+        return Panel(
+            Group(*parts),
+            title="ash",
+            border_style="cyan",
+            padding=(0, 1),
         )
-        self._active_live = live
-        return live
 
     def _active_buffers_required(self) -> _LiveBuffers:
         if not hasattr(self, "_active_buffers") or self._active_buffers is None:
@@ -165,21 +175,16 @@ class TerminalUI:
         if not text:
             return
         buffers = self._active_buffers_required()
-        buffers.response.append(text)
+        buffers.response += text
         self._refresh_live()
 
     def print_thought(self, text: str) -> None:
         if not text:
             return
         buffers = self._active_buffers_required()
-        # Thoughts are rendered as an inline dim annotation in the response
-        # panel — this keeps the layout single-region so rich.live does not
-        # need a multi-panel grid for V1 minimal.
-        if len(buffers.response) > 0:
-            buffers.response.append("\n")
-        thought = Text("💭 " + text, style="dim italic")
-        buffers.response.append(thought)
-        buffers.response.append("\n")
+        if buffers.thought:
+            buffers.thought.append("\n")
+        buffers.thought.append("reasoning: " + text, style="dim italic")
         self._refresh_live()
 
     def finalize_turn(self) -> None:
@@ -187,7 +192,7 @@ class TerminalUI:
 
         live = getattr(self, "_active_live", None)
         if live is not None:
-            live.refresh()
+            live.update(self._render_active_turn(), refresh=True)
         self._active_buffers = None
         self._active_live = None
         if self._token_progress is not None:
@@ -209,8 +214,13 @@ class TerminalUI:
 
     def _refresh_live(self) -> None:
         live = getattr(self, "_active_live", None)
-        if live is not None and not self.reduced_motion:
-            live.refresh()
+        if live is None or self.reduced_motion:
+            return
+        now = time.monotonic()
+        repaint = now - self._last_refresh >= 0.05
+        live.update(self._render_active_turn(), refresh=repaint)
+        if repaint:
+            self._last_refresh = now
 
     # --- approval surface -------------------------------------------------
 

@@ -1,6 +1,7 @@
 # tests/unit/test_terminal_ui.py
 from ui.terminal import TerminalUI
 from io import StringIO
+from rich.console import Console
 
 
 def test_terminal_ui_initializes_with_safety_tier():
@@ -16,6 +17,23 @@ def test_terminal_ui_supports_no_color_and_reduced_motion():
     assert ui.console.no_color is True
     assert ui.reduced_motion is True
     assert ui.show_token_meter is True
+
+
+def test_terminal_ui_renders_markdown_and_reasoning() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        console=Console(file=output, force_terminal=False, width=80),
+    )
+    with ui.begin_turn():
+        ui.print_thought("checking")
+        ui.print_token("**bold**\n\n```python\nprint('ok')\n```")
+    ui.finalize_turn()
+
+    rendered = output.getvalue()
+    assert "reasoning: checking" in rendered
+    assert "bold" in rendered
+    assert "print('ok')" in rendered
+    assert "**bold**" not in rendered
 
 
 def test_terminal_ui_dry_run_denies_all():
