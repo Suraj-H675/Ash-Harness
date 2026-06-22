@@ -328,11 +328,12 @@ def _interactive_model_picker(config: AshConfig, loop: AshLoop) -> None:
         print(f"Error: {exc}", file=sys.stderr)
 
 
-async def _repl(loop: AshLoop, config: AshConfig) -> int:
+async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     from cli.custom_commands import CustomCommandCatalog
     from cli.slash import parse_slash_command, render_help
     from safety.trust import is_workspace_trusted
     from ui.prompt import PromptInput
+    from ui.status import StatusLine
 
     command_roots = [(Path.home() / ".ash" / "commands", "user")]
     if is_workspace_trusted(loop.project_root):
@@ -340,15 +341,7 @@ async def _repl(loop: AshLoop, config: AshConfig) -> int:
     custom_commands = CustomCommandCatalog(tuple(command_roots))
     discovered_commands = custom_commands.discover()
 
-    def status_line() -> str:
-        session_id = (
-            loop.current_session.session_id[:8] if loop.current_session else "none"
-        )
-        return (
-            f" {config.model} | {loop.permission_policy.mode.value} | "
-            f"ctx ~{loop._last_context_tokens} | session {session_id} | "
-            f"{loop.project_root} "
-        )
+    status_line = StatusLine(loop, config, sandbox_manager)
 
     prompt_input = PromptInput(
         status_provider=status_line,
@@ -1370,18 +1363,29 @@ def main(argv: list[str] | None = None) -> int:
             print("Interrupted.", file=sys.stderr)
             return 130
     try:
-        return asyncio.run(_bootstrap_and_repl(loop, config, session_id=args.session))
+        return asyncio.run(
+            _bootstrap_and_repl(
+                loop,
+                config,
+                sandbox_manager,
+                session_id=args.session,
+            )
+        )
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
 
 
 async def _bootstrap_and_repl(
-    loop: AshLoop, config: AshConfig, *, session_id: str | None
+    loop: AshLoop,
+    config: AshConfig,
+    sandbox_manager: Any,
+    *,
+    session_id: str | None,
 ) -> int:
     try:
         await loop.start_session(session_id)
-        return await _repl(loop, config)
+        return await _repl(loop, config, sandbox_manager)
     finally:
         await loop.aclose()
 

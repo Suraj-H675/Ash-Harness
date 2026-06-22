@@ -22,3 +22,8 @@ def test_session_token_totals_accumulate(tmp_path) -> None:
     assert row["total_prompt_tokens"] == 30
     assert row["total_completion_tokens"] == 12
     assert row["total_cost_usd"] == 0.03
+    usage = store.get_session_usage(session.session_id)
+    assert usage.total_tokens == 42
+    assert usage.prompt_tokens == 30
+    assert usage.completion_tokens == 12
+    assert usage.cost_usd == 0.03

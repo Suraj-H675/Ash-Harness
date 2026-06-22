@@ -64,6 +64,13 @@ class SessionSummary(BaseModel):
     model: str = ""
 
 
+class SessionUsage(BaseModel):
+    total_tokens: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost_usd: float = 0.0
+
+
 _db_write_locks: dict[str, asyncio.Lock] = {}
 _db_write_locks_guard = threading.Lock()
 
@@ -566,6 +573,22 @@ class SessionStore:
             )
             for row in rows
         ]
+
+    def get_session_usage(self, session_id: str) -> SessionUsage:
+        """Return persisted token and explicitly configured cost totals."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT COALESCE(total_tokens, 0) AS total_tokens, "
+                "COALESCE(total_prompt_tokens, 0) AS prompt_tokens, "
+                "COALESCE(total_completion_tokens, 0) AS completion_tokens, "
+                "COALESCE(total_cost_usd, 0) AS cost_usd "
+                "FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Session not found: {session_id}")
+        return SessionUsage(**dict(row))
 
     def cleanup_sessions(
         self, retention_days: int, *, project_path: str | None = None
