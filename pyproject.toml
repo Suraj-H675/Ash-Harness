@@ -50,6 +50,10 @@ vector = [
     "onnxruntime>=1.16",
 ]
 
+[project.urls]
+Repository = "https://github.com/Suraj-H675/Ash-Harness"
+Issues = "https://github.com/Suraj-H675/Ash-Harness/issues"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

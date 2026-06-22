@@ -929,6 +929,10 @@ def main(argv: list[str] | None = None) -> int:
     reset_parser.add_argument("--cache", action="store_true")
     reset_parser.add_argument("--all", action="store_true")
     reset_parser.add_argument("--yes", action="store_true")
+    update_parser = subparsers.add_parser(
+        "update", help="Check GitHub for a newer Ash release"
+    )
+    update_parser.add_argument("--json", action="store_true")
     serve_parser = subparsers.add_parser(
         "serve", help="Run the authenticated local Ash HTTP API"
     )
@@ -1051,6 +1055,20 @@ def main(argv: list[str] | None = None) -> int:
             confirmed=True,
         )
         print(f"Removed {len(removed)} path(s).")
+        return 0
+
+    if args.command == "update":
+        from cli.update import check_for_update, render_update_status
+
+        try:
+            update_status = check_for_update(current_version=version)
+        except ValueError as exc:
+            if args.json:
+                print(json.dumps({"error": str(exc)}, sort_keys=True))
+            else:
+                print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(render_update_status(update_status, json_output=args.json))
         return 0
 
     if args.command == "serve":
