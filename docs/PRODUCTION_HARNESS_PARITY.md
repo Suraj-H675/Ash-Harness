@@ -43,7 +43,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Config precedence | Partial | CLI > env > project > user > defaults, with an explain command |
 | Config migration | Partial | Versioned and idempotent migrations with backups |
 | `ash doctor` | Verified locally | Human/JSON diagnostics; optional endpoint connectivity probe |
-| Update/version check | Missing | Explicit command; no mandatory telemetry |
+| Update/version check | Verified locally | Explicit GitHub release check with no background telemetry or self-modification |
 | Uninstall/reset | Verified locally | Confirmed selective reset for config, sessions, cache, or all local state |
 
 ## 2. Core Agent Runtime

@@ -33,11 +33,15 @@ ash -p "summarize" --output-format json
 ash --session SESSION_ID         # resume a durable session
 ash mcp add local -- python server.py
 ash trust add .                  # allow project ASH.md, skills, hooks, MCP
+ash update                       # explicitly check GitHub releases
+ASH_SERVER_TOKEN=change-me-long-token ash serve
 ```
 
-Inside the terminal, `/help` lists session, context, model, diff, permissions,
-sandbox, skills, plugins, export, and diagnostic commands. `Alt+Enter` or
-`Ctrl+J` inserts a newline; prompt history is stored under `~/.ash`.
+Inside the terminal, `/help` lists session, context, model, diff, review,
+permissions, sandbox, skills, plugins, export, and diagnostic commands.
+`/review` supports worktree, staged, commit, and branch-versus-base scopes.
+`Alt+Enter` or `Ctrl+J` inserts a newline; prompt history is stored under
+`~/.ash`.
 
 Project-controlled extensions are disabled until the workspace is trusted.
 API keys are stored in `~/.ash/.env` with restricted permissions. Custom
@@ -55,6 +59,11 @@ ollama/qwen3-coder
 
 Run `ash setup` to configure a provider and `ash doctor --connect` to test its
 endpoint. Run `ash doctor --json` for machine-readable diagnostics.
+
+Terminal behavior is configurable with `ASH_INPUT_MODE=vi`,
+`ASH_NO_COLOR=true`, `ASH_REDUCED_MOTION=true`, and
+`ASH_SHOW_TOKEN_METER=true`. Structured keybindings can be set in
+`~/.ash/ash.toml`.
 
 See [the production parity checklist](docs/PRODUCTION_HARNESS_PARITY.md) for
 implemented and remaining release requirements.
