@@ -40,6 +40,10 @@ ash storage backup               # consistent timestamped backup
 ash storage restore BACKUP --yes # validated, non-destructive restore
 ```
 
+The authenticated server exposes synchronous turns at `/v1/turn` and live
+SSE turn events at `/v1/turn/stream`; non-loopback binding requires
+`--allow-remote`.
+
 Inside the terminal, `/help` lists session, context, model, diff, review,
 permissions, sandbox, skills, plugins, export, and diagnostic commands.
 `/review` supports worktree, staged, commit, and branch-versus-base scopes.

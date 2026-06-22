@@ -220,7 +220,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | CI mode | Missing | Deterministic noninteractive approvals and no ANSI |
 | SDK/library API | Verified locally | Async create/prompt/session/lifecycle API independent of the TUI |
 | JSON-RPC server | Partial | Validated stdio methods, cancellation, lifecycle, and tests; remote transport remains |
-| HTTP server | Partial | Bearer auth, rate limits, lifecycle, session/turn routes, SSE lifecycle events, and safe CLI binding; live token events remain |
+| HTTP server | Verified locally | Bearer auth, rate limits, lifecycle, session/turn routes, live SSE events, cancellation, and safe CLI binding |
 | IDE/ACP integration | Missing | Protocol-based editor integration after CLI core is stable |
 
 ## 12. Reliability And Operations
