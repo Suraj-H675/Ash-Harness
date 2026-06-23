@@ -1374,13 +1374,21 @@ def main(argv: list[str] | None = None) -> int:
         allowed_web_domains=config.allowed_web_domains,
     )
 
-    from context.instructions import discover_instructions, render_instructions
+    from context.instructions import (
+        InstructionDiagnostic,
+        discover_instructions,
+        render_instructions,
+    )
 
+    instruction_diagnostics: list[InstructionDiagnostic] = []
+    discovered_instructions = discover_instructions(
+        config.workspace_root,
+        include_project=workspace_trusted,
+        diagnostics=instruction_diagnostics,
+    )
     instruction_text = render_instructions(
-        discover_instructions(
-            config.workspace_root,
-            include_project=workspace_trusted,
-        )
+        discovered_instructions,
+        instruction_diagnostics,
     )
     from hooks.config import load_command_hooks
 
