@@ -12,6 +12,9 @@ from pydantic_settings import (
 )
 
 
+CURRENT_CONFIG_SCHEMA_VERSION = 1
+
+
 class AshConfig(BaseSettings):
     """Runtime settings loaded from environment variables, ~/.ash/.env, and ~/.ash/ash.toml."""
 
@@ -25,6 +28,11 @@ class AshConfig(BaseSettings):
     model: str = Field(
         "anthropic/claude-sonnet-4-6",
         description="Model in provider/model string format (e.g. anthropic/claude-sonnet-4-6, ollama/qwen3-coder)",
+    )
+    config_schema_version: int = Field(
+        CURRENT_CONFIG_SCHEMA_VERSION,
+        ge=1,
+        description="Ash config schema version. Newer versions are refused.",
     )
     temperature: float = Field(0.0, description="Model generation temperature.")
 
@@ -204,6 +212,17 @@ class AshConfig(BaseSettings):
         except ValueError as exc:
             allowed = ", ".join(mode.value for mode in PermissionMode)
             raise ValueError(f"safety_tier must be one of: {allowed}") from exc
+
+    @field_validator("config_schema_version")
+    @classmethod
+    def validate_config_schema_version(cls, value: int) -> int:
+        if value > CURRENT_CONFIG_SCHEMA_VERSION:
+            raise ValueError(
+                "config_schema_version "
+                f"{value} is newer than this Ash version supports "
+                f"({CURRENT_CONFIG_SCHEMA_VERSION})"
+            )
+        return value
 
     @field_validator("context_budget_weights")
     @classmethod

@@ -7,6 +7,7 @@ from config import AshConfig
 
 ENV_KEYS = [
     "ASH_MODEL",
+    "ASH_CONFIG_SCHEMA_VERSION",
     "ASH_TEMPERATURE",
     "ASH_MAX_CONTEXT_TOKENS",
     "ASH_MAX_COMPLETION_TOKENS",
@@ -92,6 +93,7 @@ def test_config_loads_all_fields_from_ash_toml(
         AshConfig.model_config["toml_file"] = original_toml_file
 
     assert config.provider == "openai"
+    assert config.config_schema_version == 1
     assert config.model == "openai/gpt-4o"
     assert config.temperature == 0.7
     assert config.max_context_tokens == 64000
@@ -155,6 +157,26 @@ def test_environment_variables_override_ash_toml(
     assert config.workspace_root == env_workspace
     assert config.command_blocklist == ["git clean", "del"]
     assert config.db_directory == env_db
+
+
+def test_future_config_schema_version_is_refused(tmp_path: Path) -> None:
+    toml_path = tmp_path / "ash.toml"
+    toml_path.write_text(
+        "\n".join(
+            [
+                "config_schema_version = 999",
+                'model = "ollama/llama3"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    original_toml_file = AshConfig.model_config.get("toml_file")
+    AshConfig.model_config["toml_file"] = str(toml_path)
+    try:
+        with pytest.raises(ValueError, match="newer than this Ash version supports"):
+            AshConfig.load()
+    finally:
+        AshConfig.model_config["toml_file"] = original_toml_file
 
 
 def test_config_loads_without_api_key(
