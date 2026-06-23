@@ -51,6 +51,9 @@ permissions, sandbox, skills, plugins, export, and diagnostic commands.
 `/plan on` enables editable sprint plans for multi-step requests; type `e` at
 the plan prompt to revise the generated contract in `$VISUAL` or `$EDITOR`,
 then `y` to approve and execute it.
+Use `ash plans list`, `ash plans show <sprint-id>`, and
+`ash plans update <sprint-id> <item> <status>` to inspect or update persisted
+checklists outside the REPL.
 `Alt+Enter` or `Ctrl+J` inserts a newline; prompt history is stored under
 `~/.ash`. Type `@path` or `@"path with spaces"` to attach bounded workspace
 text or a directory listing to a prompt; secret, binary, oversized, and

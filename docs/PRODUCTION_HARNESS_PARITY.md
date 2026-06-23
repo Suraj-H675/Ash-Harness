@@ -159,7 +159,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Tests/build/lint diagnostics | Partial | Parse diagnostics and feed concise structured failures |
 | Web fetch/search | Partial | Guarded HTTP(S) `web_fetch` includes optional domain allowlist; search and citation workflow remain |
 | Ask-user tool | Verified locally | Typed blocking question with bounded options and explicit empty-answer failure |
-| Todo/plan tracking | Partial/unwired | Runtime-visible and persisted progress updates |
+| Todo/plan tracking | Partial | Persisted sprint checklists are inspectable and updatable from the top-level CLI; automatic runtime progress injection remains |
 
 ## 8. Safety, Trust, And Permissions
 
