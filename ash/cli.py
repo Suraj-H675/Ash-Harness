@@ -1033,6 +1033,28 @@ def main(argv: list[str] | None = None) -> int:
     sessions_parser.add_argument("--limit", type=int, default=20)
     sessions_parser.add_argument("--all-projects", action="store_true")
     sessions_parser.add_argument("--json", action="store_true")
+    plans_parser = subparsers.add_parser(
+        "plans", help="Inspect or update persisted sprint plans"
+    )
+    plans_subparsers = plans_parser.add_subparsers(
+        dest="plans_action", required=True
+    )
+    plans_list = plans_subparsers.add_parser("list")
+    plans_list.add_argument("--limit", type=int, default=20)
+    plans_list.add_argument("--all-projects", action="store_true")
+    plans_list.add_argument("--json", action="store_true")
+    plans_show = plans_subparsers.add_parser("show")
+    plans_show.add_argument("sprint_id")
+    plans_show.add_argument("--json", action="store_true")
+    plans_update = plans_subparsers.add_parser("update")
+    plans_update.add_argument("sprint_id")
+    plans_update.add_argument("item_idx", type=int)
+    plans_update.add_argument(
+        "status",
+        choices=["pending", "in_progress", "done", "skipped", "failed"],
+    )
+    plans_update.add_argument("--notes", default="")
+    plans_update.add_argument("--json", action="store_true")
     permissions_parser = subparsers.add_parser(
         "permissions", help="Inspect or change persistent project tool grants"
     )
@@ -1381,6 +1403,58 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
         print(render_session_summaries(sessions, json_output=args.json))
+        return 0
+
+    if args.command == "plans":
+        from cli.plans import (
+            list_plans,
+            render_plan_detail,
+            render_plan_summaries,
+            render_updated_plan_item,
+            show_plan,
+            update_plan_item,
+        )
+
+        plans_config = AshConfig.load(
+            **({"db_directory": args.db_directory} if args.db_directory else {})
+        )
+        store = SessionStore(plans_config.db_directory / "sessions.db")
+        try:
+            if args.plans_action == "list":
+                print(
+                    render_plan_summaries(
+                        list_plans(
+                            store,
+                            project_path=str(plans_config.workspace_root),
+                            all_projects=args.all_projects,
+                            limit=args.limit,
+                        ),
+                        json_output=args.json,
+                    )
+                )
+            elif args.plans_action == "show":
+                print(
+                    render_plan_detail(
+                        show_plan(store, args.sprint_id),
+                        json_output=args.json,
+                    )
+                )
+            else:
+                print(
+                    render_updated_plan_item(
+                        update_plan_item(
+                            store,
+                            args.sprint_id,
+                            args.item_idx,
+                            args.status,
+                            notes=args.notes,
+                        ),
+                        json_output=args.json,
+                    )
+                )
+        except (KeyError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
         return 0
 
     if args.command == "permissions":

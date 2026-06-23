@@ -222,6 +222,16 @@ class SprintExecution:
         self._replace(updated)
         return updated
 
+    def set_item_status(
+        self,
+        idx: int,
+        status: ChecklistStatus,
+        notes: str = "",
+    ) -> ChecklistItem:
+        updated = _replace(self._find(idx), status=status, notes=notes)
+        self._replace(updated)
+        return updated
+
     def _find(self, idx: int) -> ChecklistItem:
         for item in self.items:
             if item.idx == idx:
