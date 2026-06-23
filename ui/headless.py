@@ -76,6 +76,19 @@ class HeadlessUI:
         else:
             print(payload["response"], file=self.stream, flush=True)
 
+    def emit_error(self, payload: dict[str, Any]) -> None:
+        event = {"type": "error", "error": payload}
+        self._notify(event)
+        if self.output_format in {"json", "stream-json"}:
+            self._emit(event)
+        else:
+            message = payload.get("message") or "Unknown error"
+            category = payload.get("category") or "internal"
+            remedy = payload.get("remedy")
+            print(f"Error [{category}]: {message}", file=sys.stderr)
+            if remedy:
+                print(f"Remedy: {remedy}", file=sys.stderr)
+
     def emit_event(self, payload: dict[str, Any]) -> None:
         self._notify(payload)
         if self.output_format == "stream-json":

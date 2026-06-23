@@ -29,6 +29,32 @@ def test_stream_json_emits_deltas_and_completion() -> None:
     ]
 
 
+def test_json_error_is_structured_machine_readable_event() -> None:
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="json", stream=stream)
+
+    ui.emit_error(
+        {
+            "category": "provider",
+            "message": "missing key",
+            "remedy": "run setup",
+            "exit_code": 1,
+            "retriable": False,
+        }
+    )
+
+    assert json.loads(stream.getvalue()) == {
+        "type": "error",
+        "error": {
+            "category": "provider",
+            "message": "missing key",
+            "remedy": "run setup",
+            "exit_code": 1,
+            "retriable": False,
+        },
+    }
+
+
 def test_headless_approval_fails_closed() -> None:
     ui = HeadlessUI(output_format="text", stream=io.StringIO())
     assert ui.request_tool_approval("run_command", {"command": "x"}) is False

@@ -20,6 +20,7 @@ from typing import Any
 from config import AshConfig
 from core.loop import AshLoop
 from core.session import SessionStore
+from exceptions import classify_exception, format_error
 from providers.base import ProviderABC
 from safety.guard import SafetyGuard
 from tools.command import RunCommandTool
@@ -1465,11 +1466,14 @@ async def _bootstrap_and_headless(
         ui.emit_result(payload)
         return 0
     except Exception as exc:  # noqa: BLE001
-        if ui.output_format in {"json", "stream-json"}:
-            ui._emit({"type": "error", "error": str(exc)})
+        error = classify_exception(exc)
+        if hasattr(ui, "emit_error"):
+            ui.emit_error(error.to_dict())
+        elif ui.output_format in {"json", "stream-json"}:
+            print(json.dumps({"type": "error", "error": error.to_dict()}), flush=True)
         else:
-            print(f"Error: {exc}", file=sys.stderr)
-        return 1
+            print(format_error(error), file=sys.stderr)
+        return error.exit_code
     finally:
         await loop.aclose()
 
