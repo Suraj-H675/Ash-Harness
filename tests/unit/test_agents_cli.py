@@ -7,8 +7,10 @@ from pathlib import Path
 from agents.shared_state import SharedState
 from ash.cli import main
 from cli.agents import (
+    list_agent_messages,
     list_agent_reports,
     list_agent_statuses,
+    render_agent_messages,
     render_agent_reports,
     render_agent_statuses,
 )
@@ -52,6 +54,20 @@ def test_agent_report_renderer_emits_json(tmp_path: Path) -> None:
 
     assert payload["reports"][0]["agent_id"] == "worker"
     assert payload["reports"][0]["summary"] == "looks good"
+
+
+def test_agent_message_renderer_emits_json(tmp_path: Path) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    state.register_agent("agent-a")
+    message_id = state.send_to_agent("lead", "agent-a", "note", "hello")
+    state.close()
+
+    messages = list_agent_messages(tmp_path / "agents.db", recipient_id="agent-a")
+    payload = json.loads(render_agent_messages(messages, json_output=True))
+
+    assert payload["messages"][0]["message_id"] == message_id
+    assert payload["messages"][0]["content"] == {"content": "hello"}
+    assert payload["messages"][0]["delivered"] is False
 
 
 def test_agents_cli_lists_persisted_statuses(
@@ -107,4 +123,61 @@ def test_agents_cli_lists_reports_and_rejects_invalid_limit(
     assert payload["reports"][0]["summary"] == "failed tests"
 
     assert main(["agents", "reports", "--limit", "0"]) == 2
+    assert "limit must be positive" in capsys.readouterr().err
+
+
+def test_agents_cli_lists_messages_without_marking_delivered(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db"
+    state = SharedState(db_dir / "agents.db")
+    state.register_agent("agent-a", role="coder")
+    state.send_to_agent("lead", "agent-a", "steer", "continue")
+    state.close()
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+
+    assert main(["agents", "messages", "--recipient", "agent-a", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["messages"][0]["message_type"] == "steer"
+    followup_state = SharedState(db_dir / "agents.db")
+    try:
+        assert len(followup_state.fetch_messages("agent-a", undelivered_only=True)) == 1
+    finally:
+        followup_state.close()
+
+
+def test_agents_cli_messages_all_includes_delivered_and_rejects_invalid_limit(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db"
+    state = SharedState(db_dir / "agents.db")
+    state.register_agent("agent-a", role="coder")
+    delivered_id = state.send_to_agent("lead", "agent-a", "steer", "delivered")
+    state.send_to_agent("lead", "agent-a", "steer", "pending")
+    state.mark_delivered([delivered_id])
+    state.close()
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+
+    assert main(["agents", "messages", "--recipient", "agent-a", "--json"]) == 0
+    pending_payload = json.loads(capsys.readouterr().out)
+    assert len(pending_payload["messages"]) == 1
+    assert pending_payload["messages"][0]["content"] == {"content": "pending"}
+
+    assert (
+        main(["agents", "messages", "--recipient", "agent-a", "--all", "--json"])
+        == 0
+    )
+    all_payload = json.loads(capsys.readouterr().out)
+    assert len(all_payload["messages"]) == 2
+
+    assert main(["agents", "messages", "--limit", "0"]) == 2
     assert "limit must be positive" in capsys.readouterr().err

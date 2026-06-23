@@ -1072,6 +1072,11 @@ def main(argv: list[str] | None = None) -> int:
     agents_reports = agents_subparsers.add_parser("reports")
     agents_reports.add_argument("--limit", type=int, default=20)
     agents_reports.add_argument("--json", action="store_true")
+    agents_messages = agents_subparsers.add_parser("messages")
+    agents_messages.add_argument("--recipient", default="lead")
+    agents_messages.add_argument("--all", action="store_true", dest="all_messages")
+    agents_messages.add_argument("--limit", type=int, default=50)
+    agents_messages.add_argument("--json", action="store_true")
     serve_parser = subparsers.add_parser(
         "serve", help="Run the authenticated local Ash HTTP API"
     )
@@ -1413,8 +1418,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "agents":
         from cli.agents import (
+            list_agent_messages,
             list_agent_reports,
             list_agent_statuses,
+            render_agent_messages,
             render_agent_reports,
             render_agent_statuses,
         )
@@ -1429,10 +1436,22 @@ def main(argv: list[str] | None = None) -> int:
                         json_output=args.json,
                     )
                 )
-            else:
+            elif args.agents_action == "reports":
                 print(
                     render_agent_reports(
                         list_agent_reports(database, limit=args.limit),
+                        json_output=args.json,
+                    )
+                )
+            else:
+                print(
+                    render_agent_messages(
+                        list_agent_messages(
+                            database,
+                            recipient_id=args.recipient,
+                            undelivered_only=not args.all_messages,
+                            limit=args.limit,
+                        ),
                         json_output=args.json,
                     )
                 )

@@ -47,6 +47,37 @@ def list_agent_reports(db_path: str | Path, *, limit: int = 20) -> list[dict[str
         state.close()
 
 
+def list_agent_messages(
+    db_path: str | Path,
+    *,
+    recipient_id: str = "lead",
+    undelivered_only: bool = True,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    state = SharedState(db_path)
+    try:
+        return [
+            {
+                "message_id": message.message_id,
+                "sender_id": message.sender_id,
+                "recipient_id": message.recipient_id,
+                "message_type": message.message_type,
+                "content": message.content,
+                "delivered": message.delivered,
+                "timestamp": message.timestamp.isoformat(),
+            }
+            for message in state.fetch_messages(
+                recipient_id,
+                undelivered_only=undelivered_only,
+                limit=limit,
+            )
+        ]
+    finally:
+        state.close()
+
+
 def render_agent_statuses(
     statuses: list[dict[str, Any]],
     *,
@@ -79,3 +110,29 @@ def render_agent_reports(
         f"{item.get('summary', '')}"
         for item in reports
     )
+
+
+def render_agent_messages(
+    messages: list[dict[str, Any]],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"messages": messages}, sort_keys=True)
+    if not messages:
+        return "No subagent messages recorded."
+    return "\n".join(
+        f"{item['message_id']} {item['sender_id']} -> {item['recipient_id']} "
+        f"{item['message_type']} "
+        f"{'delivered' if item['delivered'] else 'pending'}: "
+        f"{_summarize_content(item['content'])}"
+        for item in messages
+    )
+
+
+def _summarize_content(content: Any) -> str:
+    if isinstance(content, dict):
+        summary = content.get("summary") or content.get("content")
+        if summary is not None:
+            return str(summary)
+    return json.dumps(content, ensure_ascii=False, sort_keys=True)
