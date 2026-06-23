@@ -42,7 +42,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Custom endpoints | Verified locally | Per-provider credentials are stored in mode-0600 env storage, not TOML |
 | Config precedence | Partial | `ash config explain` shows env/dotenv/TOML/default sources; project config and full CLI override reporting remain |
 | Config migration | Partial | Legacy file migration and config schema future-version refusal exist; config backups remain |
-| `ash doctor` | Verified locally | Human/JSON diagnostics; optional endpoint connectivity probe |
+| `ash doctor` | Verified locally | Human/JSON diagnostics, extension config validation, optional endpoint connectivity probe |
 | Update/version check | Verified locally | Explicit GitHub release check with no background telemetry or self-modification |
 | Uninstall/reset | Verified locally | Confirmed selective reset for config, sessions, cache, or all local state |
 
