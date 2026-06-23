@@ -993,6 +993,21 @@ def main(argv: list[str] | None = None) -> int:
     storage_restore = storage_subparsers.add_parser("restore")
     storage_restore.add_argument("backup", type=Path)
     storage_restore.add_argument("--yes", action="store_true")
+    audit_parser = subparsers.add_parser(
+        "audit", help="Inspect or export tamper-evident session audit logs"
+    )
+    audit_subparsers = audit_parser.add_subparsers(
+        dest="audit_action", required=True
+    )
+    audit_list = audit_subparsers.add_parser("list")
+    audit_list.add_argument("--session", required=True, dest="audit_session")
+    audit_list.add_argument("--json", action="store_true")
+    audit_verify = audit_subparsers.add_parser("verify")
+    audit_verify.add_argument("--session", required=True, dest="audit_session")
+    audit_verify.add_argument("--json", action="store_true")
+    audit_export = audit_subparsers.add_parser("export")
+    audit_export.add_argument("--session", required=True, dest="audit_session")
+    audit_export.add_argument("--output", required=True, type=Path)
     serve_parser = subparsers.add_parser(
         "serve", help="Run the authenticated local Ash HTTP API"
     )
@@ -1207,6 +1222,49 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Restored: {restored}")
         for path in preserved:
             print(f"Preserved previous data: {path}")
+        return 0
+
+    if args.command == "audit":
+        from cli.audit import (
+            export_audit_log,
+            render_audit_records,
+            render_audit_verification,
+        )
+
+        audit_config = AshConfig.load(
+            **({"db_directory": args.db_directory} if args.db_directory else {})
+        )
+        store = SessionStore(audit_config.db_directory / "sessions.db")
+        try:
+            store.load_session(args.audit_session)
+        except KeyError:
+            print(f"Error: session not found: {args.audit_session}", file=sys.stderr)
+            return 1
+        if args.audit_action == "list":
+            print(
+                render_audit_records(
+                    args.audit_session,
+                    store.list_audit_logs(args.audit_session),
+                    json_output=args.json,
+                )
+            )
+            return 0
+        if args.audit_action == "verify":
+            errors = store.verify_audit_log(args.audit_session)
+            print(
+                render_audit_verification(
+                    args.audit_session,
+                    errors,
+                    json_output=args.json,
+                )
+            )
+            return 0 if not errors else 1
+        try:
+            exported = export_audit_log(store, args.audit_session, args.output)
+        except OSError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Audit log exported: {exported}")
         return 0
 
     if args.command == "serve":
