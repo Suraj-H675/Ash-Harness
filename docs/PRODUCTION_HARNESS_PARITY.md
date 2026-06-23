@@ -157,7 +157,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Git status/diff/log | Verified locally | Read-only bounded Git inspection tools |
 | Git commit | Partial | Explicit staging scope, no unrelated changes, hooks/errors surfaced |
 | Tests/build/lint diagnostics | Partial | Parse diagnostics and feed concise structured failures |
-| Web fetch/search | Missing | Optional, domain/network policy controlled, citations |
+| Web fetch/search | Partial | Guarded HTTP(S) `web_fetch` exists; search, citation workflow, and domain policy remain |
 | Ask-user tool | Verified locally | Typed blocking question with bounded options and explicit empty-answer failure |
 | Todo/plan tracking | Partial/unwired | Runtime-visible and persisted progress updates |
 

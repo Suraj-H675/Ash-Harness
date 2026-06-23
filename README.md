@@ -58,6 +58,9 @@ out-of-workspace paths are rejected.
 Project-controlled extensions are disabled until the workspace is trusted.
 API keys are stored in `~/.ash/.env` with restricted permissions. Custom
 provider metadata is stored separately in `~/.ash/ash.toml`.
+Network fetches use the `web_fetch` tool and require normal tool approval;
+private, loopback, reserved, non-HTTP, oversized, and unsupported-content URLs
+are refused before request content reaches the model.
 
 ## Configuration
 
