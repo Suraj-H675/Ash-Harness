@@ -157,7 +157,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Git status/diff/log | Verified locally | Read-only bounded Git inspection tools |
 | Git commit | Partial | Explicit staging scope, no unrelated changes, hooks/errors surfaced |
 | Tests/build/lint diagnostics | Partial | Parse diagnostics and feed concise structured failures |
-| Web fetch/search | Partial | Guarded HTTP(S) `web_fetch` exists; search, citation workflow, and domain policy remain |
+| Web fetch/search | Partial | Guarded HTTP(S) `web_fetch` includes optional domain allowlist; search and citation workflow remain |
 | Ask-user tool | Verified locally | Typed blocking question with bounded options and explicit empty-answer failure |
 | Todo/plan tracking | Partial/unwired | Runtime-visible and persisted progress updates |
 
@@ -174,7 +174,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Full auto mode | Partial | Explicit dangerous-mode warning and sandbox requirement |
 | Dry-run mode | Verified after fix | No side effects, including hooks and subagents |
 | OS sandbox | Partial/unwired | Linux bwrap, macOS sandbox/container, Windows restricted execution |
-| Network isolation | Partial | Per-command/domain approval and sandbox enforcement |
+| Network isolation | Partial | `web_fetch` supports public-host validation plus domain allowlist; per-command sandbox network enforcement remains |
 | Environment scrubbing | Partial | Secret allowlist, redacted logs, child-process policy |
 | Prompt-injection isolation | Partial | Untrusted content provenance and tool-policy enforcement |
 | Secret scanning/redaction | Partial | Runtime logs, persisted messages/tool calls, tool output, and exports are redacted; pre-commit scanning remains |
