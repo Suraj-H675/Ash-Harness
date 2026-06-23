@@ -328,7 +328,12 @@ class SubagentOrchestrator:
 
         return {
             "researcher": ("read_file", "search_code"),
-            "coder": ("read_file", "write_file", "replace_file_content"),
+            "coder": (
+                "read_file",
+                "write_file",
+                "replace_file_content",
+                "replace_file_edits",
+            ),
             "tester": ("read_file", "run_command", "search_code"),
             "reviewer": ("read_file", "search_code"),
             "general": ("spawn_agent",),

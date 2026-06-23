@@ -17,6 +17,7 @@ def test_plan_mode_allows_reads() -> None:
 def test_auto_edit_allows_edits_but_asks_for_commands() -> None:
     policy = PermissionPolicy("auto_edit")
     assert policy.evaluate("replace_file_content", {}).action == PolicyAction.ALLOW
+    assert policy.evaluate("replace_file_edits", {}).action == PolicyAction.ALLOW
     assert policy.evaluate("run_command", {}).action == PolicyAction.ASK
 
 

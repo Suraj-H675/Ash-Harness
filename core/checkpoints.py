@@ -14,7 +14,13 @@ from tools.base import BaseTool, ToolMiddleware, ToolResult
 from tools.patch import extract_patch_paths
 
 
-EDIT_TOOLS = {"write_file", "whole_edit", "replace_file_content", "apply_patch"}
+EDIT_TOOLS = {
+    "write_file",
+    "whole_edit",
+    "replace_file_content",
+    "replace_file_edits",
+    "apply_patch",
+}
 MAX_CHECKPOINT_BYTES = 20 * 1024 * 1024
 
 

@@ -36,7 +36,13 @@ READ_ONLY_TOOLS = frozenset(
     }
 )
 EDIT_TOOLS = frozenset(
-    {"write_file", "replace_file_content", "whole_edit", "apply_patch"}
+    {
+        "write_file",
+        "replace_file_content",
+        "replace_file_edits",
+        "whole_edit",
+        "apply_patch",
+    }
 )
 
 

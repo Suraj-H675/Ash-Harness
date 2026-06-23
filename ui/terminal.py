@@ -339,6 +339,31 @@ class TerminalUI:
                         lineterm="",
                     )
                 )
+        if tool_name == "replace_file_edits":
+            edits = arguments.get("edits")
+            if isinstance(edits, list):
+                previews: list[str] = []
+                for index, edit in enumerate(edits[:20], start=1):
+                    if not isinstance(edit, dict):
+                        continue
+                    before = edit.get("target_content")
+                    after = edit.get("replacement_content")
+                    if not isinstance(before, str) or not isinstance(after, str):
+                        continue
+                    diff = "\n".join(
+                        difflib.unified_diff(
+                            before.splitlines(),
+                            after.splitlines(),
+                            fromfile=f"edit-{index}-target",
+                            tofile=f"edit-{index}-replacement",
+                            lineterm="",
+                        )
+                    )
+                    if diff:
+                        previews.append(diff)
+                if len(edits) > 20:
+                    previews.append("[diff preview truncated]")
+                return "\n\n".join(previews)
         if self.workspace_root is None or tool_name not in {
             "write_file",
             "whole_edit",

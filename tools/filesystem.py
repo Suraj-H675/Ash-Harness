@@ -76,6 +76,47 @@ class ReplaceFileContentArgs(BaseModel):
     )
 
 
+class ReplacementEdit(BaseModel):
+    start_line: int = Field(
+        ...,
+        ge=1,
+        description="Start of block range containing target content (1-indexed, inclusive).",
+    )
+    end_line: int = Field(
+        ...,
+        ge=1,
+        description="End of block range containing target content (1-indexed, inclusive).",
+    )
+    target_content: str = Field(
+        ...,
+        description="Exact string to replace within this line range.",
+    )
+    replacement_content: str = Field(
+        ...,
+        description="Replacement content for this line range.",
+    )
+
+
+class ReplaceFileEditsArgs(BaseModel):
+    file_path: str = Field(..., description="Path of target file to edit.")
+    edits: list[ReplacementEdit] = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description=(
+            "Ordered exact replacements. Ranges must be non-overlapping and are "
+            "all validated before any write occurs."
+        ),
+    )
+    expected_sha256: str | None = Field(
+        None,
+        description=(
+            "Optional lowercase SHA-256 digest from the last read_file result. "
+            "If supplied, all edits are refused when the file changed since that read."
+        ),
+    )
+
+
 class WholeEditArgs(BaseModel):
     file_path: str = Field(..., description="Absolute or relative path to the file.")
     content: str = Field(..., description="Complete new file content.")
@@ -198,20 +239,9 @@ class ReplaceFileContentTool(BaseTool):
 
         original_text = resolved_path.read_text(encoding="utf-8")
         actual_sha256 = _sha256_text(original_text)
-        if (
-            args.expected_sha256 is not None
-            and args.expected_sha256.casefold() != actual_sha256
-        ):
-            return ToolResult(
-                success=False,
-                output="",
-                error=(
-                    "Error: File changed since it was read. "
-                    f"expected_sha256={args.expected_sha256}; "
-                    f"actual_sha256={actual_sha256}. "
-                    "Read the file again before editing."
-                ),
-            )
+        stale_error = _validate_expected_sha256(args.expected_sha256, actual_sha256)
+        if stale_error is not None:
+            return ToolResult(success=False, output="", error=stale_error)
         normalized_text = _normalize_line_endings(original_text)
         lines = normalized_text.splitlines(keepends=True)
 
@@ -249,6 +279,77 @@ class ReplaceFileContentTool(BaseTool):
             output=(
                 f"Replaced lines {args.start_line}-{args.end_line} in {resolved_path}."
             ),
+        )
+
+
+class ReplaceFileEditsTool(BaseTool):
+    name = "replace_file_edits"
+    description = (
+        "Apply multiple exact replacements to one workspace file atomically after "
+        "validating every bounded line range."
+    )
+    args_schema = ReplaceFileEditsArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = ReplaceFileEditsArgs(**kwargs)
+        resolved_path = self.safety_guard.validate_path(args.file_path)
+        if not resolved_path.exists():
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Error: File not found: {args.file_path}",
+            )
+        if not resolved_path.is_file():
+            return ToolResult(
+                success=False, output="", error=f"Error: Not a file: {args.file_path}"
+            )
+        if _is_binary_file(resolved_path):
+            return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
+
+        original_text = resolved_path.read_text(encoding="utf-8")
+        actual_sha256 = _sha256_text(original_text)
+        stale_error = _validate_expected_sha256(args.expected_sha256, actual_sha256)
+        if stale_error is not None:
+            return ToolResult(success=False, output="", error=stale_error)
+
+        normalized_text = _normalize_line_endings(original_text)
+        lines = normalized_text.splitlines(keepends=True)
+        validation_error = _validate_non_overlapping_edits(args.edits, len(lines))
+        if validation_error is not None:
+            return ToolResult(success=False, output="", error=validation_error)
+
+        for index, edit in enumerate(args.edits, start=1):
+            segment = "".join(lines[edit.start_line - 1 : edit.end_line])
+            normalized_segment = _strip_trailing_newlines(
+                _normalize_line_endings(segment)
+            )
+            normalized_target = _strip_trailing_newlines(
+                _normalize_line_endings(edit.target_content)
+            )
+            if normalized_segment != normalized_target:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(
+                        f"Error: edit {index} target_content does not match "
+                        "the specified line range.\n"
+                        f"{_build_mismatch_error(normalized_target, normalized_segment)}"
+                    ),
+                )
+
+        new_lines = list(lines)
+        for edit in sorted(args.edits, key=lambda item: item.start_line, reverse=True):
+            segment = "".join(lines[edit.start_line - 1 : edit.end_line])
+            replacement = _normalize_line_endings(edit.replacement_content)
+            if segment.endswith("\n") and replacement and not replacement.endswith("\n"):
+                replacement = f"{replacement}\n"
+            new_lines[edit.start_line - 1 : edit.end_line] = replacement.splitlines(
+                keepends=True
+            )
+        _atomic_write_text(resolved_path, "".join(new_lines))
+        return ToolResult(
+            success=True,
+            output=f"Applied {len(args.edits)} edits to {resolved_path}.",
         )
 
 
@@ -292,6 +393,10 @@ async def replace_file_content(safety_guard: SafetyGuard, **kwargs: Any) -> Tool
     return await ReplaceFileContentTool(safety_guard).run(**kwargs)
 
 
+async def replace_file_edits(safety_guard: SafetyGuard, **kwargs: Any) -> ToolResult:
+    return await ReplaceFileEditsTool(safety_guard).run(**kwargs)
+
+
 def _is_binary_file(path: Path) -> bool:
     with path.open("rb") as file:
         return b"\x00" in file.read(BINARY_DETECTION_BYTES)
@@ -333,6 +438,32 @@ def _format_read_metadata(path: Path, lines: list[str], content: str) -> str:
 
 def _sha256_text(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _validate_expected_sha256(expected: str | None, actual: str) -> str | None:
+    if expected is None or expected.casefold() == actual:
+        return None
+    return (
+        "Error: File changed since it was read. "
+        f"expected_sha256={expected}; actual_sha256={actual}. "
+        "Read the file again before editing."
+    )
+
+
+def _validate_non_overlapping_edits(
+    edits: list[ReplacementEdit],
+    line_count: int,
+) -> str | None:
+    previous_end = 0
+    for index, edit in enumerate(sorted(edits, key=lambda item: item.start_line), 1):
+        if edit.end_line < edit.start_line:
+            return f"Error: edit {index} end_line must be >= start_line."
+        if edit.start_line <= previous_end:
+            return f"Error: edit {index} overlaps an earlier edit."
+        if edit.start_line - 1 >= line_count or edit.end_line > line_count:
+            return f"Error: edit {index} line range is outside file bounds."
+        previous_end = edit.end_line
+    return None
 
 
 def _build_mismatch_error(expected: str, actual: str) -> str:

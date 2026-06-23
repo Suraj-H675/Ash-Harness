@@ -12,6 +12,7 @@ from tools.filesystem import (
     EXISTS_ERROR,
     ReadFileTool,
     ReplaceFileContentTool,
+    ReplaceFileEditsTool,
     WholeEditTool,
     WriteFileTool,
 )
@@ -241,6 +242,99 @@ async def test_replace_file_content_rejects_stale_expected_sha256(
 
 
 @pytest.mark.asyncio
+async def test_replace_file_edits_applies_multiple_ranges_atomically(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+
+    result = await ReplaceFileEditsTool(guard).run(
+        file_path="doc.txt",
+        edits=[
+            {
+                "start_line": 1,
+                "end_line": 1,
+                "target_content": "one",
+                "replacement_content": "ONE",
+            },
+            {
+                "start_line": 3,
+                "end_line": 4,
+                "target_content": "three\nfour",
+                "replacement_content": "THREE\nFOUR",
+            },
+        ],
+    )
+
+    assert result.success is True
+    assert target.read_text(encoding="utf-8") == "ONE\ntwo\nTHREE\nFOUR\n"
+
+
+@pytest.mark.asyncio
+async def test_replace_file_edits_rejects_mismatch_without_partial_write(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "doc.txt"
+    original = "one\ntwo\nthree\n"
+    target.write_text(original, encoding="utf-8")
+
+    result = await ReplaceFileEditsTool(guard).run(
+        file_path="doc.txt",
+        edits=[
+            {
+                "start_line": 1,
+                "end_line": 1,
+                "target_content": "one",
+                "replacement_content": "ONE",
+            },
+            {
+                "start_line": 3,
+                "end_line": 3,
+                "target_content": "wrong",
+                "replacement_content": "THREE",
+            },
+        ],
+    )
+
+    assert result.success is False
+    assert "edit 2 target_content does not match" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_replace_file_edits_rejects_overlapping_ranges(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+    result = await ReplaceFileEditsTool(guard).run(
+        file_path="doc.txt",
+        edits=[
+            {
+                "start_line": 1,
+                "end_line": 2,
+                "target_content": "one\ntwo",
+                "replacement_content": "ONE\nTWO",
+            },
+            {
+                "start_line": 2,
+                "end_line": 3,
+                "target_content": "two\nthree",
+                "replacement_content": "TWO\nTHREE",
+            },
+        ],
+    )
+
+    assert result.success is False
+    assert "overlaps an earlier edit" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == "one\ntwo\nthree\n"
+
+
+@pytest.mark.asyncio
 async def test_replace_file_content_does_not_search_outside_requested_bounds(
     project_root: Path,
     guard: SafetyGuard,
@@ -373,6 +467,8 @@ def test_auto_commit_tool_is_in_default_tools():
     tools = _build_tools(guard)
     assert "auto_commit" in tools, "auto_commit must be in default tools dict"
     assert tools["auto_commit"].name == "auto_commit"
+    assert "replace_file_edits" in tools
+    assert tools["replace_file_edits"].name == "replace_file_edits"
 
 
 @pytest.mark.asyncio

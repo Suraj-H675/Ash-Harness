@@ -28,6 +28,7 @@ from tools.base import BaseTool
 from tools.filesystem import (
     ReadFileTool,
     ReplaceFileContentTool,
+    ReplaceFileEditsTool,
     WholeEditTool,
     WriteFileTool,
 )
@@ -215,6 +216,7 @@ def _build_tools(
         ReadFileTool(safety_guard),
         WriteFileTool(safety_guard),
         ReplaceFileContentTool(safety_guard),
+        ReplaceFileEditsTool(safety_guard),
         WholeEditTool(safety_guard),
         RunCommandTool(
             safety_guard,
