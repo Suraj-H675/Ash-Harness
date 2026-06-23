@@ -122,7 +122,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | Central slash-command registry | Verified locally | Metadata, aliases, parsing, completion, and stable help |
-| `/help` | Partial | Complete command reference; searchable overlay remains |
+| `/help` | Partial | Filterable command reference with aliases is wired; full-screen searchable overlay remains |
 | `/status` | Verified locally | Runtime model/mode/workspace/session diagnostics |
 | `/model` and `/models` | Partial | Dynamic catalogs, custom/local models, capability display |
 | `/new`, `/resume`, `/sessions` | Verified locally | Durable session lifecycle and missing-ID errors |
