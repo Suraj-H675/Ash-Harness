@@ -1,3 +1,4 @@
+import hashlib
 import shlex
 import sys
 from pathlib import Path
@@ -43,7 +44,11 @@ async def test_read_file_returns_numbered_line_slice(
     )
 
     assert result.success is True
-    assert result.output == "2: two\n3: three"
+    digest = hashlib.sha256("one\ntwo\nthree\n".encode("utf-8")).hexdigest()
+    assert result.output == (
+        f"[read_file metadata: path={target}; sha256={digest}; total_file_lines=3]\n"
+        "2: two\n3: three"
+    )
     assert result.error is None
     assert result.truncated is False
 
@@ -77,6 +82,7 @@ async def test_read_file_truncation_reports_follow_up_range(
 
     assert result.success is True
     assert result.truncated is True
+    assert "[read_file metadata:" in result.output
     assert "800: line 800" in result.output
     assert "801: line 801" not in result.output
     assert (
@@ -105,6 +111,7 @@ async def test_read_file_truncation_metadata_respects_start_line(
 
     assert result.success is True
     assert result.truncated is True
+    assert "[read_file metadata:" in result.output
     assert "900: line 900" in result.output
     assert "901: line 901" not in result.output
     assert (
@@ -185,6 +192,52 @@ async def test_replace_file_content_confined_to_line_bounds_and_normalizes_crlf(
     assert result.success is True
     assert target.read_text(encoding="utf-8") == "one\nTWO\nthree\n"
     assert list(target.parent.glob(".doc.txt.*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_accepts_matching_expected_sha256(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "doc.txt"
+    original = "one\ntwo\nthree\n"
+    target.write_text(original, encoding="utf-8")
+    expected_sha256 = hashlib.sha256(original.encode("utf-8")).hexdigest()
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        start_line=2,
+        end_line=2,
+        target_content="two",
+        replacement_content="TWO",
+        expected_sha256=expected_sha256,
+    )
+
+    assert result.success is True
+    assert target.read_text(encoding="utf-8") == "one\nTWO\nthree\n"
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_rejects_stale_expected_sha256(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        start_line=2,
+        end_line=2,
+        target_content="two",
+        replacement_content="TWO",
+        expected_sha256="0" * 64,
+    )
+
+    assert result.success is False
+    assert "File changed since it was read" in (result.error or "")
+    assert "actual_sha256=" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == "one\ntwo\nthree\n"
 
 
 @pytest.mark.asyncio

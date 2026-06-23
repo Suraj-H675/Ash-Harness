@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import os
 import tempfile
 from pathlib import Path
@@ -66,6 +67,13 @@ class ReplaceFileContentArgs(BaseModel):
         ...,
         description="The content to replace the target_content with.",
     )
+    expected_sha256: str | None = Field(
+        None,
+        description=(
+            "Optional lowercase SHA-256 digest from the last read_file result. "
+            "If supplied, the edit is refused when the file changed since that read."
+        ),
+    )
 
 
 class WholeEditArgs(BaseModel):
@@ -96,7 +104,8 @@ class ReadFileTool(BaseTool):
         if _is_binary_file(resolved_path):
             return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
 
-        lines = resolved_path.read_text(encoding="utf-8").splitlines()
+        original_text = resolved_path.read_text(encoding="utf-8")
+        lines = original_text.splitlines()
         if args.end_line is not None and args.end_line < args.start_line:
             return ToolResult(
                 success=False, output="", error="Error: end_line must be >= start_line."
@@ -112,10 +121,12 @@ class ReadFileTool(BaseTool):
             selected = selected[:DEFAULT_MAX_READ_LINES]
             truncated = True
 
-        output = "\n".join(
+        metadata = _format_read_metadata(resolved_path, lines, original_text)
+        numbered_lines = "\n".join(
             f"{line_number}: {line}"
             for line_number, line in enumerate(selected, start=args.start_line)
         )
+        output = metadata if not numbered_lines else f"{metadata}\n{numbered_lines}"
         if truncated:
             output = (
                 f"{output}\n"
@@ -186,6 +197,21 @@ class ReplaceFileContentTool(BaseTool):
             return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
 
         original_text = resolved_path.read_text(encoding="utf-8")
+        actual_sha256 = _sha256_text(original_text)
+        if (
+            args.expected_sha256 is not None
+            and args.expected_sha256.casefold() != actual_sha256
+        ):
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "Error: File changed since it was read. "
+                    f"expected_sha256={args.expected_sha256}; "
+                    f"actual_sha256={actual_sha256}. "
+                    "Read the file again before editing."
+                ),
+            )
         normalized_text = _normalize_line_endings(original_text)
         lines = normalized_text.splitlines(keepends=True)
 
@@ -295,6 +321,18 @@ def _format_read_truncation_metadata(
         f"omitted_lines={omitted_lines}; "
         f"next_start_line={returned_end + 1}]"
     )
+
+
+def _format_read_metadata(path: Path, lines: list[str], content: str) -> str:
+    return (
+        "[read_file metadata: "
+        f"path={path}; sha256={_sha256_text(content)}; "
+        f"total_file_lines={len(lines)}]"
+    )
+
+
+def _sha256_text(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _build_mismatch_error(expected: str, actual: str) -> str:
