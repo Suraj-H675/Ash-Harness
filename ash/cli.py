@@ -904,6 +904,7 @@ def main(argv: list[str] | None = None) -> int:
         version = importlib.metadata.version("ash")
     except importlib.metadata.PackageNotFoundError:
         version = "0.1.0"
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser.add_argument("--version", action="version", version=f"ash {version}")
     subparsers = parser.add_subparsers(dest="command")
     setup_parser = subparsers.add_parser(
@@ -1021,15 +1022,32 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Require one-shot output to validate against a JSON Schema file.",
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Run without interactive prompts or ANSI; defaults one-shot output to stream-json.",
+    )
     args = parser.parse_args(argv)
     if args.json_schema is not None and args.prompt is None:
         parser.error("--json-schema requires --prompt")
     if args.prompt == "-":
         args.prompt = sys.stdin.read()
     elif args.prompt is None and not sys.stdin.isatty() and args.command is None:
-        piped_prompt = sys.stdin.read()
+        try:
+            piped_prompt = sys.stdin.read()
+        except OSError:
+            piped_prompt = ""
         if piped_prompt.strip():
             args.prompt = piped_prompt
+    if args.ci:
+        if args.command is None and args.prompt is None:
+            print(
+                "Error: --ci requires --prompt, piped stdin, or a subcommand.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.prompt is not None and "--output-format" not in raw_argv:
+            args.output_format = "stream-json"
 
     if args.command == "setup":
         from cli.setup import cmd_setup
@@ -1209,6 +1227,8 @@ def main(argv: list[str] | None = None) -> int:
     config = AshConfig.load()
     if args.mode is not None:
         config = config.model_copy(update={"safety_tier": args.mode})
+    if args.ci:
+        config = config.model_copy(update={"no_color": True, "reduced_motion": True})
 
     # First-run detection: prompt to run setup if no provider configured
     from cli.setup import _has_provider_configured
@@ -1245,6 +1265,7 @@ def main(argv: list[str] | None = None) -> int:
     if (
         not workspace_trusted
         and args.prompt is None
+        and not args.ci
         and sys.stdin.isatty()
         and sys.stdout.isatty()
     ):
