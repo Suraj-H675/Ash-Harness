@@ -136,7 +136,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/sandbox` | Verified locally | Active backend, tier, capabilities, and network policy |
 | `/mcp` | Partial | Top-level add/remove/list/status config supports JSON and env/header metadata; REPL status/tools/resources/prompts use live clients; auth and richer lifecycle remain |
 | `/skills`, `/plugins`, `/hooks` | Partial | Skills/plugins/hooks are inspectable with trust-gated top-level extension inventory and `/hooks`; enable/disable/reload lifecycle remains |
-| `/agents` | Partial | Slash status/stop for live agents plus top-level persisted status/report inspection; steering/resume remain |
+| `/agents` | Partial | Slash status/stop for live agents plus top-level persisted status/report/message inspection; steering/resume remain |
 | `/doctor` | Verified locally | Runs the local health report in-session |
 | Shell escape (`!`) | Verified locally | Commands use the normal policy, sandbox, persistence, and audit path |
 | File mention/completion (`@`) | Partial | Workspace file/directory completion and bounded text expansion; fuzzy symbols/images/MCP remain |
@@ -203,7 +203,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Spawn subagent tool | Partial | Real bounded provider-backed worker with persisted report; worker tools remain restricted |
 | Parallel agents | Partial test harness only | Bounded scheduling, cancellation, token/cost limits |
 | Agent status/output | Partial | Live slash status plus top-level persisted status/report inspection; full TUI view remains |
-| Agent messaging | Partial/unwired | Typed IPC, backpressure, delivery/ack semantics |
+| Agent messaging | Partial | Typed SQLite IPC is persisted and inspectable from the top-level CLI; backpressure, delivery acknowledgements, and steering UX remain |
 | Role tool policies | Partial | Enforced by central policy engine |
 | Worktree isolation | Missing in production | Create/merge/cleanup Git worktrees safely |
 | Result consolidation | Partial test harness only | Evidence-linked summaries and conflict handling |
