@@ -135,7 +135,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/permissions` | Partial | Inspect/change active mode and persistent tool grants; persisted argument grants remain |
 | `/sandbox` | Verified locally | Active backend, tier, capabilities, and network policy |
 | `/mcp` | Partial | Top-level add/remove/list/status config supports JSON and env/header metadata; REPL status/tools/resources/prompts use live clients; auth and richer lifecycle remain |
-| `/skills`, `/plugins`, `/hooks` | Partial/unwired | Discover, inspect, enable, disable, trust, reload |
+| `/skills`, `/plugins`, `/hooks` | Partial | Skills/plugins/hooks are inspectable with trust-gated top-level extension inventory and `/hooks`; enable/disable/reload lifecycle remains |
 | `/agents` | Placeholder | Spawn real workers, inspect status/output, steer, stop, resume |
 | `/doctor` | Verified locally | Runs the local health report in-session |
 | Shell escape (`!`) | Verified locally | Commands use the normal policy, sandbox, persistence, and audit path |
