@@ -64,10 +64,15 @@ class PermissionPolicy:
         arguments: dict[str, Any],
     ) -> PolicyDecision:
         if self.mode == PermissionMode.DRY_RUN:
-            return PolicyDecision(PolicyAction.DENY, "dry-run mode forbids side effects")
+            return PolicyDecision(
+                PolicyAction.DENY, "dry-run mode forbids side effects"
+            )
         if tool_name in READ_ONLY_TOOLS:
             return PolicyDecision(PolicyAction.ALLOW, "read-only tool")
-        if tool_name == "background_process" and arguments.get("action") in {"list", "poll"}:
+        if tool_name == "background_process" and arguments.get("action") in {
+            "list",
+            "poll",
+        }:
             return PolicyDecision(PolicyAction.ALLOW, "read-only process observation")
         if self.mode == PermissionMode.PLAN:
             return PolicyDecision(PolicyAction.DENY, "plan mode is read-only")

@@ -195,6 +195,7 @@ def _build_tools(
     from tools.patch import ApplyPatchTool
     from tools.process import BackgroundProcessTool
     from tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
+    from tools.web import WebFetchTool
 
     root = project_root if project_root is not None else safety_guard.project_root
     skill_roots = [Path.home() / ".ash" / "skills"]
@@ -228,6 +229,7 @@ def _build_tools(
         ListDirectoryTool(safety_guard),
         GlobFilesTool(safety_guard),
         SearchTextTool(safety_guard),
+        WebFetchTool(safety_guard),
         ListSkillsTool(safety_guard, catalog),
         ActivateSkillTool(safety_guard, catalog),
     ]
