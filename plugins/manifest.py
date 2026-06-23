@@ -12,10 +12,14 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, parse
 
 
+CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION = 1
+
+
 @dataclass
 class PluginManifest:
     name: str
     version: str
+    schema_version: int = CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION
     description: str = ""
     commands: list[dict[str, Any]] = field(default_factory=list)
     agents: list[dict[str, Any]] = field(default_factory=list)
@@ -27,9 +31,22 @@ class PluginManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PluginManifest:
+        raw_schema_version = data.get(
+            "schemaVersion",
+            data.get("schema_version", CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION),
+        )
+        if not isinstance(raw_schema_version, int):
+            raise ValueError("plugin schemaVersion must be an integer")
+        if raw_schema_version > CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION:
+            raise ValueError(
+                "plugin manifest schemaVersion "
+                f"{raw_schema_version} is newer than supported "
+                f"{CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION}; upgrade Ash"
+            )
         return cls(
             name=data["name"],
             version=data.get("version", "0.0.0"),
+            schema_version=raw_schema_version,
             description=data.get("description", ""),
             commands=data.get("commands", []),
             agents=data.get("agents", []),
