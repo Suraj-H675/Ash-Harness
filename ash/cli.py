@@ -1053,13 +1053,24 @@ def main(argv: list[str] | None = None) -> int:
         default="info",
     )
     mcp_subparser = subparsers.add_parser("mcp")
-    mcp_subparser.add_argument("action", choices=["add", "list", "remove"])
-    mcp_subparser.add_argument("server_name", nargs="?")
-    mcp_subparser.add_argument(
+    mcp_action_subparsers = mcp_subparser.add_subparsers(
+        dest="action", required=True
+    )
+    mcp_list = mcp_action_subparsers.add_parser("list")
+    mcp_list.add_argument("--json", action="store_true")
+    mcp_status = mcp_action_subparsers.add_parser("status")
+    mcp_status.add_argument("--json", action="store_true")
+    mcp_add = mcp_action_subparsers.add_parser("add")
+    mcp_add.add_argument("server_name")
+    mcp_add.add_argument(
         "--transport", choices=["stdio", "http", "sse"], default="stdio"
     )
-    mcp_subparser.add_argument("--url", default="")
-    mcp_subparser.add_argument("server_command", nargs=argparse.REMAINDER)
+    mcp_add.add_argument("--url", default="")
+    mcp_add.add_argument("--env", action="append", default=[])
+    mcp_add.add_argument("--header", action="append", default=[])
+    mcp_add.add_argument("--json", action="store_true")
+    mcp_remove = mcp_action_subparsers.add_parser("remove")
+    mcp_remove.add_argument("server_name")
     parser.add_argument(
         "--db-directory",
         type=Path,
@@ -1100,7 +1111,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run without interactive prompts or ANSI; defaults one-shot output to stream-json.",
     )
-    args = parser.parse_args(argv)
+    args, unknown_args = parser.parse_known_args(argv)
+    if unknown_args:
+        if args.command == "mcp" and getattr(args, "action", None) == "add":
+            args.server_command = unknown_args
+        else:
+            parser.error(f"unrecognized arguments: {' '.join(unknown_args)}")
+    elif args.command == "mcp" and getattr(args, "action", None) == "add":
+        args.server_command = []
     if args.json_schema is not None and args.prompt is None:
         parser.error("--json-schema requires --prompt")
     if args.prompt == "-":
@@ -1370,20 +1388,16 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     if args.command == "mcp":
+        from cli.mcp import (
+            parse_key_value_options,
+            render_mcp_servers,
+        )
         from mcp.server import MCPServerConfig, load_mcp_servers, save_mcp_servers
 
         path = Path.cwd() / ".mcp.json"
         servers = load_mcp_servers(path)
-        if args.action == "list":
-            if not servers:
-                print("No MCP servers configured.")
-            for name, cfg in servers.items():
-                target = (
-                    cfg.url
-                    if cfg.transport != "stdio"
-                    else f"{cfg.command} {' '.join(cfg.args)}"
-                )
-                print(f"{name} [{cfg.transport}]: {target}")
+        if args.action in {"list", "status"}:
+            print(render_mcp_servers(servers, json_output=args.json))
             return 0
         if not args.server_name:
             print("Error: server name is required.", file=sys.stderr)
@@ -1410,16 +1424,31 @@ def main(argv: list[str] | None = None) -> int:
         if args.transport != "stdio" and not args.url:
             print("Error: HTTP/SSE MCP add requires --url.", file=sys.stderr)
             return 2
-        servers[args.server_name] = MCPServerConfig(
-            name=args.server_name,
-            command=command_parts[0] if command_parts else "",
-            args=command_parts[1:],
-            env={},
-            transport=args.transport,
-            url=args.url,
-        )
+        try:
+            env = parse_key_value_options(args.env, label="--env")
+            headers = parse_key_value_options(args.header, label="--header")
+            servers[args.server_name] = MCPServerConfig(
+                name=args.server_name,
+                command=command_parts[0] if command_parts else "",
+                args=command_parts[1:],
+                env=env,
+                transport=args.transport,
+                url=args.url,
+                headers=headers,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
         save_mcp_servers(servers, path)
-        print(f"Added MCP server {args.server_name}.")
+        if args.json:
+            print(
+                render_mcp_servers(
+                    {args.server_name: servers[args.server_name]},
+                    json_output=True,
+                )
+            )
+        else:
+            print(f"Added MCP server {args.server_name}.")
         return 0
 
     config = AshConfig.load()
