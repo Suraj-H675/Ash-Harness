@@ -105,6 +105,7 @@ class ReadFileTool(BaseTool):
         start_index = args.start_line - 1
         end_index = args.end_line if args.end_line is not None else len(lines)
         selected = lines[start_index:end_index]
+        selected_count = len(selected)
 
         truncated = False
         if len(selected) > DEFAULT_MAX_READ_LINES:
@@ -117,7 +118,8 @@ class ReadFileTool(BaseTool):
         )
         if truncated:
             output = (
-                f"{output}\n[Warning: Output truncated. Too many lines in file read.]"
+                f"{output}\n"
+                f"{_format_read_truncation_metadata(args.start_line, end_index, len(lines), selected_count)}"
             )
 
         return ToolResult(
@@ -280,6 +282,24 @@ def _normalize_line_endings(content: str) -> str:
 
 def _strip_trailing_newlines(content: str) -> str:
     return content.rstrip("\n")
+
+
+def _format_read_truncation_metadata(
+    requested_start: int,
+    requested_end: int,
+    total_file_lines: int,
+    selected_count: int,
+) -> str:
+    returned_end = requested_start + DEFAULT_MAX_READ_LINES - 1
+    omitted_lines = max(0, selected_count - DEFAULT_MAX_READ_LINES)
+    return (
+        "[read_file truncated: "
+        f"requested_lines={requested_start}-{requested_end}; "
+        f"returned_lines={requested_start}-{returned_end}; "
+        f"total_file_lines={total_file_lines}; "
+        f"omitted_lines={omitted_lines}; "
+        f"next_start_line={returned_end + 1}]"
+    )
 
 
 def _build_mismatch_error(expected: str, actual: str) -> str:

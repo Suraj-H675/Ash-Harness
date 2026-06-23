@@ -63,6 +63,58 @@ async def test_read_file_blocks_binary_null_byte(
 
 
 @pytest.mark.asyncio
+async def test_read_file_truncation_reports_follow_up_range(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "large.txt"
+    target.write_text(
+        "\n".join(f"line {index}" for index in range(1, 806)) + "\n",
+        encoding="utf-8",
+    )
+
+    result = await ReadFileTool(guard).run(file_path="large.txt")
+
+    assert result.success is True
+    assert result.truncated is True
+    assert "800: line 800" in result.output
+    assert "801: line 801" not in result.output
+    assert (
+        "[read_file truncated: requested_lines=1-805; returned_lines=1-800; "
+        "total_file_lines=805; omitted_lines=5; next_start_line=801]"
+        in result.output
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_file_truncation_metadata_respects_start_line(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "large.txt"
+    target.write_text(
+        "\n".join(f"line {index}" for index in range(1, 1001)) + "\n",
+        encoding="utf-8",
+    )
+
+    result = await ReadFileTool(guard).run(
+        file_path="large.txt",
+        start_line=101,
+        end_line=950,
+    )
+
+    assert result.success is True
+    assert result.truncated is True
+    assert "900: line 900" in result.output
+    assert "901: line 901" not in result.output
+    assert (
+        "[read_file truncated: requested_lines=101-950; returned_lines=101-900; "
+        "total_file_lines=1000; omitted_lines=50; next_start_line=901]"
+        in result.output
+    )
+
+
+@pytest.mark.asyncio
 async def test_write_file_creates_parent_directories_and_respects_overwrite(
     project_root: Path,
     guard: SafetyGuard,
