@@ -41,7 +41,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Local models | Partial | Ollama discovery, health checks, pull guidance, tool-capability detection |
 | Custom endpoints | Verified locally | Per-provider credentials are stored in mode-0600 env storage, not TOML |
 | Config precedence | Partial | `ash config explain` shows env/dotenv/TOML/default sources; project config and full CLI override reporting remain |
-| Config migration | Partial | Legacy file migration exists; explicit config schema versions and backups remain |
+| Config migration | Partial | Legacy file migration and config schema future-version refusal exist; config backups remain |
 | `ash doctor` | Verified locally | Human/JSON diagnostics; optional endpoint connectivity probe |
 | Update/version check | Verified locally | Explicit GitHub release check with no background telemetry or self-modification |
 | Uninstall/reset | Verified locally | Confirmed selective reset for config, sessions, cache, or all local state |
@@ -238,7 +238,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Packaging CI | Verified locally | Wheel/sdist build, clean install, console and module command smoke tests pass |
 | Security tests | Partial | Command/path bypass corpus, sandbox escape assumptions, secret leaks |
 | Performance tests | Missing | Startup, large repo indexing, long session, memory use, redraw latency |
-| Compatibility policy | Missing | Config/session/plugin schema versions and deprecation windows |
+| Compatibility policy | Partial | Config and session schemas are versioned with future-version refusal; plugin compatibility/deprecation windows remain |
 
 ## Delivery Gates
 
