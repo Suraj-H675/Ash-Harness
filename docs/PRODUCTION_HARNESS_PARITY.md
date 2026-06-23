@@ -86,7 +86,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | Durable sessions | Verified locally | SQLite schema migrations, lifecycle, integrity checks, backup, and restore |
-| Resume by ID | Partial | Error if missing unless user explicitly requests a new session |
+| Resume by ID | Verified locally | Restores existing durable sessions and reports a classified session error for missing ids |
 | Session picker/list/search | Partial | Recent cwd-scoped session list with model/title/query; full-screen picker remains |
 | Session naming | Verified locally | Rename and stable persisted display names |
 | Fork session | Verified locally | New durable session from a selected message boundary |
