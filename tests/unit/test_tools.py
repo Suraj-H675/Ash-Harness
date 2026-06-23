@@ -393,6 +393,34 @@ async def test_run_command_defaults_to_project_root_cwd(
 
 
 @pytest.mark.asyncio
+async def test_run_command_scrubs_secret_environment(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SECRET_TOKEN", "super-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    script = (
+        "import os; "
+        "print(os.getenv('SECRET_TOKEN', 'missing')); "
+        "print(os.getenv('ANTHROPIC_API_KEY', 'missing')); "
+        "print(bool(os.getenv('PATH'))); "
+        "print(os.getenv('ASH_WORKSPACE_ROOT', ''))"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+    result = await RunCommandTool(guard).run(command_line=command)
+
+    assert result.success is True
+    lines = result.output.splitlines()
+    assert lines[0] == "missing"
+    assert lines[1] == "missing"
+    assert lines[2] == "True"
+    assert lines[3] == str(project_root)
+
+
+@pytest.mark.asyncio
 async def test_run_command_enforces_timeout(guard: SafetyGuard) -> None:
     command = (
         f"{shlex.quote(sys.executable)} -c {shlex.quote('import time; time.sleep(2)')}"

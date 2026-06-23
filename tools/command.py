@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import platform
 import re
 from pathlib import Path
@@ -29,6 +30,27 @@ POWERSHELL_FILE_CMDLETS = (
     "rename-item",
     "new-item",
 )
+SAFE_ENV_KEYS = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "USERNAME",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "PYTHONIOENCODING",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+    }
+)
+SAFE_ENV_PREFIXES = ("LC_",)
 
 
 class RunCommandArgs(BaseModel):
@@ -90,19 +112,34 @@ class RunCommandTool(BaseTool):
         if sandboxed:
             assert self.sandbox_manager is not None
             argv = ["/bin/sh", "-c", args.command_line]
-            return await self._run_sandboxed(argv, args.timeout_seconds, cwd)
+            return await self._run_sandboxed(
+                argv,
+                args.timeout_seconds,
+                cwd,
+                env=build_scrubbed_command_env(self.project_root),
+            )
 
-        return await self._run_scoped(args.command_line, args.timeout_seconds, cwd)
+        return await self._run_scoped(
+            args.command_line,
+            args.timeout_seconds,
+            cwd,
+            env=build_scrubbed_command_env(self.project_root),
+        )
 
     async def _run_sandboxed(
-        self, argv: list[str], timeout_seconds: int, cwd: str | None
+        self,
+        argv: list[str],
+        timeout_seconds: int,
+        cwd: str | None,
+        *,
+        env: dict[str, str],
     ) -> ToolResult:
         assert self.sandbox_manager is not None
         from pathlib import Path
 
         cwd_path = Path(cwd) if cwd is not None else None
         result: SandboxResult = await self.sandbox_manager.run(
-            argv, cwd=cwd_path, timeout=timeout_seconds
+            argv, cwd=cwd_path, timeout=timeout_seconds, env=env
         )
         output, truncated = _truncate_command_output(result.stdout)
         error, error_truncated = _truncate_command_output(result.stderr)
@@ -120,7 +157,12 @@ class RunCommandTool(BaseTool):
         )
 
     async def _run_scoped(
-        self, command_line: str, timeout_seconds: int, cwd: str | None
+        self,
+        command_line: str,
+        timeout_seconds: int,
+        cwd: str | None,
+        *,
+        env: dict[str, str],
     ) -> ToolResult:
         try:
             if platform.system() == "Windows":
@@ -133,6 +175,7 @@ class RunCommandTool(BaseTool):
                     "-Command",
                     command_line,
                     cwd=cwd,
+                    env=env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     **process_group_options(),
@@ -141,6 +184,7 @@ class RunCommandTool(BaseTool):
                 process = await asyncio.create_subprocess_shell(
                     command_line,
                     cwd=cwd,
+                    env=env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     **process_group_options(),
@@ -219,6 +263,19 @@ def contains_forbidden_windows_chain(command_line: str) -> bool:
     if allowed_compiler_chain.search(command_line):
         return False
     return any(chain in command_line for chain in (";", "&&", "||"))
+
+
+def build_scrubbed_command_env(project_root: Path | None = None) -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in SAFE_ENV_KEYS or any(key.startswith(prefix) for prefix in SAFE_ENV_PREFIXES)
+    }
+    if "PATH" not in env:
+        env["PATH"] = os.defpath
+    if project_root is not None:
+        env["ASH_WORKSPACE_ROOT"] = str(project_root)
+    return env
 
 
 def _truncate_command_output(output: str) -> tuple[str, bool]:

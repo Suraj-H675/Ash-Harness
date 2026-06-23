@@ -163,6 +163,7 @@ class SandboxManager:
         *,
         cwd: Path | None = None,
         timeout: int | None = None,
+        env: dict[str, str] | None = None,
     ) -> SandboxResult:
         """
         Run ``command`` (argv list) under the active sandbox.
@@ -182,18 +183,20 @@ class SandboxManager:
             backend = self._build_backend(self._tier)
         except SandboxBackendUnavailable:
             return await _run_scoped(
-                _ScopedBackend(), command, cwd, deadline, fallback=True
+                _ScopedBackend(), command, cwd, deadline, fallback=True, env=env
             )
 
         if isinstance(backend, _ScopedBackend):
-            return await _run_scoped(backend, command, cwd, deadline, fallback=False)
+            return await _run_scoped(
+                backend, command, cwd, deadline, fallback=False, env=env
+            )
 
         # Tier 2/3 path: build the wrapped argv, then exec.
         try:
             wrapped = backend.wrap(command, cwd=cwd)
         except SandboxBackendUnavailable:
             return await _run_scoped(
-                _ScopedBackend(), command, cwd, deadline, fallback=True
+                _ScopedBackend(), command, cwd, deadline, fallback=True, env=env
             )
 
         return await _run_subprocess(
@@ -202,6 +205,7 @@ class SandboxManager:
             deadline=deadline,
             tier=self._tier,
             backend_name=backend.name,
+            env=env,
         )
 
     # --- tier detection --------------------------------------------------
@@ -264,6 +268,7 @@ async def _run_scoped(
     deadline: int,
     *,
     fallback: bool,
+    env: dict[str, str] | None = None,
 ) -> SandboxResult:
     """Execute the command directly via asyncio.create_subprocess_exec."""
 
@@ -271,6 +276,7 @@ async def _run_scoped(
     process = await asyncio.create_subprocess_exec(
         *command,
         cwd=str(cwd) if cwd is not None else None,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         **process_group_options(),
@@ -311,6 +317,7 @@ async def _run_subprocess(
     deadline: int,
     tier: SandboxTier,
     backend_name: str,
+    env: dict[str, str] | None = None,
 ) -> SandboxResult:
     """Execute a pre-wrapped argv (e.g. bwrap or docker run) directly."""
 
@@ -318,6 +325,7 @@ async def _run_subprocess(
     process = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(cwd) if cwd is not None else None,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         **process_group_options(),
