@@ -1061,6 +1061,17 @@ def main(argv: list[str] | None = None) -> int:
         default="all",
     )
     extensions_parser.add_argument("--json", action="store_true")
+    agents_parser = subparsers.add_parser(
+        "agents", help="Inspect persisted subagent status and reports"
+    )
+    agents_subparsers = agents_parser.add_subparsers(
+        dest="agents_action", required=True
+    )
+    agents_list = agents_subparsers.add_parser("list")
+    agents_list.add_argument("--json", action="store_true")
+    agents_reports = agents_subparsers.add_parser("reports")
+    agents_reports.add_argument("--limit", type=int, default=20)
+    agents_reports.add_argument("--json", action="store_true")
     serve_parser = subparsers.add_parser(
         "serve", help="Run the authenticated local Ash HTTP API"
     )
@@ -1398,6 +1409,36 @@ def main(argv: list[str] | None = None) -> int:
                 json_output=getattr(args, "json", False),
             )
         )
+        return 0
+
+    if args.command == "agents":
+        from cli.agents import (
+            list_agent_reports,
+            list_agent_statuses,
+            render_agent_reports,
+            render_agent_statuses,
+        )
+
+        agents_config = AshConfig.load()
+        database = agents_config.db_directory / "agents.db"
+        try:
+            if args.agents_action == "list":
+                print(
+                    render_agent_statuses(
+                        list_agent_statuses(database),
+                        json_output=args.json,
+                    )
+                )
+            else:
+                print(
+                    render_agent_reports(
+                        list_agent_reports(database, limit=args.limit),
+                        json_output=args.json,
+                    )
+                )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
         return 0
 
     if args.command == "extensions":
