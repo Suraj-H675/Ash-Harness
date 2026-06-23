@@ -1,8 +1,11 @@
 import json
+import sqlite3
 
 import pytest
 
 from cli.doctor import DoctorCheck, render_doctor, run_doctor
+from cli.doctor import _check_storage
+from config import AshConfig
 
 
 def test_render_doctor_json_has_stable_schema() -> None:
@@ -30,3 +33,16 @@ async def test_doctor_reports_local_runtime_without_network(
     assert by_name["storage"].status == "pass"
     assert "connectivity" not in by_name
     assert not (tmp_path / "db" / ".doctor.sqlite3").exists()
+
+
+def test_storage_check_reports_sqlite_open_failures(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_connect(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr("cli.doctor.sqlite3.connect", fail_connect)
+    check = _check_storage(AshConfig(db_directory=tmp_path / "db"))
+    assert check.name == "storage"
+    assert check.status == "fail"
+    assert "unable to open database file" in check.message

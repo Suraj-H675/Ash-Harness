@@ -67,7 +67,7 @@ def _check_storage(config: AshConfig) -> DoctorCheck:
         finally:
             connection.close()
             db.unlink(missing_ok=True)
-    except OSError as exc:
+    except (OSError, sqlite3.Error) as exc:
         return DoctorCheck(
             "storage", "fail", f"Database directory is not writable: {exc}"
         )
