@@ -136,6 +136,26 @@ async def test_write_file_creates_parent_directories_and_respects_overwrite(
     assert (project_root / "src" / "app.py").read_text(
         encoding="utf-8"
     ) == "print('again')\n"
+    assert list((project_root / "src").glob(".app.py.*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_write_file_atomic_write_preserves_exact_newlines(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "script.txt"
+    content = "one\r\ntwo\r\n"
+
+    result = await WriteFileTool(guard).run(
+        file_path="script.txt",
+        content=content,
+        overwrite=True,
+    )
+
+    assert result.success is True
+    assert target.read_bytes() == content.encode("utf-8")
+    assert list(project_root.glob(".script.txt.*.tmp")) == []
 
 
 @pytest.mark.asyncio
@@ -281,6 +301,13 @@ async def test_whole_edit_tool(tmp_path: Path) -> None:
 
     assert result.success, f"whole_edit failed: {result.error}"
     assert test_file.read_text() == "new content\nwith more lines\n" * 100
+    assert list(tmp_path.glob(".big.py.*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_whole_edit_blocks_paths_outside_project(guard: SafetyGuard) -> None:
+    with pytest.raises(SafetyViolation):
+        await WholeEditTool(guard).run(file_path="../outside.txt", content="nope")
 
 
 def test_auto_commit_tool_is_in_default_tools():

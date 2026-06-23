@@ -142,24 +142,15 @@ class WriteFileTool(BaseTool):
         if resolved_path.exists() and not args.overwrite:
             return ToolResult(success=False, output="", error=EXISTS_ERROR)
 
-        parent = resolved_path.parent
-        self.safety_guard.validate_path(parent)
-        parent.mkdir(parents=True, exist_ok=True)
+        error = _prepare_atomic_text_write(
+            resolved_path,
+            safety_guard=self.safety_guard,
+            display_path=args.file_path,
+        )
+        if error is not None:
+            return ToolResult(success=False, output="", error=error)
 
-        if resolved_path.exists() and not os.access(resolved_path, os.W_OK):
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Error: File is not writable: {args.file_path}",
-            )
-        if not os.access(parent, os.W_OK):
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Error: Directory is not writable: {parent}",
-            )
-
-        resolved_path.write_text(args.content, encoding="utf-8", newline="")
+        _atomic_write_text(resolved_path, args.content)
         return ToolResult(
             success=True,
             output=f"Wrote {len(args.content)} characters to {resolved_path}.",
@@ -248,11 +239,15 @@ class WholeEditTool(BaseTool):
         args = WholeEditArgs(**kwargs)
         resolved_path = self.safety_guard.validate_path(args.file_path)
 
-        parent = resolved_path.parent
-        if not parent.exists():
-            parent.mkdir(parents=True, exist_ok=True)
+        error = _prepare_atomic_text_write(
+            resolved_path,
+            safety_guard=self.safety_guard,
+            display_path=args.file_path,
+        )
+        if error is not None:
+            return ToolResult(success=False, output="", error=error)
 
-        resolved_path.write_text(args.content, encoding="utf-8", newline="")
+        _atomic_write_text(resolved_path, args.content)
         return ToolResult(
             success=True,
             output=f"Whole-edit applied to {resolved_path} ({len(args.content)} chars).",
@@ -313,6 +308,23 @@ def _build_mismatch_error(expected: str, actual: str) -> str:
         )
     )
     return f"Error: target_content does not match the specified line range.\n{diff}"
+
+
+def _prepare_atomic_text_write(
+    path: Path,
+    *,
+    safety_guard: SafetyGuard,
+    display_path: str,
+) -> str | None:
+    parent = path.parent
+    safety_guard.validate_path(parent)
+    parent.mkdir(parents=True, exist_ok=True)
+
+    if path.exists() and not os.access(path, os.W_OK):
+        return f"Error: File is not writable: {display_path}"
+    if not os.access(parent, os.W_OK):
+        return f"Error: Directory is not writable: {parent}"
+    return None
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
