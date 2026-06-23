@@ -178,7 +178,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Environment scrubbing | Partial | Child processes receive a scrubbed operational env and tool outputs are redacted; explicit secret allowlist remains |
 | Prompt-injection isolation | Partial | Untrusted content provenance and tool-policy enforcement |
 | Secret scanning/redaction | Partial | Runtime logs, persisted messages/tool calls, tool output, and exports are redacted; pre-commit scanning remains |
-| Audit log | Partial | Tool approvals, blocks, and outcomes are persisted with a tamper-evident hash chain; export and broader decision coverage remain |
+| Audit log | Partial | Tool approvals, blocks, and outcomes are persisted with a tamper-evident hash chain plus CLI list/verify/export; broader non-tool decision coverage remains |
 | Enterprise policy layers | Missing | System/admin policy that lower scopes cannot override |
 
 ## 9. Extensibility
