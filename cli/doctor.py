@@ -94,6 +94,25 @@ def _check_mcp(config: AshConfig) -> DoctorCheck:
     return DoctorCheck("mcp", "pass", f"{len(servers)} server(s) configured")
 
 
+def _check_extensions(config: AshConfig) -> DoctorCheck:
+    from cli.extensions import discover_extensions
+
+    inventory = discover_extensions(config.workspace_root)
+    if inventory.errors:
+        return DoctorCheck(
+            "extensions",
+            "fail",
+            "; ".join(inventory.errors),
+            "Run `ash extensions --json`, then fix or remove invalid plugin/hook files.",
+        )
+    return DoctorCheck(
+        "extensions",
+        "pass",
+        f"{len(inventory.skills)} skill(s), {len(inventory.plugins)} plugin(s), "
+        f"{len(inventory.hooks)} hook config(s)",
+    )
+
+
 async def _check_connectivity(config: AshConfig) -> DoctorCheck:
     provider = config.provider
     if provider == "ollama":
@@ -175,6 +194,7 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
         )
     )
     checks.append(_check_mcp(config))
+    checks.append(_check_extensions(config))
     if connect:
         checks.append(await _check_connectivity(config))
     return checks
