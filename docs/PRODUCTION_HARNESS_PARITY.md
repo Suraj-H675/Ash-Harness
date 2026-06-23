@@ -134,7 +134,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/plan` mode | Verified locally | Explicit toggle, editable sprint contract, approval gate, and execution transition |
 | `/permissions` | Partial | Inspect/change active mode and persistent tool grants; persisted argument grants remain |
 | `/sandbox` | Verified locally | Active backend, tier, capabilities, and network policy |
-| `/mcp` | Placeholder | Add/remove/auth/list/status/tools/resources with live clients |
+| `/mcp` | Partial | Top-level add/remove/list/status config supports JSON and env/header metadata; REPL status/tools/resources/prompts use live clients; auth and richer lifecycle remain |
 | `/skills`, `/plugins`, `/hooks` | Partial/unwired | Discover, inspect, enable, disable, trust, reload |
 | `/agents` | Placeholder | Spawn real workers, inspect status/output, steer, stop, resume |
 | `/doctor` | Verified locally | Runs the local health report in-session |
