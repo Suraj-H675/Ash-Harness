@@ -132,7 +132,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/diff` | Partial | Current/staged/path Git diff; per-turn checkpoint diff remains |
 | `/review` | Verified locally | Bounded reviews for worktree/untracked, staged, commit, or current branch versus base |
 | `/plan` mode | Verified locally | Explicit toggle, editable sprint contract, approval gate, and execution transition |
-| `/permissions` | Partial | Inspect/change active mode; persisted argument grants remain |
+| `/permissions` | Partial | Inspect/change active mode and persistent tool grants; persisted argument grants remain |
 | `/sandbox` | Verified locally | Active backend, tier, capabilities, and network policy |
 | `/mcp` | Placeholder | Add/remove/auth/list/status/tools/resources with live clients |
 | `/skills`, `/plugins`, `/hooks` | Partial/unwired | Discover, inspect, enable, disable, trust, reload |
@@ -168,7 +168,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Workspace path boundary | Partial | File tools and command effects; symlink/race-safe behavior |
 | Trusted-folder prompt | Verified locally | Project instructions, skills, hooks, plugins, and MCP are trust-gated |
 | Fine-grained policy engine | Partial | Central allow/ask/deny by tool and mode; persisted argument rules remain |
-| Approval persistence | Partial | Session grants and persistent project tool grants with inspection/revocation |
+| Approval persistence | Partial | Persistent project tool grants have slash/top-level inspection, JSON output, revocation, and clear; session-scoped and argument-scoped grants remain |
 | Read-only plan mode | Verified locally | Non-read tools are denied by the central policy |
 | Auto-edit mode | Verified locally | Reads/edits allowed while commands and external tools remain gated |
 | Full auto mode | Partial | Explicit dangerous-mode warning and sandbox requirement |
