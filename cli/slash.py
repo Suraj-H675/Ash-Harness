@@ -38,6 +38,7 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("import", "Import an Ash JSONL transcript", "/import <path>"),
     SlashCommand("context", "Show current context usage", "/context"),
     SlashCommand("compact", "Compact older conversation history", "/compact"),
+    SlashCommand("plan", "Toggle editable sprint planning", "/plan [on|off]"),
     SlashCommand("skills", "List available instruction skills", "/skills [query]"),
     SlashCommand("plugins", "List discovered declarative plugins", "/plugins"),
     SlashCommand("commands", "List custom Markdown commands", "/commands"),

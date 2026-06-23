@@ -10,8 +10,12 @@ automated tests and CI can drive the loop.
 
 from __future__ import annotations
 
-import sys
 import difflib
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -375,14 +379,35 @@ class TerminalUI:
         """Render a sprint plan and ask the user to approve / edit / reject.
 
         Returns ``True`` when the user approves, ``False`` otherwise.
-        Edits are out of scope for V5 — we treat ``e`` as a synonym
-        of ``n`` (reject) and log it; the planner can be re-invoked.
+        Typing ``e`` opens ``$VISUAL`` or ``$EDITOR`` with the plan markdown,
+        validates the edited result, then asks for approval again.
         """
 
         live = getattr(self, "_active_live", None)
         if live is not None:
             live.stop()
 
+        try:
+            while True:
+                self._render_plan(execution)
+                try:
+                    answer = self._input_stream.readline().strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    answer = ""
+                if answer in {"y", "yes"}:
+                    return True
+                if answer not in {"e", "edit"}:
+                    return False
+                try:
+                    self._edit_plan(execution)
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    self.console.print(f"Plan edit failed: {exc}", style="red")
+                    return False
+        finally:
+            if live is not None:
+                live.start()
+
+    def _render_plan(self, execution: Any) -> None:
         body = Text()
         body.append("Goal: ", style="bold")
         body.append(execution.contract.goal)
@@ -412,19 +437,37 @@ class TerminalUI:
             )
         )
 
-        try:
-            answer = self._input_stream.readline().strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            answer = ""
-        if live is not None:
-            live.start()
+    def _edit_plan(self, execution: Any) -> None:
+        from core.planner import apply_sprint_markdown_edit, render_sprint_markdown
 
-        if answer in {"y", "yes"}:
-            return True
-        if answer in {"e", "edit"}:
-            # Edits are out of scope for V5; surface that to the user
-            # but still treat as a non-approval so they can re-plan.
-            self.console.print(
-                "[yellow]Edit mode is not implemented yet — rejecting the plan.[/yellow]"
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+        if not editor:
+            raise ValueError("Set VISUAL or EDITOR to edit sprint plans")
+        command = shlex.split(editor, posix=os.name != "nt")
+        if not command:
+            raise ValueError("VISUAL/EDITOR is empty")
+        file_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".md",
+                prefix="ash-plan-",
+                delete=False,
+            ) as handle:
+                handle.write(render_sprint_markdown(execution))
+                file_path = Path(handle.name)
+            result = subprocess.run([*command, str(file_path)], check=False)
+            if result.returncode != 0:
+                raise subprocess.SubprocessError(
+                    f"editor exited with status {result.returncode}"
+                )
+            if file_path.stat().st_size > 1_000_000:
+                raise ValueError("edited plan exceeds 1 MB")
+            apply_sprint_markdown_edit(
+                execution,
+                file_path.read_text(encoding="utf-8"),
             )
-        return False
+        finally:
+            if file_path is not None:
+                file_path.unlink(missing_ok=True)

@@ -90,6 +90,10 @@ class AshConfig(BaseSettings):
         },
         description="Prompt actions mapped to prompt-toolkit key sequences.",
     )
+    enable_sprint_planning: bool = Field(
+        False,
+        description="Generate an editable sprint contract for multi-step requests.",
+    )
     allow_unsafe_auto_approve: bool = Field(
         False,
         description="Allow full auto mode without an OS-level sandbox.",

@@ -12,6 +12,7 @@ from ash.cli import _build_provider, _build_tools
 from config import AshConfig
 from core.checkpoints import FileCheckpointMiddleware
 from core.loop import AshLoop
+from core.planner import Planner
 from core.redaction import redact_text
 from core.secret_middleware import SecretRedactionMiddleware
 from core.session import SessionStore, SessionSummary
@@ -85,6 +86,12 @@ class AshClient:
             project_root=runtime_config.workspace_root,
             tools=tools,
             config=runtime_config,
+            planner=(
+                Planner(active_provider)
+                if runtime_config.enable_sprint_planning
+                else None
+            ),
+            enable_sprint_planning=runtime_config.enable_sprint_planning,
             safety_tier=runtime_config.safety_tier,
             on_tool_approval=approval_callback,
             enable_semantic_memory=runtime_config.memory_backend != "off",

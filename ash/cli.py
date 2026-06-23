@@ -608,6 +608,22 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     flush=True,
                 )
                 continue
+            if command.name == "plan":
+                if len(arguments) > 1 or arguments[:1] not in ([], ["on"], ["off"]):
+                    print(f"Usage: {command.usage}", file=sys.stderr)
+                    continue
+                if arguments:
+                    enabled = arguments[0] == "on"
+                    loop.enable_sprint_planning = enabled
+                    if enabled and loop.planner is None:
+                        from core.planner import Planner
+
+                        loop.planner = Planner(loop.provider)
+                print(
+                    "Sprint planning: "
+                    + ("enabled" if loop.enable_sprint_planning else "disabled")
+                )
+                continue
             if command.name == "skills":
                 result = await loop.tools["list_skills"].run(query=" ".join(arguments))
                 print(result.output or "No matching skills.", flush=True)
@@ -1346,6 +1362,12 @@ def main(argv: list[str] | None = None) -> int:
         FileCheckpointMiddleware(session_store, safety_guard, checkpoint_context)
     )
     loop.tool_middlewares.append(SecretRedactionMiddleware())
+
+    if config.enable_sprint_planning:
+        from core.planner import Planner
+
+        loop.planner = Planner(provider)
+        loop.enable_sprint_planning = True
 
     if args.prompt is not None:
         try:

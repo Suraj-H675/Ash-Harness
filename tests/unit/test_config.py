@@ -14,6 +14,7 @@ ENV_KEYS = [
     "ASH_SAFETY_TIER",
     "ASH_WORKSPACE_ROOT",
     "ASH_COMMAND_BLOCKLIST",
+    "ASH_ENABLE_SPRINT_PLANNING",
     "ASH_DB_DIRECTORY",
     # Provider API keys — clear these so they don't pollute tests
     "ANTHROPIC_API_KEY",
@@ -181,6 +182,11 @@ def test_terminal_preferences_are_validated() -> None:
     assert config.reduced_motion is True
     assert config.show_token_meter is True
     assert config.keybindings["newline"] == ["c-o"]
+
+
+def test_sprint_planning_can_be_enabled_from_config() -> None:
+    config = AshConfig(enable_sprint_planning=True)
+    assert config.enable_sprint_planning is True
 
 
 def test_terminal_keybinding_collisions_are_rejected() -> None:

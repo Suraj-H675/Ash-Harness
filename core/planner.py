@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -106,7 +106,6 @@ _FIELD_PATTERN = re.compile(
 )
 
 
-@dataclass(frozen=True)
 class PlannerError(RuntimeError):
     """Raised when the LLM response cannot be parsed into a sprint."""
 
@@ -265,6 +264,40 @@ def render_sprint_markdown(execution: SprintExecution) -> str:
             lines.append(f"- [{mark}] {item.description}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def apply_sprint_markdown_edit(execution: SprintExecution, markdown: str) -> None:
+    """Validate edited plan Markdown and update an existing planning execution."""
+
+    if execution.state != SprintState.PLANNING:
+        raise PlannerError("only planning sprints can be edited")
+    if "## Goal" not in markdown or "## Checklist" not in markdown:
+        raise PlannerError("edited plan must include Goal and Checklist sections")
+    edited = parse_sprint_response(markdown, fallback_goal=execution.contract.goal)
+    if not edited.items:
+        raise PlannerError("edited plan must contain at least one checklist item")
+    _validate_plan_paths(edited.contract.files_in_scope, "Files in Scope")
+    _validate_plan_paths(edited.contract.files_off_limits, "Files Off Limits")
+    overlap = set(edited.contract.files_in_scope) & set(
+        edited.contract.files_off_limits
+    )
+    if overlap:
+        raise PlannerError(
+            "plan paths cannot be both in scope and off limits: "
+            + ", ".join(str(path) for path in sorted(overlap))
+        )
+    execution.contract = replace(
+        edited.contract,
+        contract_id=execution.contract.contract_id,
+        max_cost_inr=execution.contract.max_cost_inr,
+    )
+    execution.set_items(edited.items)
+
+
+def _validate_plan_paths(paths: tuple[Path, ...], section: str) -> None:
+    for path in paths:
+        if path.is_absolute() or ".." in path.parts:
+            raise PlannerError(f"{section} contains an unsafe path: {path}")
 
 
 # --- internal helpers -----------------------------------------------------

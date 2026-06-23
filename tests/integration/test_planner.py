@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from core.planner import Planner, parse_sprint_response, render_sprint_markdown
+from core.planner import (
+    Planner,
+    PlannerError,
+    apply_sprint_markdown_edit,
+    parse_sprint_response,
+    render_sprint_markdown,
+)
+from core.loop import AshLoop
 from core.session import SessionStore
 from core.sprint import (
     ChecklistItem,
@@ -19,6 +26,7 @@ from core.sprint import (
     looks_like_sprint_request,
 )
 from providers.base import StreamChunk
+from safety.guard import SafetyGuard
 from ui.terminal import TerminalUI
 
 
@@ -202,6 +210,34 @@ revert
     assert "Replace SHA256 with bcrypt" in md
 
 
+def test_apply_sprint_markdown_edit_preserves_identity_and_validates_paths() -> None:
+    execution = parse_sprint_response(
+        "## Goal\nOld\n\n## Checklist\n### Work\n- [ ] Old step\n",
+        fallback_goal="old",
+    )
+    contract_id = execution.contract.contract_id
+    apply_sprint_markdown_edit(
+        execution,
+        "## Goal\nNew\n\n## Files in Scope\n- src/new.py\n\n"
+        "## Checklist\n### Work\n- [ ] New step\n",
+    )
+    assert execution.contract.contract_id == contract_id
+    assert execution.contract.goal == "New"
+    assert execution.items[0].description == "New step"
+
+    with pytest.raises(PlannerError, match="unsafe path"):
+        apply_sprint_markdown_edit(
+            execution,
+            "## Goal\nBad\n\n## Files in Scope\n- ../outside\n\n"
+            "## Checklist\n### Work\n- [ ] Bad step\n",
+        )
+
+
+def test_planner_error_accepts_messages() -> None:
+    error = PlannerError("bad plan")
+    assert str(error) == "bad plan"
+
+
 # ---------------------------------------------------------------------------
 # Planner end-to-end with a fake provider
 # ---------------------------------------------------------------------------
@@ -232,6 +268,41 @@ def test_planner_decompose_rejects_empty_request(tmp_path: Path) -> None:
     planner = Planner(provider)
     with pytest.raises(Exception):
         asyncio.run(planner.decompose("   ", project_root=tmp_path))
+
+
+def test_loop_runs_editable_planning_phase_before_execution(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        scripts=[
+            [
+                "## Goal\nImplement login\n\n## Test Command\npytest\n\n"
+                "## Rollback Plan\nrevert\n\n## Checklist\n\n"
+                "### Implementation\n- [ ] Add login endpoint\n"
+            ],
+            ["<response>executed plan</response>"],
+        ]
+    )
+    store = SessionStore(tmp_path / "sessions.db")
+    guard = SafetyGuard(tmp_path)
+    loop = AshLoop(
+        store,
+        provider,
+        guard,
+        _make_ui(input_text="y\n"),
+        tmp_path,
+        planner=Planner(provider),
+        enable_sprint_planning=True,
+    )
+
+    asyncio.run(loop.start_session())
+    response = asyncio.run(loop.run_turn("Implement user authentication for the API"))
+
+    assert response == "executed plan"
+    assert loop.current_session is not None
+    sprint_ids = store.list_session_sprints(loop.current_session.session_id)
+    assert len(sprint_ids) == 1
+    sprint = store.load_sprint(sprint_ids[0])
+    assert sprint.state == SprintState.ACTIVE
+    assert sprint.items[0].description == "Add login endpoint"
 
 
 # ---------------------------------------------------------------------------
@@ -435,3 +506,21 @@ def test_show_plan_rejects_on_empty_input() -> None:
     exec = parse_sprint_response("## Goal\nx\n", fallback_goal="ignored")
     ui = _make_ui(input_text="\n")
     assert ui.show_plan(exec) is False
+
+
+def test_show_plan_can_edit_then_approve(monkeypatch) -> None:
+    execution = parse_sprint_response(
+        "## Goal\nOld\n\n## Checklist\n### Work\n- [ ] Old step\n",
+        fallback_goal="old",
+    )
+    ui = _make_ui(input_text="e\ny\n")
+
+    def edit(plan) -> None:
+        apply_sprint_markdown_edit(
+            plan,
+            "## Goal\nEdited\n\n## Checklist\n### Work\n- [ ] Edited step\n",
+        )
+
+    monkeypatch.setattr(ui, "_edit_plan", edit)
+    assert ui.show_plan(execution) is True
+    assert execution.contract.goal == "Edited"
