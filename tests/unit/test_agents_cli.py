@@ -13,6 +13,8 @@ from cli.agents import (
     render_agent_messages,
     render_agent_reports,
     render_agent_statuses,
+    render_sent_agent_message,
+    send_agent_message,
 )
 
 
@@ -68,6 +70,23 @@ def test_agent_message_renderer_emits_json(tmp_path: Path) -> None:
     assert payload["messages"][0]["message_id"] == message_id
     assert payload["messages"][0]["content"] == {"content": "hello"}
     assert payload["messages"][0]["delivered"] is False
+
+
+def test_send_agent_message_renderer_emits_json(tmp_path: Path) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    state.register_agent("agent-a")
+    state.close()
+
+    message = send_agent_message(
+        tmp_path / "agents.db",
+        recipient_id="agent-a",
+        content='{"summary": "continue"}',
+        json_content=True,
+    )
+    payload = json.loads(render_sent_agent_message(message, json_output=True))
+
+    assert payload["message"]["recipient_id"] == "agent-a"
+    assert payload["message"]["content"] == {"summary": "continue"}
 
 
 def test_agents_cli_lists_persisted_statuses(
@@ -181,3 +200,77 @@ def test_agents_cli_messages_all_includes_delivered_and_rejects_invalid_limit(
 
     assert main(["agents", "messages", "--limit", "0"]) == 2
     assert "limit must be positive" in capsys.readouterr().err
+
+
+def test_agents_cli_sends_plain_steering_message(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db"
+    state = SharedState(db_dir / "agents.db")
+    state.register_agent("agent-a", role="coder")
+    state.close()
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+
+    assert main(["agents", "send", "agent-a", "continue", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["message"]["recipient_id"] == "agent-a"
+    assert payload["message"]["content"] == {"content": "continue"}
+    followup_state = SharedState(db_dir / "agents.db")
+    try:
+        messages = followup_state.fetch_messages("agent-a")
+        assert messages[0].message_type == "steer"
+        assert messages[0].content == {"content": "continue"}
+    finally:
+        followup_state.close()
+
+
+def test_agents_cli_send_validates_recipient_and_json_content(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db"
+    SharedState(db_dir / "agents.db").close()
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+
+    assert main(["agents", "send", "missing", "hello"]) == 2
+    assert "is not registered" in capsys.readouterr().err
+
+    assert (
+        main(
+            [
+                "agents",
+                "send",
+                "missing",
+                "[1]",
+                "--json-content",
+                "--force",
+            ]
+        )
+        == 2
+    )
+    assert "JSON content must be an object" in capsys.readouterr().err
+
+    assert (
+        main(
+            [
+                "agents",
+                "send",
+                "missing",
+                '{"summary": "queued"}',
+                "--json-content",
+                "--force",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["message"]["content"] == {"summary": "queued"}

@@ -78,6 +78,64 @@ def list_agent_messages(
         state.close()
 
 
+def send_agent_message(
+    db_path: str | Path,
+    *,
+    recipient_id: str,
+    content: str,
+    sender_id: str = "lead",
+    message_type: str = "steer",
+    json_content: bool = False,
+    require_registered: bool = True,
+) -> dict[str, Any]:
+    recipient_id = recipient_id.strip()
+    sender_id = sender_id.strip()
+    message_type = message_type.strip()
+    if not recipient_id:
+        raise ValueError("recipient must not be empty")
+    if not sender_id:
+        raise ValueError("sender must not be empty")
+    if not message_type:
+        raise ValueError("message type must not be empty")
+
+    state = SharedState(db_path)
+    try:
+        if require_registered and state.get_status(recipient_id) is None:
+            raise ValueError(
+                f"recipient {recipient_id!r} is not registered; use --force to queue anyway"
+            )
+        if json_content:
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON content: {exc.msg}") from exc
+            if not isinstance(payload, dict):
+                raise ValueError("JSON content must be an object")
+            message_id = state.send_message(
+                sender_id,
+                recipient_id,
+                message_type,
+                payload,
+            )
+        else:
+            payload = {"content": content}
+            message_id = state.send_to_agent(
+                sender_id,
+                recipient_id,
+                message_type,
+                content,
+            )
+        return {
+            "message_id": message_id,
+            "sender_id": sender_id,
+            "recipient_id": recipient_id,
+            "message_type": message_type,
+            "content": payload,
+        }
+    finally:
+        state.close()
+
+
 def render_agent_statuses(
     statuses: list[dict[str, Any]],
     *,
@@ -127,6 +185,20 @@ def render_agent_messages(
         f"{'delivered' if item['delivered'] else 'pending'}: "
         f"{_summarize_content(item['content'])}"
         for item in messages
+    )
+
+
+def render_sent_agent_message(
+    message: dict[str, Any],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"message": message}, sort_keys=True)
+    return (
+        f"Queued message {message['message_id']} "
+        f"{message['sender_id']} -> {message['recipient_id']} "
+        f"{message['message_type']}."
     )
 
 

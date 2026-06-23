@@ -1077,6 +1077,14 @@ def main(argv: list[str] | None = None) -> int:
     agents_messages.add_argument("--all", action="store_true", dest="all_messages")
     agents_messages.add_argument("--limit", type=int, default=50)
     agents_messages.add_argument("--json", action="store_true")
+    agents_send = agents_subparsers.add_parser("send")
+    agents_send.add_argument("recipient")
+    agents_send.add_argument("content")
+    agents_send.add_argument("--sender", default="lead")
+    agents_send.add_argument("--type", default="steer", dest="message_type")
+    agents_send.add_argument("--json-content", action="store_true")
+    agents_send.add_argument("--force", action="store_true")
+    agents_send.add_argument("--json", action="store_true")
     serve_parser = subparsers.add_parser(
         "serve", help="Run the authenticated local Ash HTTP API"
     )
@@ -1424,6 +1432,8 @@ def main(argv: list[str] | None = None) -> int:
             render_agent_messages,
             render_agent_reports,
             render_agent_statuses,
+            render_sent_agent_message,
+            send_agent_message,
         )
 
         agents_config = AshConfig.load()
@@ -1444,17 +1454,33 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
             else:
-                print(
-                    render_agent_messages(
-                        list_agent_messages(
-                            database,
-                            recipient_id=args.recipient,
-                            undelivered_only=not args.all_messages,
-                            limit=args.limit,
-                        ),
-                        json_output=args.json,
+                if args.agents_action == "messages":
+                    print(
+                        render_agent_messages(
+                            list_agent_messages(
+                                database,
+                                recipient_id=args.recipient,
+                                undelivered_only=not args.all_messages,
+                                limit=args.limit,
+                            ),
+                            json_output=args.json,
+                        )
                     )
-                )
+                else:
+                    print(
+                        render_sent_agent_message(
+                            send_agent_message(
+                                database,
+                                recipient_id=args.recipient,
+                                sender_id=args.sender,
+                                message_type=args.message_type,
+                                content=args.content,
+                                json_content=args.json_content,
+                                require_registered=not args.force,
+                            ),
+                            json_output=args.json,
+                        )
+                    )
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
