@@ -62,3 +62,36 @@ def set_tool_grant(workspace: Path, tool_name: str, allowed: bool) -> None:
         except OSError:
             pass
         raise
+
+
+def clear_tool_grants(workspace: Path) -> None:
+    """Remove all persistent tool grants for one workspace."""
+
+    path = grants_path()
+    if not path.is_file():
+        return
+    payload: dict = {"version": 1, "workspaces": {}}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            payload = loaded
+    except (OSError, json.JSONDecodeError):
+        return
+    workspaces = payload.setdefault("workspaces", {})
+    workspaces.pop(canonical_workspace(workspace), None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise

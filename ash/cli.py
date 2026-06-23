@@ -1021,6 +1021,24 @@ def main(argv: list[str] | None = None) -> int:
     sessions_parser.add_argument("--limit", type=int, default=20)
     sessions_parser.add_argument("--all-projects", action="store_true")
     sessions_parser.add_argument("--json", action="store_true")
+    permissions_parser = subparsers.add_parser(
+        "permissions", help="Inspect or change persistent project tool grants"
+    )
+    permissions_parser.add_argument("--json", action="store_true")
+    permissions_subparsers = permissions_parser.add_subparsers(
+        dest="permissions_action"
+    )
+    permissions_status = permissions_subparsers.add_parser("status")
+    permissions_status.add_argument("--json", action="store_true")
+    permissions_allow = permissions_subparsers.add_parser("allow")
+    permissions_allow.add_argument("tool_name")
+    permissions_allow.add_argument("--json", action="store_true")
+    permissions_revoke = permissions_subparsers.add_parser("revoke")
+    permissions_revoke.add_argument("tool_name")
+    permissions_revoke.add_argument("--json", action="store_true")
+    permissions_clear = permissions_subparsers.add_parser("clear")
+    permissions_clear.add_argument("--yes", action="store_true")
+    permissions_clear.add_argument("--json", action="store_true")
     serve_parser = subparsers.add_parser(
         "serve", help="Run the authenticated local Ash HTTP API"
     )
@@ -1299,6 +1317,47 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
         print(render_session_summaries(sessions, json_output=args.json))
+        return 0
+
+    if args.command == "permissions":
+        from cli.permissions import (
+            allow_permission_grant,
+            clear_permission_grants,
+            render_permission_grants,
+            revoke_permission_grant,
+        )
+        from safety.grants import load_tool_grants
+
+        permissions_config = AshConfig.load()
+        workspace = permissions_config.workspace_root
+        action = args.permissions_action or "status"
+        try:
+            if action == "allow":
+                grants = allow_permission_grant(workspace, args.tool_name)
+            elif action == "revoke":
+                grants = revoke_permission_grant(workspace, args.tool_name)
+            elif action == "clear":
+                confirmed = args.yes
+                if not confirmed and sys.stdin.isatty():
+                    confirmed = input(
+                        f"Clear persistent grants for {workspace.resolve()}? [y/N] "
+                    ).strip().casefold() in {"y", "yes"}
+                if not confirmed:
+                    print("Permission grant clear cancelled.", file=sys.stderr)
+                    return 2
+                grants = clear_permission_grants(workspace)
+            else:
+                grants = load_tool_grants(workspace)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        print(
+            render_permission_grants(
+                workspace,
+                grants,
+                json_output=getattr(args, "json", False),
+            )
+        )
         return 0
 
     if args.command == "serve":
