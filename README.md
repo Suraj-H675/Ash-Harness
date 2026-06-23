@@ -29,6 +29,7 @@ uv run pytest -q
 ```bash
 ash                              # interactive terminal session
 ash -p "inspect and test this repo"  # one-shot prompt
+ash --ci -p "inspect only"          # no prompts; stream-json by default
 ash -p "summarize" --output-format json
 ash --session SESSION_ID         # resume a durable session
 ash mcp add local -- python server.py

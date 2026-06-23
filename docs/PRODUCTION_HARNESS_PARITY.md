@@ -217,7 +217,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | JSON output | Verified locally | Machine-clean completion/error objects |
 | Streaming JSONL | Verified locally | Typed token, reasoning, context, tool lifecycle, completion, and error events |
 | Stdin prompts | Verified locally | Piped stdin and `-p -` enter machine-clean one-shot mode |
-| CI mode | Missing | Deterministic noninteractive approvals and no ANSI |
+| CI mode | Verified locally | `--ci` disables interactive prompts/ANSI and defaults one-shot output to stream-json |
 | SDK/library API | Verified locally | Async create/prompt/session/lifecycle API independent of the TUI |
 | JSON-RPC server | Partial | Validated stdio methods, cancellation, lifecycle, and tests; remote transport remains |
 | HTTP server | Verified locally | Bearer auth, rate limits, lifecycle, session/turn routes, live SSE events, cancellation, and safe CLI binding |
