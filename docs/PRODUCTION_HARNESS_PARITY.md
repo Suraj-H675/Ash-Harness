@@ -153,7 +153,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | List/glob files | Verified locally | Bounded production tools with workspace scoping |
 | Text/regex search | Verified locally | Ripgrep-backed bounded search with Python fallback |
 | Symbol/code search | Partial/unwired | Tree-sitter/LSP-backed definitions and references |
-| Shell execution | Partial/unsafe default | Policy engine, sandbox injection, process groups, streaming output |
+| Shell execution | Partial | Policy engine, sandbox injection, process groups, and child env scrubbing; streaming output remains |
 | Git status/diff/log | Verified locally | Read-only bounded Git inspection tools |
 | Git commit | Partial | Explicit staging scope, no unrelated changes, hooks/errors surfaced |
 | Tests/build/lint diagnostics | Partial | Parse diagnostics and feed concise structured failures |
@@ -175,7 +175,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Dry-run mode | Verified after fix | No side effects, including hooks and subagents |
 | OS sandbox | Partial/unwired | Linux bwrap, macOS sandbox/container, Windows restricted execution |
 | Network isolation | Partial | `web_fetch` supports public-host validation plus domain allowlist; per-command sandbox network enforcement remains |
-| Environment scrubbing | Partial | Secret allowlist, redacted logs, child-process policy |
+| Environment scrubbing | Partial | Child processes receive a scrubbed operational env and tool outputs are redacted; explicit secret allowlist remains |
 | Prompt-injection isolation | Partial | Untrusted content provenance and tool-policy enforcement |
 | Secret scanning/redaction | Partial | Runtime logs, persisted messages/tool calls, tool output, and exports are redacted; pre-commit scanning remains |
 | Audit log | Partial/unwired | Every decision/tool side effect with tamper-evident export |
