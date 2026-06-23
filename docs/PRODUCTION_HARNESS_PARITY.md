@@ -74,7 +74,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Tool-output pruning | Verified locally | Stale large results are pruned in provider context while preserving call identity and durable data |
 | Prompt caching | Missing | Provider-supported cache controls and hit metrics |
 | Repository map | Partial/unwired | Incremental index, ignores, active-file ranking, production injection |
-| Project instructions | Partial | Trusted hierarchical `ASH.md` discovery; imports/diagnostics remain |
+| Project instructions | Partial | Trusted hierarchical `ASH.md` discovery plus bounded `@import` expansion and diagnostics; conflict lint remains |
 | User instructions | Verified locally | Global `~/.ash/ASH.md` is loaded with a bounded size |
 | Session memory | Partial | Searchable summaries rather than raw transcript concatenation |
 | Project memory | Partial | Explicit project-scoped index/search/clear controls; automatic policy remains |
