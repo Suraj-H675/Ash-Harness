@@ -127,6 +127,13 @@ class AshConfig(BaseSettings):
         default=["format", "rm -rf", "Remove-Item"],
         description="Command patterns that immediately fail SafetyGuard checks.",
     )
+    allowed_web_domains: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional web_fetch allowlist. Entries are hostnames or wildcard "
+            "subdomains like *.example.com. Empty allows any public host."
+        ),
+    )
 
     db_directory: Path = Field(
         default=Path.home() / ".ash" / "db",
@@ -232,6 +239,35 @@ class AshConfig(BaseSettings):
         from context.history import normalize_context_budget_weights
 
         return normalize_context_budget_weights(value)
+
+    @field_validator("allowed_web_domains")
+    @classmethod
+    def validate_allowed_web_domains(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw in value:
+            item = raw.strip().casefold().rstrip(".")
+            if not item:
+                continue
+            if (
+                "://" in item
+                or "/" in item
+                or any(character.isspace() for character in item)
+            ):
+                raise ValueError(
+                    "allowed_web_domains entries must be hostnames, not URLs"
+                )
+            if item.startswith("*."):
+                host = item[2:]
+                if not host or "*" in host:
+                    raise ValueError(
+                        "allowed_web_domains wildcard entries must look like *.example.com"
+                    )
+            elif "*" in item:
+                raise ValueError(
+                    "allowed_web_domains supports wildcards only as a leading '*.'"
+                )
+            normalized.append(item)
+        return sorted(set(normalized))
 
     @field_validator("input_mode")
     @classmethod

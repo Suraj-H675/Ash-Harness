@@ -190,6 +190,7 @@ def _build_tools(
     allow_project_extensions: bool = False,
     provider_factory: Any | None = None,
     agent_db_path: Path | None = None,
+    allowed_web_domains: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     from plugins.skills import ActivateSkillTool, ListSkillsTool, SkillCatalog
     from tools.ask_user import AskUserTool
@@ -230,7 +231,7 @@ def _build_tools(
         ListDirectoryTool(safety_guard),
         GlobFilesTool(safety_guard),
         SearchTextTool(safety_guard),
-        WebFetchTool(safety_guard),
+        WebFetchTool(safety_guard, allowed_domains=allowed_web_domains),
         ListSkillsTool(safety_guard, catalog),
         ActivateSkillTool(safety_guard, catalog),
     ]
@@ -1370,6 +1371,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_project_extensions=workspace_trusted,
         provider_factory=lambda: _build_provider(config),
         agent_db_path=config.db_directory / "agents.db",
+        allowed_web_domains=config.allowed_web_domains,
     )
 
     from context.instructions import discover_instructions, render_instructions

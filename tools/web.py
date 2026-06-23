@@ -45,10 +45,15 @@ class WebFetchTool(BaseTool):
     args_schema = WebFetchArgs
 
     def __init__(
-        self, safety_guard, *, transport: httpx.AsyncBaseTransport | None = None
+        self,
+        safety_guard,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        allowed_domains: list[str] | tuple[str, ...] | None = None,
     ):
         super().__init__(safety_guard)
         self._transport = transport
+        self._allowed_domains = _normalize_allowed_domains(allowed_domains or ())
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = WebFetchArgs(**kwargs)
@@ -56,6 +61,7 @@ class WebFetchTool(BaseTool):
             final_url, status_code, content_type, body = await _fetch_public_text(
                 args.url,
                 transport=self._transport,
+                allowed_domains=self._allowed_domains,
             )
         except ValueError as exc:
             return ToolResult(success=False, output="", error=str(exc))
@@ -84,8 +90,9 @@ async def _fetch_public_text(
     raw_url: str,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
+    allowed_domains: tuple[str, ...] = (),
 ) -> tuple[str, int, str, str]:
-    url = _validate_public_url(raw_url)
+    url = _validate_public_url(raw_url, allowed_domains=allowed_domains)
     async with httpx.AsyncClient(
         timeout=10.0,
         transport=transport,
@@ -100,7 +107,10 @@ async def _fetch_public_text(
                     location = response.headers.get("location")
                     if not location:
                         raise ValueError("Redirect response did not include Location")
-                    url = _validate_public_url(urljoin(str(response.url), location))
+                    url = _validate_public_url(
+                        urljoin(str(response.url), location),
+                        allowed_domains=allowed_domains,
+                    )
                     continue
                 if response.status_code >= 400:
                     raise ValueError(
@@ -135,14 +145,48 @@ async def _fetch_public_text(
         raise ValueError(f"Too many redirects while fetching {raw_url}")
 
 
-def _validate_public_url(raw_url: str) -> str:
+def _validate_public_url(
+    raw_url: str,
+    *,
+    allowed_domains: tuple[str, ...] = (),
+) -> str:
     parsed = urlparse(raw_url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("Only http and https URLs are supported")
     if not parsed.hostname:
         raise ValueError("URL must include a hostname")
+    if allowed_domains and not _host_allowed(parsed.hostname, allowed_domains):
+        raise ValueError(
+            f"Host {parsed.hostname!r} is not in allowed_web_domains"
+        )
     _ensure_public_host(parsed.hostname)
     return raw_url
+
+
+def _normalize_allowed_domains(
+    domains: list[str] | tuple[str, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                domain.strip().casefold().rstrip(".")
+                for domain in domains
+                if domain.strip()
+            }
+        )
+    )
+
+
+def _host_allowed(hostname: str, allowed_domains: tuple[str, ...]) -> bool:
+    host = hostname.casefold().rstrip(".")
+    for domain in allowed_domains:
+        if domain.startswith("*."):
+            suffix = domain[2:]
+            if host.endswith(f".{suffix}") and host != suffix:
+                return True
+        elif host == domain:
+            return True
+    return False
 
 
 def _ensure_public_host(hostname: str) -> None:

@@ -15,6 +15,7 @@ ENV_KEYS = [
     "ASH_SAFETY_TIER",
     "ASH_WORKSPACE_ROOT",
     "ASH_COMMAND_BLOCKLIST",
+    "ASH_ALLOWED_WEB_DOMAINS",
     "ASH_ENABLE_SPRINT_PLANNING",
     "ASH_DB_DIRECTORY",
     # Provider API keys — clear these so they don't pollute tests
@@ -204,6 +205,18 @@ def test_terminal_preferences_are_validated() -> None:
     assert config.reduced_motion is True
     assert config.show_token_meter is True
     assert config.keybindings["newline"] == ["c-o"]
+
+
+def test_allowed_web_domains_are_normalized_and_validated() -> None:
+    config = AshConfig(
+        allowed_web_domains=["Example.COM.", "*.Docs.Example", "example.com"]
+    )
+    assert config.allowed_web_domains == ["*.docs.example", "example.com"]
+
+    with pytest.raises(ValueError, match="must be hostnames"):
+        AshConfig(allowed_web_domains=["https://example.com"])
+    with pytest.raises(ValueError, match="wildcards only"):
+        AshConfig(allowed_web_domains=["api.*.example.com"])
 
 
 def test_sprint_planning_can_be_enabled_from_config() -> None:

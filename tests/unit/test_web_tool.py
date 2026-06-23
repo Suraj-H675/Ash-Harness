@@ -59,6 +59,56 @@ async def test_web_fetch_validates_redirect_targets(monkeypatch, guard) -> None:
     assert "non-public" in (result.error or "")
 
 
+@pytest.mark.asyncio
+async def test_web_fetch_enforces_allowed_domains(monkeypatch, guard) -> None:
+    monkeypatch.setattr("tools.web._ensure_public_host", lambda hostname: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            text="allowed",
+        )
+
+    tool = WebFetchTool(
+        guard,
+        transport=httpx.MockTransport(handler),
+        allowed_domains=["example.com", "*.docs.example"],
+    )
+    allowed_exact = await tool.run(url="https://example.com/page")
+    allowed_wildcard = await tool.run(url="https://api.docs.example/page")
+    blocked = await tool.run(url="https://blocked.example/page")
+
+    assert allowed_exact.success is True
+    assert allowed_wildcard.success is True
+    assert blocked.success is False
+    assert "allowed_web_domains" in (blocked.error or "")
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_rejects_redirect_outside_allowed_domains(
+    monkeypatch,
+    guard,
+) -> None:
+    monkeypatch.setattr("tools.web._ensure_public_host", lambda hostname: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            302,
+            headers={"location": "https://other.example/final"},
+        )
+
+    tool = WebFetchTool(
+        guard,
+        transport=httpx.MockTransport(handler),
+        allowed_domains=["example.com"],
+    )
+    result = await tool.run(url="https://example.com/start")
+
+    assert result.success is False
+    assert "allowed_web_domains" in (result.error or "")
+
+
 def test_web_fetch_rejects_private_and_non_http_hosts(monkeypatch) -> None:
     with monkeypatch.context() as mp:
         mp.setattr("tools.web._ensure_public_host", lambda hostname: None)
