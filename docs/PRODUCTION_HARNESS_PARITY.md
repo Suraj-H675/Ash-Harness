@@ -214,8 +214,8 @@ Research is clean-room: proprietary or leaked source is not used.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | One-shot prompt (`ash -p`) | Verified locally | Session-aware one-shot mode with meaningful exit codes |
-| JSON output | Verified locally | Machine-clean completion/error objects |
-| Streaming JSONL | Verified locally | Typed token, reasoning, context, tool lifecycle, completion, and error events |
+| JSON output | Verified locally | Machine-clean completion objects and structured error objects |
+| Streaming JSONL | Verified locally | Typed token, reasoning, context, tool lifecycle, completion, and structured error events |
 | Stdin prompts | Verified locally | Piped stdin and `-p -` enter machine-clean one-shot mode |
 | CI mode | Verified locally | `--ci` disables interactive prompts/ANSI and defaults one-shot output to stream-json |
 | SDK/library API | Verified locally | Async create/prompt/session/lifecycle API independent of the TUI |
@@ -229,7 +229,7 @@ Research is clean-room: proprietary or leaked source is not used.
 |---|---|---|
 | Structured logging | Partial | Rotation, redaction, correlation IDs, debug bundle |
 | Telemetry | Missing | Off by default or explicit opt-in; local metrics still available |
-| Error taxonomy | Missing | Config/provider/tool/policy/sandbox/context/storage errors with remedies |
+| Error taxonomy | Partial | Shared config/provider/tool/policy/sandbox/context/storage classifier is wired into headless/CI errors; broader interactive command adoption remains |
 | Graceful shutdown | Verified locally | Providers, MCP clients, command trees, background agents, SDK, and servers close deterministically |
 | Database migrations | Verified locally | Schema version table, transactional ordered migration, future-version refusal, and backups |
 | Corruption recovery | Verified locally | Read-only integrity diagnostics plus validated backup and pre-restore preservation |
