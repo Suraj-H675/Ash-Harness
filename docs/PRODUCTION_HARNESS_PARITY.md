@@ -131,7 +131,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/clear`, `/rewind`, `/undo` | Verified locally | New-session clear, transcript rewind, and conflict-aware file undo |
 | `/diff` | Partial | Current/staged/path Git diff; per-turn checkpoint diff remains |
 | `/review` | Verified locally | Bounded reviews for worktree/untracked, staged, commit, or current branch versus base |
-| `/plan` mode | Partial/unwired | Read-only planning, editable plan, explicit transition to build mode |
+| `/plan` mode | Verified locally | Explicit toggle, editable sprint contract, approval gate, and execution transition |
 | `/permissions` | Partial | Inspect/change active mode; persisted argument grants remain |
 | `/sandbox` | Verified locally | Active backend, tier, capabilities, and network policy |
 | `/mcp` | Placeholder | Add/remove/auth/list/status/tools/resources with live clients |

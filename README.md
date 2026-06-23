@@ -47,6 +47,9 @@ SSE turn events at `/v1/turn/stream`; non-loopback binding requires
 Inside the terminal, `/help` lists session, context, model, diff, review,
 permissions, sandbox, skills, plugins, export, and diagnostic commands.
 `/review` supports worktree, staged, commit, and branch-versus-base scopes.
+`/plan on` enables editable sprint plans for multi-step requests; type `e` at
+the plan prompt to revise the generated contract in `$VISUAL` or `$EDITOR`,
+then `y` to approve and execute it.
 `Alt+Enter` or `Ctrl+J` inserts a newline; prompt history is stored under
 `~/.ash`. Type `@path` or `@"path with spaces"` to attach bounded workspace
 text or a directory listing to a prompt; secret, binary, oversized, and
@@ -71,8 +74,8 @@ endpoint. Run `ash doctor --json` for machine-readable diagnostics.
 
 Terminal behavior is configurable with `ASH_INPUT_MODE=vi`,
 `ASH_NO_COLOR=true`, `ASH_REDUCED_MOTION=true`, and
-`ASH_SHOW_TOKEN_METER=true`. Structured keybindings can be set in
-`~/.ash/ash.toml`.
+`ASH_SHOW_TOKEN_METER=true`. Structured keybindings and sprint planning can be
+set in `~/.ash/ash.toml`.
 
 See [the production parity checklist](docs/PRODUCTION_HARNESS_PARITY.md) for
 implemented and remaining release requirements.
