@@ -1545,6 +1545,10 @@ async def _bootstrap_and_repl(
     try:
         await loop.start_session(session_id)
         return await _repl(loop, config, sandbox_manager)
+    except Exception as exc:  # noqa: BLE001
+        error = classify_exception(exc)
+        print(format_error(error), file=sys.stderr)
+        return error.exit_code
     finally:
         await loop.aclose()
 

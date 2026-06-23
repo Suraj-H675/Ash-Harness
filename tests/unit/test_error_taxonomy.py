@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ash.cli import _bootstrap_and_headless
+from ash.cli import _bootstrap_and_headless, _bootstrap_and_repl
 from config import AshConfig
 from core.planner import PlannerError
 from core.session import SessionStorageError
@@ -88,3 +88,30 @@ async def test_headless_bootstrap_emits_structured_error() -> None:
     assert payload["error"]["category"] == "provider"
     assert payload["error"]["message"] == "OpenAI API error: timeout"
     assert payload["error"]["retriable"] is True
+
+
+@pytest.mark.asyncio
+async def test_repl_bootstrap_formats_missing_session_error(capsys) -> None:
+    class MissingSessionLoop:
+        closed = False
+
+        async def start_session(self, session_id=None):
+            raise KeyError(f"Session not found: {session_id}")
+
+        async def aclose(self):
+            self.closed = True
+
+    loop = MissingSessionLoop()
+
+    code = await _bootstrap_and_repl(
+        loop,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        session_id="missing",
+    )
+
+    assert code == 1
+    assert loop.closed is True
+    stderr = capsys.readouterr().err
+    assert "Error [session]: Session not found: missing" in stderr
+    assert "List sessions" in stderr
