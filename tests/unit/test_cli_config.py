@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 from pathlib import Path
@@ -350,3 +351,83 @@ def test_ash_config_loads_saved_provider_key_into_process(
     AshConfig()
 
     assert os.environ["ANTHROPIC_API_KEY"] == "saved-key"
+
+
+def test_explain_config_reports_sources_and_masks_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cli import config as cli_config
+    from config import AshConfig
+
+    cli_config.ASH_DIR = tmp_path / ".ash"
+    cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+    cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+    cli_config.ensure_ash_dir()
+    cli_config.ENV_FILE.write_text("ASH_SAFETY_TIER=dry_run\n", encoding="utf-8")
+    cli_config.CONFIG_FILE.write_text(
+        "max_context_tokens = 64000\n"
+        "[custom_providers.local]\n"
+        "api_key = 'local-secret-value'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ASH_MODEL", "openai/gpt-5.2")
+    monkeypatch.setenv("ASH_OPENAI_API_KEY", "sk-secret-value")
+    monkeypatch.delenv("ASH_SAFETY_TIER", raising=False)
+
+    config = AshConfig(
+        model="openai/gpt-5.2",
+        safety_tier="dry_run",
+        max_context_tokens=64000,
+        openai_api_key="sk-secret-value",
+        custom_providers={"local": {"api_key": "local-secret-value"}},
+    )
+    entries = {
+        entry.field: entry for entry in cli_config.explain_config(config)
+    }
+
+    assert entries["model"].source == "env"
+    assert entries["model"].detail == "ASH_MODEL"
+    assert entries["safety_tier"].source == "dotenv"
+    assert entries["max_context_tokens"].source == "toml"
+    assert entries["max_context_tokens"].value == 64000
+    assert entries["openai_api_key"].value == "sk-s...alue"
+    assert entries["custom_providers"].value["local"]["api_key"] == "loca...alue"
+
+
+def test_render_config_explain_json_is_machine_readable() -> None:
+    from cli.config import ConfigExplanation, render_config_explain
+
+    rendered = render_config_explain(
+        [ConfigExplanation("model", "ollama/test", "env", "ASH_MODEL")],
+        json_output=True,
+    )
+
+    assert json.loads(rendered) == {
+        "config": [
+            {
+                "field": "model",
+                "value": "ollama/test",
+                "source": "env",
+                "detail": "ASH_MODEL",
+            }
+        ]
+    }
+
+
+def test_config_explain_cli_json_smoke(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.cli import main
+    from config import AshConfig
+
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: cls(model="ollama/test")),
+    )
+
+    assert main(["config", "explain", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert any(entry["field"] == "model" for entry in payload["config"])

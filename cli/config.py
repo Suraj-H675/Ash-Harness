@@ -8,9 +8,12 @@ All file writes are atomic (tempfile.mkstemp + os.replace).
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
+import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -194,6 +197,165 @@ def load_config() -> dict[str, Any]:
             return toml.load(f)
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Config explanation
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConfigExplanation:
+    field: str
+    value: Any
+    source: str
+    detail: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "field": self.field,
+            "value": self.value,
+            "source": self.source,
+            "detail": self.detail,
+        }
+
+
+def explain_config(config: Any) -> list[ConfigExplanation]:
+    """Explain each AshConfig field's best-known source and masked value."""
+
+    fields = getattr(type(config), "model_fields", {})
+    toml_values = _load_raw_toml_config()
+    dotenv_values = load_env()
+    env_path = get_env_path()
+    config_path = get_config_path()
+    explanations: list[ConfigExplanation] = []
+
+    for field in sorted(fields):
+        env_key = f"ASH_{field.upper()}"
+        source = "default"
+        detail = "Ash built-in default"
+        if field == "model" and (
+            model_source := _env_or_dotenv_source("ASH_MODEL", dotenv_values, env_path)
+        ):
+            source, detail = model_source
+        elif field == "model" and (
+            legacy_model_source := _env_or_dotenv_source(
+                "ASH_MODEL_NAME", dotenv_values, env_path
+            )
+        ):
+            source, detail = legacy_model_source
+        elif env_source := _env_or_dotenv_source(env_key, dotenv_values, env_path):
+            source, detail = env_source
+        elif field in toml_values:
+            source = "toml"
+            detail = str(config_path)
+        explanations.append(
+            ConfigExplanation(
+                field=field,
+                value=_mask_config_value(field, getattr(config, field)),
+                source=source,
+                detail=detail,
+            )
+        )
+    return explanations
+
+
+def _env_or_dotenv_source(
+    key: str,
+    dotenv_values: dict[str, str],
+    env_path: Path,
+) -> tuple[str, str] | None:
+    if key in os.environ:
+        if key in dotenv_values and os.environ[key] == dotenv_values[key]:
+            return "dotenv", str(env_path)
+        return "env", key
+    if key in dotenv_values:
+        return "dotenv", str(env_path)
+    return None
+
+
+def render_config_explain(
+    explanations: list[ConfigExplanation],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps(
+            {"config": [entry.to_dict() for entry in explanations]},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    lines = ["Ash config"]
+    for entry in explanations:
+        lines.append(
+            f"{entry.field}: {entry.value!r} ({entry.source}: {entry.detail})"
+        )
+    return "\n".join(lines)
+
+
+def _load_raw_toml_config() -> dict[str, Any]:
+    path = get_config_path()
+    if not path.exists():
+        return {}
+    try:
+        with path.open("rb") as handle:
+            value = tomllib.load(handle)
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _mask_config_value(field: str, value: Any) -> Any:
+    if _is_secret_name(field):
+        return _mask_secret(str(value))
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _mask_nested_config_value(str(key), nested)
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_nested_config_value(field, item) for item in value]
+    return value
+
+
+def _mask_nested_config_value(key: str, value: Any) -> Any:
+    if _is_secret_name(key):
+        return _mask_secret(str(value))
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            str(nested_key): _mask_nested_config_value(str(nested_key), nested_value)
+            for nested_key, nested_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_nested_config_value(key, item) for item in value]
+    return value
+
+
+def _is_secret_name(name: str) -> bool:
+    lowered = name.casefold()
+    secret_markers = (
+        "api_key",
+        "apikey",
+        "secret",
+        "password",
+        "access_token",
+        "auth_token",
+        "bearer_token",
+        "refresh_token",
+    )
+    return any(marker in lowered for marker in secret_markers)
+
+
+def _mask_secret(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "****"
+    return value[:4] + "..." + value[-4:]
 
 
 # ---------------------------------------------------------------------------

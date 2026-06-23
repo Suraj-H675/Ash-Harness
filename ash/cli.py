@@ -937,6 +937,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Also probe the configured local or API endpoint",
     )
+    config_parser = subparsers.add_parser(
+        "config", help="Inspect Ash configuration sources"
+    )
+    config_subparsers = config_parser.add_subparsers(
+        dest="config_action", required=True
+    )
+    config_explain = config_subparsers.add_parser(
+        "explain", help="Show effective config values and their sources"
+    )
+    config_explain.add_argument("--json", action="store_true")
     trust_parser = subparsers.add_parser(
         "trust", help="Inspect or change project extension trust"
     )
@@ -1061,6 +1071,26 @@ def main(argv: list[str] | None = None) -> int:
         checks = asyncio.run(run_doctor(connect=args.connect))
         print(render_doctor(checks, json_output=args.json_output))
         return 1 if any(check.status == "fail" for check in checks) else 0
+
+    if args.command == "config":
+        from cli.config import explain_config, render_config_explain
+
+        try:
+            config = AshConfig.load()
+        except Exception as exc:  # noqa: BLE001
+            error = classify_exception(exc)
+            if args.json:
+                print(json.dumps({"error": error.to_dict()}, sort_keys=True))
+            else:
+                print(format_error(error), file=sys.stderr)
+            return error.exit_code
+        print(
+            render_config_explain(
+                explain_config(config),
+                json_output=args.json,
+            )
+        )
+        return 0
 
     if args.command == "trust":
         from safety.trust import (
