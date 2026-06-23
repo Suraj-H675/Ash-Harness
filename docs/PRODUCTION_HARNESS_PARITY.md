@@ -238,7 +238,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Packaging CI | Verified locally | Wheel/sdist build, clean install, console and module command smoke tests pass |
 | Security tests | Partial | Command/path bypass corpus, sandbox escape assumptions, secret leaks |
 | Performance tests | Missing | Startup, large repo indexing, long session, memory use, redraw latency |
-| Compatibility policy | Partial | Config and session schemas are versioned with future-version refusal; plugin compatibility/deprecation windows remain |
+| Compatibility policy | Partial | Config, session, and plugin manifest schemas are versioned with future-version refusal; plugin deprecation windows remain |
 
 ## Delivery Gates
 
