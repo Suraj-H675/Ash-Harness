@@ -15,7 +15,7 @@ class SlashCommand:
 
 
 COMMANDS: tuple[SlashCommand, ...] = (
-    SlashCommand("help", "Show available commands", "/help"),
+    SlashCommand("help", "Show available commands", "/help [query]"),
     SlashCommand("status", "Show session and runtime status", "/status"),
     SlashCommand(
         "model", "Choose or switch the active model", "/model [provider/model]"
@@ -92,10 +92,38 @@ def parse_slash_command(text: str) -> tuple[SlashCommand, list[str]] | None:
     return command, parts[1:]
 
 
-def render_help() -> str:
+def render_help(query: str | None = None) -> str:
     """Render a stable, compact command reference."""
 
-    width = max(len(command.usage) for command in COMMANDS)
+    normalized_query = " ".join((query or "").split()).casefold()
+    commands = [
+        command
+        for command in COMMANDS
+        if not normalized_query or _command_matches(command, normalized_query)
+    ]
+    if not commands:
+        return f"No slash commands match {query!r}."
+    width = max(len(command.usage) for command in commands)
     return "\n".join(
-        f"{command.usage:<{width}}  {command.description}" for command in COMMANDS
+        f"{command.usage:<{width}}  {command.description}"
+        f"{_render_aliases(command.aliases)}"
+        for command in commands
     )
+
+
+def _command_matches(command: SlashCommand, query: str) -> bool:
+    fields = (
+        command.name,
+        command.description,
+        command.usage,
+        *(command.aliases),
+        *(f"/{alias}" for alias in command.aliases),
+    )
+    return any(query in field.casefold() for field in fields)
+
+
+def _render_aliases(aliases: tuple[str, ...]) -> str:
+    if not aliases:
+        return ""
+    rendered = ", ".join(f"/{alias}" for alias in aliases)
+    return f" (aliases: {rendered})"

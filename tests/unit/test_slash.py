@@ -29,3 +29,14 @@ def test_help_lists_core_session_commands() -> None:
     assert "/review [worktree|staged|commit REF|branch BASE]" in rendered
     assert "/plan [on|off]" in rendered
     assert "/hooks" in rendered
+    assert "/help [query]" in rendered
+    assert "aliases: /clear" in rendered
+
+
+def test_help_filters_by_command_alias_and_description() -> None:
+    assert "/review [worktree|staged|commit REF|branch BASE]" in render_help("git")
+    assert "/new" in render_help("clear")
+    assert "/exit" in render_help("/quit")
+    assert render_help("definitely-not-a-command") == (
+        "No slash commands match 'definitely-not-a-command'."
+    )

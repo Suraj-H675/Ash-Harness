@@ -430,7 +430,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             if command.name == "exit":
                 return 0
             if command.name == "help":
-                print(render_help(), flush=True)
+                print(render_help(" ".join(arguments) or None), flush=True)
                 continue
             if command.name == "status":
                 session = loop.current_session
