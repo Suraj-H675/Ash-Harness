@@ -1008,6 +1008,19 @@ def main(argv: list[str] | None = None) -> int:
     audit_export = audit_subparsers.add_parser("export")
     audit_export.add_argument("--session", required=True, dest="audit_session")
     audit_export.add_argument("--output", required=True, type=Path)
+    sessions_parser = subparsers.add_parser(
+        "sessions", help="List saved Ash sessions"
+    )
+    sessions_parser.add_argument(
+        "sessions_action",
+        nargs="?",
+        choices=["list"],
+        default="list",
+    )
+    sessions_parser.add_argument("--query", default="")
+    sessions_parser.add_argument("--limit", type=int, default=20)
+    sessions_parser.add_argument("--all-projects", action="store_true")
+    sessions_parser.add_argument("--json", action="store_true")
     serve_parser = subparsers.add_parser(
         "serve", help="Run the authenticated local Ash HTTP API"
     )
@@ -1265,6 +1278,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         print(f"Audit log exported: {exported}")
+        return 0
+
+    if args.command == "sessions":
+        from cli.sessions import list_session_summaries, render_session_summaries
+
+        sessions_config = AshConfig.load(
+            **({"db_directory": args.db_directory} if args.db_directory else {})
+        )
+        store = SessionStore(sessions_config.db_directory / "sessions.db")
+        try:
+            sessions = list_session_summaries(
+                store,
+                project_path=str(sessions_config.workspace_root),
+                all_projects=args.all_projects,
+                limit=args.limit,
+                query=args.query,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        print(render_session_summaries(sessions, json_output=args.json))
         return 0
 
     if args.command == "serve":
