@@ -68,7 +68,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | Token accounting | Partial | Provider/model-aware counts and visible uncertainty |
-| Context budget allocation | Missing | Enforced budgets for system, tools, history, files, map, and memory |
+| Context budget allocation | Partial | Configurable system/tool/history/repo-map/memory budgets are enforced before compaction; file attachment and provider cache budgets remain |
 | Automatic compaction | Verified locally | Threshold-based extractive summary retains recent tool call/result pairs |
 | Manual `/compact` | Verified locally | Forces compaction while preserving the durable transcript |
 | Tool-output pruning | Verified locally | Stale large results are pruned in provider context while preserving call identity and durable data |
