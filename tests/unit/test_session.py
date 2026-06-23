@@ -51,8 +51,12 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
     with get_db_connection(db_path) as conn:
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 1
+            == 2
         )
+        audit_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(audit_logs)")
+        }
+        assert "previous_hash" in audit_columns
 
 
 def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
@@ -80,7 +84,7 @@ def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     store = SessionStore(db_path)
 
     assert store.load_session("legacy").session_id == "legacy"
-    backups = list(tmp_path.glob("legacy.db.before-v1-migration.*.backup"))
+    backups = list(tmp_path.glob("legacy.db.before-v2-migration.*.backup"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as conn:
         assert conn.execute("SELECT session_id FROM sessions").fetchone()[0] == "legacy"
@@ -170,6 +174,41 @@ def test_tool_call_storage_inserts_and_updates_records(tmp_path: Path) -> None:
     loaded = store.load_session(session.session_id)
 
     assert loaded.tool_calls == [updated]
+
+
+def test_audit_log_hash_chain_detects_tampering(tmp_path: Path) -> None:
+    db_path = tmp_path / "session_store.db"
+    store = SessionStore(db_path)
+    session = store.create_session(project_path="/workspace")
+
+    first = store.append_audit_log(
+        session.session_id,
+        action_type="user_approval",
+        target_resource="write_file",
+        details={"call_id": "call-1", "path": "a.py"},
+        result="APPROVED",
+    )
+    second = store.append_audit_log(
+        session.session_id,
+        action_type="file_write",
+        target_resource="write_file",
+        details={"call_id": "call-1", "success": True},
+        result="SUCCESS",
+    )
+
+    assert first.previous_hash == ""
+    assert second.previous_hash == first.sha256_hash
+    assert store.verify_audit_log(session.session_id) == []
+
+    with get_db_connection(db_path) as conn, conn:
+        conn.execute(
+            "UPDATE audit_logs SET details_json = ? WHERE log_id = ?",
+            ('{"call_id":"call-1","success":false}', second.log_id),
+        )
+
+    assert store.verify_audit_log(session.session_id) == [
+        f"audit log {second.log_id} sha256_hash mismatch"
+    ]
 
 
 def test_connection_uses_wal_pragmas_and_foreign_keys(tmp_path: Path) -> None:

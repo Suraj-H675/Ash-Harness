@@ -26,6 +26,8 @@ from uuid import uuid4
 
 from core.recovery import CircuitBreaker, CircuitBreakerError
 from core.session import (
+    AuditAction,
+    AuditResult,
     Message,
     Session,
     SessionStore,
@@ -90,6 +92,13 @@ class LoopUI(Protocol):
 
 
 DEFAULT_MAX_TURN_ITERATIONS = 10
+FILE_WRITE_TOOLS = {
+    "write_file",
+    "replace_file_content",
+    "replace_file_edits",
+    "whole_edit",
+    "apply_patch",
+}
 
 
 def _provider_capabilities(provider: Any) -> ProviderCapabilities:
@@ -188,6 +197,14 @@ def _normalize_native_tool_call(call: dict[str, Any]) -> dict[str, Any]:
         "name": name,
         "arguments": arguments,
     }
+
+
+def _audit_action_for_tool(tool_name: str) -> AuditAction:
+    if tool_name == "run_command":
+        return "command_run"
+    if tool_name in FILE_WRITE_TOOLS:
+        return "file_write"
+    return "tool_call"
 
 
 class AshLoop:
@@ -782,6 +799,19 @@ class AshLoop:
             else:
                 approved = self.ui.request_tool_approval(tool_name, arguments)
             record.approved = approved
+            if approved:
+                self._append_tool_audit(
+                    session,
+                    action_type="user_approval",
+                    target_resource=tool_name,
+                    details={
+                        "call_id": record.call_id,
+                        "arguments": record.arguments,
+                        "decision": decision.action.value,
+                        "reason": decision.reason,
+                    },
+                    result="APPROVED",
+                )
             if not approved:
                 record.executed = False
                 record.error = (
@@ -790,6 +820,26 @@ class AshLoop:
                     else "Denied by user"
                 )
                 self.session_store.save_tool_call(session.session_id, record)
+                self._append_tool_audit(
+                    session,
+                    action_type=(
+                        "safety_block"
+                        if decision.action == PolicyAction.DENY
+                        else "user_approval"
+                    ),
+                    target_resource=tool_name,
+                    details={
+                        "call_id": record.call_id,
+                        "arguments": record.arguments,
+                        "decision": decision.action.value,
+                        "reason": record.error,
+                    },
+                    result=(
+                        "BLOCKED_BY_GUARD"
+                        if decision.action == PolicyAction.DENY
+                        else "DENIED"
+                    ),
+                )
                 self.ui.emit_event(
                     {
                         "type": "tool.denied",
@@ -810,6 +860,17 @@ class AshLoop:
             if tool is None:
                 record.error = f"Unknown tool: {tool_name}"
                 self.session_store.save_tool_call(session.session_id, record)
+                self._append_tool_audit(
+                    session,
+                    action_type="tool_call",
+                    target_resource=tool_name,
+                    details={
+                        "call_id": record.call_id,
+                        "arguments": record.arguments,
+                        "error": record.error,
+                    },
+                    result="FAILURE",
+                )
                 self.circuit_breaker.record_failure(tool_name)
                 self.ui.emit_event(
                     {"type": "tool.error", **event_base, "error": record.error}
@@ -849,6 +910,17 @@ class AshLoop:
                 record.executed = True
                 record.error = str(exc)
                 self.session_store.save_tool_call(session.session_id, record)
+                self._append_tool_audit(
+                    session,
+                    action_type=_audit_action_for_tool(tool_name),
+                    target_resource=tool_name,
+                    details={
+                        "call_id": record.call_id,
+                        "arguments": record.arguments,
+                        "error": redact_text(str(exc)),
+                    },
+                    result="FAILURE",
+                )
                 self.circuit_breaker.record_failure(tool_name)
                 self.ui.emit_event(
                     {
@@ -870,6 +942,20 @@ class AshLoop:
             record.result = tool_result.output
             record.error = tool_result.error
             self.session_store.save_tool_call(session.session_id, record)
+            self._append_tool_audit(
+                session,
+                action_type=_audit_action_for_tool(tool_name),
+                target_resource=tool_name,
+                details={
+                    "call_id": record.call_id,
+                    "arguments": record.arguments,
+                    "success": tool_result.success,
+                    "output": redact_text(tool_result.output),
+                    "error": redact_text(tool_result.error or ""),
+                    "truncated": tool_result.truncated,
+                },
+                result="SUCCESS" if tool_result.success else "FAILURE",
+            )
             self.ui.emit_event(
                 {
                     "type": "tool.completed",
@@ -917,6 +1003,23 @@ class AshLoop:
                     self._iterations_since_skill_use = 0
 
         return results
+
+    def _append_tool_audit(
+        self,
+        session: Session,
+        *,
+        action_type: AuditAction,
+        target_resource: str,
+        details: dict[str, Any],
+        result: AuditResult,
+    ) -> None:
+        self.session_store.append_audit_log(
+            session.session_id,
+            action_type=action_type,
+            target_resource=target_resource,
+            details=redact_value(details),
+            result=result,
+        )
 
     # --- prompt assembly --------------------------------------------------
 

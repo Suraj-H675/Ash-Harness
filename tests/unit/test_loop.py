@@ -174,6 +174,33 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tool_execution_writes_tamper_evident_audit_log(tmp_path):
+    provider = NativeToolProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    store = SessionStore(tmp_path / "audit.db")
+    loop = AshLoop(
+        store,
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+    )
+
+    session = await loop.start_session()
+    await loop.run_turn("use the capture tool")
+
+    audit = store.list_audit_logs(session.session_id)
+    assert [(row.action_type, row.result) for row in audit] == [
+        ("user_approval", "APPROVED"),
+        ("tool_call", "SUCCESS"),
+    ]
+    assert audit[1].previous_hash == audit[0].sha256_hash
+    assert store.verify_audit_log(session.session_id) == []
+    assert audit[0].details["arguments"] == {"text": "hello"}
+
+
+@pytest.mark.asyncio
 async def test_context_budget_report_enforces_sections(tmp_path):
     provider = BudgetProvider()
     guard = SafetyGuard(project_root=tmp_path)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
@@ -17,7 +18,11 @@ from pydantic import BaseModel, Field
 
 
 Role = Literal["system", "user", "assistant", "tool"]
-CURRENT_SCHEMA_VERSION = 1
+AuditAction = Literal[
+    "tool_call", "command_run", "file_write", "safety_block", "user_approval"
+]
+AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
+CURRENT_SCHEMA_VERSION = 2
 
 
 class SessionStorageError(RuntimeError):
@@ -40,6 +45,18 @@ class ToolCallRecord(BaseModel):
     result: str | None = None
     error: str | None = None
     timestamp: datetime
+
+
+class AuditLogRecord(BaseModel):
+    log_id: int | None = None
+    session_id: str
+    action_type: AuditAction
+    target_resource: str
+    details: dict[str, Any]
+    result: AuditResult
+    timestamp: datetime
+    previous_hash: str = ""
+    sha256_hash: str
 
 
 class Session(BaseModel):
@@ -89,6 +106,46 @@ def _serialize_datetime(value: datetime) -> str:
 
 def _deserialize_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _audit_hash(
+    *,
+    session_id: str,
+    timestamp: datetime,
+    action_type: AuditAction,
+    target_resource: str,
+    details_json: str,
+    result: AuditResult,
+    previous_hash: str,
+) -> str:
+    payload = {
+        "session_id": session_id,
+        "timestamp": _serialize_datetime(timestamp),
+        "action_type": action_type,
+        "target_resource": target_resource,
+        "details_json": details_json,
+        "result": result,
+        "previous_hash": previous_hash,
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _audit_record_from_row(row: sqlite3.Row) -> "AuditLogRecord":
+    return AuditLogRecord(
+        log_id=int(row["log_id"]),
+        session_id=str(row["session_id"]),
+        action_type=row["action_type"],
+        target_resource=str(row["target_resource"]),
+        details=json.loads(str(row["details_json"])),
+        result=row["result"],
+        timestamp=_deserialize_datetime(str(row["timestamp"])),
+        previous_hash=str(row["previous_hash"] or ""),
+        sha256_hash=str(row["sha256_hash"] or ""),
+    )
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
@@ -183,41 +240,55 @@ class SessionStore:
         """
 
         with closing(get_db_connection(self.db_path)) as conn, conn:
-            if from_version >= 1:
-                return
-            # Sessions columns
-            for col_spec in (
-                ("total_tokens", "INTEGER DEFAULT 0"),
-                ("total_cost_inr", "REAL DEFAULT 0"),
-                ("total_cost_usd", "REAL DEFAULT 0"),
-                ("total_prompt_tokens", "INTEGER DEFAULT 0"),
-                ("total_completion_tokens", "INTEGER DEFAULT 0"),
-                ("title", "TEXT DEFAULT ''"),
-                ("updated_at", "TIMESTAMP"),
-                ("context_summary", "TEXT DEFAULT ''"),
-                ("model", "TEXT DEFAULT ''"),
-            ):
-                col_name, col_type = col_spec
-                if not _column_exists(conn, "sessions", col_name):
-                    conn.execute(
-                        f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}"
-                    )
+            if from_version < 1:
+                self._migrate_v1(conn)
+            if from_version < 2:
+                self._migrate_v2(conn)
 
-            # Messages columns
-            for col_spec in (
-                ("token_count", "INTEGER DEFAULT 0"),
-                ("prompt_tokens", "INTEGER DEFAULT 0"),
-                ("completion_tokens", "INTEGER DEFAULT 0"),
-            ):
-                col_name, col_type = col_spec
-                if not _column_exists(conn, "messages", col_name):
-                    conn.execute(
-                        f"ALTER TABLE messages ADD COLUMN {col_name} {col_type}"
-                    )
+    def _migrate_v1(self, conn: sqlite3.Connection) -> None:
+        """Migrate databases created before explicit schema tracking."""
+
+        # Sessions columns
+        for col_spec in (
+            ("total_tokens", "INTEGER DEFAULT 0"),
+            ("total_cost_inr", "REAL DEFAULT 0"),
+            ("total_cost_usd", "REAL DEFAULT 0"),
+            ("total_prompt_tokens", "INTEGER DEFAULT 0"),
+            ("total_completion_tokens", "INTEGER DEFAULT 0"),
+            ("title", "TEXT DEFAULT ''"),
+            ("updated_at", "TIMESTAMP"),
+            ("context_summary", "TEXT DEFAULT ''"),
+            ("model", "TEXT DEFAULT ''"),
+        ):
+            col_name, col_type = col_spec
+            if not _column_exists(conn, "sessions", col_name):
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}")
+
+        # Messages columns
+        for col_spec in (
+            ("token_count", "INTEGER DEFAULT 0"),
+            ("prompt_tokens", "INTEGER DEFAULT 0"),
+            ("completion_tokens", "INTEGER DEFAULT 0"),
+        ):
+            col_name, col_type = col_spec
+            if not _column_exists(conn, "messages", col_name):
+                conn.execute(f"ALTER TABLE messages ADD COLUMN {col_name} {col_type}")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (1, _serialize_datetime(_utc_now())),
+        )
+
+    def _migrate_v2(self, conn: sqlite3.Connection) -> None:
+        """Add tamper-evident audit-log chaining metadata."""
+
+        if not _column_exists(conn, "audit_logs", "previous_hash"):
             conn.execute(
-                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (CURRENT_SCHEMA_VERSION, _serialize_datetime(_utc_now())),
+                "ALTER TABLE audit_logs ADD COLUMN previous_hash TEXT DEFAULT ''"
             )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (2, _serialize_datetime(_utc_now())),
+        )
 
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
@@ -321,7 +392,8 @@ class SessionStore:
                         'SUCCESS',
                         'FAILURE'
                     )),
-                    sha256_hash TEXT
+                    sha256_hash TEXT,
+                    previous_hash TEXT DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_logs(session_id);
@@ -942,6 +1014,121 @@ class SessionStore:
                     _serialize_datetime(record.timestamp),
                 ),
             )
+
+    def append_audit_log(
+        self,
+        session_id: str,
+        *,
+        action_type: AuditAction,
+        target_resource: str,
+        details: dict[str, Any],
+        result: AuditResult,
+        timestamp: datetime | None = None,
+    ) -> AuditLogRecord:
+        """Append one tamper-evident audit event for a session."""
+
+        event_time = timestamp or _utc_now()
+        details_json = _canonical_json(details)
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            previous_row = conn.execute(
+                """
+                SELECT sha256_hash FROM audit_logs
+                WHERE session_id = ?
+                ORDER BY log_id DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            previous_hash = (
+                str(previous_row["sha256_hash"])
+                if previous_row is not None and previous_row["sha256_hash"]
+                else ""
+            )
+            event_hash = _audit_hash(
+                session_id=session_id,
+                timestamp=event_time,
+                action_type=action_type,
+                target_resource=target_resource,
+                details_json=details_json,
+                result=result,
+                previous_hash=previous_hash,
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO audit_logs (
+                    session_id,
+                    timestamp,
+                    action_type,
+                    target_resource,
+                    details_json,
+                    result,
+                    sha256_hash,
+                    previous_hash
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    _serialize_datetime(event_time),
+                    action_type,
+                    target_resource,
+                    details_json,
+                    result,
+                    event_hash,
+                    previous_hash,
+                ),
+            )
+            return AuditLogRecord(
+                log_id=int(cursor.lastrowid or 0),
+                session_id=session_id,
+                action_type=action_type,
+                target_resource=target_resource,
+                details=json.loads(details_json),
+                result=result,
+                timestamp=event_time,
+                previous_hash=previous_hash,
+                sha256_hash=event_hash,
+            )
+
+    def list_audit_logs(self, session_id: str) -> list[AuditLogRecord]:
+        """Return audit log records for a session in append order."""
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            rows = conn.execute(
+                """
+                SELECT log_id, session_id, timestamp, action_type, target_resource,
+                       details_json, result, sha256_hash, previous_hash
+                FROM audit_logs
+                WHERE session_id = ?
+                ORDER BY log_id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+        return [_audit_record_from_row(row) for row in rows]
+
+    def verify_audit_log(self, session_id: str) -> list[str]:
+        """Return integrity errors for a session audit chain."""
+
+        errors: list[str] = []
+        previous_hash = ""
+        for record in self.list_audit_logs(session_id):
+            if record.previous_hash != previous_hash:
+                errors.append(
+                    f"audit log {record.log_id} previous_hash mismatch"
+                )
+            expected_hash = _audit_hash(
+                session_id=record.session_id,
+                timestamp=record.timestamp,
+                action_type=record.action_type,
+                target_resource=record.target_resource,
+                details_json=_canonical_json(record.details),
+                result=record.result,
+                previous_hash=record.previous_hash,
+            )
+            if record.sha256_hash != expected_hash:
+                errors.append(f"audit log {record.log_id} sha256_hash mismatch")
+            previous_hash = record.sha256_hash
+        return errors
 
     # --- sprint + checklist persistence (Sprint 12 / V5) ---------------
 
