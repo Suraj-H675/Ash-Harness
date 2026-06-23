@@ -146,7 +146,7 @@ Research is clean-room: proprietary or leaked source is not used.
 
 | Capability | Ash status | Required production behavior |
 |---|---|---|
-| Read file/ranges | Partial | Encoding, binary/media handling, stable truncation metadata |
+| Read file/ranges | Partial | UTF-8 text reads, binary blocking, and stable truncation metadata exist; broader encoding/media handling remains |
 | Write/create file | Partial | Atomic write, permissions, newline/encoding preservation |
 | Exact replace/edit | Partial | Multiple edits, conflict diagnostics, stale-read protection |
 | Patch application | Verified locally | Validated multi-file Git patch with dry-run and atomic check/apply |
