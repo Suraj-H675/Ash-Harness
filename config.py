@@ -62,6 +62,19 @@ class AshConfig(BaseSettings):
         ge=2,
         description="Recent messages retained verbatim during compaction.",
     )
+    context_budget_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "system": 0.20,
+            "tools": 0.15,
+            "history": 0.45,
+            "repo_map": 0.10,
+            "memory": 0.10,
+        },
+        description=(
+            "Relative provider-input budget weights for system, tools, "
+            "history, repo_map, and memory context."
+        ),
+    )
 
     safety_tier: str = Field(
         "interactive",
@@ -191,6 +204,15 @@ class AshConfig(BaseSettings):
         except ValueError as exc:
             allowed = ", ".join(mode.value for mode in PermissionMode)
             raise ValueError(f"safety_tier must be one of: {allowed}") from exc
+
+    @field_validator("context_budget_weights")
+    @classmethod
+    def validate_context_budget_weights(
+        cls, value: dict[str, float]
+    ) -> dict[str, float]:
+        from context.history import normalize_context_budget_weights
+
+        return normalize_context_budget_weights(value)
 
     @field_validator("input_mode")
     @classmethod

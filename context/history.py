@@ -7,6 +7,40 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 
+DEFAULT_CONTEXT_BUDGET_WEIGHTS: dict[str, float] = {
+    "system": 0.20,
+    "tools": 0.15,
+    "history": 0.45,
+    "repo_map": 0.10,
+    "memory": 0.10,
+}
+
+
+@dataclass(frozen=True)
+class ContextBudgetSlice:
+    name: str
+    limit: int
+    used: int = 0
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class ContextBudgetReport:
+    """Per-turn token budget accounting for provider input construction."""
+
+    maximum: int
+    completion_reserve: int
+    input_limit: int
+    slices: dict[str, ContextBudgetSlice]
+
+
+@dataclass(frozen=True)
+class BoundedText:
+    text: str
+    tokens: int
+    truncated: bool
+
+
 @dataclass(frozen=True)
 class CompactionResult:
     messages: list[dict[str, Any]]
@@ -15,6 +49,130 @@ class CompactionResult:
     estimated_tokens: int
     removed_messages: int = 0
     pruned_tool_outputs: int = 0
+
+
+class ContextBudgetAllocator:
+    """Allocate and enforce deterministic input budgets across context sections."""
+
+    def __init__(
+        self,
+        *,
+        max_context_tokens: int,
+        completion_reserve: int,
+        weights: dict[str, float] | None = None,
+    ) -> None:
+        if max_context_tokens < 1:
+            raise ValueError("max_context_tokens must be positive")
+        if completion_reserve < 0 or completion_reserve >= max_context_tokens:
+            raise ValueError("completion_reserve must be below the context limit")
+        self.max_context_tokens = max_context_tokens
+        self.completion_reserve = completion_reserve
+        self.weights = normalize_context_budget_weights(weights)
+
+    @property
+    def input_limit(self) -> int:
+        return max(1, self.max_context_tokens - self.completion_reserve)
+
+    def allocate(self) -> dict[str, int]:
+        remaining = self.input_limit
+        budgets: dict[str, int] = {}
+        items = list(self.weights.items())
+        for index, (name, weight) in enumerate(items):
+            if index == len(items) - 1:
+                limit = remaining
+            else:
+                limit = max(1, int(self.input_limit * weight))
+                limit = min(limit, max(1, remaining - (len(items) - index - 1)))
+            budgets[name] = limit
+            remaining -= limit
+        return budgets
+
+    def fit_text(
+        self,
+        text: str,
+        *,
+        limit: int,
+        count_tokens: Callable[[str], int],
+    ) -> BoundedText:
+        tokens = max(0, int(count_tokens(text)))
+        if tokens <= limit:
+            return BoundedText(text=text, tokens=tokens, truncated=False)
+        marker = (
+            "\n\n[context section truncated by Ash budget manager; "
+            f"original_tokens~{tokens}; budget={limit}]"
+        )
+        marker_tokens = max(0, int(count_tokens(marker)))
+        if marker_tokens >= limit:
+            compact_marker = f"[truncated; original_tokens~{tokens}]"
+            compact_tokens = max(0, int(count_tokens(compact_marker)))
+            if compact_tokens <= limit:
+                return BoundedText(
+                    text=compact_marker,
+                    tokens=compact_tokens,
+                    truncated=True,
+                )
+            return BoundedText(text="", tokens=0, truncated=True)
+
+        low = 0
+        high = len(text)
+        best = ""
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = text[:mid].rstrip() + marker
+            candidate_tokens = max(0, int(count_tokens(candidate)))
+            if candidate_tokens <= limit:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        final_tokens = max(0, int(count_tokens(best or marker.strip())))
+        return BoundedText(
+            text=best or marker.strip(),
+            tokens=final_tokens,
+            truncated=True,
+        )
+
+    def report(
+        self,
+        *,
+        limits: dict[str, int],
+        usage: dict[str, int],
+        truncated: set[str] | None = None,
+    ) -> ContextBudgetReport:
+        truncated = truncated or set()
+        slices = {
+            name: ContextBudgetSlice(
+                name=name,
+                limit=limits.get(name, 0),
+                used=usage.get(name, 0),
+                truncated=name in truncated,
+            )
+            for name in limits
+        }
+        return ContextBudgetReport(
+            maximum=self.max_context_tokens,
+            completion_reserve=self.completion_reserve,
+            input_limit=self.input_limit,
+            slices=slices,
+        )
+
+
+def normalize_context_budget_weights(
+    weights: dict[str, float] | None,
+) -> dict[str, float]:
+    source = dict(DEFAULT_CONTEXT_BUDGET_WEIGHTS)
+    if weights:
+        unknown = set(weights) - set(source)
+        if unknown:
+            names = ", ".join(sorted(unknown))
+            raise ValueError(f"unknown context budget bucket(s): {names}")
+        source.update(weights)
+    if any(value < 0 for value in source.values()):
+        raise ValueError("context budget weights must be non-negative")
+    total = sum(source.values())
+    if total <= 0:
+        raise ValueError("at least one context budget weight must be positive")
+    return {name: value / total for name, value in source.items()}
 
 
 class HistoryCompactor:
@@ -34,6 +192,7 @@ class HistoryCompactor:
         recent_messages: int = 12,
         summary_char_limit: int = 12_000,
         max_tool_output_chars: int = 8_000,
+        input_token_limit: int | None = None,
     ) -> None:
         if max_context_tokens < 1:
             raise ValueError("max_context_tokens must be positive")
@@ -47,9 +206,14 @@ class HistoryCompactor:
         self.recent_messages = max(2, recent_messages)
         self.summary_char_limit = summary_char_limit
         self.max_tool_output_chars = max(256, max_tool_output_chars)
+        if input_token_limit is not None and input_token_limit < 1:
+            raise ValueError("input_token_limit must be positive")
+        self._input_token_limit = input_token_limit
 
     @property
     def input_limit(self) -> int:
+        if self._input_token_limit is not None:
+            return self._input_token_limit
         usable = self.max_context_tokens - self.completion_reserve
         return max(1, int(usable * self.threshold))
 

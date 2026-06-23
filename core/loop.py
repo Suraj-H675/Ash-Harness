@@ -266,6 +266,7 @@ class AshLoop:
             )
         self._config = config
         self._last_context_tokens = 0
+        self._last_context_budget: Any | None = None
         self.skill_nudge_interval = skill_nudge_interval
         self._iterations_since_skill_use = 0
         self.continuous_mode = continuous_mode
@@ -621,6 +622,20 @@ class AshLoop:
                 }
             )
         return result
+
+    def _estimate_tool_schema_tokens(self) -> int:
+        """Estimate tool declaration tokens reserved outside chat messages."""
+
+        if not self.tools:
+            return 0
+        if _provider_capabilities(self.provider).native_tools:
+            payload: Any = self._tools_to_openai_format(self.tools)
+        else:
+            payload = [
+                {"name": tool.name, "description": getattr(tool, "description", "")}
+                for tool in self.tools.values()
+            ]
+        return max(0, int(self.provider.count_tokens(json.dumps(payload, default=str))))
 
     async def _stream_one_completion(
         self,
@@ -1025,6 +1040,7 @@ class AshLoop:
         """Build the messages payload for the provider."""
 
         system_content = self.system_prompt
+        repo_section = ""
         if self.repo_map is not None:
             # Rank against any workspace files touched in this turn so far
             # (best-effort: just the user message we just persisted).
@@ -1036,37 +1052,97 @@ class AshLoop:
                 )
             except Exception as exc:  # noqa: BLE001 — repo map is best-effort
                 repo_section = f"(repo map unavailable: {exc})"
-            system_content = f"{system_content}\n\n{repo_section}"
 
+        memory_section = ""
         if self._pending_memory_context:
-            system_content = f"{system_content}\n\n## Relevant Context\n{self._pending_memory_context}"
+            memory_section = f"## Relevant Context\n{self._pending_memory_context}"
 
-        messages: list[dict[str, Any]] = [{"role": "system", "content": system_content}]
-        for message in session.messages:
-            msg_dict: dict[str, Any] = {
-                "role": message.role,
-                "content": message.content,
-            }
-            if message.role == "assistant" and message.metadata.get("tool_calls"):
-                msg_dict["tool_calls"] = message.metadata["tool_calls"]
-            # OpenAI requires tool_call_id on role=tool messages.
-            if message.role == "tool" and message.metadata.get("call_id"):
-                msg_dict["tool_call_id"] = message.metadata["call_id"]
-            messages.append(msg_dict)
         if self._config is not None:
-            from context.history import HistoryCompactor
+            from context.history import ContextBudgetAllocator, HistoryCompactor
 
             maximum_context = min(
                 self._config.max_context_tokens,
                 _provider_capabilities(self.provider).context_window
                 or self._config.max_context_tokens,
             )
+            allocator = ContextBudgetAllocator(
+                max_context_tokens=maximum_context,
+                completion_reserve=self._config.max_completion_tokens,
+                weights=self._config.context_budget_weights,
+            )
+            budget_limits = allocator.allocate()
+            budget_usage: dict[str, int] = {}
+            truncated: set[str] = set()
+
+            tool_schema_tokens = self._estimate_tool_schema_tokens()
+            budget_usage["tools"] = tool_schema_tokens
+
+            system_fit = allocator.fit_text(
+                system_content,
+                limit=budget_limits["system"],
+                count_tokens=self.provider.count_tokens,
+            )
+            budget_usage["system"] = system_fit.tokens
+            if system_fit.truncated:
+                truncated.add("system")
+            system_parts = [system_fit.text]
+
+            if repo_section:
+                repo_fit = allocator.fit_text(
+                    repo_section,
+                    limit=budget_limits["repo_map"],
+                    count_tokens=self.provider.count_tokens,
+                )
+                budget_usage["repo_map"] = repo_fit.tokens
+                if repo_fit.truncated:
+                    truncated.add("repo_map")
+                system_parts.append(repo_fit.text)
+            else:
+                budget_usage["repo_map"] = 0
+
+            if memory_section:
+                memory_fit = allocator.fit_text(
+                    memory_section,
+                    limit=budget_limits["memory"],
+                    count_tokens=self.provider.count_tokens,
+                )
+                budget_usage["memory"] = memory_fit.tokens
+                if memory_fit.truncated:
+                    truncated.add("memory")
+                system_parts.append(memory_fit.text)
+            else:
+                budget_usage["memory"] = 0
+
+            system_content = "\n\n".join(part for part in system_parts if part)
+            messages: list[dict[str, Any]] = [
+                {"role": "system", "content": system_content}
+            ]
+            for message in session.messages:
+                msg_dict: dict[str, Any] = {
+                    "role": message.role,
+                    "content": message.content,
+                }
+                if message.role == "assistant" and message.metadata.get("tool_calls"):
+                    msg_dict["tool_calls"] = message.metadata["tool_calls"]
+                # OpenAI requires tool_call_id on role=tool messages.
+                if message.role == "tool" and message.metadata.get("call_id"):
+                    msg_dict["tool_call_id"] = message.metadata["call_id"]
+                messages.append(msg_dict)
+
+            reserved_tokens = (
+                budget_usage["system"]
+                + budget_usage["repo_map"]
+                + budget_usage["memory"]
+                + budget_usage["tools"]
+            )
+            provider_input_limit = max(1, allocator.input_limit - tool_schema_tokens)
             compactor = HistoryCompactor(
                 max_context_tokens=maximum_context,
                 completion_reserve=self._config.max_completion_tokens,
                 threshold=self._config.context_compaction_threshold,
                 recent_messages=self._config.context_recent_messages,
                 max_tool_output_chars=self._config.max_tool_result_tokens * 4,
+                input_token_limit=provider_input_limit,
             )
             result = compactor.compact(
                 messages,
@@ -1075,6 +1151,16 @@ class AshLoop:
                 force=force_compaction,
             )
             self._last_context_tokens = result.estimated_tokens
+            budget_usage["history"] = max(0, result.estimated_tokens - reserved_tokens)
+            if budget_usage["history"] > budget_limits["history"]:
+                truncated.add("history")
+            self._last_context_budget = allocator.report(
+                limits=budget_limits,
+                usage=budget_usage,
+                truncated=truncated,
+            )
+            if self.turn_context is not None:
+                self.turn_context.set("context_budget", self._last_context_budget)
             self.ui.update_token_count(
                 result.estimated_tokens,
                 max(1, maximum_context - self._config.max_completion_tokens),
@@ -1086,6 +1172,21 @@ class AshLoop:
                     result.summary,
                 )
             return result.messages
+        messages = [{"role": "system", "content": system_content}]
+        if repo_section:
+            messages[0]["content"] = f"{messages[0]['content']}\n\n{repo_section}"
+        if memory_section:
+            messages[0]["content"] = f"{messages[0]['content']}\n\n{memory_section}"
+        for message in session.messages:
+            msg_dict = {
+                "role": message.role,
+                "content": message.content,
+            }
+            if message.role == "assistant" and message.metadata.get("tool_calls"):
+                msg_dict["tool_calls"] = message.metadata["tool_calls"]
+            if message.role == "tool" and message.metadata.get("call_id"):
+                msg_dict["tool_call_id"] = message.metadata["call_id"]
+            messages.append(msg_dict)
         return messages
 
     def compact_current_context(self) -> tuple[int, bool]:

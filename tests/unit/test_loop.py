@@ -1,9 +1,13 @@
 # tests/unit/test_loop.py
 import pytest
+from datetime import datetime, timezone
 from core.loop import AshLoop
 from tools.base import BaseTool, ToolResult, ToolMiddleware, ToolMiddlewareSkip
-from core.session import SessionStore
+from config import AshConfig
+from context.turn import TurnContext
+from core.session import Message, SessionStore
 from providers.base import ProviderABC, StreamChunk
+from providers.capabilities import ProviderCapabilities
 from safety.guard import SafetyGuard
 from ui.terminal import TerminalUI
 from tools.filesystem import ReadFileTool
@@ -93,6 +97,34 @@ class CaptureTool(BaseTool):
         return ToolResult(success=True, output=kwargs["text"])
 
 
+class BudgetTool(BaseTool):
+    name = "budget_tool"
+    description = "tool " * 80
+    args_schema = None
+
+    async def run(self, **kwargs):
+        return ToolResult(success=True, output="ok")
+
+
+class BudgetProvider(ProviderABC):
+    model_name = "budget-test"
+    capabilities = ProviderCapabilities(native_tools=True, context_window=200)
+
+    def count_tokens(self, text):
+        return len(str(text).split())
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        yield StreamChunk(content="done", is_done=True)
+
+
+class LargeRepoMap:
+    def rank(self, active):
+        return active
+
+    def render(self, ranked, top_files=5, symbols_per_file=6):
+        return "repo " * 120
+
+
 class EventUI(TerminalUI):
     def __init__(self, safety_tier="auto_approve"):
         super().__init__(safety_tier=safety_tier)
@@ -139,6 +171,58 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
         "tool.completed",
     ]
     assert ui.events[-1]["output"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_context_budget_report_enforces_sections(tmp_path):
+    provider = BudgetProvider()
+    guard = SafetyGuard(project_root=tmp_path)
+    turn_context = TurnContext(session_id="pending", turn_id="turn-1")
+    loop = AshLoop(
+        SessionStore(tmp_path / "budget.db"),
+        provider,
+        guard,
+        EventUI(),
+        tmp_path,
+        tools={"budget_tool": BudgetTool(guard)},
+        system_prompt="system " * 120,
+        repo_map=LargeRepoMap(),
+        turn_context=turn_context,
+        config=AshConfig(
+            model="openai/budget-test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            max_context_tokens=200,
+            max_completion_tokens=20,
+            memory_backend="off",
+            context_budget_weights={
+                "system": 0.10,
+                "tools": 0.20,
+                "history": 0.50,
+                "repo_map": 0.10,
+                "memory": 0.10,
+            },
+        ),
+    )
+    session = await loop.start_session()
+    session.messages.append(
+        Message(
+            role="user",
+            content="history " * 200,
+            timestamp=datetime.now(timezone.utc),
+        )
+    )
+    loop._pending_memory_context = "memory " * 120
+
+    messages = loop._build_messages(session)
+    budget = turn_context.get("context_budget")
+
+    assert budget is loop._last_context_budget
+    assert budget.slices["tools"].used > 0
+    assert budget.slices["system"].truncated is True
+    assert budget.slices["repo_map"].truncated is True
+    assert budget.slices["memory"].truncated is True
+    assert "context section truncated" in messages[0]["content"]
 
 
 @pytest.mark.asyncio

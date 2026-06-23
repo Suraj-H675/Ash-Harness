@@ -1,4 +1,6 @@
-from context.history import HistoryCompactor
+import pytest
+
+from context.history import ContextBudgetAllocator, HistoryCompactor
 
 
 def count_words(text: str) -> int:
@@ -90,3 +92,39 @@ def test_stale_large_tool_output_is_pruned_without_mutating_transcript() -> None
     assert result.pruned_tool_outputs == 1
     assert "call_id=call-old" in result.messages[2]["content"]
     assert messages[2]["content"] == large
+
+
+def test_context_budget_allocator_normalizes_and_fits_text() -> None:
+    allocator = ContextBudgetAllocator(
+        max_context_tokens=100,
+        completion_reserve=10,
+        weights={
+            "system": 1,
+            "tools": 1,
+            "history": 2,
+            "repo_map": 1,
+            "memory": 1,
+        },
+    )
+
+    limits = allocator.allocate()
+    assert sum(limits.values()) == 90
+    assert limits["history"] > limits["system"]
+
+    bounded = allocator.fit_text("word " * 100, limit=12, count_tokens=count_words)
+    assert bounded.truncated is True
+    assert bounded.tokens <= 12
+    assert "context section truncated" in bounded.text
+
+    tiny = allocator.fit_text("word " * 100, limit=1, count_tokens=count_words)
+    assert tiny.truncated is True
+    assert tiny.tokens <= 1
+
+
+def test_context_budget_allocator_rejects_invalid_weights() -> None:
+    with pytest.raises(ValueError, match="unknown context budget bucket"):
+        ContextBudgetAllocator(
+            max_context_tokens=100,
+            completion_reserve=10,
+            weights={"unknown": 1},
+        )
