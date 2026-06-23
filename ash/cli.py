@@ -666,6 +666,18 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 for path, error in catalog.errors.items():
                     print(f"Invalid plugin {path}: {error}", file=sys.stderr)
                 continue
+            if command.name == "hooks":
+                from cli.extensions import (
+                    discover_extensions,
+                    render_extension_inventory,
+                )
+
+                inventory = discover_extensions(loop.project_root)
+                print(
+                    render_extension_inventory(inventory, kind="hooks"),
+                    flush=True,
+                )
+                continue
             if command.name == "commands":
                 if not discovered_commands:
                     print("No custom commands discovered.")
@@ -1039,6 +1051,16 @@ def main(argv: list[str] | None = None) -> int:
     permissions_clear = permissions_subparsers.add_parser("clear")
     permissions_clear.add_argument("--yes", action="store_true")
     permissions_clear.add_argument("--json", action="store_true")
+    extensions_parser = subparsers.add_parser(
+        "extensions", help="Inspect trusted skills, plugins, and hooks"
+    )
+    extensions_parser.add_argument(
+        "kind",
+        nargs="?",
+        choices=["all", "skills", "plugins", "hooks"],
+        default="all",
+    )
+    extensions_parser.add_argument("--json", action="store_true")
     serve_parser = subparsers.add_parser(
         "serve", help="Run the authenticated local Ash HTTP API"
     )
@@ -1374,6 +1396,20 @@ def main(argv: list[str] | None = None) -> int:
                 workspace,
                 grants,
                 json_output=getattr(args, "json", False),
+            )
+        )
+        return 0
+
+    if args.command == "extensions":
+        from cli.extensions import discover_extensions, render_extension_inventory
+
+        extension_config = AshConfig.load()
+        inventory = discover_extensions(extension_config.workspace_root)
+        print(
+            render_extension_inventory(
+                inventory,
+                kind=args.kind,
+                json_output=args.json,
             )
         )
         return 0

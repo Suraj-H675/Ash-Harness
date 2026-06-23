@@ -28,3 +28,4 @@ def test_help_lists_core_session_commands() -> None:
     assert "/status" in rendered
     assert "/review [worktree|staged|commit REF|branch BASE]" in rendered
     assert "/plan [on|off]" in rendered
+    assert "/hooks" in rendered

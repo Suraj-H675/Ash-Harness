@@ -41,6 +41,7 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("plan", "Toggle editable sprint planning", "/plan [on|off]"),
     SlashCommand("skills", "List available instruction skills", "/skills [query]"),
     SlashCommand("plugins", "List discovered declarative plugins", "/plugins"),
+    SlashCommand("hooks", "List trusted command hook configs", "/hooks"),
     SlashCommand("commands", "List custom Markdown commands", "/commands"),
     SlashCommand("agents", "Show or stop subagents", "/agents [stop AGENT_ID]"),
     SlashCommand("diff", "Show the current Git diff", "/diff [--staged] [path]"),
