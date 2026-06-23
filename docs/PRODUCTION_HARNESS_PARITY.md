@@ -87,7 +87,7 @@ Research is clean-room: proprietary or leaked source is not used.
 |---|---|---|
 | Durable sessions | Verified locally | SQLite schema migrations, lifecycle, integrity checks, backup, and restore |
 | Resume by ID | Verified locally | Restores existing durable sessions and reports a classified session error for missing ids |
-| Session picker/list/search | Partial | Recent cwd-scoped session list with model/title/query; full-screen picker remains |
+| Session picker/list/search | Partial | Slash and top-level cwd-scoped session list/search are verified with JSON output; full-screen picker remains |
 | Session naming | Verified locally | Rename and stable persisted display names |
 | Fork session | Verified locally | New durable session from a selected message boundary |
 | Rewind conversation | Partial | Transcript rewind is durable; combined transcript-plus-file rewind remains |
