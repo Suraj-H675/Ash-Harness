@@ -40,7 +40,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | API-key providers | Partial | Anthropic, OpenAI, Groq, DeepSeek and custom endpoints tested from fresh process |
 | Local models | Partial | Ollama discovery, health checks, pull guidance, tool-capability detection |
 | Custom endpoints | Verified locally | Per-provider credentials are stored in mode-0600 env storage, not TOML |
-| Config precedence | Partial | CLI > env > project > user > defaults, with an explain command |
+| Config precedence | Partial | `ash config explain` shows env/dotenv/TOML/default sources; project config and full CLI override reporting remain |
 | Config migration | Partial | Legacy file migration exists; explicit config schema versions and backups remain |
 | `ash doctor` | Verified locally | Human/JSON diagnostics; optional endpoint connectivity probe |
 | Update/version check | Verified locally | Explicit GitHub release check with no background telemetry or self-modification |
