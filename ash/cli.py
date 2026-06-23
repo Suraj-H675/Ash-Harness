@@ -288,6 +288,16 @@ def _print_model_list(config: AshConfig) -> None:
     print()
 
 
+def _render_context_budget(report: Any | None) -> str:
+    if report is None:
+        return ""
+    lines = ["Budget:"]
+    for name, item in report.slices.items():
+        suffix = " truncated" if item.truncated else ""
+        lines.append(f"  {name}: ~{item.used}/{item.limit}{suffix}")
+    return "\n".join(lines)
+
+
 def _interactive_model_picker(config: AshConfig, loop: AshLoop) -> None:
     """Show models grouped by provider, let user pick by provider number."""
     # Determine current
@@ -597,9 +607,12 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 has_summary = bool(
                     loop.current_session and loop.current_session.context_summary
                 )
+                budget = _render_context_budget(loop._last_context_budget)
+                budget_suffix = f"\n{budget}" if budget else ""
                 print(
                     f"Context: ~{loop._last_context_tokens}/{maximum} input tokens; "
-                    f"summary={'yes' if has_summary else 'no'}",
+                    f"summary={'yes' if has_summary else 'no'}"
+                    f"{budget_suffix}",
                     flush=True,
                 )
                 continue
