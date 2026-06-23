@@ -148,7 +148,7 @@ Research is clean-room: proprietary or leaked source is not used.
 |---|---|---|
 | Read file/ranges | Partial | UTF-8 text reads, binary blocking, and stable truncation metadata exist; broader encoding/media handling remains |
 | Write/create file | Partial | Atomic UTF-8 writes preserve supplied newlines and validate path/permissions; broader encoding preservation remains |
-| Exact replace/edit | Partial | Multiple edits, conflict diagnostics, stale-read protection |
+| Exact replace/edit | Partial | Bounded exact replacement has diff diagnostics and optional stale-read SHA-256 protection; multiple edits remain |
 | Patch application | Verified locally | Validated multi-file Git patch with dry-run and atomic check/apply |
 | List/glob files | Verified locally | Bounded production tools with workspace scoping |
 | Text/regex search | Verified locally | Ripgrep-backed bounded search with Python fallback |
