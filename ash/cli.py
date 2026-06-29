@@ -34,6 +34,10 @@ from tools.filesystem import (
 )
 from tools.git import AutoCommitTool, GitDiffTool, GitLogTool, GitStatusTool
 from ui.terminal import TerminalUI
+from ash_logging import get_logger
+
+
+_log = get_logger(__name__)
 
 
 KNOWN_PROVIDERS = frozenset(
@@ -249,6 +253,24 @@ def _build_tools(
             )
         )
     return {tool.name: tool for tool in tools}
+
+
+def _build_repo_map(config: AshConfig):
+    """Build the optional repository map without making startup depend on indexing."""
+
+    if not config.repo_map_enabled:
+        return None
+    from repo.repomap import RepoMap
+
+    try:
+        return RepoMap(
+            config.workspace_root,
+            max_files=config.repo_map_max_files,
+            exclude_patterns=config.repo_map_exclude_patterns,
+        )
+    except OSError as exc:
+        _log.warning("repository map unavailable: {}", exc)
+        return None
 
 
 def _print_model_list(config: AshConfig) -> None:
@@ -1785,6 +1807,7 @@ def main(argv: list[str] | None = None) -> int:
         safety_guard=safety_guard,
         ui=ui,
         project_root=config.workspace_root,
+        repo_map=_build_repo_map(config),
         tools=tools,
         hooks=hooks,
         additional_instructions=instruction_text,

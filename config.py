@@ -167,6 +167,16 @@ class AshConfig(BaseSettings):
         ],
         description="Glob patterns to exclude from RepoMap analysis.",
     )
+    repo_map_enabled: bool = Field(
+        True,
+        description="Build and inject a repository symbol map into model context.",
+    )
+    repo_map_max_files: int = Field(
+        500,
+        ge=1,
+        le=10_000,
+        description="Maximum source files indexed by the repository map.",
+    )
     memory_backend: str = Field(
         "auto",
         description="Memory backend: auto, chroma, fts5, or off.",

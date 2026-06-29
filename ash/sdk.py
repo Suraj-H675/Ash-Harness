@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
-from ash.cli import _build_provider, _build_tools
+from ash.cli import _build_provider, _build_repo_map, _build_tools
 from config import AshConfig
 from core.checkpoints import FileCheckpointMiddleware
 from core.loop import AshLoop
@@ -84,6 +84,7 @@ class AshClient:
             safety_guard=guard,
             ui=HeadlessUI(output_format="text", stream=io.StringIO()),
             project_root=runtime_config.workspace_root,
+            repo_map=_build_repo_map(runtime_config),
             tools=tools,
             config=runtime_config,
             planner=(

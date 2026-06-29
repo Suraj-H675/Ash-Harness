@@ -45,12 +45,26 @@ async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
     )
     client = await AshClient.create(config=config, provider=SDKProvider())
     try:
+        assert client.loop.repo_map is not None
         result = await client.prompt("hello")
         assert result.response == "sdk response"
         assert result.session_id
         assert client.sessions()[0].session_id == result.session_id
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_can_disable_repository_map(tmp_path) -> None:
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+    async with await AshClient.create(config=config, provider=SDKProvider()) as client:
+        assert client.loop.repo_map is None
 
 
 @pytest.mark.asyncio
