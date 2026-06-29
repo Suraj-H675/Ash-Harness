@@ -1,7 +1,7 @@
 """Repository map and Personalized PageRank (PPR) for Ash context.
 
 Given a workspace, the map:
-  1. Walks Python files, parses each with the tree-sitter
+  1. Walks supported source files, parses each with the tree-sitter
      :class:`~ash.repo.parser.SymbolExtractor`, and records every
      class/function/method/import symbol.
   2. Builds a file-level dependency graph: an edge ``A -> B`` means some
@@ -23,11 +23,7 @@ from typing import Iterable
 
 import numpy as np
 
-from repo.parser import Symbol, SymbolExtractor
-
-
-# Top-level file extensions we treat as parseable Python source.
-PYTHON_SUFFIXES = {".py", ".pyi"}
+from repo.parser import SOURCE_SUFFIXES, Symbol, SymbolExtractor
 
 # Folders that should never be descended into when building a repo map.
 DEFAULT_IGNORED_DIRS = frozenset(
@@ -63,6 +59,8 @@ class FileNode:
 def _normalize_module_name(path: Path, project_root: Path) -> str | None:
     """Turn a workspace path into a dotted module name when possible."""
 
+    if path.suffix.casefold() not in {".py", ".pyi"}:
+        return None
     try:
         relative = path.relative_to(project_root)
     except ValueError:
@@ -75,7 +73,7 @@ def _normalize_module_name(path: Path, project_root: Path) -> str | None:
     return ".".join(parts)
 
 
-def _discover_python_files(
+def _discover_source_files(
     project_root: Path,
     *,
     ignored_dirs: frozenset[str] = DEFAULT_IGNORED_DIRS,
@@ -91,7 +89,7 @@ def _discover_python_files(
             if entry.name in ignored_dirs or entry.name.startswith("."):
                 continue
             files.extend(
-                _discover_python_files(
+                _discover_source_files(
                     entry,
                     ignored_dirs=ignored_dirs,
                     exclude_patterns=(
@@ -100,7 +98,7 @@ def _discover_python_files(
                     ),
                 )
             )
-        elif entry.is_file() and entry.suffix in PYTHON_SUFFIXES:
+        elif entry.is_file() and entry.suffix.casefold() in SOURCE_SUFFIXES:
             files.append(entry)
     return files
 
@@ -187,6 +185,25 @@ def _resolve_module_reference(
 ) -> Path | None:
     """Resolve absolute and package-relative imports to an indexed file."""
 
+    if module.startswith("path:"):
+        return _resolve_path_reference(
+            module[5:], source_path=source_path, project_root=project_root
+        )
+    if module.startswith("include:"):
+        return _resolve_include_reference(
+            module[8:], source_path=source_path, project_root=project_root
+        )
+    if module.startswith("rust:"):
+        return _resolve_rust_reference(
+            module[5:], source_path=source_path, project_root=project_root
+        )
+    if module.startswith("java:"):
+        return _resolve_dotted_source(module[5:], project_root, ".java")
+    if module.startswith("csharp:"):
+        return _resolve_dotted_source(module[7:], project_root, ".cs")
+    if module.startswith("go:"):
+        return _resolve_go_reference(module[3:], project_root)
+
     leading_dots = len(module) - len(module.lstrip("."))
     remainder = module[leading_dots:]
     if leading_dots:
@@ -217,11 +234,134 @@ def _resolve_module_reference(
     return None
 
 
+def _resolve_path_reference(
+    reference: str,
+    *,
+    source_path: Path,
+    project_root: Path,
+) -> Path | None:
+    if not reference.startswith("."):
+        return None
+    base = (source_path.parent / reference).resolve()
+    candidates = [base]
+    source_suffix = source_path.suffix.casefold()
+    if source_suffix in {".ts", ".tsx", ".mts", ".cts"}:
+        suffixes = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+    else:
+        suffixes = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts")
+    candidates.extend(Path(f"{base}{suffix}") for suffix in suffixes)
+    candidates.extend(base / f"index{suffix}" for suffix in suffixes)
+    return _first_workspace_file(candidates, project_root)
+
+
+def _resolve_include_reference(
+    reference: str,
+    *,
+    source_path: Path,
+    project_root: Path,
+) -> Path | None:
+    return _first_workspace_file(
+        [
+            source_path.parent / reference,
+            project_root / reference,
+            project_root / "include" / reference,
+        ],
+        project_root,
+    )
+
+
+def _resolve_rust_reference(
+    reference: str,
+    *,
+    source_path: Path,
+    project_root: Path,
+) -> Path | None:
+    cleaned = reference.replace("{", "").replace("}", "").replace("*", "")
+    parts = [part.strip() for part in cleaned.split("::") if part.strip()]
+    if not parts:
+        return None
+    if parts[0] == "crate":
+        parts = parts[1:]
+        base = project_root / "src" if (project_root / "src").is_dir() else project_root
+    elif parts[0] == "self":
+        parts = parts[1:]
+        base = source_path.parent
+    else:
+        base = source_path.parent
+        while parts and parts[0] == "super":
+            base = base.parent
+            parts = parts[1:]
+    while parts:
+        path = base.joinpath(*parts)
+        target = _first_workspace_file(
+            [path.with_suffix(".rs"), path / "mod.rs"], project_root
+        )
+        if target is not None:
+            return target
+        parts.pop()
+    return None
+
+
+def _resolve_dotted_source(
+    reference: str, project_root: Path, suffix: str
+) -> Path | None:
+    parts = [part for part in reference.split(".") if part]
+    roots = [
+        project_root,
+        project_root / "src",
+        project_root / "src" / "main" / "java",
+        project_root / "src" / "test" / "java",
+        project_root / "app" / "src" / "main" / "java",
+    ]
+    while parts:
+        target = _first_workspace_file(
+            [root.joinpath(*parts).with_suffix(suffix) for root in roots], project_root
+        )
+        if target is not None:
+            return target
+        parts.pop(0)
+    return None
+
+
+def _resolve_go_reference(reference: str, project_root: Path) -> Path | None:
+    parts = [part for part in reference.split("/") if part]
+    for offset in range(len(parts)):
+        directory = project_root.joinpath(*parts[offset:])
+        if not directory.is_dir():
+            continue
+        try:
+            files = sorted(directory.glob("*.go"))
+        except OSError:
+            continue
+        target = _first_workspace_file(files, project_root)
+        if target is not None:
+            return target
+    return None
+
+
+def _first_workspace_file(
+    candidates: Iterable[Path], project_root: Path
+) -> Path | None:
+    root = project_root.resolve()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
 def _extract_references(symbols: Iterable[Symbol]) -> set[str]:
     """Pull out dotted module references from import statements."""
 
     refs: set[str] = set()
     for symbol in symbols:
+        if symbol.reference:
+            refs.add(symbol.reference)
+            continue
         if symbol.kind not in {"import", "import_from"}:
             continue
         text = symbol.name
@@ -352,7 +492,20 @@ class RepoMap:
             else:
                 # Show functions/methods/classes, skip plain imports.
                 interesting = [
-                    s for s in node.symbols if s.kind in {"function", "method", "class"}
+                    s
+                    for s in node.symbols
+                    if s.kind
+                    in {
+                        "function",
+                        "method",
+                        "class",
+                        "interface",
+                        "enum",
+                        "struct",
+                        "trait",
+                        "record",
+                        "type",
+                    }
                 ]
                 if not interesting:
                     lines.append("*No definitions extracted.*")
@@ -378,7 +531,7 @@ class RepoMap:
             if self._adjacency is None:
                 continue
             for dep_idx in range(self._adjacency.shape[0]):
-                if self._adjacency[src_idx, dep_idx] > 0:
+                if self._adjacency[dep_idx, src_idx] > 0:
                     dep_path = self._files[dep_idx].path
                     dep_label = str(dep_path.relative_to(self.project_root))
                     lines.append(f'  "{src_label}" -> "{dep_label}";')
@@ -397,7 +550,7 @@ class RepoMap:
         return self._files[self._index[resolved]]
 
     def _refresh(self) -> None:
-        discovered = _discover_python_files(
+        discovered = _discover_source_files(
             self.project_root,
             exclude_patterns=self._exclude_patterns,
         )

@@ -194,3 +194,88 @@ def test_repomap_resolves_relative_imports(tmp_path: Path) -> None:
     ranked = dict(RepoMap(tmp_path).rank([active]))
 
     assert ranked[helper.resolve()] > ranked[isolated.resolve()]
+
+
+def test_repomap_discovers_and_renders_multiple_languages(tmp_path: Path) -> None:
+    (tmp_path / "api.go").write_text("package api\nfunc Serve() {}\n")
+    (tmp_path / "model.rs").write_text("pub struct Model;\n")
+    (tmp_path / "view.tsx").write_text(
+        "interface Props {}\nexport function View() { return <main /> }\n"
+    )
+
+    repo_map = RepoMap(tmp_path)
+    names = {node.path.name for node in repo_map.files}
+    rendered = repo_map.render(repo_map.rank([]))
+
+    assert names == {"api.go", "model.rs", "view.tsx"}
+    assert "Serve" in rendered
+    assert "Model" in rendered
+    assert "View" in rendered
+    assert "Props" in rendered
+
+
+def test_repomap_ranks_javascript_relative_dependency(tmp_path: Path) -> None:
+    active = tmp_path / "main.ts"
+    active.write_text('import { helper } from "./helper";\nexport function main() {}\n')
+    helper = tmp_path / "helper.ts"
+    helper.write_text("export function helper() {}\n")
+    isolated = tmp_path / "isolated.ts"
+    isolated.write_text("export function isolated() {}\n")
+
+    ranked = dict(RepoMap(tmp_path).rank([active]))
+
+    assert ranked[helper.resolve()] > ranked[isolated.resolve()]
+
+
+def test_repomap_prefers_same_language_for_extensionless_import(tmp_path: Path) -> None:
+    active = tmp_path / "main.ts"
+    active.write_text('import { helper } from "./helper";\n')
+    typescript = tmp_path / "helper.ts"
+    typescript.write_text("export function helper() {}\n")
+    javascript = tmp_path / "helper.js"
+    javascript.write_text("export function helper() {}\n")
+
+    ranked = dict(RepoMap(tmp_path).rank([active]))
+
+    assert ranked[typescript.resolve()] > ranked[javascript.resolve()]
+
+
+def test_repomap_resolves_dotted_javascript_basename(tmp_path: Path) -> None:
+    active = tmp_path / "main.ts"
+    active.write_text('import { helper } from "./helper.test";\n')
+    dependency = tmp_path / "helper.test.ts"
+    dependency.write_text("export function helper() {}\n")
+    isolated = tmp_path / "isolated.ts"
+    isolated.write_text("export function isolated() {}\n")
+
+    ranked = dict(RepoMap(tmp_path).rank([active]))
+
+    assert ranked[dependency.resolve()] > ranked[isolated.resolve()]
+
+
+def test_repomap_resolves_java_source_root_import(tmp_path: Path) -> None:
+    source_root = tmp_path / "src" / "main" / "java" / "com" / "example"
+    source_root.mkdir(parents=True)
+    active = source_root / "Main.java"
+    active.write_text("import com.example.Dep;\nclass Main {}\n")
+    dependency = source_root / "Dep.java"
+    dependency.write_text("class Dep {}\n")
+    isolated = tmp_path / "Isolated.java"
+    isolated.write_text("class Isolated {}\n")
+
+    ranked = dict(RepoMap(tmp_path).rank([active]))
+
+    assert ranked[dependency.resolve()] > ranked[isolated.resolve()]
+
+
+def test_repomap_dot_graph_follows_import_direction(tmp_path: Path) -> None:
+    source = tmp_path / "main.ts"
+    source.write_text('import { helper } from "./helper";\n')
+    dependency = tmp_path / "helper.ts"
+    dependency.write_text("export function helper() {}\n")
+    repo_map = RepoMap(tmp_path)
+
+    graph = repo_map.to_dot_graph([source, dependency])
+
+    assert '"main.ts" -> "helper.ts";' in graph
+    assert '"helper.ts" -> "main.ts";' not in graph
