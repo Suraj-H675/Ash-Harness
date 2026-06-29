@@ -152,7 +152,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Patch application | Verified locally | Validated multi-file Git patch with dry-run and atomic check/apply |
 | List/glob files | Verified locally | Bounded production tools with workspace scoping |
 | Text/regex search | Verified locally | Ripgrep-backed bounded search with Python fallback |
-| Symbol/code search | Partial/unwired | Tree-sitter/LSP-backed definitions and references |
+| Symbol/code search | Verified locally | Read-only `find_symbol` and `find_references` tools use the incremental Tree-sitter index, exact locations, case controls, globs, and bounded results |
 | Shell execution | Partial | Policy engine, sandbox injection, process groups, and child env scrubbing; streaming output remains |
 | Git status/diff/log | Verified locally | Read-only bounded Git inspection tools |
 | Git commit | Partial | Explicit staging scope, no unrelated changes, hooks/errors surfaced |
