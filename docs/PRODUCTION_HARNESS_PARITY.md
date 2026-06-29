@@ -67,12 +67,12 @@ Research is clean-room: proprietary or leaked source is not used.
 
 | Capability | Ash status | Required production behavior |
 |---|---|---|
-| Token accounting | Partial | Provider/model-aware counts and visible uncertainty |
-| Context budget allocation | Partial | Configurable system/tool/history/repo-map/memory budgets are enforced before compaction and shown by `/context`; file attachment and provider cache budgets remain |
+| Token accounting | Partial | Provider usage, cached input, completion, and configured cache-aware costs are normalized and persisted; visible estimate uncertainty remains |
+| Context budget allocation | Partial | Configurable system/tool/history/repo-map/memory budgets are enforced before compaction and shown by `/context`; file attachment budgets remain |
 | Automatic compaction | Verified locally | Threshold-based extractive summary retains recent tool call/result pairs |
 | Manual `/compact` | Verified locally | Forces compaction while preserving the durable transcript |
 | Tool-output pruning | Verified locally | Stale large results are pruned in provider context while preserving call identity and durable data |
-| Prompt caching | Missing | Provider-supported cache controls and hit metrics |
+| Prompt caching | Verified locally | First-party Anthropic/OpenAI automatic controls and retention mapping; normalized reads/writes/hit rate persist and surface through CLI, SDK, HTTP, and JSON-RPC; custom/local endpoints remain untouched ([OpenAI](https://platform.openai.com/docs/guides/prompt-caching), [Anthropic](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)) |
 | Repository map | Verified locally | Incremental Tree-sitter symbols/imports for Python, JS/JSX, TS/TSX, Go, Rust, Java, C/C++, and C#; configured/Git ignores, active-file ranking, and CLI/SDK injection |
 | Project instructions | Partial | Trusted hierarchical `ASH.md` discovery plus bounded `@import` expansion and diagnostics; conflict lint remains |
 | User instructions | Verified locally | Global `~/.ash/ASH.md` is loaded with a bounded size |
@@ -107,7 +107,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Markdown/code rendering | Verified locally | Streamed Rich Markdown with fenced-code highlighting and bounded repaint frequency |
 | Diff preview | Partial | Bounded unified previews for writes/replacements/patches; side-by-side view remains |
 | Approval dialog | Partial | Allow once/session/persist, deny with feedback, editable scope |
-| Status line | Verified locally | Cached model, mode, branch, context budget, cost, sandbox, session, and cwd state |
+| Status line | Verified locally | Cached model, mode, branch, context budget, prompt-cache totals, cost, sandbox, session, and cwd state |
 | Themes | Partial | ANSI-safe no-color mode is wired; selectable light/dark themes remain |
 | Configurable keybindings | Verified locally | Cross-platform newline/editor actions with collision validation |
 | Vim input mode | Verified locally | Optional Emacs or Vim prompt-toolkit editing mode |
@@ -123,11 +123,11 @@ Research is clean-room: proprietary or leaked source is not used.
 |---|---|---|
 | Central slash-command registry | Verified locally | Metadata, aliases, parsing, completion, and stable help |
 | `/help` | Partial | Filterable command reference with aliases is wired; full-screen searchable overlay remains |
-| `/status` | Verified locally | Runtime model/mode/workspace/session diagnostics |
+| `/status` | Verified locally | Runtime model/mode/workspace/session plus persisted token, cache, and cost diagnostics |
 | `/model` and `/models` | Partial | Dynamic catalogs, custom/local models, capability display |
 | `/new`, `/resume`, `/sessions` | Verified locally | Durable session lifecycle and missing-ID errors |
 | `/rename`, `/fork` | Verified locally | Session organization and transcript branching |
-| `/compact`, `/context` | Verified locally | Context compaction and budget inspection |
+| `/compact`, `/context` | Verified locally | Context compaction, budget inspection, and last-turn cache hit metrics |
 | `/cancel` | Verified locally | Cancel the active provider/tool turn while retaining already completed work |
 | `/clear`, `/rewind`, `/undo` | Verified locally | New-session clear, transcript rewind, and conflict-aware file undo |
 | `/diff` | Partial | Current/staged/path Git diff; per-turn checkpoint diff remains |
@@ -215,11 +215,11 @@ Research is clean-room: proprietary or leaked source is not used.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | One-shot prompt (`ash -p`) | Verified locally | Session-aware one-shot mode with meaningful exit codes |
-| JSON output | Verified locally | Machine-clean completion objects and structured error objects |
-| Streaming JSONL | Verified locally | Typed token, reasoning, context, tool lifecycle, completion, and structured error events |
+| JSON output | Verified locally | Machine-clean completion objects with normalized usage and structured error objects |
+| Streaming JSONL | Verified locally | Typed token, reasoning, context, usage, tool lifecycle, completion, and structured error events |
 | Stdin prompts | Verified locally | Piped stdin and `-p -` enter machine-clean one-shot mode |
 | CI mode | Verified locally | `--ci` disables interactive prompts/ANSI and defaults one-shot output to stream-json |
-| SDK/library API | Verified locally | Async create/prompt/steer/session/lifecycle API independent of the TUI |
+| SDK/library API | Verified locally | Async create/prompt/steer/session/lifecycle API with normalized usage independent of the TUI |
 | JSON-RPC server | Partial | Validated stdio methods, cancellation, lifecycle, and tests; remote transport remains |
 | HTTP server | Verified locally | Bearer auth, rate limits, lifecycle, session/turn/steering routes, live SSE events, cancellation, and safe CLI binding |
 | IDE/ACP integration | Missing | Protocol-based editor integration after CLI core is stable |

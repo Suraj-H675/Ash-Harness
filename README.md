@@ -84,5 +84,20 @@ Terminal behavior is configurable with `ASH_INPUT_MODE=vi`,
 `ASH_SHOW_TOKEN_METER=true`. Structured keybindings and sprint planning can be
 set in `~/.ash/ash.toml`.
 
+First-party Anthropic and OpenAI prompt caching is enabled by default. It can
+be configured in `~/.ash/ash.toml`:
+
+```toml
+prompt_cache_enabled = true
+prompt_cache_retention = "memory" # memory or extended
+```
+
+`memory` selects Anthropic's default 5-minute cache or OpenAI's in-memory
+cache. `extended` selects Anthropic's 1-hour TTL or OpenAI's 24-hour retention
+where the chosen model supports it. Provider-specific cache controls are not
+sent to custom OpenAI-compatible endpoints or local models. Cache reads,
+writes, hit rate, and configured costs are visible through `/status`,
+`/context`, JSON output, the SDK, HTTP, and JSON-RPC.
+
 See [the production parity checklist](docs/PRODUCTION_HARNESS_PARITY.md) for
 implemented and remaining release requirements.
