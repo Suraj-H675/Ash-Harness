@@ -48,6 +48,12 @@ class AshConfig(BaseSettings):
         20000,
         description="Limit for single tool response strings before middle truncation.",
     )
+    steering_queue_limit: int = Field(
+        20,
+        ge=1,
+        le=100,
+        description="Maximum user steering messages waiting for a running turn.",
+    )
     model_pricing_usd_per_million: dict[str, dict[str, float]] = Field(
         default_factory=dict,
         description=(

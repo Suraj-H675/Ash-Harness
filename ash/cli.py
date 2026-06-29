@@ -1815,6 +1815,7 @@ def main(argv: list[str] | None = None) -> int:
         hooks=hooks,
         additional_instructions=instruction_text,
         config=config,
+        max_steering_messages=config.steering_queue_limit,
         safety_tier=config.safety_tier,
         mcp_config_path=(
             config.workspace_root / ".mcp.json" if workspace_trusted else None

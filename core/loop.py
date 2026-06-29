@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, ContextManager, Protocol
@@ -250,6 +251,7 @@ class AshLoop:
         chroma_persist_dir: Path | None = None,
         mcp_config_path: Path | None = None,
         config: "AshConfig | None" = None,
+        max_steering_messages: int = 20,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -263,6 +265,10 @@ class AshLoop:
             self.system_prompt = f"{self.system_prompt}\n\n{additional_instructions}"
         self.token_counter = token_counter
         self.max_turn_iterations = max_turn_iterations
+        if max_steering_messages < 1:
+            raise ValueError("max_steering_messages must be at least 1")
+        self.max_steering_messages = max_steering_messages
+        self._steering_messages: deque[str] = deque()
         self.repo_map = repo_map
         self.auto_commit = auto_commit
         self.auto_commit_paths = list(auto_commit_paths or [])
@@ -457,7 +463,12 @@ class AshLoop:
         final_text = ""
         total_prompt_tokens = 0
         total_completion_tokens = 0
-        for _ in range(self.max_turn_iterations):
+        iteration = 0
+        iteration_budget = self.max_turn_iterations
+        maximum_iteration_budget = self.max_turn_iterations + self.max_steering_messages
+        while iteration < iteration_budget:
+            iteration += 1
+            self._drain_steering_messages(session)
             # Optionally search semantic memory and inject relevant context.
             self._pending_memory_context = ""
             if self.enable_semantic_memory and self._vector_pipeline is not None:
@@ -496,6 +507,12 @@ class AshLoop:
 
             if not tool_calls:
                 final_text = assistant_text
+                if self._steering_messages:
+                    iteration_budget = min(
+                        maximum_iteration_budget,
+                        iteration_budget + 1,
+                    )
+                    continue
                 if (
                     self.continuous_mode
                     and self._continuous_turns < self.max_continuous_turns
@@ -533,6 +550,12 @@ class AshLoop:
                 )
                 self.session_store.save_message(session.session_id, tool_message)
                 session.messages.append(tool_message)
+
+            if self._steering_messages and iteration >= iteration_budget:
+                iteration_budget = min(
+                    maximum_iteration_budget,
+                    iteration_budget + 1,
+                )
 
             # Memory nudge check — injected periodically after tool results.
             self._turns_since_nudge += 1
@@ -591,6 +614,55 @@ class AshLoop:
         _log.info(f"turn complete, {len(final_text)} chars returned")
         self.session_store.complete_turn(self.turn_context.turn_id)
         return final_text
+
+    @property
+    def pending_steering_count(self) -> int:
+        return len(self._steering_messages)
+
+    def queue_steering(self, message: str) -> int:
+        """Queue user guidance for the next safe model-iteration boundary."""
+
+        normalized = message.strip()
+        if not normalized:
+            raise ValueError("steering message cannot be empty")
+        if len(self._steering_messages) >= self.max_steering_messages:
+            raise OverflowError(
+                f"steering queue is full ({self.max_steering_messages} messages)"
+            )
+        self._steering_messages.append(normalized)
+        self.ui.emit_event(
+            {
+                "type": "turn.steering.queued",
+                "pending": len(self._steering_messages),
+            }
+        )
+        return len(self._steering_messages)
+
+    def _drain_steering_messages(self, session: Session) -> int:
+        applied = 0
+        while self._steering_messages:
+            content = self._steering_messages.popleft()
+            message = Message(
+                role="user",
+                content=content,
+                timestamp=_utc_now(),
+                metadata={"steering": True},
+            )
+            self.session_store.save_message(
+                session.session_id,
+                message.model_copy(update={"content": redact_text(content)}),
+            )
+            session.messages.append(message)
+            applied += 1
+        if applied:
+            self.ui.emit_event(
+                {
+                    "type": "turn.steering.applied",
+                    "count": applied,
+                    "pending": 0,
+                }
+            )
+        return applied
 
     # --- sprint planning helpers (Sprint 12 / V5) ---------------------
 
@@ -1034,7 +1106,9 @@ class AshLoop:
             try:
                 from tools.patch import extract_patch_paths
 
-                paths = extract_patch_paths(str(arguments.get("patch", "")), self.safety_guard)
+                paths = extract_patch_paths(
+                    str(arguments.get("patch", "")), self.safety_guard
+                )
             except (TypeError, ValueError):
                 return
         elif tool_name in REPO_MAP_FILE_TOOLS:

@@ -1,4 +1,5 @@
-# tests/unit/test_loop.py
+import asyncio
+
 import pytest
 from datetime import datetime, timezone
 from core.loop import AshLoop
@@ -132,6 +133,87 @@ class EventUI(TerminalUI):
 
     def emit_event(self, payload):
         self.events.append(payload)
+
+
+class SteeringProvider(ProviderABC):
+    model_name = "steering-test"
+
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self.received_messages = []
+
+    def count_tokens(self, text):
+        return len(str(text).split())
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        self.calls += 1
+        self.received_messages.append(list(messages))
+        if self.calls == 1:
+            self.started.set()
+            await self.release.wait()
+            yield StreamChunk(content="initial answer", is_done=True)
+        else:
+            yield StreamChunk(content="redirected answer", is_done=True)
+
+
+@pytest.mark.asyncio
+async def test_queued_steering_is_persisted_and_applied_to_running_turn(tmp_path):
+    provider = SteeringProvider()
+    store = SessionStore(tmp_path / "steering.db")
+    ui = EventUI()
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        ui,
+        tmp_path,
+    )
+
+    turn = asyncio.create_task(loop.run_turn("start with the original approach"))
+    await provider.started.wait()
+    assert loop.queue_steering("use the safer approach instead") == 1
+    provider.release.set()
+
+    response = await turn
+
+    assert response == "redirected answer"
+    assert provider.calls == 2
+    second_messages = provider.received_messages[1]
+    assert any(
+        message["role"] == "user"
+        and message["content"] == "use the safer approach instead"
+        for message in second_messages
+    )
+    assert loop.pending_steering_count == 0
+    assert [event["type"] for event in ui.events] == [
+        "turn.steering.queued",
+        "turn.steering.applied",
+    ]
+    loaded = store.load_session(loop.current_session.session_id)
+    steering = next(
+        message for message in loaded.messages if message.metadata.get("steering")
+    )
+    assert steering.role == "user"
+    assert steering.content == "use the safer approach instead"
+
+
+def test_steering_queue_validates_messages_and_capacity(tmp_path):
+    loop = AshLoop(
+        SessionStore(tmp_path / "steering-limit.db"),
+        BudgetProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        max_steering_messages=1,
+    )
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        loop.queue_steering("  ")
+    assert loop.queue_steering("first") == 1
+    with pytest.raises(OverflowError, match="queue is full"):
+        loop.queue_steering("second")
 
 
 @pytest.mark.asyncio

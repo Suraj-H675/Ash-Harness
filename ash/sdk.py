@@ -89,6 +89,7 @@ class AshClient:
             repo_map=repo_map,
             tools=tools,
             config=runtime_config,
+            max_steering_messages=runtime_config.steering_queue_limit,
             planner=(
                 Planner(active_provider)
                 if runtime_config.enable_sprint_planning
