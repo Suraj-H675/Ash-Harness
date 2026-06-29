@@ -210,6 +210,29 @@ def _audit_action_for_tool(tool_name: str) -> AuditAction:
     return "tool_call"
 
 
+def _calculate_turn_cost(
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+    pricing: dict[str, float],
+) -> float:
+    """Calculate configured cost while avoiding double-charging cached input."""
+
+    prompt = max(0, prompt_tokens)
+    cache_read = min(max(0, cache_read_tokens), prompt)
+    cache_write = min(max(0, cache_write_tokens), prompt - cache_read)
+    uncached = prompt - cache_read - cache_write
+    input_rate = float(pricing.get("input", 0.0))
+    return (
+        uncached * input_rate
+        + cache_read * float(pricing.get("cache_read", input_rate))
+        + cache_write * float(pricing.get("cache_write", input_rate))
+        + max(0, completion_tokens) * float(pricing.get("output", 0.0))
+    ) / 1_000_000
+
+
 class AshLoop:
     """V1 minimal agent loop."""
 
@@ -298,6 +321,11 @@ class AshLoop:
         self._config = config
         self._last_context_tokens = 0
         self._last_context_budget: Any | None = None
+        self._last_turn_prompt_tokens = 0
+        self._last_turn_completion_tokens = 0
+        self._last_cache_read_tokens = 0
+        self._last_cache_write_tokens = 0
+        self._last_turn_cost_usd = 0.0
         self.skill_nudge_interval = skill_nudge_interval
         self._iterations_since_skill_use = 0
         self.continuous_mode = continuous_mode
@@ -493,6 +521,8 @@ class AshLoop:
         final_text = ""
         total_prompt_tokens = 0
         total_completion_tokens = 0
+        total_cache_read_tokens = 0
+        total_cache_write_tokens = 0
         iteration = 0
         iteration_budget = self.max_turn_iterations
         maximum_iteration_budget = self.max_turn_iterations + self.max_steering_messages
@@ -513,9 +543,13 @@ class AshLoop:
                 tool_calls,
                 turn_prompt_tokens,
                 turn_completion_tokens,
+                turn_cache_read_tokens,
+                turn_cache_write_tokens,
             ) = await self._stream_one_completion(messages)
             total_prompt_tokens += turn_prompt_tokens
             total_completion_tokens += turn_completion_tokens
+            total_cache_read_tokens += turn_cache_read_tokens
+            total_cache_write_tokens += turn_cache_write_tokens
 
             # Persist the assistant turn.
             assistant_message = Message(
@@ -613,21 +647,43 @@ class AshLoop:
         # Save accumulated token usage to session DB.
         prompt = int(total_prompt_tokens) if total_prompt_tokens else 0
         completion = int(total_completion_tokens) if total_completion_tokens else 0
+        cache_read = int(total_cache_read_tokens) if total_cache_read_tokens else 0
+        cache_write = int(total_cache_write_tokens) if total_cache_write_tokens else 0
+        pricing: dict[str, float] = {}
+        if self._config is not None:
+            pricing = self._config.model_pricing_usd_per_million.get(
+                self._config.model, {}
+            )
+        turn_cost_usd = _calculate_turn_cost(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
+            pricing=pricing,
+        )
+        self._last_turn_prompt_tokens = prompt
+        self._last_turn_completion_tokens = completion
+        self._last_cache_read_tokens = cache_read
+        self._last_cache_write_tokens = cache_write
+        self._last_turn_cost_usd = turn_cost_usd
+        usage_payload = {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "cache_hit_rate": cache_read / prompt if prompt else 0.0,
+            "cost_usd": turn_cost_usd,
+        }
+        self.turn_context.set("usage", usage_payload)
         if prompt > 0 or completion > 0:
-            pricing: dict[str, float] = {}
-            if self._config is not None:
-                pricing = self._config.model_pricing_usd_per_million.get(
-                    self._config.model, {}
-                )
-            turn_cost_usd = (
-                prompt * float(pricing.get("input", 0.0))
-                + completion * float(pricing.get("output", 0.0))
-            ) / 1_000_000
+            self.ui.emit_event({"type": "turn.usage", **usage_payload})
             self.session_store.save_session_token_stats(
                 session.session_id,
                 prompt,
                 completion,
                 turn_cost_usd,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_write,
             )
 
         if self.auto_commit:
@@ -766,8 +822,8 @@ class AshLoop:
     async def _stream_one_completion(
         self,
         messages: list[dict[str, Any]],
-    ) -> tuple[str, list[dict[str, Any]], int, int]:
-        """Stream one completion, returning (text, tool_calls, prompt_tokens, completion_tokens)."""
+    ) -> tuple[str, list[dict[str, Any]], int, int, int, int]:
+        """Stream one completion with normalized token and cache usage."""
 
         # Build OpenAI-format tools list for providers that support native tool_calls.
         openai_tools = (
@@ -781,6 +837,8 @@ class AshLoop:
         tool_calls: list[dict[str, Any]] = []
         prompt_tokens = 0
         completion_tokens = 0
+        cache_read_tokens = 0
+        cache_write_tokens = 0
         native_tool_calls_from_api: list[dict[str, Any]] = []
 
         try:
@@ -800,6 +858,8 @@ class AshLoop:
                     if chunk.is_done:
                         prompt_tokens = chunk.prompt_tokens
                         completion_tokens = chunk.completion_tokens
+                        cache_read_tokens = chunk.cache_read_tokens
+                        cache_write_tokens = chunk.cache_write_tokens
                 # Drain the parser's remaining buffer at end-of-stream.
                 for event in parser.feed(""):
                     self._handle_event(event, text_chunks, tool_calls)
@@ -814,7 +874,14 @@ class AshLoop:
                 _normalize_native_tool_call(call) for call in native_tool_calls_from_api
             ]
 
-        return "".join(text_chunks), tool_calls, prompt_tokens, completion_tokens
+        return (
+            "".join(text_chunks),
+            tool_calls,
+            prompt_tokens,
+            completion_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        )
 
     def _handle_event(
         self,

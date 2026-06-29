@@ -66,7 +66,8 @@ class AshConfig(BaseSettings):
         default_factory=dict,
         description=(
             "Optional explicit model pricing: provider/model -> "
-            "{input: USD per million tokens, output: USD per million tokens}."
+            "{input, output, cache_read, cache_write: USD per million tokens}. "
+            "Cache rates default to the input rate when omitted."
         ),
     )
     fallback_models: list[str] = Field(

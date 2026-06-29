@@ -118,6 +118,23 @@ class BudgetProvider(ProviderABC):
         yield StreamChunk(content="done", is_done=True)
 
 
+class CacheUsageProvider(ProviderABC):
+    model_name = "cache-test"
+
+    def count_tokens(self, text):
+        return len(str(text).split())
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        yield StreamChunk(
+            content="<response>done</response>",
+            is_done=True,
+            prompt_tokens=100,
+            completion_tokens=5,
+            cache_read_tokens=60,
+            cache_write_tokens=20,
+        )
+
+
 class LargeRepoMap:
     def rank(self, active):
         return active
@@ -364,6 +381,59 @@ async def test_context_budget_report_enforces_sections(tmp_path):
     assert budget.slices["repo_map"].truncated is True
     assert budget.slices["memory"].truncated is True
     assert "context section truncated" in messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
+    store = SessionStore(tmp_path / "cache-usage.db")
+    ui = EventUI()
+    config = AshConfig(
+        model="openai/cache-test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        model_pricing_usd_per_million={
+            "openai/cache-test": {
+                "input": 2.0,
+                "output": 10.0,
+                "cache_read": 0.2,
+                "cache_write": 2.5,
+            }
+        },
+    )
+    loop = AshLoop(
+        store,
+        CacheUsageProvider(),
+        SafetyGuard(project_root=tmp_path),
+        ui,
+        tmp_path,
+        config=config,
+    )
+
+    session = await loop.start_session()
+    assert await loop.run_turn("measure usage") == "done"
+
+    assert loop._last_turn_prompt_tokens == 100
+    assert loop._last_turn_completion_tokens == 5
+    assert loop._last_cache_read_tokens == 60
+    assert loop._last_cache_write_tokens == 20
+    assert loop._last_turn_cost_usd == pytest.approx(0.000152)
+    assert loop.turn_context is not None
+    assert loop.turn_context.get("usage")["cache_hit_rate"] == 0.6
+    assert next(event for event in ui.events if event["type"] == "turn.usage") == {
+        "type": "turn.usage",
+        "prompt_tokens": 100,
+        "completion_tokens": 5,
+        "cache_read_tokens": 60,
+        "cache_write_tokens": 20,
+        "cache_hit_rate": 0.6,
+        "cost_usd": pytest.approx(0.000152),
+    }
+    usage = store.get_session_usage(session.session_id)
+    assert usage.prompt_tokens == 100
+    assert usage.cache_read_tokens == 60
+    assert usage.cache_write_tokens == 20
+    assert usage.cost_usd == pytest.approx(0.000152)
 
 
 @pytest.mark.asyncio
