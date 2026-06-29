@@ -48,6 +48,8 @@ async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
         assert client.loop.repo_map is not None
         assert "find_symbol" in client.loop.tools
         assert "find_references" in client.loop.tools
+        assert client.loop.tools["find_symbol"].repo_map is client.loop.repo_map
+        assert client.loop.tools["find_references"].repo_map is client.loop.repo_map
         result = await client.prompt("hello")
         assert result.response == "sdk response"
         assert result.session_id

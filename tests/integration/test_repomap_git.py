@@ -16,6 +16,7 @@ from repo.repomap import RepoMap
 from safety.guard import SafetyGuard
 from tools.git import AutoCommitTool
 from tools.filesystem import ReadFileTool, WriteFileTool
+from tools.symbols import FindReferencesTool, FindSymbolTool
 from ui.terminal import TerminalUI
 
 
@@ -142,6 +143,53 @@ def test_multilanguage_repo_map_injected_into_system_prompt(
     assert "Client" in system_content
     assert "connect" in system_content
     assert "transport.ts" in system_content
+
+
+def test_structural_navigation_tools_execute_in_agent_loop(
+    workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
+) -> None:
+    (workspace / "service.py").write_text(
+        "class Service:\n    pass\n\ndef build():\n    return Service()\n"
+    )
+    repo_map = RepoMap(workspace)
+    symbol_tool = FindSymbolTool(safety_guard, repo_map)
+    references_tool = FindReferencesTool(safety_guard, repo_map)
+    provider = FakeProvider(
+        scripts=[
+            [
+                '<call_tool name="find_symbol">'
+                '<arg name="query">Service</arg>'
+                "</call_tool>"
+                '<call_tool name="find_references">'
+                '<arg name="query">Service</arg>'
+                "</call_tool>"
+            ],
+            ["<response>navigation complete</response>"],
+        ]
+    )
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=workspace,
+        repo_map=repo_map,
+        tools={
+            symbol_tool.name: symbol_tool,
+            references_tool.name: references_tool,
+        },
+    )
+
+    response = asyncio.run(loop.run_turn("locate Service"))
+
+    assert response == "navigation complete"
+    loaded = session_store.load_session(loop.current_session.session_id)
+    tool_messages = [
+        message.content for message in loaded.messages if message.role == "tool"
+    ]
+    assert len(tool_messages) == 2
+    assert "service.py:1: class Service [python]" in tool_messages[0]
+    assert "service.py:5:12: Service [python]" in tool_messages[1]
 
 
 def test_repo_map_prioritizes_successfully_read_file(
