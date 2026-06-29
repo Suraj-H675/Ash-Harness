@@ -221,22 +221,31 @@ def test_steering_queue_validates_messages_and_capacity(tmp_path):
 @pytest.mark.asyncio
 async def test_turn_running_state_resets_after_cancellation(tmp_path):
     provider = SteeringProvider()
+    ui = EventUI()
     loop = AshLoop(
         SessionStore(tmp_path / "steering-cancel.db"),
         provider,
         SafetyGuard(project_root=tmp_path),
-        EventUI(),
+        ui,
         tmp_path,
     )
     turn = asyncio.create_task(loop.run_turn("wait"))
     await provider.started.wait()
     assert loop.is_turn_running is True
+    loop.queue_steering("pending redirect")
 
     turn.cancel()
     with pytest.raises(asyncio.CancelledError):
         await turn
 
     assert loop.is_turn_running is False
+    assert loop.pending_steering_count == 0
+    cancelled = next(event for event in ui.events if event["type"] == "turn.cancelled")
+    assert cancelled["discarded_steering"] == 1
+    assert (
+        loop.session_store.reconcile_interrupted_turns(loop.current_session.session_id)
+        == 0
+    )
 
 
 @pytest.mark.asyncio

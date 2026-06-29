@@ -704,6 +704,16 @@ class SessionStore:
                 (_serialize_datetime(_utc_now()), turn_id),
             )
 
+    def interrupt_turn(self, turn_id: str) -> None:
+        """Mark one in-flight turn interrupted without affecting other sessions."""
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            conn.execute(
+                "UPDATE turn_journal SET status = 'interrupted', completed_at = ? "
+                "WHERE turn_id = ? AND status = 'started'",
+                (_serialize_datetime(_utc_now()), turn_id),
+            )
+
     def reconcile_interrupted_turns(self, session_id: str) -> int:
         with closing(get_db_connection(self.db_path)) as conn, conn:
             cursor = conn.execute(
@@ -1113,9 +1123,7 @@ class SessionStore:
         previous_hash = ""
         for record in self.list_audit_logs(session_id):
             if record.previous_hash != previous_hash:
-                errors.append(
-                    f"audit log {record.log_id} previous_hash mismatch"
-                )
+                errors.append(f"audit log {record.log_id} previous_hash mismatch")
             expected_hash = _audit_hash(
                 session_id=record.session_id,
                 timestamp=record.timestamp,

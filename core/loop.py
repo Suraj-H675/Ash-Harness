@@ -400,9 +400,23 @@ class AshLoop:
 
         if self._turn_running:
             raise RuntimeError("a turn is already running")
+        previous_turn_id = self.turn_context.turn_id if self.turn_context else None
         self._turn_running = True
         try:
             return await self._run_turn(user_input)
+        except asyncio.CancelledError:
+            current_turn_id = self.turn_context.turn_id if self.turn_context else None
+            if current_turn_id is not None and current_turn_id != previous_turn_id:
+                self.session_store.interrupt_turn(current_turn_id)
+            discarded = len(self._steering_messages)
+            self._steering_messages.clear()
+            self.ui.emit_event(
+                {
+                    "type": "turn.cancelled",
+                    "discarded_steering": discarded,
+                }
+            )
+            raise
         finally:
             self._turn_running = False
 
