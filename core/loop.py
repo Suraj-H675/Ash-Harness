@@ -883,14 +883,14 @@ class AshLoop:
             self.ui.emit_event({"type": "tool.requested", **event_base})
 
             decision = self.permission_policy.evaluate(tool_name, arguments)
-            if self.on_tool_approval is not None:
-                approved = await self.on_tool_approval(tool_name, arguments)
-            elif self.ui.has_approval_callback:
-                approved = self.ui.request_tool_approval(tool_name, arguments)
-            elif decision.action == PolicyAction.ALLOW:
+            if decision.action == PolicyAction.ALLOW:
                 approved = True
             elif decision.action == PolicyAction.DENY:
                 approved = False
+            elif self.on_tool_approval is not None:
+                approved = await self.on_tool_approval(tool_name, arguments)
+            elif self.ui.has_approval_callback:
+                approved = self.ui.request_tool_approval(tool_name, arguments)
             else:
                 approved = self.ui.request_tool_approval(tool_name, arguments)
             record.approved = approved

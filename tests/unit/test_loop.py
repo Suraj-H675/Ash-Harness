@@ -446,6 +446,13 @@ async def test_middleware_skip_aborts_tool(tmp_path):
 async def test_on_tool_approval_callback_is_called(tmp_path):
     call_log = []
 
+    class ApprovalProvider(MockProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(
+                tool_call_delta='<call_tool name="my_tool"></call_tool>',
+                is_done=True,
+            )
+
     async def approval_callback(tool_name, arguments):
         call_log.append((tool_name, arguments))
         return True  # approve all tools
@@ -453,16 +460,16 @@ async def test_on_tool_approval_callback_is_called(tmp_path):
     with tempfile.TemporaryDirectory() as db_dir:
         store = SessionStore(Path(db_dir) / "test.db")
         guard = SafetyGuard(project_root=tmp_path)
-        ui = TerminalUI(safety_tier="dry_run")
+        ui = TerminalUI(safety_tier="interactive")
         from core.recovery import CircuitBreaker
 
         loop = AshLoop(
             store,
-            MockProvider(),
+            ApprovalProvider(),
             guard,
             ui,
             tmp_path,
-            tools={"read_file": ReadFileTool(guard)},
+            tools={"my_tool": MyTestTool(guard)},
             on_tool_approval=approval_callback,
             circuit_breaker=CircuitBreaker(max_failures=10),
             max_turn_iterations=1,
@@ -471,7 +478,34 @@ async def test_on_tool_approval_callback_is_called(tmp_path):
         await loop.run_turn("test")
 
         assert len(call_log) > 0
-        assert any(call[0] == "read_file" for call in call_log)
+        assert any(call[0] == "my_tool" for call in call_log)
+
+
+@pytest.mark.asyncio
+async def test_tool_approval_callback_cannot_override_policy_decisions(tmp_path):
+    calls = []
+
+    async def approve(tool_name, arguments):
+        calls.append(tool_name)
+        return True
+
+    guard = SafetyGuard(project_root=tmp_path)
+    loop = AshLoop(
+        SessionStore(tmp_path / "policy-callback.db"),
+        MockProvider(),
+        guard,
+        TerminalUI(safety_tier="dry_run"),
+        tmp_path,
+        tools={"read_file": ReadFileTool(guard)},
+        on_tool_approval=approve,
+        safety_tier="dry_run",
+        max_turn_iterations=1,
+    )
+    await loop.start_session()
+
+    await loop.run_turn("test")
+
+    assert calls == []
 
 
 @pytest.mark.asyncio
