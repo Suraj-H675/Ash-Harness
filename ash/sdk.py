@@ -32,6 +32,26 @@ class AshResult:
     session_id: str
     model: str
     context_tokens: int
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    cost_usd: float = 0.0
+
+    @property
+    def usage(self) -> dict[str, int | float]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "cache_hit_rate": (
+                self.cache_read_tokens / self.prompt_tokens
+                if self.prompt_tokens
+                else 0.0
+            ),
+            "cost_usd": self.cost_usd,
+        }
 
 
 @dataclass(frozen=True)
@@ -153,11 +173,17 @@ class AshClient:
             await self._start_unlocked()
         response = await self.loop.run_turn(text)
         assert self.loop.current_session is not None
+        usage = self.loop.last_turn_usage
         return AshResult(
             response=response,
             session_id=self.loop.current_session.session_id,
             model=self.config.model,
             context_tokens=self.loop._last_context_tokens,
+            prompt_tokens=int(usage["prompt_tokens"]),
+            completion_tokens=int(usage["completion_tokens"]),
+            cache_read_tokens=int(usage["cache_read_tokens"]),
+            cache_write_tokens=int(usage["cache_write_tokens"]),
+            cost_usd=float(usage["cost_usd"]),
         )
 
     async def stream_prompt(self, text: str) -> AsyncIterator[AshEvent]:
@@ -195,6 +221,7 @@ class AshClient:
                             "session_id": result.session_id,
                             "model": result.model,
                             "context_tokens": result.context_tokens,
+                            "usage": result.usage,
                         },
                     )
                 )

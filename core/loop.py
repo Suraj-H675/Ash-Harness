@@ -423,6 +423,20 @@ class AshLoop:
     def is_turn_running(self) -> bool:
         return self._turn_running
 
+    @property
+    def last_turn_usage(self) -> dict[str, int | float]:
+        prompt = self._last_turn_prompt_tokens
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": self._last_turn_completion_tokens,
+            "cache_read_tokens": self._last_cache_read_tokens,
+            "cache_write_tokens": self._last_cache_write_tokens,
+            "cache_hit_rate": (
+                self._last_cache_read_tokens / prompt if prompt else 0.0
+            ),
+            "cost_usd": self._last_turn_cost_usd,
+        }
+
     async def run_turn(self, user_input: str) -> str:
         """Run one turn while preventing unsafe concurrent session mutation."""
 
@@ -666,14 +680,7 @@ class AshLoop:
         self._last_cache_read_tokens = cache_read
         self._last_cache_write_tokens = cache_write
         self._last_turn_cost_usd = turn_cost_usd
-        usage_payload = {
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "cache_read_tokens": cache_read,
-            "cache_write_tokens": cache_write,
-            "cache_hit_rate": cache_read / prompt if prompt else 0.0,
-            "cost_usd": turn_cost_usd,
-        }
+        usage_payload = self.last_turn_usage
         self.turn_context.set("usage", usage_payload)
         if prompt > 0 or completion > 0:
             self.ui.emit_event({"type": "turn.usage", **usage_payload})

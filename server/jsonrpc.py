@@ -22,9 +22,7 @@ class JSONRPCServer:
             "status": self._status,
         }
 
-    async def handle_request(
-        self, request: dict[str, Any]
-    ) -> dict[str, Any] | None:
+    async def handle_request(self, request: dict[str, Any]) -> dict[str, Any] | None:
         request_id = request.get("id")
         if request.get("jsonrpc") != "2.0" or not isinstance(
             request.get("method"), str
@@ -39,8 +37,10 @@ class JSONRPCServer:
             return None if request_id is None else _result(request_id, cancelled)
         handler = self._methods.get(method)
         if handler is None:
-            return None if request_id is None else _error(
-                request_id, -32601, f"Method not found: {method}"
+            return (
+                None
+                if request_id is None
+                else _error(request_id, -32601, f"Method not found: {method}")
             )
         if request_id is None:
             asyncio.ensure_future(handler(params))
@@ -94,6 +94,7 @@ class JSONRPCServer:
             "session_id": result.session_id,
             "model": result.model,
             "context_tokens": result.context_tokens,
+            "usage": result.usage,
         }
 
     async def _new_session(self, params: dict[str, Any]) -> dict[str, str]:
@@ -121,6 +122,7 @@ class JSONRPCServer:
             "workspace": str(self.client.loop.project_root),
             "session_id": session.session_id if session else None,
             "context_tokens": self.client.loop._last_context_tokens,
+            "usage": self.client.loop.last_turn_usage,
         }
 
 

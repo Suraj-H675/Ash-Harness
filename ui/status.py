@@ -39,11 +39,14 @@ class StatusLine:
         session = self.loop.current_session
         session_id = session.session_id[:8] if session else "none"
         cost = 0.0
+        cache_read = 0
+        cache_write = 0
         if session is not None:
             try:
-                cost = self.loop.session_store.get_session_usage(
-                    session.session_id
-                ).cost_usd
+                usage = self.loop.session_store.get_session_usage(session.session_id)
+                cost = usage.cost_usd
+                cache_read = usage.cache_read_tokens
+                cache_write = usage.cache_write_tokens
             except KeyError:
                 pass
         maximum = max(
@@ -54,6 +57,7 @@ class StatusLine:
             f" {self.config.model} | {self.loop.permission_policy.mode.value} | "
             f"git:{git_branch(self.loop.project_root)} | "
             f"ctx ~{self.loop._last_context_tokens}/{maximum} | "
+            f"cache:{cache_read}r/{cache_write}w | "
             f"${cost:.4f} | sb:{self.sandbox.backend_name} | "
             f"s:{session_id} | {self.loop.project_root} "
         )

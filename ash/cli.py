@@ -491,6 +491,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             if command.name == "status":
                 session = loop.current_session
                 capabilities = loop.provider.capabilities
+                session_usage = (
+                    loop.session_store.get_session_usage(session.session_id)
+                    if session is not None
+                    else None
+                )
                 print(
                     "\n".join(
                         (
@@ -513,6 +518,21 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             ),
                             "Fallbacks: "
                             + (", ".join(config.fallback_models) or "(none)"),
+                            "Tokens: "
+                            + (
+                                f"{session_usage.prompt_tokens} prompt, "
+                                f"{session_usage.completion_tokens} completion"
+                                if session_usage is not None
+                                else "0 prompt, 0 completion"
+                            ),
+                            "Prompt cache: "
+                            + (
+                                f"{session_usage.cache_read_tokens} read, "
+                                f"{session_usage.cache_write_tokens} written"
+                                if session_usage is not None
+                                else "0 read, 0 written"
+                            ),
+                            f"Cost: ${(session_usage.cost_usd if session_usage is not None else 0.0):.6f}",
                         )
                     ),
                     flush=True,
@@ -671,9 +691,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 )
                 budget = _render_context_budget(loop._last_context_budget)
                 budget_suffix = f"\n{budget}" if budget else ""
+                last_usage = loop.last_turn_usage
                 print(
                     f"Context: ~{loop._last_context_tokens}/{maximum} input tokens; "
                     f"summary={'yes' if has_summary else 'no'}"
+                    f"; last cache={last_usage['cache_read_tokens']} read/"
+                    f"{last_usage['cache_write_tokens']} written "
+                    f"({float(last_usage['cache_hit_rate']):.1%} hit)"
                     f"{budget_suffix}",
                     flush=True,
                 )
@@ -1955,6 +1979,7 @@ async def _bootstrap_and_headless(
             "session_id": session.session_id,
             "model": config.model,
             "context_tokens": loop._last_context_tokens,
+            "usage": loop.last_turn_usage,
         }
         if schema is not None:
             payload["structured_output"] = validate_structured_output(response, schema)

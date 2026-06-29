@@ -102,6 +102,7 @@ def create_app(
             "session_id": result.session_id,
             "model": result.model,
             "context_tokens": result.context_tokens,
+            "usage": result.usage,
         }
 
     @app.post("/v1/turn/stream", dependencies=[Depends(authorize)])

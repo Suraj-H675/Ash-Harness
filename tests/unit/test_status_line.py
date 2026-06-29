@@ -13,7 +13,14 @@ from ui.status import StatusLine, git_branch
 def test_status_line_includes_runtime_git_cost_and_sandbox(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     session = store.create_session(str(tmp_path))
-    store.save_session_token_stats(session.session_id, 10, 5, 0.0123)
+    store.save_session_token_stats(
+        session.session_id,
+        10,
+        5,
+        0.0123,
+        cache_read_tokens=7,
+        cache_write_tokens=2,
+    )
     loop = SimpleNamespace(
         current_session=session,
         session_store=store,
@@ -31,6 +38,7 @@ def test_status_line_includes_runtime_git_cost_and_sandbox(tmp_path: Path) -> No
     rendered = StatusLine(loop, config, sandbox, refresh_seconds=60)()
 
     assert "ctx ~123/900" in rendered
+    assert "cache:7r/2w" in rendered
     assert "$0.0123" in rendered
     assert "sb:scoped" in rendered
     assert f"s:{session.session_id[:8]}" in rendered

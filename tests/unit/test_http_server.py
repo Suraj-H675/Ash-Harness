@@ -64,6 +64,7 @@ async def test_http_server_requires_auth_and_runs_turn() -> None:
         )
         assert response.status_code == 200
         assert response.json()["response"] == "HELLO"
+        assert response.json()["usage"]["cache_read_tokens"] == 0
 
 
 @pytest.mark.asyncio

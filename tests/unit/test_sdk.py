@@ -17,7 +17,14 @@ class SDKProvider(ProviderABC):
 
     async def stream_chat(self, messages, temperature=0.0, tools=None):
         yield StreamChunk(content="<response>sdk ")
-        yield StreamChunk(content="response</response>", is_done=True)
+        yield StreamChunk(
+            content="response</response>",
+            is_done=True,
+            prompt_tokens=100,
+            completion_tokens=10,
+            cache_read_tokens=80,
+            cache_write_tokens=5,
+        )
 
 
 class SerialProvider(SDKProvider):
@@ -71,6 +78,11 @@ async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
         result = await client.prompt("hello")
         assert result.response == "sdk response"
         assert result.session_id
+        assert result.prompt_tokens == 100
+        assert result.completion_tokens == 10
+        assert result.cache_read_tokens == 80
+        assert result.cache_write_tokens == 5
+        assert result.usage["cache_hit_rate"] == 0.8
         assert client.sessions()[0].session_id == result.session_id
     finally:
         await client.close()
@@ -110,6 +122,7 @@ async def test_async_sdk_streams_real_turn_events(tmp_path) -> None:
     )
     assert events[-1].type == "turn.completed"
     assert events[-1].data["response"] == "sdk response"
+    assert events[-1].data["usage"]["cache_read_tokens"] == 80
 
 
 @pytest.mark.asyncio

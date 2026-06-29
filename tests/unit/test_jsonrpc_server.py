@@ -10,6 +10,14 @@ class FakeLoop:
     current_session = None
     project_root = "/tmp/project"
     _last_context_tokens = 0
+    last_turn_usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "cache_hit_rate": 0.0,
+        "cost_usd": 0.0,
+    }
 
     class Policy:
         class Mode:
@@ -47,6 +55,7 @@ async def test_jsonrpc_turn_validation_and_unknown_method() -> None:
         {"jsonrpc": "2.0", "id": 1, "method": "turn/run", "params": {"input": "hi"}}
     )
     assert response["result"]["response"] == "HI"
+    assert response["result"]["usage"]["prompt_tokens"] == 0
     invalid = await server.handle_request(
         {"jsonrpc": "2.0", "id": 2, "method": "turn/run", "params": {}}
     )
@@ -68,7 +77,12 @@ async def test_jsonrpc_cancellation() -> None:
     server = JSONRPCServer(client)  # type: ignore[arg-type]
     pending = asyncio.create_task(
         server.handle_request(
-            {"jsonrpc": "2.0", "id": "slow", "method": "turn/run", "params": {"input": "wait"}}
+            {
+                "jsonrpc": "2.0",
+                "id": "slow",
+                "method": "turn/run",
+                "params": {"input": "wait"},
+            }
         )
     )
     await asyncio.sleep(0)
