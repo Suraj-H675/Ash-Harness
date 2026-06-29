@@ -116,6 +116,34 @@ def test_repo_map_injected_into_system_prompt(
     assert "alpha.py" in system_message["content"]
 
 
+def test_multilanguage_repo_map_injected_into_system_prompt(
+    workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
+) -> None:
+    (workspace / "client.ts").write_text(
+        'import { request } from "./transport";\n'
+        "export interface Client {}\n"
+        "export function connect() {}\n"
+    )
+    (workspace / "transport.ts").write_text("export function request() {}\n")
+    provider = FakeProvider(scripts=[["<response>ok</response>"]])
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=workspace,
+        repo_map=RepoMap(workspace),
+    )
+
+    asyncio.run(loop.run_turn("inspect the TypeScript client"))
+
+    system_content = provider.received_messages[0][0]["content"]
+    assert "client.ts" in system_content
+    assert "Client" in system_content
+    assert "connect" in system_content
+    assert "transport.ts" in system_content
+
+
 def test_repo_map_prioritizes_successfully_read_file(
     workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
 ) -> None:
