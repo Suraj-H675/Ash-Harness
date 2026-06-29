@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from core.loop import AshLoop
+from safety.policy import PolicyAction
 
 if TYPE_CHECKING:
     from ui.prompt import PromptInput
@@ -88,6 +89,9 @@ class InteractiveTurnController:
     async def _request_approval(
         self, tool_name: str, arguments: dict[str, object]
     ) -> bool:
+        decision = self.loop.permission_policy.evaluate(tool_name, dict(arguments))
+        if decision.action == PolicyAction.ALLOW:
+            return True
         if self.ui.is_tool_approved_for_session(tool_name):
             self.ui.show_tool_approval(tool_name, arguments, auto=True)
             return True
