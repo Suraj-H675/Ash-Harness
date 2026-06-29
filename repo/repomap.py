@@ -23,7 +23,7 @@ from typing import Iterable
 
 import numpy as np
 
-from repo.parser import SOURCE_SUFFIXES, Symbol, SymbolExtractor
+from repo.parser import SOURCE_SUFFIXES, SourceLocation, Symbol, SymbolExtractor
 
 # Folders that should never be descended into when building a repo map.
 DEFAULT_IGNORED_DIRS = frozenset(
@@ -422,6 +422,57 @@ class RepoMap:
 
         self._refresh()
 
+    def find_definitions(
+        self,
+        name: str,
+        *,
+        case_sensitive: bool = True,
+        path_glob: str | None = None,
+        limit: int = 100,
+    ) -> list[Symbol]:
+        """Find exact structural definitions in the current workspace index."""
+
+        self.refresh()
+        expected = name if case_sensitive else name.casefold()
+        matches: list[Symbol] = []
+        for file_node in self._files:
+            if not self._matches_path_glob(file_node.path, path_glob):
+                continue
+            for symbol in file_node.symbols:
+                if symbol.kind in {"import", "import_from"}:
+                    continue
+                candidate = symbol.name if case_sensitive else symbol.name.casefold()
+                if candidate == expected:
+                    matches.append(symbol)
+                    if len(matches) >= limit:
+                        return matches
+        return matches
+
+    def find_references(
+        self,
+        name: str,
+        *,
+        case_sensitive: bool = True,
+        path_glob: str | None = None,
+        limit: int = 200,
+    ) -> list[SourceLocation]:
+        """Find structural identifier uses, excluding declaration names."""
+
+        self.refresh()
+        matches: list[SourceLocation] = []
+        for file_node in self._files:
+            if not self._matches_path_glob(file_node.path, path_glob):
+                continue
+            for location in self._extractor.find_references(
+                file_node.path,
+                name,
+                case_sensitive=case_sensitive,
+            ):
+                matches.append(location)
+                if len(matches) >= limit:
+                    return matches
+        return matches
+
     def rank(
         self,
         active_files: Iterable[Path],
@@ -463,6 +514,16 @@ class RepoMap:
         except (OSError, ValueError):
             return True
         return _matches_exclude_pattern(relative, self._exclude_patterns, is_dir=False)
+
+    def _matches_path_glob(self, path: Path, pattern: str | None) -> bool:
+        if not pattern:
+            return True
+        try:
+            relative = path.relative_to(self.project_root).as_posix()
+        except ValueError:
+            return False
+        normalized = pattern.replace("\\", "/")
+        return fnmatch.fnmatchcase(relative, normalized)
 
     def render(
         self,

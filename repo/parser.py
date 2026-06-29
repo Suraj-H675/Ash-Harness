@@ -46,6 +46,19 @@ class Symbol:
 
 
 @dataclass(frozen=True)
+class SourceLocation:
+    """A precise source occurrence returned by structural code navigation."""
+
+    name: str
+    file_path: str
+    start_line: int
+    start_column: int
+    end_line: int
+    end_column: int
+    language: str
+
+
+@dataclass(frozen=True)
 class LanguageSpec:
     name: str
     factory: Callable[[], Any]
@@ -206,6 +219,17 @@ LANGUAGE_BY_SUFFIX: dict[str, LanguageSpec] = {
     ".cs": _CSHARP,
 }
 SOURCE_SUFFIXES = frozenset(LANGUAGE_BY_SUFFIX)
+IDENTIFIER_NODE_TYPES = frozenset(
+    {
+        "identifier",
+        "type_identifier",
+        "field_identifier",
+        "property_identifier",
+        "namespace_identifier",
+        "package_identifier",
+        "shorthand_property_identifier",
+    }
+)
 
 
 class SymbolExtractor:
@@ -215,28 +239,68 @@ class SymbolExtractor:
         self._parsers: dict[str, Parser] = {}
 
     def extract(self, file_path: Path) -> list[Symbol]:
-        spec = LANGUAGE_BY_SUFFIX.get(file_path.suffix.casefold())
-        if spec is None:
+        parsed = self._parse_file(file_path)
+        if parsed is None:
             return []
-        try:
-            source = file_path.read_bytes()
-        except OSError:
-            return []
-
-        parser = self._parsers.get(spec.name)
-        if parser is None:
-            parser = Parser(Language(spec.factory()))
-            self._parsers[spec.name] = parser
-        tree = parser.parse(source)
+        spec, root = parsed
         symbols: list[Symbol] = []
         self._collect(
-            tree.root_node,
+            root,
             file_path=file_path,
             spec=spec,
             parent=None,
             out=symbols,
         )
         return symbols
+
+    def find_references(
+        self,
+        file_path: Path,
+        name: str,
+        *,
+        case_sensitive: bool = True,
+    ) -> list[SourceLocation]:
+        """Find identifier references, excluding structural declaration names."""
+
+        parsed = self._parse_file(file_path)
+        if parsed is None:
+            return []
+        spec, root = parsed
+        expected = name if case_sensitive else name.casefold()
+        matches: list[SourceLocation] = []
+        for node in [root, *self._descendants(root)]:
+            if node.type not in IDENTIFIER_NODE_TYPES:
+                continue
+            value = self._text(node)
+            comparable = value if case_sensitive else value.casefold()
+            if comparable != expected or self._is_declaration_name(node, spec):
+                continue
+            matches.append(
+                SourceLocation(
+                    name=value,
+                    file_path=str(file_path),
+                    start_line=node.start_point[0] + 1,
+                    start_column=node.start_point[1] + 1,
+                    end_line=node.end_point[0] + 1,
+                    end_column=node.end_point[1] + 1,
+                    language=spec.name,
+                )
+            )
+        return matches
+
+    def _parse_file(self, file_path: Path) -> tuple[LanguageSpec, Node] | None:
+        spec = LANGUAGE_BY_SUFFIX.get(file_path.suffix.casefold())
+        if spec is None:
+            return None
+        try:
+            source = file_path.read_bytes()
+        except OSError:
+            return None
+        parser = self._parsers.get(spec.name)
+        if parser is None:
+            parser = Parser(Language(spec.factory()))
+            self._parsers[spec.name] = parser
+        return spec, parser.parse(source).root_node
 
     def _collect(
         self,
@@ -352,35 +416,61 @@ class SymbolExtractor:
 
     @classmethod
     def _definition_name(cls, node: Node) -> str | None:
+        name = cls._definition_name_node(node)
+        return cls._text(name).strip() or None
+
+    @classmethod
+    def _definition_name_node(cls, node: Node) -> Node | None:
         name = node.child_by_field_name("name")
         if name is not None:
-            return cls._text(name).strip() or None
+            return name
         declarator = node.child_by_field_name("declarator")
         if declarator is not None:
-            return cls._declarator_name(declarator)
+            return cls._declarator_name_node(declarator)
         for descendant in cls._descendants(node):
-            if descendant.type in {
-                "identifier",
-                "type_identifier",
-                "field_identifier",
-            }:
-                return cls._text(descendant).strip() or None
+            if descendant.type in IDENTIFIER_NODE_TYPES:
+                return descendant
         return None
 
     @classmethod
     def _declarator_name(cls, node: Node) -> str | None:
+        name = cls._declarator_name_node(node)
+        return cls._text(name).strip() or None
+
+    @classmethod
+    def _declarator_name_node(cls, node: Node) -> Node | None:
         current: Node | None = node
         while current is not None:
             if current.type in {"identifier", "field_identifier", "type_identifier"}:
-                return cls._text(current).strip() or None
+                return current
             next_node = current.child_by_field_name("declarator")
             if next_node is None:
                 break
             current = next_node
         for descendant in cls._descendants(node):
             if descendant.type in {"identifier", "field_identifier"}:
-                return cls._text(descendant).strip() or None
+                return descendant
         return None
+
+    @classmethod
+    def _is_declaration_name(cls, node: Node, spec: LanguageSpec) -> bool:
+        parent = node.parent
+        while parent is not None:
+            if (
+                parent.type in spec.class_nodes
+                or parent.type in spec.function_nodes
+                or parent.type == "variable_declarator"
+            ):
+                declared = cls._definition_name_node(parent)
+                if (
+                    declared is not None
+                    and declared.start_byte == node.start_byte
+                    and declared.end_byte == node.end_byte
+                ):
+                    return True
+                return False
+            parent = parent.parent
+        return False
 
     @classmethod
     def _receiver_parent(cls, node: Node, language: str) -> str | None:

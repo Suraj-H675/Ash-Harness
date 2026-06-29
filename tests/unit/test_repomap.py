@@ -279,3 +279,47 @@ def test_repomap_dot_graph_follows_import_direction(tmp_path: Path) -> None:
 
     assert '"main.ts" -> "helper.ts";' in graph
     assert '"helper.ts" -> "main.ts";' not in graph
+
+
+def test_repomap_finds_definitions_and_references_across_languages(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "service.py").write_text(
+        "def connect():\n    pass\n\ndef run():\n    connect()\n"
+    )
+    (tmp_path / "client.ts").write_text(
+        "export function connect() {}\nexport function run() { connect(); }\n"
+    )
+    repo_map = RepoMap(tmp_path)
+
+    definitions = repo_map.find_definitions("connect")
+    references = repo_map.find_references("connect")
+
+    assert {(Path(item.file_path).name, item.start_line) for item in definitions} == {
+        ("client.ts", 1),
+        ("service.py", 1),
+    }
+    assert {(Path(item.file_path).name, item.start_line) for item in references} == {
+        ("client.ts", 2),
+        ("service.py", 5),
+    }
+
+
+def test_repomap_symbol_queries_support_path_globs_and_case_folding(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "Main.java").write_text("class Connection {}\n")
+    (tmp_path / "Connection.cs").write_text("class Connection {}\n")
+    repo_map = RepoMap(tmp_path)
+
+    matches = repo_map.find_definitions(
+        "connection",
+        case_sensitive=False,
+        path_glob="src/*.java",
+    )
+
+    assert [(Path(item.file_path).name, item.language) for item in matches] == [
+        ("Main.java", "java")
+    ]

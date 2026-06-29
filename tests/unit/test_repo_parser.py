@@ -188,3 +188,48 @@ def test_extract_returns_empty_for_unsupported_language(tmp_path: Path) -> None:
     path = tmp_path / "notes.txt"
     path.write_text("not source code")
     assert SymbolExtractor().extract(path) == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "source", "expected_line"),
+    [
+        (
+            "sample.py",
+            'def target():\n    return "target"\n\n# target\ntarget()\n',
+            5,
+        ),
+        (
+            "sample.ts",
+            'function target() { return "target"; }\n// target\ntarget();\n',
+            3,
+        ),
+        (
+            "sample.c",
+            'void target(void) {}\nconst char *text = "target";\ntarget();\n',
+            3,
+        ),
+    ],
+)
+def test_find_references_excludes_declarations_comments_and_strings(
+    tmp_path: Path,
+    filename: str,
+    source: str,
+    expected_line: int,
+) -> None:
+    path = tmp_path / filename
+    path.write_text(source)
+
+    matches = SymbolExtractor().find_references(path, "target")
+
+    assert [(item.start_line, item.start_column) for item in matches] == [
+        (expected_line, 1)
+    ]
+
+
+def test_find_references_supports_case_insensitive_matching(tmp_path: Path) -> None:
+    path = tmp_path / "sample.cs"
+    path.write_text("class Example { void Run() { RUN(); } }\n")
+
+    matches = SymbolExtractor().find_references(path, "run", case_sensitive=False)
+
+    assert [item.name for item in matches] == ["RUN"]
