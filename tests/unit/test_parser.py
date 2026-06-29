@@ -185,6 +185,21 @@ def test_multiple_tool_calls_in_single_feed() -> None:
     ]
 
 
+def test_adjacent_tool_calls_with_arguments_remain_separate() -> None:
+    parser = StreamingXMLParser()
+
+    events = _drive(
+        parser,
+        '<call_tool name="first"><arg name="query">one</arg></call_tool>'
+        '<call_tool name="second"><arg name="query">two</arg></call_tool>',
+    )
+
+    assert events == [
+        ("tool_call", {"name": "first", "arguments": {"query": "one"}}),
+        ("tool_call", {"name": "second", "arguments": {"query": "two"}}),
+    ]
+
+
 def test_special_characters_in_arg_value_are_preserved() -> None:
     parser = StreamingXMLParser()
 

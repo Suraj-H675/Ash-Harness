@@ -179,15 +179,9 @@ class StreamingXMLParser:
             return self._process_tool_state()
 
         arg_match = self._ARG_OPEN_PATTERN.search(self._buffer)
-        if arg_match is not None:
-            self._current_arg_name = arg_match.group(1)
-            self._state = _State.ARG
-            self._buffer = self._buffer[arg_match.end() :]
-            self._accumulated_text = ""
-            return [], True
-
-        if "</call_tool>" in self._buffer:
-            _, post = self._buffer.split("</call_tool>", 1)
+        close_index = self._buffer.find("</call_tool>")
+        if close_index >= 0 and (arg_match is None or close_index < arg_match.start()):
+            post = self._buffer[close_index + len("</call_tool>") :]
             events: list[Event] = [
                 (
                     "tool_call",
@@ -201,6 +195,13 @@ class StreamingXMLParser:
             self._buffer = post
             self._current_tool_name = None
             return events, True
+
+        if arg_match is not None:
+            self._current_arg_name = arg_match.group(1)
+            self._state = _State.ARG
+            self._buffer = self._buffer[arg_match.end() :]
+            self._accumulated_text = ""
+            return [], True
 
         return [], False
 
