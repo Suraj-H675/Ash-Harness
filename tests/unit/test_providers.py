@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Callable
 
 import pytest
@@ -575,6 +576,198 @@ async def test_openai_provider_stream_chat_signature():
     assert hasattr(provider, "stream_chat")
     assert hasattr(provider, "count_tokens")
     assert hasattr(provider, "model_name")
+
+
+class _AsyncChunkStream:
+    def __init__(self, chunks: list[Any]) -> None:
+        self._chunks = chunks
+
+    def __aiter__(self):
+        async def generate():
+            for chunk in self._chunks:
+                yield chunk
+
+        return generate()
+
+
+class _FakeOpenAICompletions:
+    def __init__(self, chunks: list[Any]) -> None:
+        self._chunks = chunks
+        self.kwargs: dict[str, Any] = {}
+
+    async def create(self, **kwargs: Any) -> _AsyncChunkStream:
+        self.kwargs = kwargs
+        return _AsyncChunkStream(self._chunks)
+
+
+class _FakeOpenAIClient:
+    def __init__(self, chunks: list[Any]) -> None:
+        self.completions = _FakeOpenAICompletions(chunks)
+        self.chat = SimpleNamespace(completions=self.completions)
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _openai_chunk(
+    *,
+    content: str = "",
+    finish_reason: str | None = None,
+    usage: Any = None,
+) -> Any:
+    choices = []
+    if finish_reason is not None or content:
+        choices.append(
+            SimpleNamespace(
+                delta=SimpleNamespace(content=content, tool_calls=None),
+                finish_reason=finish_reason,
+            )
+        )
+    return SimpleNamespace(choices=choices, usage=usage)
+
+
+@pytest.mark.asyncio
+async def test_openai_prompt_cache_and_usage_only_chunk() -> None:
+    from providers.openai import OpenAIProvider
+
+    usage = SimpleNamespace(
+        prompt_tokens=1200,
+        completion_tokens=10,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=1024),
+    )
+    client = _FakeOpenAIClient(
+        [
+            _openai_chunk(content="hello"),
+            _openai_chunk(finish_reason="stop"),
+            _openai_chunk(usage=usage),
+        ]
+    )
+    provider = OpenAIProvider(
+        model_name="gpt-5.2",
+        api_key="test-key",
+        client=client,
+    )
+    provider.configure_prompt_cache(
+        enabled=True,
+        cache_key="ash-project-test",
+        retention="extended",
+    )
+
+    chunks = [
+        chunk
+        async for chunk in provider.stream_chat([{"role": "user", "content": "hi"}])
+    ]
+
+    assert "".join(chunk.content for chunk in chunks) == "hello"
+    assert chunks[-1].is_done is True
+    assert chunks[-1].prompt_tokens == 1200
+    assert chunks[-1].completion_tokens == 10
+    assert chunks[-1].cache_read_tokens == 1024
+    assert client.completions.kwargs["stream_options"] == {"include_usage": True}
+    assert client.completions.kwargs["prompt_cache_key"] == "ash-project-test"
+    assert client.completions.kwargs["prompt_cache_retention"] == "24h"
+
+    await provider.aclose()
+    assert client.closed is False
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_endpoint_omits_openai_cache_options() -> None:
+    from providers.openai import OpenAIProvider
+
+    client = _FakeOpenAIClient([_openai_chunk(finish_reason="stop")])
+    provider = OpenAIProvider(
+        model_name="compatible-model",
+        api_key="test-key",
+        base_url="http://localhost:1234/v1",
+        client=client,
+    )
+
+    _ = [chunk async for chunk in provider.stream_chat([])]
+
+    assert "stream_options" not in client.completions.kwargs
+    assert "prompt_cache_key" not in client.completions.kwargs
+    assert "prompt_cache_retention" not in client.completions.kwargs
+
+
+class _FakeAnthropicStream:
+    def __init__(self, final_message: Any) -> None:
+        self._final_message = final_message
+        self.text_stream = self._texts()
+
+    async def _texts(self):
+        yield "hello"
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    async def get_final_message(self) -> Any:
+        return self._final_message
+
+
+class _FakeAnthropicMessages:
+    def __init__(self, final_message: Any) -> None:
+        self._final_message = final_message
+        self.kwargs: dict[str, Any] = {}
+
+    def stream(self, **kwargs: Any) -> _FakeAnthropicStream:
+        self.kwargs = kwargs
+        return _FakeAnthropicStream(self._final_message)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_prompt_cache_normalizes_usage() -> None:
+    from providers.anthropic import AnthropicProvider
+
+    final_message = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=50,
+            cache_read_input_tokens=1000,
+            cache_creation_input_tokens=500,
+            output_tokens=20,
+        ),
+        stop_reason="end_turn",
+        content=[],
+    )
+    messages = _FakeAnthropicMessages(final_message)
+    client = SimpleNamespace(messages=messages)
+    provider = AnthropicProvider(
+        model_name="claude-sonnet-4-6",
+        api_key="test-key",
+        client=client,
+    )
+    provider.configure_prompt_cache(enabled=True, retention="extended")
+
+    chunks = [
+        chunk
+        async for chunk in provider.stream_chat([{"role": "user", "content": "hi"}])
+    ]
+
+    assert "".join(chunk.content for chunk in chunks) == "hello"
+    assert messages.kwargs["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert chunks[-1].prompt_tokens == 1550
+    assert chunks[-1].completion_tokens == 20
+    assert chunks[-1].cache_read_tokens == 1000
+    assert chunks[-1].cache_write_tokens == 500
+
+
+def test_prompt_cache_retention_validation() -> None:
+    from providers.anthropic import AnthropicProvider
+    from providers.openai import OpenAIProvider
+
+    anthropic = AnthropicProvider("claude-test", "test-key", client=object())
+    openai_provider = OpenAIProvider(
+        "gpt-test", "test-key", client=_FakeOpenAIClient([])
+    )
+
+    with pytest.raises(ValueError, match="retention"):
+        anthropic.configure_prompt_cache(enabled=True, retention="forever")
+    with pytest.raises(ValueError, match="retention"):
+        openai_provider.configure_prompt_cache(enabled=True, retention="forever")
 
 
 # ---------------------------------------------------------------------------

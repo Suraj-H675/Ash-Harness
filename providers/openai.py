@@ -52,6 +52,7 @@ def prepare_openai_messages(
 
 class OpenAIProvider(ProviderABC):
     provider_family = "openai"
+
     def __init__(
         self,
         model_name: str = "gpt-4o",
@@ -59,6 +60,7 @@ class OpenAIProvider(ProviderABC):
         *,
         base_url: str | None = None,
         token_counter: TokenCounterLike | None = None,
+        client: Any | None = None,
     ) -> None:
         if not api_key:
             raise ValueError(
@@ -69,7 +71,11 @@ class OpenAIProvider(ProviderABC):
         self._api_key = api_key
         self._base_url = base_url
         self._token_counter = token_counter or OpenAITokenCounter(model_name)
-        self._client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._client = client or openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._owns_client = client is None
+        self._prompt_cache_enabled = False
+        self._prompt_cache_key = ""
+        self._prompt_cache_retention = "memory"
 
     @property
     def model_name(self) -> str:
@@ -83,6 +89,19 @@ class OpenAIProvider(ProviderABC):
             raise ValueError("max_tokens must be positive")
         self._max_tokens = max_tokens
 
+    def configure_prompt_cache(
+        self,
+        *,
+        enabled: bool,
+        cache_key: str = "",
+        retention: str = "memory",
+    ) -> None:
+        if retention not in {"memory", "extended"}:
+            raise ValueError("prompt cache retention must be memory or extended")
+        self._prompt_cache_enabled = enabled
+        self._prompt_cache_key = cache_key
+        self._prompt_cache_retention = retention
+
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
@@ -95,6 +114,14 @@ class OpenAIProvider(ProviderABC):
             "temperature": temperature,
             "stream": True,
         }
+        if self._base_url is None:
+            kwargs["stream_options"] = {"include_usage": True}
+        if self._prompt_cache_enabled:
+            if self._prompt_cache_key:
+                kwargs["prompt_cache_key"] = self._prompt_cache_key
+            kwargs["prompt_cache_retention"] = (
+                "24h" if self._prompt_cache_retention == "extended" else "in_memory"
+            )
         if tools:
             kwargs["tools"] = tools
         if hasattr(self, "_max_tokens"):
@@ -110,11 +137,27 @@ class OpenAIProvider(ProviderABC):
         completed: list[dict[str, Any]] = []
 
         async for chunk in stream:
-            delta = chunk.choices[0].delta
+            choices = getattr(chunk, "choices", None) or []
+            usage = getattr(chunk, "usage", None)
+            if not choices:
+                if usage is not None:
+                    details = getattr(usage, "prompt_tokens_details", None)
+                    yield StreamChunk(
+                        is_done=True,
+                        model=self._model_name,
+                        prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                        completion_tokens=(getattr(usage, "completion_tokens", 0) or 0),
+                        cache_read_tokens=getattr(details, "cached_tokens", 0) or 0,
+                    )
+                continue
+
+            choice = choices[0]
+            delta = choice.delta
             content = delta.content or ""
-            is_done = chunk.choices[0].finish_reason is not None
+            is_done = choice.finish_reason is not None
             prompt_tokens = 0
             completion_tokens = 0
+            cache_read_tokens = 0
             stop_reason = None
 
             # Process native tool_calls from the delta.
@@ -133,10 +176,12 @@ class OpenAIProvider(ProviderABC):
 
             # On terminal chunk, finalise every partial tool call.
             if is_done:
-                if hasattr(chunk, "usage") and chunk.usage is not None:
-                    prompt_tokens = chunk.usage.prompt_tokens or 0
-                    completion_tokens = chunk.usage.completion_tokens or 0
-                stop_reason = chunk.choices[0].finish_reason
+                if usage is not None:
+                    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                    details = getattr(usage, "prompt_tokens_details", None)
+                    cache_read_tokens = getattr(details, "cached_tokens", 0) or 0
+                stop_reason = choice.finish_reason
                 for partial in partials.values():
                     completed.append(
                         {
@@ -153,6 +198,7 @@ class OpenAIProvider(ProviderABC):
                 model=self._model_name,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                cache_read_tokens=cache_read_tokens,
                 stop_reason=stop_reason,
                 # Surface complete native tool calls so the loop can use their
                 # real IDs instead of generating random UUIDs.
@@ -164,4 +210,5 @@ class OpenAIProvider(ProviderABC):
             completed.clear()
 
     async def aclose(self) -> None:
-        await self._client.close()
+        if self._owns_client:
+            await self._client.close()

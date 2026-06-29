@@ -353,6 +353,19 @@ def test_ash_config_loads_saved_provider_key_into_process(
     assert os.environ["ANTHROPIC_API_KEY"] == "saved-key"
 
 
+def test_prompt_cache_key_is_stable_without_exposing_workspace(tmp_path: Path) -> None:
+    from ash.cli import _prompt_cache_key
+    from config import AshConfig
+
+    config = AshConfig(workspace_root=tmp_path / "private-workspace")
+
+    first = _prompt_cache_key(config)
+    assert first == _prompt_cache_key(config)
+    assert first.startswith("ash-project-")
+    assert len(first) == len("ash-project-") + 24
+    assert str(config.workspace_root) not in first
+
+
 def test_explain_config_reports_sources_and_masks_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -382,9 +395,7 @@ def test_explain_config_reports_sources_and_masks_secrets(
         openai_api_key="sk-secret-value",
         custom_providers={"local": {"api_key": "local-secret-value"}},
     )
-    entries = {
-        entry.field: entry for entry in cli_config.explain_config(config)
-    }
+    entries = {entry.field: entry for entry in cli_config.explain_config(config)}
 
     assert entries["model"].source == "env"
     assert entries["model"].detail == "ASH_MODEL"

@@ -16,7 +16,8 @@ class StreamChunk(BaseModel):
     deltas populate ``content``; mid-flight tool-call fragments populate
     ``tool_call_delta``. ``is_done`` flips to ``True`` on the terminal
     chunk so the loop can finalize the turn. ``prompt_tokens`` and
-    ``completion_tokens`` are best-effort usage figures.
+    ``completion_tokens`` are best-effort usage figures. Cache reads and
+    writes are included in ``prompt_tokens`` and also exposed separately.
     """
 
     content: str = ""
@@ -24,6 +25,8 @@ class StreamChunk(BaseModel):
     is_done: bool = False
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
     stop_reason: str | None = None
     model: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)

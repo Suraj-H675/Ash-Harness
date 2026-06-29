@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -106,6 +107,10 @@ def _build_provider(config: AshConfig) -> ProviderABC:
             base_url=base_url,
         )
         prov.configure_max_tokens(config.max_completion_tokens)
+        prov.configure_prompt_cache(
+            enabled=config.prompt_cache_enabled and base_url is None,
+            retention=config.prompt_cache_retention,
+        )
         return prov
 
     elif provider == "openai":
@@ -119,6 +124,11 @@ def _build_provider(config: AshConfig) -> ProviderABC:
             base_url=base_url,
         )
         prov.configure_max_tokens(config.max_completion_tokens)
+        prov.configure_prompt_cache(
+            enabled=config.prompt_cache_enabled and base_url is None,
+            cache_key=_prompt_cache_key(config),
+            retention=config.prompt_cache_retention,
+        )
         return prov
 
     elif provider == "ollama":
@@ -185,6 +195,12 @@ def _build_provider(config: AshConfig) -> ProviderABC:
         return prov
 
     raise ValueError(f"Unknown provider in model string: {provider!r}")
+
+
+def _prompt_cache_key(config: AshConfig) -> str:
+    workspace = str(config.workspace_root.expanduser().resolve()).encode("utf-8")
+    digest = hashlib.sha256(workspace).hexdigest()[:24]
+    return f"ash-project-{digest}"
 
 
 def _build_tools(

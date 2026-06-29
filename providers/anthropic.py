@@ -115,6 +115,8 @@ class AnthropicProvider(ProviderABC):
         self._client = client
         self._owns_client = client is None
         self._token_counter = token_counter or AnthropicTokenCounter()
+        self._prompt_cache_enabled = False
+        self._prompt_cache_retention = "memory"
 
     @property
     def model_name(self) -> str:
@@ -163,6 +165,11 @@ class AnthropicProvider(ProviderABC):
         anthropic_tools = prepare_anthropic_tools(tools)
         if anthropic_tools:
             request_kwargs["tools"] = anthropic_tools
+        if self._prompt_cache_enabled:
+            cache_control = {"type": "ephemeral"}
+            if self._prompt_cache_retention == "extended":
+                cache_control["ttl"] = "1h"
+            request_kwargs["cache_control"] = cache_control
 
         # Cap output to keep runaway generations bounded; the spec exposes
         # ``max_completion_tokens`` on the AshConfig for the loop to wire.
@@ -177,6 +184,9 @@ class AnthropicProvider(ProviderABC):
 
             final_message = await stream.get_final_message()
             usage = getattr(final_message, "usage", None)
+            uncached_input_tokens = getattr(usage, "input_tokens", 0) or 0
+            cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cache_write_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
             stop_reason = getattr(final_message, "stop_reason", None)
             native_tool_calls = []
             for block in getattr(final_message, "content", []) or []:
@@ -191,8 +201,12 @@ class AnthropicProvider(ProviderABC):
             yield StreamChunk(
                 content="",
                 is_done=True,
-                prompt_tokens=getattr(usage, "input_tokens", 0) or 0,
+                prompt_tokens=(
+                    uncached_input_tokens + cache_read_tokens + cache_write_tokens
+                ),
                 completion_tokens=getattr(usage, "output_tokens", 0) or 0,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
                 stop_reason=stop_reason,
                 model=self._model_name,
                 native_tool_calls=native_tool_calls or None,
@@ -204,6 +218,17 @@ class AnthropicProvider(ProviderABC):
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         self._max_tokens = max_tokens
+
+    def configure_prompt_cache(
+        self,
+        *,
+        enabled: bool,
+        retention: str = "memory",
+    ) -> None:
+        if retention not in {"memory", "extended"}:
+            raise ValueError("prompt cache retention must be memory or extended")
+        self._prompt_cache_enabled = enabled
+        self._prompt_cache_retention = retention
 
     async def aclose(self) -> None:
         if self._client is not None and self._owns_client:

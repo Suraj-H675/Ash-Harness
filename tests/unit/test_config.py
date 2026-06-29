@@ -207,6 +207,15 @@ def test_terminal_preferences_are_validated() -> None:
     assert config.keybindings["newline"] == ["c-o"]
 
 
+def test_prompt_cache_preferences_are_validated() -> None:
+    config = AshConfig(prompt_cache_enabled=False, prompt_cache_retention="EXTENDED")
+
+    assert config.prompt_cache_enabled is False
+    assert config.prompt_cache_retention == "extended"
+    with pytest.raises(ValueError, match="prompt_cache_retention"):
+        AshConfig(prompt_cache_retention="forever")
+
+
 def test_allowed_web_domains_are_normalized_and_validated() -> None:
     config = AshConfig(
         allowed_web_domains=["Example.COM.", "*.Docs.Example", "example.com"]

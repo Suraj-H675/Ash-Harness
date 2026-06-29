@@ -54,6 +54,14 @@ class AshConfig(BaseSettings):
         le=100,
         description="Maximum user steering messages waiting for a running turn.",
     )
+    prompt_cache_enabled: bool = Field(
+        True,
+        description="Enable first-party provider prompt-cache optimizations.",
+    )
+    prompt_cache_retention: str = Field(
+        "memory",
+        description="Prompt cache retention: memory or extended.",
+    )
     model_pricing_usd_per_million: dict[str, dict[str, float]] = Field(
         default_factory=dict,
         description=(
@@ -207,6 +215,14 @@ class AshConfig(BaseSettings):
         if value not in {"auto", "chroma", "fts5", "off"}:
             raise ValueError("memory_backend must be auto, chroma, fts5, or off")
         return value
+
+    @field_validator("prompt_cache_retention")
+    @classmethod
+    def validate_prompt_cache_retention(cls, value: str) -> str:
+        normalized = value.casefold()
+        if normalized not in {"memory", "extended"}:
+            raise ValueError("prompt_cache_retention must be memory or extended")
+        return normalized
 
     @field_validator("model")
     @classmethod
