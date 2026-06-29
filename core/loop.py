@@ -99,6 +99,8 @@ FILE_WRITE_TOOLS = {
     "whole_edit",
     "apply_patch",
 }
+REPO_MAP_FILE_TOOLS = {*FILE_WRITE_TOOLS, "read_file"}
+MAX_ACTIVE_REPO_FILES = 20
 
 
 def _provider_capabilities(provider: Any) -> ProviderCapabilities:
@@ -264,6 +266,11 @@ class AshLoop:
         self.repo_map = repo_map
         self.auto_commit = auto_commit
         self.auto_commit_paths = list(auto_commit_paths or [])
+        self._repo_map_active_files: list[Path] = []
+        for path in self.auto_commit_paths:
+            candidate = path if path.is_absolute() else self.project_root / path
+            self._remember_repo_file(candidate)
+        self._repo_map_dirty = False
         self.planner = planner
         self.enable_sprint_planning = enable_sprint_planning
         self.tool_middlewares: list[ToolMiddleware] = list(tool_middlewares or [])
@@ -976,6 +983,7 @@ class AshLoop:
                     "token_count": tool_result.token_count,
                 }
             )
+            self._record_repo_map_activity(tool_name, arguments, tool_result)
             if tool_result.success:
                 self.circuit_breaker.record_success()
             else:
@@ -1003,6 +1011,47 @@ class AshLoop:
                     self._iterations_since_skill_use = 0
 
         return results
+
+    def _remember_repo_file(self, path: Path) -> None:
+        """Keep a bounded least-recently-used list of files relevant to context."""
+
+        resolved = path.resolve()
+        if resolved in self._repo_map_active_files:
+            self._repo_map_active_files.remove(resolved)
+        self._repo_map_active_files.append(resolved)
+        del self._repo_map_active_files[:-MAX_ACTIVE_REPO_FILES]
+
+    def _record_repo_map_activity(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: ToolResult,
+    ) -> None:
+        if self.repo_map is None or not result.success:
+            return
+        paths: set[str] = set()
+        if tool_name == "apply_patch":
+            try:
+                from tools.patch import extract_patch_paths
+
+                paths = extract_patch_paths(str(arguments.get("patch", "")), self.safety_guard)
+            except (TypeError, ValueError):
+                return
+        elif tool_name in REPO_MAP_FILE_TOOLS:
+            file_path = arguments.get("file_path")
+            if isinstance(file_path, str) and file_path:
+                paths.add(file_path)
+        else:
+            return
+
+        for path in paths:
+            try:
+                resolved = self.safety_guard.validate_path(path)
+            except Exception:  # noqa: BLE001 - context tracking is best-effort
+                continue
+            self._remember_repo_file(resolved)
+        if tool_name in FILE_WRITE_TOOLS and not bool(arguments.get("dry_run", False)):
+            self._repo_map_dirty = True
 
     def _append_tool_audit(
         self,
@@ -1145,11 +1194,13 @@ class AshLoop:
         system_content = self.system_prompt
         repo_section = ""
         if self.repo_map is not None:
-            # Rank against any workspace files touched in this turn so far
-            # (best-effort: just the user message we just persisted).
-            active = [Path(p) for p in (self.auto_commit_paths or [])]
             try:
-                ranked = self.repo_map.rank(active or [self.project_root])
+                if self._repo_map_dirty:
+                    try:
+                        self.repo_map.refresh()
+                    finally:
+                        self._repo_map_dirty = False
+                ranked = self.repo_map.rank(self._repo_map_active_files)
                 repo_section = self.repo_map.render(
                     ranked, top_files=5, symbols_per_file=6
                 )

@@ -15,6 +15,7 @@ from providers.base import StreamChunk
 from repo.repomap import RepoMap
 from safety.guard import SafetyGuard
 from tools.git import AutoCommitTool
+from tools.filesystem import ReadFileTool, WriteFileTool
 from ui.terminal import TerminalUI
 
 
@@ -113,6 +114,74 @@ def test_repo_map_injected_into_system_prompt(
     system_message = provider.received_messages[0][0]
     assert "## Repository Map" in system_message["content"]
     assert "alpha.py" in system_message["content"]
+
+
+def test_repo_map_prioritizes_successfully_read_file(
+    workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
+) -> None:
+    for name in ["a", "b", "c", "d", "e", "z_active"]:
+        (workspace / f"{name}.py").write_text(f"def {name}(): pass\n")
+    provider = FakeProvider(
+        scripts=[
+            [
+                '<call_tool name="read_file"><arg name="file_path">'
+                "z_active.py</arg></call_tool>"
+            ],
+            ["<response>done</response>"],
+        ]
+    )
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=workspace,
+        repo_map=RepoMap(workspace),
+        tools={"read_file": ReadFileTool(safety_guard)},
+    )
+
+    asyncio.run(loop.run_turn("read the active file"))
+
+    first_system = provider.received_messages[0][0]["content"]
+    second_system = provider.received_messages[1][0]["content"]
+    assert "z_active.py" not in first_system
+    assert "z_active.py" in second_system
+
+
+def test_repo_map_refreshes_after_successful_write(
+    workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
+) -> None:
+    for name in ["a", "b", "c", "d", "e"]:
+        (workspace / f"{name}.py").write_text(f"def {name}(): pass\n")
+    provider = FakeProvider(
+        scripts=[
+            [
+                '<call_tool name="write_file">'
+                '<arg name="file_path">z_new.py</arg>'
+                '<arg name="content">def fresh(): pass\n</arg>'
+                "</call_tool>"
+            ],
+            ["<response>done</response>"],
+        ]
+    )
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=workspace,
+        repo_map=RepoMap(workspace),
+        tools={"write_file": WriteFileTool(safety_guard)},
+    )
+
+    asyncio.run(loop.run_turn("create a new file"))
+
+    assert (workspace / "z_new.py").exists()
+    first_system = provider.received_messages[0][0]["content"]
+    second_system = provider.received_messages[1][0]["content"]
+    assert "z_new.py" not in first_system
+    assert "z_new.py" in second_system
+    assert "fresh" in second_system
 
 
 def test_auto_commit_creates_commit_on_turn_completion(
