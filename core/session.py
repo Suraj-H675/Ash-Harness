@@ -22,7 +22,7 @@ AuditAction = Literal[
     "tool_call", "command_run", "file_write", "safety_block", "user_approval"
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 class SessionStorageError(RuntimeError):
@@ -85,6 +85,8 @@ class SessionUsage(BaseModel):
     total_tokens: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
     cost_usd: float = 0.0
 
 
@@ -244,6 +246,8 @@ class SessionStore:
                 self._migrate_v1(conn)
             if from_version < 2:
                 self._migrate_v2(conn)
+            if from_version < 3:
+                self._migrate_v3(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -288,6 +292,21 @@ class SessionStore:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
             (2, _serialize_datetime(_utc_now())),
+        )
+
+    def _migrate_v3(self, conn: sqlite3.Connection) -> None:
+        """Add provider prompt-cache usage totals."""
+
+        for col_spec in (
+            ("total_cache_read_tokens", "INTEGER DEFAULT 0"),
+            ("total_cache_write_tokens", "INTEGER DEFAULT 0"),
+        ):
+            col_name, col_type = col_spec
+            if not _column_exists(conn, "sessions", col_name):
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (3, _serialize_datetime(_utc_now())),
         )
 
     def backup(
@@ -340,7 +359,9 @@ class SessionStore:
                     total_cost_inr REAL DEFAULT 0,
                     total_cost_usd REAL DEFAULT 0,
                     total_prompt_tokens INTEGER DEFAULT 0,
-                    total_completion_tokens INTEGER DEFAULT 0
+                    total_completion_tokens INTEGER DEFAULT 0,
+                    total_cache_read_tokens INTEGER DEFAULT 0,
+                    total_cache_write_tokens INTEGER DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS messages (
@@ -654,6 +675,8 @@ class SessionStore:
                 "SELECT COALESCE(total_tokens, 0) AS total_tokens, "
                 "COALESCE(total_prompt_tokens, 0) AS prompt_tokens, "
                 "COALESCE(total_completion_tokens, 0) AS completion_tokens, "
+                "COALESCE(total_cache_read_tokens, 0) AS cache_read_tokens, "
+                "COALESCE(total_cache_write_tokens, 0) AS cache_write_tokens, "
                 "COALESCE(total_cost_usd, 0) AS cost_usd "
                 "FROM sessions WHERE session_id = ?",
                 (session_id,),
@@ -962,6 +985,9 @@ class SessionStore:
         total_prompt_tokens: int,
         total_completion_tokens: int,
         turn_cost_usd: float,
+        *,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
     ) -> None:
         """Accumulate one turn's token and explicitly configured cost totals."""
 
@@ -972,7 +998,9 @@ class SessionStore:
                 SET total_tokens = COALESCE(total_tokens, 0) + ?,
                     total_cost_usd = COALESCE(total_cost_usd, 0) + ?,
                     total_prompt_tokens = COALESCE(total_prompt_tokens, 0) + ?,
-                    total_completion_tokens = COALESCE(total_completion_tokens, 0) + ?
+                    total_completion_tokens = COALESCE(total_completion_tokens, 0) + ?,
+                    total_cache_read_tokens = COALESCE(total_cache_read_tokens, 0) + ?,
+                    total_cache_write_tokens = COALESCE(total_cache_write_tokens, 0) + ?
                 WHERE session_id = ?
                 """,
                 (
@@ -980,6 +1008,8 @@ class SessionStore:
                     turn_cost_usd,
                     total_prompt_tokens,
                     total_completion_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
                     session_id,
                 ),
             )
