@@ -281,6 +281,21 @@ class TerminalUI:
             return True
         return answer in {"y", "yes"}
 
+    def is_tool_approved_for_session(self, tool_name: str) -> bool:
+        return tool_name in self._session_approvals
+
+    def approve_tool_for_session(self, tool_name: str) -> None:
+        self._session_approvals.add(tool_name)
+
+    def show_tool_approval(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | dict[str, object],
+        *,
+        auto: bool,
+    ) -> None:
+        self._render_approval_notice(tool_name, dict(arguments), auto=auto)
+
     def _render_approval_notice(
         self,
         tool_name: str,

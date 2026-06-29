@@ -17,6 +17,7 @@ class SlashCommand:
 COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("help", "Show available commands", "/help [query]"),
     SlashCommand("status", "Show session and runtime status", "/status"),
+    SlashCommand("cancel", "Cancel the running turn", "/cancel"),
     SlashCommand(
         "model", "Choose or switch the active model", "/model [provider/model]"
     ),

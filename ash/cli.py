@@ -381,6 +381,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     from safety.trust import is_workspace_trusted
     from ui.prompt import PromptInput
     from ui.status import StatusLine
+    from ui.turn_input import InteractiveTurnController
 
     command_roots = [(Path.home() / ".ash" / "commands", "user")]
     if is_workspace_trusted(loop.project_root):
@@ -396,6 +397,14 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         input_mode=config.input_mode,
         keybindings=config.keybindings,
         workspace_root=loop.project_root,
+    )
+    if not isinstance(loop.ui, TerminalUI):
+        raise TypeError("interactive REPL requires TerminalUI")
+    turn_controller = InteractiveTurnController(
+        loop,
+        prompt_input,
+        loop.ui,
+        write_status=loop.ui.console.print,
     )
     print(
         "ash - type /help for commands",
@@ -492,6 +501,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     ),
                     flush=True,
                 )
+                continue
+            if command.name == "cancel":
+                print("No turn is currently running.", flush=True)
                 continue
             if command.name == "new":
                 session = await loop.start_session()
@@ -951,7 +963,12 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
             if expand_mentions:
                 user_input = expand_file_mentions(user_input, loop.safety_guard)
-            response = await loop.run_turn(user_input)
+            response = await turn_controller.run(user_input)
+            if response is None:
+                continue
+        except EOFError:
+            print()
+            return 0
         except Exception as exc:  # noqa: BLE001
             print(f"Error: {exc}", file=sys.stderr, flush=True)
             continue
