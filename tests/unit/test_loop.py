@@ -173,12 +173,14 @@ async def test_queued_steering_is_persisted_and_applied_to_running_turn(tmp_path
 
     turn = asyncio.create_task(loop.run_turn("start with the original approach"))
     await provider.started.wait()
+    assert loop.is_turn_running is True
     assert loop.queue_steering("use the safer approach instead") == 1
     provider.release.set()
 
     response = await turn
 
     assert response == "redirected answer"
+    assert loop.is_turn_running is False
     assert provider.calls == 2
     second_messages = provider.received_messages[1]
     assert any(
@@ -214,6 +216,27 @@ def test_steering_queue_validates_messages_and_capacity(tmp_path):
     assert loop.queue_steering("first") == 1
     with pytest.raises(OverflowError, match="queue is full"):
         loop.queue_steering("second")
+
+
+@pytest.mark.asyncio
+async def test_turn_running_state_resets_after_cancellation(tmp_path):
+    provider = SteeringProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "steering-cancel.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+    turn = asyncio.create_task(loop.run_turn("wait"))
+    await provider.started.wait()
+    assert loop.is_turn_running is True
+
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert loop.is_turn_running is False
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,10 @@ class ResumeRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
 
 
+class SteeringRequest(BaseModel):
+    input: str = Field(..., min_length=1, max_length=1_000_000)
+
+
 class SlidingWindowLimiter:
     def __init__(self, requests_per_minute: int) -> None:
         if requests_per_minute < 1:
@@ -107,6 +111,16 @@ def create_app(
                 yield _sse(event.type, event.data)
 
         return StreamingResponse(events(), media_type="text/event-stream")
+
+    @app.post("/v1/turn/steer", dependencies=[Depends(authorize)])
+    async def steer_turn(payload: SteeringRequest) -> dict[str, int]:
+        try:
+            pending = await client.steer(payload.input)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except OverflowError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        return {"pending": pending}
 
     @app.get("/v1/sessions", dependencies=[Depends(authorize)])
     async def sessions(query: str = "", limit: int = 20) -> dict:

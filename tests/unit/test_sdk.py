@@ -35,6 +35,24 @@ class SerialProvider(SDKProvider):
             self.active -= 1
 
 
+class SteeringSDKProvider(SDKProvider):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self.received_messages = []
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        self.calls += 1
+        self.received_messages.append(list(messages))
+        if self.calls == 1:
+            self.started.set()
+            await self.release.wait()
+            yield StreamChunk(content="initial", is_done=True)
+        else:
+            yield StreamChunk(content="redirected", is_done=True)
+
+
 @pytest.mark.asyncio
 async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
     config = AshConfig(
@@ -110,3 +128,32 @@ async def test_async_sdk_serializes_prompts_on_one_session(tmp_path) -> None:
 
     assert first.response == second.response == "done"
     assert provider.maximum_active == 1
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_steers_running_turn_without_waiting_for_prompt_lock(
+    tmp_path,
+) -> None:
+    provider = SteeringSDKProvider()
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    async with await AshClient.create(config=config, provider=provider) as client:
+        with pytest.raises(RuntimeError, match="no turn"):
+            await client.steer("too early")
+
+        prompt = asyncio.create_task(client.prompt("start"))
+        await provider.started.wait()
+        assert await client.steer("redirect now") == 1
+        provider.release.set()
+        result = await prompt
+
+    assert result.response == "redirected"
+    assert provider.calls == 2
+    assert any(
+        message["role"] == "user" and message["content"] == "redirect now"
+        for message in provider.received_messages[1]
+    )

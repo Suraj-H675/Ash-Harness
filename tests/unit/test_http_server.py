@@ -6,6 +6,9 @@ from server.http import create_app
 
 
 class FakeClient:
+    def __init__(self):
+        self.steering_error = None
+
     async def prompt(self, text):
         return AshResult(text.upper(), "session-1", "fake/model", 2)
 
@@ -20,6 +23,11 @@ class FakeClient:
 
     async def close(self):
         return None
+
+    async def steer(self, text):
+        if self.steering_error is not None:
+            raise self.steering_error
+        return 1
 
     async def stream_prompt(self, text):
         yield AshEvent("turn.started", {})
@@ -94,3 +102,40 @@ async def test_http_server_forwards_live_sse_events() -> None:
         assert body.count("event: assistant.delta") == 2
         assert 'data: {"text":"he"}' in body
         assert "event: turn.completed" in body
+
+
+@pytest.mark.asyncio
+async def test_http_server_queues_turn_steering_and_reports_conflicts() -> None:
+    client = FakeClient()
+    app = create_app(
+        client,  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        accepted = await http.post(
+            "/v1/turn/steer",
+            json={"input": "change direction"},
+            headers=headers,
+        )
+        assert accepted.status_code == 200
+        assert accepted.json() == {"pending": 1}
+
+        client.steering_error = RuntimeError("no turn is currently running")
+        idle = await http.post(
+            "/v1/turn/steer",
+            json={"input": "too late"},
+            headers=headers,
+        )
+        assert idle.status_code == 409
+
+        client.steering_error = OverflowError("steering queue is full")
+        full = await http.post(
+            "/v1/turn/steer",
+            json={"input": "one more"},
+            headers=headers,
+        )
+        assert full.status_code == 429

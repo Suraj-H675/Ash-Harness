@@ -269,6 +269,7 @@ class AshLoop:
             raise ValueError("max_steering_messages must be at least 1")
         self.max_steering_messages = max_steering_messages
         self._steering_messages: deque[str] = deque()
+        self._turn_running = False
         self.repo_map = repo_map
         self.auto_commit = auto_commit
         self.auto_commit_paths = list(auto_commit_paths or [])
@@ -390,7 +391,22 @@ class AshLoop:
 
     # --- the main turn ----------------------------------------------------
 
+    @property
+    def is_turn_running(self) -> bool:
+        return self._turn_running
+
     async def run_turn(self, user_input: str) -> str:
+        """Run one turn while preventing unsafe concurrent session mutation."""
+
+        if self._turn_running:
+            raise RuntimeError("a turn is already running")
+        self._turn_running = True
+        try:
+            return await self._run_turn(user_input)
+        finally:
+            self._turn_running = False
+
+    async def _run_turn(self, user_input: str) -> str:
         """Run a single user turn to completion and return the final text."""
 
         _log.info("turn started")
@@ -520,7 +536,7 @@ class AshLoop:
                     self._continuous_turns += 1
                     follow_up = "Continue the previous task. What is the next step?"
                     self.session_store.complete_turn(self.turn_context.turn_id)
-                    return await self.run_turn(follow_up)
+                    return await self._run_turn(follow_up)
                 break
 
             # Independent read-only calls may execute concurrently; all other

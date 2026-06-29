@@ -139,6 +139,13 @@ class AshClient:
         async with self._turn_lock:
             return await self._prompt_unlocked(text)
 
+    async def steer(self, text: str) -> int:
+        """Queue guidance for the currently running turn without waiting on it."""
+
+        if not self.loop.is_turn_running:
+            raise RuntimeError("no turn is currently running")
+        return self.loop.queue_steering(text)
+
     async def _prompt_unlocked(self, text: str) -> AshResult:
         if not text.strip():
             raise ValueError("prompt cannot be empty")
