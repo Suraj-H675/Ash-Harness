@@ -30,9 +30,7 @@ class ApplyPatchTool(BaseTool):
             paths = extract_patch_paths(args.patch, self.safety_guard)
         except (ValueError, SafetyViolation) as exc:
             return ToolResult(success=False, output="", error=f"Invalid patch: {exc}")
-        check = await _git_apply(
-            self.safety_guard.project_root, args.patch, check=True
-        )
+        check = await _git_apply(self.safety_guard.project_root, args.patch, check=True)
         if check[0] != 0:
             return ToolResult(
                 success=False,
@@ -95,9 +93,7 @@ def _normalize_patch_path(path: str) -> str:
     return candidate.as_posix()
 
 
-async def _git_apply(
-    cwd: Path, patch: str, *, check: bool
-) -> tuple[int, str, str]:
+async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, str]:
     command = ["git", "apply", "--whitespace=nowarn"]
     if check:
         command.append("--check")

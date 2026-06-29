@@ -91,9 +91,7 @@ class MCPClient:
                 future = self._pending.pop(request_id)
                 if not future.done():
                     future.set_result(message)
-        error = MCPProtocolError(
-            f"MCP server {self.config.name!r} closed its stdout"
-        )
+        error = MCPProtocolError(f"MCP server {self.config.name!r} closed its stdout")
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(error)
@@ -246,9 +244,7 @@ class MCPClient:
         self._stderr_task = None
 
 
-def _parse_http_response(
-    response: httpx.Response, request_id: int
-) -> dict[str, Any]:
+def _parse_http_response(response: httpx.Response, request_id: int) -> dict[str, Any]:
     content_type = response.headers.get("content-type", "").casefold()
     if "text/event-stream" not in content_type:
         payload = response.json()

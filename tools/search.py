@@ -33,7 +33,9 @@ class ListDirectoryTool(BaseTool):
         args = ListDirectoryArgs(**kwargs)
         root = self.safety_guard.validate_path(args.directory_path)
         if not root.is_dir():
-            return ToolResult(success=False, output="", error=f"Not a directory: {root}")
+            return ToolResult(
+                success=False, output="", error=f"Not a directory: {root}"
+            )
         iterator = root.rglob("*") if args.recursive else root.iterdir()
         entries: list[str] = []
         truncated = False
@@ -69,7 +71,9 @@ class GlobFilesTool(BaseTool):
         args = GlobFilesArgs(**kwargs)
         root = self.safety_guard.validate_path(args.directory_path)
         if not root.is_dir():
-            return ToolResult(success=False, output="", error=f"Not a directory: {root}")
+            return ToolResult(
+                success=False, output="", error=f"Not a directory: {root}"
+            )
         matches: list[str] = []
         truncated = False
         for path in root.rglob("*"):
@@ -112,7 +116,9 @@ class SearchTextTool(BaseTool):
         args = SearchTextArgs(**kwargs)
         root = self.safety_guard.validate_path(args.directory_path)
         if not root.is_dir():
-            return ToolResult(success=False, output="", error=f"Not a directory: {root}")
+            return ToolResult(
+                success=False, output="", error=f"Not a directory: {root}"
+            )
         if shutil.which("rg") is None:
             return await self._python_fallback(root, args)
 

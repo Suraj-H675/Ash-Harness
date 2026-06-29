@@ -112,8 +112,7 @@ def test_plans_cli_shows_and_updates_plan_items(
     assert update_payload["item"]["status"] == "in_progress"
 
     assert (
-        main(["--db-directory", str(db_dir), "plans", "show", sprint_id, "--json"])
-        == 0
+        main(["--db-directory", str(db_dir), "plans", "show", sprint_id, "--json"]) == 0
     )
     show_payload = json.loads(capsys.readouterr().out)
     assert show_payload["plan"]["items"][1]["notes"] == "started"

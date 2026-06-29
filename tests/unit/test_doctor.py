@@ -9,9 +9,7 @@ from config import AshConfig
 
 
 def test_render_doctor_json_has_stable_schema() -> None:
-    rendered = render_doctor(
-        [DoctorCheck("config", "pass", "valid")], json_output=True
-    )
+    rendered = render_doctor([DoctorCheck("config", "pass", "valid")], json_output=True)
     payload = json.loads(rendered)
     assert payload["schema_version"] == 1
     assert payload["ok"] is True

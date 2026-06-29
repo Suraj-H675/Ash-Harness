@@ -212,6 +212,8 @@ async def _git_result(cwd: Path, args: Sequence[str]) -> ToolResult:
         token_count=count_output_tokens(output),
         truncated=truncated,
     )
+
+
 def _name_from_author(author: str) -> str:
     if "<" in author:
         return author.split("<", 1)[0].strip()

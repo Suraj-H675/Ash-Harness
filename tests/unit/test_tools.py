@@ -88,8 +88,7 @@ async def test_read_file_truncation_reports_follow_up_range(
     assert "801: line 801" not in result.output
     assert (
         "[read_file truncated: requested_lines=1-805; returned_lines=1-800; "
-        "total_file_lines=805; omitted_lines=5; next_start_line=801]"
-        in result.output
+        "total_file_lines=805; omitted_lines=5; next_start_line=801]" in result.output
     )
 
 
@@ -117,8 +116,7 @@ async def test_read_file_truncation_metadata_respects_start_line(
     assert "901: line 901" not in result.output
     assert (
         "[read_file truncated: requested_lines=101-950; returned_lines=101-900; "
-        "total_file_lines=1000; omitted_lines=50; next_start_line=901]"
-        in result.output
+        "total_file_lines=1000; omitted_lines=50; next_start_line=901]" in result.output
     )
 
 

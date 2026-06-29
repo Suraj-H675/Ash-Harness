@@ -46,8 +46,7 @@ class MCPServerConfig:
     @property
     def resolved_headers(self) -> dict[str, str]:
         return {
-            key: expand_env_vars(value)
-            for key, value in (self.headers or {}).items()
+            key: expand_env_vars(value) for key, value in (self.headers or {}).items()
         }
 
     @classmethod

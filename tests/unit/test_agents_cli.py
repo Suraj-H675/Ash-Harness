@@ -192,8 +192,7 @@ def test_agents_cli_messages_all_includes_delivered_and_rejects_invalid_limit(
     assert pending_payload["messages"][0]["content"] == {"content": "pending"}
 
     assert (
-        main(["agents", "messages", "--recipient", "agent-a", "--all", "--json"])
-        == 0
+        main(["agents", "messages", "--recipient", "agent-a", "--all", "--json"]) == 0
     )
     all_payload = json.loads(capsys.readouterr().out)
     assert len(all_payload["messages"]) == 2

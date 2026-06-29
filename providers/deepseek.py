@@ -17,6 +17,7 @@ from providers.openai import prepare_openai_messages
 
 class DeepSeekProvider(ProviderABC):
     provider_family = "deepseek"
+
     def __init__(
         self,
         model_name: str = "deepseek-chat",
@@ -84,7 +85,11 @@ class DeepSeekProvider(ProviderABC):
                 for tc in delta.tool_calls:
                     idx = tc.index
                     if idx not in partials:
-                        partials[idx] = {"id": tc.id or f"call_{idx}", "name": tc.function.name or "", "arguments": ""}
+                        partials[idx] = {
+                            "id": tc.id or f"call_{idx}",
+                            "name": tc.function.name or "",
+                            "arguments": "",
+                        }
                     if tc.function.arguments:
                         partials[idx]["arguments"] += tc.function.arguments
 

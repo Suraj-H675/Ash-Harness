@@ -267,11 +267,16 @@ class HistoryCompactor:
             "role": "system",
             "content": "## Compacted conversation summary\n" + summary,
         }
-        compacted = ([system] if system is not None else []) + [summary_message] + recent
+        compacted = (
+            ([system] if system is not None else []) + [summary_message] + recent
+        )
 
         # If the recent tail itself is still too large, drop oldest complete
         # entries until it fits. Never drop the current user message.
-        while len(compacted) > 3 and self._count(compacted, count_tokens) > self.input_limit:
+        while (
+            len(compacted) > 3
+            and self._count(compacted, count_tokens) > self.input_limit
+        ):
             drop_at = 2 if system is not None else 1
             candidate = compacted[drop_at]
             if candidate.get("role") == "tool":
@@ -308,7 +313,9 @@ class HistoryCompactor:
                 and len(content) > self.max_tool_output_chars
             ):
                 replacement = dict(message)
-                call_id = message.get("tool_call_id") or message.get("call_id") or "unknown"
+                call_id = (
+                    message.get("tool_call_id") or message.get("call_id") or "unknown"
+                )
                 replacement["content"] = (
                     f"[stale tool output pruned: call_id={call_id}; "
                     f"original_chars={len(content)}]"

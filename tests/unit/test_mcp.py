@@ -112,7 +112,7 @@ def test_manager_stop_all() -> None:
     assert len(manager.list_servers()) == 0
 
 
-FAKE_MCP_SERVER = r'''
+FAKE_MCP_SERVER = r"""
 import json, sys
 for line in sys.stdin:
     message = json.loads(line)
@@ -136,7 +136,7 @@ for line in sys.stdin:
     else:
         result = {}
     print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
-'''
+"""
 
 
 @pytest.mark.asyncio

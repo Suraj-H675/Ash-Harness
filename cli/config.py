@@ -287,9 +287,7 @@ def render_config_explain(
         )
     lines = ["Ash config"]
     for entry in explanations:
-        lines.append(
-            f"{entry.field}: {entry.value!r} ({entry.source}: {entry.detail})"
-        )
+        lines.append(f"{entry.field}: {entry.value!r} ({entry.source}: {entry.detail})")
     return "\n".join(lines)
 
 

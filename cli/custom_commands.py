@@ -73,7 +73,7 @@ def _parse(path: Path, root: Path, source: str) -> CustomCommand:
             for line in text[4:end].splitlines():
                 key, separator, value = line.partition(":")
                 if separator:
-                    metadata[key.strip().casefold()] = value.strip().strip('"\'')
+                    metadata[key.strip().casefold()] = value.strip().strip("\"'")
             body = text[end + 5 :]
     relative = path.relative_to(root).with_suffix("")
     default_name = ":".join(relative.parts)

@@ -47,9 +47,7 @@ class OpenAITokenCounter:
         self._encoder: object = _ApproximateEncoder()
         if os.environ.get("ASH_ENABLE_TIKTOKEN_DOWNLOAD") == "1":
             try:
-                self._encoder = tiktoken.get_encoding(
-                    DEFAULT_OPENAI_FALLBACK_ENCODING
-                )
+                self._encoder = tiktoken.get_encoding(DEFAULT_OPENAI_FALLBACK_ENCODING)
                 self.using_approximation = False
             except Exception:
                 # Token usage returned by the provider remains authoritative.

@@ -117,6 +117,7 @@ def test_semantic_memory_injects_into_system_prompt(tmp_path: Path) -> None:
     session_store.get_recent_session_summaries.return_value = []
 
     provider = MagicMock(spec=ProviderABC)
+
     # Simulate a streaming response with no tool calls.
     async def mock_stream(messages, temperature=0.0, tools=None):
         yield MagicMock(content="Hello, I can help you.", tool_call_delta=None)
@@ -170,4 +171,8 @@ def test_semantic_memory_injects_into_system_prompt(tmp_path: Path) -> None:
     system_msg = captured_messages[0]
     assert system_msg["role"] == "system"
     # The Relevant Context section should mention hello.py or greet.
-    assert "Relevant Context" in system_msg["content"] or "hello.py" in system_msg["content"] or "greet" in system_msg["content"]
+    assert (
+        "Relevant Context" in system_msg["content"]
+        or "hello.py" in system_msg["content"]
+        or "greet" in system_msg["content"]
+    )

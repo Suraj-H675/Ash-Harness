@@ -39,7 +39,9 @@ class _FakeGetpass:
 class TestHasProviderConfigured:
     """Tests for _has_provider_configured."""
 
-    def test_true_when_api_key_set_for_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_true_when_api_key_set_for_provider(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """provider/model + matching API key = configured."""
         mock_config = MagicMock(model="anthropic/claude-3-5-sonnet")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
@@ -72,7 +74,9 @@ class TestHasProviderConfigured:
     ) -> None:
         """Custom provider in config.custom_providers = configured."""
         mock_config = MagicMock(model="my-minimax/MiniMax-M2.7")
-        mock_config.custom_providers = {"my-minimax": {"base_url": "https://api.minimax.io/v1"}}
+        mock_config.custom_providers = {
+            "my-minimax": {"base_url": "https://api.minimax.io/v1"}
+        }
         for key in (
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",

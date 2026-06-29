@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from safety.guard import SafetyGuard
 
+
 class ToolResult(BaseModel):
     success: bool
     output: str

@@ -51,9 +51,8 @@ def render_audit_verification(
         )
     if ok:
         return f"Audit log verified for session {session_id}."
-    return (
-        f"Audit log verification failed for session {session_id}:\n"
-        + "\n".join(errors)
+    return f"Audit log verification failed for session {session_id}:\n" + "\n".join(
+        errors
     )
 
 

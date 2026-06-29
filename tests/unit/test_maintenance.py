@@ -12,7 +12,10 @@ def test_session_retention_and_selective_reset(tmp_path, monkeypatch) -> None:
     with connection:
         connection.execute(
             "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
-            ((datetime.now(timezone.utc) - timedelta(days=40)).isoformat(), old.session_id),
+            (
+                (datetime.now(timezone.utc) - timedelta(days=40)).isoformat(),
+                old.session_id,
+            ),
         )
     connection.close()
     assert store.cleanup_sessions(30, project_path=str(tmp_path)) == 1

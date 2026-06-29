@@ -78,7 +78,9 @@ def test_stale_large_tool_output_is_pruned_without_mutating_transcript() -> None
         {
             "role": "assistant",
             "content": "",
-            "tool_calls": [{"call_id": "call-old", "name": "read_file", "arguments": {}}],
+            "tool_calls": [
+                {"call_id": "call-old", "name": "read_file", "arguments": {}}
+            ],
         },
         {"role": "tool", "content": large, "tool_call_id": "call-old"},
         {"role": "user", "content": "next"},

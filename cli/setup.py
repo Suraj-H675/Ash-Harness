@@ -284,9 +284,13 @@ def _flow_openai_compatible() -> None:
         return
 
     api_key = input("  API key (optional, press Enter to skip): ").strip()
-    key_env = "ASH_PROVIDER_" + "".join(
-        character if character.isalnum() else "_" for character in name.upper()
-    ) + "_API_KEY"
+    key_env = (
+        "ASH_PROVIDER_"
+        + "".join(
+            character if character.isalnum() else "_" for character in name.upper()
+        )
+        + "_API_KEY"
+    )
     if api_key:
         save_env_value(key_env, api_key)
 
@@ -610,7 +614,9 @@ def _prompt_choice(prompt: str, options: list[str], default: int) -> Optional[in
     """Ask user to pick from numbered options. Returns 0-based index or None to cancel."""
     options_str = "/".join(f"'{o}'" for o in options)
     while True:
-        val = input(f"\n  {prompt} ({options_str}) [{default + 1}], 'c' to cancel: ").strip()
+        val = input(
+            f"\n  {prompt} ({options_str}) [{default + 1}], 'c' to cancel: "
+        ).strip()
         if not val:
             return default
         if val.lower() in ("c", "q", "cancel"):

@@ -512,9 +512,7 @@ class ChromaIndex(VectorIndex):
         if self._client is None:
             raise VectorBackendUnavailable("Chroma client is unavailable")
         self._client.delete_collection(self._collection_name)
-        self._collection = self._client.get_or_create_collection(
-            self._collection_name
-        )
+        self._collection = self._client.get_or_create_collection(self._collection_name)
 
 
 class VectorBackendUnavailable(RuntimeError):

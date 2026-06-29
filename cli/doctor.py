@@ -136,9 +136,17 @@ async def _check_connectivity(config: AshConfig) -> DoctorCheck:
         base = str(custom.get("base_url") or defaults.get(provider, "")).rstrip("/")
         endpoint = f"{base}/models"
         key_env = str(custom.get("key_env", ""))
-        key = os.environ.get(key_env, "") if key_env else os.environ.get(
-            {"openai": "OPENAI_API_KEY", "groq": "GROQ_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}.get(provider, ""),
-            "",
+        key = (
+            os.environ.get(key_env, "")
+            if key_env
+            else os.environ.get(
+                {
+                    "openai": "OPENAI_API_KEY",
+                    "groq": "GROQ_API_KEY",
+                    "deepseek": "DEEPSEEK_API_KEY",
+                }.get(provider, ""),
+                "",
+            )
         )
         headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
@@ -162,11 +170,20 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
     try:
         config = AshConfig.load()
     except Exception as exc:  # noqa: BLE001
-        checks.append(DoctorCheck("config", "fail", str(exc), "Repair ~/.ash/ash.toml or environment settings."))
+        checks.append(
+            DoctorCheck(
+                "config",
+                "fail",
+                str(exc),
+                "Repair ~/.ash/ash.toml or environment settings.",
+            )
+        )
         return checks
     checks.extend(
         [
-            DoctorCheck("config", "pass", f"model={config.model}; mode={config.safety_tier}"),
+            DoctorCheck(
+                "config", "pass", f"model={config.model}; mode={config.safety_tier}"
+            ),
             _check_credentials(config),
             _check_workspace(config),
             _check_storage(config),
@@ -178,7 +195,8 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
             DoctorCheck(
                 "ripgrep",
                 "pass" if shutil.which("rg") else "warn",
-                shutil.which("rg") or "rg is unavailable; Python search fallback will be used",
+                shutil.which("rg")
+                or "rg is unavailable; Python search fallback will be used",
             ),
         ]
     )

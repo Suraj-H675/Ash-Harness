@@ -58,17 +58,13 @@ def parse_instruction_skill(path: Path) -> InstructionSkill:
             for line in text[4:end].splitlines():
                 key, separator, value = line.partition(":")
                 if separator:
-                    metadata[key.strip().casefold()] = value.strip().strip('"\'')
+                    metadata[key.strip().casefold()] = value.strip().strip("\"'")
             body = text[end + 5 :]
     name = metadata.get("name") or path.parent.name
     description = metadata.get("description", "")
     if not description:
         description = next(
-            (
-                line.lstrip("# ").strip()
-                for line in body.splitlines()
-                if line.strip()
-            ),
+            (line.lstrip("# ").strip() for line in body.splitlines() if line.strip()),
             "Instruction skill",
         )
     return InstructionSkill(
@@ -102,9 +98,7 @@ class ListSkillsTool(BaseTool):
             or query in skill.name.casefold()
             or query in skill.description.casefold()
         ]
-        output = "\n".join(
-            f"{skill.name}: {skill.description}" for skill in skills
-        )
+        output = "\n".join(f"{skill.name}: {skill.description}" for skill in skills)
         return ToolResult(
             success=True,
             output=output,

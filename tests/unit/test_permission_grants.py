@@ -9,15 +9,15 @@ def test_persistent_grants_round_trip_and_cannot_override_plan(tmp_path, monkeyp
     set_tool_grant(workspace, "run_command", True)
     assert load_tool_grants(workspace) == {"run_command"}
     assert (
-        PermissionPolicy(
-            "interactive", persistent_tool_grants={"run_command"}
-        ).evaluate("run_command", {}).action
+        PermissionPolicy("interactive", persistent_tool_grants={"run_command"})
+        .evaluate("run_command", {})
+        .action
         == PolicyAction.ALLOW
     )
     assert (
-        PermissionPolicy(
-            "plan", persistent_tool_grants={"run_command"}
-        ).evaluate("run_command", {}).action
+        PermissionPolicy("plan", persistent_tool_grants={"run_command"})
+        .evaluate("run_command", {})
+        .action
         == PolicyAction.DENY
     )
     set_tool_grant(workspace, "run_command", False)

@@ -156,9 +156,7 @@ def _validate_public_url(
     if not parsed.hostname:
         raise ValueError("URL must include a hostname")
     if allowed_domains and not _host_allowed(parsed.hostname, allowed_domains):
-        raise ValueError(
-            f"Host {parsed.hostname!r} is not in allowed_web_domains"
-        )
+        raise ValueError(f"Host {parsed.hostname!r} is not in allowed_web_domains")
     _ensure_public_host(parsed.hostname)
     return raw_url
 

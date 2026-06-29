@@ -88,8 +88,6 @@ async def test_hook_timeout_is_enforced():
     async def slow(name, args):
         await asyncio.sleep(1)
 
-    registry.register_pre_tool(
-        PreToolUseHook(matcher=re.compile(".*"), callback=slow)
-    )
+    registry.register_pre_tool(PreToolUseHook(matcher=re.compile(".*"), callback=slow))
     with pytest.raises(asyncio.TimeoutError):
         await registry.fire_pre_tool("read_file", {})

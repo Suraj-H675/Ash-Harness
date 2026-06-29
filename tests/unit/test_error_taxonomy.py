@@ -33,7 +33,9 @@ def test_classify_config_validation_error() -> None:
 
 
 def test_classify_policy_storage_sandbox_and_context_errors() -> None:
-    assert classify_exception(SafetyViolation("blocked")).category == ErrorCategory.POLICY
+    assert (
+        classify_exception(SafetyViolation("blocked")).category == ErrorCategory.POLICY
+    )
     assert (
         classify_exception(SessionStorageError("database corrupt")).category
         == ErrorCategory.STORAGE
@@ -41,7 +43,9 @@ def test_classify_policy_storage_sandbox_and_context_errors() -> None:
     sandbox = classify_exception(SandboxBackendUnavailable("bwrap missing"))
     assert sandbox.category == ErrorCategory.SANDBOX
     assert sandbox.retriable is True
-    assert classify_exception(PlannerError("bad plan")).category == ErrorCategory.CONTEXT
+    assert (
+        classify_exception(PlannerError("bad plan")).category == ErrorCategory.CONTEXT
+    )
 
 
 def test_classify_provider_error_is_retriable_for_transient_failures() -> None:

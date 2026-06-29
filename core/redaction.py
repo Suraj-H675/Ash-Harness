@@ -28,7 +28,10 @@ def redact_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             key: "[REDACTED]"
-            if any(term in str(key).casefold() for term in ("key", "token", "secret", "password"))
+            if any(
+                term in str(key).casefold()
+                for term in ("key", "token", "secret", "password")
+            )
             else redact_value(item)
             for key, item in value.items()
         }

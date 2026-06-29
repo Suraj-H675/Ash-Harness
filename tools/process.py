@@ -51,14 +51,18 @@ class BackgroundProcessTool(BaseTool):
             return self._result("\n".join(lines) or "No background jobs.")
         job = self.jobs.get(args.job_id)
         if job is None:
-            return ToolResult(success=False, output="", error=f"Unknown job: {args.job_id}")
+            return ToolResult(
+                success=False, output="", error=f"Unknown job: {args.job_id}"
+            )
         if args.action == "poll":
             output = "".join(job.output[job.cursor :])
             job.cursor = len(job.output)
             return self._result(f"{self._status(job)}\n{output}".rstrip())
         if args.action == "write":
             if job.process.stdin is None or job.process.returncode is not None:
-                return ToolResult(success=False, output="", error="Job stdin is unavailable")
+                return ToolResult(
+                    success=False, output="", error="Job stdin is unavailable"
+                )
             job.process.stdin.write(args.input.encode())
             await job.process.stdin.drain()
             return self._result(f"Wrote {len(args.input)} bytes to {job.job_id}.")
@@ -70,7 +74,9 @@ class BackgroundProcessTool(BaseTool):
         if not args.command:
             return ToolResult(success=False, output="", error="start requires command")
         self.safety_guard.validate_command(args.command)
-        cwd = self.safety_guard.validate_path(args.cwd or self.safety_guard.project_root)
+        cwd = self.safety_guard.validate_path(
+            args.cwd or self.safety_guard.project_root
+        )
         if platform.system() == "Windows":
             argv = ["powershell.exe", "-NoProfile", "-Command", args.command]
         else:
@@ -98,12 +104,18 @@ class BackgroundProcessTool(BaseTool):
 
     @staticmethod
     def _status(job: Job) -> str:
-        state = "running" if job.process.returncode is None else f"exited({job.process.returncode})"
+        state = (
+            "running"
+            if job.process.returncode is None
+            else f"exited({job.process.returncode})"
+        )
         return f"{job.job_id} {state}: {job.command}"
 
     @staticmethod
     def _result(output: str) -> ToolResult:
-        return ToolResult(success=True, output=output, token_count=count_output_tokens(output))
+        return ToolResult(
+            success=True, output=output, token_count=count_output_tokens(output)
+        )
 
     async def aclose(self) -> None:
         await asyncio.gather(

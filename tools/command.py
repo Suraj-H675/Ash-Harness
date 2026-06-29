@@ -269,7 +269,8 @@ def build_scrubbed_command_env(project_root: Path | None = None) -> dict[str, st
     env = {
         key: value
         for key, value in os.environ.items()
-        if key in SAFE_ENV_KEYS or any(key.startswith(prefix) for prefix in SAFE_ENV_PREFIXES)
+        if key in SAFE_ENV_KEYS
+        or any(key.startswith(prefix) for prefix in SAFE_ENV_PREFIXES)
     }
     if "PATH" not in env:
         env["PATH"] = os.defpath

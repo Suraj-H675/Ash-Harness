@@ -11,6 +11,7 @@ from providers.base import ProviderABC, StreamChunk, TokenCounterLike
 
 class OllamaProvider(ProviderABC):
     provider_family = "ollama"
+
     def __init__(
         self,
         model_name: str = "llama3",

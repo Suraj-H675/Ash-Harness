@@ -146,8 +146,7 @@ def render_agent_statuses(
     if not statuses:
         return "No subagents recorded."
     return "\n".join(
-        f"{item['agent_id']} [{item['role']}] {item['status']}: "
-        f"{item['current_task']}"
+        f"{item['agent_id']} [{item['role']}] {item['status']}: {item['current_task']}"
         for item in statuses
     )
 

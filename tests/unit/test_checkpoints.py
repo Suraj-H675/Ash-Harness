@@ -12,8 +12,10 @@ async def test_checkpoint_undo_and_conflict_detection(tmp_path) -> None:
     path.write_text("before")
     store = SessionStore(tmp_path / "sessions.db")
     session = store.create_session(str(tmp_path))
+
     def context():
         return session.session_id, "turn-1"
+
     guard = SafetyGuard(tmp_path)
     middleware = FileCheckpointMiddleware(store, guard, context)
     arguments = {"file_path": "file.txt", "content": "after"}
@@ -27,6 +29,7 @@ async def test_checkpoint_undo_and_conflict_detection(tmp_path) -> None:
 
     def context2():
         return session.session_id, "turn-2"
+
     middleware = FileCheckpointMiddleware(store, guard, context2)
     await middleware.before_tool("whole_edit", arguments, tool)
     result = await tool.run(**arguments)

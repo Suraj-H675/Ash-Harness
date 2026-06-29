@@ -341,7 +341,11 @@ class ReplaceFileEditsTool(BaseTool):
         for edit in sorted(args.edits, key=lambda item: item.start_line, reverse=True):
             segment = "".join(lines[edit.start_line - 1 : edit.end_line])
             replacement = _normalize_line_endings(edit.replacement_content)
-            if segment.endswith("\n") and replacement and not replacement.endswith("\n"):
+            if (
+                segment.endswith("\n")
+                and replacement
+                and not replacement.endswith("\n")
+            ):
                 replacement = f"{replacement}\n"
             new_lines[edit.start_line - 1 : edit.end_line] = replacement.splitlines(
                 keepends=True

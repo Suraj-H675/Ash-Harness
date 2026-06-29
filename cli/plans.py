@@ -108,7 +108,9 @@ def update_plan_item(
         checklist_status = ChecklistStatus(status)
     except ValueError as exc:
         valid = ", ".join(item.value for item in ChecklistStatus)
-        raise ValueError(f"invalid status {status!r}; expected one of: {valid}") from exc
+        raise ValueError(
+            f"invalid status {status!r}; expected one of: {valid}"
+        ) from exc
     item = execution.set_item_status(item_idx, checklist_status, notes)
     store.save_sprint(session_id, execution)
     return item.to_dict()
@@ -149,9 +151,7 @@ def render_plan_detail(plan: dict[str, Any], *, json_output: bool = False) -> st
     if json_output:
         return json.dumps({"plan": plan}, sort_keys=True)
     contract = plan["contract"]
-    done = sum(
-        1 for item in plan["items"] if item["status"] in {"done", "skipped"}
-    )
+    done = sum(1 for item in plan["items"] if item["status"] in {"done", "skipped"})
     lines = [
         f"{contract['contract_id']} [{plan['state']}] {done}/{len(plan['items'])}",
         contract["goal"],

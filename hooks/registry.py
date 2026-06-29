@@ -32,9 +32,7 @@ class PreToolUseHook(Hook):
     matcher: re.Pattern[str]  # e.g. re.compile(r"Write|Edit")
     callback: Callable[[str, dict[str, Any]], Awaitable[None]]
 
-    async def run(
-        self, **kwargs: Any
-    ) -> HookResult:
+    async def run(self, **kwargs: Any) -> HookResult:
         tool_name = str(kwargs["tool_name"])
         arguments = kwargs["arguments"]
         if self.matcher.search(tool_name):
@@ -49,9 +47,7 @@ class PostToolUseHook(Hook):
     matcher: re.Pattern[str]
     callback: Callable[[str, dict[str, Any], Any], Awaitable[None]]
 
-    async def run(
-        self, **kwargs: Any
-    ) -> HookResult:
+    async def run(self, **kwargs: Any) -> HookResult:
         tool_name = str(kwargs["tool_name"])
         arguments = kwargs["arguments"]
         result = kwargs["result"]
@@ -111,9 +107,9 @@ class HookRegistry:
     async def fire_session_start(self) -> None:
         self._injected_prompt = ""  # reset at start of each session
         for hook in self._session_start:
-            prompt_addition = await asyncio.wait_for(
-                hook.run(), timeout=self.timeout_seconds
-            ) or ""
+            prompt_addition = (
+                await asyncio.wait_for(hook.run(), timeout=self.timeout_seconds) or ""
+            )
             if prompt_addition:
                 self._injected_prompt += (
                     ("\n" + prompt_addition)

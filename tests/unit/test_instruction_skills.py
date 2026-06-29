@@ -27,8 +27,6 @@ async def test_instruction_skills_discover_list_and_activate(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_unknown_instruction_skill_fails_cleanly(tmp_path) -> None:
     catalog = SkillCatalog((tmp_path / "skills",))
-    result = await ActivateSkillTool(SafetyGuard(tmp_path), catalog).run(
-        name="missing"
-    )
+    result = await ActivateSkillTool(SafetyGuard(tmp_path), catalog).run(name="missing")
     assert result.success is False
     assert "Unknown skill" in (result.error or "")

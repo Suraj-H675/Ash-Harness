@@ -49,7 +49,9 @@ class FailoverProvider(ProviderABC):
                 last_error = exc
                 self.failures.append(f"{provider.model_name}: {exc}")
         assert last_error is not None
-        raise RuntimeError("All configured providers failed: " + "; ".join(self.failures)) from last_error
+        raise RuntimeError(
+            "All configured providers failed: " + "; ".join(self.failures)
+        ) from last_error
 
     async def aclose(self) -> None:
         for provider in self.providers:

@@ -20,7 +20,9 @@ from hooks.registry import (
 from sandbox.process_utils import process_group_options, terminate_process_tree
 
 
-def load_command_hooks(paths: list[Path], *, timeout_seconds: float = 10.0) -> HookRegistry:
+def load_command_hooks(
+    paths: list[Path], *, timeout_seconds: float = 10.0
+) -> HookRegistry:
     registry = HookRegistry(timeout_seconds=timeout_seconds)
     for path in paths:
         if not path.is_file():
@@ -31,16 +33,32 @@ def load_command_hooks(paths: list[Path], *, timeout_seconds: float = 10.0) -> H
         for item in payload.get("pre_tool", []):
             matcher, command = _parse(item, path)
 
-            async def pre(name: str, arguments: dict[str, Any], command=command) -> None:
-                await _run(command, {"event": "pre_tool", "tool": name, "arguments": arguments})
+            async def pre(
+                name: str, arguments: dict[str, Any], command=command
+            ) -> None:
+                await _run(
+                    command, {"event": "pre_tool", "tool": name, "arguments": arguments}
+                )
 
             registry.register_pre_tool(PreToolUseHook(matcher, pre))
         for item in payload.get("post_tool", []):
             matcher, command = _parse(item, path)
 
-            async def post(name: str, arguments: dict[str, Any], result: Any, command=command) -> None:
-                serializable = result.model_dump() if hasattr(result, "model_dump") else result
-                await _run(command, {"event": "post_tool", "tool": name, "arguments": arguments, "result": serializable})
+            async def post(
+                name: str, arguments: dict[str, Any], result: Any, command=command
+            ) -> None:
+                serializable = (
+                    result.model_dump() if hasattr(result, "model_dump") else result
+                )
+                await _run(
+                    command,
+                    {
+                        "event": "post_tool",
+                        "tool": name,
+                        "arguments": arguments,
+                        "result": serializable,
+                    },
+                )
 
             registry.register_post_tool(PostToolUseHook(matcher, post))
         for item in payload.get("session_start", []):
@@ -54,7 +72,9 @@ def load_command_hooks(paths: list[Path], *, timeout_seconds: float = 10.0) -> H
     return registry
 
 
-def _parse(item: Any, path: Path, *, matcher_required: bool = True) -> tuple[re.Pattern[str], list[str]]:
+def _parse(
+    item: Any, path: Path, *, matcher_required: bool = True
+) -> tuple[re.Pattern[str], list[str]]:
     if not isinstance(item, dict) or not isinstance(item.get("command"), list):
         raise ValueError(f"Invalid hook entry in {path}")
     command = [str(part) for part in item["command"]]
@@ -83,7 +103,10 @@ async def _run(command: list[str], payload: dict[str, Any]) -> str | None:
         await terminate_process_tree(process)
         raise
     if process.returncode != 0:
-        raise RuntimeError(stderr.decode(errors="replace").strip() or f"hook exited {process.returncode}")
+        raise RuntimeError(
+            stderr.decode(errors="replace").strip()
+            or f"hook exited {process.returncode}"
+        )
     text = stdout.decode("utf-8", errors="replace").strip()
     return text or None
 
