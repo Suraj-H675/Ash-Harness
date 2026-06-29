@@ -54,8 +54,8 @@ Research is clean-room: proprietary or leaked source is not used.
 | Native tool calling | Partial | Canonical calls translated correctly for every provider |
 | XML fallback tool protocol | Partial | Keep only for models without native tools; strict parser and validation |
 | Parallel tool calls | Partial | Independent read-only calls run concurrently with deterministic result order |
-| Turn steering | Missing | Queue or inject user guidance while a turn runs |
-| Interrupt/cancel | Partial | Process trees and provider streams cancel; CLI exits 130; interactive steering remains |
+| Turn steering | Verified locally | Bounded durable guidance queue applies at safe iteration boundaries through interactive CLI, SDK, and HTTP |
+| Interrupt/cancel | Verified locally | `/cancel` preempts live interactive turns, propagates cancellation, clears pending steering, and finalizes the turn journal |
 | Retry policy | Partial | Retry only classified transient failures; jitter and provider retry headers |
 | Circuit breaker | Partial | Consistent state, actionable recovery, tested public behavior |
 | Long-running process control | Verified locally | Managed start/list/poll/stdin/stop with process-tree cleanup |
@@ -128,6 +128,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/new`, `/resume`, `/sessions` | Verified locally | Durable session lifecycle and missing-ID errors |
 | `/rename`, `/fork` | Verified locally | Session organization and transcript branching |
 | `/compact`, `/context` | Verified locally | Context compaction and budget inspection |
+| `/cancel` | Verified locally | Cancel the active provider/tool turn while retaining already completed work |
 | `/clear`, `/rewind`, `/undo` | Verified locally | New-session clear, transcript rewind, and conflict-aware file undo |
 | `/diff` | Partial | Current/staged/path Git diff; per-turn checkpoint diff remains |
 | `/review` | Verified locally | Bounded reviews for worktree/untracked, staged, commit, or current branch versus base |
@@ -218,9 +219,9 @@ Research is clean-room: proprietary or leaked source is not used.
 | Streaming JSONL | Verified locally | Typed token, reasoning, context, tool lifecycle, completion, and structured error events |
 | Stdin prompts | Verified locally | Piped stdin and `-p -` enter machine-clean one-shot mode |
 | CI mode | Verified locally | `--ci` disables interactive prompts/ANSI and defaults one-shot output to stream-json |
-| SDK/library API | Verified locally | Async create/prompt/session/lifecycle API independent of the TUI |
+| SDK/library API | Verified locally | Async create/prompt/steer/session/lifecycle API independent of the TUI |
 | JSON-RPC server | Partial | Validated stdio methods, cancellation, lifecycle, and tests; remote transport remains |
-| HTTP server | Verified locally | Bearer auth, rate limits, lifecycle, session/turn routes, live SSE events, cancellation, and safe CLI binding |
+| HTTP server | Verified locally | Bearer auth, rate limits, lifecycle, session/turn/steering routes, live SSE events, cancellation, and safe CLI binding |
 | IDE/ACP integration | Missing | Protocol-based editor integration after CLI core is stable |
 
 ## 12. Reliability And Operations
