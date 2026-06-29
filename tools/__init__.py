@@ -10,6 +10,7 @@ from tools.filesystem import (
 from tools.command import RunCommandTool
 from tools.git import AutoCommitTool
 from tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
+from tools.symbols import FindReferencesTool, FindSymbolTool
 
 __all__ = [
     "BaseTool",
@@ -23,4 +24,6 @@ __all__ = [
     "GlobFilesTool",
     "ListDirectoryTool",
     "SearchTextTool",
+    "FindSymbolTool",
+    "FindReferencesTool",
 ]

@@ -46,6 +46,8 @@ async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
     client = await AshClient.create(config=config, provider=SDKProvider())
     try:
         assert client.loop.repo_map is not None
+        assert "find_symbol" in client.loop.tools
+        assert "find_references" in client.loop.tools
         result = await client.prompt("hello")
         assert result.response == "sdk response"
         assert result.session_id

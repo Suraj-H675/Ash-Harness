@@ -27,6 +27,8 @@ READ_ONLY_TOOLS = frozenset(
         "list_dir",
         "glob_files",
         "search_text",
+        "find_symbol",
+        "find_references",
         "git_status",
         "git_diff",
         "git_log",

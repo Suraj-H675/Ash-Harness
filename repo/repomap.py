@@ -432,6 +432,8 @@ class RepoMap:
     ) -> list[Symbol]:
         """Find exact structural definitions in the current workspace index."""
 
+        if limit <= 0:
+            return []
         self.refresh()
         expected = name if case_sensitive else name.casefold()
         matches: list[Symbol] = []
@@ -458,6 +460,8 @@ class RepoMap:
     ) -> list[SourceLocation]:
         """Find structural identifier uses, excluding declaration names."""
 
+        if limit <= 0:
+            return []
         self.refresh()
         matches: list[SourceLocation] = []
         for file_node in self._files:

@@ -70,6 +70,7 @@ class AshClient:
         )
         active_provider = provider or _build_provider(runtime_config)
         sandbox = SandboxManager(workspace_root=runtime_config.workspace_root)
+        repo_map = _build_repo_map(runtime_config)
         tools = _build_tools(
             guard,
             runtime_config.workspace_root,
@@ -77,6 +78,7 @@ class AshClient:
             allow_project_extensions=False,
             provider_factory=lambda: _build_provider(runtime_config),
             agent_db_path=runtime_config.db_directory / "agents.db",
+            repo_map=repo_map,
         )
         loop = AshLoop(
             session_store=store,
@@ -84,7 +86,7 @@ class AshClient:
             safety_guard=guard,
             ui=HeadlessUI(output_format="text", stream=io.StringIO()),
             project_root=runtime_config.workspace_root,
-            repo_map=_build_repo_map(runtime_config),
+            repo_map=repo_map,
             tools=tools,
             config=runtime_config,
             planner=(

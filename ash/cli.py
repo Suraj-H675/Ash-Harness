@@ -196,6 +196,7 @@ def _build_tools(
     provider_factory: Any | None = None,
     agent_db_path: Path | None = None,
     allowed_web_domains: list[str] | tuple[str, ...] | None = None,
+    repo_map: Any | None = None,
 ) -> dict[str, Any]:
     from plugins.skills import ActivateSkillTool, ListSkillsTool, SkillCatalog
     from tools.ask_user import AskUserTool
@@ -203,6 +204,7 @@ def _build_tools(
     from tools.process import BackgroundProcessTool
     from tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
     from tools.web import WebFetchTool
+    from tools.symbols import FindReferencesTool, FindSymbolTool
 
     root = project_root if project_root is not None else safety_guard.project_root
     skill_roots = [Path.home() / ".ash" / "skills"]
@@ -251,6 +253,13 @@ def _build_tools(
                 SharedState(agent_db_path),
                 provider_factory,
             )
+        )
+    if repo_map is not None:
+        tools.extend(
+            [
+                FindSymbolTool(safety_guard, repo_map),
+                FindReferencesTool(safety_guard, repo_map),
+            ]
         )
     return {tool.name: tool for tool in tools}
 
@@ -1030,9 +1039,7 @@ def main(argv: list[str] | None = None) -> int:
     audit_parser = subparsers.add_parser(
         "audit", help="Inspect or export tamper-evident session audit logs"
     )
-    audit_subparsers = audit_parser.add_subparsers(
-        dest="audit_action", required=True
-    )
+    audit_subparsers = audit_parser.add_subparsers(dest="audit_action", required=True)
     audit_list = audit_subparsers.add_parser("list")
     audit_list.add_argument("--session", required=True, dest="audit_session")
     audit_list.add_argument("--json", action="store_true")
@@ -1042,9 +1049,7 @@ def main(argv: list[str] | None = None) -> int:
     audit_export = audit_subparsers.add_parser("export")
     audit_export.add_argument("--session", required=True, dest="audit_session")
     audit_export.add_argument("--output", required=True, type=Path)
-    sessions_parser = subparsers.add_parser(
-        "sessions", help="List saved Ash sessions"
-    )
+    sessions_parser = subparsers.add_parser("sessions", help="List saved Ash sessions")
     sessions_parser.add_argument(
         "sessions_action",
         nargs="?",
@@ -1058,9 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
     plans_parser = subparsers.add_parser(
         "plans", help="Inspect or update persisted sprint plans"
     )
-    plans_subparsers = plans_parser.add_subparsers(
-        dest="plans_action", required=True
-    )
+    plans_subparsers = plans_parser.add_subparsers(dest="plans_action", required=True)
     plans_list = plans_subparsers.add_parser("list")
     plans_list.add_argument("--limit", type=int, default=20)
     plans_list.add_argument("--all-projects", action="store_true")
@@ -1143,9 +1146,7 @@ def main(argv: list[str] | None = None) -> int:
         default="info",
     )
     mcp_subparser = subparsers.add_parser("mcp")
-    mcp_action_subparsers = mcp_subparser.add_subparsers(
-        dest="action", required=True
-    )
+    mcp_action_subparsers = mcp_subparser.add_subparsers(dest="action", required=True)
     mcp_list = mcp_action_subparsers.add_parser("list")
     mcp_list.add_argument("--json", action="store_true")
     mcp_status = mcp_action_subparsers.add_parser("status")
@@ -1764,6 +1765,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    repo_map = _build_repo_map(config)
     tools = _build_tools(
         safety_guard,
         config.workspace_root,
@@ -1772,6 +1774,7 @@ def main(argv: list[str] | None = None) -> int:
         provider_factory=lambda: _build_provider(config),
         agent_db_path=config.db_directory / "agents.db",
         allowed_web_domains=config.allowed_web_domains,
+        repo_map=repo_map,
     )
 
     from context.instructions import (
@@ -1807,7 +1810,7 @@ def main(argv: list[str] | None = None) -> int:
         safety_guard=safety_guard,
         ui=ui,
         project_root=config.workspace_root,
-        repo_map=_build_repo_map(config),
+        repo_map=repo_map,
         tools=tools,
         hooks=hooks,
         additional_instructions=instruction_text,

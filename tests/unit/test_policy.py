@@ -14,6 +14,12 @@ def test_plan_mode_allows_reads() -> None:
     assert decision.action == PolicyAction.ALLOW
 
 
+@pytest.mark.parametrize("tool_name", ["find_symbol", "find_references"])
+def test_structural_navigation_tools_are_read_only(tool_name: str) -> None:
+    decision = PermissionPolicy("plan").evaluate(tool_name, {"query": "Example"})
+    assert decision.action == PolicyAction.ALLOW
+
+
 def test_auto_edit_allows_edits_but_asks_for_commands() -> None:
     policy = PermissionPolicy("auto_edit")
     assert policy.evaluate("replace_file_content", {}).action == PolicyAction.ALLOW
