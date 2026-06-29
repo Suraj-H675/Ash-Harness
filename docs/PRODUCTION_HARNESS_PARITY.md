@@ -73,7 +73,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Manual `/compact` | Verified locally | Forces compaction while preserving the durable transcript |
 | Tool-output pruning | Verified locally | Stale large results are pruned in provider context while preserving call identity and durable data |
 | Prompt caching | Missing | Provider-supported cache controls and hit metrics |
-| Repository map | Partial/unwired | Incremental index, ignores, active-file ranking, production injection |
+| Repository map | Partial | Python incremental indexing, configured/Git ignores, active-file ranking, and CLI/SDK injection are verified; multi-language symbol extraction remains |
 | Project instructions | Partial | Trusted hierarchical `ASH.md` discovery plus bounded `@import` expansion and diagnostics; conflict lint remains |
 | User instructions | Verified locally | Global `~/.ash/ASH.md` is loaded with a bounded size |
 | Session memory | Partial | Searchable summaries rather than raw transcript concatenation |
