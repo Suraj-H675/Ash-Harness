@@ -16,6 +16,7 @@ Given a workspace, the map:
 from __future__ import annotations
 
 import fnmatch
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -78,16 +79,88 @@ def _discover_python_files(
     project_root: Path,
     *,
     ignored_dirs: frozenset[str] = DEFAULT_IGNORED_DIRS,
+    exclude_patterns: Iterable[str] = (),
 ) -> list[Path]:
+    patterns = tuple(exclude_patterns)
     files: list[Path] = []
     for entry in sorted(project_root.iterdir(), key=lambda p: p.name):
+        relative = entry.relative_to(project_root)
+        if _matches_exclude_pattern(relative, patterns, is_dir=entry.is_dir()):
+            continue
         if entry.is_dir():
             if entry.name in ignored_dirs or entry.name.startswith("."):
                 continue
-            files.extend(_discover_python_files(entry, ignored_dirs=ignored_dirs))
+            files.extend(
+                _discover_python_files(
+                    entry,
+                    ignored_dirs=ignored_dirs,
+                    exclude_patterns=(
+                        _relative_pattern_for_child(pattern, entry.name)
+                        for pattern in patterns
+                    ),
+                )
+            )
         elif entry.is_file() and entry.suffix in PYTHON_SUFFIXES:
             files.append(entry)
     return files
+
+
+def _relative_pattern_for_child(pattern: str, child_name: str) -> str:
+    """Translate a root-relative glob for recursive discovery."""
+
+    normalized = pattern.replace("\\", "/").lstrip("./")
+    prefix = f"{child_name}/"
+    if normalized.startswith(prefix):
+        return normalized[len(prefix) :]
+    return normalized
+
+
+def _matches_exclude_pattern(
+    relative_path: Path,
+    patterns: Iterable[str],
+    *,
+    is_dir: bool,
+) -> bool:
+    path = relative_path.as_posix().lstrip("./")
+    for raw_pattern in patterns:
+        pattern = raw_pattern.replace("\\", "/").lstrip("./")
+        if not pattern:
+            continue
+        directory_pattern = pattern.rstrip("/")
+        if fnmatch.fnmatchcase(path, pattern) or fnmatch.fnmatchcase(
+            path, directory_pattern
+        ):
+            return True
+        if is_dir and fnmatch.fnmatchcase(f"{path}/__ash_probe__", pattern):
+            return True
+    return False
+
+
+def _git_ignored_files(project_root: Path, paths: Iterable[Path]) -> set[Path]:
+    """Return untracked files ignored by Git, or an empty set outside a worktree."""
+
+    relative_paths = [path.relative_to(project_root).as_posix() for path in paths]
+    if not relative_paths:
+        return set()
+    payload = "\0".join(relative_paths).encode("utf-8") + b"\0"
+    try:
+        completed = subprocess.run(
+            ["git", "check-ignore", "--stdin", "-z"],
+            cwd=project_root,
+            input=payload,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if completed.returncode not in {0, 1}:
+        return set()
+    return {
+        (project_root / item.decode("utf-8", errors="surrogateescape")).resolve()
+        for item in completed.stdout.split(b"\0")
+        if item
+    }
 
 
 def _module_to_path(module: str, project_root: Path) -> Path | None:
@@ -102,6 +175,45 @@ def _module_to_path(module: str, project_root: Path) -> Path | None:
         )
         if candidate.exists():
             return candidate
+    return None
+
+
+def _resolve_module_reference(
+    module: str,
+    *,
+    source_path: Path,
+    project_root: Path,
+    module_index: dict[str, Path],
+) -> Path | None:
+    """Resolve absolute and package-relative imports to an indexed file."""
+
+    leading_dots = len(module) - len(module.lstrip("."))
+    remainder = module[leading_dots:]
+    if leading_dots:
+        source_module = _normalize_module_name(source_path, project_root)
+        if source_module is None:
+            return None
+        package_parts = source_module.split(".")
+        if source_path.name != "__init__.py":
+            package_parts = package_parts[:-1]
+        parents_to_drop = leading_dots - 1
+        if parents_to_drop > len(package_parts):
+            return None
+        base_parts = package_parts[: len(package_parts) - parents_to_drop]
+        module_parts = [*base_parts, *(remainder.split(".") if remainder else [])]
+        normalized = ".".join(part for part in module_parts if part)
+    else:
+        normalized = module
+
+    candidate = normalized
+    while candidate:
+        target = module_index.get(candidate)
+        if target is not None:
+            return target
+        target = _module_to_path(candidate, project_root)
+        if target is not None:
+            return target.resolve()
+        candidate = candidate.rpartition(".")[0]
     return None
 
 
@@ -128,12 +240,12 @@ def _extract_references(symbols: Iterable[Symbol]) -> set[str]:
                 continue
             if module:
                 refs.add(module)
-            # Also record the imported names so callers can match on
-            # ``Foo`` (the class name) for files that re-export symbols.
+            # Imported names may be submodules (``from pkg import module``).
             for piece in rhs.split(","):
                 head = piece.strip().split(" as ")[0].strip()
-                if head and "." in head:
-                    refs.add(head.rsplit(".", 1)[0])
+                if head and head != "*":
+                    separator = "" if module.endswith(".") else "."
+                    refs.add(f"{module}{separator}{head}" if module else head)
     return refs
 
 
@@ -148,7 +260,7 @@ class RepoMap:
         max_files: int = 500,
         exclude_patterns: list[str] | None = None,
     ) -> None:
-        self.project_root = project_root
+        self.project_root = project_root.resolve()
         self._extractor = extractor or SymbolExtractor()
         self._max_files = max_files
         self._exclude_patterns = exclude_patterns or []
@@ -156,6 +268,7 @@ class RepoMap:
         self._module_index: dict[str, Path] = {}
         self._index: dict[Path, int] = {}
         self._adjacency: np.ndarray | None = None
+        self._file_cache: dict[Path, tuple[tuple[int, int], FileNode]] = {}
         self._refresh()
 
     # --- public API -----------------------------------------------------
@@ -205,13 +318,11 @@ class RepoMap:
         return [p for p in ordered if not self._is_excluded(p[0])]
 
     def _is_excluded(self, path: Path) -> bool:
-        path_str = str(path)
-        for pattern in self._exclude_patterns:
-            if fnmatch.fnmatch(path_str, pattern) or fnmatch.fnmatch(
-                path_str, f"**/{pattern}"
-            ):
-                return True
-        return False
+        try:
+            relative = path.resolve().relative_to(self.project_root.resolve())
+        except (OSError, ValueError):
+            return True
+        return _matches_exclude_pattern(relative, self._exclude_patterns, is_dir=False)
 
     def render(
         self,
@@ -243,10 +354,13 @@ class RepoMap:
                 interesting = [
                     s for s in node.symbols if s.kind in {"function", "method", "class"}
                 ]
-                for sym in interesting[:symbols_per_file]:
-                    kind = sym.kind
-                    parent = f" (in {sym.parent})" if sym.parent else ""
-                    lines.append(f"- **{sym.name}** `{kind}`{parent}")
+                if not interesting:
+                    lines.append("*No definitions extracted.*")
+                else:
+                    for sym in interesting[:symbols_per_file]:
+                        kind = sym.kind
+                        parent = f" (in {sym.parent})" if sym.parent else ""
+                        lines.append(f"- **{sym.name}** `{kind}`{parent}")
             lines.append("")
         return "\n".join(lines).rstrip() + "\n"
 
@@ -283,23 +397,44 @@ class RepoMap:
         return self._files[self._index[resolved]]
 
     def _refresh(self) -> None:
-        paths = _discover_python_files(self.project_root)[: self._max_files]
+        discovered = _discover_python_files(
+            self.project_root,
+            exclude_patterns=self._exclude_patterns,
+        )
+        ignored = _git_ignored_files(self.project_root, discovered)
+        paths = [path for path in discovered if path.resolve() not in ignored][
+            : self._max_files
+        ]
         files: list[FileNode] = []
         module_index: dict[str, Path] = {}
+        next_cache: dict[Path, tuple[tuple[int, int], FileNode]] = {}
 
         for path in paths:
-            symbols = tuple(self._extractor.extract(path))
-            refs = _extract_references(symbols)
-            files.append(
-                FileNode(
-                    path=path.resolve(), symbols=symbols, referenced_modules=tuple(refs)
+            resolved = path.resolve()
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            fingerprint = (stat.st_mtime_ns, stat.st_size)
+            cached = self._file_cache.get(resolved)
+            if cached is not None and cached[0] == fingerprint:
+                node = cached[1]
+            else:
+                symbols = tuple(self._extractor.extract(path))
+                refs = _extract_references(symbols)
+                node = FileNode(
+                    path=resolved,
+                    symbols=symbols,
+                    referenced_modules=tuple(sorted(refs)),
                 )
-            )
+            files.append(node)
+            next_cache[resolved] = (fingerprint, node)
             module_name = _normalize_module_name(path, self.project_root)
             if module_name is not None:
-                module_index[module_name] = path.resolve()
+                module_index[module_name] = resolved
 
         self._files = files
+        self._file_cache = next_cache
         self._module_index = module_index
         self._index = {node.path: i for i, node in enumerate(files)}
         self._adjacency = self._build_adjacency()
@@ -312,14 +447,19 @@ class RepoMap:
 
         for i, node in enumerate(self._files):
             for ref in node.referenced_modules:
-                target = self._module_index.get(ref)
-                if target is None:
-                    target = _module_to_path(ref, self.project_root)
+                target = _resolve_module_reference(
+                    ref,
+                    source_path=node.path,
+                    project_root=self.project_root,
+                    module_index=self._module_index,
+                )
                 if target is None:
                     continue
                 j = self._index.get(target.resolve())
                 if j is not None and j != i:
-                    matrix[i, j] += 1.0
+                    # Columns are sources and rows are destinations so M @ v
+                    # follows an import edge from the importer to its dependency.
+                    matrix[j, i] += 1.0
         return matrix
 
 
@@ -335,7 +475,7 @@ def calculate_personalized_pagerank(
 
     Implements the spec formula::
 
-        v = (1 - alpha) * M @ v + alpha * p
+        v = alpha * M @ v + (1 - alpha) * p
 
     where ``M`` is the column-normalized adjacency (transitions out of
     each node), ``p`` is the teleport vector concentrated on the
@@ -345,6 +485,10 @@ def calculate_personalized_pagerank(
     n = adjacency_matrix.shape[0] if adjacency_matrix.ndim == 2 else 0
     if n == 0:
         return np.array([])
+    if adjacency_matrix.shape != (n, n):
+        raise ValueError("adjacency_matrix must be square")
+    if not 0.0 <= alpha < 1.0:
+        raise ValueError("alpha must be in the range [0, 1)")
 
     # Column-normalize so each column is a transition distribution.
     column_sums = adjacency_matrix.sum(axis=0)
@@ -360,7 +504,7 @@ def calculate_personalized_pagerank(
     p = np.zeros(n)
     if teleport_indices:
         # Filter to in-bounds indices to be defensive.
-        valid = [i for i in teleport_indices if 0 <= i < n]
+        valid = sorted({i for i in teleport_indices if 0 <= i < n})
         if valid:
             p[valid] = 1.0 / len(valid)
         else:
@@ -370,7 +514,7 @@ def calculate_personalized_pagerank(
 
     v = np.copy(p)
     for _ in range(max_iter):
-        v_next = (1.0 - alpha) * np.dot(normalized, v) + alpha * p
+        v_next = alpha * np.dot(normalized, v) + (1.0 - alpha) * p
         if np.linalg.norm(v_next - v, 1) < tol:
             return v_next
         v = v_next
