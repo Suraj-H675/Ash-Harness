@@ -413,14 +413,17 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         input_mode=config.input_mode,
         keybindings=config.keybindings,
         workspace_root=loop.project_root,
+        transcript=loop.ui.transcript if isinstance(loop.ui, TerminalUI) else None,
+        tui_mode=config.tui_mode,
     )
     if not isinstance(loop.ui, TerminalUI):
         raise TypeError("interactive REPL requires TerminalUI")
+    loop.ui.viewport_mode = prompt_input.uses_viewport
     turn_controller = InteractiveTurnController(
         loop,
         prompt_input,
         loop.ui,
-        write_status=loop.ui.console.print,
+        write_status=loop.ui.write_status,
     )
     print(
         "ash - type /help for commands",
@@ -1012,7 +1015,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"Error: {exc}", file=sys.stderr, flush=True)
             continue
-        print(response, flush=True)
+        if not prompt_input.uses_viewport:
+            print(response, flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:

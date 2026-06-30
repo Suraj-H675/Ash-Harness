@@ -119,6 +119,10 @@ class AshConfig(BaseSettings):
         "emacs",
         description="Interactive editor mode: emacs or vi.",
     )
+    tui_mode: str = Field(
+        "viewport",
+        description="Interactive terminal renderer: viewport or inline.",
+    )
     keybindings: dict[str, list[str]] = Field(
         default_factory=lambda: {
             "newline": ["escape enter", "c-j"],
@@ -334,6 +338,14 @@ class AshConfig(BaseSettings):
                     )
                 owners[keys] = action
                 normalized[action].append(" ".join(keys))
+        return normalized
+
+    @field_validator("tui_mode")
+    @classmethod
+    def validate_tui_mode(cls, value: str) -> str:
+        normalized = value.casefold()
+        if normalized not in {"viewport", "inline"}:
+            raise ValueError("tui_mode must be viewport or inline")
         return normalized
 
     @property

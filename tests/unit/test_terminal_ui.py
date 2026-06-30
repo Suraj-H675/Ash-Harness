@@ -53,6 +53,23 @@ def test_terminal_ui_does_not_commit_empty_assistant_entry() -> None:
     assert ui.transcript.snapshot() == ()
 
 
+def test_terminal_ui_viewport_mode_uses_transcript_without_live_output() -> None:
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False))
+    ui.viewport_mode = True
+
+    with ui.begin_turn():
+        ui.print_token("visible in viewport")
+    ui.finalize_turn()
+    ui.write_status("queued")
+
+    assert output.getvalue() == ""
+    assert [entry.content for entry in ui.transcript.snapshot()] == [
+        "visible in viewport",
+        "queued",
+    ]
+
+
 def test_terminal_ui_dry_run_denies_all():
     ui = TerminalUI(safety_tier="dry_run")
     approved = ui.request_tool_approval("write_file", {"file_path": "x"})

@@ -16,6 +16,8 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.enums import EditingMode
 
 from cli.slash import COMMANDS
+from ui.transcript import Transcript
+from ui.viewport import TranscriptViewport
 
 
 class AshCompleter(Completer):
@@ -97,12 +99,17 @@ class PromptInput:
         input_mode: str = "emacs",
         keybindings: dict[str, list[str]] | None = None,
         workspace_root: Path | None = None,
+        transcript: Transcript | None = None,
+        tui_mode: str = "inline",
     ) -> None:
         if input_mode not in {"emacs", "vi"}:
             raise ValueError("input_mode must be emacs or vi")
+        if tui_mode not in {"viewport", "inline"}:
+            raise ValueError("tui_mode must be viewport or inline")
         self.input_stream = input_stream or sys.stdin
         self.interactive = bool(getattr(self.input_stream, "isatty", lambda: False)())
         self._session: PromptSession[str] | None = None
+        self._viewport: TranscriptViewport | None = None
         if self.interactive:
             path = history_path or (Path.home() / ".ash" / "history")
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -115,31 +122,51 @@ class PromptInput:
             )
             words.extend(f"/{name}" for name in (extra_commands or []))
             words = sorted(set(words))
-            self._session = PromptSession(
-                history=FileHistory(str(path)),
-                auto_suggest=AutoSuggestFromHistory(),
-                completer=AshCompleter(words, workspace_root or Path.cwd()),
-                complete_while_typing=True,
-                key_bindings=_key_bindings(
-                    keybindings
-                    if keybindings is not None
-                    else {
-                        "newline": ["escape enter", "c-j"],
-                        "open_editor": ["c-x c-e"],
-                    }
-                ),
-                editing_mode=(
-                    EditingMode.VI if input_mode == "vi" else EditingMode.EMACS
-                ),
-                multiline=False,
-                enable_open_in_editor=True,
-                bottom_toolbar=status_provider,
-            )
+            completer = AshCompleter(words, workspace_root or Path.cwd())
+            if tui_mode == "viewport":
+                self._viewport = TranscriptViewport(
+                    transcript or Transcript(),
+                    history_path=path,
+                    completer=completer,
+                    status_provider=status_provider,
+                    input_mode=input_mode,
+                )
+            else:
+                self._session = PromptSession(
+                    history=FileHistory(str(path)),
+                    auto_suggest=AutoSuggestFromHistory(),
+                    completer=completer,
+                    complete_while_typing=True,
+                    key_bindings=_key_bindings(
+                        keybindings
+                        if keybindings is not None
+                        else {
+                            "newline": ["escape enter", "c-j"],
+                            "open_editor": ["c-x c-e"],
+                        }
+                    ),
+                    editing_mode=(
+                        EditingMode.VI if input_mode == "vi" else EditingMode.EMACS
+                    ),
+                    multiline=False,
+                    enable_open_in_editor=True,
+                    bottom_toolbar=status_provider,
+                )
+
+    @property
+    def uses_viewport(self) -> bool:
+        return self._viewport is not None
 
     async def read(self, prompt: str = "> ") -> str:
+        if self._viewport is not None:
+            return await self._viewport.read(prompt)
         if self._session is not None:
             return await self._session.prompt_async(prompt)
         line = self.input_stream.readline()
         if line == "":
             raise EOFError
         return line.rstrip("\r\n")
+
+    def close(self) -> None:
+        if self._viewport is not None:
+            self._viewport.close()

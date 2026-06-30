@@ -22,3 +22,5 @@ def test_redirected_eof_is_reported() -> None:
 def test_invalid_input_mode_is_rejected() -> None:
     with pytest.raises(ValueError, match="input_mode"):
         PromptInput(input_stream=io.StringIO(""), input_mode="modal")
+    with pytest.raises(ValueError, match="tui_mode"):
+        PromptInput(input_stream=io.StringIO(""), tui_mode="floating")

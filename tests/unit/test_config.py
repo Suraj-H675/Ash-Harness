@@ -195,12 +195,14 @@ def test_config_loads_without_api_key(
 def test_terminal_preferences_are_validated() -> None:
     config = AshConfig(
         input_mode="VI",
+        tui_mode="INLINE",
         no_color=True,
         reduced_motion=True,
         show_token_meter=True,
         keybindings={"newline": ["c-o"], "open_editor": ["c-x c-e"]},
     )
     assert config.input_mode == "vi"
+    assert config.tui_mode == "inline"
     assert config.no_color is True
     assert config.reduced_motion is True
     assert config.show_token_meter is True
@@ -243,6 +245,9 @@ def test_terminal_keybinding_collisions_are_rejected() -> None:
 def test_unknown_terminal_input_mode_is_rejected() -> None:
     with pytest.raises(ValueError, match="input_mode"):
         AshConfig(input_mode="modal")
+
+    with pytest.raises(ValueError, match="tui_mode"):
+        AshConfig(tui_mode="floating")
 
 
 def test_backward_compat_ash_api_key_promoted_to_anthropic(

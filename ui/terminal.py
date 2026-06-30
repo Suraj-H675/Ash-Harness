@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -97,6 +98,7 @@ class TerminalUI:
         self.transcript = transcript or Transcript()
         self._assistant_entry_id: str | None = None
         self._reasoning_entry_id: str | None = None
+        self.viewport_mode = False
         self._token_progress = (
             Progress(
                 TextColumn("[progress.description]{task.description}"),
@@ -132,7 +134,7 @@ class TerminalUI:
         label = f"[Token {bar} {current_tokens}/{max_tokens} ({pct * 100:.1f}%)]"
         return label
 
-    def begin_turn(self) -> Live:
+    def begin_turn(self) -> Any:
         """Return a :class:`rich.live.Live` context the loop can update."""
 
         buffers: _LiveBuffers = _LiveBuffers.fresh()
@@ -145,6 +147,11 @@ class TerminalUI:
             )
         else:
             self._token_task = None
+
+        if self.viewport_mode:
+            self._active_live = None
+            self._last_refresh = 0.0
+            return nullcontext()
 
         live = Live(
             self._render_active_turn(),
@@ -285,7 +292,8 @@ class TerminalUI:
         line = Text("tool ", style="dim")
         line.append(tool, style="bold")
         line.append(f" [{label}]", style=style)
-        self.console.print(line)
+        if not self.viewport_mode:
+            self.console.print(line)
 
     # --- approval surface -------------------------------------------------
 
@@ -367,7 +375,8 @@ class TerminalUI:
             title=tool_name,
             metadata={"auto": auto},
         )
-        self.console.print(Panel(body, border_style="yellow", title="approval"))
+        if not self.viewport_mode:
+            self.console.print(Panel(body, border_style="yellow", title="approval"))
 
         if live is not None:
             live.start()
@@ -531,13 +540,22 @@ class TerminalUI:
             title=f"sprint {execution.contract.contract_id[:8]}",
             metadata={"type": "plan.approval"},
         )
-        self.console.print(
-            Panel(
-                body,
-                border_style="cyan",
-                title=f"sprint {execution.contract.contract_id[:8]}",
+        if not self.viewport_mode:
+            self.console.print(
+                Panel(
+                    body,
+                    border_style="cyan",
+                    title=f"sprint {execution.contract.contract_id[:8]}",
+                )
             )
-        )
+
+    def write_status(self, text: str, *, error: bool = False) -> None:
+        if error:
+            self.transcript.append("error", text, title="error")
+        else:
+            self.transcript.append("status", text, title="status")
+        if not self.viewport_mode:
+            self.console.print(text, style="red" if error else None)
 
     def _edit_plan(self, execution: Any) -> None:
         from core.planner import apply_sprint_markdown_edit, render_sprint_markdown
