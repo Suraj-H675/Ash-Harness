@@ -450,8 +450,23 @@ class TestCmdSetup:
         args = MagicMock(section="model", quick=False, non_interactive=True)
         monkeypatch.setattr("cli.setup.is_interactive_stdin", lambda: False)
 
-        assert cmd_setup(args) == 2
+        with patch("cli.setup._has_provider_configured", return_value=False):
+            assert cmd_setup(args) == 2
         assert "requires an interactive terminal" in capsys.readouterr().err
+
+    def test_cmd_setup_non_interactive_accepts_existing_configuration(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from cli.setup import cmd_setup
+
+        args = MagicMock(section="model", quick=False, non_interactive=True)
+        monkeypatch.setattr("cli.setup.is_interactive_stdin", lambda: False)
+
+        with patch("cli.setup._has_provider_configured", return_value=True):
+            assert cmd_setup(args) == 0
+        output = capsys.readouterr().out
+        assert "Ash is configured for" in output
+        assert "doctor --connect" in output
 
 
 class TestSetupNavigation:

@@ -83,6 +83,9 @@ def cmd_setup(args) -> int:
     except (EOFError, KeyboardInterrupt, SetupCancelled):
         print("\nSetup cancelled.", file=sys.stderr)
         return int(SetupOutcome.CANCELLED)
+    except Exception as exc:  # noqa: BLE001 - CLI boundary returns a stable status
+        print(f"Setup failed: {exc}", file=sys.stderr)
+        return int(SetupOutcome.ERROR)
 
 
 def run_setup_wizard(args) -> SetupOutcome:
@@ -91,21 +94,21 @@ def run_setup_wizard(args) -> SetupOutcome:
     quick = getattr(args, "quick", False)
     non_interactive = getattr(args, "non_interactive", False)
 
-    # Non-interactive: fail fast
-    if non_interactive or not is_interactive_stdin():
-        print("Error: ash setup requires an interactive terminal.", file=sys.stderr)
-        print(
-            "Set provider credentials with environment variables or rerun in a TTY.",
-            file=sys.stderr,
-        )
-        return SetupOutcome.ERROR
-
-    # ------------------------------------------------------------------
-    # Import AshConfig here to avoid circular imports at top level
-    # ------------------------------------------------------------------
     from config import AshConfig
 
     config = AshConfig.load()
+
+    if non_interactive or not is_interactive_stdin():
+        if _has_provider_configured(config):
+            print(f"Ash is configured for {config.model}.")
+            print("Run 'ash doctor --connect' to verify endpoint connectivity.")
+            return SetupOutcome.SUCCESS
+        print("Error: ash setup requires an interactive terminal.", file=sys.stderr)
+        print(
+            "Set ASH_MODEL and its provider API key, configure Ollama, or rerun in a TTY.",
+            file=sys.stderr,
+        )
+        return SetupOutcome.ERROR
 
     # Banner
     _print_header("Ash Setup Wizard")
