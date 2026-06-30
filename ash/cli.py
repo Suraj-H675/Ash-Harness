@@ -300,6 +300,11 @@ def _build_repo_map(config: AshConfig):
 
 def _print_model_list(config: AshConfig) -> None:
     """Show models grouped by provider."""
+    print(_render_model_list(config))
+
+
+def _render_model_list(config: AshConfig, *, numbered: bool = False) -> str:
+    """Render known models for interactive or machine-independent display."""
     from providers.capabilities import infer_capabilities
 
     # Determine current provider/model
@@ -314,10 +319,12 @@ def _print_model_list(config: AshConfig) -> None:
         prov, mod = _parse_model_string(m)
         grouped.setdefault(prov, []).append(mod)
 
-    print("\nAvailable models:")
+    lines = ["Available models:"]
+    number = 0
     for prov, models in grouped.items():
-        print(f"\n{prov.capitalize()}:")
+        lines.append(f"\n{prov.capitalize()}:")
         for model in models:
+            number += 1
             marker = (
                 " (current)"
                 if prov == current_provider and model == current_model
@@ -334,8 +341,9 @@ def _print_model_list(config: AshConfig) -> None:
                 )
                 if enabled
             ]
-            print(f"  {model} [{', '.join(labels)}]{marker}")
-    print()
+            prefix = f"[{number}] " if numbered else ""
+            lines.append(f"  {prefix}{model} [{', '.join(labels)}]{marker}")
+    return "\n".join(lines)
 
 
 def _render_context_budget(report: Any | None) -> str:
@@ -348,47 +356,30 @@ def _render_context_budget(report: Any | None) -> str:
     return "\n".join(lines)
 
 
-def _interactive_model_picker(config: AshConfig, loop: AshLoop) -> None:
+async def _interactive_model_picker(
+    config: AshConfig,
+    loop: AshLoop,
+    prompt_input: Any,
+    write_output: Any,
+) -> None:
     """Show models grouped by provider, let user pick by provider number."""
-    # Determine current
-    try:
-        current_provider, current_model = _parse_model_string(config.model)
-    except ValueError:
-        current_provider, current_model = "anthropic", config.model
-
-    # Group by provider
-    grouped: dict[str, list[tuple[int, str, str]]] = {}
-    for i, model_str in enumerate(AVAILABLE_MODELS, 1):
-        prov, mod = _parse_model_string(model_str)
-        grouped.setdefault(prov, []).append((i, mod, model_str))
-
-    print("\nAvailable models:")
-    for prov, entries in grouped.items():
-        print(f"\n{prov.capitalize()}:")
-        for num, mod, _ in entries:
-            marker = (
-                " ← current"
-                if prov == current_provider and mod == current_model
-                else ""
-            )
-            print(f"  [{num}] {mod}{marker}")
-
-    choice = input("\nPick a number (or 'c' to cancel): ").strip()
+    write_output(_render_model_list(config, numbered=True))
+    choice = (await prompt_input.read("Pick a number (or 'c' to cancel)> ")).strip()
     if choice.lower() == "c":
         return
     try:
         idx = int(choice) - 1
         model_str = AVAILABLE_MODELS[idx]
     except (ValueError, IndexError):
-        print("Invalid selection.")
+        write_output("Invalid selection.", file=sys.stderr)
         return
 
     try:
         loop.switch_model(model_str)
         config.model = model_str
-        print(f"Switched to {model_str}\n")
+        write_output(f"Switched to {model_str}")
     except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        write_output(f"Error: {exc}", file=sys.stderr)
 
 
 async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
@@ -398,6 +389,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     from ui.prompt import PromptInput
     from ui.status import StatusLine
     from ui.turn_input import InteractiveTurnController
+    from ui.output import ReplPrinter
 
     command_roots = [(Path.home() / ".ash" / "commands", "user")]
     if is_workspace_trusted(loop.project_root):
@@ -419,6 +411,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     if not isinstance(loop.ui, TerminalUI):
         raise TypeError("interactive REPL requires TerminalUI")
     loop.ui.viewport_mode = prompt_input.uses_viewport
+    print = ReplPrinter(loop.ui, viewport=prompt_input.uses_viewport)  # noqa: A001
     turn_controller = InteractiveTurnController(
         loop,
         prompt_input,
@@ -968,14 +961,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             and parsed_command[0].name == "model"
             and not parsed_command[1]
         ):
-            from cli.setup import setup_model_provider
-
-            old_model = config.model
-            setup_model_provider(config)
-            # Reload config after wizard may have written new ASH_MODEL
-            config = AshConfig.load()
-            if config.model != old_model:
-                loop.switch_model(config.model)
+            await _interactive_model_picker(config, loop, prompt_input, print)
             continue
 
         # /model provider/model → switch to full string
@@ -997,7 +983,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
         # /models → list
         if parsed_command is not None and parsed_command[0].name == "models":
-            _print_model_list(config)
+            print(_render_model_list(config))
             continue
 
         # Normal turn

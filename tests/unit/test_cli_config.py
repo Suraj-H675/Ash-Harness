@@ -366,6 +366,33 @@ def test_prompt_cache_key_is_stable_without_exposing_workspace(tmp_path: Path) -
     assert str(config.workspace_root) not in first
 
 
+def test_model_catalog_rendering_and_shared_input_picker() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from ash.cli import AVAILABLE_MODELS, _interactive_model_picker, _render_model_list
+    from config import AshConfig
+
+    config = AshConfig(model=AVAILABLE_MODELS[0])
+    rendered = _render_model_list(config, numbered=True)
+    assert "[1]" in rendered
+    assert "(current)" in rendered
+
+    class Prompt:
+        async def read(self, prompt: str) -> str:
+            assert prompt.startswith("Pick a number")
+            return "2"
+
+    selected = []
+    output = []
+    loop = SimpleNamespace(switch_model=selected.append)
+    asyncio.run(_interactive_model_picker(config, loop, Prompt(), output.append))
+
+    assert selected == [AVAILABLE_MODELS[1]]
+    assert config.model == AVAILABLE_MODELS[1]
+    assert output[-1] == f"Switched to {AVAILABLE_MODELS[1]}"
+
+
 def test_explain_config_reports_sources_and_masks_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
