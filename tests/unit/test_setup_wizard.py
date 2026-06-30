@@ -149,15 +149,32 @@ class TestAnthropicFlow:
         monkeypatch.setattr("builtins.input", _fake_input(["1"]))  # model selection
 
         with patch("cli.setup._verify_anthropic"):
-            with patch("cli.setup.save_env_value") as mock_save:
+            with patch("cli.setup.save_env_values") as mock_save:
                 from cli.setup import _flow_anthropic
 
                 _flow_anthropic("")
-                calls = {call[0][0]: call[0][1] for call in mock_save.call_args_list}
+                calls = mock_save.call_args.args[0]
                 assert "ANTHROPIC_API_KEY" in calls
                 assert calls["ANTHROPIC_API_KEY"] == "sk-ant-test123"
                 assert "ASH_MODEL" in calls
                 assert calls["ASH_MODEL"].startswith("anthropic/")
+
+    def test_cancelled_model_selection_does_not_save_partial_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli.setup import SetupCancelled, _flow_anthropic
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass("sk-new"))
+        monkeypatch.setattr("builtins.input", _fake_input(["c"]))
+
+        with (
+            patch("cli.setup._probe_anthropic_models", return_value=["model"]),
+            patch("cli.setup.save_env_values") as save,
+            pytest.raises(SetupCancelled),
+        ):
+            _flow_anthropic("")
+        save.assert_not_called()
 
 
 class TestGroqFlow:
@@ -175,11 +192,11 @@ class TestGroqFlow:
         )  # select model index 1
 
         with patch("cli.setup._verify_openai"):
-            with patch("cli.setup.save_env_value") as mock_save:
+            with patch("cli.setup.save_env_values") as mock_save:
                 from cli.setup import _flow_groq
 
                 _flow_groq("")
-                calls = {call[0][0]: call[0][1] for call in mock_save.call_args_list}
+                calls = mock_save.call_args.args[0]
                 assert "GROQ_API_KEY" in calls
                 assert calls["GROQ_API_KEY"] == "gsk_groq_test"
                 assert "ASH_MODEL" in calls
@@ -194,18 +211,18 @@ class TestOpenaiCompatibleFlow:
     ) -> None:
         """Custom endpoint metadata is saved without embedding its API key."""
         monkeypatch.setenv("HOME", str(tmp_path))
-        # provider name, base URL, API key (optional), model name
+        # provider name, base URL, model name
         monkeypatch.setattr(
             "builtins.input",
             _fake_input(
                 [
                     "my-minimax",
                     "https://api.minimax.io/v1",
-                    "sk-cp-test",
                     "MiniMax-M2.7",
                 ]
             ),
         )
+        monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass("sk-cp-test"))
 
         with patch("cli.setup._probe_models", return_value=[]):
             with patch("cli.setup.save_config") as mock_save_config:
@@ -273,6 +290,28 @@ class TestProbeModels:
 
             result = _probe_ollama_models("http://localhost:11434")
             assert result == ["llama3", "qwen2.5-coder:7b"]
+
+
+class TestSetupValidation:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "localhost:11434",
+            "ftp://example.com",
+            "https://user:secret@example.com/v1",
+            "https://example.com/v1?token=secret",
+        ],
+    )
+    def test_base_url_rejects_unsafe_or_ambiguous_values(self, value: str) -> None:
+        from cli.setup import _validate_base_url
+
+        with pytest.raises(ValueError):
+            _validate_base_url(value)
+
+    def test_base_url_normalizes_trailing_slash(self) -> None:
+        from cli.setup import _validate_base_url
+
+        assert _validate_base_url("http://localhost:11434/") == "http://localhost:11434"
 
 
 class TestCmdSetup:

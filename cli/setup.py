@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import re
 import sys
 from enum import IntEnum
 from typing import Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -22,6 +24,7 @@ from cli.config import (
     mask_key,
     save_config,
     save_env_value,
+    save_env_values,
 )
 
 
@@ -55,6 +58,7 @@ PROVIDERS = [
         "Custom endpoint with any OpenAI-compatible API",
     ),
 ]
+_PROVIDER_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
 
 # ---------------------------------------------------------------------------
@@ -170,9 +174,12 @@ def _flow_anthropic(current: str) -> SetupOutcome:
         models = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"]
     model = _prompt_model_list(models, current)
 
-    # Save ASH_MODEL env var
-    save_env_value("ASH_MODEL", f"anthropic/{model}")
-    # Verify
+    save_env_values(
+        {
+            "ANTHROPIC_API_KEY": api_key,
+            "ASH_MODEL": f"anthropic/{model}",
+        }
+    )
     _verify_anthropic(api_key, model)
     return SetupOutcome.SUCCESS
 
@@ -187,16 +194,20 @@ def _flow_openai(current: str) -> SetupOutcome:
         "OPENAI_API_BASE",
         "https://api.openai.com/v1",
     )
-    if base_url_override:
-        save_env_value("OPENAI_API_BASE", base_url_override)
-
-    models = _probe_models("https://api.openai.com/v1", api_key)
+    base_url = base_url_override or "https://api.openai.com/v1"
+    models = _probe_models(base_url, api_key)
     if not models:
         print("Could not fetch models. Using default list.")
         models = ["gpt-5.2", "gpt-5.2-codex", "gpt-5-mini", "gpt-4.1"]
     model = _prompt_model_list(models, current)
 
-    save_env_value("ASH_MODEL", f"openai/{model}")
+    settings = {
+        "OPENAI_API_KEY": api_key,
+        "ASH_MODEL": f"openai/{model}",
+    }
+    if base_url_override:
+        settings["OPENAI_API_BASE"] = base_url_override
+    save_env_values(settings)
     _verify_openai(api_key, base_url_override, model)
     return SetupOutcome.SUCCESS
 
@@ -211,17 +222,21 @@ def _flow_deepseek(current: str) -> SetupOutcome:
         "DEEPSEEK_API_BASE",
         "https://api.deepseek.com/v1",
     )
-    if base_url_override:
-        save_env_value("DEEPSEEK_API_BASE", base_url_override)
-
-    models = _probe_models("https://api.deepseek.com/v1", api_key)
+    base_url = base_url_override or "https://api.deepseek.com/v1"
+    models = _probe_models(base_url, api_key)
     if not models:
         print("Could not fetch models. Using default list.")
         models = ["deepseek-chat", "deepseek-reasoner"]
     model = _prompt_model_list(models, current)
 
-    save_env_value("ASH_MODEL", f"deepseek/{model}")
-    _verify_openai(api_key, base_url_override, model)
+    settings = {
+        "DEEPSEEK_API_KEY": api_key,
+        "ASH_MODEL": f"deepseek/{model}",
+    }
+    if base_url_override:
+        settings["DEEPSEEK_API_BASE"] = base_url_override
+    save_env_values(settings)
+    _verify_openai(api_key, base_url, model)
     return SetupOutcome.SUCCESS
 
 
@@ -242,7 +257,12 @@ def _flow_groq(current: str) -> SetupOutcome:
         ]
     model = _prompt_model_list(models, current)
 
-    save_env_value("ASH_MODEL", f"groq/{model}")
+    save_env_values(
+        {
+            "GROQ_API_KEY": api_key,
+            "ASH_MODEL": f"groq/{model}",
+        }
+    )
     _verify_openai(api_key, "https://api.groq.com/openai/v1", model)
     return SetupOutcome.SUCCESS
 
@@ -257,7 +277,7 @@ def _flow_ollama(current: str) -> SetupOutcome:
     )
     if not base_url:
         base_url = "http://localhost:11434"
-    save_env_value("OLLAMA_API_BASE", base_url)
+    base_url = _validate_base_url(base_url)
 
     models = _probe_ollama_models(base_url)
     if not models:
@@ -266,7 +286,12 @@ def _flow_ollama(current: str) -> SetupOutcome:
 
     model = _prompt_model_list(models, current)
 
-    save_env_value("ASH_MODEL", f"ollama/{model}")
+    save_env_values(
+        {
+            "OLLAMA_API_BASE": base_url,
+            "ASH_MODEL": f"ollama/{model}",
+        }
+    )
     print(f"  Configured Ollama with model: {model}")
     return SetupOutcome.SUCCESS
 
@@ -279,10 +304,14 @@ def _flow_openai_compatible() -> SetupOutcome:
     _print_header("OpenAI-Compatible Endpoint")
 
     name = _prompt_setup_text("  Provider name (e.g. my-minimax): ")
+    if not _PROVIDER_NAME.fullmatch(name) or name in {item[0] for item in PROVIDERS}:
+        print("  Provider name must be a unique identifier without spaces or '/'.")
+        raise SetupBack
 
     base_url = _prompt_setup_text("  Base URL (e.g. https://api.minimax.io/v1): ")
+    base_url = _validate_base_url(base_url)
 
-    api_key = input("  API key (optional, press Enter to skip): ").strip()
+    api_key = getpass.getpass("  API key (optional, press Enter to skip): ").strip()
     key_env = (
         "ASH_PROVIDER_"
         + "".join(
@@ -290,9 +319,6 @@ def _flow_openai_compatible() -> SetupOutcome:
         )
         + "_API_KEY"
     )
-    if api_key:
-        save_env_value(key_env, api_key)
-
     # Probe models
     models = _probe_models(base_url, api_key or None)
     if not models:
@@ -323,8 +349,10 @@ def _flow_openai_compatible() -> SetupOutcome:
     }
     save_config({"custom_providers": custom})
 
-    # Set ASH_MODEL to this custom provider's model
-    save_env_value("ASH_MODEL", f"{name}/{model}")
+    settings = {"ASH_MODEL": f"{name}/{model}"}
+    if api_key:
+        settings[key_env] = api_key
+    save_env_values(settings)
     print(f"\n  Saved custom provider '{name}' to {get_config_path()}")
     print(f"  Model: {model}")
     return SetupOutcome.SUCCESS
@@ -570,7 +598,6 @@ def _prompt_api_key(
     if key.casefold() in {"b", "back"}:
         raise SetupBack
 
-    save_env_value(env_var, key)
     return key
 
 
@@ -582,10 +609,28 @@ def _prompt_optional_url(env_var: str, default: str) -> Optional[str]:
         prompt += f" [{existing}]"
     else:
         prompt += f" [{default}]"
-    val = _prompt_setup_text(prompt + ": ", allow_empty=True)
-    if val:
-        return val
-    return existing or None
+    while True:
+        val = _prompt_setup_text(prompt + ": ", allow_empty=True)
+        candidate = val or existing
+        if not candidate:
+            return None
+        try:
+            return _validate_base_url(candidate)
+        except ValueError as exc:
+            print(f"  Invalid URL: {exc}")
+
+
+def _validate_base_url(value: str) -> str:
+    """Validate an HTTP(S) API base URL without embedded credentials."""
+
+    parsed = urlsplit(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("use an absolute http:// or https:// URL")
+    if parsed.username or parsed.password:
+        raise ValueError("embedded credentials are not allowed")
+    if parsed.query or parsed.fragment:
+        raise ValueError("query strings and fragments are not allowed")
+    return value.strip().rstrip("/")
 
 
 def _prompt_model_list(models: list[str], current: str) -> str:
