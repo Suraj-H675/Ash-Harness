@@ -84,6 +84,11 @@ Terminal behavior is configurable with `ASH_INPUT_MODE=vi`,
 `ASH_SHOW_TOKEN_METER=true`. Structured keybindings and sprint planning can be
 set in `~/.ash/ash.toml`.
 
+Interactive sessions use the responsive transcript viewport by default. Use
+`PageUp`/`PageDown` to inspect history and `End` to resume following live
+output. Set `ASH_TUI_MODE=inline` when native terminal scrollback is preferred
+or a terminal does not support full-screen applications reliably.
+
 First-party Anthropic and OpenAI prompt caching is enabled by default. It can
 be configured in `~/.ash/ash.toml`:
 
