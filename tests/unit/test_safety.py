@@ -53,6 +53,34 @@ def test_validate_path_blocks_symlink_escape(tmp_path: Path) -> None:
         guard.validate_path("linked-outside/secret.txt")
 
 
+def test_validate_mutation_path_rejects_in_scope_symlink(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    target = project_root / "target"
+    target.mkdir()
+    link = project_root / "linked"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+
+    guard = SafetyGuard(project_root)
+
+    assert guard.validate_path("linked/file.txt") == target / "file.txt"
+    with pytest.raises(SafetyViolation, match="symlink or junction"):
+        guard.validate_mutation_path("linked/file.txt")
+
+
+def test_validate_mutation_path_allows_new_nested_path(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    guard = SafetyGuard(project_root)
+
+    assert guard.validate_mutation_path("new/nested/file.txt") == (
+        project_root / "new" / "nested" / "file.txt"
+    )
+
+
 def test_validate_path_enforces_allowed_directories(tmp_path: Path) -> None:
     project_root = tmp_path / "project"
     allowed = project_root / "src"

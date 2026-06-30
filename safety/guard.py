@@ -5,8 +5,10 @@ from pathlib import Path
 from typing import Tuple
 
 from safety.path_scope import (
+    lexical_target_path,
     normalize_allowed_directories,
     normalize_project_root,
+    path_has_link_component,
     path_is_in_scope,
     resolve_target_path,
 )
@@ -105,6 +107,30 @@ class SafetyGuard:
         raise SafetyViolation(
             f"Access denied: path '{target_path}' is outside project scope."
         )
+
+    def validate_mutation_path(self, target_path: str | Path) -> Path:
+        """Validate a write target and reject link-based path indirection."""
+
+        lexical = lexical_target_path(target_path, self.project_root)
+        resolved = resolve_target_path(lexical, self.project_root)
+        if not path_is_in_scope(
+            resolved,
+            self.project_root,
+            self.allowed_directories,
+        ) or not path_is_in_scope(
+            lexical,
+            self.project_root,
+            self.allowed_directories,
+        ):
+            raise SafetyViolation(
+                f"Access denied: path '{target_path}' is outside project scope."
+            )
+        link = path_has_link_component(lexical, self.project_root)
+        if link is not None:
+            raise SafetyViolation(
+                f"Access denied: mutation path contains a symlink or junction: {link}"
+            )
+        return lexical
 
     def validate_command(self, command_str: str) -> Tuple[bool, str]:
         """
