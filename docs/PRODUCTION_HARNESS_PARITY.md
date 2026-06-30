@@ -36,9 +36,9 @@ Research is clean-room: proprietary or leaked source is not used.
 | `ash` console command | Verified locally | Wheel and sdist build; clean-environment console smoke test passes |
 | `python -m ash` | Verified locally | Keep as supported fallback |
 | Dependency separation | Partial | Runtime, dev, provider, vector, and server extras with lockfile consistency |
-| First-run wizard | Partial | No-key detection, cancel/back, retry, verification, non-TTY guidance |
+| First-run wizard | Verified locally | No-key detection, deterministic cancel/back, endpoint retry/save-unverified choices, non-billable model discovery, secret input, atomic related settings, non-TTY guidance, and fresh-process API/local checks |
 | API-key providers | Partial | Anthropic, OpenAI, Groq, DeepSeek and custom endpoints tested from fresh process |
-| Local models | Partial | Ollama discovery, health checks, pull guidance, tool-capability detection |
+| Local models | Partial | Ollama URL validation, installed-model discovery, health failure detail, start/pull guidance, and fresh-process configuration checks are wired; pull execution and dynamic tool-capability detection remain |
 | Custom endpoints | Verified locally | Per-provider credentials are stored in mode-0600 env storage, not TOML |
 | Config precedence | Partial | `ash config explain` shows env/dotenv/TOML/default sources; project config and full CLI override reporting remain |
 | Config migration | Partial | Legacy file migration and config schema future-version refusal exist; config backups remain |

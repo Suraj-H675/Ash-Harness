@@ -88,6 +88,14 @@ ollama/qwen3-coder
 
 Run `ash setup` to configure a provider and `ash doctor --connect` to test its
 endpoint. Run `ash doctor --json` for machine-readable diagnostics.
+The setup wizard discovers models through the provider endpoint before writing
+credentials, supports `b` to return and `c` to cancel, and offers explicit
+retry or save-unverified choices when an endpoint is unavailable. API keys use
+hidden input and related key/base/model settings are committed atomically.
+Ollama setup discovers installed models and gives `ollama serve`/`ollama pull`
+guidance without starting a download. In scripts, `ash setup
+--non-interactive` validates an existing environment configuration without
+prompting or making a network request.
 
 Terminal behavior is configurable with `ASH_INPUT_MODE=vi`,
 `ASH_NO_COLOR=true`, `ASH_REDUCED_MOTION=true`, and
