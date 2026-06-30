@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -33,6 +34,81 @@ class ProviderHTTPError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.headers = headers or {}
+
+
+class ProviderCircuitOpen(RuntimeError):
+    """Raised when a provider circuit is still in its cooldown window."""
+
+    def __init__(self, provider: str, retry_after: float) -> None:
+        self.provider = provider
+        self.retry_after = max(0.0, retry_after)
+        super().__init__(
+            f"Provider circuit is open for {provider}; retry in "
+            f"{self.retry_after:.1f} seconds"
+        )
+
+
+@dataclass
+class _CircuitState:
+    failures: int = 0
+    opened_at: float | None = None
+
+
+class ProviderCircuitBreaker:
+    """Small per-provider circuit breaker for exhausted transient requests."""
+
+    def __init__(
+        self,
+        *,
+        failure_threshold: int = 5,
+        cooldown_seconds: float = 30.0,
+        clock=time.monotonic,
+    ) -> None:
+        if failure_threshold < 2:
+            raise ValueError("failure_threshold must be at least 2")
+        if cooldown_seconds <= 0:
+            raise ValueError("cooldown_seconds must be positive")
+        self.failure_threshold = failure_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self._clock = clock
+        self._states: dict[str, _CircuitState] = {}
+
+    def before_request(self, provider: str) -> None:
+        state = self._states.get(provider)
+        if state is None or state.opened_at is None:
+            return
+        elapsed = self._clock() - state.opened_at
+        if elapsed < self.cooldown_seconds:
+            raise ProviderCircuitOpen(provider, self.cooldown_seconds - elapsed)
+        # Half-open: one serial probe. A failed probe reopens immediately.
+        state.opened_at = None
+        state.failures = self.failure_threshold - 1
+
+    def record_success(self, provider: str) -> None:
+        self._states.pop(provider, None)
+
+    def record_failure(self, provider: str) -> bool:
+        state = self._states.setdefault(provider, _CircuitState())
+        state.failures += 1
+        if state.failures < self.failure_threshold:
+            return False
+        state.opened_at = self._clock()
+        return True
+
+    def snapshot(self, provider: str) -> dict[str, float | int | bool]:
+        state = self._states.get(provider, _CircuitState())
+        remaining = 0.0
+        is_open = state.opened_at is not None
+        if state.opened_at is not None:
+            remaining = max(
+                0.0,
+                self.cooldown_seconds - (self._clock() - state.opened_at),
+            )
+        return {
+            "failures": state.failures,
+            "open": is_open and remaining > 0,
+            "retry_after": remaining,
+        }
 
 
 def classify_provider_failure(error: BaseException) -> ProviderFailure:

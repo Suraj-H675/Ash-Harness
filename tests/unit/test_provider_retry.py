@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from providers.retry import (
+    ProviderCircuitBreaker,
+    ProviderCircuitOpen,
     ProviderFailure,
     classify_provider_failure,
     retry_delay,
@@ -72,3 +74,37 @@ def test_retry_delay_prefers_header_and_caps_backoff(monkeypatch) -> None:
         )
         == 5.0
     )
+
+
+def test_provider_circuit_opens_cools_down_and_resets() -> None:
+    now = 100.0
+    circuit = ProviderCircuitBreaker(
+        failure_threshold=2,
+        cooldown_seconds=10,
+        clock=lambda: now,
+    )
+    assert circuit.record_failure("openai/model") is False
+    assert circuit.record_failure("openai/model") is True
+    assert circuit.snapshot("openai/model") == {
+        "failures": 2,
+        "open": True,
+        "retry_after": 10.0,
+    }
+    with pytest.raises(ProviderCircuitOpen) as exc:
+        circuit.before_request("openai/model")
+    assert exc.value.retry_after == 10.0
+
+    now = 111.0
+    circuit.before_request("openai/model")
+    assert circuit.record_failure("openai/model") is True
+    circuit.record_success("openai/model")
+    assert circuit.snapshot("openai/model")["failures"] == 0
+
+
+def test_provider_circuit_tracks_providers_independently() -> None:
+    circuit = ProviderCircuitBreaker(failure_threshold=2)
+    circuit.record_failure("provider-a")
+    circuit.record_failure("provider-a")
+
+    circuit.before_request("provider-b")
+    assert circuit.snapshot("provider-b")["open"] is False

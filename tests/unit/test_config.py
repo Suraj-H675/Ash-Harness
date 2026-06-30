@@ -260,10 +260,14 @@ def test_provider_retry_preferences_are_validated() -> None:
         provider_max_attempts=5,
         provider_retry_base_delay=0.25,
         provider_retry_max_delay=12.0,
+        provider_circuit_failure_threshold=4,
+        provider_circuit_cooldown_seconds=45,
     )
     assert config.provider_max_attempts == 5
     assert config.provider_retry_base_delay == 0.25
     assert config.provider_retry_max_delay == 12.0
+    assert config.provider_circuit_failure_threshold == 4
+    assert config.provider_circuit_cooldown_seconds == 45
     with pytest.raises(ValueError, match="provider_retry_max_delay"):
         AshConfig(provider_retry_base_delay=2.0, provider_retry_max_delay=1.0)
 

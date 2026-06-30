@@ -173,5 +173,24 @@ sent to custom OpenAI-compatible endpoints or local models. Cache reads,
 writes, hit rate, and configured costs are visible through `/status`,
 `/context`, JSON output, the SDK, HTTP, and JSON-RPC.
 
+Provider requests use one harness-level resilience policy. Only transient
+connection, timeout, 408/409/425/429, and 5xx failures before the first stream
+chunk are retried; authentication, validation, quota-exhaustion, and partial
+stream failures are never replayed. `Retry-After` is honored within the
+configured cap, otherwise Ash uses exponential backoff with jitter:
+
+```toml
+provider_max_attempts = 3
+provider_retry_base_delay = 0.5
+provider_retry_max_delay = 8.0
+provider_circuit_failure_threshold = 5
+provider_circuit_cooldown_seconds = 30.0
+```
+
+Exhausted transient requests open a provider circuit after the configured
+threshold. `/status` reports circuit state; cooldown permits a half-open probe,
+and a successful request resets it. Retry reasons are redacted in logs and
+structured events.
+
 See [the production parity checklist](docs/PRODUCTION_HARNESS_PARITY.md) for
 implemented and remaining release requirements.

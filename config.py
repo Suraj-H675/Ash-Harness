@@ -45,6 +45,8 @@ PROJECT_CONFIG_FIELDS = frozenset(
         "provider_max_attempts",
         "provider_retry_base_delay",
         "provider_retry_max_delay",
+        "provider_circuit_failure_threshold",
+        "provider_circuit_cooldown_seconds",
         "model_pricing_usd_per_million",
         "context_compaction_threshold",
         "context_recent_messages",
@@ -296,6 +298,18 @@ class AshConfig(BaseSettings):
         ge=0.0,
         le=300.0,
         description="Maximum provider retry delay, including Retry-After values.",
+    )
+    provider_circuit_failure_threshold: int = Field(
+        5,
+        ge=2,
+        le=20,
+        description="Exhausted transient requests required to open the provider circuit.",
+    )
+    provider_circuit_cooldown_seconds: float = Field(
+        30.0,
+        gt=0.0,
+        le=3600.0,
+        description="Provider circuit cooldown before a half-open probe.",
     )
     context_compaction_threshold: float = Field(
         0.80,

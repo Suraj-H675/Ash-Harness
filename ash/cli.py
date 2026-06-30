@@ -528,6 +528,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             if command.name == "status":
                 session = loop.current_session
                 capabilities = loop.provider.capabilities
+                provider_circuit = loop.provider_circuit_breaker.snapshot(
+                    loop._provider_circuit_key
+                )
                 session_usage = (
                     loop.session_store.get_session_usage(session.session_id)
                     if session is not None
@@ -555,6 +558,12 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             ),
                             "Fallbacks: "
                             + (", ".join(config.fallback_models) or "(none)"),
+                            "Provider circuit: "
+                            + (
+                                f"open ({provider_circuit['retry_after']:.1f}s cooldown)"
+                                if provider_circuit["open"]
+                                else f"closed ({provider_circuit['failures']} failures)"
+                            ),
                             "Tokens: "
                             + (
                                 f"{session_usage.prompt_tokens} prompt, "

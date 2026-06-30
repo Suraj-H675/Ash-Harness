@@ -56,8 +56,8 @@ Research is clean-room: proprietary or leaked source is not used.
 | Parallel tool calls | Partial | Independent read-only calls run concurrently with deterministic result order |
 | Turn steering | Verified locally | Bounded durable guidance queue applies at safe iteration boundaries through interactive CLI, SDK, and HTTP |
 | Interrupt/cancel | Verified locally | `/cancel` preempts live interactive turns, propagates cancellation, clears pending steering, and finalizes the turn journal |
-| Retry policy | Partial | Retry only classified transient failures; jitter and provider retry headers |
-| Circuit breaker | Partial | Consistent state, actionable recovery, tested public behavior |
+| Retry policy | Verified locally | One harness-owned policy retries only classified pre-output transient failures, honors bounded Retry-After, adds jittered exponential backoff, preserves cancellation, emits redacted events, and disables nested SDK retries |
+| Circuit breaker | Verified locally | Exhausted transient requests open provider-keyed state, fail fast during cooldown, expose `/status` and events, allow a half-open probe, and reset on success |
 | Long-running process control | Verified locally | Managed start/list/poll/stdin/stop with process-tree cleanup |
 | Structured output mode | Verified locally | One-shot JSON Schema injection, parsing, validation, and machine output |
 | Model capability negotiation | Partial | Tools, vision, reasoning, local status, and known context/output limits; dynamic manifests remain |

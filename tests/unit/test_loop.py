@@ -9,6 +9,7 @@ from context.turn import TurnContext
 from core.session import Message, SessionStore
 from providers.base import ProviderABC, StreamChunk
 from providers.capabilities import ProviderCapabilities
+from providers.retry import ProviderCircuitBreaker, ProviderCircuitOpen
 from safety.grants import PermissionRule, RuleEffect
 from safety.guard import SafetyGuard
 from ui.terminal import TerminalUI
@@ -792,3 +793,61 @@ async def test_provider_does_not_retry_permanent_or_partial_failure(tmp_path):
     with pytest.raises(ConnectionError, match="stream disconnected"):
         await partial_loop._stream_one_completion([])
     assert partial.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_circuit_fails_fast_then_allows_probe(tmp_path):
+    now = 10.0
+
+    class RecoveringProvider(ProviderABC):
+        model_name = "recovering"
+
+        def __init__(self):
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.calls <= 2:
+                raise ConnectionError("offline")
+            yield StreamChunk(content="online", is_done=True)
+
+    provider = RecoveringProvider()
+    ui = EventUI()
+    circuit = ProviderCircuitBreaker(
+        failure_threshold=2,
+        cooldown_seconds=5,
+        clock=lambda: now,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "circuit.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        ui,
+        tmp_path,
+        provider_circuit_breaker=circuit,
+        config=AshConfig(
+            model="ollama/test",
+            provider_max_attempts=1,
+            provider_circuit_failure_threshold=2,
+            provider_circuit_cooldown_seconds=5,
+        ),
+    )
+
+    for _ in range(2):
+        with pytest.raises(ConnectionError, match="offline"):
+            await loop._stream_one_completion([])
+    assert provider.calls == 2
+    assert any(event["type"] == "provider.circuit_opened" for event in ui.events)
+
+    with pytest.raises(ProviderCircuitOpen, match="circuit is open"):
+        await loop._stream_one_completion([])
+    assert provider.calls == 2
+
+    now = 16.0
+    response, *_ = await loop._stream_one_completion([])
+    assert response == "online"
+    assert provider.calls == 3
+    assert circuit.snapshot(loop._provider_circuit_key)["failures"] == 0

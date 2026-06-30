@@ -39,7 +39,11 @@ from ash_logging import get_logger
 from mcp.server import load_mcp_servers
 from providers.base import ProviderABC, TokenCounterLike
 from providers.capabilities import ProviderCapabilities
-from providers.retry import classify_provider_failure, retry_delay
+from providers.retry import (
+    ProviderCircuitBreaker,
+    classify_provider_failure,
+    retry_delay,
+)
 from repo.repomap import RepoMap
 from safety.guard import SafetyGuard
 from safety.policy import PermissionPolicy, PolicyAction, READ_ONLY_TOOLS
@@ -113,6 +117,17 @@ def _provider_capabilities(provider: Any) -> ProviderCapabilities:
         if isinstance(capabilities, ProviderCapabilities)
         else ProviderCapabilities()
     )
+
+
+def _provider_circuit_key(provider: ProviderABC) -> str:
+    nested = getattr(provider, "providers", None)
+    if isinstance(nested, list) and nested:
+        identities = [
+            f"{getattr(item, 'provider_family', 'custom')}/{item.model_name}"
+            for item in nested
+        ]
+        return "failover:" + ",".join(identities)
+    return f"{getattr(provider, 'provider_family', 'custom')}/{provider.model_name}"
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are Ash, a terminal-native AI coding harness. You are pairing with a developer to write, edit, test, and debug code in the local workspace.
@@ -248,6 +263,7 @@ class AshLoop:
         *,
         tools: dict[str, BaseTool] | None = None,
         circuit_breaker: CircuitBreaker | None = None,
+        provider_circuit_breaker: ProviderCircuitBreaker | None = None,
         system_prompt: str | None = None,
         additional_instructions: str = "",
         token_counter: TokenCounterLike | None = None,
@@ -323,6 +339,18 @@ class AshLoop:
                 root_provider=lambda: self.project_root,
             )
         self._config = config
+        self.provider_circuit_breaker = (
+            provider_circuit_breaker
+            or ProviderCircuitBreaker(
+                failure_threshold=int(
+                    getattr(config, "provider_circuit_failure_threshold", 5)
+                ),
+                cooldown_seconds=float(
+                    getattr(config, "provider_circuit_cooldown_seconds", 30.0)
+                ),
+            )
+        )
+        self._provider_circuit_key = _provider_circuit_key(provider)
         self._last_context_tokens = 0
         self._last_context_budget: Any | None = None
         self._last_turn_prompt_tokens = 0
@@ -862,6 +890,7 @@ class AshLoop:
         retry_max_delay = float(getattr(self._config, "provider_retry_max_delay", 8.0))
 
         try:
+            self.provider_circuit_breaker.before_request(self._provider_circuit_key)
             with self.ui.begin_turn():
                 attempt = 1
                 while True:
@@ -895,6 +924,27 @@ class AshLoop:
                             or not failure.retriable
                             or attempt >= maximum_attempts
                         ):
+                            if (
+                                failure.retriable
+                                and self.provider_circuit_breaker.record_failure(
+                                    self._provider_circuit_key
+                                )
+                            ):
+                                snapshot = self.provider_circuit_breaker.snapshot(
+                                    self._provider_circuit_key
+                                )
+                                self.ui.emit_event(
+                                    {
+                                        "type": "provider.circuit_opened",
+                                        "provider": self._provider_circuit_key,
+                                        "failures": snapshot["failures"],
+                                        "cooldown_seconds": getattr(
+                                            self._config,
+                                            "provider_circuit_cooldown_seconds",
+                                            30.0,
+                                        ),
+                                    }
+                                )
                             raise
                         delay = retry_delay(
                             failure,
@@ -922,6 +972,7 @@ class AshLoop:
                         )
                         await asyncio.sleep(delay)
                         attempt += 1
+                self.provider_circuit_breaker.record_success(self._provider_circuit_key)
                 # Drain the parser's remaining buffer at end-of-stream.
                 for event in parser.feed(""):
                     self._handle_event(event, text_chunks, tool_calls)
