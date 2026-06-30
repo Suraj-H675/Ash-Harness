@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from io import StringIO
 from typing import Any
 
 from prompt_toolkit.application import Application, get_app_or_none
@@ -11,7 +12,12 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.formatted_text import AnyFormattedText, FormattedText
+from prompt_toolkit.formatted_text import (
+    ANSI,
+    AnyFormattedText,
+    FormattedText,
+    to_formatted_text,
+)
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
@@ -25,6 +31,8 @@ from prompt_toolkit.layout import (
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.output.base import Output
 from prompt_toolkit.styles import Style
+from rich.console import Console
+from rich.markdown import Markdown
 
 from ui.transcript import Transcript, TranscriptEntry, TranscriptEvent
 
@@ -57,6 +65,59 @@ def format_transcript(entries: tuple[TranscriptEntry, ...]) -> AnyFormattedText:
     return FormattedText(fragments)
 
 
+class RichTranscriptFormatter:
+    """Render assistant Markdown once per content/width combination."""
+
+    def __init__(self) -> None:
+        self._cache: dict[tuple[str, str, int], AnyFormattedText] = {}
+
+    def format(
+        self,
+        entries: tuple[TranscriptEntry, ...],
+        *,
+        width: int,
+    ) -> AnyFormattedText:
+        fragments: list[tuple[str, str] | tuple[str, str, Any]] = []
+        live_keys: set[tuple[str, str, int]] = set()
+        for index, entry in enumerate(entries):
+            if index:
+                fragments.append(("", "\n\n"))
+            style, default_title = _ENTRY_STYLE[entry.kind]
+            fragments.append((style, f"{entry.title or default_title} > "))
+            if entry.kind == "assistant" and entry.content:
+                key = (entry.entry_id, entry.content, width)
+                live_keys.add(key)
+                rendered = self._cache.get(key)
+                if rendered is None:
+                    rendered = self._render_markdown(entry.content, width=width)
+                    self._cache[key] = rendered
+                fragments.append(("", "\n"))
+                fragments.extend(to_formatted_text(rendered))
+            else:
+                body_style = "class:reasoning" if entry.kind == "reasoning" else ""
+                fragments.append((body_style, entry.content or " "))
+            if not entry.finalized:
+                fragments.append(("class:streaming", "  ..."))
+        if len(self._cache) > max(32, len(live_keys) * 4):
+            self._cache = {
+                key: value for key, value in self._cache.items() if key in live_keys
+            }
+        return FormattedText(fragments)
+
+    @staticmethod
+    def _render_markdown(content: str, *, width: int) -> AnyFormattedText:
+        stream = StringIO()
+        console = Console(
+            file=stream,
+            force_terminal=True,
+            color_system="truecolor",
+            width=max(20, width - 2),
+            soft_wrap=False,
+        )
+        console.print(Markdown(content, hyperlinks=False))
+        return ANSI(stream.getvalue().rstrip("\n"))
+
+
 class TranscriptViewport:
     """One full-screen transcript/composer application reusable across reads."""
 
@@ -79,6 +140,7 @@ class TranscriptViewport:
         self._running = False
         self._follow_tail = True
         self._vertical_scroll = 10**9
+        self._formatter = RichTranscriptFormatter()
 
         self.input_buffer = Buffer(
             history=FileHistory(str(history_path)),
@@ -167,7 +229,9 @@ class TranscriptViewport:
         self._unsubscribe()
 
     def _transcript_text(self) -> AnyFormattedText:
-        return format_transcript(self.transcript.snapshot())
+        app = get_app_or_none()
+        width = app.output.get_size().columns if app is self.application else 80
+        return self._formatter.format(self.transcript.snapshot(), width=width)
 
     def _status_text(self) -> AnyFormattedText:
         return FormattedText([("", f" {self.status_provider()} ")])

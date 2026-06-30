@@ -7,7 +7,7 @@ from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from ui.transcript import Transcript
-from ui.viewport import TranscriptViewport, format_transcript
+from ui.viewport import RichTranscriptFormatter, TranscriptViewport, format_transcript
 
 
 class SizedDummyOutput(DummyOutput):
@@ -35,6 +35,26 @@ def test_format_transcript_preserves_semantics_and_streaming_state() -> None:
     assert "you > inspect this" in rendered
     assert "ash > working  ..." in rendered
     assert "read_file > read_file [completed]" in rendered
+
+
+def test_rich_transcript_formatter_renders_markdown_and_caches_cells() -> None:
+    transcript = Transcript()
+    transcript.append(
+        "assistant",
+        "**bold**\n\n```python\nprint('ok')\n```",
+        title="ash",
+    )
+    formatter = RichTranscriptFormatter()
+
+    first = _plain(formatter.format(transcript.snapshot(), width=80))
+    cache_size = len(formatter._cache)
+    second = _plain(formatter.format(transcript.snapshot(), width=80))
+
+    assert "**bold**" not in first
+    assert "bold" in first
+    assert "print('ok')" in first
+    assert second == first
+    assert len(formatter._cache) == cache_size == 1
 
 
 @pytest.mark.asyncio
