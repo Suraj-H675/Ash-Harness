@@ -980,12 +980,12 @@ class AshLoop:
             decision = self.permission_policy.evaluate(tool_name, arguments)
             if decision.action == PolicyAction.DENY:
                 approved = False
+            elif decision.action == PolicyAction.ALLOW:
+                approved = True
             elif self.on_tool_approval is not None:
                 approved = await self.on_tool_approval(tool_name, arguments)
             elif self.ui.has_approval_callback:
                 approved = self.ui.request_tool_approval(tool_name, arguments)
-            elif decision.action == PolicyAction.ALLOW:
-                approved = True
             else:
                 approved = self.ui.request_tool_approval(tool_name, arguments)
             record.approved = approved
@@ -999,6 +999,7 @@ class AshLoop:
                         "arguments": record.arguments,
                         "decision": decision.action.value,
                         "reason": decision.reason,
+                        "rule_id": decision.rule_id,
                     },
                     result="APPROVED",
                 )
@@ -1023,6 +1024,7 @@ class AshLoop:
                         "arguments": record.arguments,
                         "decision": decision.action.value,
                         "reason": record.error,
+                        "rule_id": decision.rule_id,
                     },
                     result=(
                         "BLOCKED_BY_GUARD"

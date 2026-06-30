@@ -17,7 +17,7 @@ from core.redaction import redact_text
 from core.secret_middleware import SecretRedactionMiddleware
 from core.session import SessionStore, SessionSummary
 from providers.base import ProviderABC
-from safety.grants import load_tool_grants
+from safety.grants import load_permission_rules
 from safety.guard import SafetyGuard
 from sandbox import SandboxManager
 from ui.headless import HeadlessUI
@@ -125,8 +125,8 @@ class AshClient:
             onnx_model_path=runtime_config.onnx_model_path,
             chroma_persist_dir=runtime_config.chroma_persist_dir,
         )
-        loop.permission_policy.persistent_tool_grants = load_tool_grants(
-            runtime_config.workspace_root
+        loop.permission_policy.set_persistent_rules(
+            load_permission_rules(runtime_config.workspace_root)
         )
 
         def checkpoint_context() -> tuple[str, str] | None:

@@ -843,7 +843,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 parsed_command = None
             if command.name == "permissions":
                 from safety.policy import PermissionMode, PermissionPolicy
-                from safety.grants import load_tool_grants, set_tool_grant
+                from safety.grants import load_permission_rules, set_tool_grant
 
                 if not arguments:
                     grants = sorted(loop.permission_policy.persistent_tool_grants)
@@ -858,8 +858,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     set_tool_grant(
                         loop.project_root, tool_name, arguments[0] == "allow"
                     )
-                    loop.permission_policy.persistent_tool_grants = load_tool_grants(
-                        loop.project_root
+                    loop.permission_policy.set_persistent_rules(
+                        load_permission_rules(loop.project_root)
                     )
                     print(f"Persistent grant {arguments[0]}: {tool_name}")
                     continue
@@ -874,7 +874,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     continue
                 loop.permission_policy = PermissionPolicy(
                     mode,
-                    persistent_tool_grants=loop.permission_policy.persistent_tool_grants,
+                    persistent_rules=loop.permission_policy.persistent_rules,
+                    session_rules=loop.permission_policy.session_rules,
                 )
                 loop.safety_tier = mode.value
                 config.safety_tier = mode.value
@@ -1889,10 +1890,10 @@ def main(argv: list[str] | None = None) -> int:
         onnx_model_path=config.onnx_model_path,
         chroma_persist_dir=config.chroma_persist_dir,
     )
-    from safety.grants import load_tool_grants
+    from safety.grants import load_permission_rules
 
-    loop.permission_policy.persistent_tool_grants = load_tool_grants(
-        config.workspace_root
+    loop.permission_policy.set_persistent_rules(
+        load_permission_rules(config.workspace_root)
     )
     from core.checkpoints import FileCheckpointMiddleware
     from core.secret_middleware import SecretRedactionMiddleware
