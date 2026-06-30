@@ -1829,9 +1829,11 @@ def main(argv: list[str] | None = None) -> int:
         if reply.lower() in ("setup", "y", "yes"):
             from cli.setup import cmd_setup
 
-            cmd_setup(
+            setup_code = cmd_setup(
                 argparse.Namespace(section="model", quick=True, non_interactive=False)
             )
+            if setup_code != 0:
+                return setup_code
             config = AshConfig.load()
 
     if args.db_directory is not None:

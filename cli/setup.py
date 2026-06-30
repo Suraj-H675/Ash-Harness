@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import getpass
 import sys
+from enum import IntEnum
 from typing import Optional
 
 import httpx
@@ -22,6 +23,20 @@ from cli.config import (
     save_config,
     save_env_value,
 )
+
+
+class SetupOutcome(IntEnum):
+    SUCCESS = 0
+    CANCELLED = 1
+    ERROR = 2
+
+
+class SetupBack(Exception):
+    """Return from a provider flow to provider selection."""
+
+
+class SetupCancelled(Exception):
+    """Cancel setup without treating it as an internal error."""
 
 
 # ---------------------------------------------------------------------------
@@ -49,11 +64,14 @@ PROVIDERS = [
 
 def cmd_setup(args) -> int:
     """Entry point for the ``ash setup`` command. Returns exit code."""
-    run_setup_wizard(args)
-    return 0
+    try:
+        return int(run_setup_wizard(args))
+    except (EOFError, KeyboardInterrupt, SetupCancelled):
+        print("\nSetup cancelled.", file=sys.stderr)
+        return int(SetupOutcome.CANCELLED)
 
 
-def run_setup_wizard(args) -> None:
+def run_setup_wizard(args) -> SetupOutcome:
     """Main setup wizard orchestrator."""
     section = getattr(args, "section", None) or "all"
     quick = getattr(args, "quick", False)
@@ -62,8 +80,11 @@ def run_setup_wizard(args) -> None:
     # Non-interactive: fail fast
     if non_interactive or not is_interactive_stdin():
         print("Error: ash setup requires an interactive terminal.", file=sys.stderr)
-        print("Use --non-interactive to suppress this error.", file=sys.stderr)
-        sys.exit(1)
+        print(
+            "Set provider credentials with environment variables or rerun in a TTY.",
+            file=sys.stderr,
+        )
+        return SetupOutcome.ERROR
 
     # ------------------------------------------------------------------
     # Import AshConfig here to avoid circular imports at top level
@@ -79,14 +100,18 @@ def run_setup_wizard(args) -> None:
     _migrate_old_ash_toml()
 
     if section in ("model", "all"):
-        setup_model_provider(config, quick=quick)
+        result = setup_model_provider(config, quick=quick)
+        if result != SetupOutcome.SUCCESS:
+            print("Setup cancelled.", file=sys.stderr)
+            return result
 
     _print_info("Setup complete!")
+    return SetupOutcome.SUCCESS
 
 
-def setup_model_provider(config, *, quick: bool = False) -> None:
+def setup_model_provider(config, *, quick: bool = False) -> SetupOutcome:
     """Provider + model selection — shared entry point from wizard and REPL."""
-    select_provider_and_model(config)
+    return select_provider_and_model(config)
 
 
 # ---------------------------------------------------------------------------
@@ -94,43 +119,38 @@ def setup_model_provider(config, *, quick: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 
-def select_provider_and_model(config) -> None:
+def select_provider_and_model(config) -> SetupOutcome:
     """Show provider list, route to provider flow, verify model."""
-    _print_header("Select your inference provider")
+    while True:
+        _print_header("Select your inference provider")
+        print("Choose a provider:\n")
+        for i, (_provider_id, name, desc) in enumerate(PROVIDERS, 1):
+            print(f"  [{i}] {name}")
+            print(f"      {desc}\n")
 
-    # Show numbered provider list
-    print("Choose a provider:\n")
-    for i, (pid, name, desc) in enumerate(PROVIDERS, 1):
-        print(f"  [{i}] {name}")
-        print(f"      {desc}\n")
-
-    default_idx = 0
-    choice = _prompt_choice(
-        "Enter a number",
-        [str(i) for i in range(1, len(PROVIDERS) + 1)],
-        default=default_idx,
-    )
-
-    if choice is None:
-        print("Cancelled.")
-        return
-
-    provider_id = PROVIDERS[choice][0]
-
-    # Route to provider-specific flow
-    current = _get_current_model(config)
-    if provider_id == "anthropic":
-        _flow_anthropic(current)
-    elif provider_id == "openai":
-        _flow_openai(current)
-    elif provider_id == "deepseek":
-        _flow_deepseek(current)
-    elif provider_id == "groq":
-        _flow_groq(current)
-    elif provider_id == "ollama":
-        _flow_ollama(current)
-    elif provider_id == "openai-compatible":
-        _flow_openai_compatible()
+        try:
+            choice = _prompt_choice(
+                "Enter a number",
+                [str(i) for i in range(1, len(PROVIDERS) + 1)],
+                default=0,
+            )
+            provider_id = PROVIDERS[choice][0]
+            current = _get_current_model(config)
+            if provider_id == "anthropic":
+                return _flow_anthropic(current)
+            if provider_id == "openai":
+                return _flow_openai(current)
+            if provider_id == "deepseek":
+                return _flow_deepseek(current)
+            if provider_id == "groq":
+                return _flow_groq(current)
+            if provider_id == "ollama":
+                return _flow_ollama(current)
+            return _flow_openai_compatible()
+        except SetupBack:
+            print("  Returning to provider selection.")
+        except SetupCancelled:
+            return SetupOutcome.CANCELLED
 
 
 # ---------------------------------------------------------------------------
@@ -138,36 +158,30 @@ def select_provider_and_model(config) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _flow_anthropic(current: str) -> None:
+def _flow_anthropic(current: str) -> SetupOutcome:
     """Anthropic setup: API key, model selection, verification."""
     _print_header("Anthropic Configuration")
 
     api_key = _prompt_api_key("ANTHROPIC_API_KEY", "Anthropic API key")
-    if api_key is None:
-        return
 
     models = _probe_anthropic_models(api_key)
     if not models:
         print("Could not fetch models. Using current documented aliases.")
         models = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"]
     model = _prompt_model_list(models, current)
-    if model is None:
-        print("  Cancelled.")
-        return
 
     # Save ASH_MODEL env var
     save_env_value("ASH_MODEL", f"anthropic/{model}")
     # Verify
     _verify_anthropic(api_key, model)
+    return SetupOutcome.SUCCESS
 
 
-def _flow_openai(current: str) -> None:
+def _flow_openai(current: str) -> SetupOutcome:
     """OpenAI setup: API key, optional base URL override, model selection."""
     _print_header("OpenAI Configuration")
 
     api_key = _prompt_api_key("OPENAI_API_KEY", "OpenAI API key")
-    if api_key is None:
-        return
 
     base_url_override = _prompt_optional_url(
         "OPENAI_API_BASE",
@@ -181,21 +195,17 @@ def _flow_openai(current: str) -> None:
         print("Could not fetch models. Using default list.")
         models = ["gpt-5.2", "gpt-5.2-codex", "gpt-5-mini", "gpt-4.1"]
     model = _prompt_model_list(models, current)
-    if model is None:
-        print("  Cancelled.")
-        return
 
     save_env_value("ASH_MODEL", f"openai/{model}")
     _verify_openai(api_key, base_url_override, model)
+    return SetupOutcome.SUCCESS
 
 
-def _flow_deepseek(current: str) -> None:
+def _flow_deepseek(current: str) -> SetupOutcome:
     """DeepSeek setup: API key, optional base URL override, model selection."""
     _print_header("DeepSeek Configuration")
 
     api_key = _prompt_api_key("DEEPSEEK_API_KEY", "DeepSeek API key")
-    if api_key is None:
-        return
 
     base_url_override = _prompt_optional_url(
         "DEEPSEEK_API_BASE",
@@ -209,21 +219,17 @@ def _flow_deepseek(current: str) -> None:
         print("Could not fetch models. Using default list.")
         models = ["deepseek-chat", "deepseek-reasoner"]
     model = _prompt_model_list(models, current)
-    if model is None:
-        print("  Cancelled.")
-        return
 
     save_env_value("ASH_MODEL", f"deepseek/{model}")
     _verify_openai(api_key, base_url_override, model)
+    return SetupOutcome.SUCCESS
 
 
-def _flow_groq(current: str) -> None:
+def _flow_groq(current: str) -> SetupOutcome:
     """Groq setup: API key, model selection."""
     _print_header("Groq Configuration")
 
     api_key = _prompt_api_key("GROQ_API_KEY", "Groq API key")
-    if api_key is None:
-        return
 
     models = _probe_models("https://api.groq.com/openai/v1", api_key)
     if not models:
@@ -235,19 +241,20 @@ def _flow_groq(current: str) -> None:
             "compound-mini",
         ]
     model = _prompt_model_list(models, current)
-    if model is None:
-        print("  Cancelled.")
-        return
 
     save_env_value("ASH_MODEL", f"groq/{model}")
     _verify_openai(api_key, "https://api.groq.com/openai/v1", model)
+    return SetupOutcome.SUCCESS
 
 
-def _flow_ollama(current: str) -> None:
+def _flow_ollama(current: str) -> SetupOutcome:
     """Ollama setup: base URL, local model selection via /api/tags."""
     _print_header("Ollama Configuration")
 
-    base_url = input(f"  Ollama base URL [{'http://localhost:11434'}]: ").strip()
+    base_url = _prompt_setup_text(
+        f"  Ollama base URL [{'http://localhost:11434'}]: ",
+        allow_empty=True,
+    )
     if not base_url:
         base_url = "http://localhost:11434"
     save_env_value("OLLAMA_API_BASE", base_url)
@@ -258,30 +265,22 @@ def _flow_ollama(current: str) -> None:
         models = ["llama3", "qwen2.5-coder:7b"]
 
     model = _prompt_model_list(models, current)
-    if model is None:
-        print("  Cancelled.")
-        return
 
     save_env_value("ASH_MODEL", f"ollama/{model}")
     print(f"  Configured Ollama with model: {model}")
+    return SetupOutcome.SUCCESS
 
 
-def _flow_openai_compatible() -> None:
+def _flow_openai_compatible() -> SetupOutcome:
     """OpenAI-compatible custom endpoint: base URL, optional API key, model selection.
 
     Saves to ~/.ash/ash.toml under [custom_providers.<name>].
     """
     _print_header("OpenAI-Compatible Endpoint")
 
-    name = input("  Provider name (e.g. my-minimax): ").strip()
-    if not name:
-        print("Cancelled.")
-        return
+    name = _prompt_setup_text("  Provider name (e.g. my-minimax): ")
 
-    base_url = input("  Base URL (e.g. https://api.minimax.io/v1): ").strip()
-    if not base_url:
-        print("Cancelled.")
-        return
+    base_url = _prompt_setup_text("  Base URL (e.g. https://api.minimax.io/v1): ")
 
     api_key = input("  API key (optional, press Enter to skip): ").strip()
     key_env = (
@@ -304,10 +303,7 @@ def _flow_openai_compatible() -> None:
     for i, m in enumerate(models, 1):
         print(f"    [{i}] {m}")
 
-    model = input("\n  Select or type a model name: ").strip()
-    if not model:
-        print("Cancelled.")
-        return
+    model = _prompt_setup_text("\n  Select or type a model name: ")
 
     # If user picked a number, resolve to model name
     if model.isdigit():
@@ -316,7 +312,7 @@ def _flow_openai_compatible() -> None:
             model = models[idx]
         else:
             print("Invalid selection.")
-            return
+            raise SetupBack
 
     # Save to ash.toml as custom_providers
     custom = load_config().get("custom_providers", {})
@@ -331,6 +327,7 @@ def _flow_openai_compatible() -> None:
     save_env_value("ASH_MODEL", f"{name}/{model}")
     print(f"\n  Saved custom provider '{name}' to {get_config_path()}")
     print(f"  Model: {model}")
+    return SetupOutcome.SUCCESS
 
 
 # ---------------------------------------------------------------------------
@@ -553,8 +550,8 @@ def _prompt_api_key(
     env_var: str,
     desc: str,
     env_var_legacy: str | None = None,
-) -> Optional[str]:
-    """Prompt for an API key if not already set. Returns key or None."""
+) -> str:
+    """Prompt for an API key, with blank input returning to provider selection."""
     # Check existing env
     existing = get_env_value(env_var)
     if env_var_legacy:
@@ -567,8 +564,11 @@ def _prompt_api_key(
 
     key = getpass.getpass(f"  Enter {desc}: ").strip()
     if not key:
-        print("  No key entered.")
-        return None
+        raise SetupBack
+    if key.casefold() in {"c", "cancel", "q", "quit"}:
+        raise SetupCancelled
+    if key.casefold() in {"b", "back"}:
+        raise SetupBack
 
     save_env_value(env_var, key)
     return key
@@ -582,25 +582,29 @@ def _prompt_optional_url(env_var: str, default: str) -> Optional[str]:
         prompt += f" [{existing}]"
     else:
         prompt += f" [{default}]"
-    val = input(prompt + ": ").strip()
+    val = _prompt_setup_text(prompt + ": ", allow_empty=True)
     if val:
         return val
     return existing or None
 
 
-def _prompt_model_list(models: list[str], current: str) -> Optional[str]:
-    """Show a numbered list of models, let user pick or type. Returns model name or None to cancel."""
+def _prompt_model_list(models: list[str], current: str) -> str:
+    """Show models and return a selection, or raise a navigation signal."""
     print("\n  Available models:")
     for i, m in enumerate(models, 1):
         marker = " (current)" if m == current else ""
         print(f"    [{i}] {m}{marker}")
 
     while True:
-        val = input("\n  Select a model (number or name, 'c' to cancel): ").strip()
+        val = input(
+            "\n  Select a model (number or name, 'b' back, 'c' cancel): "
+        ).strip()
         if not val:
             continue
-        if val.lower() in ("c", "q", "cancel"):
-            return None
+        if val.casefold() in ("c", "q", "cancel", "quit"):
+            raise SetupCancelled
+        if val.casefold() in ("b", "back"):
+            raise SetupBack
         if val.isdigit():
             idx = int(val) - 1
             if 0 <= idx < len(models):
@@ -610,8 +614,8 @@ def _prompt_model_list(models: list[str], current: str) -> Optional[str]:
             return val
 
 
-def _prompt_choice(prompt: str, options: list[str], default: int) -> Optional[int]:
-    """Ask user to pick from numbered options. Returns 0-based index or None to cancel."""
+def _prompt_choice(prompt: str, options: list[str], default: int) -> int:
+    """Ask for a numbered option, raising when the user cancels."""
     options_str = "/".join(f"'{o}'" for o in options)
     while True:
         val = input(
@@ -619,13 +623,27 @@ def _prompt_choice(prompt: str, options: list[str], default: int) -> Optional[in
         ).strip()
         if not val:
             return default
-        if val.lower() in ("c", "q", "cancel"):
-            return None
+        if val.casefold() in ("c", "q", "cancel", "quit"):
+            raise SetupCancelled
         if val.isdigit():
             idx = int(val) - 1
             if 0 <= idx < len(options):
                 return idx
         print("  Invalid choice.")
+
+
+def _prompt_setup_text(prompt: str, *, allow_empty: bool = False) -> str:
+    """Read wizard text with consistent back/cancel controls."""
+
+    while True:
+        value = input(prompt).strip()
+        if value.casefold() in {"c", "cancel", "q", "quit"}:
+            raise SetupCancelled
+        if value.casefold() in {"b", "back"}:
+            raise SetupBack
+        if value or allow_empty:
+            return value
+        print("  A value is required. Enter 'b' to go back or 'c' to cancel.")
 
 
 def _print_header(title: str) -> None:

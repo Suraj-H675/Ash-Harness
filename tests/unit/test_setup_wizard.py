@@ -290,8 +290,44 @@ class TestCmdSetup:
         )
 
         with patch("cli.setup.is_interactive_stdin", return_value=True):
-            with patch("cli.setup.run_setup_wizard"):
-                from cli.setup import cmd_setup
+            from cli.setup import SetupOutcome, cmd_setup
 
+            with patch(
+                "cli.setup.run_setup_wizard",
+                return_value=SetupOutcome.SUCCESS,
+            ):
                 result = cmd_setup(mock_args)
                 assert result == 0
+
+    def test_cmd_setup_non_interactive_returns_usage_error(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from cli.setup import cmd_setup
+
+        args = MagicMock(section="model", quick=False, non_interactive=True)
+        monkeypatch.setattr("cli.setup.is_interactive_stdin", lambda: False)
+
+        assert cmd_setup(args) == 2
+        assert "requires an interactive terminal" in capsys.readouterr().err
+
+
+class TestSetupNavigation:
+    def test_provider_selection_can_cancel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli.setup import SetupOutcome, select_provider_and_model
+
+        monkeypatch.setattr("builtins.input", _fake_input(["c"]))
+
+        assert select_provider_and_model(MagicMock(model="")) == SetupOutcome.CANCELLED
+
+    def test_blank_api_key_returns_to_provider_selection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli.setup import SetupOutcome, select_provider_and_model
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setattr("builtins.input", _fake_input(["1", "c"]))
+        monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass(""))
+
+        assert select_provider_and_model(MagicMock(model="")) == SetupOutcome.CANCELLED
