@@ -114,7 +114,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | External editor | Verified locally | Prompt-toolkit external-editor integration |
 | Image/file attachments | Partial | Safe bounded text/directory `@path` expansion and completion; image/provider blocks remain |
 | Prompt history search | Verified locally | Persistent prompt-toolkit file history and reverse search |
-| Desktop notifications | Missing | Optional completion/approval notifications |
+| Desktop notifications | Verified locally | Opt-in completion/approval events, conservative OSC 9/BEL auto detection, tmux passthrough, TTY gating, control-character stripping, bounded optional previews, and failure isolation ([Claude Code behavior](https://code.claude.com/docs/en/terminal-config), [Codex backend](https://github.com/openai/codex/tree/main/codex-rs/tui/src/notifications)) |
 | Accessibility | Partial | Reduced-redraw and no-color controls are wired; dedicated screen-reader output remains |
 
 ## 6. Commands And Modes

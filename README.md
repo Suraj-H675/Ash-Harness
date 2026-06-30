@@ -89,6 +89,22 @@ Interactive sessions use the responsive transcript viewport by default. Use
 output. Set `ASH_TUI_MODE=inline` when native terminal scrollback is preferred
 or a terminal does not support full-screen applications reliably.
 
+Desktop notifications are disabled by default. Enable terminal-aware desktop
+notifications with `ASH_NOTIFICATION_METHOD=auto`, or choose `osc9` or `bel`
+explicitly. The equivalent TOML configuration is:
+
+```toml
+notification_method = "auto" # off, auto, osc9, or bel
+notification_events = ["turn_complete", "approval_required"]
+notification_include_preview = false
+```
+
+`auto` uses OSC 9 for detected Ghostty, iTerm2, Kitty, Warp, and WezTerm
+sessions and falls back to the terminal bell elsewhere. Output is TTY-only,
+control characters are removed, and optional response previews are bounded.
+Inside tmux, enable `allow-passthrough` in tmux for OSC notifications to reach
+the host terminal.
+
 First-party Anthropic and OpenAI prompt caching is enabled by default. It can
 be configured in `~/.ash/ash.toml`:
 
