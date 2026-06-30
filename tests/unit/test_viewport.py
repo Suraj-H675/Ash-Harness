@@ -2,11 +2,21 @@ from pathlib import Path
 
 import pytest
 from prompt_toolkit.formatted_text import to_formatted_text
+from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from ui.transcript import Transcript
 from ui.viewport import TranscriptViewport, format_transcript
+
+
+class SizedDummyOutput(DummyOutput):
+    def __init__(self, columns: int, rows: int) -> None:
+        self.columns = columns
+        self.rows = rows
+
+    def get_size(self) -> Size:
+        return Size(rows=self.rows, columns=self.columns)
 
 
 def _plain(value) -> str:
@@ -86,3 +96,42 @@ def test_viewport_rejects_concurrent_read(tmp_path: Path) -> None:
 
         asyncio.run(read_again())
     viewport.close()
+
+
+@pytest.mark.asyncio
+async def test_viewport_survives_narrow_wide_resize_and_live_updates(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    transcript = Transcript()
+    transcript.append(
+        "assistant",
+        "A long response with Unicode: 你好世界. " * 20,
+        title="ash",
+    )
+    output = SizedDummyOutput(columns=32, rows=8)
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            transcript,
+            history_path=tmp_path / "history",
+            status_provider=lambda: "model | mode | context | session | workspace",
+            input=pipe,
+            output=output,
+        )
+        pending = asyncio.create_task(viewport.read())
+        await asyncio.sleep(0.05)
+        assert pending.done() is False
+
+        transcript.append("tool", "read_file [completed]", title="read_file")
+        output.columns = 200
+        output.rows = 60
+        viewport.application.invalidate()
+        await asyncio.sleep(0.05)
+        assert pending.done() is False
+
+        pipe.send_bytes(b"\x1b[5~")  # PageUp
+        pipe.send_bytes(b"\x1b[F")  # End / follow tail
+        pipe.send_text("resize intact\r")
+        assert await pending == "resize intact"
+        viewport.close()
