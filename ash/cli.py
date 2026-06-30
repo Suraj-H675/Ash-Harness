@@ -93,6 +93,17 @@ def _load_config_or_report(**overrides: Any) -> tuple[AshConfig | None, int]:
         return None, error.exit_code
 
 
+def _config_overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    if getattr(args, "mode", None) is not None:
+        overrides["safety_tier"] = args.mode
+    if getattr(args, "ci", False):
+        overrides.update({"no_color": True, "reduced_motion": True})
+    if getattr(args, "db_directory", None) is not None:
+        overrides["db_directory"] = args.db_directory
+    return overrides
+
+
 def _parse_model_string(model: str) -> tuple[str, str]:
     """Parse 'provider/model' string into (provider, model_name)."""
     if "/" not in model:
@@ -1388,7 +1399,11 @@ def main(argv: list[str] | None = None) -> int:
         from cli.config import explain_config, render_config_explain
 
         try:
-            config = AshConfig.load()
+            config = AshConfig.load(
+                _override_source="cli",
+                _override_detail="command-line option",
+                **_config_overrides_from_args(args),
+            )
         except Exception as exc:  # noqa: BLE001
             error = classify_exception(exc)
             if args.json:
@@ -1825,13 +1840,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Added MCP server {args.server_name}.")
         return 0
 
-    runtime_overrides: dict[str, Any] = {}
-    if args.mode is not None:
-        runtime_overrides["safety_tier"] = args.mode
-    if args.ci:
-        runtime_overrides.update({"no_color": True, "reduced_motion": True})
-    if args.db_directory is not None:
-        runtime_overrides["db_directory"] = args.db_directory
+    runtime_overrides = _config_overrides_from_args(args)
 
     loaded_config, config_exit_code = _load_config_or_report(**runtime_overrides)
     if loaded_config is None:

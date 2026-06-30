@@ -605,3 +605,34 @@ def test_config_explain_cli_json_smoke(
     assert main(["config", "explain", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert any(entry["field"] == "model" for entry in payload["config"])
+
+
+def test_config_explain_reports_global_cli_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.cli import main
+
+    monkeypatch.setenv("ASH_MODEL", "ollama/test")
+    assert (
+        main(
+            [
+                "--mode",
+                "plan",
+                "--db-directory",
+                str(tmp_path / "db"),
+                "config",
+                "explain",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    entries = {
+        item["field"]: item for item in json.loads(capsys.readouterr().out)["config"]
+    }
+    assert entries["safety_tier"]["source"] == "cli"
+    assert entries["safety_tier"]["value"] == "plan"
+    assert entries["db_directory"]["source"] == "cli"
+    assert entries["db_directory"]["value"] == str(tmp_path / "db")
