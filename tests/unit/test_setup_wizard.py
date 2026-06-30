@@ -133,6 +133,13 @@ class TestGetCurrentModel:
         mock_config = MagicMock(model="")
         assert _get_current_model(mock_config) == ""
 
+    def test_provider_specific_current_model_does_not_cross_providers(self) -> None:
+        from cli.setup import _get_current_model_for_provider
+
+        config = MagicMock(model="anthropic/claude-example")
+        assert _get_current_model_for_provider(config, "anthropic") == "claude-example"
+        assert _get_current_model_for_provider(config, "openai") == ""
+
 
 class TestAnthropicFlow:
     """Tests for _flow_anthropic — verifies correct env values are saved."""
@@ -146,30 +153,40 @@ class TestAnthropicFlow:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         # _prompt_api_key calls getpass once, _prompt_model_list calls input once
         monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass("sk-ant-test123"))
-        monkeypatch.setattr("builtins.input", _fake_input(["1"]))  # model selection
+        monkeypatch.setattr(
+            "builtins.input", _fake_input(["", "1"])
+        )  # default base URL, model selection
 
-        with patch("cli.setup._verify_anthropic"):
-            with patch("cli.setup.save_env_values") as mock_save:
-                from cli.setup import _flow_anthropic
+        from cli.setup import ModelProbe, _flow_anthropic
 
-                _flow_anthropic("")
-                calls = mock_save.call_args.args[0]
-                assert "ANTHROPIC_API_KEY" in calls
-                assert calls["ANTHROPIC_API_KEY"] == "sk-ant-test123"
-                assert "ASH_MODEL" in calls
-                assert calls["ASH_MODEL"].startswith("anthropic/")
+        with (
+            patch(
+                "cli.setup._probe_anthropic_models_detailed",
+                return_value=ModelProbe(models=("claude-test",)),
+            ),
+            patch("cli.setup.save_env_values") as mock_save,
+        ):
+            _flow_anthropic("")
+            calls = mock_save.call_args.args[0]
+            assert "ANTHROPIC_API_KEY" in calls
+            assert calls["ANTHROPIC_API_KEY"] == "sk-ant-test123"
+            assert "ASH_MODEL" in calls
+            assert calls["ASH_MODEL"].startswith("anthropic/")
 
     def test_cancelled_model_selection_does_not_save_partial_credentials(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from cli.setup import SetupCancelled, _flow_anthropic
+        from cli.setup import ModelProbe, SetupCancelled, _flow_anthropic
 
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass("sk-new"))
-        monkeypatch.setattr("builtins.input", _fake_input(["c"]))
+        monkeypatch.setattr("builtins.input", _fake_input(["", "c"]))
 
         with (
-            patch("cli.setup._probe_anthropic_models", return_value=["model"]),
+            patch(
+                "cli.setup._probe_anthropic_models_detailed",
+                return_value=ModelProbe(models=("model",)),
+            ),
             patch("cli.setup.save_env_values") as save,
             pytest.raises(SetupCancelled),
         ):
@@ -191,16 +208,81 @@ class TestGroqFlow:
             "builtins.input", _fake_input(["1"])
         )  # select model index 1
 
-        with patch("cli.setup._verify_openai"):
-            with patch("cli.setup.save_env_values") as mock_save:
-                from cli.setup import _flow_groq
+        from cli.setup import ModelProbe, _flow_groq
 
-                _flow_groq("")
-                calls = mock_save.call_args.args[0]
-                assert "GROQ_API_KEY" in calls
-                assert calls["GROQ_API_KEY"] == "gsk_groq_test"
-                assert "ASH_MODEL" in calls
-                assert calls["ASH_MODEL"].startswith("groq/")
+        with (
+            patch(
+                "cli.setup._probe_models_detailed",
+                return_value=ModelProbe(models=("groq-test",)),
+            ),
+            patch("cli.setup.save_env_values") as mock_save,
+        ):
+            _flow_groq("")
+            calls = mock_save.call_args.args[0]
+            assert "GROQ_API_KEY" in calls
+            assert calls["GROQ_API_KEY"] == "gsk_groq_test"
+            assert "ASH_MODEL" in calls
+            assert calls["ASH_MODEL"].startswith("groq/")
+
+
+class TestOpenAIFlow:
+    def test_custom_base_url_is_used_for_discovery_and_saved_atomically(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli.setup import ModelProbe, _flow_openai
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+        monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass("sk-openai"))
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(["https://gateway.example/v1/", "1"]),
+        )
+
+        with (
+            patch(
+                "cli.setup._probe_models_detailed",
+                return_value=ModelProbe(models=("gateway-model",)),
+            ) as probe,
+            patch("cli.setup.save_env_values") as save,
+        ):
+            _flow_openai("")
+
+        probe.assert_called_once_with("https://gateway.example/v1", "sk-openai")
+        assert save.call_args.args[0] == {
+            "OPENAI_API_KEY": "sk-openai",
+            "OPENAI_API_BASE": "https://gateway.example/v1",
+            "ASH_MODEL": "openai/gateway-model",
+        }
+
+
+class TestDiscoveryRecovery:
+    def test_probe_can_retry_then_verify(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cli.setup import ModelProbe, _discover_models
+
+        monkeypatch.setattr("builtins.input", _fake_input(["r"]))
+        probe = MagicMock(
+            side_effect=[
+                ModelProbe(error="HTTP 503"),
+                ModelProbe(models=("model-a",)),
+            ]
+        )
+
+        assert _discover_models("Provider", probe) == (["model-a"], True)
+        assert probe.call_count == 2
+
+    def test_probe_can_continue_explicitly_without_verification(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli.setup import ModelProbe, _discover_models
+
+        monkeypatch.setattr("builtins.input", _fake_input(["s"]))
+
+        assert _discover_models(
+            "Provider",
+            lambda: ModelProbe(error="offline"),
+            fallback=["manual-model"],
+        ) == (["manual-model"], False)
 
 
 class TestOpenaiCompatibleFlow:
@@ -224,7 +306,12 @@ class TestOpenaiCompatibleFlow:
         )
         monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass("sk-cp-test"))
 
-        with patch("cli.setup._probe_models", return_value=[]):
+        from cli.setup import ModelProbe
+
+        with patch(
+            "cli.setup._probe_models_detailed",
+            return_value=ModelProbe(models=("MiniMax-M2.7",)),
+        ):
             with patch("cli.setup.save_config") as mock_save_config:
                 from cli.setup import _flow_openai_compatible
 
@@ -272,6 +359,23 @@ class TestProbeModels:
 
             result = _probe_models("https://api.openai.com/v1", "sk-test")
             assert result == []
+
+    def test_probe_error_redacts_echoed_api_key(self) -> None:
+        from cli.setup import _probe_models_detailed
+
+        response = MagicMock(
+            status_code=401,
+            text="invalid key sk-secret-value",
+        )
+        with patch("cli.setup.httpx.get", return_value=response):
+            result = _probe_models_detailed(
+                "https://api.example.test/v1",
+                "sk-secret-value",
+            )
+
+        assert result.models == ()
+        assert "sk-secret-value" not in (result.error or "")
+        assert "[REDACTED]" in (result.error or "")
 
     def test_probe_ollama_models_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_probe_ollama_models returns model names on 200 response."""

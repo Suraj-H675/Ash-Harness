@@ -6,10 +6,11 @@ storage to ~/.ash/.env and ~/.ash/ash.toml.
 
 from __future__ import annotations
 
-import asyncio
 import getpass
 import re
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional
 from urllib.parse import urlsplit
@@ -23,7 +24,6 @@ from cli.config import (
     load_config,
     mask_key,
     save_config,
-    save_env_value,
     save_env_values,
 )
 
@@ -47,10 +47,10 @@ class SetupCancelled(Exception):
 # ---------------------------------------------------------------------------
 
 PROVIDERS = [
-    ("anthropic", "Anthropic", "Claude models — ANTHROPIC_API_KEY"),
-    ("openai", "OpenAI", "GPT-4o, GPT-4o-mini, o3 — OPENAI_API_KEY"),
-    ("deepseek", "DeepSeek", "DeepSeek-V3, DeepSeek-Coder — DEEPSEEK_API_KEY"),
-    ("groq", "Groq", "Llama, Qwen — GROQ_API_KEY"),
+    ("anthropic", "Anthropic", "Anthropic API models - ANTHROPIC_API_KEY"),
+    ("openai", "OpenAI", "OpenAI API models - OPENAI_API_KEY"),
+    ("deepseek", "DeepSeek", "DeepSeek API models - DEEPSEEK_API_KEY"),
+    ("groq", "Groq", "Groq-hosted models - GROQ_API_KEY"),
     ("ollama", "Ollama", "Local models (no API key needed)"),
     (
         "openai-compatible",
@@ -59,6 +59,16 @@ PROVIDERS = [
     ),
 ]
 _PROVIDER_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
+
+
+@dataclass(frozen=True)
+class ModelProbe:
+    models: tuple[str, ...] = ()
+    error: str | None = None
+
+    @property
+    def verified(self) -> bool:
+        return self.error is None
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +149,7 @@ def select_provider_and_model(config) -> SetupOutcome:
                 default=0,
             )
             provider_id = PROVIDERS[choice][0]
-            current = _get_current_model(config)
+            current = _get_current_model_for_provider(config, provider_id)
             if provider_id == "anthropic":
                 return _flow_anthropic(current)
             if provider_id == "openai":
@@ -167,20 +177,28 @@ def _flow_anthropic(current: str) -> SetupOutcome:
     _print_header("Anthropic Configuration")
 
     api_key = _prompt_api_key("ANTHROPIC_API_KEY", "Anthropic API key")
-
-    models = _probe_anthropic_models(api_key)
-    if not models:
-        print("Could not fetch models. Using current documented aliases.")
-        models = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"]
-    model = _prompt_model_list(models, current)
-
-    save_env_values(
-        {
-            "ANTHROPIC_API_KEY": api_key,
-            "ASH_MODEL": f"anthropic/{model}",
-        }
+    base_url_override = _prompt_optional_url(
+        "ANTHROPIC_API_BASE",
+        "https://api.anthropic.com",
     )
-    _verify_anthropic(api_key, model)
+    base_url = base_url_override or "https://api.anthropic.com"
+
+    models, verified = _discover_models(
+        "Anthropic",
+        lambda: _probe_anthropic_models_detailed(api_key, base_url),
+        fallback=[current] if current else [],
+    )
+    model = _prompt_model_list(models, current)
+    _confirm_undiscovered_model(model, models, verified)
+
+    settings = {
+        "ANTHROPIC_API_KEY": api_key,
+        "ASH_MODEL": f"anthropic/{model}",
+    }
+    if base_url_override:
+        settings["ANTHROPIC_API_BASE"] = base_url_override
+    save_env_values(settings)
+    _print_verification_status(verified)
     return SetupOutcome.SUCCESS
 
 
@@ -195,11 +213,13 @@ def _flow_openai(current: str) -> SetupOutcome:
         "https://api.openai.com/v1",
     )
     base_url = base_url_override or "https://api.openai.com/v1"
-    models = _probe_models(base_url, api_key)
-    if not models:
-        print("Could not fetch models. Using default list.")
-        models = ["gpt-5.2", "gpt-5.2-codex", "gpt-5-mini", "gpt-4.1"]
+    models, verified = _discover_models(
+        "OpenAI",
+        lambda: _probe_models_detailed(base_url, api_key),
+        fallback=[current] if current else [],
+    )
     model = _prompt_model_list(models, current)
+    _confirm_undiscovered_model(model, models, verified)
 
     settings = {
         "OPENAI_API_KEY": api_key,
@@ -208,7 +228,7 @@ def _flow_openai(current: str) -> SetupOutcome:
     if base_url_override:
         settings["OPENAI_API_BASE"] = base_url_override
     save_env_values(settings)
-    _verify_openai(api_key, base_url_override, model)
+    _print_verification_status(verified)
     return SetupOutcome.SUCCESS
 
 
@@ -223,11 +243,13 @@ def _flow_deepseek(current: str) -> SetupOutcome:
         "https://api.deepseek.com/v1",
     )
     base_url = base_url_override or "https://api.deepseek.com/v1"
-    models = _probe_models(base_url, api_key)
-    if not models:
-        print("Could not fetch models. Using default list.")
-        models = ["deepseek-chat", "deepseek-reasoner"]
+    models, verified = _discover_models(
+        "DeepSeek",
+        lambda: _probe_models_detailed(base_url, api_key),
+        fallback=[current] if current else [],
+    )
     model = _prompt_model_list(models, current)
+    _confirm_undiscovered_model(model, models, verified)
 
     settings = {
         "DEEPSEEK_API_KEY": api_key,
@@ -236,7 +258,7 @@ def _flow_deepseek(current: str) -> SetupOutcome:
     if base_url_override:
         settings["DEEPSEEK_API_BASE"] = base_url_override
     save_env_values(settings)
-    _verify_openai(api_key, base_url, model)
+    _print_verification_status(verified)
     return SetupOutcome.SUCCESS
 
 
@@ -246,16 +268,16 @@ def _flow_groq(current: str) -> SetupOutcome:
 
     api_key = _prompt_api_key("GROQ_API_KEY", "Groq API key")
 
-    models = _probe_models("https://api.groq.com/openai/v1", api_key)
-    if not models:
-        print("Could not fetch models. Using default list.")
-        models = [
-            "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant",
-            "qwen3.3-32b",
-            "compound-mini",
-        ]
+    models, verified = _discover_models(
+        "Groq",
+        lambda: _probe_models_detailed(
+            "https://api.groq.com/openai/v1",
+            api_key,
+        ),
+        fallback=[current] if current else [],
+    )
     model = _prompt_model_list(models, current)
+    _confirm_undiscovered_model(model, models, verified)
 
     save_env_values(
         {
@@ -263,7 +285,7 @@ def _flow_groq(current: str) -> SetupOutcome:
             "ASH_MODEL": f"groq/{model}",
         }
     )
-    _verify_openai(api_key, "https://api.groq.com/openai/v1", model)
+    _print_verification_status(verified)
     return SetupOutcome.SUCCESS
 
 
@@ -279,12 +301,18 @@ def _flow_ollama(current: str) -> SetupOutcome:
         base_url = "http://localhost:11434"
     base_url = _validate_base_url(base_url)
 
-    models = _probe_ollama_models(base_url)
-    if not models:
-        print("Warning: could not reach Ollama. Using default list.")
-        models = ["llama3", "qwen2.5-coder:7b"]
+    models, verified = _discover_models(
+        "Ollama",
+        lambda: _probe_ollama_models_detailed(base_url),
+        fallback=[current] if current else [],
+        guidance=(
+            "Start Ollama with 'ollama serve'. If it has no models, run "
+            "'ollama pull <model>', then retry."
+        ),
+    )
 
     model = _prompt_model_list(models, current)
+    _confirm_undiscovered_model(model, models, verified)
 
     save_env_values(
         {
@@ -293,6 +321,7 @@ def _flow_ollama(current: str) -> SetupOutcome:
         }
     )
     print(f"  Configured Ollama with model: {model}")
+    _print_verification_status(verified)
     return SetupOutcome.SUCCESS
 
 
@@ -312,6 +341,10 @@ def _flow_openai_compatible() -> SetupOutcome:
     base_url = _validate_base_url(base_url)
 
     api_key = getpass.getpass("  API key (optional, press Enter to skip): ").strip()
+    if api_key.casefold() in {"c", "cancel", "q", "quit"}:
+        raise SetupCancelled
+    if api_key.casefold() in {"b", "back"}:
+        raise SetupBack
     key_env = (
         "ASH_PROVIDER_"
         + "".join(
@@ -319,11 +352,10 @@ def _flow_openai_compatible() -> SetupOutcome:
         )
         + "_API_KEY"
     )
-    # Probe models
-    models = _probe_models(base_url, api_key or None)
-    if not models:
-        print("  Warning: could not probe /models endpoint. Enter model name manually.")
-        models = []
+    models, verified = _discover_models(
+        name,
+        lambda: _probe_models_detailed(base_url, api_key or None),
+    )
 
     print("\n  Available models from endpoint:")
     for i, m in enumerate(models, 1):
@@ -339,6 +371,7 @@ def _flow_openai_compatible() -> SetupOutcome:
         else:
             print("Invalid selection.")
             raise SetupBack
+    _confirm_undiscovered_model(model, models, verified)
 
     # Save to ash.toml as custom_providers
     custom = load_config().get("custom_providers", {})
@@ -355,6 +388,7 @@ def _flow_openai_compatible() -> SetupOutcome:
     save_env_values(settings)
     print(f"\n  Saved custom provider '{name}' to {get_config_path()}")
     print(f"  Model: {model}")
+    _print_verification_status(verified)
     return SetupOutcome.SUCCESS
 
 
@@ -363,124 +397,166 @@ def _flow_openai_compatible() -> SetupOutcome:
 # ---------------------------------------------------------------------------
 
 
-def _probe_anthropic_models(api_key: str) -> list[str]:
-    """Call Anthropic's model-list endpoint and return newest-first IDs."""
+def _response_error(response: httpx.Response, *, secret: str | None = None) -> str:
+    detail = " ".join(response.text.split())[:200]
+    if secret:
+        detail = detail.replace(secret, "[REDACTED]")
+    return f"HTTP {response.status_code}" + (f": {detail}" if detail else "")
+
+
+def _models_from_payload(payload: object, *, collection: str) -> tuple[str, ...]:
+    if not isinstance(payload, dict):
+        return ()
+    values = payload.get(collection, [])
+    if not isinstance(values, list):
+        return ()
+    models: list[str] = []
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id" if collection == "data" else "name")
+        if isinstance(model_id, str) and model_id:
+            models.append(model_id)
+    return tuple(dict.fromkeys(models))
+
+
+def _probe_anthropic_models_detailed(
+    api_key: str,
+    base_url: str = "https://api.anthropic.com",
+) -> ModelProbe:
+    normalized_base = base_url.rstrip("/")
+    endpoint = (
+        f"{normalized_base}/models"
+        if normalized_base.endswith("/v1")
+        else f"{normalized_base}/v1/models"
+    )
     try:
         response = httpx.get(
-            "https://api.anthropic.com/v1/models",
+            endpoint,
             headers={
                 "x-api-key": api_key,
                 "anthropic-version": "2023-06-01",
             },
             timeout=10,
         )
-        if response.status_code == 200:
-            return [
-                str(item["id"])
-                for item in response.json().get("data", [])
-                if isinstance(item, dict) and item.get("id")
-            ]
-    except Exception:
-        pass
-    return []
+        if response.status_code != 200:
+            return ModelProbe(error=_response_error(response, secret=api_key))
+        models = _models_from_payload(response.json(), collection="data")
+        return ModelProbe(
+            models=models,
+            error=None if models else "the endpoint returned no model IDs",
+        )
+    except Exception as exc:  # noqa: BLE001 - setup must surface probe failures
+        return ModelProbe(error=f"{type(exc).__name__}: {exc}")
 
 
-def _probe_models(base_url: str, api_key: Optional[str]) -> list[str]:
-    """Call the /models endpoint of an OpenAI-compatible API. Returns model IDs."""
-    headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+def _probe_anthropic_models(api_key: str) -> list[str]:
+    """Call Anthropic's model-list endpoint and return newest-first IDs."""
+    return list(_probe_anthropic_models_detailed(api_key).models)
 
+
+def _probe_models_detailed(base_url: str, api_key: Optional[str]) -> ModelProbe:
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
-        resp = httpx.get(
+        response = httpx.get(
             f"{base_url.rstrip('/')}/models",
             headers=headers,
             timeout=10,
         )
-        if resp.status_code == 200:
-            data = resp.json()
-            # OpenAI-compatible response shape: {"object": "list", "data": [...]}
-            models = []
-            for item in data.get("data", []):
-                mid = item.get("id", "")
-                if mid:
-                    models.append(mid)
-            return models
-    except Exception:
-        pass
-    return []
+        if response.status_code != 200:
+            return ModelProbe(error=_response_error(response, secret=api_key))
+        models = _models_from_payload(response.json(), collection="data")
+        return ModelProbe(
+            models=models,
+            error=None if models else "the endpoint returned no model IDs",
+        )
+    except Exception as exc:  # noqa: BLE001 - setup must surface probe failures
+        return ModelProbe(error=f"{type(exc).__name__}: {exc}")
+
+
+def _probe_models(base_url: str, api_key: Optional[str]) -> list[str]:
+    """Call the /models endpoint of an OpenAI-compatible API. Returns model IDs."""
+    return list(_probe_models_detailed(base_url, api_key).models)
+
+
+def _probe_ollama_models_detailed(base_url: str) -> ModelProbe:
+    try:
+        response = httpx.get(f"{base_url.rstrip('/')}/api/tags", timeout=10)
+        if response.status_code != 200:
+            return ModelProbe(error=_response_error(response))
+        models = _models_from_payload(response.json(), collection="models")
+        return ModelProbe(
+            models=models,
+            error=None if models else "Ollama is running but has no installed models",
+        )
+    except Exception as exc:  # noqa: BLE001 - setup must surface probe failures
+        return ModelProbe(error=f"{type(exc).__name__}: {exc}")
 
 
 def _probe_ollama_models(base_url: str) -> list[str]:
     """Call Ollama /api/tags. Returns model names."""
-    try:
-        resp = httpx.get(f"{base_url.rstrip('/')}/api/tags", timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            return [m["name"] for m in data.get("models", [])]
-    except Exception:
-        pass
-    return []
+    return list(_probe_ollama_models_detailed(base_url).models)
 
 
 # ---------------------------------------------------------------------------
-# Verification helpers
+# Verification and recovery helpers
 # ---------------------------------------------------------------------------
 
 
-def _verify_anthropic(api_key: str, model: str) -> None:
-    """Verify Anthropic API key with a minimal completion request."""
-    try:
-        from anthropic import AsyncAnthropic
-    except ImportError:
-        print("  Warning: 'anthropic' package not installed — skipping verification.")
-        return
+def _discover_models(
+    provider_name: str,
+    probe: Callable[[], ModelProbe],
+    *,
+    fallback: list[str] | None = None,
+    guidance: str = "",
+) -> tuple[list[str], bool]:
+    """Probe with explicit retry/back/cancel/save-unverified decisions."""
 
-    client = AsyncAnthropic(api_key=api_key)
-
-    async def verify() -> bool:
-        try:
-            async with client.messages.stream(
-                model=model,
-                max_tokens=1,
-                messages=[{"role": "user", "content": "hi"}],
-            ) as stream:
-                async for _ in stream.text_stream:
-                    pass
-            return True
-        except Exception as exc:
-            print(f"\n  Verification failed: {exc}")
-            return False
-
-    success = asyncio.run(verify())
-    if success:
-        print("  ✓ API key verified successfully.")
-
-
-def _verify_openai(
-    api_key: str,
-    base_url: Optional[str],
-    model: str,
-) -> None:
-    """Verify an OpenAI-compatible API key with a trivial request."""
-    url = (base_url or "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 1,
-    }
-
-    try:
-        resp = httpx.post(url, json=payload, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            print("  ✓ API key verified successfully.")
-        else:
+    while True:
+        result = probe()
+        if result.models:
             print(
-                f"\n  Verification failed: HTTP {resp.status_code} — {resp.text[:200]}"
+                f"  Verified {provider_name}; discovered {len(result.models)} model(s)."
             )
-    except Exception as exc:
-        print(f"\n  Verification failed: {exc}")
+            return list(result.models), True
+        print(f"  Could not verify {provider_name}: {result.error or 'unknown error'}")
+        if guidance:
+            print(f"  {guidance}")
+        action = (
+            input(
+                "  Retry [r], continue unverified [s], go back [b], or cancel [c]? [r] "
+            )
+            .strip()
+            .casefold()
+        )
+        if action in {"", "r", "retry"}:
+            continue
+        if action in {"s", "save", "continue"}:
+            return list(fallback or ()), False
+        if action in {"b", "back"}:
+            raise SetupBack
+        if action in {"c", "cancel", "q", "quit"}:
+            raise SetupCancelled
+        print("  Invalid choice.")
+
+
+def _confirm_undiscovered_model(model: str, models: list[str], verified: bool) -> None:
+    if not verified or model in models:
+        return
+    answer = (
+        input(f"  {model!r} was not returned by the endpoint. Use it anyway? [y/N] ")
+        .strip()
+        .casefold()
+    )
+    if answer not in {"y", "yes"}:
+        raise SetupBack
+
+
+def _print_verification_status(verified: bool) -> None:
+    if verified:
+        print("  Provider credentials and model discovery verified.")
+    else:
+        print("  Saved without verification. Run 'ash doctor --connect' before use.")
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +606,14 @@ def _get_current_model(config) -> str:
     return model_str
 
 
+def _get_current_model_for_provider(config, provider: str) -> str:
+    model_str = getattr(config, "model", "") or ""
+    configured_provider, separator, model_name = model_str.partition("/")
+    if separator and configured_provider == provider:
+        return model_name
+    return ""
+
+
 def _migrate_old_ash_toml() -> None:
     """Detect old project-root ash.toml and offer to migrate to ~/.ash/."""
     from pathlib import Path
@@ -555,15 +639,16 @@ def _migrate_old_ash_toml() -> None:
     if resp in ("n", "no"):
         return
 
-    # Migrate api_key
+    migrated: dict[str, str] = {}
     if old_config.get("api_key"):
-        save_env_value("ANTHROPIC_API_KEY", str(old_config["api_key"]))
+        migrated["ANTHROPIC_API_KEY"] = str(old_config["api_key"])
 
     # Migrate provider + model
     provider = old_config.get("provider", "anthropic")
     model_name = old_config.get("model_name", "")
     if model_name:
-        save_env_value("ASH_MODEL", f"{provider}/{model_name}")
+        migrated["ASH_MODEL"] = f"{provider}/{model_name}"
+    save_env_values(migrated)
 
     print("\n  Migration complete. Old ash.toml left in place.")
     print("  You may remove it manually.")
@@ -586,7 +671,11 @@ def _prompt_api_key(
         existing = existing or get_env_value(env_var_legacy)
     if existing:
         print(f"  Found existing {desc}: {mask_key(env_var)}")
-        resp = input("    Rotate? [y/N] ").strip().lower()
+        resp = input("    Rotate? [y/N, b back, c cancel] ").strip().casefold()
+        if resp in {"c", "cancel", "q", "quit"}:
+            raise SetupCancelled
+        if resp in {"b", "back"}:
+            raise SetupBack
         if resp not in ("y", "yes"):
             return existing
 
