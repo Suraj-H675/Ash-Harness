@@ -78,6 +78,25 @@ async def test_viewport_submits_input_and_can_be_reused(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_viewport_honors_custom_multiline_binding(tmp_path: Path) -> None:
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            Transcript(),
+            history_path=tmp_path / "history",
+            keybindings={"newline": ["c-o"], "open_editor": ["c-x c-e"]},
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = viewport.read()
+        pipe.send_text("first")
+        pipe.send_bytes(b"\x0f")  # Ctrl+O
+        pipe.send_text("second\r")
+
+        assert await pending == "first\nsecond"
+        viewport.close()
+
+
+@pytest.mark.asyncio
 async def test_viewport_interrupt_and_eof_restore_input_ownership(
     tmp_path: Path,
 ) -> None:

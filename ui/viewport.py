@@ -129,6 +129,7 @@ class TranscriptViewport:
         completer: Any = None,
         status_provider: Callable[[], str] | None = None,
         input_mode: str = "emacs",
+        keybindings: dict[str, list[str]] | None = None,
         input: Input | None = None,
         output: Output | None = None,
     ) -> None:
@@ -141,6 +142,10 @@ class TranscriptViewport:
         self._follow_tail = True
         self._vertical_scroll = 10**9
         self._formatter = RichTranscriptFormatter()
+        self._configured_keybindings = keybindings or {
+            "newline": ["escape enter", "c-j"],
+            "open_editor": ["c-x c-e"],
+        }
 
         self.input_buffer = Buffer(
             history=FileHistory(str(history_path)),
@@ -259,10 +264,20 @@ class TranscriptViewport:
                 return
             event.app.exit(result=self.input_buffer.text)
 
-        @bindings.add("c-j")
-        @bindings.add("escape", "enter")
         def newline(event) -> None:
             event.current_buffer.insert_text("\n")
+
+        def open_editor(event) -> None:
+            event.current_buffer.open_in_editor()
+
+        handlers = {
+            "newline": newline,
+            "open_editor": open_editor,
+        }
+        for action, sequences in self._configured_keybindings.items():
+            handler = handlers[action]
+            for sequence in sequences:
+                bindings.add(*sequence.split())(handler)
 
         @bindings.add("c-c")
         def interrupt(event) -> None:

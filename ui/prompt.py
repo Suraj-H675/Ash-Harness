@@ -130,6 +130,7 @@ class PromptInput:
                     completer=completer,
                     status_provider=status_provider,
                     input_mode=input_mode,
+                    keybindings=keybindings,
                 )
             else:
                 self._session = PromptSession(
