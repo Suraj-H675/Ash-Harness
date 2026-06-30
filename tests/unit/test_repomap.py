@@ -2,53 +2,39 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import shutil
 import subprocess
 from unittest.mock import Mock
 
-import numpy as np
 import pytest
 
 from repo.repomap import RepoMap, calculate_personalized_pagerank
 
 
 def test_pagerank_concentrates_on_teleport_node() -> None:
-    matrix = np.array(
-        [
-            [0, 1, 0],
-            [1, 0, 0],
-            [0, 0, 0],
-        ],
-        dtype=float,
-    )
+    matrix = [[0, 1, 0], [1, 0, 0], [0, 0, 0]]
     v = calculate_personalized_pagerank(matrix, teleport_indices=[0])
-    assert abs(v.sum() - 1.0) < 1e-6
+    assert abs(sum(v) - 1.0) < 1e-6
     assert v[0] > v[1] > v[2]
 
 
 def test_pagerank_handles_dangling_nodes() -> None:
     # Node 2 has no outbound edges — must not produce NaN.
-    matrix = np.array(
-        [
-            [0, 1, 0],
-            [1, 0, 0],
-            [0, 0, 0],
-        ],
-        dtype=float,
-    )
+    matrix = [[0, 1, 0], [1, 0, 0], [0, 0, 0]]
     v = calculate_personalized_pagerank(matrix, teleport_indices=[0, 1, 2])
-    assert np.all(np.isfinite(v))
-    assert abs(v.sum() - 1.0) < 1e-6
+    assert all(math.isfinite(value) for value in v)
+    assert abs(sum(v) - 1.0) < 1e-6
 
 
 def test_pagerank_empty_matrix_returns_empty() -> None:
-    out = calculate_personalized_pagerank(np.zeros((0, 0)), teleport_indices=[])
-    assert out.size == 0
+    out = calculate_personalized_pagerank([], teleport_indices=[])
+    assert out == []
 
 
 def test_pagerank_no_teleport_defaults_to_uniform() -> None:
-    matrix = np.array([[0, 1], [1, 0]], dtype=float)
+    matrix = [[0, 1], [1, 0]]
     v = calculate_personalized_pagerank(matrix, teleport_indices=[])
     # Symmetric two-node graph with no teleport bias — both nodes share score.
     assert abs(v[0] - v[1]) < 1e-6
@@ -56,18 +42,18 @@ def test_pagerank_no_teleport_defaults_to_uniform() -> None:
 
 def test_pagerank_rejects_invalid_inputs() -> None:
     with pytest.raises(ValueError, match="square"):
-        calculate_personalized_pagerank(np.zeros((2, 3)), teleport_indices=[])
+        calculate_personalized_pagerank([[0, 0, 0], [0, 0, 0]], teleport_indices=[])
     with pytest.raises(ValueError, match="alpha"):
         calculate_personalized_pagerank(
-            np.zeros((2, 2)), teleport_indices=[], alpha=1.0
+            [[0, 0], [0, 0]], teleport_indices=[], alpha=1.0
         )
 
 
 def test_pagerank_deduplicates_teleport_indices() -> None:
-    matrix = np.zeros((2, 2))
+    matrix = [[0, 0], [0, 0]]
     duplicated = calculate_personalized_pagerank(matrix, teleport_indices=[0, 0, 1])
     unique = calculate_personalized_pagerank(matrix, teleport_indices=[0, 1])
-    assert np.allclose(duplicated, unique)
+    assert duplicated == pytest.approx(unique)
 
 
 def test_repomap_discovers_python_files(tmp_path: Path) -> None:

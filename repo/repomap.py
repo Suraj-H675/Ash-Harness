@@ -19,9 +19,7 @@ import fnmatch
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
-
-import numpy as np
+from typing import Iterable, Sequence
 
 from repo.parser import SOURCE_SUFFIXES, SourceLocation, Symbol, SymbolExtractor
 
@@ -407,7 +405,7 @@ class RepoMap:
         self._files: list[FileNode] = []
         self._module_index: dict[str, Path] = {}
         self._index: dict[Path, int] = {}
-        self._adjacency: np.ndarray | None = None
+        self._adjacency: list[list[float]] | None = None
         self._file_cache: dict[Path, tuple[tuple[int, int], FileNode]] = {}
         self._refresh()
 
@@ -595,8 +593,8 @@ class RepoMap:
             src_label = str(src_path.relative_to(self.project_root))
             if self._adjacency is None:
                 continue
-            for dep_idx in range(self._adjacency.shape[0]):
-                if self._adjacency[dep_idx, src_idx] > 0:
+            for dep_idx in range(len(self._adjacency)):
+                if self._adjacency[dep_idx][src_idx] > 0:
                     dep_path = self._files[dep_idx].path
                     dep_label = str(dep_path.relative_to(self.project_root))
                     lines.append(f'  "{src_label}" -> "{dep_label}";')
@@ -657,9 +655,9 @@ class RepoMap:
         self._index = {node.path: i for i, node in enumerate(files)}
         self._adjacency = self._build_adjacency()
 
-    def _build_adjacency(self) -> np.ndarray:
+    def _build_adjacency(self) -> list[list[float]]:
         n = len(self._files)
-        matrix = np.zeros((n, n), dtype=float)
+        matrix = [[0.0 for _ in range(n)] for _ in range(n)]
         if n == 0:
             return matrix
 
@@ -677,17 +675,17 @@ class RepoMap:
                 if j is not None and j != i:
                     # Columns are sources and rows are destinations so M @ v
                     # follows an import edge from the importer to its dependency.
-                    matrix[j, i] += 1.0
+                    matrix[j][i] += 1.0
         return matrix
 
 
 def calculate_personalized_pagerank(
-    adjacency_matrix: np.ndarray,
+    adjacency_matrix: Sequence[Sequence[float]],
     teleport_indices: list[int],
     alpha: float = 0.85,
     max_iter: int = 100,
     tol: float = 1e-6,
-) -> np.ndarray:
+) -> list[float]:
     """
     Compute Personalized PageRank for a directed dependency graph.
 
@@ -700,40 +698,48 @@ def calculate_personalized_pagerank(
     ``teleport_indices``, and ``alpha`` is the damping factor.
     """
 
-    n = adjacency_matrix.shape[0] if adjacency_matrix.ndim == 2 else 0
+    n = len(adjacency_matrix)
     if n == 0:
-        return np.array([])
-    if adjacency_matrix.shape != (n, n):
+        return []
+    if any(len(row) != n for row in adjacency_matrix):
         raise ValueError("adjacency_matrix must be square")
     if not 0.0 <= alpha < 1.0:
         raise ValueError("alpha must be in the range [0, 1)")
 
-    # Column-normalize so each column is a transition distribution.
-    column_sums = adjacency_matrix.sum(axis=0)
-    normalized = np.zeros_like(adjacency_matrix, dtype=float)
-    for col in range(n):
-        if column_sums[col] > 0:
-            normalized[:, col] = adjacency_matrix[:, col] / column_sums[col]
-        else:
-            # Dangling node: distribute uniformly.
-            normalized[:, col] = np.ones(n) / n
+    column_sums = [
+        sum(float(adjacency_matrix[row][col]) for row in range(n))
+        for col in range(n)
+    ]
 
     # Teleport vector.
-    p = np.zeros(n)
+    p = [0.0] * n
     if teleport_indices:
         # Filter to in-bounds indices to be defensive.
         valid = sorted({i for i in teleport_indices if 0 <= i < n})
         if valid:
-            p[valid] = 1.0 / len(valid)
+            share = 1.0 / len(valid)
+            for index in valid:
+                p[index] = share
         else:
-            p[:] = 1.0 / n
+            p = [1.0 / n] * n
     else:
-        p[:] = 1.0 / n
+        p = [1.0 / n] * n
 
-    v = np.copy(p)
+    v = list(p)
     for _ in range(max_iter):
-        v_next = alpha * np.dot(normalized, v) + (1.0 - alpha) * p
-        if np.linalg.norm(v_next - v, 1) < tol:
+        v_next = [(1.0 - alpha) * value for value in p]
+        for col, column_sum in enumerate(column_sums):
+            if column_sum > 0:
+                scale = alpha * v[col] / column_sum
+                for row in range(n):
+                    weight = float(adjacency_matrix[row][col])
+                    if weight:
+                        v_next[row] += scale * weight
+            else:
+                dangling_share = alpha * v[col] / n
+                for row in range(n):
+                    v_next[row] += dangling_share
+        if sum(abs(next_value - value) for next_value, value in zip(v_next, v)) < tol:
             return v_next
         v = v_next
     return v
