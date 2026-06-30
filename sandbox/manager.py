@@ -82,6 +82,7 @@ class SandboxInvocation:
 
 
 class SandboxStatus(TypedDict):
+    requested_backend: str
     backend: str
     tier: SandboxTier
     isolated: bool
@@ -110,10 +111,10 @@ def has_sandbox_exec() -> bool:
     return shutil.which("sandbox-exec") is not None
 
 
-def has_docker() -> bool:
-    """Whether ``docker`` is on PATH."""
+def has_docker(image: str = DEFAULT_IMAGE) -> bool:
+    """Whether Docker's daemon and selected local image are ready."""
 
-    return probe_docker() is not None
+    return probe_docker(image=image) is not None
 
 
 def auto_approve_safety_error(
@@ -167,6 +168,8 @@ class SandboxManager:
     timeout_seconds: int = 300
     extra_read_only_paths: tuple[Path, ...] = field(default_factory=tuple)
     allow_scoped_fallback: bool = False
+    backend_preference: str = "auto"
+    docker_image: str = DEFAULT_IMAGE
 
     def __post_init__(self) -> None:
         if self.preferred_tier not in {
@@ -175,6 +178,13 @@ class SandboxManager:
             SANDBOX_TIER_DOCKER,
         }:
             raise ValueError("preferred_tier must be 1, 2, or 3")
+        self.backend_preference = self.backend_preference.strip().casefold()
+        if self.backend_preference not in {"auto", "native", "docker", "direct"}:
+            raise ValueError(
+                "backend_preference must be auto, native, docker, or direct"
+            )
+        if not self.docker_image.strip():
+            raise ValueError("docker_image must not be empty")
         self._available: dict[str, bool] = {"scoped": True}
         self._tier: SandboxTier = self._detect_tier()
 
@@ -221,6 +231,7 @@ class SandboxManager:
                 "isolation and require permission-policy control."
             )
         return {
+            "requested_backend": self.backend_preference,
             "backend": self.backend_name,
             "tier": self.tier,
             "isolated": isolated,
@@ -229,7 +240,14 @@ class SandboxManager:
             "fail_closed": not self.allow_scoped_fallback,
             "available": self.capabilities(),
             "detail": detail,
-            "remediation": "" if isolated else _sandbox_remediation(),
+            "remediation": (
+                ""
+                if isolated or self.backend_preference == "direct"
+                else _sandbox_remediation(
+                    preference=self.backend_preference,
+                    docker_image=self.docker_image,
+                )
+            ),
         }
 
     def is_fully_isolated(self) -> bool:
@@ -312,13 +330,19 @@ class SandboxManager:
     def _detect_tier(self) -> SandboxTier:
         """Prefer a compatible native sandbox, then a verified container."""
 
-        if self.preferred_tier >= SANDBOX_TIER_BWRAP:
+        if self.backend_preference == "direct":
+            return SANDBOX_TIER_SCOPED
+        use_native = self.backend_preference in {"auto", "native"}
+        use_docker = self.backend_preference in {"auto", "docker"}
+        if use_native and self.preferred_tier >= SANDBOX_TIER_BWRAP:
             if sys.platform.startswith("linux") and self._backend_available("bwrap"):
                 return SANDBOX_TIER_BWRAP
             if sys.platform == "darwin" and self._backend_available("sandbox_exec"):
                 return SANDBOX_TIER_BWRAP
-        if self.preferred_tier >= SANDBOX_TIER_DOCKER and self._backend_available(
-            "docker"
+        if (
+            use_docker
+            and self.preferred_tier >= SANDBOX_TIER_DOCKER
+            and self._backend_available("docker")
         ):
             return SANDBOX_TIER_DOCKER
         return SANDBOX_TIER_SCOPED
@@ -330,7 +354,7 @@ class SandboxManager:
         probes = {
             "bwrap": has_bwrap,
             "sandbox_exec": has_sandbox_exec,
-            "docker": has_docker,
+            "docker": lambda: has_docker(self.docker_image),
         }
         available = probes[name]()
         self._available[name] = available
@@ -339,7 +363,9 @@ class SandboxManager:
     def _build_backend(self, tier: SandboxTier) -> SandboxBackend:
         if tier == SANDBOX_TIER_DOCKER:
             docker_backend = DockerSandbox(
-                workspace_root=self.workspace_root, network=self.network
+                workspace_root=self.workspace_root,
+                network=self.network,
+                image=self.docker_image,
             )
             if not docker_backend.is_available():
                 raise SandboxBackendUnavailable("docker backend unavailable")
@@ -555,21 +581,32 @@ def _backend_name(tier: SandboxTier) -> str:
     return "scoped"
 
 
-def _sandbox_remediation() -> str:
+def _sandbox_remediation(*, preference: str, docker_image: str) -> str:
+    if preference == "docker":
+        return (
+            "Start Docker and build or provide the configured local image "
+            f"{docker_image}."
+        )
+    if preference == "native":
+        if sys.platform.startswith("linux"):
+            return "Install and enable bubblewrap."
+        if sys.platform == "darwin":
+            return "Ensure /usr/bin/sandbox-exec is available."
+        return "No native sandbox backend is supported on this platform."
     if sys.platform.startswith("linux"):
         return (
             "Install and enable bubblewrap, or start Docker and provide the "
-            f"{DEFAULT_IMAGE} image."
+            f"{docker_image} image."
         )
     if sys.platform == "darwin":
         return (
             "Ensure /usr/bin/sandbox-exec is available, or start Docker and provide "
-            f"the {DEFAULT_IMAGE} image."
+            f"the {docker_image} image."
         )
     if sys.platform == "win32":
         return (
             "Start Docker Desktop and provide the "
-            f"{DEFAULT_IMAGE} image; native Windows isolation is not "
+            f"{docker_image} image; native Windows isolation is not "
             "currently available."
         )
-    return f"Start Docker and provide the {DEFAULT_IMAGE} image."
+    return f"Start Docker and provide the {docker_image} image."

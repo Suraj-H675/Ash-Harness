@@ -39,6 +39,9 @@ ash = "ash.cli:main"
 packages = ["ash", "agents", "cli", "context", "core", "hooks", "lsp", "mcp", "memory", "plugins", "providers", "repo", "safety", "sandbox", "server", "tools", "ui"]
 py-modules = ["ash_logging", "config", "exceptions"]
 
+[tool.setuptools.package-data]
+sandbox = ["Dockerfile"]
+
 [tool.uv]
 package = true
 

@@ -63,7 +63,7 @@ class SteeringSDKProvider(SDKProvider):
 
 @pytest.mark.asyncio
 async def test_async_sdk_rejects_unisolated_auto_approve(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("sandbox.manager.has_docker", lambda: False)
+    monkeypatch.setattr("sandbox.manager.has_docker", lambda _image: False)
     monkeypatch.setattr("sandbox.manager.has_bwrap", lambda: False)
     monkeypatch.setattr("sandbox.manager.has_sandbox_exec", lambda: False)
     config = AshConfig(

@@ -391,6 +391,18 @@ class AshConfig(BaseSettings):
         False,
         description="Allow full auto mode without an OS-level sandbox.",
     )
+    sandbox_backend: str = Field(
+        "auto",
+        description="Command isolation backend: auto, native, docker, or direct.",
+    )
+    sandbox_network: bool = Field(
+        False,
+        description="Allow network access inside isolated shell commands.",
+    )
+    sandbox_docker_image: str = Field(
+        "ash-sandbox:latest",
+        description="Local Docker image used by the Docker sandbox backend.",
+    )
     workspace_root: Path = Field(
         default_factory=discover_workspace_root,
         description="Scoped base folder containing project target code.",
@@ -509,6 +521,22 @@ class AshConfig(BaseSettings):
         except ValueError as exc:
             allowed = ", ".join(mode.value for mode in PermissionMode)
             raise ValueError(f"safety_tier must be one of: {allowed}") from exc
+
+    @field_validator("sandbox_backend")
+    @classmethod
+    def validate_sandbox_backend(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"auto", "native", "docker", "direct"}:
+            raise ValueError("sandbox_backend must be auto, native, docker, or direct")
+        return normalized
+
+    @field_validator("sandbox_docker_image")
+    @classmethod
+    def validate_sandbox_docker_image(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or any(char.isspace() for char in normalized):
+            raise ValueError("sandbox_docker_image must be a non-empty image reference")
+        return normalized
 
     @field_validator("config_schema_version")
     @classmethod

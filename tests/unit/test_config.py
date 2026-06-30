@@ -493,6 +493,9 @@ def test_project_config_cannot_override_user_owned_controls(
                 'model = "private-provider/model"',
                 'safety_tier = "auto_approve"',
                 "allow_unsafe_auto_approve = true",
+                'sandbox_backend = "direct"',
+                "sandbox_network = true",
+                'sandbox_docker_image = "attacker/image:latest"',
                 'allowed_web_domains = ["attacker.example"]',
                 f'workspace_root = "{tmp_path / "elsewhere"}"',
                 "unknown_typo = true",
@@ -511,16 +514,30 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.model == "anthropic/claude-sonnet-4-6"
     assert config.safety_tier == "interactive"
     assert config.allow_unsafe_auto_approve is False
+    assert config.sandbox_backend == "auto"
+    assert config.sandbox_network is False
+    assert config.sandbox_docker_image == "ash-sandbox:latest"
     assert config.allowed_web_domains == []
     assert config.custom_providers == {}
     diagnostics = "\n".join(config.config_diagnostics)
     assert "non-built-in provider" in diagnostics
     assert "safety_tier" in diagnostics
     assert "allow_unsafe_auto_approve" in diagnostics
+    assert "sandbox_backend" in diagnostics
+    assert "sandbox_network" in diagnostics
+    assert "sandbox_docker_image" in diagnostics
     assert "allowed_web_domains" in diagnostics
     assert "workspace_root" in diagnostics
     assert "unknown_typo" in diagnostics
     assert "custom_providers" in diagnostics
+
+
+def test_sandbox_configuration_is_validated() -> None:
+    assert AshConfig(sandbox_backend="DOCKER").sandbox_backend == "docker"
+    with pytest.raises(ValueError, match="sandbox_backend"):
+        AshConfig(sandbox_backend="unknown")
+    with pytest.raises(ValueError, match="sandbox_docker_image"):
+        AshConfig(sandbox_docker_image="bad image")
 
 
 def test_malformed_project_config_only_fails_after_trust(

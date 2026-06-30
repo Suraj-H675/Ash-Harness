@@ -83,7 +83,12 @@ class AshClient:
             runtime_config = runtime_config.model_copy(
                 update={"workspace_root": workspace.resolve()}
             )
-        sandbox = SandboxManager(workspace_root=runtime_config.workspace_root)
+        sandbox = SandboxManager(
+            workspace_root=runtime_config.workspace_root,
+            network=runtime_config.sandbox_network,
+            backend_preference=runtime_config.sandbox_backend,
+            docker_image=runtime_config.sandbox_docker_image,
+        )
         safety_error = auto_approve_safety_error(
             sandbox,
             allow_unsafe=runtime_config.allow_unsafe_auto_approve,

@@ -140,6 +140,56 @@ def test_manager_rejects_invalid_preferred_tier(tmp_path: Path) -> None:
         SandboxManager(workspace_root=tmp_path, preferred_tier=0)
 
 
+def test_manager_explicit_direct_does_not_probe_backends(tmp_path: Path) -> None:
+    with (
+        patch("sandbox.manager.has_bwrap") as bwrap,
+        patch("sandbox.manager.has_sandbox_exec") as sandbox_exec,
+        patch("sandbox.manager.has_docker") as docker,
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="direct",
+        )
+
+    assert manager.tier == SANDBOX_TIER_SCOPED
+    bwrap.assert_not_called()
+    sandbox_exec.assert_not_called()
+    docker.assert_not_called()
+
+
+def test_manager_explicit_native_does_not_fall_back_to_docker(
+    tmp_path: Path,
+) -> None:
+    with (
+        patch("sandbox.manager.sys.platform", "win32"),
+        patch("sandbox.manager.has_docker") as docker,
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="native",
+        )
+
+    assert manager.tier == SANDBOX_TIER_SCOPED
+    docker.assert_not_called()
+
+
+def test_manager_explicit_docker_uses_configured_image(tmp_path: Path) -> None:
+    with (
+        patch("sandbox.manager.sys.platform", "linux"),
+        patch("sandbox.manager.has_bwrap") as bwrap,
+        patch("sandbox.manager.has_docker", return_value=True) as docker,
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            docker_image="company/ash-sandbox:v2",
+        )
+
+    assert manager.tier == SANDBOX_TIER_DOCKER
+    bwrap.assert_not_called()
+    docker.assert_called_once_with("company/ash-sandbox:v2")
+
+
 def test_manager_capabilities_reports_each_backend(tmp_path: Path) -> None:
     with (
         patch("sandbox.manager.sys.platform", "linux"),

@@ -200,7 +200,12 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
             ),
         ]
     )
-    sandbox = SandboxManager(workspace_root=config.workspace_root)
+    sandbox = SandboxManager(
+        workspace_root=config.workspace_root,
+        network=config.sandbox_network,
+        backend_preference=config.sandbox_backend,
+        docker_image=config.sandbox_docker_image,
+    )
     sandbox_status = sandbox.status()
     checks.append(
         DoctorCheck(

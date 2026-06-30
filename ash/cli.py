@@ -1150,6 +1150,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Also probe the configured local or API endpoint",
     )
+    sandbox_parser = subparsers.add_parser(
+        "sandbox", help="Inspect sandbox enforcement or build the baseline image"
+    )
+    sandbox_subparsers = sandbox_parser.add_subparsers(
+        dest="sandbox_action", required=True
+    )
+    sandbox_status_parser = sandbox_subparsers.add_parser("status")
+    sandbox_status_parser.add_argument("--json", action="store_true")
+    sandbox_build_parser = sandbox_subparsers.add_parser("build")
+    sandbox_build_parser.add_argument("--image", default=None)
     config_parser = subparsers.add_parser(
         "config", help="Inspect Ash configuration sources"
     )
@@ -1418,6 +1428,30 @@ def main(argv: list[str] | None = None) -> int:
         checks = asyncio.run(run_doctor(connect=args.connect))
         print(render_doctor(checks, json_output=args.json_output))
         return 1 if any(check.status == "fail" for check in checks) else 0
+
+    if args.command == "sandbox":
+        from cli.sandbox import (
+            build_sandbox_image,
+            render_sandbox_status,
+            sandbox_status,
+        )
+
+        try:
+            sandbox_config = AshConfig.load()
+            if args.sandbox_action == "status":
+                print(
+                    render_sandbox_status(
+                        sandbox_status(sandbox_config),
+                        json_output=args.json,
+                    )
+                )
+                return 0
+            image = args.image or sandbox_config.sandbox_docker_image
+            print(f"Building local sandbox image {image}...")
+            return build_sandbox_image(image)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     if args.command == "config":
         from cli.config import explain_config, render_config_explain
@@ -1969,7 +2003,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     from sandbox import SandboxManager, auto_approve_safety_error
 
-    sandbox_manager = SandboxManager(workspace_root=config.workspace_root)
+    sandbox_manager = SandboxManager(
+        workspace_root=config.workspace_root,
+        network=config.sandbox_network,
+        backend_preference=config.sandbox_backend,
+        docker_image=config.sandbox_docker_image,
+    )
     safety_error = auto_approve_safety_error(
         sandbox_manager,
         allow_unsafe=config.allow_unsafe_auto_approve,

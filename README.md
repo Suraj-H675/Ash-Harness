@@ -50,6 +50,8 @@ ash storage restore BACKUP --yes # validated, non-destructive restore
 ash permissions status --json    # inspect effective project rules
 ash permissions deny write_file --exact 'file_path=".env"'
 ash permissions allow run_command --command-prefix pytest
+ash sandbox status --json        # inspect effective command isolation
+ash sandbox build                # explicitly build the optional baseline image
 ```
 
 The authenticated server exposes synchronous turns at `/v1/turn` and live
@@ -93,6 +95,20 @@ the permission policy; `auto_approve` is refused unless
 `ASH_ALLOW_UNSAFE_AUTO_APPROVE=true` is explicitly set. `/sandbox` and
 `ash doctor` report the effective filesystem, network, backend readiness, and
 fail-closed policy.
+
+Sandbox selection is user-owned configuration and cannot be weakened by a
+project `.ash/config.toml`:
+
+```toml
+sandbox_backend = "auto" # auto, native, docker, or direct
+sandbox_network = false
+sandbox_docker_image = "ash-sandbox:latest"
+```
+
+`auto` prefers Bubblewrap on Linux or `sandbox-exec` on macOS, then a locally
+available Docker image. Windows uses the Docker fallback. `ash sandbox build`
+builds the packaged Python, Node.js, Go, Rust, Java, and native-build baseline;
+it is an explicit operation and Ash never downloads or builds it at startup.
 
 ## Configuration
 
