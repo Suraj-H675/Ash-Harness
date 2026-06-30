@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -128,6 +129,60 @@ class TestAtomicWrite:
         # Old key should not appear; new key should appear once
         assert "old_key" not in content
         assert "ANTHROPIC_API_KEY=new_key" in content
+
+    def test_save_env_values_commits_related_settings_together(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+
+        cli_config.save_env_values(
+            {
+                "OPENAI_API_KEY": "sk-test",
+                "OPENAI_API_BASE": "https://example.test/v1",
+                "ASH_MODEL": "openai/test-model",
+            }
+        )
+
+        assert cli_config.load_env() == {
+            "OPENAI_API_KEY": "sk-test",
+            "OPENAI_API_BASE": "https://example.test/v1",
+            "ASH_MODEL": "openai/test-model",
+        }
+        assert os.environ["ASH_MODEL"] == "openai/test-model"
+
+    def test_save_env_values_rejects_dotenv_injection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+
+        with pytest.raises(ValueError, match="forbidden newline"):
+            cli_config.save_env_value("OPENAI_API_KEY", "key\nASH_MODEL=evil/model")
+        assert not cli_config.ENV_FILE.exists()
+
+    def test_failed_env_write_does_not_mutate_process_environment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cli import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(
+            cli_config.os, "replace", MagicMock(side_effect=OSError("disk"))
+        )
+
+        with pytest.raises(OSError, match="disk"):
+            cli_config.save_env_value("OPENAI_API_KEY", "sk-not-persisted")
+        assert "OPENAI_API_KEY" not in os.environ
 
     def test_save_env_value_file_permissions(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

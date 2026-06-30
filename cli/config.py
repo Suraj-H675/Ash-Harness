@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import tomllib
@@ -26,6 +27,7 @@ ASH_DIR = Path.home() / ".ash"
 ENV_FILE = ASH_DIR / ".env"
 CONFIG_FILE = ASH_DIR / "ash.toml"
 _INITIAL_PATHS = (ASH_DIR, ENV_FILE, CONFIG_FILE)
+_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _paths() -> tuple[Path, Path, Path]:
@@ -66,40 +68,48 @@ def save_env_value(key: str, value: str) -> None:
     Preserves existing keys. Sets os.environ[key] = value so providers
     pick up the change immediately.
     """
+    save_env_values({key: value})
+
+
+def save_env_values(values: dict[str, str]) -> None:
+    """Atomically persist multiple dotenv values and then publish them in-process."""
+
+    if not values:
+        return
+    for key, value in values.items():
+        if not _ENV_KEY.fullmatch(key):
+            raise ValueError(f"invalid environment variable name: {key!r}")
+        if not isinstance(value, str):
+            raise TypeError(f"environment value for {key} must be a string")
+        if any(character in value for character in ("\r", "\n", "\x00")):
+            raise ValueError(
+                f"environment value for {key} contains a forbidden newline or NUL"
+            )
+
     ash_dir = ensure_ash_dir()
     env_file = get_env_path()
-    # Set in environment immediately so providers see it
-    os.environ[key] = value
-
-    # Read existing lines
     lines: list[str] = []
     if env_file.exists():
-        with env_file.open() as f:
+        with env_file.open(encoding="utf-8") as f:
             for raw_line in f:
                 stripped = raw_line.strip()
-                # Skip empty lines and comments
                 if not stripped or stripped.startswith("#"):
                     lines.append(raw_line)
                     continue
-                # Parse key=... (value may contain = signs)
                 if "=" in stripped:
                     existing_key = stripped.split("=", 1)[0]
-                    if existing_key == key:
-                        # Skip the old line; we'll append the new one
+                    if existing_key in values:
                         continue
                 lines.append(raw_line)
 
-    # Build new line
-    new_line = f"{key}={value}\n"
-
-    # Atomic write via mkstemp + replace
     fd, tmp = tempfile.mkstemp(dir=str(ash_dir), suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.writelines(lines)
             if lines and not lines[-1].endswith("\n"):
                 f.write("\n")
-            f.write(new_line)
+            for key, value in values.items():
+                f.write(f"{key}={value}\n")
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, env_file)
@@ -111,6 +121,7 @@ def save_env_value(key: str, value: str) -> None:
         except OSError:
             pass
         raise
+    os.environ.update(values)
 
 
 def get_env_value(key: str) -> str | None:
