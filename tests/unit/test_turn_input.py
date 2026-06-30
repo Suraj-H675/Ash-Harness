@@ -9,7 +9,9 @@ from rich.console import Console
 from core.loop import AshLoop
 from core.session import SessionStore
 from providers.base import ProviderABC, StreamChunk
+from safety.grants import RuleEffect, load_permission_rules
 from safety.guard import SafetyGuard
+from safety.policy import PolicyAction
 from tools.filesystem import WriteFileTool
 from ui.terminal import TerminalUI
 from ui.notifications import NotificationEvent
@@ -248,3 +250,197 @@ async def test_plan_approval_uses_shared_prompt_owner(tmp_path: Path) -> None:
     assert notifier.calls == [
         (NotificationEvent.APPROVAL_REQUIRED, "Ash needs plan approval.")
     ]
+
+
+@pytest.mark.asyncio
+async def test_approval_can_persist_exact_project_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    prompt = RoutedPrompt()
+    await prompt.approvals.put("p")
+    statuses: list[str] = []
+    ui = make_ui()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        BlockingProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+        write_status=statuses.append,
+    )
+
+    approved = await controller._request_approval(
+        "write_file",
+        {"file_path": "docs/result.md", "content": "first"},
+    )
+
+    assert approved is True
+    rules = load_permission_rules(tmp_path)
+    assert len(rules) == 1
+    assert rules[0].effect == RuleEffect.ALLOW
+    assert [matcher.argument for matcher in rules[0].matchers] == ["file_path"]
+    assert (
+        loop.permission_policy.evaluate(
+            "write_file",
+            {"file_path": "docs/result.md", "content": "changed"},
+        ).action
+        == PolicyAction.ALLOW
+    )
+    assert (
+        loop.permission_policy.evaluate(
+            "write_file",
+            {"file_path": "src/result.py", "content": "changed"},
+        ).action
+        == PolicyAction.ASK
+    )
+    assert statuses == [f"Saved allow rule {rules[0].rule_id} for write_file."]
+
+
+@pytest.mark.asyncio
+async def test_approval_can_allow_exact_session_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    prompt = RoutedPrompt()
+    await prompt.approvals.put("s")
+    ui = make_ui()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        BlockingProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(loop, prompt, ui)  # type: ignore[arg-type]
+    arguments = {"file_path": "notes.txt", "content": "one"}
+
+    assert await controller._request_approval("write_file", arguments) is True
+    assert load_permission_rules(tmp_path) == []
+    assert (
+        loop.permission_policy.evaluate(
+            "write_file", {"file_path": "notes.txt", "content": "two"}
+        ).action
+        == PolicyAction.ALLOW
+    )
+    assert (
+        loop.permission_policy.evaluate(
+            "write_file", {"file_path": "other.txt", "content": "two"}
+        ).action
+        == PolicyAction.ASK
+    )
+
+
+@pytest.mark.asyncio
+async def test_approval_can_persist_verified_command_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    prompt = RoutedPrompt()
+    await prompt.approvals.put("c")
+    await prompt.approvals.put("pytest")
+    statuses: list[str] = []
+    ui = make_ui()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        BlockingProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+        write_status=statuses.append,
+    )
+
+    assert (
+        await controller._request_approval(
+            "run_command",
+            {"command_line": "pytest tests/unit -q"},
+        )
+        is True
+    )
+    assert (
+        loop.permission_policy.evaluate(
+            "run_command", {"command_line": "pytest tests/integration -q"}
+        ).action
+        == PolicyAction.ALLOW
+    )
+    assert (
+        loop.permission_policy.evaluate(
+            "run_command", {"command_line": "pytest -q && echo unsafe"}
+        ).action
+        == PolicyAction.ASK
+    )
+    assert prompt.prompts[-1].startswith("Approve command prefix")
+    assert statuses[0].startswith("Saved allow rule ")
+
+
+@pytest.mark.asyncio
+async def test_approval_can_persist_scoped_denial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    prompt = RoutedPrompt()
+    await prompt.approvals.put("x")
+    ui = make_ui()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        BlockingProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(loop, prompt, ui)  # type: ignore[arg-type]
+    arguments = {"file_path": ".env", "content": "secret"}
+
+    assert await controller._request_approval("write_file", arguments) is False
+    decision = loop.permission_policy.evaluate("write_file", arguments)
+    assert decision.action == PolicyAction.DENY
+    assert decision.rule_id == load_permission_rules(tmp_path)[0].rule_id
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_command_prefix_approval_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    prompt = RoutedPrompt()
+    await prompt.approvals.put("c")
+    await prompt.approvals.put("pytest")
+    statuses: list[str] = []
+    ui = make_ui()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        BlockingProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+        write_status=statuses.append,
+    )
+
+    approved = await controller._request_approval(
+        "run_command",
+        {"command_line": "pytest -q && echo unsafe"},
+    )
+
+    assert approved is False
+    assert load_permission_rules(tmp_path) == []
+    assert statuses and statuses[0].startswith("Permission scope rejected:")

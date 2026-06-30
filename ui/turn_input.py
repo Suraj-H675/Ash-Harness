@@ -7,6 +7,16 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from core.loop import AshLoop
+from safety.grants import (
+    ArgumentMatcher,
+    MatchOperator,
+    PermissionGrantError,
+    PermissionRule,
+    RuleEffect,
+    add_permission_rule,
+    build_command_prefix_matcher,
+    build_exact_scope_matchers,
+)
 from safety.policy import PolicyAction
 from ui.notifications import NotificationEvent, NotificationSink
 
@@ -119,18 +129,100 @@ class InteractiveTurnController:
         )
         self.ui.show_tool_approval(tool_name, arguments, auto=False)
         try:
-            answer = (
-                (await self.prompt_input.read("Approve [y/a/N]? ")).strip().casefold()
+            choices = (
+                "Approve [y] once, [s] scope/session, [a] tool/session, "
+                "[p] scope/project, [x] deny scope/project"
             )
+            if tool_name == "run_command":
+                choices += ", [c] command prefix/project"
+            answer = (
+                (await self.prompt_input.read(f"{choices}, [N] deny? "))
+                .strip()
+                .casefold()
+            )
+            if answer in {"y", "yes"}:
+                return True
+            if answer in {"a", "always", "session", "tool"}:
+                self.loop.permission_policy.add_session_rule(
+                    PermissionRule.create(RuleEffect.ALLOW, tool_name)
+                )
+                self.ui.approve_tool_for_session(tool_name)
+                self.write_status(f"Allowed {tool_name} for this session.")
+                return True
+            if answer in {"s", "scope"}:
+                rule = self._exact_scope_rule(RuleEffect.ALLOW, tool_name, arguments)
+                self.loop.permission_policy.add_session_rule(rule)
+                self.write_status(
+                    f"Allowed scoped {tool_name} calls for this session ({rule.rule_id})."
+                )
+                return True
+            if answer in {"p", "persist", "project"}:
+                rule = self._exact_scope_rule(RuleEffect.ALLOW, tool_name, arguments)
+                self._persist_rule(rule)
+                return True
+            if answer in {"x", "never", "block"}:
+                rule = self._exact_scope_rule(RuleEffect.DENY, tool_name, arguments)
+                self._persist_rule(rule)
+                return False
+            if answer in {"c", "command"} and tool_name == "run_command":
+                command_line = arguments.get("command_line")
+                if not isinstance(command_line, str):
+                    raise PermissionGrantError(
+                        "run_command request has no string command_line"
+                    )
+                prefix_text = (
+                    await self.prompt_input.read(
+                        "Approve command prefix (shell words; blank cancels)> "
+                    )
+                ).strip()
+                if not prefix_text:
+                    return False
+                matchers: list[ArgumentMatcher] = [
+                    build_command_prefix_matcher(command_line, prefix_text)
+                ]
+                if arguments.get("cwd") is not None:
+                    matchers.append(
+                        ArgumentMatcher(
+                            "cwd",
+                            MatchOperator.EXACT,
+                            arguments["cwd"],
+                        )
+                    )
+                rule = PermissionRule.create(
+                    RuleEffect.ALLOW,
+                    tool_name,
+                    matchers,
+                )
+                self._persist_rule(rule)
+                return True
+            return False
+        except PermissionGrantError as exc:
+            self.write_status(f"Permission scope rejected: {exc}")
+            return False
         except (EOFError, KeyboardInterrupt):
             return False
         finally:
             self._approval_active = False
             self._approval_complete.set()
-        if answer in {"a", "always", "session"}:
-            self.ui.approve_tool_for_session(tool_name)
-            return True
-        return answer in {"y", "yes"}
+
+    @staticmethod
+    def _exact_scope_rule(
+        effect: RuleEffect,
+        tool_name: str,
+        arguments: dict[str, object],
+    ) -> PermissionRule:
+        return PermissionRule.create(
+            effect,
+            tool_name,
+            build_exact_scope_matchers(arguments),
+        )
+
+    def _persist_rule(self, rule: PermissionRule) -> None:
+        rules = add_permission_rule(self.loop.project_root, rule)
+        self.loop.permission_policy.set_persistent_rules(rules)
+        self.write_status(
+            f"Saved {rule.effect.value} rule {rule.rule_id} for {rule.tool_name}."
+        )
 
     async def _request_plan_approval(self, execution) -> bool:
         self._approval_active = True

@@ -352,7 +352,12 @@ class TerminalUI:
         *,
         auto: bool,
     ) -> None:
-        self._render_approval_notice(tool_name, dict(arguments), auto=auto)
+        self._render_approval_notice(
+            tool_name,
+            dict(arguments),
+            auto=auto,
+            scope_options=not auto,
+        )
 
     def _render_approval_notice(
         self,
@@ -360,6 +365,7 @@ class TerminalUI:
         arguments: dict[str, Any],
         *,
         auto: bool,
+        scope_options: bool = False,
     ) -> None:
         # Suspend the live render while we print the approval panel.
         live = getattr(self, "_active_live", None)
@@ -380,6 +386,16 @@ class TerminalUI:
             body.append(preview, style="dim")
         if auto:
             body.append("\n[auto-approved]", style="green")
+        elif scope_options:
+            command_choice = (
+                ", command prefix for project [c]" if tool_name == "run_command" else ""
+            )
+            body.append(
+                "\nApprove once [y], scoped for session [s], tool for session [a], "
+                "scoped for project [p], deny scope for project [x]"
+                f"{command_choice}, or deny [N]? ",
+                style="bold yellow",
+            )
         else:
             body.append(
                 "\nApprove once [y], for this session [a], or deny [N]? ",

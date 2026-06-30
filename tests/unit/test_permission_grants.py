@@ -9,6 +9,7 @@ from safety.grants import (
     PermissionRule,
     RuleEffect,
     add_permission_rule,
+    build_exact_scope_matchers,
     grants_path,
     load_permission_rules,
     load_tool_grants,
@@ -105,3 +106,10 @@ def test_permission_rule_file_refuses_corruption_and_future_versions(
     path.write_text('{"version": 999, "workspaces": {}}', encoding="utf-8")
     with pytest.raises(PermissionGrantError, match="newer than supported"):
         load_permission_rules(workspace)
+
+
+def test_exact_scope_never_silently_drops_large_non_content_arguments() -> None:
+    with pytest.raises(PermissionGrantError, match="exceeds 8 KiB"):
+        build_exact_scope_matchers(
+            {"resource": "x" * 9000, "content": "bulk payload is intentionally omitted"}
+        )

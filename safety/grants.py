@@ -24,6 +24,15 @@ MAX_RULE_FILE_BYTES = 1_000_000
 MAX_EXACT_VALUE_BYTES = 8192
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
+_BULK_ARGUMENTS = frozenset(
+    {
+        "content",
+        "edits",
+        "patch",
+        "replacement_content",
+        "target_content",
+    }
+)
 
 
 class PermissionGrantError(ValueError):
@@ -288,6 +297,46 @@ class PermissionRule:
                 f"permission rule id does not match its content: {supplied_id!r}"
             )
         return rule
+
+
+def build_exact_scope_matchers(
+    arguments: Mapping[str, Any],
+) -> list[ArgumentMatcher]:
+    """Build a durable exact scope while excluding bulk content payloads."""
+
+    matchers: list[ArgumentMatcher] = []
+    for argument, value in sorted(arguments.items()):
+        if argument in _BULK_ARGUMENTS:
+            continue
+        matchers.append(ArgumentMatcher(argument, MatchOperator.EXACT, value))
+    if not matchers:
+        raise PermissionGrantError(
+            "this call has no bounded non-content arguments to scope safely"
+        )
+    return matchers
+
+
+def build_command_prefix_matcher(
+    command_line: str,
+    prefix_text: str,
+) -> ArgumentMatcher:
+    """Parse and verify a user-selected argv prefix for the current command."""
+
+    try:
+        prefix = shlex.split(prefix_text, posix=os.name != "nt")
+    except ValueError as exc:
+        raise PermissionGrantError(f"invalid command prefix: {exc}") from exc
+    matcher = ArgumentMatcher(
+        "command_line",
+        MatchOperator.COMMAND_PREFIX,
+        prefix,
+    )
+    if not matcher.matches({"command_line": command_line}):
+        raise PermissionGrantError(
+            "command prefix must match the current simple command; "
+            "compound commands, redirection, and substitution require exact approval"
+        )
+    return matcher
 
 
 def grants_path() -> Path:
