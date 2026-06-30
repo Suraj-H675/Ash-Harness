@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from core.loop import AshLoop
 from safety.policy import PolicyAction
+from ui.notifications import NotificationEvent, NotificationSink
 
 if TYPE_CHECKING:
     from ui.prompt import PromptInput
@@ -24,11 +25,15 @@ class InteractiveTurnController:
         ui: TerminalUI,
         *,
         write_status: Callable[[str], None] = print,
+        notifier: NotificationSink | None = None,
+        notification_include_preview: bool = False,
     ) -> None:
         self.loop = loop
         self.prompt_input = prompt_input
         self.ui = ui
         self.write_status = write_status
+        self.notifier = notifier
+        self.notification_include_preview = notification_include_preview
         self._steering_read: asyncio.Task[str] | None = None
         self._approval_active = False
         self._approval_complete = asyncio.Event()
@@ -53,7 +58,7 @@ class InteractiveTurnController:
                 )
                 if turn in done:
                     await self._cancel_steering_read()
-                    return await turn
+                    break
 
                 try:
                     steering = steering_read.result().strip()
@@ -82,7 +87,12 @@ class InteractiveTurnController:
                     self.write_status(f"Steering rejected: {exc}")
                     continue
                 self.write_status(f"Steering queued ({pending} pending).")
-            return await turn
+            response = await turn
+            message = "Ash turn complete."
+            if self.notification_include_preview and response.strip():
+                message = f"Ash finished: {response}"
+            self._notify(NotificationEvent.TURN_COMPLETE, message)
+            return response
         finally:
             await self._cancel_steering_read()
             if not turn.done():
@@ -103,6 +113,10 @@ class InteractiveTurnController:
         self._approval_active = True
         self._approval_complete.clear()
         await self._cancel_steering_read()
+        self._notify(
+            NotificationEvent.APPROVAL_REQUIRED,
+            f"Ash needs approval: {tool_name}",
+        )
         self.ui.show_tool_approval(tool_name, arguments, auto=False)
         try:
             answer = (
@@ -122,6 +136,10 @@ class InteractiveTurnController:
         self._approval_active = True
         self._approval_complete.clear()
         await self._cancel_steering_read()
+        self._notify(
+            NotificationEvent.APPROVAL_REQUIRED,
+            "Ash needs plan approval.",
+        )
         try:
             while True:
                 self.ui.show_plan_review(execution)
@@ -145,6 +163,14 @@ class InteractiveTurnController:
         finally:
             self._approval_active = False
             self._approval_complete.set()
+
+    def _notify(self, event: NotificationEvent, message: str) -> None:
+        if self.notifier is None:
+            return
+        try:
+            self.notifier.notify(event, message)
+        except Exception:  # noqa: BLE001 - optional notifications cannot break turns
+            return
 
     async def _cancel_steering_read(self) -> None:
         task = self._steering_read

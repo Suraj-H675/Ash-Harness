@@ -12,6 +12,7 @@ from providers.base import ProviderABC, StreamChunk
 from safety.guard import SafetyGuard
 from tools.filesystem import WriteFileTool
 from ui.terminal import TerminalUI
+from ui.notifications import NotificationEvent
 from ui.turn_input import InteractiveTurnController
 
 
@@ -26,6 +27,15 @@ class RoutedPrompt:
         if prompt.startswith(("Approve", "Plan")):
             return await self.approvals.get()
         return await self.steering.get()
+
+
+class RecordingNotifier:
+    def __init__(self) -> None:
+        self.calls: list[tuple[NotificationEvent, str]] = []
+
+    def notify(self, event: str | NotificationEvent, message: str) -> bool:
+        self.calls.append((NotificationEvent(event), message))
+        return True
 
 
 class BlockingProvider(ProviderABC):
@@ -90,6 +100,7 @@ async def test_interactive_controller_queues_steering_during_stream(
     provider = BlockingProvider()
     prompt = RoutedPrompt()
     statuses: list[str] = []
+    notifier = RecordingNotifier()
     ui = make_ui()
     loop = AshLoop(
         SessionStore(tmp_path / "sessions.db"),
@@ -103,6 +114,8 @@ async def test_interactive_controller_queues_steering_during_stream(
         prompt,  # type: ignore[arg-type]
         ui,
         write_status=statuses.append,
+        notifier=notifier,
+        notification_include_preview=True,
     )
 
     turn = asyncio.create_task(controller.run("start"))
@@ -118,6 +131,9 @@ async def test_interactive_controller_queues_steering_during_stream(
     assert ui.transcript.snapshot()[0].kind == "user"
     assert ui.transcript.snapshot()[0].content == "start"
     assert statuses == ["Steering queued (1 pending)."]
+    assert notifier.calls == [
+        (NotificationEvent.TURN_COMPLETE, "Ash finished: redirected")
+    ]
     assert any(
         message["role"] == "user" and message["content"] == "change direction"
         for message in provider.messages[1]
@@ -129,6 +145,7 @@ async def test_interactive_controller_cancels_running_turn(tmp_path: Path) -> No
     provider = BlockingProvider()
     prompt = RoutedPrompt()
     statuses: list[str] = []
+    notifier = RecordingNotifier()
     ui = make_ui()
     loop = AshLoop(
         SessionStore(tmp_path / "sessions.db"),
@@ -142,6 +159,7 @@ async def test_interactive_controller_cancels_running_turn(tmp_path: Path) -> No
         prompt,  # type: ignore[arg-type]
         ui,
         write_status=statuses.append,
+        notifier=notifier,
     )
 
     turn = asyncio.create_task(controller.run("start"))
@@ -150,6 +168,7 @@ async def test_interactive_controller_cancels_running_turn(tmp_path: Path) -> No
 
     assert await turn is None
     assert statuses == ["Turn cancelled."]
+    assert notifier.calls == []
     assert loop.is_turn_running is False
     assert (
         loop.session_store.reconcile_interrupted_turns(loop.current_session.session_id)
@@ -162,6 +181,7 @@ async def test_interactive_approval_preempts_steering_reader(tmp_path: Path) -> 
     prompt = RoutedPrompt()
     await prompt.approvals.put("y")
     statuses: list[str] = []
+    notifier = RecordingNotifier()
     ui = make_ui()
     guard = SafetyGuard(tmp_path)
     tool = WriteFileTool(guard)
@@ -178,6 +198,7 @@ async def test_interactive_approval_preempts_steering_reader(tmp_path: Path) -> 
         prompt,  # type: ignore[arg-type]
         ui,
         write_status=statuses.append,
+        notifier=notifier,
     )
 
     response = await controller.run("write the file")
@@ -186,6 +207,10 @@ async def test_interactive_approval_preempts_steering_reader(tmp_path: Path) -> 
     assert (tmp_path / "approved.txt").read_text() == "written"
     assert any(item.startswith("Approve") for item in prompt.prompts)
     assert statuses == []
+    assert notifier.calls == [
+        (NotificationEvent.APPROVAL_REQUIRED, "Ash needs approval: write_file"),
+        (NotificationEvent.TURN_COMPLETE, "Ash turn complete."),
+    ]
 
 
 @pytest.mark.asyncio
@@ -200,7 +225,13 @@ async def test_plan_approval_uses_shared_prompt_owner(tmp_path: Path) -> None:
         ui,
         tmp_path,
     )
-    controller = InteractiveTurnController(loop, prompt, ui)  # type: ignore[arg-type]
+    notifier = RecordingNotifier()
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+        notifier=notifier,
+    )
     execution = SimpleNamespace(
         contract=SimpleNamespace(
             contract_id="12345678-plan",
@@ -214,3 +245,6 @@ async def test_plan_approval_uses_shared_prompt_owner(tmp_path: Path) -> None:
     assert await controller._request_plan_approval(execution) is True
     assert prompt.prompts == ["Plan [y/e/N]? "]
     assert ui.transcript.snapshot()[-1].metadata == {"type": "plan.approval"}
+    assert notifier.calls == [
+        (NotificationEvent.APPROVAL_REQUIRED, "Ash needs plan approval.")
+    ]

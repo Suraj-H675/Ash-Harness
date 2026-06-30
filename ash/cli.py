@@ -390,6 +390,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     from ui.status import StatusLine
     from ui.turn_input import InteractiveTurnController
     from ui.output import ReplPrinter
+    from ui.notifications import TerminalNotifier
 
     command_roots = [(Path.home() / ".ash" / "commands", "user")]
     if is_workspace_trusted(loop.project_root):
@@ -419,6 +420,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         prompt_input,
         loop.ui,
         write_status=loop.ui.write_status,
+        notifier=TerminalNotifier(
+            config.notification_method,
+            events=config.notification_events,
+        ),
+        notification_include_preview=config.notification_include_preview,
     )
     print(
         "ash - type /help for commands",

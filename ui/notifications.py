@@ -7,7 +7,7 @@ import sys
 import unicodedata
 from collections.abc import Mapping
 from enum import StrEnum
-from typing import TextIO
+from typing import Protocol, TextIO
 
 
 class NotificationMethod(StrEnum):
@@ -24,6 +24,12 @@ class NotificationEvent(StrEnum):
 
     TURN_COMPLETE = "turn_complete"
     APPROVAL_REQUIRED = "approval_required"
+
+
+class NotificationSink(Protocol):
+    """Structural interface consumed by the interactive turn controller."""
+
+    def notify(self, event: str | NotificationEvent, message: str) -> bool: ...
 
 
 _OSC9_TERM_PROGRAMS = {
