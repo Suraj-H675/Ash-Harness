@@ -103,7 +103,7 @@ Research is clean-room: proprietary or leaked source is not used.
 |---|---|---|
 | Multiline editor | Verified locally | Prompt-toolkit editor with persistent history and multiline bindings |
 | Responsive full-screen TUI | Partial | Transcript-owned prompt-toolkit viewport, narrow/wide resize reflow, page navigation, live tail, terminal restoration, and inline fallback are locally verified; native Windows terminal runtime remains |
-| Streaming transcript | Partial | Immutable semantic user/assistant/reasoning/tool/approval/status/error entries, bounded history, mutable live cells, and command output routing are wired; rich viewport Markdown remains |
+| Streaming transcript | Verified locally | Immutable semantic user/assistant/reasoning/tool/approval/status/error entries, bounded mutable live cells, rich cached Markdown, command output routing, and durable-session hydration |
 | Markdown/code rendering | Verified locally | Streamed Rich Markdown with fenced-code highlighting and bounded repaint frequency |
 | Diff preview | Partial | Bounded unified previews for writes/replacements/patches; side-by-side view remains |
 | Approval dialog | Partial | Allow once/session/persist, deny with feedback, editable scope |
