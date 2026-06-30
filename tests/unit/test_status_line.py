@@ -33,7 +33,7 @@ def test_status_line_includes_runtime_git_cost_and_sandbox(tmp_path: Path) -> No
         max_context_tokens=1000,
         max_completion_tokens=100,
     )
-    sandbox = SimpleNamespace(backend_name="scoped")
+    sandbox = SimpleNamespace(backend_name="scoped", is_fully_isolated=lambda: False)
 
     rendered = StatusLine(loop, config, sandbox, refresh_seconds=60)()
 
@@ -41,6 +41,7 @@ def test_status_line_includes_runtime_git_cost_and_sandbox(tmp_path: Path) -> No
     assert "cache:7r/2w" in rendered
     assert "$0.0123" in rendered
     assert "sb:scoped" in rendered
+    assert "sb:scoped!" in rendered
     assert f"s:{session.session_id[:8]}" in rendered
 
 

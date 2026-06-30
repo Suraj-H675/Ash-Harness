@@ -201,14 +201,18 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
         ]
     )
     sandbox = SandboxManager(workspace_root=config.workspace_root)
+    sandbox_status = sandbox.status()
     checks.append(
         DoctorCheck(
             "sandbox",
-            "pass" if sandbox.is_fully_isolated() else "warn",
-            f"{sandbox.backend_name} (tier {sandbox.tier})",
-            "Install/enable bubblewrap or Docker before using auto_approve."
-            if not sandbox.is_fully_isolated()
-            else "",
+            "pass" if sandbox_status["isolated"] else "warn",
+            (
+                f"{sandbox_status['backend']} (tier {sandbox_status['tier']}); "
+                f"filesystem={sandbox_status['filesystem']}; "
+                f"network={sandbox_status['network']}; "
+                f"fail_closed={str(sandbox_status['fail_closed']).lower()}"
+            ),
+            str(sandbox_status["remediation"]),
         )
     )
     checks.append(_check_mcp(config))

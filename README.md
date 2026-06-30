@@ -84,6 +84,16 @@ Network fetches use the `web_fetch` tool and require normal tool approval;
 private, loopback, reserved, non-HTTP, oversized, and unsupported-content URLs
 are refused before request content reaches the model.
 
+Shell commands use a fail-closed workspace sandbox when one is available:
+Bubblewrap on Linux, `sandbox-exec` on macOS, or a verified
+`ash-sandbox:latest` Docker image (including Docker Desktop on Windows).
+Network access is disabled inside isolated commands. Without one of those
+backends, Ash clearly reports direct execution and keeps shell actions behind
+the permission policy; `auto_approve` is refused unless
+`ASH_ALLOW_UNSAFE_AUTO_APPROVE=true` is explicitly set. `/sandbox` and
+`ash doctor` report the effective filesystem, network, backend readiness, and
+fail-closed policy.
+
 ## Configuration
 
 The selected model uses `provider/model` form, for example:

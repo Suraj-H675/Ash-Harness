@@ -14,6 +14,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -66,7 +67,20 @@ class DockerSandbox(SandboxBackend):
         if not command:
             raise ValueError("command must be a non-empty sequence")
 
-        args: list[str] = [self.docker_path or "docker", "run", "--rm", "--interactive"]
+        args: list[str] = [
+            self.docker_path or "docker",
+            "run",
+            "--rm",
+            "--interactive",
+            "--init",
+            "--pids-limit=256",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=512m",
+            "--env",
+            "HOME=/tmp",
+        ]
+        if sys.platform != "win32" and hasattr(os, "getuid"):
+            args.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
         if not self.network:
             args.append("--network=none")
         if self.memory_limit is not None:

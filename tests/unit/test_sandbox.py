@@ -58,6 +58,7 @@ def test_has_sandbox_exec_only_on_macos() -> None:
 
 def test_manager_picks_highest_available_tier(tmp_path: Path) -> None:
     with (
+        patch("sandbox.manager.sys.platform", "linux"),
         patch("sandbox.manager.has_docker", return_value=False),
         patch("sandbox.manager.has_bwrap", return_value=True),
     ):
@@ -66,14 +67,50 @@ def test_manager_picks_highest_available_tier(tmp_path: Path) -> None:
         assert mgr.backend_name == "bubblewrap"
 
 
-def test_manager_prefers_docker_when_available(tmp_path: Path) -> None:
+def test_manager_prefers_native_backend_when_docker_is_also_available(
+    tmp_path: Path,
+) -> None:
     with (
+        patch("sandbox.manager.sys.platform", "linux"),
         patch("sandbox.manager.has_docker", return_value=True),
         patch("sandbox.manager.has_bwrap", return_value=True),
     ):
         mgr = SandboxManager(workspace_root=tmp_path)
+        assert mgr.tier == SANDBOX_TIER_BWRAP
+        assert mgr.backend_name == "bubblewrap"
+
+
+def test_manager_uses_docker_as_windows_isolation_backend(tmp_path: Path) -> None:
+    with (
+        patch("sandbox.manager.sys.platform", "win32"),
+        patch("sandbox.manager.has_docker", return_value=True),
+    ):
+        mgr = SandboxManager(workspace_root=tmp_path)
         assert mgr.tier == SANDBOX_TIER_DOCKER
         assert mgr.backend_name == "docker"
+
+
+def test_manager_uses_sandbox_exec_on_macos(tmp_path: Path) -> None:
+    with (
+        patch("sandbox.manager.sys.platform", "darwin"),
+        patch("sandbox.manager.has_sandbox_exec", return_value=True),
+        patch("sandbox.manager.has_docker", return_value=True),
+    ):
+        mgr = SandboxManager(workspace_root=tmp_path)
+        assert mgr.tier == SANDBOX_TIER_BWRAP
+        assert mgr.backend_name == "sandbox-exec"
+
+
+def test_manager_reports_unisolated_windows_without_docker(tmp_path: Path) -> None:
+    with (
+        patch("sandbox.manager.sys.platform", "win32"),
+        patch("sandbox.manager.has_docker", return_value=False),
+    ):
+        mgr = SandboxManager(workspace_root=tmp_path)
+        status = mgr.status()
+        assert status["isolated"] is False
+        assert status["filesystem"] == "host"
+        assert "Docker Desktop" in str(status["remediation"])
 
 
 def test_manager_falls_back_to_scoped_when_nothing_available(tmp_path: Path) -> None:
@@ -89,6 +126,7 @@ def test_manager_falls_back_to_scoped_when_nothing_available(tmp_path: Path) -> 
 
 def test_manager_respects_preferred_tier(tmp_path: Path) -> None:
     with (
+        patch("sandbox.manager.sys.platform", "linux"),
         patch("sandbox.manager.has_docker", return_value=True),
         patch("sandbox.manager.has_bwrap", return_value=True),
     ):
@@ -97,8 +135,14 @@ def test_manager_respects_preferred_tier(tmp_path: Path) -> None:
         assert mgr.backend_name == "bubblewrap"
 
 
+def test_manager_rejects_invalid_preferred_tier(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="1, 2, or 3"):
+        SandboxManager(workspace_root=tmp_path, preferred_tier=0)
+
+
 def test_manager_capabilities_reports_each_backend(tmp_path: Path) -> None:
     with (
+        patch("sandbox.manager.sys.platform", "linux"),
         patch("sandbox.manager.has_docker", return_value=False),
         patch("sandbox.manager.has_bwrap", return_value=True),
         patch("sandbox.manager.has_sandbox_exec", return_value=False),
@@ -115,6 +159,7 @@ def test_manager_capabilities_reports_each_backend(tmp_path: Path) -> None:
 
 def test_manager_is_fully_isolated_only_at_tier_2_plus(tmp_path: Path) -> None:
     with (
+        patch("sandbox.manager.sys.platform", "linux"),
         patch("sandbox.manager.has_docker", return_value=False),
         patch("sandbox.manager.has_bwrap", return_value=True),
         patch("sandbox.manager.has_sandbox_exec", return_value=False),
@@ -123,12 +168,30 @@ def test_manager_is_fully_isolated_only_at_tier_2_plus(tmp_path: Path) -> None:
         assert mgr.is_fully_isolated() is True
 
     with (
+        patch("sandbox.manager.sys.platform", "linux"),
         patch("sandbox.manager.has_docker", return_value=False),
         patch("sandbox.manager.has_bwrap", return_value=False),
         patch("sandbox.manager.has_sandbox_exec", return_value=False),
     ):
         mgr = SandboxManager(workspace_root=tmp_path)
         assert mgr.is_fully_isolated() is False
+
+
+def test_manager_status_describes_enforcement(tmp_path: Path) -> None:
+    with (
+        patch("sandbox.manager.sys.platform", "linux"),
+        patch("sandbox.manager.has_bwrap", return_value=True),
+        patch("sandbox.manager.has_docker", return_value=False),
+    ):
+        mgr = SandboxManager(workspace_root=tmp_path, network=False)
+        status = mgr.status()
+
+    assert status["backend"] == "bubblewrap"
+    assert status["isolated"] is True
+    assert status["filesystem"] == "workspace-write"
+    assert status["network"] == "blocked"
+    assert status["fail_closed"] is True
+    assert status["remediation"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +218,10 @@ def test_bubblewrap_wrap_includes_namespace_flags(tmp_path: Path) -> None:
     assert "--unshare-uts" in argv
     assert "--unshare-ipc" in argv
     assert "--die-with-parent" in argv
+    assert "--proc" in argv
+    assert argv[argv.index("--proc") + 1] == "/proc"
+    assert "--dev" in argv
+    assert argv[argv.index("--dev") + 1] == "/dev"
     # Network is off by default.
     assert "--unshare-net" in argv
     # Workspace is bound.
@@ -218,6 +285,10 @@ def test_docker_wrap_includes_security_flags(tmp_path: Path) -> None:
     assert "--cap-drop=ALL" in argv
     assert "--security-opt=no-new-privileges" in argv
     assert "--read-only" in argv
+    assert "--init" in argv
+    assert "--pids-limit=256" in argv
+    assert "/tmp:rw,nosuid,nodev,size=512m" in argv
+    assert "HOME=/tmp" in argv
     # Bind mount and container-native working directory for the workspace.
     assert "--mount" in argv
     assert f"source={tmp_path},target=/workspace" in " ".join(argv)

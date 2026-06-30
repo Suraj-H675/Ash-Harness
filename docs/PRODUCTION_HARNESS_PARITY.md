@@ -154,7 +154,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | List/glob files | Verified locally | Bounded production tools with workspace scoping |
 | Text/regex search | Verified locally | Ripgrep-backed bounded search with Python fallback |
 | Symbol/code search | Verified locally | Read-only `find_symbol` and `find_references` tools use the incremental Tree-sitter index, exact locations, case controls, globs, and bounded results |
-| Shell execution | Partial | Policy engine, sandbox injection, process groups, and child env scrubbing; streaming output remains |
+| Shell execution | Partial | Foreground and managed background commands share fail-closed sandbox injection, process-tree termination, and child env scrubbing; streaming foreground output remains |
 | Git status/diff/log | Verified locally | Read-only bounded Git inspection tools |
 | Git commit | Partial | Explicit staging scope, no unrelated changes, hooks/errors surfaced |
 | Tests/build/lint diagnostics | Partial | Parse diagnostics and feed concise structured failures |
@@ -172,10 +172,10 @@ Research is clean-room: proprietary or leaked source is not used.
 | Approval persistence | Verified locally | Atomic mode-0600 versioned rules, version-1 migration, stable IDs, exact session/project scopes, command-prefix project scopes, scoped denial, slash/top-level inspection, removal, and clear |
 | Read-only plan mode | Verified locally | Non-read tools are denied by the central policy |
 | Auto-edit mode | Verified locally | Reads/edits allowed while commands and external tools remain gated |
-| Full auto mode | Partial | Explicit dangerous-mode warning and sandbox requirement |
+| Full auto mode | Verified locally | CLI startup, runtime mode switching, and SDK reject unisolated auto-approve unless the explicit unsafe override is set |
 | Dry-run mode | Verified after fix | No side effects, including hooks and subagents |
-| OS sandbox | Partial/unwired | Linux bwrap, macOS sandbox/container, Windows restricted execution |
-| Network isolation | Partial | `web_fetch` supports public-host validation plus domain allowlist; per-command sandbox network enforcement remains |
+| OS sandbox | Partial | Fail-closed workspace-write Bubblewrap on Linux, scoped `sandbox-exec` profile on macOS, verified Docker image fallback on all platforms, and clearly labeled approval-controlled direct mode; native Windows AppContainer remains |
+| Network isolation | Verified locally | Bubblewrap network namespace, macOS profile rules, and Docker `none` networking default to blocked; `web_fetch` separately enforces public-host validation and optional domains |
 | Environment scrubbing | Partial | Child processes receive a scrubbed operational env and tool outputs are redacted; explicit secret allowlist remains |
 | Prompt-injection isolation | Partial | Untrusted content provenance and tool-policy enforcement |
 | Secret scanning/redaction | Partial | Runtime logs, persisted messages/tool calls, tool output, and exports are redacted; pre-commit scanning remains |

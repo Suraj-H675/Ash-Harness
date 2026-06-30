@@ -971,18 +971,23 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 print(f"Permission mode: {mode.value}")
                 continue
             if command.name == "sandbox":
-                from sandbox import SandboxManager
-
-                manager = SandboxManager(workspace_root=loop.project_root)
+                manager = sandbox_manager
+                sandbox_status = manager.status()
                 sandbox_capabilities = ", ".join(
                     f"{name}={'yes' if available else 'no'}"
-                    for name, available in manager.capabilities().items()
+                    for name, available in sandbox_status["available"].items()
                 )
                 print(
-                    f"Sandbox: {manager.backend_name} (tier {manager.tier}); "
-                    f"network={'enabled' if manager.network else 'disabled'}; "
+                    f"Sandbox: {sandbox_status['backend']} "
+                    f"(tier {sandbox_status['tier']}); "
+                    f"isolated={'yes' if sandbox_status['isolated'] else 'no'}; "
+                    f"filesystem={sandbox_status['filesystem']}; "
+                    f"network={sandbox_status['network']}; "
+                    f"fail_closed={'yes' if sandbox_status['fail_closed'] else 'no'}; "
                     f"{sandbox_capabilities}"
                 )
+                if sandbox_status["remediation"]:
+                    print(f"Action: {sandbox_status['remediation']}")
                 continue
             if command.name == "doctor":
                 from cli.doctor import render_doctor, run_doctor

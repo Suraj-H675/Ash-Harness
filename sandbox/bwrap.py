@@ -99,10 +99,11 @@ class BubblewrapSandbox(SandboxBackend):
 
         # Read-only system mounts so basic commands can resolve their
         # loaders; the list is intentionally conservative.
-        for ro in ("/usr", "/bin", "/lib", "/lib64", "/etc", "/dev"):
+        for ro in ("/usr", "/bin", "/lib", "/lib64", "/etc"):
             if Path(ro).exists():
                 ro_str = str(Path(ro))
                 args.extend(["--ro-bind", ro_str, ro_str])
+        args.extend(["--proc", "/proc", "--dev", "/dev"])
 
         # Workspace (read-write) — required for any meaningful work.
         if self.workspace_root is None:

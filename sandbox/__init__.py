@@ -6,9 +6,9 @@ Tiered execution per the V4 roadmap in ASH_MASTER_PLAN_V2.md:
 * Tier 2: bubblewrap on Linux, sandbox-exec on macOS.
 * Tier 3: ephemeral Docker container.
 
-Higher tiers are preferred when available; on any failure the manager
-falls back to the next-lower tier so user workflows are never blocked
-by missing sandboxing infrastructure.
+Ash prefers the compatible native backend, then a verified Docker image.
+Direct execution is labeled as unisolated, and an isolated invocation fails
+closed if its backend disappears.
 """
 
 from sandbox._base import (

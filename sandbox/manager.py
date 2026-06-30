@@ -19,7 +19,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, TypedDict
 
 from sandbox._base import (
     SANDBOX_TIER_BWRAP,
@@ -30,7 +30,7 @@ from sandbox._base import (
     SandboxTier,
 )
 from sandbox.bwrap import BubblewrapSandbox, probe_bwrap
-from sandbox.docker import DockerSandbox, probe_docker
+from sandbox.docker import DEFAULT_IMAGE, DockerSandbox, probe_docker
 from sandbox.process_utils import process_group_options, terminate_process_tree
 
 
@@ -79,6 +79,18 @@ class SandboxInvocation:
     tier: SandboxTier
     backend_name: str
     fallback_used: bool = False
+
+
+class SandboxStatus(TypedDict):
+    backend: str
+    tier: SandboxTier
+    isolated: bool
+    filesystem: str
+    network: str
+    fail_closed: bool
+    available: dict[str, bool]
+    detail: str
+    remediation: str
 
 
 # --- probe helpers ---------------------------------------------------------
@@ -136,9 +148,9 @@ class SandboxManager:
         2/3; optional for tier 1 (the path-scoped subprocess respects
         the caller's ``cwd``).
     preferred_tier
-        The highest tier the caller is willing to use. The manager
-        still picks the highest tier ``<= preferred_tier`` that is
-        actually available; defaults to the maximum (3).
+        The strongest tier the caller is willing to use. Native isolation is
+        preferred for host-tool compatibility, with a verified container as
+        the portable fallback. Defaults to the maximum (3).
     network
         Whether sandboxed processes may access the network. Defaults
         to ``False`` per the V4 spec.
@@ -157,6 +169,13 @@ class SandboxManager:
     allow_scoped_fallback: bool = False
 
     def __post_init__(self) -> None:
+        if self.preferred_tier not in {
+            SANDBOX_TIER_SCOPED,
+            SANDBOX_TIER_BWRAP,
+            SANDBOX_TIER_DOCKER,
+        }:
+            raise ValueError("preferred_tier must be 1, 2, or 3")
+        self._available: dict[str, bool] = {"scoped": True}
         self._tier: SandboxTier = self._detect_tier()
 
     # --- public API ------------------------------------------------------
@@ -178,9 +197,39 @@ class SandboxManager:
 
         return {
             "scoped": True,
-            "bwrap": has_bwrap(),
-            "sandbox_exec": has_sandbox_exec(),
-            "docker": has_docker(),
+            "bwrap": self._backend_available("bwrap"),
+            "sandbox_exec": self._backend_available("sandbox_exec"),
+            "docker": self._backend_available("docker"),
+        }
+
+    def status(self) -> SandboxStatus:
+        """Return stable, user-facing enforcement and backend diagnostics."""
+
+        isolated = self.is_fully_isolated()
+        if isolated:
+            filesystem = "workspace-write"
+            network = "enabled" if self.network else "blocked"
+            detail = (
+                "Commands are isolated to the workspace and temporary storage; "
+                f"network access is {network}."
+            )
+        else:
+            filesystem = "host"
+            network = "host"
+            detail = (
+                "Commands run as the current user without OS filesystem or network "
+                "isolation and require permission-policy control."
+            )
+        return {
+            "backend": self.backend_name,
+            "tier": self.tier,
+            "isolated": isolated,
+            "filesystem": filesystem,
+            "network": network,
+            "fail_closed": not self.allow_scoped_fallback,
+            "available": self.capabilities(),
+            "detail": detail,
+            "remediation": "" if isolated else _sandbox_remediation(),
         }
 
     def is_fully_isolated(self) -> bool:
@@ -261,15 +310,31 @@ class SandboxManager:
     # --- tier detection --------------------------------------------------
 
     def _detect_tier(self) -> SandboxTier:
-        """Pick the highest available tier ``<= preferred_tier``."""
+        """Prefer a compatible native sandbox, then a verified container."""
 
-        if self.preferred_tier >= SANDBOX_TIER_DOCKER and has_docker():
+        if self.preferred_tier >= SANDBOX_TIER_BWRAP:
+            if sys.platform.startswith("linux") and self._backend_available("bwrap"):
+                return SANDBOX_TIER_BWRAP
+            if sys.platform == "darwin" and self._backend_available("sandbox_exec"):
+                return SANDBOX_TIER_BWRAP
+        if self.preferred_tier >= SANDBOX_TIER_DOCKER and self._backend_available(
+            "docker"
+        ):
             return SANDBOX_TIER_DOCKER
-        if self.preferred_tier >= SANDBOX_TIER_BWRAP and has_bwrap():
-            return SANDBOX_TIER_BWRAP
-        if self.preferred_tier >= SANDBOX_TIER_BWRAP and has_sandbox_exec():
-            return SANDBOX_TIER_BWRAP
         return SANDBOX_TIER_SCOPED
+
+    def _backend_available(self, name: str) -> bool:
+        cached = self._available.get(name)
+        if cached is not None:
+            return cached
+        probes = {
+            "bwrap": has_bwrap,
+            "sandbox_exec": has_sandbox_exec,
+            "docker": has_docker,
+        }
+        available = probes[name]()
+        self._available[name] = available
+        return available
 
     def _build_backend(self, tier: SandboxTier) -> SandboxBackend:
         if tier == SANDBOX_TIER_DOCKER:
@@ -488,3 +553,23 @@ def _backend_name(tier: SandboxTier) -> str:
             return "sandbox-exec"
         return "bubblewrap"
     return "scoped"
+
+
+def _sandbox_remediation() -> str:
+    if sys.platform.startswith("linux"):
+        return (
+            "Install and enable bubblewrap, or start Docker and provide the "
+            f"{DEFAULT_IMAGE} image."
+        )
+    if sys.platform == "darwin":
+        return (
+            "Ensure /usr/bin/sandbox-exec is available, or start Docker and provide "
+            f"the {DEFAULT_IMAGE} image."
+        )
+    if sys.platform == "win32":
+        return (
+            "Start Docker Desktop and provide the "
+            f"{DEFAULT_IMAGE} image; native Windows isolation is not "
+            "currently available."
+        )
+    return f"Start Docker and provide the {DEFAULT_IMAGE} image."

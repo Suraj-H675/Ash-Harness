@@ -53,12 +53,15 @@ class StatusLine:
             1,
             self.config.max_context_tokens - self.config.max_completion_tokens,
         )
+        sandbox_label = self.sandbox.backend_name
+        if not self.sandbox.is_fully_isolated():
+            sandbox_label += "!"
         self._cached = (
             f" {self.config.model} | {self.loop.permission_policy.mode.value} | "
             f"git:{git_branch(self.loop.project_root)} | "
             f"ctx ~{self.loop._last_context_tokens}/{maximum} | "
             f"cache:{cache_read}r/{cache_write}w | "
-            f"${cost:.4f} | sb:{self.sandbox.backend_name} | "
+            f"${cost:.4f} | sb:{sandbox_label} | "
             f"s:{session_id} | {self.loop.project_root} "
         )
         return self._cached
