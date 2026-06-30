@@ -130,6 +130,47 @@ class TestAtomicWrite:
         assert "old_key" not in content
         assert "ANTHROPIC_API_KEY=new_key" in content
 
+    def test_config_backup_is_verified_and_private(self, tmp_path: Path) -> None:
+        from cli import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        source = tmp_path / "legacy.toml"
+        source.write_bytes(b'model_name = "legacy"\n')
+
+        backup = cli_config.backup_config_file(source, label="legacy-ash.toml")
+
+        assert backup.parent == cli_config.ASH_DIR / "backups"
+        assert backup.read_bytes() == source.read_bytes()
+        assert backup.name.startswith("legacy-ash.toml.")
+        assert backup.name.endswith(".bak")
+        if os.name != "nt":
+            assert backup.stat().st_mode & 0o777 == 0o600
+            assert backup.parent.stat().st_mode & 0o777 == 0o700
+        assert list(backup.parent.glob("*.tmp")) == []
+
+    def test_config_backup_rejects_symlinks_and_invalid_labels(
+        self, tmp_path: Path
+    ) -> None:
+        from cli import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        source = tmp_path / "source.toml"
+        source.write_text("value = 1\n", encoding="utf-8")
+        symlink = tmp_path / "linked.toml"
+        try:
+            symlink.symlink_to(source)
+        except OSError:
+            pytest.skip("symlinks are unavailable")
+
+        with pytest.raises(ValueError, match="symlinked"):
+            cli_config.backup_config_file(symlink, label="legacy")
+        with pytest.raises(ValueError, match="backup label"):
+            cli_config.backup_config_file(source, label="../escape")
+
     def test_save_env_values_commits_related_settings_together(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

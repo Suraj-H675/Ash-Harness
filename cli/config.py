@@ -9,12 +9,14 @@ All file writes are atomic (tempfile.mkstemp + os.replace).
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sys
 import tempfile
 import tomllib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,7 @@ CONFIG_FILE = ASH_DIR / "ash.toml"
 _INITIAL_PATHS = (ASH_DIR, ENV_FILE, CONFIG_FILE)
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FILE_BACKED_ENV_VALUES: dict[str, tuple[str, str]] = {}
+_BACKUP_LABEL = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def _paths() -> tuple[Path, Path, Path]:
@@ -56,6 +59,55 @@ def get_env_path() -> Path:
 def get_config_path() -> Path:
     """Return ~/.ash/ash.toml."""
     return _paths()[2]
+
+
+def backup_config_file(path: str | Path, *, label: str) -> Path:
+    """Create and verify a private immutable copy of a config file."""
+
+    source = Path(path).expanduser()
+    if not _BACKUP_LABEL.fullmatch(label):
+        raise ValueError("backup label may contain only letters, digits, '.', '_', and '-'")
+    if source.is_symlink():
+        raise ValueError(f"refusing to back up symlinked config file: {source}")
+    if not source.is_file():
+        raise FileNotFoundError(source)
+
+    before = source.stat()
+    backup_dir = ensure_ash_dir() / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        backup_dir.chmod(0o700)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    destination = backup_dir / f"{label}.{timestamp}.bak"
+    fd, temporary = tempfile.mkstemp(
+        dir=backup_dir,
+        prefix=f".{label}.",
+        suffix=".tmp",
+    )
+    source_digest = hashlib.sha256()
+    try:
+        with source.open("rb") as source_handle, os.fdopen(fd, "wb") as target:
+            while chunk := source_handle.read(1024 * 1024):
+                source_digest.update(chunk)
+                target.write(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        after = source.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise OSError(f"config changed while it was being backed up: {source}")
+        copied_digest = hashlib.sha256(Path(temporary).read_bytes()).digest()
+        if copied_digest != source_digest.digest():
+            raise OSError(f"config backup verification failed: {source}")
+        os.replace(temporary, destination)
+        if os.name != "nt":
+            destination.chmod(0o600)
+        return destination
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
