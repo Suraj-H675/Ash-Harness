@@ -7,6 +7,7 @@ import httpx
 
 from context.tokens import AnthropicTokenCounter
 from providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from providers.retry import ProviderHTTPError
 
 
 class OllamaProvider(ProviderABC):
@@ -58,7 +59,11 @@ class OllamaProvider(ProviderABC):
                 if resp.status_code != 200:
                     await resp.aread()
                     text = resp.text
-                    raise RuntimeError(f"Ollama API error {resp.status_code}: {text}")
+                    raise ProviderHTTPError(
+                        f"Ollama API error {resp.status_code}: {text}",
+                        status_code=resp.status_code,
+                        headers=resp.headers,
+                    )
                 async for line in resp.aiter_lines():
                     if not line.strip():
                         continue

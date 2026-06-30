@@ -694,3 +694,101 @@ async def test_retry_on_transient_failure(tmp_path):
         assert (
             transient_count == 3
         )  # 3 total attempts: fail, fail, success (MAX_RETRIES=2 means 2 retries)
+
+
+@pytest.mark.asyncio
+async def test_provider_retries_transient_failure_before_output(tmp_path):
+    class APIConnectionError(RuntimeError):
+        pass
+
+    class FlakyProvider(ProviderABC):
+        model_name = "flaky-provider"
+
+        def __init__(self):
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.calls < 3:
+                raise APIConnectionError("connection reset sk-abcdefghijklmnop")
+            yield StreamChunk(content="recovered", is_done=True)
+
+    provider = FlakyProvider()
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        ui,
+        tmp_path,
+        config=AshConfig(
+            model="ollama/test",
+            provider_max_attempts=3,
+            provider_retry_base_delay=0,
+            provider_retry_max_delay=0,
+        ),
+    )
+
+    response, *_ = await loop._stream_one_completion([])
+
+    assert response == "recovered"
+    assert provider.calls == 3
+    retries = [event for event in ui.events if event["type"] == "provider.retrying"]
+    assert [event["attempt"] for event in retries] == [2, 3]
+    assert all(event["delay_seconds"] == 0 for event in retries)
+    assert all("sk-abcdefghijklmnop" not in event["reason"] for event in retries)
+
+
+@pytest.mark.asyncio
+async def test_provider_does_not_retry_permanent_or_partial_failure(tmp_path):
+    class APIError(RuntimeError):
+        status_code = 401
+
+    class PermanentProvider(ProviderABC):
+        model_name = "permanent"
+
+        def __init__(self):
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            raise APIError("invalid API key")
+            yield  # pragma: no cover
+
+    permanent = PermanentProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "permanent.db"),
+        permanent,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(model="ollama/test", provider_retry_base_delay=0),
+    )
+    with pytest.raises(APIError, match="invalid API key"):
+        await loop._stream_one_completion([])
+    assert permanent.calls == 1
+
+    class PartialProvider(PermanentProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            yield StreamChunk(content="partial")
+            raise ConnectionError("stream disconnected")
+
+    partial = PartialProvider()
+    partial_loop = AshLoop(
+        SessionStore(tmp_path / "partial.db"),
+        partial,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(model="ollama/test", provider_retry_base_delay=0),
+    )
+    with pytest.raises(ConnectionError, match="stream disconnected"):
+        await partial_loop._stream_one_completion([])
+    assert partial.calls == 1

@@ -39,6 +39,7 @@ from ash_logging import get_logger
 from mcp.server import load_mcp_servers
 from providers.base import ProviderABC, TokenCounterLike
 from providers.capabilities import ProviderCapabilities
+from providers.retry import classify_provider_failure, retry_delay
 from repo.repomap import RepoMap
 from safety.guard import SafetyGuard
 from safety.policy import PermissionPolicy, PolicyAction, READ_ONLY_TOOLS
@@ -854,26 +855,73 @@ class AshLoop:
         cache_read_tokens = 0
         cache_write_tokens = 0
         native_tool_calls_from_api: list[dict[str, Any]] = []
+        maximum_attempts = int(getattr(self._config, "provider_max_attempts", 3))
+        retry_base_delay = float(
+            getattr(self._config, "provider_retry_base_delay", 0.5)
+        )
+        retry_max_delay = float(getattr(self._config, "provider_retry_max_delay", 8.0))
 
         try:
             with self.ui.begin_turn():
-                async for chunk in self.provider.stream_chat(
-                    messages, tools=openai_tools
-                ):
-                    for fragment in (chunk.content, chunk.tool_call_delta):
-                        if not fragment:
-                            continue
-                        for event in parser.feed(fragment):
-                            self._handle_event(event, text_chunks, tool_calls)
-                    # Collect native tool calls from the API (these carry real IDs).
-                    if chunk.native_tool_calls:
-                        native_tool_calls_from_api.extend(chunk.native_tool_calls)
-                    # Capture usage from the final chunk (when is_done=True).
-                    if chunk.is_done:
-                        prompt_tokens = chunk.prompt_tokens
-                        completion_tokens = chunk.completion_tokens
-                        cache_read_tokens = chunk.cache_read_tokens
-                        cache_write_tokens = chunk.cache_write_tokens
+                attempt = 1
+                while True:
+                    emitted = False
+                    try:
+                        async for chunk in self.provider.stream_chat(
+                            messages, tools=openai_tools
+                        ):
+                            emitted = True
+                            for fragment in (chunk.content, chunk.tool_call_delta):
+                                if not fragment:
+                                    continue
+                                for event in parser.feed(fragment):
+                                    self._handle_event(event, text_chunks, tool_calls)
+                            if chunk.native_tool_calls:
+                                native_tool_calls_from_api.extend(
+                                    chunk.native_tool_calls
+                                )
+                            if chunk.is_done:
+                                prompt_tokens = chunk.prompt_tokens
+                                completion_tokens = chunk.completion_tokens
+                                cache_read_tokens = chunk.cache_read_tokens
+                                cache_write_tokens = chunk.cache_write_tokens
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        failure = classify_provider_failure(exc)
+                        if (
+                            emitted
+                            or not failure.retriable
+                            or attempt >= maximum_attempts
+                        ):
+                            raise
+                        delay = retry_delay(
+                            failure,
+                            attempt,
+                            base_delay=retry_base_delay,
+                            max_delay=retry_max_delay,
+                        )
+                        safe_reason = redact_text(failure.message)
+                        self.ui.emit_event(
+                            {
+                                "type": "provider.retrying",
+                                "attempt": attempt + 1,
+                                "max_attempts": maximum_attempts,
+                                "delay_seconds": delay,
+                                "status_code": failure.status_code,
+                                "reason": safe_reason,
+                            }
+                        )
+                        _log.warning(
+                            "provider attempt {}/{} failed before output; retrying in {:.2f}s: {}",
+                            attempt,
+                            maximum_attempts,
+                            delay,
+                            safe_reason,
+                        )
+                        await asyncio.sleep(delay)
+                        attempt += 1
                 # Drain the parser's remaining buffer at end-of-stream.
                 for event in parser.feed(""):
                     self._handle_event(event, text_chunks, tool_calls)

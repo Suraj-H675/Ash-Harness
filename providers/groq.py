@@ -35,7 +35,11 @@ class GroqProvider(ProviderABC):
         self._api_key = api_key
         self._base_url = base_url or "https://api.groq.com/openai/v1"
         self._token_counter = token_counter or AnthropicTokenCounter()
-        self._client = openai.AsyncOpenAI(api_key=api_key, base_url=self._base_url)
+        self._client = openai.AsyncOpenAI(
+            api_key=api_key,
+            base_url=self._base_url,
+            max_retries=0,
+        )
 
     @property
     def model_name(self) -> str:

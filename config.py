@@ -42,6 +42,9 @@ PROJECT_CONFIG_FIELDS = frozenset(
         "steering_queue_limit",
         "prompt_cache_enabled",
         "prompt_cache_retention",
+        "provider_max_attempts",
+        "provider_retry_base_delay",
+        "provider_retry_max_delay",
         "model_pricing_usd_per_million",
         "context_compaction_threshold",
         "context_recent_messages",
@@ -275,6 +278,24 @@ class AshConfig(BaseSettings):
     fallback_models: list[str] = Field(
         default_factory=list,
         description="Ordered provider/model fallbacks used before output begins.",
+    )
+    provider_max_attempts: int = Field(
+        3,
+        ge=1,
+        le=10,
+        description="Maximum provider attempts before any response output is emitted.",
+    )
+    provider_retry_base_delay: float = Field(
+        0.5,
+        ge=0.0,
+        le=60.0,
+        description="Initial provider retry delay in seconds.",
+    )
+    provider_retry_max_delay: float = Field(
+        8.0,
+        ge=0.0,
+        le=300.0,
+        description="Maximum provider retry delay, including Retry-After values.",
     )
     context_compaction_threshold: float = Field(
         0.80,
@@ -592,6 +613,15 @@ class AshConfig(BaseSettings):
                     "notification_events entries must be turn_complete or approval_required"
                 ) from exc
         return list(dict.fromkeys(normalized))
+
+    @model_validator(mode="after")
+    def validate_provider_retry_delays(self) -> "AshConfig":
+        if self.provider_retry_max_delay < self.provider_retry_base_delay:
+            raise ValueError(
+                "provider_retry_max_delay must be greater than or equal to "
+                "provider_retry_base_delay"
+            )
+        return self
 
     @model_validator(mode="after")
     def apply_screen_reader_preferences(self) -> "AshConfig":

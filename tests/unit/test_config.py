@@ -255,6 +255,19 @@ def test_prompt_cache_preferences_are_validated() -> None:
         AshConfig(prompt_cache_retention="forever")
 
 
+def test_provider_retry_preferences_are_validated() -> None:
+    config = AshConfig(
+        provider_max_attempts=5,
+        provider_retry_base_delay=0.25,
+        provider_retry_max_delay=12.0,
+    )
+    assert config.provider_max_attempts == 5
+    assert config.provider_retry_base_delay == 0.25
+    assert config.provider_retry_max_delay == 12.0
+    with pytest.raises(ValueError, match="provider_retry_max_delay"):
+        AshConfig(provider_retry_base_delay=2.0, provider_retry_max_delay=1.0)
+
+
 def test_allowed_web_domains_are_normalized_and_validated() -> None:
     config = AshConfig(
         allowed_web_domains=["Example.COM.", "*.Docs.Example", "example.com"]

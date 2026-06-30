@@ -71,7 +71,11 @@ class OpenAIProvider(ProviderABC):
         self._api_key = api_key
         self._base_url = base_url
         self._token_counter = token_counter or OpenAITokenCounter(model_name)
-        self._client = client or openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._client = client or openai.AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=0,
+        )
         self._owns_client = client is None
         self._prompt_cache_enabled = False
         self._prompt_cache_key = ""

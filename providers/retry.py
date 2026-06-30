@@ -26,6 +26,15 @@ class ProviderFailure:
     retry_after: float | None = None
 
 
+class ProviderHTTPError(RuntimeError):
+    """Provider-neutral HTTP failure retaining status and response headers."""
+
+    def __init__(self, message: str, *, status_code: int, headers: Any = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.headers = headers or {}
+
+
 def classify_provider_failure(error: BaseException) -> ProviderFailure:
     """Classify an SDK/http failure without importing provider SDK types."""
 

@@ -137,12 +137,12 @@ class AnthropicProvider(ProviderABC):
                 "Install it with `pip install anthropic` or inject a client."
             ) from exc
 
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {"max_retries": 0}
         if self._api_key:
             kwargs["api_key"] = self._api_key
         if self._base_url:
             kwargs["base_url"] = self._base_url
-        self._client = AsyncAnthropic(**kwargs) if kwargs else AsyncAnthropic()
+        self._client = AsyncAnthropic(**kwargs)
         return self._client
 
     async def stream_chat(

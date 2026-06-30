@@ -505,6 +505,44 @@ def test_openai_provider_initializes():
     assert provider.count_tokens("hello world") > 0
 
 
+def test_ash_owned_sdk_clients_disable_nested_retries(monkeypatch) -> None:
+    import sys
+
+    from providers.anthropic import AnthropicProvider
+    from providers.deepseek import DeepSeekProvider
+    from providers.groq import GroqProvider
+    from providers.openai import OpenAIProvider
+
+    openai_calls: list[dict[str, Any]] = []
+    anthropic_calls: list[dict[str, Any]] = []
+
+    def openai_client(**kwargs):
+        openai_calls.append(kwargs)
+        return SimpleNamespace()
+
+    def anthropic_client(**kwargs):
+        anthropic_calls.append(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr("providers.openai.openai.AsyncOpenAI", openai_client)
+    monkeypatch.setattr("providers.deepseek.openai.AsyncOpenAI", openai_client)
+    monkeypatch.setattr("providers.groq.openai.AsyncOpenAI", openai_client)
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=anthropic_client),
+    )
+
+    OpenAIProvider(model_name="gpt", api_key="key")
+    DeepSeekProvider(model_name="deepseek", api_key="key")
+    GroqProvider(model_name="groq", api_key="key")
+    AnthropicProvider(model_name="claude", api_key="key")._resolve_client()
+
+    assert len(openai_calls) == 3
+    assert all(call["max_retries"] == 0 for call in openai_calls)
+    assert anthropic_calls == [{"max_retries": 0, "api_key": "key"}]
+
+
 def test_openai_message_translation_preserves_tool_call_ids():
     from providers.openai import prepare_openai_messages
 
