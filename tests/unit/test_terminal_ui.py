@@ -34,6 +34,23 @@ def test_terminal_ui_renders_markdown_and_reasoning() -> None:
     assert "bold" in rendered
     assert "print('ok')" in rendered
     assert "**bold**" not in rendered
+    transcript = ui.transcript.snapshot()
+    assert [(entry.kind, entry.finalized) for entry in transcript] == [
+        ("reasoning", True),
+        ("assistant", True),
+    ]
+    assert transcript[0].content == "checking"
+    assert transcript[1].content.startswith("**bold**")
+
+
+def test_terminal_ui_does_not_commit_empty_assistant_entry() -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+
+    with ui.begin_turn():
+        pass
+    ui.finalize_turn()
+
+    assert ui.transcript.snapshot() == ()
 
 
 def test_terminal_ui_dry_run_denies_all():
@@ -80,3 +97,5 @@ def test_terminal_ui_renders_tool_lifecycle_without_arguments() -> None:
     )
     assert "tool read_file [completed]" in output.getvalue()
     assert "secret" not in output.getvalue()
+    assert ui.transcript.snapshot()[-1].content == "read_file [completed]"
+    assert "arguments" not in (ui.transcript.snapshot()[-1].metadata or {})

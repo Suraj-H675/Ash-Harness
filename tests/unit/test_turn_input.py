@@ -114,6 +114,8 @@ async def test_interactive_controller_queues_steering_during_stream(
     provider.release.set()
 
     assert await turn == "redirected"
+    assert ui.transcript.snapshot()[0].kind == "user"
+    assert ui.transcript.snapshot()[0].content == "start"
     assert statuses == ["Steering queued (1 pending)."]
     assert any(
         message["role"] == "user" and message["content"] == "change direction"

@@ -28,6 +28,8 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 from rich.text import Text
 
+from ui.transcript import Transcript
+
 
 ApprovalCallback = Callable[[str, dict[str, Any]], bool]
 
@@ -72,6 +74,7 @@ class TerminalUI:
         no_color: bool = False,
         reduced_motion: bool = False,
         workspace_root: Path | None = None,
+        transcript: Transcript | None = None,
     ) -> None:
         if safety_tier not in {
             "interactive",
@@ -91,6 +94,9 @@ class TerminalUI:
         self.show_token_meter = show_token_meter
         self.reduced_motion = reduced_motion
         self.workspace_root = workspace_root.resolve() if workspace_root else None
+        self.transcript = transcript or Transcript()
+        self._assistant_entry_id: str | None = None
+        self._reasoning_entry_id: str | None = None
         self._token_progress = (
             Progress(
                 TextColumn("[progress.description]{task.description}"),
@@ -131,6 +137,8 @@ class TerminalUI:
 
         buffers: _LiveBuffers = _LiveBuffers.fresh()
         self._active_buffers = buffers
+        self._assistant_entry_id = None
+        self._reasoning_entry_id = None
         if self._token_progress is not None:
             self._token_task = self._token_progress.add_task(
                 "[dim]Tokens", total=100000, completed=0
@@ -180,12 +188,22 @@ class TerminalUI:
             return
         buffers = self._active_buffers_required()
         buffers.response += text
+        if self._assistant_entry_id is None:
+            self._assistant_entry_id = self.transcript.begin("assistant", title="ash")
+        self.transcript.append_delta(self._assistant_entry_id, text)
         self._refresh_live()
 
     def print_thought(self, text: str) -> None:
         if not text:
             return
         buffers = self._active_buffers_required()
+        if self._reasoning_entry_id is None:
+            self._reasoning_entry_id = self.transcript.begin(
+                "reasoning", title="reasoning"
+            )
+        elif buffers.thought:
+            self.transcript.append_delta(self._reasoning_entry_id, "\n")
+        self.transcript.append_delta(self._reasoning_entry_id, text)
         if buffers.thought:
             buffers.thought.append("\n")
         buffers.thought.append("reasoning: " + text, style="dim italic")
@@ -197,8 +215,14 @@ class TerminalUI:
         live = getattr(self, "_active_live", None)
         if live is not None:
             live.update(self._render_active_turn(), refresh=True)
+        if self._reasoning_entry_id is not None:
+            self.transcript.finalize(self._reasoning_entry_id)
+        if self._assistant_entry_id is not None:
+            self.transcript.finalize(self._assistant_entry_id)
         self._active_buffers = None
         self._active_live = None
+        self._reasoning_entry_id = None
+        self._assistant_entry_id = None
         if self._token_progress is not None:
             self._token_progress.stop()
         self._token_task = None
@@ -248,6 +272,16 @@ class TerminalUI:
             "tool.error": ("error", "red"),
         }
         label, style = labels[event_type]
+        self.transcript.append(
+            "tool",
+            f"{tool} [{label}]",
+            title=tool,
+            metadata={
+                key: payload[key]
+                for key in ("type", "call_id", "success")
+                if key in payload
+            },
+        )
         line = Text("tool ", style="dim")
         line.append(tool, style="bold")
         line.append(f" [{label}]", style=style)
@@ -327,10 +361,21 @@ class TerminalUI:
                 "\nApprove once [y], for this session [a], or deny [N]? ",
                 style="bold yellow",
             )
+        self.transcript.append(
+            "approval",
+            body.plain,
+            title=tool_name,
+            metadata={"auto": auto},
+        )
         self.console.print(Panel(body, border_style="yellow", title="approval"))
 
         if live is not None:
             live.start()
+
+    def record_user_input(self, text: str) -> None:
+        """Commit submitted user input to the interactive transcript."""
+
+        self.transcript.append("user", text, title="you")
 
     def _edit_preview(self, tool_name: str, arguments: dict[str, Any]) -> str:
         if tool_name == "apply_patch":

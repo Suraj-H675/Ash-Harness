@@ -37,6 +37,7 @@ class InteractiveTurnController:
     async def run(self, user_input: str) -> str | None:
         """Return the final response, or ``None`` when the user cancels."""
 
+        self.ui.record_user_input(user_input)
         previous_approval = self.loop.on_tool_approval
         self.loop.on_tool_approval = self._request_approval
         turn = asyncio.create_task(self.loop.run_turn(user_input))
