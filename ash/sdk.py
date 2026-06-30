@@ -83,6 +83,7 @@ class AshClient:
             runtime_config = runtime_config.model_copy(
                 update={"workspace_root": workspace.resolve()}
             )
+        permission_rules = load_permission_rules(runtime_config.workspace_root)
         store = SessionStore(runtime_config.db_directory / "sessions.db")
         guard = SafetyGuard(
             runtime_config.workspace_root,
@@ -125,9 +126,7 @@ class AshClient:
             onnx_model_path=runtime_config.onnx_model_path,
             chroma_persist_dir=runtime_config.chroma_persist_dir,
         )
-        loop.permission_policy.set_persistent_rules(
-            load_permission_rules(runtime_config.workspace_root)
-        )
+        loop.permission_policy.set_persistent_rules(permission_rules)
 
         def checkpoint_context() -> tuple[str, str] | None:
             if loop.current_session is None or loop.turn_context is None:

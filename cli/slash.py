@@ -54,7 +54,7 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand(
         "permissions",
         "Inspect/change mode or grants",
-        "/permissions [mode|allow TOOL|revoke TOOL]",
+        "/permissions [mode|allow TOOL|ask TOOL|deny TOOL|revoke TOOL|remove RULE_ID]",
     ),
     SlashCommand("sandbox", "Show active sandbox capabilities", "/sandbox"),
     SlashCommand("doctor", "Run local diagnostics", "/doctor"),

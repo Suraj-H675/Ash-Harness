@@ -842,26 +842,62 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 user_input = build_review_prompt(label, changes)
                 parsed_command = None
             if command.name == "permissions":
+                from cli.permissions import render_permission_rules
+                from safety.grants import (
+                    PermissionRule,
+                    RuleEffect,
+                    add_permission_rule,
+                    load_permission_rules,
+                    remove_permission_rule,
+                    remove_permission_rules_for_tool,
+                )
                 from safety.policy import PermissionMode, PermissionPolicy
-                from safety.grants import load_permission_rules, set_tool_grant
 
                 if not arguments:
-                    grants = sorted(loop.permission_policy.persistent_tool_grants)
                     print(f"Permission mode: {loop.permission_policy.mode.value}")
-                    print("Persistent grants: " + (", ".join(grants) or "(none)"))
+                    print(
+                        render_permission_rules(
+                            loop.project_root,
+                            loop.permission_policy.persistent_rules,
+                        )
+                    )
                     continue
-                if len(arguments) == 2 and arguments[0] in {"allow", "revoke"}:
-                    tool_name = arguments[1]
-                    if tool_name not in loop.tools:
-                        print(f"Error: unknown tool {tool_name!r}", file=sys.stderr)
+                if len(arguments) == 2 and arguments[0] in {
+                    "allow",
+                    "ask",
+                    "deny",
+                    "revoke",
+                    "remove",
+                }:
+                    action, target = arguments
+                    try:
+                        if action == "remove":
+                            remove_permission_rule(loop.project_root, target)
+                        else:
+                            if target not in loop.tools:
+                                print(
+                                    f"Error: unknown tool {target!r}",
+                                    file=sys.stderr,
+                                )
+                                continue
+                            if action == "revoke":
+                                remove_permission_rules_for_tool(
+                                    loop.project_root,
+                                    target,
+                                    effect=RuleEffect.ALLOW,
+                                )
+                            else:
+                                add_permission_rule(
+                                    loop.project_root,
+                                    PermissionRule.create(action, target),
+                                )
+                        loop.permission_policy.set_persistent_rules(
+                            load_permission_rules(loop.project_root)
+                        )
+                    except ValueError as exc:
+                        print(f"Error: {exc}", file=sys.stderr)
                         continue
-                    set_tool_grant(
-                        loop.project_root, tool_name, arguments[0] == "allow"
-                    )
-                    loop.permission_policy.set_persistent_rules(
-                        load_permission_rules(loop.project_root)
-                    )
-                    print(f"Persistent grant {arguments[0]}: {tool_name}")
+                    print(f"Permission rule {action}: {target}")
                     continue
                 if len(arguments) != 1:
                     print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
@@ -1151,12 +1187,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     permissions_status = permissions_subparsers.add_parser("status")
     permissions_status.add_argument("--json", action="store_true")
-    permissions_allow = permissions_subparsers.add_parser("allow")
-    permissions_allow.add_argument("tool_name")
-    permissions_allow.add_argument("--json", action="store_true")
+    for effect in ("allow", "ask", "deny"):
+        permissions_rule = permissions_subparsers.add_parser(effect)
+        permissions_rule.add_argument("tool_name")
+        permissions_rule.add_argument(
+            "--exact",
+            action="append",
+            default=[],
+            metavar="ARGUMENT=JSON",
+        )
+        permissions_rule.add_argument(
+            "--prefix",
+            action="append",
+            default=[],
+            metavar="ARGUMENT=TEXT",
+        )
+        permissions_rule.add_argument(
+            "--command-prefix",
+            nargs="+",
+            default=[],
+            metavar="TOKEN",
+        )
+        permissions_rule.add_argument("--json", action="store_true")
     permissions_revoke = permissions_subparsers.add_parser("revoke")
     permissions_revoke.add_argument("tool_name")
     permissions_revoke.add_argument("--json", action="store_true")
+    permissions_remove = permissions_subparsers.add_parser("remove")
+    permissions_remove.add_argument("rule_id")
+    permissions_remove.add_argument("--json", action="store_true")
     permissions_clear = permissions_subparsers.add_parser("clear")
     permissions_clear.add_argument("--yes", action="store_true")
     permissions_clear.add_argument("--json", action="store_true")
@@ -1544,21 +1602,32 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "permissions":
         from cli.permissions import (
-            allow_permission_grant,
+            add_cli_permission_rule,
             clear_permission_grants,
-            render_permission_grants,
+            remove_cli_permission_rule,
+            render_permission_rules,
             revoke_permission_grant,
         )
-        from safety.grants import load_tool_grants
+        from safety.grants import load_permission_rules
 
         permissions_config = AshConfig.load()
         workspace = permissions_config.workspace_root
         action = args.permissions_action or "status"
         try:
-            if action == "allow":
-                grants = allow_permission_grant(workspace, args.tool_name)
+            if action in {"allow", "ask", "deny"}:
+                _, rules = add_cli_permission_rule(
+                    workspace,
+                    action,
+                    args.tool_name,
+                    exact=args.exact,
+                    prefix=args.prefix,
+                    command_prefix=args.command_prefix,
+                )
             elif action == "revoke":
-                grants = revoke_permission_grant(workspace, args.tool_name)
+                revoke_permission_grant(workspace, args.tool_name)
+                rules = load_permission_rules(workspace)
+            elif action == "remove":
+                rules = remove_cli_permission_rule(workspace, args.rule_id)
             elif action == "clear":
                 confirmed = args.yes
                 if not confirmed and sys.stdin.isatty():
@@ -1568,16 +1637,17 @@ def main(argv: list[str] | None = None) -> int:
                 if not confirmed:
                     print("Permission grant clear cancelled.", file=sys.stderr)
                     return 2
-                grants = clear_permission_grants(workspace)
+                clear_permission_grants(workspace)
+                rules = []
             else:
-                grants = load_tool_grants(workspace)
+                rules = load_permission_rules(workspace)
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
         print(
-            render_permission_grants(
+            render_permission_rules(
                 workspace,
-                grants,
+                rules,
                 json_output=getattr(args, "json", False),
             )
         )
@@ -1788,6 +1858,14 @@ def main(argv: list[str] | None = None) -> int:
             set_workspace_trusted(config.workspace_root, True)
             workspace_trusted = True
 
+    from safety.grants import PermissionGrantError, load_permission_rules
+
+    try:
+        permission_rules = load_permission_rules(config.workspace_root)
+    except PermissionGrantError as exc:
+        print(f"Error: invalid permission policy: {exc}", file=sys.stderr)
+        return 2
+
     db_path = config.db_directory / "sessions.db"
     session_store = SessionStore(db_path)
     if config.session_retention_days > 0:
@@ -1890,11 +1968,7 @@ def main(argv: list[str] | None = None) -> int:
         onnx_model_path=config.onnx_model_path,
         chroma_persist_dir=config.chroma_persist_dir,
     )
-    from safety.grants import load_permission_rules
-
-    loop.permission_policy.set_persistent_rules(
-        load_permission_rules(config.workspace_root)
-    )
+    loop.permission_policy.set_persistent_rules(permission_rules)
     from core.checkpoints import FileCheckpointMiddleware
     from core.secret_middleware import SecretRedactionMiddleware
 
