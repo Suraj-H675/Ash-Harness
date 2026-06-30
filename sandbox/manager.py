@@ -6,9 +6,9 @@ construction time, picks the highest tier it can use, and exposes a
 single :meth:`run` method that always returns a
 :class:`SandboxResult` regardless of which tier ran the command.
 
-Falling back is graceful: if a Tier 2/3 backend raises
-:class:`SandboxBackendUnavailable` mid-run, the manager transparently
-re-issues the command at Tier 1 so the user workflow is not blocked.
+An isolated command fails closed if its backend becomes unavailable. An
+explicit compatibility switch permits scoped fallback for callers that have
+already obtained informed consent for unisolated execution.
 """
 
 from __future__ import annotations
@@ -124,6 +124,7 @@ class SandboxManager:
     network: bool = False
     timeout_seconds: int = 300
     extra_read_only_paths: tuple[Path, ...] = field(default_factory=tuple)
+    allow_scoped_fallback: bool = False
 
     def __post_init__(self) -> None:
         self._tier: SandboxTier = self._detect_tier()
@@ -168,11 +169,9 @@ class SandboxManager:
         """
         Run ``command`` (argv list) under the active sandbox.
 
-        If the active tier is unavailable mid-run (e.g. bwrap installed
-        but bwrap binary missing on the executable path), the manager
-        transparently falls back to Tier 1. The :class:`SandboxResult`
-        reports the actual tier used and a ``fallback_used`` flag so
-        the loop can log the degradation.
+        Isolated backends fail closed when they become unavailable. Callers
+        may explicitly opt into scoped fallback for compatibility; the result
+        then reports the actual tier and ``fallback_used=True``.
         """
 
         if not command:
@@ -182,6 +181,8 @@ class SandboxManager:
         try:
             backend = self._build_backend(self._tier)
         except SandboxBackendUnavailable:
+            if not self.allow_scoped_fallback:
+                raise
             return await _run_scoped(
                 _ScopedBackend(), command, cwd, deadline, fallback=True, env=env
             )
@@ -195,6 +196,8 @@ class SandboxManager:
         try:
             wrapped = backend.wrap(command, cwd=cwd)
         except SandboxBackendUnavailable:
+            if not self.allow_scoped_fallback:
+                raise
             return await _run_scoped(
                 _ScopedBackend(), command, cwd, deadline, fallback=True, env=env
             )
@@ -240,7 +243,10 @@ class SandboxManager:
                     raise SandboxBackendUnavailable("bwrap backend unavailable")
                 return bwrap_backend
             if has_sandbox_exec():
-                return _SandboxExecBackend()
+                return _SandboxExecBackend(
+                    workspace_root=self.workspace_root,
+                    network=self.network,
+                )
         return _ScopedBackend()
 
 
@@ -368,6 +374,8 @@ class _SandboxExecBackend(SandboxBackend):
 
     name: str = "sandbox-exec"
     tier: SandboxTier = SANDBOX_TIER_BWRAP
+    workspace_root: Path | None = None
+    network: bool = False
 
     def is_available(self) -> bool:
         return has_sandbox_exec()
@@ -375,20 +383,51 @@ class _SandboxExecBackend(SandboxBackend):
     def wrap(self, command: Sequence[str], *, cwd: Path | None = None) -> list[str]:
         if not self.is_available():
             raise SandboxBackendUnavailable("sandbox-exec not available")
-        return ["sandbox-exec", "-p", _SANDBOX_EXEC_PROFILE, *command]
+        if self.workspace_root is None:
+            raise SandboxBackendUnavailable("sandbox-exec requires a workspace root")
+        root = Path(self.workspace_root).resolve()
+        if not root.is_dir():
+            raise SandboxBackendUnavailable(
+                f"workspace root is not a directory: {root}"
+            )
+        if cwd is not None:
+            cwd_path = Path(cwd).resolve()
+            try:
+                cwd_path.relative_to(root)
+            except ValueError as exc:
+                raise SandboxBackendUnavailable(
+                    f"cwd is outside the sandbox workspace: {cwd_path}"
+                ) from exc
+            if not cwd_path.is_dir():
+                raise SandboxBackendUnavailable(
+                    f"sandbox cwd is not a directory: {cwd_path}"
+                )
+        profile = _sandbox_exec_profile(root, network=self.network)
+        return ["sandbox-exec", "-p", profile, *command]
 
 
-_SANDBOX_EXEC_PROFILE = """(version 1)
+def _sandbox_exec_profile(workspace_root: Path, *, network: bool) -> str:
+    root = _escape_sandbox_literal(str(workspace_root))
+    network_rules = (
+        "(allow network*)"
+        if network
+        else "(deny network-outbound)\n(deny network-inbound)"
+    )
+    return f"""(version 1)
 (deny default)
 (allow process-exec)
 (allow process-fork)
 (allow file-read*)
-(allow file-write* (subpath "/tmp"))
-(allow file-write* (subpath "/Users"))
+(allow file-write* (subpath \"{root}\"))
+(allow file-write* (subpath \"/tmp\"))
+(allow file-write* (subpath \"/private/tmp\"))
 (allow sysctl-read)
-(deny network-outbound)
-(deny network-inbound)
+{network_rules}
 """
+
+
+def _escape_sandbox_literal(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 # --- helpers --------------------------------------------------------------

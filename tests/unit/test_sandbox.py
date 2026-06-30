@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -23,7 +24,7 @@ from sandbox import (
     has_sandbox_exec,
 )
 from sandbox.bwrap import probe_bwrap
-from sandbox.docker import probe_docker
+from sandbox.docker import DEFAULT_IMAGE, probe_docker
 from tools.command import RunCommandTool
 
 
@@ -217,9 +218,10 @@ def test_docker_wrap_includes_security_flags(tmp_path: Path) -> None:
     assert "--cap-drop=ALL" in argv
     assert "--security-opt=no-new-privileges" in argv
     assert "--read-only" in argv
-    # Volume mount for the workspace.
-    assert "--volume" in argv
-    assert "/workspace:rw" in " ".join(argv)
+    # Bind mount and container-native working directory for the workspace.
+    assert "--mount" in argv
+    assert f"source={tmp_path},target=/workspace" in " ".join(argv)
+    assert argv[argv.index("--workdir") + 1] == "/workspace"
     # Image + command tail.
     assert argv[-2:] == ["echo", "hi"]
 
@@ -235,12 +237,63 @@ def test_docker_with_network_omits_none_flag(tmp_path: Path) -> None:
     assert "--network=none" not in argv
 
 
+def test_docker_maps_nested_host_cwd_to_container(tmp_path: Path) -> None:
+    fake = tmp_path / "docker"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    nested = tmp_path / "packages" / "api"
+    nested.mkdir(parents=True)
+    backend = DockerSandbox(workspace_root=tmp_path, docker_path=str(fake))
+
+    argv = backend.wrap(["pwd"], cwd=nested)
+
+    assert argv[argv.index("--workdir") + 1] == "/workspace/packages/api"
+
+
+def test_docker_rejects_cwd_outside_workspace(tmp_path: Path) -> None:
+    fake = tmp_path / "docker"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    backend = DockerSandbox(workspace_root=workspace, docker_path=str(fake))
+
+    with pytest.raises(SandboxBackendUnavailable, match="outside"):
+        backend.wrap(["pwd"], cwd=tmp_path)
+
+
+def test_probe_docker_requires_daemon_and_image() -> None:
+    ready = subprocess.CompletedProcess([], 0, stdout=b"27.0\n", stderr=b"")
+    image = subprocess.CompletedProcess([], 0, stdout=b"[]", stderr=b"")
+    with (
+        patch("sandbox.docker.shutil.which", return_value="/usr/bin/docker"),
+        patch("sandbox.docker.subprocess.run", side_effect=[ready, image]) as run,
+    ):
+        assert probe_docker() == "/usr/bin/docker"
+    assert run.call_args_list[1].args[0][-1] == DEFAULT_IMAGE
+
+
+def test_probe_docker_rejects_unreachable_daemon_or_missing_image() -> None:
+    failed = subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"failed")
+    ready = subprocess.CompletedProcess([], 0, stdout=b"27.0\n", stderr=b"")
+    with (
+        patch("sandbox.docker.shutil.which", return_value="/usr/bin/docker"),
+        patch("sandbox.docker.subprocess.run", return_value=failed),
+    ):
+        assert probe_docker() is None
+    with (
+        patch("sandbox.docker.shutil.which", return_value="/usr/bin/docker"),
+        patch("sandbox.docker.subprocess.run", side_effect=[ready, failed]),
+    ):
+        assert probe_docker() is None
+
+
 # ---------------------------------------------------------------------------
 # Manager run() with mocked tier-1 fallback
 # ---------------------------------------------------------------------------
 
 
-def test_run_falls_back_to_scoped_when_docker_unavailable_mid_flight(
+def test_run_fails_closed_when_docker_unavailable_mid_flight(
     tmp_path: Path,
 ) -> None:
     # Force tier 3 detection, then make the Docker backend raise at
@@ -252,12 +305,25 @@ def test_run_falls_back_to_scoped_when_docker_unavailable_mid_flight(
     ):
         mgr = SandboxManager(workspace_root=tmp_path)
 
-    # The Docker backend should fail when actually wrapping because no
-    # docker binary exists; the manager must transparently fall back.
     async def runner() -> object:
         return await mgr.run(["echo", "fallback"], cwd=tmp_path)
 
-    result = asyncio.run(runner())
+    with pytest.raises(SandboxBackendUnavailable):
+        asyncio.run(runner())
+
+
+def test_run_only_falls_back_when_explicitly_enabled(tmp_path: Path) -> None:
+    with (
+        patch("sandbox.manager.has_docker", return_value=True),
+        patch("sandbox.manager.has_bwrap", return_value=False),
+        patch("sandbox.manager.has_sandbox_exec", return_value=False),
+    ):
+        mgr = SandboxManager(
+            workspace_root=tmp_path,
+            allow_scoped_fallback=True,
+        )
+
+    result = asyncio.run(mgr.run(["echo", "fallback"], cwd=tmp_path))
     assert result.fallback_used is True
     assert result.tier == SANDBOX_TIER_SCOPED
     assert "fallback" in result.stdout
@@ -343,7 +409,7 @@ def test_run_command_with_sandbox_annotates_output(tmp_path: Path) -> None:
     assert "annotated" in result.output
 
 
-def test_run_command_falls_back_when_sandbox_unavailable(tmp_path: Path) -> None:
+def test_run_command_fails_closed_when_sandbox_unavailable(tmp_path: Path) -> None:
     from safety.guard import SafetyGuard
 
     guard = SafetyGuard(project_root=tmp_path)
@@ -356,7 +422,45 @@ def test_run_command_falls_back_when_sandbox_unavailable(tmp_path: Path) -> None
         mgr = SandboxManager(workspace_root=tmp_path)
     assert mgr.tier == SANDBOX_TIER_DOCKER  # by detection
     tool = RunCommandTool(guard, sandbox_manager=mgr)
-    # Actual run should still succeed via the scoped fallback.
-    result = asyncio.run(tool.run(command_line="echo ok", cwd=str(tmp_path)))
-    assert result.success is True
-    assert "ok" in result.output
+    with pytest.raises(SandboxBackendUnavailable):
+        asyncio.run(tool.run(command_line="echo ok", cwd=str(tmp_path)))
+
+
+def test_bubblewrap_rejects_cwd_outside_workspace(tmp_path: Path) -> None:
+    fake = tmp_path / "bwrap"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    backend = BubblewrapSandbox(workspace_root=workspace, bwrap_path=str(fake))
+
+    with pytest.raises(SandboxBackendUnavailable, match="outside"):
+        backend.wrap(["pwd"], cwd=tmp_path)
+
+
+def test_macos_profile_only_writes_workspace_and_temp(tmp_path: Path) -> None:
+    from sandbox.manager import _SandboxExecBackend
+
+    workspace = tmp_path / 'workspace "quoted"'
+    workspace.mkdir()
+    with patch("sandbox.manager.has_sandbox_exec", return_value=True):
+        argv = _SandboxExecBackend(workspace_root=workspace).wrap(
+            ["echo", "ok"], cwd=workspace
+        )
+
+    profile = argv[argv.index("-p") + 1]
+    escaped_workspace = str(workspace).replace('"', '\\"')
+    assert f'(subpath "{escaped_workspace}")' in profile
+    assert '(subpath "/Users")' not in profile
+    assert "(deny network-outbound)" in profile
+
+
+def test_macos_profile_can_explicitly_allow_network(tmp_path: Path) -> None:
+    from sandbox.manager import _SandboxExecBackend
+
+    with patch("sandbox.manager.has_sandbox_exec", return_value=True):
+        profile = _SandboxExecBackend(workspace_root=tmp_path, network=True).wrap(
+            ["echo", "ok"], cwd=tmp_path
+        )[2]
+    assert "(allow network*)" in profile
+    assert "(deny network-outbound)" not in profile

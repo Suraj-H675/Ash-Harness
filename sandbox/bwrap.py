@@ -105,17 +105,26 @@ class BubblewrapSandbox(SandboxBackend):
                 args.extend(["--ro-bind", ro_str, ro_str])
 
         # Workspace (read-write) — required for any meaningful work.
-        if self.workspace_root is not None:
-            root = Path(self.workspace_root).resolve()
-            args.extend(["--bind", str(root), str(root)])
+        if self.workspace_root is None:
+            raise SandboxBackendUnavailable("bubblewrap requires a workspace root")
+        root = Path(self.workspace_root).resolve()
+        if not root.is_dir():
+            raise SandboxBackendUnavailable(
+                f"workspace root is not a directory: {root}"
+            )
+        args.extend(["--bind", str(root), str(root)])
 
         # Scratch directory for ephemeral writes.
-        scratch = self.scratch_dir
-        if scratch is None:
-            scratch = Path(tempfile_workspace_scratch(self.workspace_root))
-        scratch = Path(scratch).resolve()
-        scratch.mkdir(parents=True, exist_ok=True)
-        args.extend(["--bind", str(scratch), str(scratch)])
+        scratch = Path(self.scratch_dir).resolve() if self.scratch_dir else Path("/tmp")
+        if self.scratch_dir is not None:
+            try:
+                scratch.relative_to(root)
+            except ValueError as exc:
+                raise SandboxBackendUnavailable(
+                    f"scratch directory is outside the sandbox workspace: {scratch}"
+                ) from exc
+            scratch.mkdir(parents=True, exist_ok=True)
+            args.extend(["--bind", str(scratch), str(scratch)])
 
         # Additional read-only paths the caller wants to expose.
         for ro_entry in self.read_only_paths:
@@ -128,12 +137,20 @@ class BubblewrapSandbox(SandboxBackend):
             # Block all network namespaces by clearing net namespace.
             args.append("--unshare-net")
 
-        # If the caller supplied a cwd, bind-mount it into the sandbox
-        # at the same path so child-relative paths still resolve.
+        # The working directory must already be part of the workspace mount.
         if cwd is not None:
             cwd_resolved = Path(cwd).resolve()
-            if cwd_resolved.exists():
-                args.extend(["--bind", str(cwd_resolved), str(cwd_resolved)])
+            try:
+                cwd_resolved.relative_to(root)
+            except ValueError as exc:
+                raise SandboxBackendUnavailable(
+                    f"cwd is outside the sandbox workspace: {cwd_resolved}"
+                ) from exc
+            if not cwd_resolved.is_dir():
+                raise SandboxBackendUnavailable(
+                    f"sandbox cwd is not a directory: {cwd_resolved}"
+                )
+            args.extend(["--chdir", str(cwd_resolved)])
 
         # Environment scrubbing: keep PATH and HOME minimal so the
         # child cannot inherit host secrets.
@@ -145,16 +162,6 @@ class BubblewrapSandbox(SandboxBackend):
         args.append("--")
         args.extend(command)
         return args
-
-
-def tempfile_workspace_scratch(workspace_root: Path | None) -> str:
-    """Pick a scratch dir name under the workspace (or /tmp as a fallback)."""
-
-    import tempfile
-
-    base = Path(workspace_root) if workspace_root is not None else Path("/tmp")
-    base.mkdir(parents=True, exist_ok=True)
-    return tempfile.mkdtemp(prefix="ash-sandbox-", dir=str(base))
 
 
 def probe_bwrap() -> str | None:

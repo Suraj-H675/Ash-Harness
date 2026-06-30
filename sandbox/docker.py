@@ -12,6 +12,7 @@ raises :class:`SandboxBackendUnavailable`.
 from __future__ import annotations
 
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,15 +75,43 @@ class DockerSandbox(SandboxBackend):
             args.extend(["--cpus", str(self.cpus)])
 
         # Bind-mount the workspace and the output directory if given.
+        container_cwd: str | None = None
         if self.workspace_root is not None:
             root = Path(self.workspace_root).resolve()
-            args.extend(["--volume", f"{root}:/workspace:rw"])
+            if not root.is_dir():
+                raise SandboxBackendUnavailable(
+                    f"workspace root is not a directory: {root}"
+                )
+            args.extend(
+                [
+                    "--mount",
+                    f"type=bind,source={root},target=/workspace",
+                ]
+            )
+            container_cwd = "/workspace"
         if self.output_dir is not None:
             out = Path(self.output_dir).resolve()
             out.mkdir(parents=True, exist_ok=True)
-            args.extend(["--volume", f"{out}:/output:rw"])
+            args.extend(["--mount", f"type=bind,source={out},target=/output"])
         if cwd is not None:
-            args.extend(["--workdir", str(Path(cwd).resolve())])
+            cwd_path = Path(cwd).resolve()
+            if self.workspace_root is None:
+                raise SandboxBackendUnavailable(
+                    "a workspace root is required when cwd is set"
+                )
+            try:
+                relative = cwd_path.relative_to(Path(self.workspace_root).resolve())
+            except ValueError as exc:
+                raise SandboxBackendUnavailable(
+                    f"cwd is outside the sandbox workspace: {cwd_path}"
+                ) from exc
+            if not cwd_path.is_dir():
+                raise SandboxBackendUnavailable(
+                    f"sandbox cwd is not a directory: {cwd_path}"
+                )
+            container_cwd = str(Path("/workspace") / relative).replace("\\", "/")
+        if container_cwd is not None:
+            args.extend(["--workdir", container_cwd])
 
         # Tighten the security profile: drop all capabilities, mark
         # the container read-only at the rootfs level, and prevent
@@ -101,7 +130,27 @@ class DockerSandbox(SandboxBackend):
         return args
 
 
-def probe_docker() -> str | None:
-    """Return the path to ``docker`` if installed, else ``None``."""
+def probe_docker(*, image: str = DEFAULT_IMAGE) -> str | None:
+    """Return Docker's path only when its daemon and sandbox image are ready."""
 
-    return shutil.which("docker")
+    path = shutil.which("docker")
+    if path is None:
+        return None
+    try:
+        daemon = subprocess.run(
+            [path, "version", "--format", "{{.Server.Version}}"],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        if daemon.returncode != 0 or not daemon.stdout.strip():
+            return None
+        image_check = subprocess.run(
+            [path, "image", "inspect", image],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return path if image_check.returncode == 0 else None
