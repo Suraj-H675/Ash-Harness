@@ -89,6 +89,11 @@ Interactive sessions use the responsive transcript viewport by default. Use
 output. Set `ASH_TUI_MODE=inline` when native terminal scrollback is preferred
 or a terminal does not support full-screen applications reliably.
 
+Set `ASH_SCREEN_READER_MODE=true` for linear, non-rewriting terminal output.
+This mode forces inline rendering, no color, reduced motion, and no token bar;
+it also disables dynamic completion, autosuggestions, and the bottom toolbar
+while retaining cancellable cross-platform prompt input and command history.
+
 Desktop notifications are disabled by default. Enable terminal-aware desktop
 notifications with `ASH_NOTIFICATION_METHOD=auto`, or choose `osc9` or `bel`
 explicitly. The equivalent TOML configuration is:
