@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -110,6 +110,10 @@ class AshConfig(BaseSettings):
     reduced_motion: bool = Field(
         False,
         description="Avoid live per-token redraws in the interactive terminal UI.",
+    )
+    screen_reader_mode: bool = Field(
+        False,
+        description="Use linear, non-rewriting interactive terminal output.",
     )
     show_token_meter: bool = Field(
         False,
@@ -386,6 +390,16 @@ class AshConfig(BaseSettings):
                     "notification_events entries must be turn_complete or approval_required"
                 ) from exc
         return list(dict.fromkeys(normalized))
+
+    @model_validator(mode="after")
+    def apply_screen_reader_preferences(self) -> "AshConfig":
+        if not self.screen_reader_mode:
+            return self
+        self.no_color = True
+        self.reduced_motion = True
+        self.show_token_meter = False
+        self.tui_mode = "inline"
+        return self
 
     @property
     def provider(self) -> str:

@@ -101,6 +101,7 @@ class PromptInput:
         workspace_root: Path | None = None,
         transcript: Transcript | None = None,
         tui_mode: str = "inline",
+        screen_reader_mode: bool = False,
     ) -> None:
         if input_mode not in {"emacs", "vi"}:
             raise ValueError("input_mode must be emacs or vi")
@@ -110,6 +111,7 @@ class PromptInput:
         self.interactive = bool(getattr(self.input_stream, "isatty", lambda: False)())
         self._session: PromptSession[str] | None = None
         self._viewport: TranscriptViewport | None = None
+        self.screen_reader_mode = screen_reader_mode
         if self.interactive:
             path = history_path or (Path.home() / ".ash" / "history")
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,7 +125,7 @@ class PromptInput:
             words.extend(f"/{name}" for name in (extra_commands or []))
             words = sorted(set(words))
             completer = AshCompleter(words, workspace_root or Path.cwd())
-            if tui_mode == "viewport":
+            if tui_mode == "viewport" and not screen_reader_mode:
                 self._viewport = TranscriptViewport(
                     transcript or Transcript(),
                     history_path=path,
@@ -135,9 +137,11 @@ class PromptInput:
             else:
                 self._session = PromptSession(
                     history=FileHistory(str(path)),
-                    auto_suggest=AutoSuggestFromHistory(),
-                    completer=completer,
-                    complete_while_typing=True,
+                    auto_suggest=(
+                        None if screen_reader_mode else AutoSuggestFromHistory()
+                    ),
+                    completer=None if screen_reader_mode else completer,
+                    complete_while_typing=not screen_reader_mode,
                     key_bindings=_key_bindings(
                         keybindings
                         if keybindings is not None
@@ -151,7 +155,7 @@ class PromptInput:
                     ),
                     multiline=False,
                     enable_open_in_editor=True,
-                    bottom_toolbar=status_provider,
+                    bottom_toolbar=None if screen_reader_mode else status_provider,
                 )
 
     @property

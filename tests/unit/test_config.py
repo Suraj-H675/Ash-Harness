@@ -15,6 +15,7 @@ ENV_KEYS = [
     "ASH_NOTIFICATION_METHOD",
     "ASH_NOTIFICATION_EVENTS",
     "ASH_NOTIFICATION_INCLUDE_PREVIEW",
+    "ASH_SCREEN_READER_MODE",
     "ASH_SAFETY_TIER",
     "ASH_WORKSPACE_ROOT",
     "ASH_COMMAND_BLOCKLIST",
@@ -210,6 +211,22 @@ def test_terminal_preferences_are_validated() -> None:
     assert config.reduced_motion is True
     assert config.show_token_meter is True
     assert config.keybindings["newline"] == ["c-o"]
+
+
+def test_screen_reader_mode_forces_linear_terminal_preferences() -> None:
+    config = AshConfig(
+        screen_reader_mode=True,
+        tui_mode="viewport",
+        no_color=False,
+        reduced_motion=False,
+        show_token_meter=True,
+    )
+
+    assert config.screen_reader_mode is True
+    assert config.tui_mode == "inline"
+    assert config.no_color is True
+    assert config.reduced_motion is True
+    assert config.show_token_meter is False
 
 
 def test_terminal_notification_preferences_are_validated() -> None:

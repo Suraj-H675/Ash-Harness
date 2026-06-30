@@ -20,6 +20,31 @@ def test_terminal_ui_supports_no_color_and_reduced_motion():
     assert ui.show_token_meter is True
 
 
+def test_screen_reader_mode_emits_linear_non_rewriting_output() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        console=Console(file=output, force_terminal=False, width=80),
+        screen_reader_mode=True,
+        show_token_meter=True,
+    )
+
+    with ui.begin_turn():
+        ui.print_thought("checking")
+        ui.print_token("**done**")
+    ui.finalize_turn()
+    ui.show_tool_approval("write_file", {"file_path": "x.py"}, auto=False)
+
+    rendered = output.getvalue()
+    assert "Reasoning: checking" in rendered
+    assert "done" in rendered
+    assert "Approval:" in rendered
+    assert "write_file" in rendered
+    assert "\x1b" not in rendered
+    assert "╭" not in rendered
+    assert ui.reduced_motion is True
+    assert ui.show_token_meter is False
+
+
 def test_terminal_ui_renders_markdown_and_reasoning() -> None:
     output = StringIO()
     ui = TerminalUI(

@@ -74,6 +74,7 @@ class TerminalUI:
         show_token_meter: bool = False,
         no_color: bool = False,
         reduced_motion: bool = False,
+        screen_reader_mode: bool = False,
         workspace_root: Path | None = None,
         transcript: Transcript | None = None,
     ) -> None:
@@ -87,6 +88,11 @@ class TerminalUI:
             raise ValueError(f"Unknown safety tier: {safety_tier!r}")
         self.safety_tier = safety_tier
         self._approval_callback = approval_callback
+        self.screen_reader_mode = screen_reader_mode
+        if screen_reader_mode:
+            no_color = True
+            reduced_motion = True
+            show_token_meter = False
         self.console = console or Console(no_color=no_color)
         self._input_stream = input_stream or sys.stdin
         self._active_buffers: _LiveBuffers | None = None
@@ -148,7 +154,7 @@ class TerminalUI:
         else:
             self._token_task = None
 
-        if self.viewport_mode:
+        if self.viewport_mode or self.screen_reader_mode:
             self._active_live = None
             self._last_refresh = 0.0
             return nullcontext()
@@ -214,6 +220,12 @@ class TerminalUI:
         if buffers.thought:
             buffers.thought.append("\n")
         buffers.thought.append("reasoning: " + text, style="dim italic")
+        if self.screen_reader_mode:
+            self.console.print(
+                f"Reasoning: {text}",
+                markup=False,
+                highlight=False,
+            )
         self._refresh_live()
 
     def finalize_turn(self) -> None:
@@ -222,6 +234,10 @@ class TerminalUI:
         live = getattr(self, "_active_live", None)
         if live is not None:
             live.update(self._render_active_turn(), refresh=True)
+        if self.screen_reader_mode and self._active_buffers is not None:
+            response = self._active_buffers.response
+            if response:
+                self.console.print(Markdown(response, hyperlinks=False))
         if self._reasoning_entry_id is not None:
             self.transcript.finalize(self._reasoning_entry_id)
         if self._assistant_entry_id is not None:
@@ -376,7 +392,11 @@ class TerminalUI:
             metadata={"auto": auto},
         )
         if not self.viewport_mode:
-            self.console.print(Panel(body, border_style="yellow", title="approval"))
+            if self.screen_reader_mode:
+                self.console.print("Approval:", markup=False, highlight=False)
+                self.console.print(body.plain, markup=False, highlight=False)
+            else:
+                self.console.print(Panel(body, border_style="yellow", title="approval"))
 
         if live is not None:
             live.start()
@@ -552,7 +572,10 @@ class TerminalUI:
         body.append("\nChecklist:\n", style="bold")
         if execution.items:
             for item in execution.items:
-                mark = "☑" if item.status.value in {"done", "skipped"} else "☐"
+                if self.screen_reader_mode:
+                    mark = "[x]" if item.status.value in {"done", "skipped"} else "[ ]"
+                else:
+                    mark = "☑" if item.status.value in {"done", "skipped"} else "☐"
                 body.append(f"  {mark} [{item.section}] {item.description}\n")
         else:
             body.append("  (empty)\n")
@@ -564,13 +587,21 @@ class TerminalUI:
             metadata={"type": "plan.approval"},
         )
         if not self.viewport_mode:
-            self.console.print(
-                Panel(
-                    body,
-                    border_style="cyan",
-                    title=f"sprint {execution.contract.contract_id[:8]}",
+            if self.screen_reader_mode:
+                self.console.print(
+                    f"Sprint {execution.contract.contract_id[:8]}:",
+                    markup=False,
+                    highlight=False,
                 )
-            )
+                self.console.print(body.plain, markup=False, highlight=False)
+            else:
+                self.console.print(
+                    Panel(
+                        body,
+                        border_style="cyan",
+                        title=f"sprint {execution.contract.contract_id[:8]}",
+                    )
+                )
 
     def write_status(self, text: str, *, error: bool = False) -> None:
         if error:

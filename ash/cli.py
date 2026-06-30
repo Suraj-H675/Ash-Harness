@@ -408,6 +408,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         workspace_root=loop.project_root,
         transcript=loop.ui.transcript if isinstance(loop.ui, TerminalUI) else None,
         tui_mode=config.tui_mode,
+        screen_reader_mode=config.screen_reader_mode,
     )
     if not isinstance(loop.ui, TerminalUI):
         raise TypeError("interactive REPL requires TerminalUI")
@@ -1809,6 +1810,7 @@ def main(argv: list[str] | None = None) -> int:
             show_token_meter=config.show_token_meter,
             no_color=config.no_color,
             reduced_motion=config.reduced_motion,
+            screen_reader_mode=config.screen_reader_mode,
         )
     from sandbox import SandboxManager
 
