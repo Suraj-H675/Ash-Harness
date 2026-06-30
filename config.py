@@ -123,6 +123,18 @@ class AshConfig(BaseSettings):
         "viewport",
         description="Interactive terminal renderer: viewport or inline.",
     )
+    notification_method: str = Field(
+        "off",
+        description="Desktop notification method: off, auto, osc9, or bel.",
+    )
+    notification_events: list[str] = Field(
+        default_factory=lambda: ["turn_complete", "approval_required"],
+        description="Interactive events that emit configured desktop notifications.",
+    )
+    notification_include_preview: bool = Field(
+        False,
+        description="Include a bounded assistant response preview in completion notifications.",
+    )
     keybindings: dict[str, list[str]] = Field(
         default_factory=lambda: {
             "newline": ["escape enter", "c-j"],
@@ -347,6 +359,33 @@ class AshConfig(BaseSettings):
         if normalized not in {"viewport", "inline"}:
             raise ValueError("tui_mode must be viewport or inline")
         return normalized
+
+    @field_validator("notification_method")
+    @classmethod
+    def validate_notification_method(cls, value: str) -> str:
+        from ui.notifications import NotificationMethod
+
+        try:
+            return NotificationMethod(value.casefold()).value
+        except ValueError as exc:
+            raise ValueError(
+                "notification_method must be off, auto, osc9, or bel"
+            ) from exc
+
+    @field_validator("notification_events")
+    @classmethod
+    def validate_notification_events(cls, value: list[str]) -> list[str]:
+        from ui.notifications import NotificationEvent
+
+        normalized: list[str] = []
+        for event in value:
+            try:
+                normalized.append(NotificationEvent(event.casefold()).value)
+            except ValueError as exc:
+                raise ValueError(
+                    "notification_events entries must be turn_complete or approval_required"
+                ) from exc
+        return list(dict.fromkeys(normalized))
 
     @property
     def provider(self) -> str:

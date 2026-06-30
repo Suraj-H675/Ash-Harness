@@ -12,6 +12,9 @@ ENV_KEYS = [
     "ASH_MAX_CONTEXT_TOKENS",
     "ASH_MAX_COMPLETION_TOKENS",
     "ASH_MAX_TOOL_RESULT_TOKENS",
+    "ASH_NOTIFICATION_METHOD",
+    "ASH_NOTIFICATION_EVENTS",
+    "ASH_NOTIFICATION_INCLUDE_PREVIEW",
     "ASH_SAFETY_TIER",
     "ASH_WORKSPACE_ROOT",
     "ASH_COMMAND_BLOCKLIST",
@@ -207,6 +210,22 @@ def test_terminal_preferences_are_validated() -> None:
     assert config.reduced_motion is True
     assert config.show_token_meter is True
     assert config.keybindings["newline"] == ["c-o"]
+
+
+def test_terminal_notification_preferences_are_validated() -> None:
+    config = AshConfig(
+        notification_method="OSC9",
+        notification_events=["TURN_COMPLETE", "turn_complete"],
+        notification_include_preview=True,
+    )
+
+    assert config.notification_method == "osc9"
+    assert config.notification_events == ["turn_complete"]
+    assert config.notification_include_preview is True
+    with pytest.raises(ValueError, match="notification_method"):
+        AshConfig(notification_method="toast")
+    with pytest.raises(ValueError, match="notification_events"):
+        AshConfig(notification_events=["startup"])
 
 
 def test_prompt_cache_preferences_are_validated() -> None:
