@@ -353,17 +353,23 @@ def save_config(config: dict[str, Any]) -> None:
         raise
 
 
-def load_config() -> dict[str, Any]:
-    """Load custom_providers from ~/.ash/ash.toml. Returns {} if file missing."""
+def load_config(*, strict: bool = False) -> dict[str, Any]:
+    """Load ~/.ash/ash.toml, optionally surfacing malformed input."""
     config_file = get_config_path()
     if not config_file.exists():
         return {}
     try:
+        if strict:
+            with config_file.open("rb") as handle:
+                value = tomllib.load(handle)
+            return value if isinstance(value, dict) else {}
         import toml  # type: ignore[import-untyped]
 
         with config_file.open() as f:
             return toml.load(f)
     except Exception:
+        if strict:
+            raise
         return {}
 
 

@@ -12,17 +12,21 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import IntEnum
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
 import httpx
 
 from cli.config import (
+    backup_config_file,
     get_env_value,
     get_config_path,
+    is_config_migration_recorded,
     is_interactive_stdin,
     load_config,
     mask_key,
+    record_config_migration,
     save_config,
     save_env_values,
 )
@@ -617,22 +621,42 @@ def _get_current_model_for_provider(config, provider: str) -> str:
     return ""
 
 
-def _migrate_old_ash_toml() -> None:
-    """Detect old project-root ash.toml and offer to migrate to ~/.ash/."""
-    from pathlib import Path
+_LEGACY_PROVIDER_KEYS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "groq": "GROQ_API_KEY",
+}
+_LEGACY_MARKERS = frozenset({"api_key", "model_name"})
+_LEGACY_RESERVED = frozenset({"api_key", "provider", "model_name"})
+_LEGACY_PATH_FIELDS = frozenset(
+    {"workspace_root", "db_directory", "chroma_persist_dir", "onnx_model_path"}
+)
+_PLACEHOLDER_KEYS = frozenset(
+    {"replace-with-your-api-key", "your-api-key", "changeme"}
+)
 
+
+def _migrate_old_ash_toml() -> None:
+    """Safely migrate the original project-root Ash config format."""
     old_path = Path.cwd() / "ash.toml"
     if not old_path.exists():
         return
+    if old_path.is_symlink():
+        print(f"  Warning: refusing to migrate symlinked config: {old_path}")
+        return
 
     try:
-        import toml  # type: ignore[import-untyped]
+        import tomllib
 
-        old_config = toml.load(old_path)
+        with old_path.open("rb") as handle:
+            old_config = tomllib.load(handle)
     except Exception:
         return
 
-    if not old_config:
+    if not isinstance(old_config, dict) or not (_LEGACY_MARKERS & old_config.keys()):
+        return
+    if is_config_migration_recorded(old_path):
         return
 
     _print_header("Old Configuration Found")
@@ -642,19 +666,99 @@ def _migrate_old_ash_toml() -> None:
     if resp in ("n", "no"):
         return
 
-    migrated: dict[str, str] = {}
-    if old_config.get("api_key"):
-        migrated["ANTHROPIC_API_KEY"] = str(old_config["api_key"])
+    user_config = load_config(strict=True)
+    config_updates, env_updates, preserved = _plan_legacy_config_migration(
+        old_config,
+        old_path=old_path,
+        user_config=user_config,
+    )
+    source_backup = backup_config_file(old_path, label="legacy-project-ash.toml")
+    destination_path = get_config_path()
+    destination_backup: Path | None = None
+    if config_updates != user_config and destination_path.is_file():
+        destination_backup = backup_config_file(
+            destination_path,
+            label="user-ash.toml-pre-migration",
+        )
+    if config_updates != user_config:
+        save_config(config_updates)
+    if env_updates:
+        save_env_values(env_updates)
+    record_config_migration(old_path, source_backup)
 
-    # Migrate provider + model
-    provider = old_config.get("provider", "anthropic")
-    model_name = old_config.get("model_name", "")
+    print("\n  Migration complete.")
+    print(f"  Legacy backup: {source_backup}")
+    if destination_backup is not None:
+        print(f"  Previous user config backup: {destination_backup}")
+    if preserved:
+        print("  Preserved existing destination values: " + ", ".join(preserved))
+    print("  Old ash.toml was left in place and will not be prompted again unless changed.")
+
+
+def _plan_legacy_config_migration(
+    old_config: dict[str, object],
+    *,
+    old_path: Path,
+    user_config: dict[str, object],
+) -> tuple[dict[str, object], dict[str, str], list[str]]:
+    """Map legacy values without replacing newer destination settings."""
+
+    from config import AshConfig, CURRENT_CONFIG_SCHEMA_VERSION
+
+    merged = dict(user_config)
+    env_updates: dict[str, str] = {}
+    preserved: list[str] = []
+    known_fields = set(AshConfig.model_fields)
+    for field, value in old_config.items():
+        if field in _LEGACY_RESERVED or field not in known_fields:
+            continue
+        normalized = _normalize_legacy_config_value(field, value, old_path.parent)
+        if field in merged:
+            preserved.append(field)
+        else:
+            merged[field] = normalized
+    merged.setdefault("config_schema_version", CURRENT_CONFIG_SCHEMA_VERSION)
+
+    provider = str(old_config.get("provider") or "anthropic").strip().casefold()
+    model_name = str(old_config.get("model_name") or "").strip()
     if model_name:
-        migrated["ASH_MODEL"] = f"{provider}/{model_name}"
-    save_env_values(migrated)
+        _preserve_or_stage_env(
+            "ASH_MODEL",
+            f"{provider}/{model_name}",
+            env_updates,
+            preserved,
+        )
+    api_key = str(old_config.get("api_key") or "").strip()
+    key_name = _LEGACY_PROVIDER_KEYS.get(provider)
+    if api_key and api_key.casefold() not in _PLACEHOLDER_KEYS and key_name:
+        _preserve_or_stage_env(
+            key_name,
+            api_key,
+            env_updates,
+            preserved,
+        )
+    return merged, env_updates, sorted(set(preserved))
 
-    print("\n  Migration complete. Old ash.toml left in place.")
-    print("  You may remove it manually.")
+
+def _preserve_or_stage_env(
+    key: str,
+    value: str,
+    updates: dict[str, str],
+    preserved: list[str],
+) -> None:
+    if get_env_value(key) is not None:
+        preserved.append(key)
+    else:
+        updates[key] = value
+
+
+def _normalize_legacy_config_value(field: str, value: object, base: Path) -> object:
+    if field not in _LEGACY_PATH_FIELDS or not isinstance(value, str):
+        return value
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = base / path
+    return str(path.resolve())
 
 
 # ---------------------------------------------------------------------------

@@ -489,3 +489,191 @@ class TestSetupNavigation:
         monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass(""))
 
         assert select_provider_and_model(MagicMock(model="")) == SetupOutcome.CANCELLED
+
+
+class TestLegacyConfigMigration:
+    @pytest.fixture(autouse=True)
+    def _clear_destination_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key in (
+            "ASH_MODEL",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "GROQ_API_KEY",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+    @staticmethod
+    def _configure_paths(tmp_path: Path) -> None:
+        from cli import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / "home" / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+
+    def test_migrates_complete_historical_config_and_records_backup(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from cli import config as cli_config
+        from cli.setup import _migrate_old_ash_toml
+
+        self._configure_paths(tmp_path)
+        project = tmp_path / "project"
+        project.mkdir()
+        legacy = project / "ash.toml"
+        legacy.write_text(
+            '\n'.join(
+                [
+                    'provider = "openai"',
+                    'model_name = "gpt-test"',
+                    'api_key = "legacy-secret"',
+                    'temperature = 0.3',
+                    'max_context_tokens = 64000',
+                    'max_completion_tokens = 2048',
+                    'max_tool_result_tokens = 9000',
+                    'safety_tier = "dry_run"',
+                    'workspace_root = "."',
+                    'command_blocklist = ["danger"]',
+                    'db_directory = ".ash-db"',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(project)
+        monkeypatch.setattr("builtins.input", _fake_input([""]))
+
+        _migrate_old_ash_toml()
+
+        env = cli_config.load_env()
+        assert env["OPENAI_API_KEY"] == "legacy-secret"
+        assert env["ASH_MODEL"] == "openai/gpt-test"
+        assert "ANTHROPIC_API_KEY" not in env
+        user = cli_config.load_config(strict=True)
+        assert user["config_schema_version"] == 1
+        assert user["temperature"] == 0.3
+        assert user["max_context_tokens"] == 64000
+        assert user["max_completion_tokens"] == 2048
+        assert user["max_tool_result_tokens"] == 9000
+        assert user["safety_tier"] == "dry_run"
+        assert user["workspace_root"] == str(project.resolve())
+        assert user["db_directory"] == str((project / ".ash-db").resolve())
+        assert user["command_blocklist"] == ["danger"]
+        backups = list((cli_config.ASH_DIR / "backups").glob("legacy-*.bak"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == legacy.read_bytes()
+        assert cli_config.is_config_migration_recorded(legacy) is True
+
+        repeated_prompt = MagicMock(side_effect=AssertionError("prompted twice"))
+        monkeypatch.setattr("builtins.input", repeated_prompt)
+        _migrate_old_ash_toml()
+        repeated_prompt.assert_not_called()
+
+    def test_preserves_existing_destinations_and_backs_up_user_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from cli import config as cli_config
+        from cli.setup import _migrate_old_ash_toml
+
+        self._configure_paths(tmp_path)
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "ash.toml").write_text(
+            'provider = "anthropic"\n'
+            'model_name = "legacy-model"\n'
+            'api_key = "legacy-key"\n'
+            'temperature = 0.8\n'
+            'max_context_tokens = 32000\n',
+            encoding="utf-8",
+        )
+        cli_config.save_config({"temperature": 0.1})
+        cli_config.save_env_values(
+            {
+                "ANTHROPIC_API_KEY": "new-key",
+                "ASH_MODEL": "anthropic/new-model",
+            }
+        )
+        monkeypatch.chdir(project)
+        monkeypatch.setattr("builtins.input", _fake_input(["y"]))
+
+        _migrate_old_ash_toml()
+
+        assert cli_config.load_env()["ANTHROPIC_API_KEY"] == "new-key"
+        assert cli_config.load_env()["ASH_MODEL"] == "anthropic/new-model"
+        user = cli_config.load_config(strict=True)
+        assert user["temperature"] == 0.1
+        assert user["max_context_tokens"] == 32000
+        destination_backups = list(
+            (cli_config.ASH_DIR / "backups").glob(
+                "user-ash.toml-pre-migration.*.bak"
+            )
+        )
+        assert len(destination_backups) == 1
+        assert "temperature = 0.1" in destination_backups[0].read_text()
+        output = capsys.readouterr().out
+        assert "ANTHROPIC_API_KEY" in output
+        assert "ASH_MODEL" in output
+        assert "temperature" in output
+
+    def test_ignores_unrelated_toml_and_placeholder_key(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from cli import config as cli_config
+        from cli.setup import _migrate_old_ash_toml
+
+        self._configure_paths(tmp_path)
+        project = tmp_path / "project"
+        project.mkdir()
+        legacy = project / "ash.toml"
+        legacy.write_text('name = "another-tool"\n', encoding="utf-8")
+        monkeypatch.chdir(project)
+        prompt = MagicMock(side_effect=AssertionError("unexpected prompt"))
+        monkeypatch.setattr("builtins.input", prompt)
+
+        _migrate_old_ash_toml()
+        prompt.assert_not_called()
+        assert not cli_config.ENV_FILE.exists()
+
+        legacy.write_text(
+            'provider = "anthropic"\n'
+            'model_name = "test"\n'
+            'api_key = "replace-with-your-api-key"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("builtins.input", _fake_input(["y"]))
+        _migrate_old_ash_toml()
+        assert "ANTHROPIC_API_KEY" not in cli_config.load_env()
+
+    def test_refuses_to_overwrite_malformed_user_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from cli import config as cli_config
+        from cli.setup import _migrate_old_ash_toml
+
+        self._configure_paths(tmp_path)
+        project = tmp_path / "project"
+        project.mkdir()
+        legacy = project / "ash.toml"
+        legacy.write_text('model_name = "legacy"\n', encoding="utf-8")
+        cli_config.ensure_ash_dir()
+        cli_config.CONFIG_FILE.write_text("invalid = [", encoding="utf-8")
+        original = cli_config.CONFIG_FILE.read_bytes()
+        monkeypatch.chdir(project)
+        monkeypatch.setattr("builtins.input", _fake_input(["y"]))
+
+        with pytest.raises(Exception):
+            _migrate_old_ash_toml()
+
+        assert cli_config.CONFIG_FILE.read_bytes() == original
+        assert cli_config.is_config_migration_recorded(legacy) is False
