@@ -9,6 +9,7 @@ from context.turn import TurnContext
 from core.session import Message, SessionStore
 from providers.base import ProviderABC, StreamChunk
 from providers.capabilities import ProviderCapabilities
+from safety.grants import PermissionRule, RuleEffect
 from safety.guard import SafetyGuard
 from ui.terminal import TerminalUI
 from tools.filesystem import ReadFileTool
@@ -558,6 +559,42 @@ async def test_on_tool_approval_callback_is_called(tmp_path):
 
         assert len(call_log) > 0
         assert any(call[0] == "my_tool" for call in call_log)
+
+
+@pytest.mark.asyncio
+async def test_allow_rule_bypasses_approval_callback(tmp_path):
+    calls = []
+
+    class ApprovalProvider(MockProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(
+                tool_call_delta='<call_tool name="my_tool"></call_tool>',
+                is_done=True,
+            )
+
+    async def approval_callback(tool_name, arguments):
+        calls.append(tool_name)
+        return False
+
+    guard = SafetyGuard(project_root=tmp_path)
+    loop = AshLoop(
+        SessionStore(tmp_path / "allow-rule.db"),
+        ApprovalProvider(),
+        guard,
+        TerminalUI(safety_tier="interactive"),
+        tmp_path,
+        tools={"my_tool": MyTestTool(guard)},
+        on_tool_approval=approval_callback,
+        max_turn_iterations=1,
+    )
+    loop.permission_policy.set_persistent_rules(
+        [PermissionRule.create(RuleEffect.ALLOW, "my_tool")]
+    )
+    await loop.start_session()
+
+    await loop.run_turn("test")
+
+    assert calls == []
 
 
 @pytest.mark.asyncio
