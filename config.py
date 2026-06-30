@@ -1,11 +1,17 @@
 """Configuration loading for Ash."""
 
+from __future__ import annotations
+
+import os
+import tomllib
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
+    DotEnvSettingsSource,
+    EnvSettingsSource,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     TomlConfigSettingsSource,
@@ -14,9 +20,171 @@ from pydantic_settings import (
 
 CURRENT_CONFIG_SCHEMA_VERSION = 1
 
+PROJECT_CONFIG_DIRECTORY = ".ash"
+PROJECT_CONFIG_FILENAME = "config.toml"
+PROJECT_MODEL_PROVIDERS = frozenset(
+    {"anthropic", "openai", "deepseek", "groq", "ollama"}
+)
+
+# Project configuration is repository-controlled input. Keep host security,
+# credentials, persistence paths, and network destinations user-owned.
+PROJECT_CONFIG_FIELDS = frozenset(
+    {
+        "config_schema_version",
+        "model",
+        "temperature",
+        "max_context_tokens",
+        "max_completion_tokens",
+        "max_tool_result_tokens",
+        "steering_queue_limit",
+        "prompt_cache_enabled",
+        "prompt_cache_retention",
+        "model_pricing_usd_per_million",
+        "context_compaction_threshold",
+        "context_recent_messages",
+        "context_budget_weights",
+        "no_color",
+        "reduced_motion",
+        "screen_reader_mode",
+        "show_token_meter",
+        "input_mode",
+        "tui_mode",
+        "notification_method",
+        "notification_events",
+        "notification_include_preview",
+        "keybindings",
+        "enable_sprint_planning",
+        "repo_map_exclude_patterns",
+        "repo_map_enabled",
+        "repo_map_max_files",
+        "memory_backend",
+    }
+)
+
+
+def discover_workspace_root(start: str | Path | None = None) -> Path:
+    """Return the nearest Git workspace root, falling back to the start path."""
+
+    candidate = Path(start or Path.cwd()).expanduser().resolve()
+    if candidate.is_file():
+        candidate = candidate.parent
+    for directory in (candidate, *candidate.parents):
+        if (directory / ".git").exists():
+            return directory
+    return candidate
+
+
+def project_config_paths(workspace_root: Path, cwd: Path | None = None) -> list[Path]:
+    """Return project config layers from workspace root to current directory."""
+
+    root = workspace_root.expanduser().resolve()
+    current = (cwd or Path.cwd()).expanduser().resolve()
+    try:
+        relative = current.relative_to(root)
+    except ValueError:
+        directories = [root]
+    else:
+        directories = [root]
+        cursor = root
+        for part in relative.parts:
+            cursor = cursor / part
+            directories.append(cursor)
+    return [
+        directory / PROJECT_CONFIG_DIRECTORY / PROJECT_CONFIG_FILENAME
+        for directory in directories
+    ]
+
+
+def _known_settings_values(
+    settings_cls: type[AshConfig], values: dict[str, Any]
+) -> dict[str, Any]:
+    return {key: value for key, value in values.items() if key in settings_cls.model_fields}
+
+
+def _case_insensitive_value(values: Any, key: str) -> Any:
+    wanted = key.casefold()
+    for candidate, value in values.items():
+        if str(candidate).casefold() == wanted:
+            return value
+    return None
+
+
+def _apply_legacy_model_values(
+    destination: dict[str, Any], raw_values: Any
+) -> dict[str, str]:
+    """Normalize legacy model variables within one precedence layer."""
+
+    details: dict[str, str] = {}
+    model = _case_insensitive_value(raw_values, "ASH_MODEL")
+    if model is None:
+        model = destination.get("model")
+    legacy_model = _case_insensitive_value(raw_values, "ASH_MODEL_NAME")
+    provider = _case_insensitive_value(raw_values, "ASH_PROVIDER") or "anthropic"
+    if model is not None:
+        normalized = str(model)
+        if "/" not in normalized and provider:
+            normalized = f"{provider}/{normalized}"
+        destination["model"] = normalized
+        details["model"] = "ASH_MODEL"
+    elif legacy_model is not None:
+        destination["model"] = f"{provider}/{legacy_model}"
+        details["model"] = "ASH_MODEL_NAME"
+    return details
+
+
+def _read_toml(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("rb") as handle:
+            value = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError(f"cannot load project config {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"project config {path} must contain a TOML table")
+    return value
+
+
+def _filter_project_config(
+    settings_cls: type[AshConfig],
+    path: Path,
+    values: dict[str, Any],
+    diagnostics: list[str],
+) -> dict[str, Any]:
+    filtered: dict[str, Any] = {}
+    for field, value in values.items():
+        if field not in settings_cls.model_fields:
+            diagnostics.append(f"ignored unknown project config key {field!r} in {path}")
+            continue
+        if field not in PROJECT_CONFIG_FIELDS:
+            diagnostics.append(f"ignored user-owned project config key {field!r} in {path}")
+            continue
+        if field == "model":
+            provider, separator, _ = str(value).partition("/")
+            if not separator or provider not in PROJECT_MODEL_PROVIDERS:
+                diagnostics.append(
+                    f"ignored project model with non-built-in provider in {path}"
+                )
+                continue
+        filtered[field] = value
+    return filtered
+
+
+def _merge_config_layer(
+    merged: dict[str, Any],
+    sources: dict[str, tuple[str, str]],
+    values: dict[str, Any],
+    *,
+    source: str,
+    detail: str,
+    detail_by_field: dict[str, str] | None = None,
+) -> None:
+    for field, value in values.items():
+        merged[field] = value
+        selected_detail = (detail_by_field or {}).get(field, detail)
+        sources[field] = (source, selected_detail)
+
 
 class AshConfig(BaseSettings):
-    """Runtime settings loaded from environment variables, ~/.ash/.env, and ~/.ash/ash.toml."""
+    """Validated runtime settings and their resolved source metadata."""
 
     model_config = SettingsConfigDict(
         env_prefix="ASH_",
@@ -24,6 +192,9 @@ class AshConfig(BaseSettings):
         env_file=str(Path.home() / ".ash" / ".env"),
         extra="ignore",
     )
+
+    _config_sources: dict[str, tuple[str, str]] = PrivateAttr(default_factory=dict)
+    _config_diagnostics: list[str] = PrivateAttr(default_factory=list)
 
     model: str = Field(
         "anthropic/claude-sonnet-4-6",
@@ -155,7 +326,7 @@ class AshConfig(BaseSettings):
         description="Allow full auto mode without an OS-level sandbox.",
     )
     workspace_root: Path = Field(
-        default_factory=Path.cwd,
+        default_factory=discover_workspace_root,
         description="Scoped base folder containing project target code.",
     )
     command_blocklist: list[str] = Field(
@@ -431,28 +602,194 @@ class AshConfig(BaseSettings):
         )
 
     @classmethod
-    def load(cls, **overrides: Any) -> "AshConfig":
-        """Load configuration with optional explicit field overrides."""
+    def load(
+        cls,
+        *,
+        _override_source: str = "override",
+        _override_detail: str = "AshConfig.load()",
+        **overrides: Any,
+    ) -> "AshConfig":
+        """Resolve all supported layers and retain exact field provenance.
 
-        return cls(**overrides)
+        Precedence, highest first, is explicit overrides, process environment,
+        trusted project config, user TOML, user dotenv, then built-in defaults.
+        """
+
+        user_config_path = Path(
+            str(cls.model_config.get("toml_file") or Path.home() / ".ash" / "ash.toml")
+        ).expanduser()
+        dotenv_path = Path(
+            str(cls.model_config.get("env_file") or Path.home() / ".ash" / ".env")
+        ).expanduser()
+
+        raw_dotenv_values = DotEnvSettingsSource(cls, env_file=dotenv_path)()
+        dotenv_values = _known_settings_values(cls, raw_dotenv_values)
+        user_values = _known_settings_values(
+            cls,
+            TomlConfigSettingsSource(cls, toml_file=user_config_path)(),
+        )
+        env_values = _known_settings_values(cls, EnvSettingsSource(cls)())
+
+        dotenv_details = _apply_legacy_model_values(
+            dotenv_values, raw_dotenv_values
+        )
+        env_details = _apply_legacy_model_values(env_values, os.environ)
+        from cli.config import file_backed_env_values
+
+        file_backed_values = file_backed_env_values(dotenv_path)
+        for field in list(env_values):
+            env_key = env_details.get(field, f"ASH_{field.upper()}")
+            if (
+                file_backed_values.get(env_key) == os.environ.get(env_key)
+                and dotenv_values.get(field) == env_values[field]
+            ):
+                del env_values[field]
+                env_details.pop(field, None)
+
+        base_values: dict[str, Any] = {}
+        for values in (dotenv_values, user_values, env_values, overrides):
+            base_values.update(values)
+        workspace_value = base_values.get("workspace_root")
+        workspace_root = (
+            Path(workspace_value).expanduser().resolve()
+            if workspace_value is not None
+            else discover_workspace_root()
+        )
+
+        diagnostics: list[str] = []
+        project_layers: list[tuple[Path, dict[str, Any]]] = []
+        from safety.trust import is_workspace_trusted
+
+        if is_workspace_trusted(workspace_root):
+            for path in project_config_paths(workspace_root):
+                if not path.is_file():
+                    continue
+                values = _read_toml(path)
+                filtered = _filter_project_config(cls, path, values, diagnostics)
+                project_layers.append((path, filtered))
+
+        merged: dict[str, Any] = {}
+        sources: dict[str, tuple[str, str]] = {
+            field: ("default", "Ash built-in default") for field in cls.model_fields
+        }
+        _merge_config_layer(
+            merged,
+            sources,
+            dotenv_values,
+            source="dotenv",
+            detail=str(dotenv_path),
+            detail_by_field={
+                field: f"{key} in {dotenv_path}"
+                for field, key in dotenv_details.items()
+            },
+        )
+        _merge_config_layer(
+            merged,
+            sources,
+            user_values,
+            source="user",
+            detail=str(user_config_path),
+        )
+        for path, values in project_layers:
+            _merge_config_layer(
+                merged,
+                sources,
+                values,
+                source="project",
+                detail=str(path),
+            )
+        _merge_config_layer(
+            merged,
+            sources,
+            env_values,
+            source="env",
+            detail="process environment",
+            detail_by_field={
+                field: key for field, key in env_details.items()
+            }
+            | {
+                field: f"ASH_{field.upper()}"
+                for field in env_values
+                if field not in env_details
+            },
+        )
+        _merge_config_layer(
+            merged,
+            sources,
+            overrides,
+            source=_override_source,
+            detail=_override_detail,
+        )
+
+        config = cls(**merged)
+        if (
+            env_details.get("model") == "ASH_MODEL_NAME"
+            and not os.environ.get("ASH_MODEL")
+        ):
+            os.environ["ASH_MODEL"] = str(env_values["model"])
+        config._config_sources = sources
+        config._config_diagnostics = diagnostics
+        config._record_derived_sources()
+        return config
+
+    def config_source(self, field: str) -> tuple[str, str] | None:
+        """Return the selected source and detail for one field."""
+
+        return self._config_sources.get(field)
+
+    @property
+    def config_diagnostics(self) -> tuple[str, ...]:
+        """Warnings produced while loading trusted project configuration."""
+
+        return tuple(self._config_diagnostics)
+
+    def with_overrides(
+        self,
+        values: dict[str, Any],
+        *,
+        source: str = "cli",
+        detail: str = "command-line option",
+    ) -> "AshConfig":
+        """Copy settings while retaining provenance for explicit overrides."""
+
+        updated = self.model_copy(update=values)
+        updated._config_sources = dict(self._config_sources)
+        updated._config_sources.update(
+            {field: (source, detail) for field in values if field in self.model_fields}
+        )
+        updated._config_diagnostics = list(self._config_diagnostics)
+        updated._record_derived_sources()
+        return updated
+
+    def _record_derived_sources(self) -> None:
+        if not self.screen_reader_mode:
+            return
+        for field in ("no_color", "reduced_motion", "show_token_meter", "tui_mode"):
+            self._config_sources[field] = ("derived", "screen_reader_mode")
 
     def model_post_init(self, *args: Any, **kwargs: Any) -> None:
         """Handle backward compat and load MCP servers."""
-        import os
-
         from cli.config import load_env
 
+        setting_env_keys = {
+            f"ASH_{field.upper()}" for field in type(self).model_fields
+        } | {"ASH_MODEL_NAME", "ASH_PROVIDER"}
         for key, value in load_env().items():
-            os.environ.setdefault(key, value)
+            if key not in setting_env_keys:
+                os.environ.setdefault(key, value)
 
         # Backward compat: if ANTHROPIC_API_KEY is not set but ASH_API_KEY is,
         # promote it so _build_provider() finds the right key.
         if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ASH_API_KEY"):
             os.environ["ANTHROPIC_API_KEY"] = os.environ["ASH_API_KEY"]
 
-        # Backward compat: ASH_MODEL_NAME → ASH_MODEL with provider prefix.
-        # Old ASH_MODEL_NAME set but no ASH_MODEL — promote, defaulting to anthropic.
-        if not os.environ.get("ASH_MODEL") and os.environ.get("ASH_MODEL_NAME"):
+        # Direct AshConfig() construction still supports the legacy model name.
+        # AshConfig.load() normalizes this before validation and records provenance.
+        if (
+            "model" not in self.model_fields_set
+            and not os.environ.get("ASH_MODEL")
+            and os.environ.get("ASH_MODEL_NAME")
+        ):
             provider_val = os.environ.get("ASH_PROVIDER", "anthropic")
             os.environ["ASH_MODEL"] = f"{provider_val}/{os.environ['ASH_MODEL_NAME']}"
             object.__setattr__(self, "model", os.environ["ASH_MODEL"])

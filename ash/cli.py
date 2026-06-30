@@ -72,6 +72,27 @@ AVAILABLE_MODELS: list[str] = [
 ]
 
 
+def _emit_config_diagnostics(config: AshConfig) -> None:
+    for diagnostic in config.config_diagnostics:
+        print(f"Warning: {diagnostic}", file=sys.stderr)
+
+
+def _load_config_or_report(**overrides: Any) -> tuple[AshConfig | None, int]:
+    try:
+        return (
+            AshConfig.load(
+                _override_source="cli",
+                _override_detail="command-line option",
+                **overrides,
+            ),
+            0,
+        )
+    except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
+        error = classify_exception(exc)
+        print(format_error(error), file=sys.stderr)
+        return None, error.exit_code
+
+
 def _parse_model_string(model: str) -> tuple[str, str]:
     """Parse 'provider/model' string into (provider, model_name)."""
     if "/" not in model:
@@ -1375,6 +1396,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(format_error(error), file=sys.stderr)
             return error.exit_code
+        _emit_config_diagnostics(config)
         print(
             render_config_explain(
                 explain_config(config),
@@ -1802,13 +1824,50 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Added MCP server {args.server_name}.")
         return 0
 
-    config = AshConfig.load()
+    runtime_overrides: dict[str, Any] = {}
     if args.mode is not None:
-        config = config.model_copy(update={"safety_tier": args.mode})
+        runtime_overrides["safety_tier"] = args.mode
     if args.ci:
-        config = config.model_copy(update={"no_color": True, "reduced_motion": True})
+        runtime_overrides.update({"no_color": True, "reduced_motion": True})
+    if args.db_directory is not None:
+        runtime_overrides["db_directory"] = args.db_directory
 
-    # First-run detection: prompt to run setup if no provider configured
+    loaded_config, config_exit_code = _load_config_or_report(**runtime_overrides)
+    if loaded_config is None:
+        return config_exit_code
+    config = loaded_config
+
+    from safety.trust import is_workspace_trusted, set_workspace_trusted
+
+    workspace_trusted = is_workspace_trusted(config.workspace_root)
+    if (
+        not workspace_trusted
+        and args.prompt is None
+        and not args.ci
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+    ):
+        answer = (
+            input(
+                f"Trust project extensions in {config.workspace_root.resolve()}? [y/N] "
+            )
+            .strip()
+            .casefold()
+        )
+        if answer in {"y", "yes"}:
+            set_workspace_trusted(config.workspace_root, True)
+            workspace_trusted = True
+            loaded_config, config_exit_code = _load_config_or_report(
+                **runtime_overrides
+            )
+            if loaded_config is None:
+                return config_exit_code
+            config = loaded_config
+
+    _emit_config_diagnostics(config)
+
+    # First-run detection runs after trust so a trusted project model layer is
+    # active immediately. Credentials and provider endpoints remain user-owned.
     from cli.setup import _has_provider_configured
 
     if not _has_provider_configured(config):
@@ -1834,31 +1893,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             if setup_code != 0:
                 return setup_code
-            config = AshConfig.load()
-
-    if args.db_directory is not None:
-        config = AshConfig.load(db_directory=args.db_directory)
-
-    from safety.trust import is_workspace_trusted, set_workspace_trusted
-
-    workspace_trusted = is_workspace_trusted(config.workspace_root)
-    if (
-        not workspace_trusted
-        and args.prompt is None
-        and not args.ci
-        and sys.stdin.isatty()
-        and sys.stdout.isatty()
-    ):
-        answer = (
-            input(
-                f"Trust project extensions in {config.workspace_root.resolve()}? [y/N] "
+            loaded_config, config_exit_code = _load_config_or_report(
+                **runtime_overrides
             )
-            .strip()
-            .casefold()
-        )
-        if answer in {"y", "yes"}:
-            set_workspace_trusted(config.workspace_root, True)
-            workspace_trusted = True
+            if loaded_config is None:
+                return config_exit_code
+            config = loaded_config
 
     from safety.grants import PermissionGrantError, load_permission_rules
 

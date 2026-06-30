@@ -28,6 +28,7 @@ ENV_FILE = ASH_DIR / ".env"
 CONFIG_FILE = ASH_DIR / "ash.toml"
 _INITIAL_PATHS = (ASH_DIR, ENV_FILE, CONFIG_FILE)
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_FILE_BACKED_ENV_VALUES: dict[str, tuple[str, str]] = {}
 
 
 def _paths() -> tuple[Path, Path, Path]:
@@ -122,6 +123,20 @@ def save_env_values(values: dict[str, str]) -> None:
             pass
         raise
     os.environ.update(values)
+    _FILE_BACKED_ENV_VALUES.update(
+        {key: (str(env_file), value) for key, value in values.items()}
+    )
+
+
+def file_backed_env_values(path: Path) -> dict[str, str]:
+    """Return values published by this process after an atomic dotenv write."""
+
+    selected_path = str(path)
+    return {
+        key: value
+        for key, (source_path, value) in _FILE_BACKED_ENV_VALUES.items()
+        if source_path == selected_path
+    }
 
 
 def get_env_value(key: str) -> str | None:
@@ -232,7 +247,7 @@ class ConfigExplanation:
 
 
 def explain_config(config: Any) -> list[ConfigExplanation]:
-    """Explain each AshConfig field's best-known source and masked value."""
+    """Explain each AshConfig field's selected source and masked value."""
 
     fields = getattr(type(config), "model_fields", {})
     toml_values = _load_raw_toml_config()
@@ -245,7 +260,10 @@ def explain_config(config: Any) -> list[ConfigExplanation]:
         env_key = f"ASH_{field.upper()}"
         source = "default"
         detail = "Ash built-in default"
-        if field == "model" and (
+        recorded = getattr(config, "config_source", lambda _field: None)(field)
+        if recorded is not None:
+            source, detail = recorded
+        elif field == "model" and (
             model_source := _env_or_dotenv_source("ASH_MODEL", dotenv_values, env_path)
         ):
             source, detail = model_source
