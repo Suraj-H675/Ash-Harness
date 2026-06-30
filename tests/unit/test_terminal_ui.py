@@ -2,6 +2,7 @@
 from ui.terminal import TerminalUI
 from io import StringIO
 from rich.console import Console
+from types import SimpleNamespace
 
 
 def test_terminal_ui_initializes_with_safety_tier():
@@ -68,6 +69,32 @@ def test_terminal_ui_viewport_mode_uses_transcript_without_live_output() -> None
         "visible in viewport",
         "queued",
     ]
+
+
+def test_terminal_ui_hydrates_bounded_durable_session_transcript() -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="system", content="hidden", metadata={}),
+            SimpleNamespace(role="user", content="question", metadata={}),
+            SimpleNamespace(role="assistant", content="answer", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                content="x" * 5000,
+                metadata={"call_id": "c1"},
+            ),
+            SimpleNamespace(role="assistant", content="", metadata={}),
+        ]
+    )
+
+    ui.load_session_transcript(session)
+
+    entries = ui.transcript.snapshot()
+    assert [entry.kind for entry in entries] == ["user", "assistant", "tool"]
+    assert entries[0].content == "question"
+    assert entries[1].content == "answer"
+    assert len(entries[2].content) < 4100
+    assert entries[2].metadata == {"call_id": "c1"}
 
 
 def test_terminal_ui_dry_run_denies_all():

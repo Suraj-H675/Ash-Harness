@@ -386,6 +386,29 @@ class TerminalUI:
 
         self.transcript.append("user", text, title="you")
 
+    def load_session_transcript(self, session: Any | None) -> None:
+        """Replace viewport history from a durable session snapshot."""
+
+        self.transcript.clear()
+        if session is None:
+            return
+        for message in session.messages:
+            content = str(message.content)
+            if message.role == "user":
+                self.transcript.append("user", content, title="you")
+            elif message.role == "assistant" and content:
+                self.transcript.append("assistant", content, title="ash")
+            elif message.role == "tool":
+                bounded = content[:4000]
+                if len(content) > len(bounded):
+                    bounded += "\n[tool result truncated in transcript]"
+                self.transcript.append(
+                    "tool",
+                    bounded,
+                    title="tool result",
+                    metadata=dict(message.metadata),
+                )
+
     def _edit_preview(self, tool_name: str, arguments: dict[str, Any]) -> str:
         if tool_name == "apply_patch":
             patch = arguments.get("patch")

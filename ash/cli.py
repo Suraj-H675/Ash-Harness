@@ -411,6 +411,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     if not isinstance(loop.ui, TerminalUI):
         raise TypeError("interactive REPL requires TerminalUI")
     loop.ui.viewport_mode = prompt_input.uses_viewport
+    if prompt_input.uses_viewport:
+        loop.ui.load_session_transcript(loop.current_session)
     print = ReplPrinter(loop.ui, viewport=prompt_input.uses_viewport)  # noqa: A001
     turn_controller = InteractiveTurnController(
         loop,
@@ -539,6 +541,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 continue
             if command.name == "new":
                 session = await loop.start_session()
+                loop.ui.load_session_transcript(session)
                 print(f"Started session {session.session_id}", flush=True)
                 continue
             if command.name == "sessions":
@@ -575,6 +578,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 except KeyError as exc:
                     print(f"Error: {exc}", file=sys.stderr, flush=True)
                     continue
+                loop.ui.load_session_transcript(session)
                 print(f"Resumed session {session.session_id}", flush=True)
                 continue
             if command.name == "rename":
@@ -602,6 +606,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     print(f"Error: {exc}", file=sys.stderr, flush=True)
                     continue
                 loop.current_session = session
+                loop.ui.load_session_transcript(session)
                 print(f"Forked session {session.session_id}", flush=True)
                 continue
             if command.name == "rewind":
@@ -617,6 +622,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     print(f"Error: {exc}", file=sys.stderr, flush=True)
                     continue
                 loop.current_session = session
+                loop.ui.load_session_transcript(session)
                 print(f"Rewound transcript to {len(session.messages)} messages.")
                 continue
             if command.name == "undo":
@@ -678,6 +684,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     print(f"Error: {exc}", file=sys.stderr, flush=True)
                     continue
                 loop.current_session = session
+                loop.ui.load_session_transcript(session)
                 print(f"Imported and resumed session {session.session_id}")
                 continue
             if command.name == "context":
