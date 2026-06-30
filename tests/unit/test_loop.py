@@ -562,7 +562,7 @@ async def test_on_tool_approval_callback_is_called(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_allow_rule_bypasses_approval_callback(tmp_path):
+async def test_allow_rule_remains_subject_to_host_approval_callback(tmp_path):
     calls = []
 
     class ApprovalProvider(MockProvider):
@@ -594,7 +594,7 @@ async def test_allow_rule_bypasses_approval_callback(tmp_path):
 
     await loop.run_turn("test")
 
-    assert calls == []
+    assert calls == ["my_tool"]
 
 
 @pytest.mark.asyncio
