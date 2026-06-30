@@ -33,6 +33,7 @@ class FailoverProvider(ProviderABC):
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         last_error: Exception | None = None
+        failures: list[str] = []
         for index, provider in enumerate(self.providers):
             emitted = False
             try:
@@ -42,15 +43,18 @@ class FailoverProvider(ProviderABC):
                     emitted = True
                     self.active_index = index
                     yield chunk
+                self.failures = failures
                 return
             except Exception as exc:  # noqa: BLE001
                 if emitted:
+                    self.failures = failures
                     raise
                 last_error = exc
-                self.failures.append(f"{provider.model_name}: {exc}")
+                failures.append(f"{provider.model_name}: {exc}")
+        self.failures = failures
         assert last_error is not None
         raise RuntimeError(
-            "All configured providers failed: " + "; ".join(self.failures)
+            "All configured providers failed: " + "; ".join(failures)
         ) from last_error
 
     async def aclose(self) -> None:
