@@ -31,9 +31,7 @@ jobs:
           uv venv .smoke-venv --python 3.12
           uv pip install --python .smoke-venv dist/*.whl
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            .smoke-venv/Scripts/ash.exe --version
-            .smoke-venv/Scripts/python.exe -m ash --help
+            .smoke-venv/Scripts/python.exe tests/packaging/smoke_minimal_install.py
           else
-            .smoke-venv/bin/ash --version
-            .smoke-venv/bin/python -m ash --help
+            .smoke-venv/bin/python tests/packaging/smoke_minimal_install.py
           fi

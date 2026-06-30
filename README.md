@@ -16,6 +16,14 @@ ash doctor
 ash
 ```
 
+The default install includes the terminal harness, coding tools, repository
+map, and supported API/local providers. Install optional features explicitly:
+
+```bash
+pip install 'ash[server]' # authenticated HTTP/SSE API
+pip install 'ash[vector]' # ChromaDB and ONNX semantic memory
+```
+
 For development:
 
 ```bash
@@ -35,7 +43,7 @@ ash --session SESSION_ID         # resume a durable session
 ash mcp add local -- python server.py
 ash trust add .                  # allow project ASH.md, skills, hooks, MCP
 ash update                       # explicitly check GitHub releases
-ASH_SERVER_TOKEN=change-me-long-token ash serve
+ASH_SERVER_TOKEN=change-me-long-token ash serve # requires ash[server]
 ash storage check --json         # read-only session DB integrity check
 ash storage backup               # consistent timestamped backup
 ash storage restore BACKUP --yes # validated, non-destructive restore
@@ -69,7 +77,7 @@ checklists outside the REPL.
 text or a directory listing to a prompt; secret, binary, oversized, and
 out-of-workspace paths are rejected.
 
-Project-controlled extensions are disabled until the workspace is trusted.
+Project-controlled config and extensions are disabled until the workspace is trusted.
 API keys are stored in `~/.ash/.env` with restricted permissions. Custom
 provider metadata is stored separately in `~/.ash/ash.toml`.
 Network fetches use the `web_fetch` tool and require normal tool approval;
@@ -96,6 +104,28 @@ Ollama setup discovers installed models and gives `ollama serve`/`ollama pull`
 guidance without starting a download. In scripts, `ash setup
 --non-interactive` validates an existing environment configuration without
 prompting or making a network request.
+
+Configuration resolves in this order, from highest to lowest priority:
+
+1. Command-line overrides
+2. Process environment (`ASH_*`)
+3. Trusted `.ash/config.toml` files from the repository root to the current directory
+4. User configuration in `~/.ash/ash.toml`
+5. User credentials/settings in `~/.ash/.env`
+6. Built-in defaults
+
+Run `ash config explain` or `ash config explain --json` to inspect the selected
+source for every field. Project configuration may tune model/runtime and TUI
+behavior, but cannot set credentials, custom provider endpoints, workspace or
+database paths, MCP servers, permission weakening, or outbound-domain policy.
+Use `ash trust add <path>` to enable project layers and `ash trust remove
+<path>` to disable them.
+
+When setup finds the original project-root `ash.toml` format, it migrates all
+recognized values without replacing newer user settings. Source and changed
+destination files receive verified mode-0600 backups under `~/.ash/backups`;
+an exact-content migration record prevents repeated prompts while retaining
+recovery evidence.
 
 Terminal behavior is configurable with `ASH_INPUT_MODE=vi`,
 `ASH_NO_COLOR=true`, `ASH_REDUCED_MOTION=true`, and

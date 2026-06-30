@@ -27,3 +27,6 @@ __pycache__/
 
 # Local harness test artifacts
 __ash_test__/
+
+# User-managed comparison sources (never inspect or package)
+/project/

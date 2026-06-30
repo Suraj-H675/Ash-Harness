@@ -35,13 +35,13 @@ Research is clean-room: proprietary or leaked source is not used.
 |---|---|---|
 | `ash` console command | Verified locally | Wheel and sdist build; clean-environment console smoke test passes |
 | `python -m ash` | Verified locally | Keep as supported fallback |
-| Dependency separation | Partial | Runtime, dev, provider, vector, and server extras with lockfile consistency |
+| Dependency separation | Verified locally | Lean default runtime/provider install, standardized dev group, published vector/server extras, actionable missing-extra errors, and lockfile/artifact checks |
 | First-run wizard | Verified locally | No-key detection, deterministic cancel/back, endpoint retry/save-unverified choices, non-billable model discovery, secret input, atomic related settings, non-TTY guidance, and fresh-process API/local checks |
 | API-key providers | Partial | Anthropic, OpenAI, Groq, DeepSeek and custom endpoints tested from fresh process |
 | Local models | Partial | Ollama URL validation, installed-model discovery, health failure detail, start/pull guidance, and fresh-process configuration checks are wired; pull execution and dynamic tool-capability detection remain |
 | Custom endpoints | Verified locally | Per-provider credentials are stored in mode-0600 env storage, not TOML |
-| Config precedence | Partial | `ash config explain` shows env/dotenv/TOML/default sources; project config and full CLI override reporting remain |
-| Config migration | Partial | Legacy file migration and config schema future-version refusal exist; config backups remain |
+| Config precedence | Verified locally | CLI > process env > trusted hierarchical project TOML > user TOML > user dotenv > defaults, with exact masked provenance and project security restrictions |
+| Config migration | Verified locally | Complete legacy mapping, conflict preservation, strict destination parsing, verified private source/destination backups, exact-content migration records, and future-version refusal |
 | `ash doctor` | Verified locally | Human/JSON diagnostics, extension config validation, optional endpoint connectivity probe |
 | Update/version check | Verified locally | Explicit GitHub release check with no background telemetry or self-modification |
 | Uninstall/reset | Verified locally | Confirmed selective reset for config, sessions, cache, or all local state |
@@ -235,8 +235,8 @@ Research is clean-room: proprietary or leaked source is not used.
 | Database migrations | Verified locally | Schema version table, transactional ordered migration, future-version refusal, and backups |
 | Corruption recovery | Verified locally | Read-only integrity diagnostics plus validated backup and pre-restore preservation |
 | Offline test suite | Partial | No hidden home-directory mutation or live network dependency |
-| Cross-platform CI | Partial | Linux/macOS/Windows workflow added; remote runs are not yet observed |
-| Packaging CI | Verified locally | Wheel/sdist build, clean install, console and module command smoke tests pass |
+| Cross-platform CI | Partial | Linux/macOS/Windows workflow and platform-neutral installed-wheel smoke gate exist; remote runs are not yet observed |
+| Packaging CI | Verified locally | Wheel/sdist build, minimal clean install, artifact metadata/content, CLI/config/trust, repo-map import, optional dependency absence, and missing-extra behavior are exercised |
 | Security tests | Partial | Command/path bypass corpus, sandbox escape assumptions, secret leaks |
 | Performance tests | Missing | Startup, large repo indexing, long session, memory use, redraw latency |
 | Compatibility policy | Partial | Config, session, and plugin manifest schemas are versioned with future-version refusal; plugin deprecation windows remain |
