@@ -110,6 +110,96 @@ def backup_config_file(path: str | Path, *, label: str) -> Path:
         raise
 
 
+def config_file_digest(path: str | Path) -> str:
+    source = Path(path).expanduser()
+    digest = hashlib.sha256()
+    with source.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def migration_state_path() -> Path:
+    return ensure_ash_dir() / "config-migrations.json"
+
+
+def is_config_migration_recorded(path: str | Path) -> bool:
+    """Return whether this exact source has a matching verified backup record."""
+
+    source = Path(path).expanduser().resolve()
+    state = _load_migration_state()
+    record = state["migrations"].get(os.path.normcase(str(source)))
+    if not isinstance(record, dict):
+        return False
+    backup_value = record.get("backup")
+    digest = record.get("sha256")
+    if not isinstance(backup_value, str) or not isinstance(digest, str):
+        return False
+    backup = Path(backup_value)
+    try:
+        return config_file_digest(source) == digest == config_file_digest(backup)
+    except OSError:
+        return False
+
+
+def record_config_migration(path: str | Path, backup: str | Path) -> None:
+    """Atomically record a completed migration after checking its backup."""
+
+    source = Path(path).expanduser().resolve()
+    backup_path = Path(backup).expanduser().resolve()
+    source_digest = config_file_digest(source)
+    if config_file_digest(backup_path) != source_digest:
+        raise OSError("refusing to record a migration with a mismatched backup")
+    state = _load_migration_state()
+    state["migrations"][os.path.normcase(str(source))] = {
+        "sha256": source_digest,
+        "backup": str(backup_path),
+        "migrated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_migration_state(state)
+
+
+def _load_migration_state() -> dict[str, Any]:
+    path = migration_state_path()
+    if not path.exists():
+        return {"version": 1, "migrations": {}}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot load config migration state {path}: {exc}") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("version") != 1
+        or not isinstance(value.get("migrations"), dict)
+    ):
+        raise ValueError(f"invalid config migration state: {path}")
+    return value
+
+
+def _save_migration_state(state: dict[str, Any]) -> None:
+    path = migration_state_path()
+    payload = (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    fd, temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            path.chmod(0o600)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
 # ---------------------------------------------------------------------------
 # .env file operations (atomic write)
 # ---------------------------------------------------------------------------

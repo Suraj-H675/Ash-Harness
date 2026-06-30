@@ -171,6 +171,46 @@ class TestAtomicWrite:
         with pytest.raises(ValueError, match="backup label"):
             cli_config.backup_config_file(source, label="../escape")
 
+    def test_migration_record_requires_exact_source_and_backup(
+        self, tmp_path: Path
+    ) -> None:
+        from cli import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        source = tmp_path / "legacy.toml"
+        source.write_text('model_name = "legacy"\n', encoding="utf-8")
+        backup = cli_config.backup_config_file(source, label="legacy")
+
+        assert cli_config.is_config_migration_recorded(source) is False
+        cli_config.record_config_migration(source, backup)
+        assert cli_config.is_config_migration_recorded(source) is True
+
+        source.write_text('model_name = "changed"\n', encoding="utf-8")
+        assert cli_config.is_config_migration_recorded(source) is False
+
+    def test_migration_record_rejects_mismatched_or_corrupt_state(
+        self, tmp_path: Path
+    ) -> None:
+        from cli import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        source = tmp_path / "legacy.toml"
+        backup = tmp_path / "wrong.bak"
+        source.write_text("source\n", encoding="utf-8")
+        backup.write_text("different\n", encoding="utf-8")
+
+        with pytest.raises(OSError, match="mismatched backup"):
+            cli_config.record_config_migration(source, backup)
+
+        cli_config.ensure_ash_dir()
+        cli_config.migration_state_path().write_text("not json", encoding="utf-8")
+        with pytest.raises(ValueError, match="cannot load config migration state"):
+            cli_config.is_config_migration_recorded(source)
+
     def test_save_env_values_commits_related_settings_together(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
