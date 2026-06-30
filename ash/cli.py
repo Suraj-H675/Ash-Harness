@@ -282,7 +282,7 @@ def _build_tools(
         GitDiffTool(safety_guard),
         GitLogTool(safety_guard),
         ApplyPatchTool(safety_guard),
-        BackgroundProcessTool(safety_guard),
+        BackgroundProcessTool(safety_guard, sandbox_manager=sandbox_manager),
         AskUserTool(safety_guard),
         ListDirectoryTool(safety_guard),
         GlobFilesTool(safety_guard),
@@ -949,6 +949,16 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     allowed = ", ".join(item.value for item in PermissionMode)
                     print(f"Error: mode must be one of: {allowed}", file=sys.stderr)
                     continue
+                if mode == PermissionMode.AUTO_APPROVE:
+                    from sandbox import auto_approve_safety_error
+
+                    safety_error = auto_approve_safety_error(
+                        sandbox_manager,
+                        allow_unsafe=config.allow_unsafe_auto_approve,
+                    )
+                    if safety_error:
+                        print(f"Error: {safety_error}", file=sys.stderr)
+                        continue
                 loop.permission_policy = PermissionPolicy(
                     mode,
                     persistent_rules=loop.permission_policy.persistent_rules,
@@ -1952,18 +1962,16 @@ def main(argv: list[str] | None = None) -> int:
             reduced_motion=config.reduced_motion,
             screen_reader_mode=config.screen_reader_mode,
         )
-    from sandbox import SandboxManager
+    from sandbox import SandboxManager, auto_approve_safety_error
 
     sandbox_manager = SandboxManager(workspace_root=config.workspace_root)
-    if (
-        config.safety_tier == "auto_approve"
-        and not sandbox_manager.is_fully_isolated()
-        and not config.allow_unsafe_auto_approve
-    ):
+    safety_error = auto_approve_safety_error(
+        sandbox_manager,
+        allow_unsafe=config.allow_unsafe_auto_approve,
+    )
+    if config.safety_tier == "auto_approve" and safety_error:
         print(
-            "Error: auto_approve requires an available OS sandbox. "
-            "Use interactive/auto_edit mode or explicitly set "
-            "ASH_ALLOW_UNSAFE_AUTO_APPROVE=true.",
+            f"Error: {safety_error}",
             file=sys.stderr,
         )
         return 2

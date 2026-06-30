@@ -422,8 +422,9 @@ def test_run_command_fails_closed_when_sandbox_unavailable(tmp_path: Path) -> No
         mgr = SandboxManager(workspace_root=tmp_path)
     assert mgr.tier == SANDBOX_TIER_DOCKER  # by detection
     tool = RunCommandTool(guard, sandbox_manager=mgr)
-    with pytest.raises(SandboxBackendUnavailable):
-        asyncio.run(tool.run(command_line="echo ok", cwd=str(tmp_path)))
+    result = asyncio.run(tool.run(command_line="echo ok", cwd=str(tmp_path)))
+    assert result.success is False
+    assert "Sandbox unavailable; command was not run" in (result.error or "")
 
 
 def test_bubblewrap_rejects_cwd_outside_workspace(tmp_path: Path) -> None:

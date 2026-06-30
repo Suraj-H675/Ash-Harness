@@ -6,13 +6,16 @@ import asyncio
 import platform
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from safety.guard import SafetyGuard
 from sandbox.process_utils import process_group_options, terminate_process_tree
+from sandbox import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable, SandboxManager
 from tools.base import BaseTool, ToolResult, count_output_tokens
+from tools.command import build_scrubbed_command_env
 
 
 @dataclass
@@ -23,6 +26,7 @@ class Job:
     output: list[str] = field(default_factory=list)
     cursor: int = 0
     readers: list[asyncio.Task[None]] = field(default_factory=list)
+    sandbox_backend: str = "scoped"
 
 
 class BackgroundProcessArgs(BaseModel):
@@ -38,9 +42,15 @@ class BackgroundProcessTool(BaseTool):
     description = "Start, list, poll, write to, or stop a managed background process."
     args_schema = BackgroundProcessArgs
 
-    def __init__(self, safety_guard: SafetyGuard) -> None:
+    def __init__(
+        self,
+        safety_guard: SafetyGuard,
+        *,
+        sandbox_manager: SandboxManager | None = None,
+    ) -> None:
         super().__init__(safety_guard)
         self.jobs: dict[str, Job] = {}
+        self.sandbox_manager = sandbox_manager
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = BackgroundProcessArgs(**kwargs)
@@ -77,19 +87,41 @@ class BackgroundProcessTool(BaseTool):
         cwd = self.safety_guard.validate_path(
             args.cwd or self.safety_guard.project_root
         )
-        if platform.system() == "Windows":
-            argv = ["powershell.exe", "-NoProfile", "-Command", args.command]
-        else:
+        isolated = (
+            self.sandbox_manager is not None
+            and self.sandbox_manager.tier >= SANDBOX_TIER_BWRAP
+        )
+        if isolated or platform.system() != "Windows":
             argv = ["/bin/sh", "-c", args.command]
+        else:
+            argv = ["powershell.exe", "-NoProfile", "-Command", args.command]
+        backend_name = "scoped"
+        if self.sandbox_manager is not None:
+            try:
+                invocation = self.sandbox_manager.prepare(argv, cwd=Path(cwd))
+            except SandboxBackendUnavailable as exc:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Sandbox unavailable; command was not started: {exc}",
+                )
+            argv = list(invocation.argv)
+            backend_name = invocation.backend_name
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd,
+            env=build_scrubbed_command_env(self.safety_guard.project_root),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             **process_group_options(),
         )
-        job = Job(uuid.uuid4().hex[:12], args.command, process)
+        job = Job(
+            uuid.uuid4().hex[:12],
+            args.command,
+            process,
+            sandbox_backend=backend_name,
+        )
         assert process.stdout is not None and process.stderr is not None
         job.readers = [
             asyncio.create_task(self._read(process.stdout, job, "")),
@@ -109,7 +141,7 @@ class BackgroundProcessTool(BaseTool):
             if job.process.returncode is None
             else f"exited({job.process.returncode})"
         )
-        return f"{job.job_id} {state}: {job.command}"
+        return f"{job.job_id} {state} [{job.sandbox_backend}]: {job.command}"
 
     @staticmethod
     def _result(output: str) -> ToolResult:

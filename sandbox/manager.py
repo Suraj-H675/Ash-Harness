@@ -43,11 +43,13 @@ __all__ = [
     "SANDBOX_TIER_SCOPED",
     "SandboxBackendUnavailable",
     "SandboxManager",
+    "SandboxInvocation",
     "SandboxResult",
     "SandboxTier",
     "has_bwrap",
     "has_docker",
     "has_sandbox_exec",
+    "auto_approve_safety_error",
 ]
 
 
@@ -66,6 +68,17 @@ class SandboxResult:
     backend_name: str
     fallback_used: bool = False
     duration_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class SandboxInvocation:
+    """A prepared subprocess invocation with its effective isolation metadata."""
+
+    argv: tuple[str, ...]
+    cwd: Path | None
+    tier: SandboxTier
+    backend_name: str
+    fallback_used: bool = False
 
 
 # --- probe helpers ---------------------------------------------------------
@@ -89,6 +102,23 @@ def has_docker() -> bool:
     """Whether ``docker`` is on PATH."""
 
     return probe_docker() is not None
+
+
+def auto_approve_safety_error(
+    manager: "SandboxManager",
+    *,
+    allow_unsafe: bool,
+) -> str | None:
+    """Explain why full-auto execution is unsafe, or return ``None``."""
+
+    if manager.is_fully_isolated() or allow_unsafe:
+        return None
+    return (
+        "auto_approve requires an available OS sandbox; "
+        f"the active backend is {manager.backend_name}, which does not isolate "
+        "filesystem or network access. Use interactive/auto_edit mode, install "
+        "a supported sandbox, or explicitly set ASH_ALLOW_UNSAFE_AUTO_APPROVE=true."
+    )
 
 
 # --- the manager -----------------------------------------------------------
@@ -178,37 +208,54 @@ class SandboxManager:
             raise ValueError("command must be a non-empty sequence")
 
         deadline = timeout if timeout is not None else self.timeout_seconds
+        invocation = self.prepare(command, cwd=cwd)
+        if invocation.tier == SANDBOX_TIER_SCOPED:
+            return await _run_scoped(
+                _ScopedBackend(),
+                invocation.argv,
+                invocation.cwd,
+                deadline,
+                fallback=invocation.fallback_used,
+                env=env,
+            )
+
+        return await _run_subprocess(
+            list(invocation.argv),
+            cwd=invocation.cwd,
+            deadline=deadline,
+            tier=invocation.tier,
+            backend_name=invocation.backend_name,
+            env=env,
+        )
+
+    def prepare(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None = None,
+    ) -> SandboxInvocation:
+        """Prepare a command for foreground or managed background execution."""
+
+        if not command:
+            raise ValueError("command must be a non-empty sequence")
         try:
             backend = self._build_backend(self._tier)
-        except SandboxBackendUnavailable:
-            if not self.allow_scoped_fallback:
-                raise
-            return await _run_scoped(
-                _ScopedBackend(), command, cwd, deadline, fallback=True, env=env
-            )
-
-        if isinstance(backend, _ScopedBackend):
-            return await _run_scoped(
-                backend, command, cwd, deadline, fallback=False, env=env
-            )
-
-        # Tier 2/3 path: build the wrapped argv, then exec.
-        try:
             wrapped = backend.wrap(command, cwd=cwd)
         except SandboxBackendUnavailable:
             if not self.allow_scoped_fallback:
                 raise
-            return await _run_scoped(
-                _ScopedBackend(), command, cwd, deadline, fallback=True, env=env
+            return SandboxInvocation(
+                tuple(command),
+                cwd,
+                SANDBOX_TIER_SCOPED,
+                "scoped",
+                fallback_used=True,
             )
-
-        return await _run_subprocess(
-            wrapped,
-            cwd=cwd,
-            deadline=deadline,
-            tier=self._tier,
+        return SandboxInvocation(
+            tuple(wrapped),
+            cwd,
+            backend.tier,
             backend_name=backend.name,
-            env=env,
         )
 
     # --- tier detection --------------------------------------------------

@@ -19,7 +19,7 @@ from core.session import SessionStore, SessionSummary
 from providers.base import ProviderABC
 from safety.grants import load_permission_rules
 from safety.guard import SafetyGuard
-from sandbox import SandboxManager
+from sandbox import SandboxBackendUnavailable, SandboxManager, auto_approve_safety_error
 from ui.headless import HeadlessUI
 
 
@@ -83,6 +83,13 @@ class AshClient:
             runtime_config = runtime_config.model_copy(
                 update={"workspace_root": workspace.resolve()}
             )
+        sandbox = SandboxManager(workspace_root=runtime_config.workspace_root)
+        safety_error = auto_approve_safety_error(
+            sandbox,
+            allow_unsafe=runtime_config.allow_unsafe_auto_approve,
+        )
+        if runtime_config.safety_tier == "auto_approve" and safety_error:
+            raise SandboxBackendUnavailable(safety_error)
         permission_rules = load_permission_rules(runtime_config.workspace_root)
         store = SessionStore(runtime_config.db_directory / "sessions.db")
         guard = SafetyGuard(
@@ -90,7 +97,6 @@ class AshClient:
             blocklist_commands=runtime_config.command_blocklist,
         )
         active_provider = provider or _build_provider(runtime_config)
-        sandbox = SandboxManager(workspace_root=runtime_config.workspace_root)
         repo_map = _build_repo_map(runtime_config)
         tools = _build_tools(
             guard,

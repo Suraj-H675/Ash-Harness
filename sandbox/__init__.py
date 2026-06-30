@@ -24,7 +24,9 @@ from sandbox.bwrap import BubblewrapSandbox
 from sandbox.docker import DockerSandbox
 from sandbox.manager import (
     SandboxManager,
+    SandboxInvocation,
     SandboxResult,
+    auto_approve_safety_error,
     has_bwrap,
     has_docker,
     has_sandbox_exec,
@@ -41,8 +43,10 @@ __all__ = [
     "SandboxBackend",
     "SandboxBackendUnavailable",
     "SandboxManager",
+    "SandboxInvocation",
     "SandboxResult",
     "SandboxTier",
+    "auto_approve_safety_error",
     "has_bwrap",
     "has_docker",
     "has_sandbox_exec",

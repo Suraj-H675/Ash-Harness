@@ -5,6 +5,7 @@ import pytest
 from ash.sdk import AshClient
 from config import AshConfig
 from providers.base import ProviderABC, StreamChunk
+from sandbox import SandboxBackendUnavailable
 
 
 class SDKProvider(ProviderABC):
@@ -58,6 +59,23 @@ class SteeringSDKProvider(SDKProvider):
             yield StreamChunk(content="initial", is_done=True)
         else:
             yield StreamChunk(content="redirected", is_done=True)
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_rejects_unisolated_auto_approve(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("sandbox.manager.has_docker", lambda: False)
+    monkeypatch.setattr("sandbox.manager.has_bwrap", lambda: False)
+    monkeypatch.setattr("sandbox.manager.has_sandbox_exec", lambda: False)
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        safety_tier="auto_approve",
+    )
+
+    with pytest.raises(SandboxBackendUnavailable, match="does not isolate"):
+        await AshClient.create(config=config, provider=SDKProvider())
 
 
 @pytest.mark.asyncio

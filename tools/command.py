@@ -12,7 +12,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from safety.guard import SafetyGuard, SafetyViolation
-from sandbox._base import SANDBOX_TIER_BWRAP
+from sandbox._base import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable
 from sandbox.manager import SandboxManager, SandboxResult
 from tools.base import BaseTool, ToolResult, count_output_tokens
 from sandbox.process_utils import process_group_options, terminate_process_tree
@@ -138,9 +138,16 @@ class RunCommandTool(BaseTool):
         from pathlib import Path
 
         cwd_path = Path(cwd) if cwd is not None else None
-        result: SandboxResult = await self.sandbox_manager.run(
-            argv, cwd=cwd_path, timeout=timeout_seconds, env=env
-        )
+        try:
+            result: SandboxResult = await self.sandbox_manager.run(
+                argv, cwd=cwd_path, timeout=timeout_seconds, env=env
+            )
+        except SandboxBackendUnavailable as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Sandbox unavailable; command was not run: {exc}",
+            )
         output, truncated = _truncate_command_output(result.stdout)
         error, error_truncated = _truncate_command_output(result.stderr)
         if error_truncated:
