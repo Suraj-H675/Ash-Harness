@@ -20,6 +20,9 @@ from pydantic_settings import (
 
 CURRENT_CONFIG_SCHEMA_VERSION = 1
 
+_INITIAL_USER_CONFIG_PATH = Path.home() / ".ash" / "ash.toml"
+_INITIAL_DOTENV_PATH = Path.home() / ".ash" / ".env"
+
 PROJECT_CONFIG_DIRECTORY = ".ash"
 PROJECT_CONFIG_FILENAME = "config.toml"
 PROJECT_MODEL_PROVIDERS = frozenset(
@@ -69,9 +72,27 @@ def discover_workspace_root(start: str | Path | None = None) -> Path:
     if candidate.is_file():
         candidate = candidate.parent
     for directory in (candidate, *candidate.parents):
-        if (directory / ".git").exists():
+        if _is_git_marker(directory / ".git"):
             return directory
     return candidate
+
+
+def _is_git_marker(path: Path) -> bool:
+    if path.is_dir():
+        return (path / "HEAD").is_file()
+    if not path.is_file():
+        return False
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:1024].lstrip().startswith(
+            "gitdir:"
+        )
+    except OSError:
+        return False
+
+
+def _configured_settings_path(key: str, initial: Path, current_default: Path) -> Path:
+    configured = Path(str(AshConfig.model_config.get(key) or current_default)).expanduser()
+    return current_default if configured == initial else configured
 
 
 def project_config_paths(workspace_root: Path, cwd: Path | None = None) -> list[Path]:
@@ -188,8 +209,8 @@ class AshConfig(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="ASH_",
-        toml_file=str(Path.home() / ".ash" / "ash.toml"),
-        env_file=str(Path.home() / ".ash" / ".env"),
+        toml_file=str(_INITIAL_USER_CONFIG_PATH),
+        env_file=str(_INITIAL_DOTENV_PATH),
         extra="ignore",
     )
 
@@ -615,12 +636,16 @@ class AshConfig(BaseSettings):
         trusted project config, user TOML, user dotenv, then built-in defaults.
         """
 
-        user_config_path = Path(
-            str(cls.model_config.get("toml_file") or Path.home() / ".ash" / "ash.toml")
-        ).expanduser()
-        dotenv_path = Path(
-            str(cls.model_config.get("env_file") or Path.home() / ".ash" / ".env")
-        ).expanduser()
+        user_config_path = _configured_settings_path(
+            "toml_file",
+            _INITIAL_USER_CONFIG_PATH,
+            Path.home() / ".ash" / "ash.toml",
+        )
+        dotenv_path = _configured_settings_path(
+            "env_file",
+            _INITIAL_DOTENV_PATH,
+            Path.home() / ".ash" / ".env",
+        )
 
         raw_dotenv_values = DotEnvSettingsSource(cls, env_file=dotenv_path)()
         dotenv_values = _known_settings_values(cls, raw_dotenv_values)

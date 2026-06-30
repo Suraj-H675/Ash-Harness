@@ -368,11 +368,17 @@ def _use_temporary_trust_store(
     )
 
 
+def _make_git_root(root: Path) -> None:
+    git_directory = root / ".git"
+    git_directory.mkdir(parents=True)
+    (git_directory / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+
 def test_workspace_root_discovers_git_ancestor(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     nested = root / "src" / "package"
     nested.mkdir(parents=True)
-    (root / ".git").mkdir()
+    _make_git_root(root)
 
     assert discover_workspace_root(nested) == root.resolve()
     assert project_config_paths(root, nested) == [
@@ -382,12 +388,21 @@ def test_workspace_root_discovers_git_ancestor(tmp_path: Path) -> None:
     ]
 
 
+def test_workspace_discovery_ignores_empty_git_marker(tmp_path: Path) -> None:
+    parent = tmp_path / "not-a-repository"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    (parent / ".git").mkdir()
+
+    assert discover_workspace_root(child) == child.resolve()
+
+
 def test_untrusted_project_config_is_inert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _use_temporary_trust_store(tmp_path, monkeypatch)
     root = tmp_path / "repo"
-    (root / ".git").mkdir(parents=True)
+    _make_git_root(root)
     (root / ".ash").mkdir()
     (root / ".ash" / "config.toml").write_text(
         'model = "ollama/untrusted"\ntemperature = 0.9\n', encoding="utf-8"
@@ -412,7 +427,7 @@ def test_trusted_project_layers_have_precise_precedence_and_provenance(
     root = tmp_path / "repo"
     nested = root / "packages" / "app"
     nested.mkdir(parents=True)
-    (root / ".git").mkdir()
+    _make_git_root(root)
     (root / ".ash").mkdir()
     (nested / ".ash").mkdir()
     (root / ".ash" / "config.toml").write_text(
@@ -454,7 +469,7 @@ def test_project_config_cannot_override_user_owned_controls(
 
     _use_temporary_trust_store(tmp_path, monkeypatch)
     root = tmp_path / "repo"
-    (root / ".git").mkdir(parents=True)
+    _make_git_root(root)
     (root / ".ash").mkdir()
     project_config = root / ".ash" / "config.toml"
     project_config.write_text(
@@ -500,7 +515,7 @@ def test_malformed_project_config_only_fails_after_trust(
 
     _use_temporary_trust_store(tmp_path, monkeypatch)
     root = tmp_path / "repo"
-    (root / ".git").mkdir(parents=True)
+    _make_git_root(root)
     (root / ".ash").mkdir()
     (root / ".ash" / "config.toml").write_text("model = [", encoding="utf-8")
     monkeypatch.chdir(root)
