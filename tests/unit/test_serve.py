@@ -3,6 +3,7 @@ import argparse
 import pytest
 
 from cli.serve import serve_http
+from exceptions import AshError
 
 
 def args(**overrides):
@@ -44,6 +45,18 @@ async def test_serve_validates_arguments_before_creating_client(monkeypatch) -> 
         await serve_http(args(port=0))
     with pytest.raises(ValueError, match="Rate limit"):
         await serve_http(args(rate_limit=0))
+
+
+@pytest.mark.asyncio
+async def test_serve_reports_missing_optional_dependencies(monkeypatch) -> None:
+    monkeypatch.setenv("ASH_SERVER_TOKEN", "0123456789abcdef")
+    monkeypatch.setattr("cli.serve.uvicorn", None)
+
+    with pytest.raises(AshError, match="optional HTTP server dependencies") as exc:
+        await serve_http(args())
+
+    assert exc.value.exit_code == 2
+    assert "ash[server]" in exc.value.remedy
 
 
 @pytest.mark.asyncio

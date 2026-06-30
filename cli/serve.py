@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import os
-
-import uvicorn
+from typing import Any
 
 from ash.sdk import AshClient
-from server.http import create_app
+from exceptions import AshError, ErrorCategory
+
+
+_uvicorn: Any
+try:
+    import uvicorn as _uvicorn
+except ModuleNotFoundError as exc:
+    if exc.name != "uvicorn":
+        raise
+    _uvicorn = None
+uvicorn: Any = _uvicorn
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
@@ -25,6 +34,14 @@ async def serve_http(args) -> int:
         raise ValueError("Port must be between 1 and 65535")
     if args.rate_limit < 1:
         raise ValueError("Rate limit must be positive")
+    if uvicorn is None:
+        raise _server_dependency_error()
+    try:
+        from server.http import create_app
+    except ModuleNotFoundError as exc:
+        if exc.name is None or not exc.name.startswith("fastapi"):
+            raise
+        raise _server_dependency_error() from exc
     client = await AshClient.create()
     try:
         app = create_app(
@@ -44,3 +61,12 @@ async def serve_http(args) -> int:
         return 0
     finally:
         await client.close()
+
+
+def _server_dependency_error() -> AshError:
+    return AshError(
+        "The optional HTTP server dependencies are not installed.",
+        category=ErrorCategory.CONFIG,
+        remedy="Install them with `pip install 'ash[server]'`, then rerun `ash serve`.",
+        exit_code=2,
+    )

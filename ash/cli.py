@@ -1756,9 +1756,10 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             return asyncio.run(serve_http(args))
-        except ValueError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 2
+        except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
+            error = classify_exception(exc)
+            print(format_error(error), file=sys.stderr)
+            return error.exit_code
 
     if args.command == "mcp":
         from cli.mcp import (

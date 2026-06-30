@@ -19,7 +19,7 @@ ash
 For development:
 
 ```bash
-uv sync --extra dev
+uv sync --group dev --extra server
 uv run ash --help
 uv run pytest -q
 ```

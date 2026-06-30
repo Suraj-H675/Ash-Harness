@@ -20,7 +20,7 @@ jobs:
         with:
           enable-cache: true
           python-version: "3.12"
-      - run: uv sync --extra dev
+      - run: uv sync --group dev --extra server
       - run: uv run ruff check .
       - run: uv run mypy ash cli config.py context core hooks mcp plugins providers safety sandbox tools ui
       - run: uv run pytest -q
