@@ -3,6 +3,7 @@ import io
 from pathlib import Path
 
 import pytest
+from types import SimpleNamespace
 from rich.console import Console
 
 from core.loop import AshLoop
@@ -22,7 +23,7 @@ class RoutedPrompt:
 
     async def read(self, prompt: str = "> ") -> str:
         self.prompts.append(prompt)
-        if prompt.startswith("Approve"):
+        if prompt.startswith(("Approve", "Plan")):
             return await self.approvals.get()
         return await self.steering.get()
 
@@ -185,3 +186,31 @@ async def test_interactive_approval_preempts_steering_reader(tmp_path: Path) -> 
     assert (tmp_path / "approved.txt").read_text() == "written"
     assert any(item.startswith("Approve") for item in prompt.prompts)
     assert statuses == []
+
+
+@pytest.mark.asyncio
+async def test_plan_approval_uses_shared_prompt_owner(tmp_path: Path) -> None:
+    prompt = RoutedPrompt()
+    await prompt.approvals.put("y")
+    ui = make_ui()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        BlockingProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(loop, prompt, ui)  # type: ignore[arg-type]
+    execution = SimpleNamespace(
+        contract=SimpleNamespace(
+            contract_id="12345678-plan",
+            goal="ship safely",
+            definition_of_done=["tests pass"],
+            files_in_scope=["ui/"],
+        ),
+        items=[],
+    )
+
+    assert await controller._request_plan_approval(execution) is True
+    assert prompt.prompts == ["Plan [y/e/N]? "]
+    assert ui.transcript.snapshot()[-1].metadata == {"type": "plan.approval"}

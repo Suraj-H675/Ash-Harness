@@ -492,6 +492,16 @@ class TerminalUI:
             if live is not None:
                 live.start()
 
+    def show_plan_review(self, execution: Any) -> None:
+        """Render a plan without reading input from the terminal."""
+
+        self._render_plan(execution)
+
+    def edit_plan(self, execution: Any) -> None:
+        """Open and validate a plan in the configured external editor."""
+
+        self._edit_plan(execution)
+
     def _render_plan(self, execution: Any) -> None:
         body = Text()
         body.append("Goal: ", style="bold")
@@ -514,6 +524,13 @@ class TerminalUI:
                 body.append(f"  {mark} [{item.section}] {item.description}\n")
         else:
             body.append("  (empty)\n")
+        body.append("\nApprove [y], edit [e], or deny [N]?", style="bold yellow")
+        self.transcript.append(
+            "approval",
+            body.plain,
+            title=f"sprint {execution.contract.contract_id[:8]}",
+            metadata={"type": "plan.approval"},
+        )
         self.console.print(
             Panel(
                 body,

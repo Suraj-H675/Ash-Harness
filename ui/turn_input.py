@@ -39,7 +39,9 @@ class InteractiveTurnController:
 
         self.ui.record_user_input(user_input)
         previous_approval = self.loop.on_tool_approval
+        previous_plan_approval = self.loop.on_plan_approval
         self.loop.on_tool_approval = self._request_approval
+        self.loop.on_plan_approval = self._request_plan_approval
         turn = asyncio.create_task(self.loop.run_turn(user_input))
         try:
             while not turn.done():
@@ -86,6 +88,7 @@ class InteractiveTurnController:
             if not turn.done():
                 await self._cancel_turn(turn)
             self.loop.on_tool_approval = previous_approval
+            self.loop.on_plan_approval = previous_plan_approval
 
     async def _request_approval(
         self, tool_name: str, arguments: dict[str, object]
@@ -114,6 +117,34 @@ class InteractiveTurnController:
             self.ui.approve_tool_for_session(tool_name)
             return True
         return answer in {"y", "yes"}
+
+    async def _request_plan_approval(self, execution) -> bool:
+        self._approval_active = True
+        self._approval_complete.clear()
+        await self._cancel_steering_read()
+        try:
+            while True:
+                self.ui.show_plan_review(execution)
+                try:
+                    answer = (
+                        (await self.prompt_input.read("Plan [y/e/N]? "))
+                        .strip()
+                        .casefold()
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    return False
+                if answer in {"y", "yes"}:
+                    return True
+                if answer not in {"e", "edit"}:
+                    return False
+                try:
+                    self.ui.edit_plan(execution)
+                except Exception as exc:  # noqa: BLE001 - editor errors deny safely
+                    self.write_status(f"Plan edit failed: {exc}")
+                    return False
+        finally:
+            self._approval_active = False
+            self._approval_complete.set()
 
     async def _cancel_steering_read(self) -> None:
         task = self._steering_read

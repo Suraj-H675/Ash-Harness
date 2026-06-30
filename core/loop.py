@@ -72,6 +72,7 @@ ToolApprovalCallback = Callable[
     [str, dict[str, Any]],  # tool_name, arguments
     Awaitable[bool],  # True = approve, False = deny
 ]
+PlanApprovalCallback = Callable[["SprintExecution"], Awaitable[bool]]
 
 
 class LoopUI(Protocol):
@@ -257,6 +258,7 @@ class AshLoop:
         enable_sprint_planning: bool = False,
         tool_middlewares: list[ToolMiddleware] | None = None,
         on_tool_approval: ToolApprovalCallback | None = None,
+        on_plan_approval: PlanApprovalCallback | None = None,
         enable_memory_recall: bool = False,
         hooks: "HookRegistry | None" = None,
         turn_context: "TurnContext | None" = None,
@@ -305,6 +307,7 @@ class AshLoop:
         self.enable_sprint_planning = enable_sprint_planning
         self.tool_middlewares: list[ToolMiddleware] = list(tool_middlewares or [])
         self.on_tool_approval = on_tool_approval
+        self.on_plan_approval = on_plan_approval
         self.enable_memory_recall = enable_memory_recall
         self.hooks = hooks
         self.turn_context = turn_context
@@ -496,7 +499,11 @@ class AshLoop:
             if looks_like_sprint_request(user_input):
                 execution = await self._planning_phase(user_input)
                 self.session_store.save_sprint(session.session_id, execution)
-                approved = self.ui.show_plan(execution)
+                approved = (
+                    await self.on_plan_approval(execution)
+                    if self.on_plan_approval is not None
+                    else self.ui.show_plan(execution)
+                )
                 if not approved:
                     execution.abort("rejected by user")
                     self.session_store.save_sprint(session.session_id, execution)
