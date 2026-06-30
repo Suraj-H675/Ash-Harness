@@ -106,7 +106,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Streaming transcript | Verified locally | Immutable semantic user/assistant/reasoning/tool/approval/status/error entries, bounded mutable live cells, rich cached Markdown, command output routing, and durable-session hydration |
 | Markdown/code rendering | Verified locally | Streamed Rich Markdown with fenced-code highlighting and bounded repaint frequency |
 | Diff preview | Partial | Bounded unified previews for writes/replacements/patches; side-by-side view remains |
-| Approval dialog | Partial | Allow once/session/persist, deny with feedback, editable scope |
+| Approval dialog | Partial | Allow once, exact session, broad session, exact project, persisted exact deny, and verified command-prefix project scopes are wired; deny-with-feedback and a full-screen scope editor remain |
 | Status line | Verified locally | Cached model, mode, branch, context budget, prompt-cache totals, cost, sandbox, session, and cwd state |
 | Themes | Partial | ANSI-safe no-color mode is wired; selectable light/dark themes remain |
 | Configurable keybindings | Verified locally | Cross-platform newline/editor actions with collision validation |
@@ -133,7 +133,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/diff` | Partial | Current/staged/path Git diff; per-turn checkpoint diff remains |
 | `/review` | Verified locally | Bounded reviews for worktree/untracked, staged, commit, or current branch versus base |
 | `/plan` mode | Verified locally | Explicit toggle, editable sprint contract, approval gate, and execution transition |
-| `/permissions` | Partial | Inspect/change active mode and persistent tool grants; persisted argument grants remain |
+| `/permissions` | Verified locally | Inspect/change mode plus versioned project allow/ask/deny rules with stable IDs, exact/string-prefix/argv-prefix matchers, JSON output, precise removal, and legacy migration ([Claude Code rule model](https://code.claude.com/docs/en/permissions)) |
 | `/sandbox` | Verified locally | Active backend, tier, capabilities, and network policy |
 | `/mcp` | Partial | Top-level add/remove/list/status config supports JSON and env/header metadata; REPL status/tools/resources/prompts use live clients; auth and richer lifecycle remain |
 | `/skills`, `/plugins`, `/hooks` | Partial | Skills/plugins/hooks are inspectable with trust-gated top-level extension inventory and `/hooks`; enable/disable/reload lifecycle remains |
@@ -168,8 +168,8 @@ Research is clean-room: proprietary or leaked source is not used.
 |---|---|---|
 | Workspace path boundary | Partial | File tools and command effects; symlink/race-safe behavior |
 | Trusted-folder prompt | Verified locally | Project instructions, skills, hooks, plugins, and MCP are trust-gated |
-| Fine-grained policy engine | Partial | Central allow/ask/deny by tool and mode; persisted argument rules remain |
-| Approval persistence | Partial | Persistent project tool grants have slash/top-level inspection, JSON output, revocation, and clear; session-scoped and argument-scoped grants remain |
+| Fine-grained policy engine | Partial | Deny-first then ask/allow precedence, mode circuit breakers, stable scoped rules, and conservative command-prefix parsing are enforced; tool-specific path/domain grammar and managed policy layers remain |
+| Approval persistence | Verified locally | Atomic mode-0600 versioned rules, version-1 migration, stable IDs, exact session/project scopes, command-prefix project scopes, scoped denial, slash/top-level inspection, removal, and clear |
 | Read-only plan mode | Verified locally | Non-read tools are denied by the central policy |
 | Auto-edit mode | Verified locally | Reads/edits allowed while commands and external tools remain gated |
 | Full auto mode | Partial | Explicit dangerous-mode warning and sandbox requirement |

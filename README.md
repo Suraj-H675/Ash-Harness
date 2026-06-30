@@ -39,6 +39,9 @@ ASH_SERVER_TOKEN=change-me-long-token ash serve
 ash storage check --json         # read-only session DB integrity check
 ash storage backup               # consistent timestamped backup
 ash storage restore BACKUP --yes # validated, non-destructive restore
+ash permissions status --json    # inspect effective project rules
+ash permissions deny write_file --exact 'file_path=".env"'
+ash permissions allow run_command --command-prefix pytest
 ```
 
 The authenticated server exposes synchronous turns at `/v1/turn` and live
@@ -51,6 +54,13 @@ permissions, sandbox, skills, plugins, export, and diagnostic commands.
 `/plan on` enables editable sprint plans for multi-step requests; type `e` at
 the plan prompt to revise the generated contract in `$VISUAL` or `$EDITOR`,
 then `y` to approve and execute it.
+Tool approvals support once-only (`y`), exact session scope (`s`), broad
+tool/session scope (`a`), persisted project scope (`p`), persisted scoped
+denial (`x`), and an explicit argv-prefix project rule for simple commands
+(`c`). Compound commands, redirection, and command substitution cannot match a
+command-prefix rule and continue to require exact approval. Persisted
+allow/ask/deny rules use stable IDs and can be listed or removed with
+`ash permissions`; deny rules take precedence over ask and allow rules.
 Use `ash plans list`, `ash plans show <sprint-id>`, and
 `ash plans update <sprint-id> <item> <status>` to inspect or update persisted
 checklists outside the REPL.
