@@ -707,8 +707,7 @@ def calculate_personalized_pagerank(
         raise ValueError("alpha must be in the range [0, 1)")
 
     column_sums = [
-        sum(float(adjacency_matrix[row][col]) for row in range(n))
-        for col in range(n)
+        sum(float(adjacency_matrix[row][col]) for row in range(n)) for col in range(n)
     ]
 
     # Teleport vector.

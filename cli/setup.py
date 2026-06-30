@@ -632,9 +632,7 @@ _LEGACY_RESERVED = frozenset({"api_key", "provider", "model_name"})
 _LEGACY_PATH_FIELDS = frozenset(
     {"workspace_root", "db_directory", "chroma_persist_dir", "onnx_model_path"}
 )
-_PLACEHOLDER_KEYS = frozenset(
-    {"replace-with-your-api-key", "your-api-key", "changeme"}
-)
+_PLACEHOLDER_KEYS = frozenset({"replace-with-your-api-key", "your-api-key", "changeme"})
 
 
 def _migrate_old_ash_toml() -> None:
@@ -692,7 +690,9 @@ def _migrate_old_ash_toml() -> None:
         print(f"  Previous user config backup: {destination_backup}")
     if preserved:
         print("  Preserved existing destination values: " + ", ".join(preserved))
-    print("  Old ash.toml was left in place and will not be prompted again unless changed.")
+    print(
+        "  Old ash.toml was left in place and will not be prompted again unless changed."
+    )
 
 
 def _plan_legacy_config_migration(

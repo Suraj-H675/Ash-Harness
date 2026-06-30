@@ -493,9 +493,7 @@ class TestSetupNavigation:
 
 class TestLegacyConfigMigration:
     @pytest.fixture(autouse=True)
-    def _clear_destination_environment(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def _clear_destination_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for key in (
             "ASH_MODEL",
             "ANTHROPIC_API_KEY",
@@ -526,15 +524,15 @@ class TestLegacyConfigMigration:
         project.mkdir()
         legacy = project / "ash.toml"
         legacy.write_text(
-            '\n'.join(
+            "\n".join(
                 [
                     'provider = "openai"',
                     'model_name = "gpt-test"',
                     'api_key = "legacy-secret"',
-                    'temperature = 0.3',
-                    'max_context_tokens = 64000',
-                    'max_completion_tokens = 2048',
-                    'max_tool_result_tokens = 9000',
+                    "temperature = 0.3",
+                    "max_context_tokens = 64000",
+                    "max_completion_tokens = 2048",
+                    "max_tool_result_tokens = 9000",
                     'safety_tier = "dry_run"',
                     'workspace_root = "."',
                     'command_blocklist = ["danger"]',
@@ -589,8 +587,8 @@ class TestLegacyConfigMigration:
             'provider = "anthropic"\n'
             'model_name = "legacy-model"\n'
             'api_key = "legacy-key"\n'
-            'temperature = 0.8\n'
-            'max_context_tokens = 32000\n',
+            "temperature = 0.8\n"
+            "max_context_tokens = 32000\n",
             encoding="utf-8",
         )
         cli_config.save_config({"temperature": 0.1})
@@ -611,9 +609,7 @@ class TestLegacyConfigMigration:
         assert user["temperature"] == 0.1
         assert user["max_context_tokens"] == 32000
         destination_backups = list(
-            (cli_config.ASH_DIR / "backups").glob(
-                "user-ash.toml-pre-migration.*.bak"
-            )
+            (cli_config.ASH_DIR / "backups").glob("user-ash.toml-pre-migration.*.bak")
         )
         assert len(destination_backups) == 1
         assert "temperature = 0.1" in destination_backups[0].read_text()

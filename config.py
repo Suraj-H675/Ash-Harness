@@ -83,15 +83,19 @@ def _is_git_marker(path: Path) -> bool:
     if not path.is_file():
         return False
     try:
-        return path.read_text(encoding="utf-8", errors="replace")[:1024].lstrip().startswith(
-            "gitdir:"
+        return (
+            path.read_text(encoding="utf-8", errors="replace")[:1024]
+            .lstrip()
+            .startswith("gitdir:")
         )
     except OSError:
         return False
 
 
 def _configured_settings_path(key: str, initial: Path, current_default: Path) -> Path:
-    configured = Path(str(AshConfig.model_config.get(key) or current_default)).expanduser()
+    configured = Path(
+        str(AshConfig.model_config.get(key) or current_default)
+    ).expanduser()
     return current_default if configured == initial else configured
 
 
@@ -119,7 +123,9 @@ def project_config_paths(workspace_root: Path, cwd: Path | None = None) -> list[
 def _known_settings_values(
     settings_cls: type[AshConfig], values: dict[str, Any]
 ) -> dict[str, Any]:
-    return {key: value for key, value in values.items() if key in settings_cls.model_fields}
+    return {
+        key: value for key, value in values.items() if key in settings_cls.model_fields
+    }
 
 
 def _case_insensitive_value(values: Any, key: str) -> Any:
@@ -173,10 +179,14 @@ def _filter_project_config(
     filtered: dict[str, Any] = {}
     for field, value in values.items():
         if field not in settings_cls.model_fields:
-            diagnostics.append(f"ignored unknown project config key {field!r} in {path}")
+            diagnostics.append(
+                f"ignored unknown project config key {field!r} in {path}"
+            )
             continue
         if field not in PROJECT_CONFIG_FIELDS:
-            diagnostics.append(f"ignored user-owned project config key {field!r} in {path}")
+            diagnostics.append(
+                f"ignored user-owned project config key {field!r} in {path}"
+            )
             continue
         if field == "model":
             provider, separator, _ = str(value).partition("/")
@@ -655,9 +665,7 @@ class AshConfig(BaseSettings):
         )
         env_values = _known_settings_values(cls, EnvSettingsSource(cls)())
 
-        dotenv_details = _apply_legacy_model_values(
-            dotenv_values, raw_dotenv_values
-        )
+        dotenv_details = _apply_legacy_model_values(dotenv_values, raw_dotenv_values)
         env_details = _apply_legacy_model_values(env_values, os.environ)
         from cli.config import file_backed_env_values
 
@@ -729,9 +737,7 @@ class AshConfig(BaseSettings):
             env_values,
             source="env",
             detail="process environment",
-            detail_by_field={
-                field: key for field, key in env_details.items()
-            }
+            detail_by_field={field: key for field, key in env_details.items()}
             | {
                 field: f"ASH_{field.upper()}"
                 for field in env_values
@@ -747,9 +753,8 @@ class AshConfig(BaseSettings):
         )
 
         config = cls(**merged)
-        if (
-            env_details.get("model") == "ASH_MODEL_NAME"
-            and not os.environ.get("ASH_MODEL")
+        if env_details.get("model") == "ASH_MODEL_NAME" and not os.environ.get(
+            "ASH_MODEL"
         ):
             os.environ["ASH_MODEL"] = str(env_values["model"])
         config._config_sources = sources

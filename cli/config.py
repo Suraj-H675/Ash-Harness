@@ -66,7 +66,9 @@ def backup_config_file(path: str | Path, *, label: str) -> Path:
 
     source = Path(path).expanduser()
     if not _BACKUP_LABEL.fullmatch(label):
-        raise ValueError("backup label may contain only letters, digits, '.', '_', and '-'")
+        raise ValueError(
+            "backup label may contain only letters, digits, '.', '_', and '-'"
+        )
     if source.is_symlink():
         raise ValueError(f"refusing to back up symlinked config file: {source}")
     if not source.is_file():
