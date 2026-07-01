@@ -25,25 +25,47 @@ class CustomCommand:
         return output
 
 
+@dataclass(frozen=True)
+class CommandSource:
+    paths: tuple[Path, ...]
+    source: str
+    namespace: str = ""
+
+
 class CustomCommandCatalog:
-    def __init__(self, roots: tuple[tuple[Path, str], ...]) -> None:
-        self.roots = roots
+    def __init__(self, roots: tuple[tuple[Path, str] | CommandSource, ...]) -> None:
+        self.sources = tuple(
+            source
+            if isinstance(source, CommandSource)
+            else CommandSource(paths=(source[0],), source=source[1])
+            for source in roots
+        )
         self.errors: dict[str, str] = {}
         self._commands: dict[str, CustomCommand] = {}
 
     def discover(self) -> list[CustomCommand]:
         commands: dict[str, CustomCommand] = {}
         self.errors.clear()
-        for root, source in self.roots:
-            if not root.is_dir():
-                continue
-            for path in sorted(root.rglob("*.md")):
+        for source in self.sources:
+            for path, root in _command_paths(source.paths):
                 try:
-                    command = _parse(path, root, source)
+                    command = _parse(
+                        path,
+                        root,
+                        source.source,
+                        namespace=source.namespace,
+                    )
                 except (OSError, UnicodeError, ValueError) as exc:
                     self.errors[str(path)] = str(exc)
                     continue
-                commands.setdefault(command.name, command)
+                existing = commands.get(command.name)
+                if existing is not None:
+                    self.errors[str(path)] = (
+                        f"duplicate command name {command.name!r}; already provided by "
+                        f"{existing.path}"
+                    )
+                    continue
+                commands[command.name] = command
         self._commands = commands
         return list(commands.values())
 
@@ -61,7 +83,23 @@ class CustomCommandCatalog:
         return self._commands[parts[0]], parts[1:]
 
 
-def _parse(path: Path, root: Path, source: str) -> CustomCommand:
+def _command_paths(paths: tuple[Path, ...]) -> list[tuple[Path, Path]]:
+    discovered: set[tuple[Path, Path]] = set()
+    for candidate in paths:
+        if candidate.is_file() and candidate.suffix.casefold() == ".md":
+            discovered.add((candidate, candidate.parent))
+        elif candidate.is_dir():
+            discovered.update((path, candidate) for path in candidate.rglob("*.md"))
+    return sorted(discovered)
+
+
+def _parse(
+    path: Path,
+    root: Path,
+    source: str,
+    *,
+    namespace: str = "",
+) -> CustomCommand:
     if path.stat().st_size > MAX_COMMAND_BYTES:
         raise ValueError("command file exceeds 128 KiB")
     text = path.read_text(encoding="utf-8")
@@ -83,4 +121,6 @@ def _parse(path: Path, root: Path, source: str) -> CustomCommand:
     description = metadata.get("description", "Custom prompt command")
     if not body.strip():
         raise ValueError("command template is empty")
+    if namespace:
+        name = f"{namespace}:{name}"
     return CustomCommand(name, description, body.strip(), path, source)

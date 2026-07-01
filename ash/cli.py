@@ -431,7 +431,7 @@ async def _interactive_model_picker(
 
 async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     from ui.terminal import TerminalUI
-    from cli.custom_commands import CustomCommandCatalog
+    from cli.custom_commands import CommandSource, CustomCommandCatalog
     from cli.slash import parse_slash_command, render_help
     from safety.trust import is_workspace_trusted
     from ui.prompt import PromptInput
@@ -441,9 +441,27 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     from ui.notifications import TerminalNotifier
 
     command_roots = [(Path.home() / ".ash" / "commands", "user")]
+    plugin_roots = [(Path.home() / ".ash" / "plugins", "user")]
     if is_workspace_trusted(loop.project_root):
         command_roots.append((loop.project_root / ".ash" / "commands", "project"))
-    custom_commands = CustomCommandCatalog(tuple(command_roots))
+        plugin_roots.append((loop.project_root / ".ash" / "plugins", "project"))
+    from plugins.lifecycle import load_extension_state
+    from plugins.registry import PluginCatalog
+
+    active_plugins = PluginCatalog(
+        tuple(plugin_roots),
+        disabled_plugins=load_extension_state().disabled_plugins,
+    ).discover()
+    command_sources: list[tuple[Path, str] | CommandSource] = list(command_roots)
+    command_sources.extend(
+        CommandSource(
+            paths=plugin.command_paths(),
+            source=f"plugin:{plugin.manifest.name}",
+            namespace=plugin.manifest.name,
+        )
+        for plugin in active_plugins
+    )
+    custom_commands = CustomCommandCatalog(tuple(command_sources))
     discovered_commands = custom_commands.discover()
 
     status_line = StatusLine(loop, config, sandbox_manager)

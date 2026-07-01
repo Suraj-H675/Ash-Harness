@@ -27,6 +27,15 @@ class DiscoveredPlugin:
             defaults.append(skill_directory)
         return tuple(defaults)
 
+    def command_paths(self) -> tuple[Path, ...]:
+        declared = tuple(
+            self.root / item for item in self.manifest.commands if isinstance(item, str)
+        )
+        if declared:
+            return declared
+        default = self.root / "commands"
+        return (default,) if default.is_dir() else ()
+
 
 class PluginCatalog:
     """Discover declarative plugin manifests from explicitly allowed roots."""
@@ -88,6 +97,16 @@ class PluginCatalog:
 
 def _validate_manifest(manifest: PluginManifest, root: Path) -> None:
     validate_plugin_identity(manifest)
+    for field, values in (
+        ("commands", manifest.commands),
+        ("agents", manifest.agents),
+        ("hooks", manifest.hooks),
+        ("mcpServers", manifest.mcp_servers),
+    ):
+        if any(isinstance(item, dict) for item in values):
+            raise ValueError(
+                f"inline {field} declarations are unsupported; use component paths"
+            )
     path_components = [*manifest.skills]
     path_components.extend(
         item

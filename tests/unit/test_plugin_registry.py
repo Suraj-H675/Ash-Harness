@@ -143,3 +143,18 @@ def test_plugin_catalog_rejects_missing_plugin_dependency(tmp_path) -> None:
 
     assert catalog.discover() == []
     assert "Missing dependency: missing" in next(iter(catalog.errors.values()))
+
+
+def test_plugin_command_paths_use_declared_or_default_locations(tmp_path) -> None:
+    root = tmp_path / "plugins"
+    plugin = root / "example"
+    command = plugin / "custom" / "review.md"
+    command.parent.mkdir(parents=True)
+    command.write_text("Review code")
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "example", "commands": ["custom/review.md"]})
+    )
+
+    found = PluginCatalog(((root, "user"),)).discover()
+
+    assert found[0].command_paths() == (command,)
