@@ -44,7 +44,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("plugins", "List discovered declarative plugins", "/plugins"),
     SlashCommand("hooks", "List trusted command hook configs", "/hooks"),
     SlashCommand("commands", "List custom Markdown commands", "/commands"),
-    SlashCommand("agents", "Show or stop subagents", "/agents [stop AGENT_ID]"),
+    SlashCommand(
+        "agents",
+        "Show, stop, or resume subagents",
+        "/agents [stop|resume AGENT_ID]",
+    ),
     SlashCommand("diff", "Show the current Git diff", "/diff [--staged] [path]"),
     SlashCommand(
         "review",

@@ -365,6 +365,69 @@ class SpawnAgentTool(BaseTool):
         )
         return True
 
+    async def resume(self, agent_id: str) -> ToolResult:
+        status = self._shared_state.get_status(agent_id)
+        if status is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Unknown subagent: {agent_id}",
+            )
+        if status.status in {"idle", "working"}:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Subagent {agent_id} is still running.",
+            )
+        report = next(
+            (
+                message.content
+                for message in reversed(
+                    self._shared_state.fetch_messages(
+                        "lead",
+                        undelivered_only=False,
+                        limit=1000,
+                    )
+                )
+                if message.message_type == "agent_report"
+                and message.content.get("agent_id") == agent_id
+            ),
+            None,
+        )
+        if report is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"No persisted report exists for subagent {agent_id}.",
+            )
+        branch = report.get("artifacts", {}).get("branch")
+        if branch:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Apply isolated branch {branch} before resuming so the new "
+                    "worker sees the previous changes."
+                ),
+            )
+        original_task = str(status.metadata.get("task") or report.get("task") or "")
+        prior_summary = str(report.get("summary") or "")
+        continuation = (
+            f"Continue this prior subtask:\n{original_task}\n\n"
+            f"Prior worker report:\n{prior_summary}"
+        )[:20_000]
+        resumed_id = f"{agent_id[:50]}-r-{uuid.uuid4().hex[:6]}"
+        result = await self.run(
+            role=status.role,
+            task=continuation,
+            agent_id=resumed_id,
+            background=True,
+            isolation=str(status.metadata.get("isolation") or "shared"),
+        )
+        if result.success:
+            result.output += f" Continued from {agent_id}."
+        return result
+
     def statuses(self) -> list[dict[str, str]]:
         return [
             {

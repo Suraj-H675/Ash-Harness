@@ -253,3 +253,65 @@ async def test_background_agent_honors_persisted_stop_message(tmp_path) -> None:
     assert message.delivered is True
     assert "persisted message" in state.get_status("stopped-worker").current_task
     await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_completed_agent_can_resume_from_persisted_report(tmp_path) -> None:
+    class ResumeProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="continued", is_done=True)
+
+    state = SharedState(tmp_path / "state" / "agents.db")
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, ResumeProvider)
+    first = await tool.run(
+        role="reviewer",
+        task="review tests",
+        agent_id="reviewer-1",
+        isolation="shared",
+    )
+    assert first.success is True
+
+    resumed = await tool.resume("reviewer-1")
+
+    assert resumed.success is True
+    assert "Continued from reviewer-1" in resumed.output
+    for _ in range(20):
+        if any(
+            status.agent_id.startswith("reviewer-1-r-")
+            for status in state.list_agents()
+        ):
+            break
+        await asyncio.sleep(0.01)
+    assert any(
+        status.agent_id.startswith("reviewer-1-r-") for status in state.list_agents()
+    )
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_isolated_agent_requires_branch_apply_before_resume(tmp_path) -> None:
+    state = SharedState(tmp_path / "state" / "agents.db")
+    state.register_agent(
+        "coder-1",
+        role="coder",
+        metadata={"task": "edit", "isolation": "worktree"},
+    )
+    state.update_status("coder-1", "completed", "done")
+    state.send_message(
+        "coder-1",
+        "lead",
+        "agent_report",
+        {
+            "agent_id": "coder-1",
+            "task": "edit",
+            "summary": "done",
+            "artifacts": {"branch": "ash-agent/coder-1"},
+        },
+    )
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, FakeProvider)
+
+    result = await tool.resume("coder-1")
+
+    assert result.success is False
+    assert "Apply isolated branch" in (result.error or "")
+    await tool.aclose()

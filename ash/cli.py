@@ -842,6 +842,15 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         else f"Agent {arguments[1]} is not running."
                     )
                     continue
+                if arguments[:1] == ["resume"]:
+                    if len(arguments) != 2 or not isinstance(
+                        agent_tool, SpawnAgentTool
+                    ):
+                        print(f"Usage: {command.usage}", file=sys.stderr)
+                        continue
+                    resumed = await agent_tool.resume(arguments[1])
+                    print(resumed.output or resumed.error or "Resume failed.")
+                    continue
                 if arguments:
                     print(f"Usage: {command.usage}", file=sys.stderr)
                     continue
