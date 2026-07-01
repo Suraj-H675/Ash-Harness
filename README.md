@@ -16,6 +16,11 @@ ash doctor
 ash
 ```
 
+Lightweight commands such as `ash --version` and `ash --help` lazy-load the
+runtime stack; provider SDKs, the agent loop, repository parser, and TUI are
+loaded only when a command needs them. Installed-wheel startup is covered by a
+sub-second regression test while preserving historical `ash.tools.*` imports.
+
 The default install includes the terminal harness, coding tools, repository
 map, and supported API/local providers. Install optional features explicitly:
 
