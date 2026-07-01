@@ -136,7 +136,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/permissions` | Verified locally | Inspect/change mode plus versioned project allow/ask/deny rules with stable IDs, exact/string-prefix/argv-prefix matchers, JSON output, precise removal, and legacy migration ([Claude Code rule model](https://code.claude.com/docs/en/permissions)) |
 | `/sandbox` | Verified locally | Active backend, tier, capabilities, and network policy |
 | `/mcp` | Partial | Top-level add/remove/list/status config supports JSON and env/header metadata; REPL status/tools/resources/prompts use live clients; auth and richer lifecycle remain |
-| `/skills`, `/plugins`, `/hooks` | Partial | Skills/plugins/hooks are inspectable with trust-gated top-level extension inventory and `/hooks`; enable/disable/reload lifecycle remains |
+| `/skills`, `/plugins`, `/hooks` | Verified locally | Namespaced components are inspectable; local install/enable/disable/confirmed-uninstall and live reload are wired |
 | `/agents` | Verified locally | Slash status/stop/resume, persisted status/report/message inspection, live queued steering/stop consumption with delivery acknowledgement, and isolated branch list/apply/discard lifecycle |
 | `/doctor` | Verified locally | Runs the local health report in-session |
 | Shell escape (`!`) | Verified locally | Commands use the normal policy, sandbox, persistence, and audit path |
@@ -191,11 +191,11 @@ Research is clean-room: proprietary or leaked source is not used.
 | MCP tool namespacing | Verified locally | `mcp__server__tool` adapters prevent collisions |
 | MCP resources/prompts | Partial | Browse in TUI and invoke/read through policy-gated model tools |
 | Skills | Verified locally | Safe standard `SKILL.md` discovery and progressive activation with trust |
-| Plugins/extensions | Partial | Local validated manifests and plugin skills; full lifecycle remains |
+| Plugins/extensions | Verified locally | Transactional local install/replace, enable/disable/uninstall state, dependency checks, component inventory, project trust, namespacing, and live reload |
 | Plugin marketplace | Missing | Signed or trust-reviewed sources; no hardcoded nonexistent registry |
-| Hooks | Partial | Trusted command hooks, JSON protocol, scrubbed env, timeout; more lifecycle events remain |
-| Custom agents | Missing in production | Declarative roles, model/tools/policy/instructions |
-| Hot reload | Partial | Clear errors and atomic registry updates |
+| Hooks | Partial | User/project/plugin command hooks, JSON protocol, plugin cwd, scrubbed env, timeout, and process cleanup; more lifecycle events remain |
+| Custom agents | Verified locally | User/project/plugin Markdown roles, namespacing, instructions, base-role isolation, and non-escalating tool restrictions |
+| Hot reload | Verified locally | Commands/completion, skills, agents, hooks, and MCP runtimes validate before live replacement |
 
 ## 10. Subagents And Work Isolation
 

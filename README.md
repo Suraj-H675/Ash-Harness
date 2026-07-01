@@ -60,6 +60,11 @@ ash sandbox build                # explicitly build the optional baseline image
 ash agents branches              # inspect isolated worker branches
 ash agents apply ash-agent/ID    # cherry-pick a worker after review
 ash agents discard ash-agent/ID --yes
+ash extensions install ./my-plugin # local directory only; validates before install
+ash extensions plugins --json      # inspect enabled and disabled plugins
+ash extensions disable my-plugin
+ash extensions enable my-plugin
+ash extensions uninstall my-plugin --yes
 ```
 
 The authenticated server exposes synchronous turns at `/v1/turn` and live
@@ -95,6 +100,19 @@ on `ash-agent/*` branches without modifying the lead worktree. The lead must be
 clean when a worktree is created or applied. Use `/agents`, `/agents stop ID`,
 and `/agents resume ID` for live status and lifecycle control; queued steering
 messages are consumed at model-iteration boundaries and marked delivered.
+
+Plugins are self-contained local directories with a root `plugin.json`.
+Manifests may declare path-based `skills`, `commands`, `agents`, `hooks`, and
+`mcpServers`; omitted fields use the conventional `skills/`, `commands/`,
+`agents/`, `hooks/hooks.json`, and `.mcp.json` locations. Plugin skills,
+commands, agents, and MCP servers are namespaced to prevent collisions.
+Dependencies are other installed plugins with optional PEP 440 version
+constraints. Installation rejects links, path traversal, malformed or
+oversized components, missing enabled dependencies, and invalid replacement
+content before changing the active version. `/plugins` manages local plugins
+inside a session and `/reload-plugins` atomically refreshes commands,
+completion, skills, agents, hooks, and MCP servers without restarting Ash.
+Project plugins remain disabled until their workspace is trusted.
 
 Project-controlled config and extensions are disabled until the workspace is trusted.
 API keys are stored in `~/.ash/.env` with restricted permissions. Custom
