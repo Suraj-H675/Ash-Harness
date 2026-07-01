@@ -155,7 +155,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | List/glob files | Verified locally | Bounded production tools with workspace scoping |
 | Text/regex search | Verified locally | Ripgrep-backed bounded search with Python fallback |
 | Symbol/code search | Verified locally | Read-only `find_symbol` and `find_references` tools use the incremental Tree-sitter index, exact locations, case controls, globs, and bounded results |
-| Shell execution | Partial | Foreground and managed background commands share fail-closed sandbox injection, process-tree termination, and child env scrubbing; streaming foreground output remains |
+| Shell execution | Verified locally | Foreground and managed background commands share fail-closed sandbox injection, process-tree termination, and child env scrubbing; foreground stdout/stderr stream as call-correlated, incrementally redacted, bounded events through inline TUI, viewport, SDK, and stream-JSON surfaces |
 | Git status/diff/log | Verified locally | Read-only bounded Git inspection tools |
 | Git commit | Partial | Explicit staging scope, no unrelated changes, hooks/errors surfaced |
 | Tests/build/lint diagnostics | Partial | Parse diagnostics and feed concise structured failures |

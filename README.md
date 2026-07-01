@@ -77,6 +77,8 @@ SSE turn events at `/v1/turn/stream`; non-loopback binding requires
 
 Inside the terminal, `/help` lists session, context, model, diff, review,
 permissions, sandbox, skills, plugins, export, and diagnostic commands.
+Prefix a command with `!` to run it through the same permission and sandbox
+policy as model tool calls while streaming bounded stdout and stderr live.
 `/resume` opens the project-scoped session picker; type to filter, use arrow
 keys to navigate, `Space` to preview, and `Enter` to resume. `/resume NAME`
 resolves an exact persisted title, while `/rename TITLE` sets that title.
