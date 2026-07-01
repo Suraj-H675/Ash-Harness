@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import codecs
 import difflib
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +15,7 @@ from safety.guard import SafetyGuard
 from safety.scoped_io import (
     ScopedFileChanged,
     ScopedIOError,
-    atomic_write_scoped_text,
+    atomic_write_scoped_bytes,
     read_scoped_bytes,
 )
 from tools.base import BaseTool, ToolResult, count_output_tokens
@@ -28,6 +30,31 @@ EXISTS_ERROR = (
     "Error: Target file already exists. Set overwrite to true to replace it, "
     "or use replace_file_content to patch specific regions."
 )
+
+
+@dataclass(frozen=True)
+class TextEncoding:
+    label: str
+    codec: str
+    bom: bytes = b""
+
+
+UTF8_ENCODING = TextEncoding("utf-8", "utf-8")
+BOM_ENCODINGS = (
+    TextEncoding("utf-32-le", "utf-32-le", codecs.BOM_UTF32_LE),
+    TextEncoding("utf-32-be", "utf-32-be", codecs.BOM_UTF32_BE),
+    TextEncoding("utf-8-sig", "utf-8", codecs.BOM_UTF8),
+    TextEncoding("utf-16-le", "utf-16-le", codecs.BOM_UTF16_LE),
+    TextEncoding("utf-16-be", "utf-16-be", codecs.BOM_UTF16_BE),
+)
+
+
+class BinaryContentError(ValueError):
+    pass
+
+
+class TextEncodingError(ValueError):
+    pass
 
 
 class ReadFileArgs(BaseModel):
@@ -150,16 +177,15 @@ class ReadFileTool(BaseTool):
             _, raw_content = read_scoped_bytes(resolved_path, self.safety_guard)
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
-        if _is_binary_content(raw_content):
-            return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
-
         try:
-            original_text = raw_content.decode("utf-8")
-        except UnicodeDecodeError:
+            original_text, encoding = _decode_text_bytes(raw_content)
+        except BinaryContentError:
+            return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
+        except TextEncodingError as exc:
             return ToolResult(
                 success=False,
                 output="",
-                error="Error: File is not valid UTF-8 text.",
+                error=str(exc),
             )
         lines = original_text.splitlines()
         if args.end_line is not None and args.end_line < args.start_line:
@@ -177,7 +203,12 @@ class ReadFileTool(BaseTool):
             selected = selected[:DEFAULT_MAX_READ_LINES]
             truncated = True
 
-        metadata = _format_read_metadata(resolved_path, lines, original_text)
+        metadata = _format_read_metadata(
+            resolved_path,
+            lines,
+            raw_content,
+            encoding,
+        )
         numbered_lines = "\n".join(
             f"{line_number}: {line}"
             for line_number, line in enumerate(selected, start=args.start_line)
@@ -210,14 +241,31 @@ class WriteFileTool(BaseTool):
             return ToolResult(success=False, output="", error=EXISTS_ERROR)
 
         try:
-            atomic_write_scoped_text(
+            payload, expected_sha256 = _encode_for_write(
                 resolved_path,
                 args.content,
                 self.safety_guard,
+                preserve_existing=args.overwrite,
+            )
+            atomic_write_scoped_bytes(
+                resolved_path,
+                payload,
+                self.safety_guard,
                 overwrite=args.overwrite,
+                expected_sha256=expected_sha256,
             )
         except FileExistsError:
             return ToolResult(success=False, output="", error=EXISTS_ERROR)
+        except BinaryContentError:
+            return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
+        except TextEncodingError as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+        except ScopedFileChanged:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Error: File changed during overwrite. Read it again before editing.",
+            )
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
         return ToolResult(
@@ -255,18 +303,17 @@ class ReplaceFileContentTool(BaseTool):
             _, raw_content = read_scoped_bytes(resolved_path, self.safety_guard)
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
-        if _is_binary_content(raw_content):
-            return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
-
         try:
-            original_text = raw_content.decode("utf-8")
-        except UnicodeDecodeError:
+            original_text, encoding = _decode_text_bytes(raw_content)
+        except BinaryContentError:
+            return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
+        except TextEncodingError as exc:
             return ToolResult(
                 success=False,
                 output="",
-                error="Error: File is not valid UTF-8 text.",
+                error=str(exc),
             )
-        actual_sha256 = _sha256_text(original_text)
+        actual_sha256 = _sha256_bytes(raw_content)
         stale_error = _validate_expected_sha256(args.expected_sha256, actual_sha256)
         if stale_error is not None:
             return ToolResult(success=False, output="", error=stale_error)
@@ -302,9 +349,9 @@ class ReplaceFileContentTool(BaseTool):
         new_text = "".join(lines[:start_index] + replacement_lines + lines[end_index:])
 
         try:
-            atomic_write_scoped_text(
+            atomic_write_scoped_bytes(
                 resolved_path,
-                new_text,
+                _encode_text_bytes(new_text, encoding),
                 self.safety_guard,
                 overwrite=True,
                 expected_sha256=actual_sha256,
@@ -350,18 +397,17 @@ class ReplaceFileEditsTool(BaseTool):
             _, raw_content = read_scoped_bytes(resolved_path, self.safety_guard)
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
-        if _is_binary_content(raw_content):
-            return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
-
         try:
-            original_text = raw_content.decode("utf-8")
-        except UnicodeDecodeError:
+            original_text, encoding = _decode_text_bytes(raw_content)
+        except BinaryContentError:
+            return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
+        except TextEncodingError as exc:
             return ToolResult(
                 success=False,
                 output="",
-                error="Error: File is not valid UTF-8 text.",
+                error=str(exc),
             )
-        actual_sha256 = _sha256_text(original_text)
+        actual_sha256 = _sha256_bytes(raw_content)
         stale_error = _validate_expected_sha256(args.expected_sha256, actual_sha256)
         if stale_error is not None:
             return ToolResult(success=False, output="", error=stale_error)
@@ -405,9 +451,9 @@ class ReplaceFileEditsTool(BaseTool):
                 keepends=True
             )
         try:
-            atomic_write_scoped_text(
+            atomic_write_scoped_bytes(
                 resolved_path,
-                "".join(new_lines),
+                _encode_text_bytes("".join(new_lines), encoding),
                 self.safety_guard,
                 overwrite=True,
                 expected_sha256=actual_sha256,
@@ -439,11 +485,28 @@ class WholeEditTool(BaseTool):
         args = WholeEditArgs(**kwargs)
         resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
         try:
-            atomic_write_scoped_text(
+            payload, expected_sha256 = _encode_for_write(
                 resolved_path,
                 args.content,
                 self.safety_guard,
+                preserve_existing=True,
+            )
+            atomic_write_scoped_bytes(
+                resolved_path,
+                payload,
+                self.safety_guard,
                 overwrite=True,
+                expected_sha256=expected_sha256,
+            )
+        except BinaryContentError:
+            return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
+        except TextEncodingError as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+        except ScopedFileChanged:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Error: File changed during overwrite. Read it again before editing.",
             )
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
@@ -473,6 +536,44 @@ def _is_binary_content(content: bytes) -> bool:
     return b"\x00" in content[:BINARY_DETECTION_BYTES]
 
 
+def _decode_text_bytes(content: bytes) -> tuple[str, TextEncoding]:
+    for encoding in BOM_ENCODINGS:
+        if content.startswith(encoding.bom):
+            try:
+                return (
+                    content[len(encoding.bom) :].decode(encoding.codec),
+                    encoding,
+                )
+            except UnicodeDecodeError as exc:
+                raise TextEncodingError(
+                    f"Error: File is not valid {encoding.label} text."
+                ) from exc
+    if _is_binary_content(content):
+        raise BinaryContentError
+    try:
+        return content.decode("utf-8"), UTF8_ENCODING
+    except UnicodeDecodeError as exc:
+        raise TextEncodingError("Error: File is not valid UTF-8 text.") from exc
+
+
+def _encode_text_bytes(content: str, encoding: TextEncoding) -> bytes:
+    return encoding.bom + content.encode(encoding.codec)
+
+
+def _encode_for_write(
+    path: Path,
+    content: str,
+    guard: SafetyGuard,
+    *,
+    preserve_existing: bool,
+) -> tuple[bytes, str | None]:
+    if not preserve_existing or not path.exists():
+        return content.encode("utf-8"), None
+    _, existing = read_scoped_bytes(path, guard)
+    _, encoding = _decode_text_bytes(existing)
+    return _encode_text_bytes(content, encoding), _sha256_bytes(existing)
+
+
 def _normalize_line_endings(content: str) -> str:
     return content.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -499,16 +600,21 @@ def _format_read_truncation_metadata(
     )
 
 
-def _format_read_metadata(path: Path, lines: list[str], content: str) -> str:
+def _format_read_metadata(
+    path: Path,
+    lines: list[str],
+    content: bytes,
+    encoding: TextEncoding,
+) -> str:
     return (
         "[read_file metadata: "
-        f"path={path}; sha256={_sha256_text(content)}; "
+        f"path={path}; sha256={_sha256_bytes(content)}; encoding={encoding.label}; "
         f"total_file_lines={len(lines)}]"
     )
 
 
-def _sha256_text(content: str) -> str:
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+def _sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
 
 
 def _validate_expected_sha256(expected: str | None, actual: str) -> str | None:

@@ -7,6 +7,7 @@ from core.checkpoints import (
 )
 from core.session import SessionStore
 from safety.guard import SafetyGuard
+from tools.base import ToolResult
 from tools.filesystem import WholeEditTool
 
 
@@ -105,8 +106,12 @@ async def test_checkpoint_diff_reports_binary_change(tmp_path) -> None:
     tool = WholeEditTool(guard)
 
     await middleware.before_tool("whole_edit", arguments, tool)
-    result = await tool.run(**arguments)
-    await middleware.after_tool("whole_edit", arguments, result)
+    path.write_bytes(b"\x00after")
+    await middleware.after_tool(
+        "whole_edit",
+        arguments,
+        ToolResult(success=True, output="written"),
+    )
 
     assert diff_latest_checkpoint(store, guard, session.session_id) == (
         f"Binary file changed: {path}"

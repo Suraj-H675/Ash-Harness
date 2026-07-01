@@ -148,8 +148,8 @@ Research is clean-room: proprietary or leaked source is not used.
 
 | Capability | Ash status | Required production behavior |
 |---|---|---|
-| Read file/ranges | Partial | UTF-8 text reads, binary blocking, and stable truncation metadata exist; broader encoding/media handling remains |
-| Write/create file | Partial | Atomic UTF-8 writes preserve supplied newlines and validate path/permissions; broader encoding preservation remains |
+| Read file/ranges | Verified locally | Ranged reads support UTF-8 plus BOM-tagged UTF-8/16/32, report raw-byte SHA-256 and encoding, block binary content, and expose stable truncation metadata |
+| Write/create file | Verified locally | New files use UTF-8; atomic overwrites and exact edits preserve BOM-tagged UTF-8/16/32 encodings, supplied newlines, modes, path scope, and stale-read race checks |
 | Exact replace/edit | Verified locally | Bounded exact replacement has diff diagnostics, optional stale-read SHA-256 protection, and atomic multi-edit support |
 | Patch application | Verified locally | Validated multi-file Git patch with dry-run and atomic check/apply |
 | List/glob files | Verified locally | Bounded production tools with workspace scoping |

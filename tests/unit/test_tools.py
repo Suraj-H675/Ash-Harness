@@ -1,5 +1,6 @@
-import hashlib
 import asyncio
+import codecs
+import hashlib
 import shlex
 import sys
 from pathlib import Path
@@ -48,7 +49,8 @@ async def test_read_file_returns_numbered_line_slice(
     assert result.success is True
     digest = hashlib.sha256("one\ntwo\nthree\n".encode("utf-8")).hexdigest()
     assert result.output == (
-        f"[read_file metadata: path={target}; sha256={digest}; total_file_lines=3]\n"
+        f"[read_file metadata: path={target}; sha256={digest}; encoding=utf-8; "
+        "total_file_lines=3]\n"
         "2: two\n3: three"
     )
     assert result.error is None
@@ -178,6 +180,91 @@ async def test_read_file_reports_invalid_utf8_without_traceback(
     assert result.error == "Error: File is not valid UTF-8 text."
 
 
+@pytest.mark.parametrize(
+    ("label", "codec", "bom"),
+    [
+        ("utf-8-sig", "utf-8", codecs.BOM_UTF8),
+        ("utf-16-le", "utf-16-le", codecs.BOM_UTF16_LE),
+        ("utf-16-be", "utf-16-be", codecs.BOM_UTF16_BE),
+        ("utf-32-le", "utf-32-le", codecs.BOM_UTF32_LE),
+        ("utf-32-be", "utf-32-be", codecs.BOM_UTF32_BE),
+    ],
+)
+@pytest.mark.asyncio
+async def test_read_file_supports_bom_tagged_unicode(
+    project_root: Path,
+    guard: SafetyGuard,
+    label: str,
+    codec: str,
+    bom: bytes,
+) -> None:
+    target = project_root / "unicode.txt"
+    raw = bom + "alpha\nbeta\n".encode(codec)
+    target.write_bytes(raw)
+
+    result = await ReadFileTool(guard).run(file_path="unicode.txt")
+
+    assert result.success is True
+    assert f"sha256={hashlib.sha256(raw).hexdigest()}" in result.output
+    assert f"encoding={label}" in result.output
+    assert "1: alpha" in result.output
+    assert "2: beta" in result.output
+
+
+@pytest.mark.parametrize(
+    ("codec", "bom"),
+    [
+        ("utf-8", codecs.BOM_UTF8),
+        ("utf-16-le", codecs.BOM_UTF16_LE),
+        ("utf-16-be", codecs.BOM_UTF16_BE),
+        ("utf-32-le", codecs.BOM_UTF32_LE),
+        ("utf-32-be", codecs.BOM_UTF32_BE),
+    ],
+)
+@pytest.mark.asyncio
+async def test_replace_file_content_preserves_bom_encoding(
+    project_root: Path,
+    guard: SafetyGuard,
+    codec: str,
+    bom: bytes,
+) -> None:
+    target = project_root / "unicode.txt"
+    target.write_bytes(bom + "one\ntwo\n".encode(codec))
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="unicode.txt",
+        start_line=2,
+        end_line=2,
+        target_content="two",
+        replacement_content="TWO",
+    )
+
+    assert result.success is True
+    raw = target.read_bytes()
+    assert raw.startswith(bom)
+    assert raw[len(bom) :].decode(codec) == "one\nTWO\n"
+
+
+@pytest.mark.asyncio
+async def test_write_file_overwrite_preserves_bom_encoding(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "unicode.txt"
+    target.write_bytes(codecs.BOM_UTF16_BE + "old\n".encode("utf-16-be"))
+
+    result = await WriteFileTool(guard).run(
+        file_path="unicode.txt",
+        content="new\n",
+        overwrite=True,
+    )
+
+    assert result.success is True
+    raw = target.read_bytes()
+    assert raw.startswith(codecs.BOM_UTF16_BE)
+    assert raw[len(codecs.BOM_UTF16_BE) :].decode("utf-16-be") == "new\n"
+
+
 @pytest.mark.asyncio
 async def test_write_file_blocks_paths_outside_project(
     guard: SafetyGuard,
@@ -195,13 +282,13 @@ async def test_write_file_does_not_clobber_file_created_during_write(
     from tools import filesystem
 
     target = project_root / "new.txt"
-    real_write = filesystem.atomic_write_scoped_text
+    real_write = filesystem.atomic_write_scoped_bytes
 
     def racing_write(*args, **kwargs):
         target.write_text("created concurrently", encoding="utf-8")
         return real_write(*args, **kwargs)
 
-    monkeypatch.setattr(filesystem, "atomic_write_scoped_text", racing_write)
+    monkeypatch.setattr(filesystem, "atomic_write_scoped_bytes", racing_write)
     result = await WriteFileTool(guard).run(file_path="new.txt", content="agent")
 
     assert result.success is False
@@ -251,13 +338,13 @@ async def test_edit_detects_file_change_during_atomic_write(
 
     target = project_root / "doc.txt"
     target.write_text("old\n", encoding="utf-8")
-    real_write = filesystem.atomic_write_scoped_text
+    real_write = filesystem.atomic_write_scoped_bytes
 
     def racing_write(*args, **kwargs):
         target.write_text("concurrent\n", encoding="utf-8")
         return real_write(*args, **kwargs)
 
-    monkeypatch.setattr(filesystem, "atomic_write_scoped_text", racing_write)
+    monkeypatch.setattr(filesystem, "atomic_write_scoped_bytes", racing_write)
     result = await ReplaceFileContentTool(guard).run(
         file_path="doc.txt",
         start_line=1,

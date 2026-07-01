@@ -110,8 +110,26 @@ def atomic_write_scoped_text(
 ) -> Path:
     """Atomically write UTF-8 text while retaining a workspace directory anchor."""
 
+    return atomic_write_scoped_bytes(
+        path,
+        content.encode("utf-8"),
+        guard,
+        overwrite=overwrite,
+        expected_sha256=expected_sha256,
+    )
+
+
+def atomic_write_scoped_bytes(
+    path: str | Path,
+    payload: bytes,
+    guard: SafetyGuard,
+    *,
+    overwrite: bool,
+    expected_sha256: str | None = None,
+) -> Path:
+    """Atomically write bytes while retaining a workspace directory anchor."""
+
     target = guard.validate_mutation_path(path)
-    payload = content.encode("utf-8")
     if _supports_anchored_io():
         _anchored_atomic_write(
             target,
