@@ -190,7 +190,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | MCP HTTP transport | Partial | JSON/SSE HTTP, headers, session IDs, and cleanup; OAuth remains out of scope |
 | MCP tool namespacing | Verified locally | `mcp__server__tool` adapters prevent collisions |
 | MCP resources/prompts | Partial | Browse in TUI and invoke/read through policy-gated model tools |
-| Skills | Verified locally | Safe standard `SKILL.md` discovery and progressive activation with trust |
+| Skills | Verified locally | Bounded standard `SKILL.md` discovery and progressive activation with trust; legacy in-process executable skills are explicit unsafe compatibility only and cannot fabricate tools |
 | Plugins/extensions | Verified locally | Transactional local install/replace, enable/disable/uninstall state, dependency checks, component inventory, project trust, namespacing, and live reload |
 | Plugin marketplace | Missing | Signed or trust-reviewed sources; no hardcoded nonexistent registry |
 | Hooks | Partial | User/project/plugin command hooks, JSON protocol, plugin cwd, scrubbed env, timeout, and process cleanup; more lifecycle events remain |

@@ -113,6 +113,10 @@ content before changing the active version. `/plugins` manages local plugins
 inside a session and `/reload-plugins` atomically refreshes commands,
 completion, skills, agents, hooks, and MCP servers without restarting Ash.
 Project plugins remain disabled until their workspace is trusted.
+Modern `SKILL.md` instruction skills never execute embedded code. The legacy
+Python/Markdown executable-skill API is disabled by default; compatibility
+callers must opt in explicitly, and even then may use only tools supplied by
+the policy-wired runtime registry.
 
 Project-controlled config and extensions are disabled until the workspace is trusted.
 API keys are stored in `~/.ash/.env` with restricted permissions. Custom
