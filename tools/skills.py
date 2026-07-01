@@ -36,6 +36,13 @@ from safety.guard import SafetyGuard
 from tools.base import BaseTool, ToolResult
 from tools.registry import SkillIndexEntry
 
+UNSAFE_EXECUTABLE_SKILL_MESSAGE = (
+    "executable Python/Markdown skills are disabled by default because they run "
+    "in the Ash process; use instruction SKILL.md files, or explicitly enable "
+    "unsafe executable-skill compatibility"
+)
+MAX_EXECUTABLE_SKILL_BYTES = 256 * 1024
+
 
 # --- SkillContext ----------------------------------------------------------
 
@@ -68,9 +75,10 @@ class SkillContext:
     ) -> str:
         tool = self._tools.get("run_command")
         if tool is None:
-            from tools.command import RunCommandTool
-
-            tool = RunCommandTool(self.safety_guard)
+            raise SkillExecutionError(
+                "run_command is unavailable; executable skills cannot create "
+                "an ungoverned command tool"
+            )
         result: ToolResult = await tool.run(
             command_line=command_line, cwd=cwd, timeout_seconds=timeout
         )
@@ -83,9 +91,10 @@ class SkillContext:
     ) -> str:
         tool = self._tools.get("read_file")
         if tool is None:
-            from tools.filesystem import ReadFileTool
-
-            tool = ReadFileTool(self.safety_guard)
+            raise SkillExecutionError(
+                "read_file is unavailable; executable skills cannot bypass the "
+                "runtime tool registry"
+            )
         result: ToolResult = await tool.run(
             file_path=file_path, start_line=start_line, end_line=end_line
         )
@@ -98,9 +107,10 @@ class SkillContext:
     ) -> None:
         tool = self._tools.get("write_file")
         if tool is None:
-            from tools.filesystem import WriteFileTool
-
-            tool = WriteFileTool(self.safety_guard)
+            raise SkillExecutionError(
+                "write_file is unavailable; executable skills cannot bypass the "
+                "runtime tool registry"
+            )
         result: ToolResult = await tool.run(
             file_path=file_path, content=content, overwrite=overwrite
         )
@@ -136,6 +146,7 @@ class _MarkdownSkill:
 def parse_markdown_skill(path: Path) -> _MarkdownSkill:
     """Parse a markdown recipe file into a structured skill."""
 
+    validate_executable_skill_path(path)
     text = path.read_text(encoding="utf-8")
     front: dict[str, str] = {}
     fm_match = _FRONTMATTER_RE.match(text)
@@ -166,13 +177,10 @@ def parse_markdown_skill(path: Path) -> _MarkdownSkill:
     )
 
 
-def parse_markdown_skill_index(path: Path) -> SkillIndexEntry | None:
+def parse_markdown_skill_index(path: Path) -> SkillIndexEntry:
     """Build a :class:`SkillIndexEntry` from a markdown file without compiling it."""
 
-    try:
-        skill = parse_markdown_skill(path)
-    except SkillParseError:
-        return None
+    skill = parse_markdown_skill(path)
     return SkillIndexEntry(
         name=skill.name,
         description=skill.description or "(no description)",
@@ -251,8 +259,12 @@ _PY_DOCSTRING_META_RE = re.compile(
 def parse_python_skill(path: Path) -> _PythonSkill:
     """Parse a Python skill file with the V7 docstring convention."""
 
+    validate_executable_skill_path(path)
     source = path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(path))
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError as exc:
+        raise SkillParseError(f"Invalid Python skill {path}: {exc}") from exc
     module_doc = ast.get_docstring(tree) or ""
 
     name = path.stem
@@ -291,11 +303,8 @@ def parse_python_skill(path: Path) -> _PythonSkill:
     )
 
 
-def parse_python_skill_index(path: Path) -> SkillIndexEntry | None:
-    try:
-        skill = parse_python_skill(path)
-    except SkillParseError:
-        return None
+def parse_python_skill_index(path: Path) -> SkillIndexEntry:
+    skill = parse_python_skill(path)
     return SkillIndexEntry(
         name=skill.name,
         description=skill.description,
@@ -313,6 +322,7 @@ def build_tool_from_python_module(
     parsed_name: str | None = None,
     parsed_description: str | None = None,
     parsed_trigger: str | None = None,
+    allow_unsafe_code: bool = False,
 ) -> BaseTool:
     """Wrap a Python skill module's ``execute`` function in a :class:`BaseTool`.
 
@@ -322,6 +332,10 @@ def build_tool_from_python_module(
     matching ``__ash_name__`` attribute.
     """
 
+    if not allow_unsafe_code:
+        raise SkillParseError(UNSAFE_EXECUTABLE_SKILL_MESSAGE)
+    if source_path is not None:
+        validate_executable_skill_path(source_path)
     execute = getattr(module, "execute", None)
     if execute is None or not callable(execute):
         raise SkillParseError("module is missing an execute() function")
@@ -382,8 +396,17 @@ class SkillParseError(ValueError):
     """Raised when a skill file cannot be parsed."""
 
 
-def compile_skill(path: Path, safety_guard: SafetyGuard) -> BaseTool:
+def compile_skill(
+    path: Path,
+    safety_guard: SafetyGuard,
+    *,
+    allow_unsafe_code: bool = False,
+) -> BaseTool:
     """Compile a skill file (Python or markdown) into a :class:`BaseTool`."""
+
+    if not allow_unsafe_code:
+        raise SkillParseError(UNSAFE_EXECUTABLE_SKILL_MESSAGE)
+    validate_executable_skill_path(path)
 
     if path.suffix == ".py":
         # Load as a module, then hand it to the module wrapper.
@@ -411,6 +434,7 @@ def compile_skill(path: Path, safety_guard: SafetyGuard) -> BaseTool:
             parsed_name=parsed.name,
             parsed_description=parsed.description,
             parsed_trigger=parsed.trigger,
+            allow_unsafe_code=True,
         )
 
     if path.suffix == ".md":
@@ -595,6 +619,13 @@ def asyncio_is_coroutine(fn: Callable[..., Any]) -> bool:
     return inspect.iscoroutinefunction(fn)
 
 
+def validate_executable_skill_path(path: Path) -> None:
+    if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+        raise SkillParseError(f"executable skill cannot be a link: {path}")
+    if path.stat().st_size > MAX_EXECUTABLE_SKILL_BYTES:
+        raise SkillParseError("executable skill exceeds 256 KiB")
+
+
 # --- self-extension ------------------------------------------------------
 
 
@@ -605,6 +636,7 @@ def write_python_skill(
     description: str,
     trigger: str,
     body: str,
+    allow_unsafe_code: bool = False,
 ) -> Path:
     """Write a new Python skill file and return the path.
 
@@ -613,6 +645,8 @@ def write_python_skill(
     active without restarting the agent.
     """
 
+    if not allow_unsafe_code:
+        raise ValueError(UNSAFE_EXECUTABLE_SKILL_MESSAGE)
     if not name.isidentifier():
         raise ValueError(f"skill name must be a valid Python identifier, got {name!r}")
     skill_dir = skill_dir.expanduser()

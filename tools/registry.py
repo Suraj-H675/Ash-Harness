@@ -44,13 +44,16 @@ class ToolRegistry:
         safety_guard: SafetyGuard,
         *,
         skill_roots: tuple[Path, ...] = (),
+        allow_executable_skills: bool = False,
     ) -> None:
         self._tools: dict[str, BaseTool] = {}
         self._skill_index: dict[str, SkillIndexEntry] = {}
         self._loaded_skill_modules: dict[str, Path] = {}
         self._safety_guard = safety_guard
         self._skill_roots: list[Path] = list(skill_roots)
+        self._allow_executable_skills = allow_executable_skills
         self._lock = threading.Lock()
+        self.skill_errors: dict[str, str] = {}
 
     # --- tool registration ---------------------------------------------
 
@@ -119,6 +122,7 @@ class ToolRegistry:
 
         if refresh:
             self._skill_index.clear()
+        self.skill_errors.clear()
 
         from tools.skills import (
             parse_markdown_skill_index,
@@ -133,13 +137,24 @@ class ToolRegistry:
                 if not path.is_file() or path in seen:
                     continue
                 seen.add(path)
-                if path.suffix == ".py":
-                    entry = parse_python_skill_index(path)
-                elif path.suffix == ".md":
-                    entry = parse_markdown_skill_index(path)
-                else:
+                try:
+                    if path.suffix == ".py":
+                        entry = parse_python_skill_index(path)
+                    elif path.suffix == ".md":
+                        entry = parse_markdown_skill_index(path)
+                    else:
+                        continue
+                except (OSError, UnicodeError, ValueError) as exc:
+                    self.skill_errors[str(path)] = str(exc)
                     continue
                 if entry is not None:
+                    existing = self._skill_index.get(entry.name)
+                    if existing is not None and existing.path != entry.path:
+                        self.skill_errors[str(path)] = (
+                            f"duplicate executable skill name {entry.name!r}; "
+                            f"already provided by {existing.path}"
+                        )
+                        continue
                     self._skill_index[entry.name] = entry
         return list(self._skill_index.values())
 
@@ -157,7 +172,11 @@ class ToolRegistry:
             return None
         from tools.skills import compile_skill
 
-        tool = compile_skill(path, self._safety_guard)
+        tool = compile_skill(
+            path,
+            self._safety_guard,
+            allow_unsafe_code=self._allow_executable_skills,
+        )
         self.register(tool)
         return tool
 
@@ -183,6 +202,13 @@ class ToolRegistry:
         multiple times without leaking stale bytecode into ``sys.modules``.
         """
 
+        if not self._allow_executable_skills:
+            from tools.skills import SkillParseError, UNSAFE_EXECUTABLE_SKILL_MESSAGE
+
+            raise SkillParseError(UNSAFE_EXECUTABLE_SKILL_MESSAGE)
+        from tools.skills import validate_executable_skill_path
+
+        validate_executable_skill_path(path)
         module_name = f"_ash_skill_{name}_{abs(hash(str(path)))}"
         spec = importlib.util.spec_from_file_location(module_name, path)
         if spec is None or spec.loader is None:
@@ -219,6 +245,7 @@ class ToolRegistry:
             parsed_name=parsed_name,
             parsed_description=parsed_description,
             parsed_trigger=parsed_trigger,
+            allow_unsafe_code=True,
         )
         self._loaded_skill_modules[name] = path
         self.register(tool)

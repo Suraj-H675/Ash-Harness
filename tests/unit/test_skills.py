@@ -13,6 +13,7 @@ from safety.guard import SafetyGuard
 from tools.base import BaseTool, ToolResult
 from tools.registry import SkillIndexEntry, ToolRegistry
 from tools.skills import (
+    MAX_EXECUTABLE_SKILL_BYTES,
     SkillParseError,
     compile_skill,
     configure_runtime,
@@ -200,7 +201,7 @@ def test_compile_markdown_skill_executes(tmp_path: Path) -> None:
     path = tmp_path / "md_skill.md"
     path.write_text(md, encoding="utf-8")
     guard = _safety_guard(tmp_path)
-    tool = compile_skill(path, guard)
+    tool = compile_skill(path, guard, allow_unsafe_code=True)
     assert tool.name == "md_skill"
     result = asyncio.run(tool.run(prefix="hello"))
     assert result.success is True
@@ -226,7 +227,7 @@ def test_compile_markdown_skill_invokes_run_command_via_context(tmp_path: Path) 
     path = tmp_path / "skill_with_context.md"
     path.write_text(md, encoding="utf-8")
     guard = _safety_guard(tmp_path)
-    tool = compile_skill(path, guard)
+    tool = compile_skill(path, guard, allow_unsafe_code=True)
     result = asyncio.run(tool.run())
     assert result.success is True
     assert result.output == "ok-from-stub"
@@ -252,7 +253,7 @@ def test_compile_markdown_skill_reports_invalid_args(tmp_path: Path) -> None:
     path = tmp_path / "typed.md"
     path.write_text(md, encoding="utf-8")
     guard = _safety_guard(tmp_path)
-    tool = compile_skill(path, guard)
+    tool = compile_skill(path, guard, allow_unsafe_code=True)
     # 'count' expects an int; passing a string fails validation.
     result = asyncio.run(tool.run(count="not-a-number"))
     assert result.success is False
@@ -276,10 +277,56 @@ def test_compile_markdown_skill_catches_executor_exception(tmp_path: Path) -> No
     path = tmp_path / "boom.md"
     path.write_text(md, encoding="utf-8")
     guard = _safety_guard(tmp_path)
-    tool = compile_skill(path, guard)
+    tool = compile_skill(path, guard, allow_unsafe_code=True)
     result = asyncio.run(tool.run())
     assert result.success is False
     assert "kaboom" in (result.error or "")
+
+
+def test_executable_skill_compilation_is_disabled_by_default(tmp_path: Path) -> None:
+    marker = tmp_path / "imported.txt"
+    path = tmp_path / "unsafe.py"
+    path.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n"
+        "async def execute(context):\n    return 'unsafe'\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillParseError, match="disabled by default"):
+        compile_skill(path, _safety_guard(tmp_path))
+
+    assert not marker.exists()
+
+
+def test_executable_skill_context_cannot_create_missing_command_tool(
+    tmp_path: Path,
+) -> None:
+    configure_runtime(tools_provider=lambda: [], root_provider=lambda: tmp_path)
+    path = tmp_path / "command.md"
+    path.write_text(
+        "## Code\n```python\nasync def execute(context):\n"
+        "    return await context.run_command('echo unsafe')\n```\n",
+        encoding="utf-8",
+    )
+    tool = compile_skill(path, _safety_guard(tmp_path), allow_unsafe_code=True)
+
+    result = asyncio.run(tool.run())
+
+    assert result.success is False
+    assert "cannot create an ungoverned command tool" in (result.error or "")
+
+
+def test_write_python_skill_is_disabled_by_default(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="disabled by default"):
+        write_python_skill(
+            tmp_path / "skills",
+            name="unsafe",
+            description="unsafe",
+            trigger="unsafe",
+            body="async def execute(context): pass",
+        )
+
+    assert not (tmp_path / "skills").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +397,7 @@ def test_registry_load_skill_compiles_tool(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     guard = _safety_guard(tmp_path)
-    reg = ToolRegistry(guard, skill_roots=(skill_dir,))
+    reg = ToolRegistry(guard, skill_roots=(skill_dir,), allow_executable_skills=True)
     reg.discover_skills()
     tool = reg.load_skill("lazy_skill")
     assert tool is not None
@@ -359,6 +406,59 @@ def test_registry_load_skill_compiles_tool(tmp_path: Path) -> None:
     assert result.output == "lazy-ok"
     # The registry now has the compiled tool available for dispatch.
     assert reg.get("lazy_skill") is tool
+
+
+def test_registry_rejects_executable_skill_loading_by_default(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills"
+    skill_dir.mkdir()
+    path = skill_dir / "unsafe.md"
+    path.write_text(
+        "## Code\n```python\nasync def execute(context):\n    return 'unsafe'\n```\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(_safety_guard(tmp_path), skill_roots=(skill_dir,))
+    registry.discover_skills()
+
+    with pytest.raises(SkillParseError, match="disabled by default"):
+        registry.load_skill("unsafe")
+
+
+def test_registry_isolates_invalid_executable_skill_metadata(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills"
+    skill_dir.mkdir()
+    valid = skill_dir / "valid.py"
+    invalid = skill_dir / "invalid.py"
+    oversized = skill_dir / "oversized.md"
+    valid.write_text("async def execute(context):\n    return 'ok'\n", encoding="utf-8")
+    invalid.write_bytes(b"\xff\xfe")
+    oversized.write_bytes(b"x" * (MAX_EXECUTABLE_SKILL_BYTES + 1))
+    registry = ToolRegistry(_safety_guard(tmp_path), skill_roots=(skill_dir,))
+
+    entries = registry.discover_skills()
+
+    assert [entry.name for entry in entries] == ["valid"]
+    assert str(invalid) in registry.skill_errors
+    assert "exceeds 256 KiB" in registry.skill_errors[str(oversized)]
+
+
+def test_registry_reports_duplicate_executable_skill_names(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills"
+    skill_dir.mkdir()
+    for filename in ("first.py", "second.py"):
+        (skill_dir / filename).write_text(
+            '"""\nname: duplicate\n"""\n'
+            "async def execute(context):\n    return 'ok'\n",
+            encoding="utf-8",
+        )
+    registry = ToolRegistry(_safety_guard(tmp_path), skill_roots=(skill_dir,))
+
+    entries = registry.discover_skills()
+
+    assert [entry.name for entry in entries] == ["duplicate"]
+    assert (
+        "duplicate executable skill name"
+        in registry.skill_errors[str(skill_dir / "second.py")]
+    )
 
 
 def test_registry_load_skill_returns_none_for_unknown(tmp_path: Path) -> None:
@@ -389,7 +489,7 @@ def test_registry_load_all_skills(tmp_path: Path) -> None:
             encoding="utf-8",
         )
     guard = _safety_guard(tmp_path)
-    reg = ToolRegistry(guard, skill_roots=(skill_dir,))
+    reg = ToolRegistry(guard, skill_roots=(skill_dir,), allow_executable_skills=True)
     reg.discover_skills()
     tools = reg.load_all_skills()
     assert len(tools) == 3
@@ -437,7 +537,7 @@ def test_write_python_skill_writes_and_registry_reloads(tmp_path: Path) -> None:
     skill_dir = tmp_path / "skills"
     skill_dir.mkdir()
     guard = _safety_guard(tmp_path)
-    reg = ToolRegistry(guard, skill_roots=(skill_dir,))
+    reg = ToolRegistry(guard, skill_roots=(skill_dir,), allow_executable_skills=True)
 
     body = textwrap.dedent(
         """\
@@ -451,6 +551,7 @@ def test_write_python_skill_writes_and_registry_reloads(tmp_path: Path) -> None:
         description="self-written",
         trigger="dyn",
         body=body,
+        allow_unsafe_code=True,
     )
     assert path.exists()
     text = path.read_text()
@@ -486,6 +587,7 @@ def test_write_python_skill_writes_and_registry_reloads(tmp_path: Path) -> None:
         description="self-written v2",
         trigger="dyn v2",
         body=body2,
+        allow_unsafe_code=True,
     )
     reloaded = reg.reload_skill_module("dynamic_skill", path)
     assert reloaded is not None
@@ -501,6 +603,7 @@ def test_write_python_skill_rejects_invalid_name(tmp_path: Path) -> None:
             description="x",
             trigger="x",
             body="async def execute(context): pass",
+            allow_unsafe_code=True,
         )
 
 
@@ -512,6 +615,7 @@ def test_write_python_skill_creates_skill_dir(tmp_path: Path) -> None:
         description="deep",
         trigger="deep",
         body="async def execute(context):\n    return 'deep'\n",
+        allow_unsafe_code=True,
     )
     assert path.exists()
     assert nested.is_dir()
@@ -539,7 +643,7 @@ def test_compiled_skill_is_a_basetool(tmp_path: Path) -> None:
     path = tmp_path / "integration.md"
     path.write_text(md, encoding="utf-8")
     guard = _safety_guard(tmp_path)
-    tool = compile_skill(path, guard)
+    tool = compile_skill(path, guard, allow_unsafe_code=True)
     assert isinstance(tool, BaseTool)
     assert tool.name == "integration_skill"
     assert issubclass(tool.args_schema, object)
