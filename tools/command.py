@@ -11,9 +11,11 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from core.redaction import StreamingRedactor
 from safety.guard import SafetyGuard, SafetyViolation
 from sandbox._base import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable
 from sandbox.manager import SandboxManager, SandboxResult
+from sandbox.process_utils import communicate_process
 from tools.base import BaseTool, ToolResult, count_output_tokens
 from sandbox.process_utils import process_group_options, terminate_process_tree
 
@@ -109,22 +111,28 @@ class RunCommandTool(BaseTool):
             and self.sandbox_manager.tier >= SANDBOX_TIER_BWRAP
         )
 
-        if sandboxed:
-            assert self.sandbox_manager is not None
-            argv = ["/bin/sh", "-c", args.command_line]
-            return await self._run_sandboxed(
-                argv,
+        streamer = _CommandEventStreamer(self.emit_event)
+        try:
+            if sandboxed:
+                assert self.sandbox_manager is not None
+                argv = ["/bin/sh", "-c", args.command_line]
+                return await self._run_sandboxed(
+                    argv,
+                    args.timeout_seconds,
+                    cwd,
+                    env=build_scrubbed_command_env(self.project_root),
+                    stream_callback=streamer,
+                )
+
+            return await self._run_scoped(
+                args.command_line,
                 args.timeout_seconds,
                 cwd,
                 env=build_scrubbed_command_env(self.project_root),
+                stream_callback=streamer,
             )
-
-        return await self._run_scoped(
-            args.command_line,
-            args.timeout_seconds,
-            cwd,
-            env=build_scrubbed_command_env(self.project_root),
-        )
+        finally:
+            streamer.finish()
 
     async def _run_sandboxed(
         self,
@@ -133,6 +141,7 @@ class RunCommandTool(BaseTool):
         cwd: str | None,
         *,
         env: dict[str, str],
+        stream_callback: "_CommandEventStreamer",
     ) -> ToolResult:
         assert self.sandbox_manager is not None
         from pathlib import Path
@@ -140,7 +149,11 @@ class RunCommandTool(BaseTool):
         cwd_path = Path(cwd) if cwd is not None else None
         try:
             result: SandboxResult = await self.sandbox_manager.run(
-                argv, cwd=cwd_path, timeout=timeout_seconds, env=env
+                argv,
+                cwd=cwd_path,
+                timeout=timeout_seconds,
+                env=env,
+                stream_callback=stream_callback,
             )
         except SandboxBackendUnavailable as exc:
             return ToolResult(
@@ -170,6 +183,7 @@ class RunCommandTool(BaseTool):
         cwd: str | None,
         *,
         env: dict[str, str],
+        stream_callback: "_CommandEventStreamer",
     ) -> ToolResult:
         try:
             if platform.system() == "Windows":
@@ -197,7 +211,7 @@ class RunCommandTool(BaseTool):
                     **process_group_options(),
                 )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
+                communicate_process(process, stream_callback=stream_callback),
                 timeout=timeout_seconds,
             )
         except asyncio.TimeoutError:
@@ -294,3 +308,45 @@ def _truncate_command_output(output: str) -> tuple[str, bool]:
         + "\n[Warning: Output truncated. Command output exceeded 100000 characters.]",
         True,
     )
+
+
+class _CommandEventStreamer:
+    """Convert subprocess chunks into bounded, redacted typed events."""
+
+    def __init__(self, emit: Any) -> None:
+        self._emit = emit
+        self._emitted_characters = 0
+        self._truncated = False
+        self._redactors = {
+            "stdout": StreamingRedactor(),
+            "stderr": StreamingRedactor(),
+        }
+
+    def __call__(self, stream: str, text: str) -> None:
+        redactor = self._redactors[stream]
+        delta = redactor.feed(text)
+        if delta:
+            self._send(stream, delta)
+
+    def finish(self) -> None:
+        for stream, redactor in self._redactors.items():
+            delta = redactor.finish()
+            if delta:
+                self._send(stream, delta)
+
+    def _send(self, stream: str, delta: str) -> None:
+        if self._truncated:
+            return
+        remaining = MAX_COMMAND_OUTPUT_CHARS - self._emitted_characters
+        if len(delta) > remaining:
+            warning = (
+                "\n[Warning: Live command output truncated after 100000 characters.]"
+            )
+            delta = delta[:remaining] + warning
+            self._truncated = True
+        self._emitted_characters += min(len(delta), remaining)
+        if delta:
+            try:
+                self._emit({"type": "tool.output", "stream": stream, "delta": delta})
+            except Exception:
+                pass

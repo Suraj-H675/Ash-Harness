@@ -1,4 +1,5 @@
 import hashlib
+import asyncio
 import shlex
 import sys
 from pathlib import Path
@@ -505,6 +506,63 @@ async def test_run_command_defaults_to_project_root_cwd(
 
     assert result.success is True
     assert result.output.strip() == "from-root"
+
+
+@pytest.mark.asyncio
+async def test_run_command_streams_redacted_output_with_invocation_context(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    script = (
+        "import sys,time; "
+        "print('first', flush=True); "
+        "time.sleep(0.2); "
+        "print('token=supersecretvalue', file=sys.stderr, flush=True)"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    tool = RunCommandTool(guard)
+    events: list[dict[str, object]] = []
+    tool.set_event_sink(events.append)
+
+    with tool.event_context({"call_id": "call-1", "tool": "run_command"}):
+        pending = asyncio.create_task(tool.run(command_line=command))
+        for _ in range(20):
+            if events:
+                break
+            await asyncio.sleep(0.02)
+        assert pending.done() is False
+        assert events[0] == {
+            "call_id": "call-1",
+            "tool": "run_command",
+            "type": "tool.output",
+            "stream": "stdout",
+            "delta": "first\n",
+        }
+        result = await pending
+
+    assert result.success is True
+    streamed = "".join(str(event["delta"]) for event in events)
+    assert "supersecretvalue" not in streamed
+    assert "[REDACTED]" in streamed
+    assert {event["stream"] for event in events} == {"stdout", "stderr"}
+
+
+@pytest.mark.asyncio
+async def test_run_command_bounds_live_output(
+    guard: SafetyGuard,
+) -> None:
+    script = "import sys; sys.stdout.write('word ' * 25000); sys.stdout.flush()"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    tool = RunCommandTool(guard)
+    events: list[dict[str, object]] = []
+    tool.set_event_sink(events.append)
+
+    result = await tool.run(command_line=command)
+
+    streamed = "".join(str(event["delta"]) for event in events)
+    assert result.truncated is True
+    assert len(streamed) < 100100
+    assert "Live command output truncated" in streamed
 
 
 @pytest.mark.asyncio

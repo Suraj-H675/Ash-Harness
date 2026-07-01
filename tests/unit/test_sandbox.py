@@ -515,6 +515,22 @@ def test_run_command_uses_tier1_when_no_sandbox(tmp_path: Path) -> None:
     assert "plain" in result.output
 
 
+def test_sandbox_manager_forwards_streaming_output(tmp_path: Path) -> None:
+    manager = SandboxManager(workspace_root=tmp_path, backend_preference="direct")
+    observed: list[tuple[str, str]] = []
+
+    result = asyncio.run(
+        manager.run(
+            [sys.executable, "-c", "print('sandbox-stream', flush=True)"],
+            cwd=tmp_path,
+            stream_callback=lambda stream, delta: observed.append((stream, delta)),
+        )
+    )
+
+    assert result.exit_code == 0
+    assert observed == [("stdout", "sandbox-stream\n")]
+
+
 def test_run_command_with_sandbox_annotates_output(tmp_path: Path) -> None:
     if not has_bwrap():
         pytest.skip("bwrap not installed on this host")

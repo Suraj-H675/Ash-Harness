@@ -168,3 +168,43 @@ def test_terminal_ui_renders_tool_lifecycle_without_arguments() -> None:
     assert "secret" not in output.getvalue()
     assert ui.transcript.snapshot()[-1].content == "read_file [completed]"
     assert "arguments" not in (ui.transcript.snapshot()[-1].metadata or {})
+
+
+def test_terminal_ui_streams_and_finalizes_command_output() -> None:
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False))
+
+    ui.emit_event({"type": "tool.started", "tool": "run_command", "call_id": "c1"})
+    ui.emit_event(
+        {
+            "type": "tool.output",
+            "tool": "run_command",
+            "call_id": "c1",
+            "stream": "stdout",
+            "delta": "one\n",
+        }
+    )
+    ui.emit_event(
+        {
+            "type": "tool.output",
+            "tool": "run_command",
+            "call_id": "c1",
+            "stream": "stderr",
+            "delta": "warning\n",
+        }
+    )
+    ui.emit_event(
+        {
+            "type": "tool.completed",
+            "tool": "run_command",
+            "call_id": "c1",
+            "success": True,
+        }
+    )
+
+    entries = ui.transcript.snapshot()
+    streamed = next(entry for entry in entries if entry.title == "run_command output")
+    assert streamed.content == "one\nwarning\n"
+    assert streamed.finalized is True
+    assert "one" in output.getvalue()
+    assert "warning" in output.getvalue()

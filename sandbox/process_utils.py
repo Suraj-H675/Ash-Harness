@@ -7,7 +7,11 @@ import os
 import signal
 import subprocess
 import sys
+from collections.abc import Callable
 from typing import Any
+
+
+ProcessStreamCallback = Callable[[str, str], None]
 
 
 def process_group_options() -> dict[str, Any]:
@@ -55,3 +59,41 @@ async def terminate_process_tree(
     except ProcessLookupError:
         return
     await process.wait()
+
+
+async def communicate_process(
+    process: asyncio.subprocess.Process,
+    *,
+    stream_callback: ProcessStreamCallback | None = None,
+) -> tuple[bytes, bytes]:
+    """Collect both pipes while optionally forwarding decoded chunks."""
+
+    if stream_callback is None:
+        return await process.communicate()
+
+    async def read_stream(
+        stream: asyncio.StreamReader | None,
+        stream_name: str,
+    ) -> bytes:
+        if stream is None:
+            return b""
+        chunks: list[bytes] = []
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            text = chunk.decode("utf-8", errors="replace")
+            try:
+                stream_callback(stream_name, text)
+            except Exception:
+                # Rendering and observer failures must never kill user commands.
+                pass
+        return b"".join(chunks)
+
+    stdout, stderr, _ = await asyncio.gather(
+        read_stream(process.stdout, "stdout"),
+        read_stream(process.stderr, "stderr"),
+        process.wait(),
+    )
+    return stdout, stderr

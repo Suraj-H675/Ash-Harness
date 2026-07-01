@@ -1,6 +1,9 @@
 """Base contracts for Ash tools."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from pydantic import BaseModel
@@ -23,6 +26,10 @@ class BaseTool(ABC):
 
     def __init__(self, safety_guard: SafetyGuard) -> None:
         self.safety_guard = safety_guard
+        self._event_sink: Callable[[dict[str, Any]], None] | None = None
+        self._event_context: ContextVar[dict[str, Any] | None] = ContextVar(
+            f"tool_event_context_{id(self)}", default=None
+        )
 
     @abstractmethod
     async def run(self, **kwargs: Any) -> ToolResult:
@@ -33,6 +40,27 @@ class BaseTool(ABC):
 
     async def aclose(self) -> None:
         """Release optional tool resources."""
+
+    def set_event_sink(self, sink: Callable[[dict[str, Any]], None] | None) -> None:
+        """Attach the owning runtime's typed event sink."""
+
+        self._event_sink = sink
+
+    @contextmanager
+    def event_context(self, context: dict[str, Any]) -> Iterator[None]:
+        """Bind per-invocation metadata without leaking across async tasks."""
+
+        token = self._event_context.set(dict(context))
+        try:
+            yield
+        finally:
+            self._event_context.reset(token)
+
+    def emit_event(self, payload: dict[str, Any]) -> None:
+        if self._event_sink is None:
+            return
+        context = self._event_context.get() or {}
+        self._event_sink({**context, **payload})
 
 
 class ToolMiddleware(ABC):

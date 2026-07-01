@@ -59,6 +59,15 @@ class MyTestTool(BaseTool):
         return ToolResult(success=True, output="my_tool ran")
 
 
+class EventTool(BaseTool):
+    name = "event_tool"
+    args_schema = None
+
+    async def run(self, **kwargs):
+        self.emit_event({"type": "tool.output", "delta": "live", "stream": "stdout"})
+        return ToolResult(success=True, output="live")
+
+
 class NativeToolProvider(ProviderABC):
     model_name = "native-test"
 
@@ -477,6 +486,45 @@ async def test_resume_unknown_session_does_not_silently_create_one(tmp_path):
 
     with pytest.raises(KeyError, match="Session not found"):
         await loop.start_session("missing")
+
+
+@pytest.mark.asyncio
+async def test_tool_output_events_inherit_call_context(tmp_path):
+    guard = SafetyGuard(project_root=tmp_path)
+    tool = EventTool(guard)
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "events.db"),
+        NativeToolProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={tool.name: tool},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+
+    result = await loop._execute_tool_calls(
+        [
+            {
+                "call_id": "call-stream-1",
+                "name": "event_tool",
+                "arguments": {},
+            }
+        ],
+        session,
+    )
+
+    output_event = next(event for event in ui.events if event["type"] == "tool.output")
+    assert output_event == {
+        "call_id": "call-stream-1",
+        "tool": "event_tool",
+        "arguments": {},
+        "type": "tool.output",
+        "delta": "live",
+        "stream": "stdout",
+    }
+    assert result[0]["output"] == "live"
 
 
 @pytest.mark.asyncio

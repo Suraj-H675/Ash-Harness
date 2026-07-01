@@ -312,6 +312,8 @@ class AshLoop:
         self.ui = ui
         self.project_root = project_root
         self.tools: dict[str, BaseTool] = dict(tools or {})
+        for tool in self.tools.values():
+            tool.set_event_sink(self.ui.emit_event)
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self.system_prompt = system_prompt or _default_system_prompt(project_root)
         if additional_instructions:
@@ -482,6 +484,8 @@ class AshLoop:
 
         self._mcp_runtime = MCPRuntime(self._mcp_configs, self.safety_guard)
         tools = await self._mcp_runtime.start()
+        for tool in tools.values():
+            tool.set_event_sink(self.ui.emit_event)
         self.tools.update(tools)
         self._mcp_tool_names = set(tools)
         for name, error in self._mcp_runtime.errors.items():
@@ -1234,7 +1238,8 @@ class AshLoop:
                 if self.hooks is not None:
                     await self.hooks.fire_pre_tool(tool_name, arguments)
                 await self._apply_middlewares_before(tool_name, arguments, tool)
-                result_dict = await _execute_with_retry(tool, tool_name, arguments)
+                with tool.event_context(event_base):
+                    result_dict = await _execute_with_retry(tool, tool_name, arguments)
                 tool_result = ToolResult(
                     success=result_dict["success"],
                     output=result_dict["output"],

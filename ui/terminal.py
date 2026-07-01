@@ -39,10 +39,11 @@ ApprovalCallback = Callable[[str, dict[str, Any]], bool]
 class _LiveBuffers:
     thought: Text
     response: str
+    tool_output: Text
 
     @classmethod
     def fresh(cls) -> "_LiveBuffers":
-        return cls(thought=Text(), response="")
+        return cls(thought=Text(), response="", tool_output=Text())
 
 
 class TerminalUI:
@@ -104,6 +105,7 @@ class TerminalUI:
         self.transcript = transcript or Transcript()
         self._assistant_entry_id: str | None = None
         self._reasoning_entry_id: str | None = None
+        self._tool_output_entries: dict[str, str] = {}
         self.viewport_mode = False
         self._token_progress = (
             Progress(
@@ -174,6 +176,8 @@ class TerminalUI:
         parts: list[Any] = []
         if buffers.thought:
             parts.append(buffers.thought)
+        if buffers.tool_output:
+            parts.append(buffers.tool_output)
         parts.append(Markdown(buffers.response, hyperlinks=False))
         if self.show_token_meter and self._token_task is not None:
             parts.append(
@@ -279,12 +283,44 @@ class TerminalUI:
         event_type = payload.get("type")
         if event_type not in {
             "tool.started",
+            "tool.output",
             "tool.completed",
             "tool.denied",
             "tool.error",
         }:
             return
         tool = str(payload.get("tool", "unknown"))
+        call_id = str(payload.get("call_id", ""))
+        if event_type == "tool.output":
+            delta = str(payload.get("delta", ""))
+            if not delta:
+                return
+            entry_id = self._tool_output_entries.get(call_id)
+            if entry_id is None:
+                entry_id = self.transcript.begin(
+                    "tool",
+                    title=f"{tool} output",
+                    metadata={"type": event_type, "call_id": call_id},
+                )
+                self._tool_output_entries[call_id] = entry_id
+            self.transcript.append_delta(entry_id, delta)
+            stream = str(payload.get("stream", "stdout"))
+            style = "red" if stream == "stderr" else ""
+            if self._active_buffers is not None:
+                self._active_buffers.tool_output.append(delta, style=style)
+                self._refresh_live()
+            elif not self.viewport_mode:
+                self.console.print(
+                    delta,
+                    style=style,
+                    end="",
+                    markup=False,
+                    highlight=False,
+                )
+            return
+        output_entry = self._tool_output_entries.pop(call_id, None)
+        if output_entry is not None:
+            self.transcript.finalize(output_entry)
         labels = {
             "tool.started": ("started", "cyan"),
             "tool.completed": (

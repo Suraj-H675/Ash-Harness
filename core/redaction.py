@@ -22,6 +22,57 @@ def redact_text(value: str) -> str:
     return redacted
 
 
+class StreamingRedactor:
+    """Redact complete tokens while retaining chunk-split secret candidates."""
+
+    def __init__(self, *, max_token_characters: int = 8192) -> None:
+        if max_token_characters < 256:
+            raise ValueError("max_token_characters must be at least 256")
+        self.max_token_characters = max_token_characters
+        self._buffer = ""
+        self._withholding_long_token = False
+
+    def feed(self, value: str) -> str:
+        if not value:
+            return ""
+        self._buffer += value
+        if self._withholding_long_token:
+            boundary = _last_whitespace_boundary(self._buffer)
+            if boundary is None:
+                self._buffer = self._buffer[-1:]
+                return ""
+            self._withholding_long_token = False
+            self._buffer = self._buffer[boundary:]
+            return ""
+
+        boundary = _last_whitespace_boundary(self._buffer)
+        if boundary is not None:
+            complete = self._buffer[:boundary]
+            self._buffer = self._buffer[boundary:]
+            return redact_text(complete)
+        if len(self._buffer) > self.max_token_characters:
+            self._buffer = ""
+            self._withholding_long_token = True
+            return "[long unbroken output token withheld]"
+        return ""
+
+    def finish(self) -> str:
+        if self._withholding_long_token:
+            self._buffer = ""
+            self._withholding_long_token = False
+            return ""
+        remaining = redact_text(self._buffer)
+        self._buffer = ""
+        return remaining
+
+
+def _last_whitespace_boundary(value: str) -> int | None:
+    for index in range(len(value) - 1, -1, -1):
+        if value[index].isspace():
+            return index + 1
+    return None
+
+
 def redact_value(value: Any) -> Any:
     if isinstance(value, str):
         return redact_text(value)

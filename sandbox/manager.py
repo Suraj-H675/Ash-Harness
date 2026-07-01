@@ -31,7 +31,12 @@ from sandbox._base import (
 )
 from sandbox.bwrap import BubblewrapSandbox, probe_bwrap
 from sandbox.docker import DEFAULT_IMAGE, DockerSandbox, probe_docker
-from sandbox.process_utils import process_group_options, terminate_process_tree
+from sandbox.process_utils import (
+    ProcessStreamCallback,
+    communicate_process,
+    process_group_options,
+    terminate_process_tree,
+)
 
 
 # Re-export the tier constants for backwards compatibility with code
@@ -262,6 +267,7 @@ class SandboxManager:
         cwd: Path | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        stream_callback: ProcessStreamCallback | None = None,
     ) -> SandboxResult:
         """
         Run ``command`` (argv list) under the active sandbox.
@@ -284,6 +290,7 @@ class SandboxManager:
                 deadline,
                 fallback=invocation.fallback_used,
                 env=env,
+                stream_callback=stream_callback,
             )
 
         return await _run_subprocess(
@@ -293,6 +300,7 @@ class SandboxManager:
             tier=invocation.tier,
             backend_name=invocation.backend_name,
             env=env,
+            stream_callback=stream_callback,
         )
 
     def prepare(
@@ -413,6 +421,7 @@ async def _run_scoped(
     *,
     fallback: bool,
     env: dict[str, str] | None = None,
+    stream_callback: ProcessStreamCallback | None = None,
 ) -> SandboxResult:
     """Execute the command directly via asyncio.create_subprocess_exec."""
 
@@ -427,7 +436,8 @@ async def _run_scoped(
     )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            process.communicate(), timeout=deadline
+            communicate_process(process, stream_callback=stream_callback),
+            timeout=deadline,
         )
     except asyncio.TimeoutError:
         await terminate_process_tree(process)
@@ -462,6 +472,7 @@ async def _run_subprocess(
     tier: SandboxTier,
     backend_name: str,
     env: dict[str, str] | None = None,
+    stream_callback: ProcessStreamCallback | None = None,
 ) -> SandboxResult:
     """Execute a pre-wrapped argv (e.g. bwrap or docker run) directly."""
 
@@ -476,7 +487,8 @@ async def _run_subprocess(
     )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            process.communicate(), timeout=deadline
+            communicate_process(process, stream_callback=stream_callback),
+            timeout=deadline,
         )
     except asyncio.TimeoutError:
         await terminate_process_tree(process)

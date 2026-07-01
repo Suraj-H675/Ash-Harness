@@ -666,21 +666,15 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             assert loop.current_session is not None
             from uuid import uuid4
 
-            shell_result = (
-                await loop._execute_tool_calls(
-                    [
-                        {
-                            "call_id": str(uuid4()),
-                            "name": "run_command",
-                            "arguments": {"command_line": command_line},
-                        }
-                    ],
-                    loop.current_session,
-                )
-            )[0]
-            print(
-                shell_result.get("output") or shell_result.get("error") or "",
-                flush=True,
+            await loop._execute_tool_calls(
+                [
+                    {
+                        "call_id": str(uuid4()),
+                        "name": "run_command",
+                        "arguments": {"command_line": command_line},
+                    }
+                ],
+                loop.current_session,
             )
             continue
 
