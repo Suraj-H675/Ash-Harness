@@ -75,7 +75,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Tool-output pruning | Verified locally | Stale large results are pruned in provider context while preserving call identity and durable data |
 | Prompt caching | Verified locally | First-party Anthropic/OpenAI automatic controls and retention mapping; normalized reads/writes/hit rate persist and surface through CLI, SDK, HTTP, and JSON-RPC; custom/local endpoints remain untouched ([OpenAI](https://platform.openai.com/docs/guides/prompt-caching), [Anthropic](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)) |
 | Repository map | Verified locally | Incremental Tree-sitter symbols/imports for Python, JS/JSX, TS/TSX, Go, Rust, Java, C/C++, and C#; configured/Git ignores, active-file ranking, and CLI/SDK injection |
-| Project instructions | Partial | Trusted hierarchical `ASH.md` discovery plus bounded `@import` expansion and diagnostics; conflict lint remains |
+| Project instructions | Verified locally | Trusted hierarchical `ASH.md` discovery, bounded `@import` expansion, diagnostics, and conservative conflict lint across user/project/imported instructions |
 | User instructions | Verified locally | Global `~/.ash/ASH.md` is loaded with a bounded size |
 | Session memory | Partial | Searchable summaries rather than raw transcript concatenation |
 | Project memory | Partial | Explicit project-scoped index/search/clear controls; automatic policy remains |

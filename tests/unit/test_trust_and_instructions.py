@@ -1,7 +1,9 @@
 from context.instructions import (
     InstructionDiagnostic,
     discover_instructions,
+    lint_instruction_conflicts,
     render_instructions,
+    InstructionFile,
 )
 from safety.trust import is_workspace_trusted, set_workspace_trusted
 
@@ -141,3 +143,69 @@ def test_cyclic_instruction_import_is_reported_once(tmp_path, monkeypatch) -> No
     assert [diagnostic.message for diagnostic in diagnostics] == [
         "instruction import skipped because it is cyclic"
     ]
+
+
+def test_conflicting_project_instructions_are_reported(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    (home / ".ash" / "ASH.md").write_text("Always run tests before final response")
+    (workspace / "ASH.md").write_text("Never run tests before final response")
+
+    diagnostics: list[InstructionDiagnostic] = []
+    discovered = discover_instructions(
+        workspace,
+        include_project=True,
+        current_directory=workspace,
+        diagnostics=diagnostics,
+    )
+    rendered = render_instructions(discovered, diagnostics)
+
+    assert "Always run tests before final response" in rendered
+    assert "Never run tests before final response" in rendered
+    assert len(diagnostics) == 1
+    assert diagnostics[0].path == workspace / "ASH.md"
+    assert "instruction conflict" in diagnostics[0].message
+    assert "run tests before final response" in diagnostics[0].message
+
+
+def test_conflicting_user_only_instructions_are_reported(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    (home / ".ash").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    (home / ".ash" / "ASH.md").write_text("Prefer pytest\n@import more.md\n")
+    (home / ".ash" / "more.md").write_text("Avoid pytest")
+
+    diagnostics: list[InstructionDiagnostic] = []
+    discover_instructions(
+        tmp_path / "repo",
+        include_project=False,
+        diagnostics=diagnostics,
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].path == home / ".ash" / "more.md"
+    assert "conflicts with" in diagnostics[0].message
+
+
+def test_instruction_conflict_lint_ignores_non_directive_prose(tmp_path) -> None:
+    diagnostics: list[InstructionDiagnostic] = []
+    lint_instruction_conflicts(
+        [
+            InstructionFile(
+                path=tmp_path / "ASH.md",
+                content="You should always consider tests.\nAvoid flaky sleeps.",
+                scope="project",
+            ),
+            InstructionFile(
+                path=tmp_path / "nested" / "ASH.md",
+                content="Prefer deterministic waits.",
+                scope="project",
+            ),
+        ],
+        diagnostics,
+    )
+
+    assert diagnostics == []

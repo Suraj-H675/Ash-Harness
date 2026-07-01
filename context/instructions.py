@@ -9,6 +9,8 @@ import shlex
 
 MAX_INSTRUCTION_FILE_BYTES = 128 * 1024
 MAX_INSTRUCTION_IMPORT_DEPTH = 5
+_AFFIRMATIVE_DIRECTIVES = ("always ", "must ", "use ", "prefer ", "do ")
+_NEGATIVE_DIRECTIVES = ("never ", "do not ", "don't ", "dont ", "avoid ", "no ")
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,7 @@ def discover_instructions(
     )
 
     if not include_project:
+        lint_instruction_conflicts(files, diagnostics)
         return files
     root = workspace.expanduser().resolve()
     current = (current_directory or Path.cwd()).expanduser().resolve()
@@ -71,7 +74,48 @@ def discover_instructions(
                 seen=set(),
             )
         )
+    lint_instruction_conflicts(files, diagnostics)
     return files
+
+
+def lint_instruction_conflicts(
+    files: list[InstructionFile],
+    diagnostics: list[InstructionDiagnostic] | None = None,
+) -> None:
+    """Append diagnostics for direct contradictory instruction directives."""
+
+    seen: dict[str, tuple[str, InstructionFile, int, str]] = {}
+    reported: set[tuple[Path, int, Path, int, str]] = set()
+    for item in files:
+        for line_number, line in enumerate(item.content.splitlines(), start=1):
+            directive = _parse_directive(line)
+            if directive is None:
+                continue
+            polarity, key, display = directive
+            previous = seen.get(key)
+            if previous is None:
+                seen[key] = (polarity, item, line_number, display)
+                continue
+            previous_polarity, previous_item, previous_line, previous_display = previous
+            if previous_polarity == polarity:
+                continue
+            report_key = (
+                previous_item.path,
+                previous_line,
+                item.path,
+                line_number,
+                key,
+            )
+            if report_key in reported:
+                continue
+            reported.add(report_key)
+            _diagnose(
+                diagnostics,
+                item.path,
+                "instruction conflict: "
+                f"line {line_number} ({display!r}) conflicts with "
+                f"{previous_item.path}:{previous_line} ({previous_display!r})",
+            )
 
 
 def render_instructions(
@@ -182,6 +226,41 @@ def _extract_imports(content: str, source: Path) -> tuple[str, list[Path]]:
             imported = source.parent / imported
         imports.append(imported)
     return "\n".join(lines).strip(), imports
+
+
+def _parse_directive(line: str) -> tuple[str, str, str] | None:
+    normalized = _normalize_directive_text(line)
+    if not normalized:
+        return None
+    for prefix in _NEGATIVE_DIRECTIVES:
+        if normalized.startswith(prefix):
+            action = normalized.removeprefix(prefix).strip()
+            return _directive("negative", action, normalized)
+    for prefix in _AFFIRMATIVE_DIRECTIVES:
+        if normalized.startswith(prefix):
+            action = normalized.removeprefix(prefix).strip()
+            return _directive("affirmative", action, normalized)
+    return None
+
+
+def _directive(
+    polarity: str,
+    action: str,
+    display: str,
+) -> tuple[str, str, str] | None:
+    key = " ".join(action.rstrip(".:;").split())
+    if len(key) < 3:
+        return None
+    return polarity, key, display
+
+
+def _normalize_directive_text(line: str) -> str:
+    text = line.strip().casefold()
+    while text.startswith(("-", "*", "+", ">", "#")):
+        text = text[1:].strip()
+    if text.startswith("[ ]") or text.startswith("[x]"):
+        text = text[3:].strip()
+    return " ".join(text.split())
 
 
 def _diagnose(
