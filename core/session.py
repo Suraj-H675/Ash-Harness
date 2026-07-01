@@ -29,6 +29,10 @@ class SessionStorageError(RuntimeError):
     """Session database cannot be opened or migrated safely."""
 
 
+class SessionResolutionError(ValueError):
+    """A human session reference cannot be resolved unambiguously."""
+
+
 class Message(BaseModel):
     role: Role
     content: str
@@ -700,6 +704,73 @@ class SessionStore:
             )
             for row in rows
         ]
+
+    def latest_session(self, project_path: str) -> SessionSummary | None:
+        """Return the most recently updated session in one project."""
+
+        sessions = self.list_sessions(project_path=project_path, limit=1)
+        return sessions[0] if sessions else None
+
+    def resolve_session(self, reference: str, project_path: str) -> SessionSummary:
+        """Resolve an exact ID or title within one canonical project scope."""
+
+        normalized_reference = " ".join(reference.split())
+        if not normalized_reference:
+            raise SessionResolutionError("session reference must not be empty")
+        project_key = normalize_project_path(project_path)
+        with closing(get_db_connection(self.db_path)) as conn:
+            rows = conn.execute(
+                """
+                SELECT s.session_id, s.project_path, s.title, s.created_at,
+                       COALESCE(s.updated_at, s.created_at) AS updated_at,
+                       COUNT(m.message_id) AS message_count, s.model
+                FROM sessions s
+                LEFT JOIN messages m ON m.session_id = s.session_id
+                WHERE s.project_key = ?
+                  AND (s.session_id = ? OR s.title = ? COLLATE NOCASE)
+                GROUP BY s.session_id
+                ORDER BY CASE WHEN s.session_id = ? THEN 0 ELSE 1 END,
+                         updated_at DESC
+                """,
+                (
+                    project_key,
+                    normalized_reference,
+                    normalized_reference,
+                    normalized_reference,
+                ),
+            ).fetchall()
+            id_matches = [row for row in rows if row["session_id"] == reference]
+            if id_matches:
+                rows = id_matches
+            if not rows:
+                elsewhere = conn.execute(
+                    "SELECT project_path FROM sessions WHERE session_id = ?",
+                    (normalized_reference,),
+                ).fetchone()
+                if elsewhere is not None:
+                    raise SessionResolutionError(
+                        "session belongs to a different project: "
+                        f"{elsewhere['project_path']}"
+                    )
+                raise SessionResolutionError(
+                    f"no session named or identified by {normalized_reference!r} "
+                    "exists in this project"
+                )
+            if len(rows) > 1:
+                raise SessionResolutionError(
+                    f"session title {normalized_reference!r} is ambiguous; "
+                    "resume by session ID"
+                )
+            row = rows[0]
+        return SessionSummary(
+            session_id=row["session_id"],
+            project_path=row["project_path"],
+            title=row["title"] or "",
+            created_at=_deserialize_datetime(row["created_at"]),
+            updated_at=_deserialize_datetime(row["updated_at"]),
+            message_count=int(row["message_count"]),
+            model=row["model"] or "",
+        )
 
     def get_session_usage(self, session_id: str) -> SessionUsage:
         """Return persisted token and explicitly configured cost totals."""

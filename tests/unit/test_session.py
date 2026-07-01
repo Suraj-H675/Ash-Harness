@@ -7,6 +7,7 @@ import pytest
 
 from core.session import (
     Message,
+    SessionResolutionError,
     SessionStore,
     SessionStorageError,
     ToolCallRecord,
@@ -316,6 +317,43 @@ def test_session_scope_resolves_equivalent_project_paths(tmp_path: Path) -> None
 
     assert [item.session_id for item in listed] == [session.session_id]
     assert session.project_path == str(project.resolve())
+
+
+def test_session_resolution_supports_exact_id_and_case_insensitive_title(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "test.db")
+    older = store.create_session(str(tmp_path))
+    store.create_session(str(tmp_path))
+    store.rename_session(older.session_id, "Auth Refactor")
+
+    assert (
+        store.resolve_session(older.session_id, str(tmp_path)).session_id
+        == older.session_id
+    )
+    assert (
+        store.resolve_session("auth refactor", str(tmp_path)).session_id
+        == older.session_id
+    )
+    assert store.latest_session(str(tmp_path)).session_id == older.session_id
+
+
+def test_session_resolution_rejects_ambiguous_and_cross_project_references(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "test.db")
+    first = store.create_session(str(tmp_path))
+    second = store.create_session(str(tmp_path))
+    foreign = store.create_session(str(tmp_path / "other"))
+    store.rename_session(first.session_id, "duplicate")
+    store.rename_session(second.session_id, "DUPLICATE")
+
+    with pytest.raises(SessionResolutionError, match="ambiguous"):
+        store.resolve_session("duplicate", str(tmp_path))
+    with pytest.raises(SessionResolutionError, match="different project"):
+        store.resolve_session(foreign.session_id, str(tmp_path))
+    with pytest.raises(SessionResolutionError, match="no session"):
+        store.resolve_session("missing", str(tmp_path))
 
 
 def test_list_and_rename_sessions(tmp_path: Path) -> None:
