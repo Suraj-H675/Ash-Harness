@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import tempfile
 import uuid
@@ -12,13 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from plugins.manifest import PluginManifest
+from plugins.manifest import PLUGIN_NAME, PluginManifest
 from plugins.registry import _validate_manifest
 
 MAX_PLUGIN_FILES = 10_000
 MAX_PLUGIN_BYTES = 256 * 1024 * 1024
 STATE_VERSION = 1
-PLUGIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class PluginLifecycleError(ValueError):
@@ -114,6 +112,18 @@ def install_local_plugin(
     if os.name != "nt":
         root.chmod(0o700)
     destination = root / manifest.name
+    installed_versions: dict[str, str] = {}
+    for installed_manifest in root.glob("*/plugin.json"):
+        if installed_manifest.parent.name == manifest.name:
+            continue
+        try:
+            installed = PluginManifest.load(installed_manifest)
+        except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+            continue
+        installed_versions[installed.name] = installed.version
+    dependency_errors = manifest.check_dependencies(installed_versions)
+    if dependency_errors:
+        raise PluginLifecycleError("; ".join(dependency_errors))
     if destination.exists() and not replace:
         raise PluginLifecycleError(
             f"plugin {manifest.name!r} is already installed; use --replace"

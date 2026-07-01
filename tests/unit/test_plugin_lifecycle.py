@@ -131,3 +131,27 @@ def test_invalid_extension_state_is_rejected(tmp_path) -> None:
 
     with pytest.raises(PluginLifecycleError, match="invalid extension state"):
         load_extension_state(state_path)
+
+
+def test_install_requires_local_plugin_dependencies_first(tmp_path) -> None:
+    destination_root = tmp_path / "installed"
+    dependent = _plugin(tmp_path / "dependent", name="dependent")
+    (dependent / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "dependent",
+                "dependencies": [{"name": "base", "version": ">=1.0"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PluginLifecycleError, match="Missing dependency: base"):
+        install_local_plugin(dependent, destination_root=destination_root)
+
+    install_local_plugin(
+        _plugin(tmp_path / "base", name="base"),
+        destination_root=destination_root,
+    )
+    installed = install_local_plugin(dependent, destination_root=destination_root)
+    assert installed.name == "dependent"

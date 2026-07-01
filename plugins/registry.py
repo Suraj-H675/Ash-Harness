@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from plugins.manifest import PluginManifest
+from plugins.manifest import PluginManifest, validate_plugin_identity
 
 
 @dataclass(frozen=True)
@@ -69,20 +69,42 @@ class PluginCatalog:
                 plugins[manifest.name] = DiscoveredPlugin(
                     manifest, path.parent, source, enabled
                 )
+        while True:
+            versions = {
+                name: plugin.manifest.version for name, plugin in plugins.items()
+            }
+            invalid = {
+                name: errors
+                for name, plugin in plugins.items()
+                if (errors := plugin.manifest.check_dependencies(versions))
+            }
+            if not invalid:
+                break
+            for name, errors in invalid.items():
+                plugin = plugins.pop(name)
+                self.errors[str(plugin.root / "plugin.json")] = "; ".join(errors)
         return list(plugins.values())
 
 
 def _validate_manifest(manifest: PluginManifest, root: Path) -> None:
-    if not manifest.name or any(part in manifest.name for part in ("/", "\\", "..")):
-        raise ValueError("plugin name must be a non-empty path-safe identifier")
-    dependency_errors = manifest.check_dependencies()
-    if dependency_errors:
-        raise ValueError("; ".join(dependency_errors))
-    for relative in manifest.skills:
+    validate_plugin_identity(manifest)
+    path_components = [*manifest.skills]
+    path_components.extend(
+        item
+        for collection in (
+            manifest.commands,
+            manifest.agents,
+            manifest.hooks,
+            manifest.mcp_servers,
+        )
+        for item in collection
+        if isinstance(item, str)
+    )
+    for relative in path_components:
         candidate = (root / relative).resolve()
         try:
             candidate.relative_to(root.resolve())
         except ValueError as exc:
-            raise ValueError(f"skill path escapes plugin root: {relative}") from exc
+            raise ValueError(f"component path escapes plugin root: {relative}") from exc
         if not candidate.exists():
-            raise ValueError(f"skill path does not exist: {relative}")
+            raise ValueError(f"component path does not exist: {relative}")

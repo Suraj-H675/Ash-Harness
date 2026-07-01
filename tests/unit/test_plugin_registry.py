@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from plugins.registry import PluginCatalog
 
 
@@ -79,3 +81,65 @@ def test_plugin_catalog_excludes_disabled_plugins_by_default(tmp_path) -> None:
     discovered = catalog.discover(include_disabled=True)
     assert len(discovered) == 1
     assert discovered[0].enabled is False
+
+
+@pytest.mark.parametrize("name", [".", "bad name", "../outside"])
+def test_plugin_catalog_rejects_nonportable_names(tmp_path, name: str) -> None:
+    root = tmp_path / "plugins"
+    plugin = root / "candidate"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.json").write_text(json.dumps({"name": name}))
+
+    catalog = PluginCatalog(((root, "user"),))
+
+    assert catalog.discover() == []
+    assert "portable path-safe" in next(iter(catalog.errors.values()))
+
+
+def test_plugin_catalog_validates_all_declared_component_paths(tmp_path) -> None:
+    root = tmp_path / "plugins"
+    plugin = root / "example"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "example", "commands": ["missing/command.md"]})
+    )
+
+    catalog = PluginCatalog(((root, "user"),))
+
+    assert catalog.discover() == []
+    assert "component path does not exist" in next(iter(catalog.errors.values()))
+
+
+def test_plugin_catalog_resolves_plugin_dependencies(tmp_path) -> None:
+    root = tmp_path / "plugins"
+    for name, payload in {
+        "base": {"name": "base", "version": "1.2.0"},
+        "dependent": {
+            "name": "dependent",
+            "dependencies": [{"name": "base", "version": ">=1.0,<2"}],
+        },
+    }.items():
+        plugin = root / name
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.json").write_text(json.dumps(payload))
+
+    catalog = PluginCatalog(((root, "user"),))
+
+    assert {item.manifest.name for item in catalog.discover()} == {
+        "base",
+        "dependent",
+    }
+
+
+def test_plugin_catalog_rejects_missing_plugin_dependency(tmp_path) -> None:
+    root = tmp_path / "plugins"
+    plugin = root / "dependent"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "dependent", "dependencies": [{"name": "missing"}]})
+    )
+
+    catalog = PluginCatalog(((root, "user"),))
+
+    assert catalog.discover() == []
+    assert "Missing dependency: missing" in next(iter(catalog.errors.values()))
