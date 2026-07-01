@@ -212,6 +212,93 @@ def test_extensions_cli_requires_management_target(capsys) -> None:
     assert "requires a target" in capsys.readouterr().err
 
 
+def test_extensions_install_validates_components_before_replacing(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    source = tmp_path / "source"
+    _write_plugin(tmp_path, "source")
+    command = source / "commands" / "broken.md"
+    command.parent.mkdir()
+    command.write_text("", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert main(["extensions", "install", str(source)]) == 2
+
+    assert "command template is empty" in capsys.readouterr().err
+    assert not (home / ".ash" / "plugins" / "source").exists()
+
+
+def test_extensions_replace_preserves_previous_plugin_when_validation_fails(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    source = tmp_path / "source"
+    _write_plugin(tmp_path, "source")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    assert main(["extensions", "install", str(source)]) == 0
+    capsys.readouterr()
+    manifest_path = source / "plugin.json"
+    payload = json.loads(manifest_path.read_text())
+    payload["version"] = "2.0.0"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    command = source / "commands" / "broken.md"
+    command.parent.mkdir()
+    command.write_text("", encoding="utf-8")
+
+    assert main(["extensions", "install", str(source), "--replace"]) == 2
+
+    assert "command template is empty" in capsys.readouterr().err
+    installed = json.loads(
+        (home / ".ash" / "plugins" / "source" / "plugin.json").read_text()
+    )
+    assert installed["version"] == "1.0.0"
+
+
+def test_extensions_enforces_enabled_plugin_dependencies(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    base = tmp_path / "base"
+    dependent = tmp_path / "dependent"
+    _write_plugin(tmp_path, "base")
+    _write_plugin(tmp_path, "dependent")
+    dependent_manifest = json.loads((dependent / "plugin.json").read_text())
+    dependent_manifest["dependencies"] = [{"name": "base", "version": ">=1"}]
+    (dependent / "plugin.json").write_text(
+        json.dumps(dependent_manifest), encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    assert main(["extensions", "install", str(base)]) == 0
+    assert main(["extensions", "install", str(dependent)]) == 0
+    capsys.readouterr()
+
+    assert main(["extensions", "disable", "base"]) == 2
+    assert "required by: dependent" in capsys.readouterr().err
+    assert main(["extensions", "disable", "dependent"]) == 0
+    assert main(["extensions", "disable", "base"]) == 0
+    capsys.readouterr()
+    assert main(["extensions", "enable", "dependent"]) == 2
+    assert "Missing dependency: base" in capsys.readouterr().err
+    assert main(["extensions", "uninstall", "base", "--yes"]) == 2
+    assert "required by: dependent" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "arguments",
     [

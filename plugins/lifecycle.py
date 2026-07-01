@@ -9,7 +9,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from plugins.manifest import PLUGIN_NAME, PluginManifest
 from plugins.registry import _validate_manifest
@@ -89,6 +89,7 @@ def install_local_plugin(
     *,
     destination_root: Path | None = None,
     replace: bool = False,
+    validator: Callable[[Path, PluginManifest], None] | None = None,
 ) -> InstalledPlugin:
     source = source.expanduser()
     if _is_link(source):
@@ -140,6 +141,13 @@ def install_local_plugin(
         _validate_manifest(staged_manifest, staged)
         if staged_manifest != manifest:
             raise PluginLifecycleError("plugin changed while it was being installed")
+        if validator is not None:
+            try:
+                validator(staged, staged_manifest)
+            except PluginLifecycleError:
+                raise
+            except Exception as exc:
+                raise PluginLifecycleError(f"invalid plugin component: {exc}") from exc
         if destination.exists():
             destination.replace(backup)
             destination_moved = True

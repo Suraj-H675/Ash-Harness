@@ -9,6 +9,9 @@ from typing import Any, Literal
 
 from mcp.server import load_mcp_servers
 from plugins.agents import AgentCatalog, AgentSource
+from cli.custom_commands import CommandSource, CustomCommandCatalog
+from hooks.config import HookConfigSource, load_command_hooks
+from plugins.manifest import PluginManifest
 from plugins.lifecycle import (
     PluginLifecycleError,
     install_local_plugin,
@@ -18,6 +21,7 @@ from plugins.lifecycle import (
     user_plugin_root,
 )
 from plugins.registry import PluginCatalog
+from plugins.registry import DiscoveredPlugin, _validate_manifest
 from plugins.skills import SkillCatalog, SkillSource
 from safety.trust import canonical_workspace, is_workspace_trusted
 
@@ -289,8 +293,15 @@ def manage_local_plugin(
     confirmed: bool = False,
 ) -> dict[str, Any]:
     if action == "install":
-        load_extension_state()
-        installed = install_local_plugin(Path(target), replace=replace)
+        state = load_extension_state()
+
+        def validate_install(root: Path, manifest: PluginManifest) -> None:
+            _require_enabled_dependencies(manifest, state.disabled_plugins)
+            _validate_plugin_contents(root, manifest)
+
+        installed = install_local_plugin(
+            Path(target), replace=replace, validator=validate_install
+        )
         set_plugin_enabled(installed.name, enabled=True)
         return {
             "action": action,
@@ -302,12 +313,25 @@ def manage_local_plugin(
 
     plugin = _installed_user_plugin(target)
     if action == "enable":
+        state = load_extension_state()
+        _require_enabled_dependencies(plugin.manifest, state.disabled_plugins)
+        _validate_plugin_contents(plugin.root, plugin.manifest)
         set_plugin_enabled(target, enabled=True)
         enabled = True
     elif action == "disable":
+        dependents = _plugin_dependents(target, enabled_only=True)
+        if dependents:
+            raise PluginLifecycleError(
+                f"cannot disable {target!r}; required by: {', '.join(dependents)}"
+            )
         set_plugin_enabled(target, enabled=False)
         enabled = False
     else:
+        dependents = _plugin_dependents(target, enabled_only=False)
+        if dependents:
+            raise PluginLifecycleError(
+                f"cannot uninstall {target!r}; required by: {', '.join(dependents)}"
+            )
         uninstall_local_plugin(target, confirmed=confirmed)
         return {
             "action": action,
@@ -338,20 +362,112 @@ def render_plugin_action(result: dict[str, Any], *, json_output: bool) -> str:
 
 
 def _installed_user_plugin(name: str):
-    state = load_extension_state()
-    catalog = PluginCatalog(
-        ((user_plugin_root(), "user"),),
-        disabled_plugins=state.disabled_plugins,
-    )
-    plugins = catalog.discover(include_disabled=True)
-    matched = next((plugin for plugin in plugins if plugin.manifest.name == name), None)
-    if matched is not None:
-        return matched
     expected = user_plugin_root() / name / "plugin.json"
-    detail = catalog.errors.get(str(expected))
-    if detail:
-        raise PluginLifecycleError(f"installed plugin {name!r} is invalid: {detail}")
-    raise PluginLifecycleError(f"plugin is not installed in user scope: {name}")
+    if not expected.is_file():
+        raise PluginLifecycleError(f"plugin is not installed in user scope: {name}")
+    try:
+        manifest = PluginManifest.load(expected)
+        _validate_manifest(manifest, expected.parent)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise PluginLifecycleError(
+            f"installed plugin {name!r} is invalid: {exc}"
+        ) from exc
+    if manifest.name != name:
+        raise PluginLifecycleError(
+            f"installed plugin directory {name!r} contains manifest {manifest.name!r}"
+        )
+    return DiscoveredPlugin(
+        manifest,
+        expected.parent,
+        "user",
+        name not in load_extension_state().disabled_plugins,
+    )
+
+
+def _installed_user_manifests() -> dict[str, PluginManifest]:
+    manifests: dict[str, PluginManifest] = {}
+    root = user_plugin_root()
+    if not root.is_dir():
+        return manifests
+    for path in sorted(root.glob("*/plugin.json")):
+        try:
+            manifest = PluginManifest.load(path)
+            _validate_manifest(manifest, path.parent)
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise PluginLifecycleError(
+                f"installed plugin {path} is invalid: {exc}"
+            ) from exc
+        manifests[manifest.name] = manifest
+    return manifests
+
+
+def _require_enabled_dependencies(
+    manifest: PluginManifest, disabled_plugins: frozenset[str]
+) -> None:
+    versions = {
+        name: installed.version
+        for name, installed in _installed_user_manifests().items()
+        if name not in disabled_plugins and name != manifest.name
+    }
+    errors = manifest.check_dependencies(versions)
+    if errors:
+        raise PluginLifecycleError("; ".join(errors))
+
+
+def _plugin_dependents(name: str, *, enabled_only: bool) -> list[str]:
+    disabled = load_extension_state().disabled_plugins
+    return sorted(
+        candidate
+        for candidate, manifest in _installed_user_manifests().items()
+        if candidate != name
+        and (not enabled_only or candidate not in disabled)
+        and any(dependency.get("name") == name for dependency in manifest.dependencies)
+    )
+
+
+def _validate_plugin_contents(root: Path, manifest: PluginManifest) -> None:
+    plugin = DiscoveredPlugin(manifest, root, "validation")
+    skills = SkillCatalog((SkillSource(plugin.skill_paths(), manifest.name),))
+    skills.discover()
+    commands = CustomCommandCatalog(
+        (
+            CommandSource(
+                plugin.command_paths(),
+                source=f"plugin:{manifest.name}",
+                namespace=manifest.name,
+            ),
+        )
+    )
+    commands.discover()
+    agents = AgentCatalog((AgentSource(plugin.agent_paths(), manifest.name),))
+    agents.discover()
+    errors = [
+        *skills.errors.values(),
+        *commands.errors.values(),
+        *agents.errors.values(),
+    ]
+    if errors:
+        raise PluginLifecycleError(errors[0])
+    try:
+        load_command_hooks(
+            [
+                HookConfigSource(
+                    path,
+                    cwd=root,
+                    environment=(("ASH_PLUGIN_ROOT", str(root)),),
+                )
+                for path in plugin.hook_paths()
+            ]
+        )
+        for path in plugin.mcp_paths():
+            load_mcp_servers(
+                path,
+                namespace=manifest.name,
+                cwd=root,
+                environment={"ASH_PLUGIN_ROOT": str(root)},
+            )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise PluginLifecycleError(f"invalid plugin component: {exc}") from exc
 
 
 def _discover_hooks(
