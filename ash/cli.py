@@ -2571,14 +2571,20 @@ async def _bootstrap_and_headless(
     json_schema_path: Path | None = None,
 ) -> int:
     from exceptions import classify_exception, format_error
-    from cli.attachments import prepare_file_mentions
+    from cli.attachments import PreparedAttachments, prepare_file_mentions
 
     try:
         session = await loop.start_session(session_id)
-        prepared = prepare_file_mentions(
-            prompt,
-            loop.safety_guard,
-            allow_images=loop.provider.capabilities.vision,
+        safety_guard = getattr(loop, "safety_guard", None)
+        provider = getattr(loop, "provider", None)
+        prepared = (
+            prepare_file_mentions(
+                prompt,
+                safety_guard,
+                allow_images=provider.capabilities.vision,
+            )
+            if safety_guard is not None and provider is not None
+            else PreparedAttachments(prompt)
         )
         prompt = prepared.prompt
         schema = None
@@ -2588,9 +2594,11 @@ async def _bootstrap_and_headless(
                 f"{prompt}\n\nReturn only JSON matching this schema:\n"
                 f"{json.dumps(schema, ensure_ascii=False)}"
             )
-        response = await loop.run_turn(
-            prompt,
-            user_metadata=prepared.message_metadata(),
+        user_metadata = prepared.message_metadata()
+        response = (
+            await loop.run_turn(prompt)
+            if user_metadata is None
+            else await loop.run_turn(prompt, user_metadata=user_metadata)
         )
         payload = {
             "response": response,
