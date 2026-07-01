@@ -1,8 +1,12 @@
 # tests/unit/test_mcp.py
 import json
+import io
 import sys
 import pytest
 import httpx
+from core.loop import AshLoop
+from core.session import SessionStore
+from providers.base import ProviderABC, StreamChunk
 from safety.guard import SafetyGuard
 from mcp.client import MCPClient
 from mcp.runtime import MCPRuntime
@@ -18,6 +22,7 @@ from mcp.server import (
     expand_env_vars,
 )
 from pathlib import Path
+from ui.headless import HeadlessUI
 
 
 def test_load_mcp_servers_from_file(tmp_path: Path) -> None:
@@ -215,6 +220,16 @@ for line in sys.stdin:
 """
 
 
+class IdleProvider(ProviderABC):
+    model_name = "idle"
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        yield StreamChunk(content="idle", is_done=True)
+
+    def count_tokens(self, text: str) -> int:
+        return len(text.split())
+
+
 @pytest.mark.asyncio
 async def test_async_client_initializes_lists_and_calls_tools() -> None:
     config = MCPServerConfig(
@@ -285,6 +300,34 @@ async def test_runtime_applies_plugin_mcp_working_directory_and_environment(
         assert result.output == f"{plugin}|{plugin}"
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_loop_reloads_mcp_tools_without_restarting_session(
+    tmp_path: Path,
+) -> None:
+    config = MCPServerConfig(
+        name="fake",
+        command=sys.executable,
+        args=["-u", "-c", FAKE_MCP_SERVER],
+        env={},
+    )
+    loop = AshLoop(
+        session_store=SessionStore(tmp_path / "sessions.db"),
+        provider=IdleProvider(),
+        safety_guard=SafetyGuard(tmp_path),
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+        mcp_configs={"fake": config},
+    )
+    await loop.start_session()
+    assert "mcp__fake__echo" in loop.tools
+
+    errors = await loop.reload_mcp_servers({})
+
+    assert errors == {}
+    assert "mcp__fake__echo" not in loop.tools
+    await loop.aclose()
 
 
 @pytest.mark.asyncio

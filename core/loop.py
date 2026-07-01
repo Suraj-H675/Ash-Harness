@@ -380,6 +380,7 @@ class AshLoop:
         self.current_session: Session | None = None
         self.recovered_turns = 0
         self._mcp_runtime: Any | None = None
+        self._mcp_tool_names: set[str] = set()
         self._mcp_configs = dict(mcp_configs or {})
         if mcp_config_path is not None and mcp_config_path.exists():
             loaded_mcp_configs = load_mcp_servers(mcp_config_path)
@@ -407,6 +408,7 @@ class AshLoop:
         if self._mcp_runtime is not None:
             await self._mcp_runtime.close()
             self._mcp_runtime = None
+        self._mcp_tool_names.clear()
         await asyncio.gather(
             *(tool.aclose() for tool in self.tools.values()),
             return_exceptions=True,
@@ -419,12 +421,7 @@ class AshLoop:
         """Create a new session or restore one by id."""
 
         if self._mcp_configs and self._mcp_runtime is None:
-            from mcp.runtime import MCPRuntime
-
-            self._mcp_runtime = MCPRuntime(self._mcp_configs, self.safety_guard)
-            self.tools.update(await self._mcp_runtime.start())
-            for name, error in self._mcp_runtime.errors.items():
-                _log.warning("MCP server %s unavailable: %s", name, error)
+            await self._start_mcp_runtime()
 
         if session_id is not None:
             self.current_session = self.session_store.load_session(session_id)
@@ -455,6 +452,30 @@ class AshLoop:
         )
         self.current_session = session
         return session
+
+    async def reload_mcp_servers(
+        self, configs: dict[str, MCPServerConfig]
+    ) -> dict[str, str]:
+        if self._mcp_runtime is not None:
+            await self._mcp_runtime.close()
+            self._mcp_runtime = None
+        for name in self._mcp_tool_names:
+            self.tools.pop(name, None)
+        self._mcp_tool_names.clear()
+        self._mcp_configs = dict(configs)
+        if self.current_session is not None and self._mcp_configs:
+            await self._start_mcp_runtime()
+        return dict(self._mcp_runtime.errors) if self._mcp_runtime is not None else {}
+
+    async def _start_mcp_runtime(self) -> None:
+        from mcp.runtime import MCPRuntime
+
+        self._mcp_runtime = MCPRuntime(self._mcp_configs, self.safety_guard)
+        tools = await self._mcp_runtime.start()
+        self.tools.update(tools)
+        self._mcp_tool_names = set(tools)
+        for name, error in self._mcp_runtime.errors.items():
+            _log.warning("MCP server %s unavailable: %s", name, error)
 
     # --- the main turn ----------------------------------------------------
 

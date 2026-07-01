@@ -16,7 +16,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from config import AshConfig
@@ -510,6 +510,139 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         ),
         notification_include_preview=config.notification_include_preview,
     )
+
+    async def reload_plugin_components() -> str:
+        nonlocal custom_commands, discovered_commands
+
+        from hooks.config import HookConfigSource, load_command_hooks
+        from mcp.server import MCPConfigSource, load_mcp_server_sources
+        from plugins.agents import AgentCatalog, AgentSource
+        from plugins.skills import (
+            ActivateSkillTool,
+            ListSkillsTool,
+            SkillCatalog,
+            SkillSource,
+        )
+        from tools.agent import SpawnAgentTool
+
+        trusted = is_workspace_trusted(loop.project_root)
+        refreshed_plugin_roots = [(Path.home() / ".ash" / "plugins", "user")]
+        refreshed_command_roots = [(Path.home() / ".ash" / "commands", "user")]
+        if trusted:
+            refreshed_plugin_roots.append(
+                (loop.project_root / ".ash" / "plugins", "project")
+            )
+            refreshed_command_roots.append(
+                (loop.project_root / ".ash" / "commands", "project")
+            )
+        plugin_catalog = PluginCatalog(
+            tuple(refreshed_plugin_roots),
+            disabled_plugins=load_extension_state().disabled_plugins,
+        )
+        plugins = plugin_catalog.discover()
+        if plugin_catalog.errors:
+            raise ValueError(next(iter(plugin_catalog.errors.values())))
+
+        refreshed_command_sources: list[tuple[Path, str] | CommandSource] = list(
+            refreshed_command_roots
+        )
+        refreshed_command_sources.extend(
+            CommandSource(
+                paths=plugin.command_paths(),
+                source=f"plugin:{plugin.manifest.name}",
+                namespace=plugin.manifest.name,
+            )
+            for plugin in plugins
+        )
+        next_commands = CustomCommandCatalog(tuple(refreshed_command_sources))
+        next_discovered_commands = next_commands.discover()
+        if next_commands.errors:
+            raise ValueError(next(iter(next_commands.errors.values())))
+
+        skill_sources: list[Path | SkillSource] = [Path.home() / ".ash" / "skills"]
+        agent_sources: list[Path | AgentSource] = [Path.home() / ".ash" / "agents"]
+        if trusted:
+            skill_sources.append(loop.project_root / ".ash" / "skills")
+            agent_sources.append(loop.project_root / ".ash" / "agents")
+        skill_sources.extend(
+            SkillSource(plugin.skill_paths(), plugin.manifest.name)
+            for plugin in plugins
+        )
+        agent_sources.extend(
+            AgentSource(plugin.agent_paths(), plugin.manifest.name)
+            for plugin in plugins
+        )
+        next_skills = SkillCatalog(tuple(skill_sources))
+        discovered_skills = next_skills.discover()
+        if next_skills.errors:
+            raise ValueError(next(iter(next_skills.errors.values())))
+        next_agents = AgentCatalog(tuple(agent_sources))
+        discovered_agents = next_agents.discover()
+        if next_agents.errors:
+            raise ValueError(next(iter(next_agents.errors.values())))
+
+        hook_sources: list[Path | HookConfigSource] = [
+            Path.home() / ".ash" / "hooks.json"
+        ]
+        if trusted:
+            hook_sources.append(loop.project_root / ".ash" / "hooks.json")
+        hook_sources.extend(
+            HookConfigSource(
+                path,
+                cwd=plugin.root,
+                environment=(("ASH_PLUGIN_ROOT", str(plugin.root)),),
+            )
+            for plugin in plugins
+            for path in plugin.hook_paths()
+        )
+        next_hooks = load_command_hooks(hook_sources)
+
+        mcp_sources: list[MCPConfigSource] = []
+        if trusted:
+            mcp_sources.append(MCPConfigSource(loop.project_root / ".mcp.json"))
+        mcp_sources.extend(
+            MCPConfigSource(
+                path,
+                namespace=plugin.manifest.name,
+                cwd=plugin.root,
+                environment=(("ASH_PLUGIN_ROOT", str(plugin.root)),),
+            )
+            for plugin in plugins
+            for path in plugin.mcp_paths()
+        )
+        next_mcp = load_mcp_server_sources(mcp_sources)
+
+        list_skills_tool = loop.tools.get("list_skills")
+        activate_skill_tool = loop.tools.get("activate_skill")
+        if not isinstance(list_skills_tool, ListSkillsTool) or not isinstance(
+            activate_skill_tool, ActivateSkillTool
+        ):
+            raise RuntimeError("skill tools are unavailable")
+        list_skills_tool.catalog = next_skills
+        activate_skill_tool.catalog = next_skills
+        spawn_tool = loop.tools.get("spawn_agent")
+        if isinstance(spawn_tool, SpawnAgentTool):
+            spawn_tool.set_custom_agents(
+                {agent.name: agent for agent in discovered_agents}
+            )
+        loop.hooks = next_hooks
+        mcp_errors = await loop.reload_mcp_servers(next_mcp)
+        custom_commands = next_commands
+        discovered_commands = next_discovered_commands
+        prompt_input.set_extra_commands(
+            [command.name for command in discovered_commands]
+        )
+        summary = (
+            f"Reloaded {len(plugins)} plugin(s): {len(discovered_skills)} skills, "
+            f"{len(discovered_agents)} agents, {len(discovered_commands)} commands, "
+            f"{len(hook_sources)} hook config(s), {len(next_mcp)} MCP server(s)."
+        )
+        if mcp_errors:
+            summary += " MCP errors: " + "; ".join(
+                f"{name}: {error}" for name, error in sorted(mcp_errors.items())
+            )
+        return summary
+
     print(
         "ash - type /help for commands",
         flush=True,
@@ -833,9 +966,49 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 print(result.output or "No matching skills.", flush=True)
                 continue
             if command.name == "plugins":
+                from cli.extensions import (
+                    PluginAction,
+                    manage_local_plugin,
+                    render_plugin_action,
+                )
+                from plugins.lifecycle import PluginLifecycleError
                 from plugins.lifecycle import load_extension_state
                 from plugins.registry import PluginCatalog
                 from safety.trust import is_workspace_trusted
+
+                if arguments:
+                    action = arguments[0]
+                    if action not in {"install", "enable", "disable", "uninstall"}:
+                        print(f"Usage: {command.usage}", file=sys.stderr)
+                        continue
+                    positional = [
+                        item for item in arguments[1:] if not item.startswith("--")
+                    ]
+                    flags = {item for item in arguments[1:] if item.startswith("--")}
+                    allowed_flags = (
+                        {"--replace"}
+                        if action == "install"
+                        else {"--yes"}
+                        if action == "uninstall"
+                        else set()
+                    )
+                    if len(positional) != 1 or not flags <= allowed_flags:
+                        print(f"Usage: {command.usage}", file=sys.stderr)
+                        continue
+                    try:
+                        plugin_result = manage_local_plugin(
+                            cast(PluginAction, action),
+                            positional[0],
+                            replace="--replace" in flags,
+                            confirmed="--yes" in flags,
+                        )
+                        reload_summary = await reload_plugin_components()
+                    except (OSError, PluginLifecycleError, ValueError) as exc:
+                        print(f"Error: {exc}", file=sys.stderr)
+                        continue
+                    print(render_plugin_action(plugin_result, json_output=False))
+                    print(reload_summary)
+                    continue
 
                 roots = [(Path.home() / ".ash" / "plugins", "user")]
                 if is_workspace_trusted(loop.project_root):
@@ -856,6 +1029,15 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     )
                 for path, error in catalog.errors.items():
                     print(f"Invalid plugin {path}: {error}", file=sys.stderr)
+                continue
+            if command.name == "reload-plugins":
+                if arguments:
+                    print(f"Usage: {command.usage}", file=sys.stderr)
+                    continue
+                try:
+                    print(await reload_plugin_components(), flush=True)
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    print(f"Error reloading plugins: {exc}", file=sys.stderr)
                 continue
             if command.name == "hooks":
                 from cli.extensions import (

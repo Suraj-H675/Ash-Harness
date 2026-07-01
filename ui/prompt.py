@@ -27,6 +27,9 @@ class AshCompleter(Completer):
         self._commands = WordCompleter(commands, sentence=True)
         self._root = workspace_root.resolve()
 
+    def set_commands(self, commands: list[str]) -> None:
+        self._commands = WordCompleter(commands, sentence=True)
+
     def get_completions(self, document: Document, complete_event):
         word = document.get_word_before_cursor(WORD=True)
         if not word.startswith("@"):
@@ -111,6 +114,7 @@ class PromptInput:
         self.interactive = bool(getattr(self.input_stream, "isatty", lambda: False)())
         self._session: PromptSession[str] | None = None
         self._viewport: TranscriptViewport | None = None
+        self._completer: AshCompleter | None = None
         self.screen_reader_mode = screen_reader_mode
         if self.interactive:
             path = history_path or (Path.home() / ".ash" / "history")
@@ -125,6 +129,7 @@ class PromptInput:
             words.extend(f"/{name}" for name in (extra_commands or []))
             words = sorted(set(words))
             completer = AshCompleter(words, workspace_root or Path.cwd())
+            self._completer = completer
             if tui_mode == "viewport" and not screen_reader_mode:
                 self._viewport = TranscriptViewport(
                     transcript or Transcript(),
@@ -161,6 +166,17 @@ class PromptInput:
     @property
     def uses_viewport(self) -> bool:
         return self._viewport is not None
+
+    def set_extra_commands(self, names: list[str]) -> None:
+        if self._completer is None:
+            return
+        words = {
+            f"/{name}"
+            for command in COMMANDS
+            for name in (command.name, *command.aliases)
+        }
+        words.update(f"/{name}" for name in names)
+        self._completer.set_commands(sorted(words))
 
     async def read(self, prompt: str = "> ") -> str:
         if self._viewport is not None:

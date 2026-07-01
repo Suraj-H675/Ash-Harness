@@ -30,6 +30,7 @@ def test_help_lists_core_session_commands() -> None:
     assert "/review [worktree|staged|commit REF|branch BASE]" in rendered
     assert "/plan [on|off]" in rendered
     assert "/hooks" in rendered
+    assert "/reload-plugins" in rendered
     assert "/help [query]" in rendered
     assert "aliases: /clear" in rendered
 

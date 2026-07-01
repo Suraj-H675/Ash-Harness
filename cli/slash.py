@@ -41,7 +41,14 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("compact", "Compact older conversation history", "/compact"),
     SlashCommand("plan", "Toggle editable sprint planning", "/plan [on|off]"),
     SlashCommand("skills", "List available instruction skills", "/skills [query]"),
-    SlashCommand("plugins", "List discovered declarative plugins", "/plugins"),
+    SlashCommand(
+        "plugins",
+        "List or manage local plugins",
+        "/plugins [install PATH|enable NAME|disable NAME|uninstall NAME --yes]",
+    ),
+    SlashCommand(
+        "reload-plugins", "Reload active plugin components", "/reload-plugins"
+    ),
     SlashCommand("hooks", "List trusted command hook configs", "/hooks"),
     SlashCommand("commands", "List custom Markdown commands", "/commands"),
     SlashCommand(

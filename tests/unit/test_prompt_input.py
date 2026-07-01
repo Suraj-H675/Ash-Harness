@@ -2,6 +2,8 @@ import asyncio
 import io
 
 import pytest
+from prompt_toolkit.completion import CompleteEvent
+from prompt_toolkit.document import Document
 
 import ui.prompt as prompt_module
 from ui.prompt import PromptInput
@@ -56,3 +58,30 @@ def test_screen_reader_mode_uses_reduced_dynamic_prompt(
     assert captured["completer"] is None
     assert captured["complete_while_typing"] is False
     assert captured["bottom_toolbar"] is None
+
+
+def test_prompt_completion_updates_after_plugin_reload(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = {}
+
+    class FakePromptSession:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(prompt_module, "PromptSession", FakePromptSession)
+    prompt = PromptInput(
+        input_stream=TtyStringIO(),
+        history_path=tmp_path / "history",
+        extra_commands=["old:command"],
+    )
+
+    prompt.set_extra_commands(["example:review"])
+    completer = captured["completer"]
+    completions = list(
+        completer.get_completions(
+            Document("/example:r"), CompleteEvent(completion_requested=True)
+        )
+    )
+
+    assert [completion.text for completion in completions] == ["/example:review"]

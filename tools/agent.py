@@ -68,11 +68,16 @@ class SpawnAgentTool(BaseTool):
         self._max_turn_iterations = max_turn_iterations
         self._custom_agents = dict(custom_agents or {})
         if self._custom_agents:
-            roles = ", ".join((*AGENT_ROLES, *sorted(self._custom_agents)))
-            self.description = (
-                f"Run a bounded worker on a focused subtask. Roles: {roles}."
-            )
+            self._update_description()
         self._tasks: dict[str, asyncio.Task[AgentReport]] = {}
+
+    def set_custom_agents(self, agents: dict[str, "AgentDefinition"]) -> None:
+        self._custom_agents = dict(agents)
+        self._update_description()
+
+    def _update_description(self) -> None:
+        roles = ", ".join((*AGENT_ROLES, *sorted(self._custom_agents)))
+        self.description = f"Run a bounded worker on a focused subtask. Roles: {roles}."
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = SpawnAgentArgs(**kwargs)
