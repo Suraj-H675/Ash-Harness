@@ -30,7 +30,9 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "fork", "Fork the session at a message boundary", "/fork [message-count]"
     ),
     SlashCommand(
-        "rewind", "Rewind transcript to a message boundary", "/rewind <message-count>"
+        "rewind",
+        "Rewind transcript, optionally restoring direct file edits",
+        "/rewind <message-count> [--files]",
     ),
     SlashCommand("undo", "Undo Ash's latest direct file edits", "/undo"),
     SlashCommand(

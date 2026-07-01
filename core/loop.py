@@ -633,6 +633,7 @@ class AshLoop:
                     "metadata": redact_value(persisted_metadata),
                 }
             ),
+            turn_id=self.turn_context.turn_id,
         )
         # Keep the in-memory session mirror in sync so subsequent
         # _build_messages() calls in the same turn see the history.
@@ -695,6 +696,7 @@ class AshLoop:
                         "metadata": redact_value(assistant_message.metadata),
                     }
                 ),
+                turn_id=self.turn_context.turn_id,
             )
             session.messages.append(assistant_message)
 
@@ -741,7 +743,11 @@ class AshLoop:
                     timestamp=_utc_now(),
                     metadata={"call_id": call["call_id"]},
                 )
-                self.session_store.save_message(session.session_id, tool_message)
+                self.session_store.save_message(
+                    session.session_id,
+                    tool_message,
+                    turn_id=self.turn_context.turn_id,
+                )
                 session.messages.append(tool_message)
 
             if self._steering_messages and iteration >= iteration_budget:
@@ -816,6 +822,7 @@ class AshLoop:
         self._last_estimated_cost_usd = estimated_cost_usd
         usage_payload = self.last_turn_usage
         self.turn_context.set("usage", usage_payload)
+        self.session_store.save_turn_usage(self.turn_context.turn_id, usage_payload)
         if prompt > 0 or completion > 0:
             self.ui.emit_event({"type": "turn.usage", **usage_payload})
             self.session_store.save_session_token_stats(
@@ -886,6 +893,7 @@ class AshLoop:
             self.session_store.save_message(
                 session.session_id,
                 message.model_copy(update={"content": redact_text(content)}),
+                turn_id=self.turn_context.turn_id if self.turn_context else None,
             )
             session.messages.append(message)
             applied += 1
@@ -1250,7 +1258,11 @@ class AshLoop:
                     if decision.action == PolicyAction.DENY
                     else "Denied by user"
                 )
-                self.session_store.save_tool_call(session.session_id, record)
+                self.session_store.save_tool_call(
+                    session.session_id,
+                    record,
+                    turn_id=self.turn_context.turn_id if self.turn_context else None,
+                )
                 self._append_tool_audit(
                     session,
                     action_type=(
@@ -1291,7 +1303,11 @@ class AshLoop:
             tool = self.tools.get(tool_name)
             if tool is None:
                 record.error = f"Unknown tool: {tool_name}"
-                self.session_store.save_tool_call(session.session_id, record)
+                self.session_store.save_tool_call(
+                    session.session_id,
+                    record,
+                    turn_id=self.turn_context.turn_id if self.turn_context else None,
+                )
                 self._append_tool_audit(
                     session,
                     action_type="tool_call",
@@ -1342,7 +1358,11 @@ class AshLoop:
             except Exception as exc:  # noqa: BLE001 — we want any error captured
                 record.executed = True
                 record.error = str(exc)
-                self.session_store.save_tool_call(session.session_id, record)
+                self.session_store.save_tool_call(
+                    session.session_id,
+                    record,
+                    turn_id=self.turn_context.turn_id if self.turn_context else None,
+                )
                 self._append_tool_audit(
                     session,
                     action_type=_audit_action_for_tool(tool_name),
@@ -1374,7 +1394,11 @@ class AshLoop:
             record.executed = True
             record.result = tool_result.output
             record.error = tool_result.error
-            self.session_store.save_tool_call(session.session_id, record)
+            self.session_store.save_tool_call(
+                session.session_id,
+                record,
+                turn_id=self.turn_context.turn_id if self.turn_context else None,
+            )
             self._append_tool_audit(
                 session,
                 action_type=_audit_action_for_tool(tool_name),

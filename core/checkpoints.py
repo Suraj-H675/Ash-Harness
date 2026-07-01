@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
-from core.session import SessionStore
+from core.session import Session, SessionStore
 from safety.guard import SafetyGuard
 from tools.base import BaseTool, ToolMiddleware, ToolResult
 from tools.patch import extract_patch_paths
@@ -106,6 +106,88 @@ def undo_latest_checkpoint(
             path.unlink(missing_ok=True)
     store.mark_file_checkpoints_restored(session_id, rows[0]["turn_id"])
     return paths
+
+
+def rewind_session_with_files(
+    store: SessionStore,
+    guard: SafetyGuard,
+    session_id: str,
+    message_count: int,
+) -> tuple[Session, list[Path]]:
+    """Rewind complete turns and restore all of their direct file edits."""
+
+    turn_ids = store.rewind_turn_ids(
+        session_id,
+        message_count,
+        require_complete_mapping=True,
+    )
+    rows = store.file_checkpoints_for_turns(session_id, turn_ids)
+    paths = [guard.validate_path(row["path"]) for row in rows]
+    simulated: dict[Path, str] = {}
+    conflicts: list[str] = []
+    for row, path in zip(rows, paths, strict=True):
+        after_sha256 = row["after_sha256"]
+        if after_sha256 is None:
+            raise RuntimeError(
+                f"Combined rewind refused because a checkpoint is incomplete: {path}"
+            )
+        current = simulated.setdefault(path, _digest(path))
+        if current != after_sha256:
+            conflicts.append(str(path))
+        simulated[path] = (
+            hashlib.sha256(bytes(row["before_content"] or b"")).hexdigest()
+            if bool(row["existed"])
+            else "missing"
+        )
+    if conflicts:
+        raise RuntimeError(
+            "Combined rewind refused because files changed after Ash's edit: "
+            + ", ".join(dict.fromkeys(conflicts))
+        )
+
+    originals: dict[Path, tuple[bool, bytes, int | None]] = {}
+    for path in paths:
+        if path in originals:
+            continue
+        existed = path.is_file()
+        originals[path] = (
+            existed,
+            path.read_bytes() if existed else b"",
+            path.stat().st_mode if existed else None,
+        )
+
+    try:
+        for row, path in zip(rows, paths, strict=True):
+            if bool(row["existed"]):
+                _atomic_restore(path, bytes(row["before_content"] or b""))
+                if row["before_mode"] is not None:
+                    os.chmod(path, int(row["before_mode"]))
+            else:
+                path.unlink(missing_ok=True)
+        session = store.rewind_session(
+            session_id,
+            message_count,
+            restored_checkpoint_turn_ids=turn_ids,
+        )
+    except Exception:
+        rollback_errors: list[str] = []
+        for path, (existed, content, mode) in originals.items():
+            try:
+                if existed:
+                    _atomic_restore(path, content)
+                    if mode is not None:
+                        os.chmod(path, mode)
+                else:
+                    path.unlink(missing_ok=True)
+            except OSError as exc:
+                rollback_errors.append(f"{path}: {exc}")
+        if rollback_errors:
+            raise RuntimeError(
+                "Combined rewind failed and file rollback was incomplete: "
+                + "; ".join(rollback_errors)
+            )
+        raise
+    return session, list(dict.fromkeys(paths))
 
 
 def diff_latest_checkpoint(

@@ -22,7 +22,7 @@ AuditAction = Literal[
     "tool_call", "command_run", "file_write", "safety_block", "user_approval"
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 class SessionStorageError(RuntimeError):
@@ -271,6 +271,8 @@ class SessionStore:
                 self._migrate_v4(conn)
             if from_version < 5:
                 self._migrate_v5(conn)
+            if from_version < 6:
+                self._migrate_v6(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -370,6 +372,30 @@ class SessionStore:
             (5, _serialize_datetime(_utc_now())),
         )
 
+    def _migrate_v6(self, conn: sqlite3.Connection) -> None:
+        """Link transcript records to turns and retain rewindable usage."""
+
+        if not _column_exists(conn, "messages", "turn_id"):
+            conn.execute("ALTER TABLE messages ADD COLUMN turn_id TEXT")
+        if not _column_exists(conn, "tool_calls", "turn_id"):
+            conn.execute("ALTER TABLE tool_calls ADD COLUMN turn_id TEXT")
+        if not _column_exists(conn, "turn_journal", "usage_json"):
+            conn.execute(
+                "ALTER TABLE turn_journal ADD COLUMN usage_json TEXT DEFAULT '{}'"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session_turn "
+            "ON messages(session_id, turn_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_calls_session_turn "
+            "ON tool_calls(session_id, turn_id)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (6, _serialize_datetime(_utc_now())),
+        )
+
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
     ) -> Path:
@@ -438,6 +464,7 @@ class SessionStore:
                     token_count INTEGER DEFAULT 0,
                     prompt_tokens INTEGER DEFAULT 0,
                     completion_tokens INTEGER DEFAULT 0,
+                    turn_id TEXT,
                     FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
                 );
 
@@ -451,6 +478,7 @@ class SessionStore:
                     result TEXT,
                     error TEXT,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    turn_id TEXT,
                     FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
                 );
 
@@ -490,6 +518,7 @@ class SessionStore:
                     user_input TEXT NOT NULL,
                     started_at TIMESTAMP NOT NULL,
                     completed_at TIMESTAMP,
+                    usage_json TEXT DEFAULT '{}',
                     FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
                 );
 
@@ -658,14 +687,18 @@ class SessionStore:
         token_count: int = 0,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
+        turn_id: str | None = None,
     ) -> None:
         """Append a single message to a session."""
 
         with closing(get_db_connection(self.db_path)) as conn, conn:
             conn.execute(
                 """
-                INSERT INTO messages (session_id, role, content, timestamp, metadata_json, token_count, prompt_tokens, completion_tokens)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO messages (
+                    session_id, role, content, timestamp, metadata_json,
+                    token_count, prompt_tokens, completion_tokens, turn_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -676,6 +709,7 @@ class SessionStore:
                     token_count,
                     prompt_tokens,
                     completion_tokens,
+                    turn_id,
                 ),
             )
             conn.execute(
@@ -863,6 +897,17 @@ class SessionStore:
                 (_serialize_datetime(_utc_now()), turn_id),
             )
 
+    def save_turn_usage(self, turn_id: str, usage: dict[str, Any]) -> None:
+        """Persist normalized usage so rewinding can adjust session totals."""
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE turn_journal SET usage_json = ? WHERE turn_id = ?",
+                (json.dumps(usage, sort_keys=True), turn_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Turn not found: {turn_id}")
+
     def interrupt_turn(self, turn_id: str) -> None:
         """Mark one in-flight turn interrupted without affecting other sessions."""
 
@@ -882,16 +927,87 @@ class SessionStore:
             )
             return cursor.rowcount
 
-    def rewind_session(self, session_id: str, message_count: int) -> Session:
+    def rewind_turn_ids(
+        self,
+        session_id: str,
+        message_count: int,
+        *,
+        require_complete_mapping: bool = False,
+    ) -> list[str]:
+        """Return complete turns removed at a transcript message boundary."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT message_id, turn_id FROM messages WHERE session_id = ? "
+                "ORDER BY message_id",
+                (session_id,),
+            ).fetchall()
+        if message_count < 0 or message_count > len(rows):
+            raise ValueError(f"message_count must be between 0 and {len(rows)}")
+        if 0 < message_count < len(rows):
+            retained_turn = rows[message_count - 1]["turn_id"]
+            removed_turn = rows[message_count]["turn_id"]
+            if retained_turn is not None and retained_turn == removed_turn:
+                raise ValueError(
+                    "message_count splits an Ash turn; choose a user-turn boundary"
+                )
+        removed = rows[message_count:]
+        if require_complete_mapping and any(row["turn_id"] is None for row in removed):
+            raise ValueError(
+                "combined rewind is unavailable for legacy messages without turn IDs; "
+                "use transcript-only /rewind or start a newer boundary"
+            )
+        return list(
+            dict.fromkeys(
+                str(row["turn_id"]) for row in removed if row["turn_id"] is not None
+            )
+        )
+
+    def rewind_session(
+        self,
+        session_id: str,
+        message_count: int,
+        *,
+        restored_checkpoint_turn_ids: list[str] | None = None,
+    ) -> Session:
         """Delete transcript records after a confirmed message boundary."""
         session = self.load_session(session_id)
-        if message_count < 0 or message_count > len(session.messages):
-            raise ValueError(
-                f"message_count must be between 0 and {len(session.messages)}"
-            )
+        turn_ids = self.rewind_turn_ids(session_id, message_count)
+        if restored_checkpoint_turn_ids and not set(
+            restored_checkpoint_turn_ids
+        ).issubset(turn_ids):
+            raise ValueError("restored checkpoint turns must be part of the rewind")
         retained = session.messages[:message_count]
         cutoff = retained[-1].timestamp if retained else None
         with closing(get_db_connection(self.db_path)) as conn, conn:
+            usage_totals = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "cost_usd": 0.0,
+                "estimated_prompt_tokens": 0,
+                "estimated_completion_tokens": 0,
+                "estimated_cost_usd": 0.0,
+            }
+            if turn_ids:
+                placeholders = ",".join("?" for _ in turn_ids)
+                usage_rows = conn.execute(
+                    f"SELECT usage_json FROM turn_journal WHERE session_id = ? "
+                    f"AND turn_id IN ({placeholders})",
+                    (session_id, *turn_ids),
+                ).fetchall()
+                for row in usage_rows:
+                    try:
+                        usage = json.loads(row["usage_json"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        usage = {}
+                    for key in usage_totals:
+                        value = usage.get(key, 0)
+                        if isinstance(value, (int, float)) and not isinstance(
+                            value, bool
+                        ):
+                            usage_totals[key] += value
             ids = conn.execute(
                 "SELECT message_id FROM messages WHERE session_id = ? "
                 "ORDER BY message_id LIMIT -1 OFFSET ?",
@@ -901,6 +1017,13 @@ class SessionStore:
                 "DELETE FROM messages WHERE message_id = ?",
                 [(row["message_id"],) for row in ids],
             )
+            if turn_ids:
+                placeholders = ",".join("?" for _ in turn_ids)
+                conn.execute(
+                    f"DELETE FROM tool_calls WHERE session_id = ? "
+                    f"AND turn_id IN ({placeholders})",
+                    (session_id, *turn_ids),
+                )
             if cutoff is None:
                 conn.execute(
                     "DELETE FROM tool_calls WHERE session_id = ?", (session_id,)
@@ -911,11 +1034,66 @@ class SessionStore:
                     (session_id, _serialize_datetime(cutoff)),
                 )
             conn.execute(
+                "UPDATE sessions SET "
+                "total_tokens = MAX(0, COALESCE(total_tokens, 0) - ?), "
+                "total_prompt_tokens = MAX(0, COALESCE(total_prompt_tokens, 0) - ?), "
+                "total_completion_tokens = MAX(0, COALESCE(total_completion_tokens, 0) - ?), "
+                "total_cache_read_tokens = MAX(0, COALESCE(total_cache_read_tokens, 0) - ?), "
+                "total_cache_write_tokens = MAX(0, COALESCE(total_cache_write_tokens, 0) - ?), "
+                "total_cost_usd = MAX(0, COALESCE(total_cost_usd, 0) - ?), "
+                "estimated_prompt_tokens = MAX(0, COALESCE(estimated_prompt_tokens, 0) - ?), "
+                "estimated_completion_tokens = MAX(0, COALESCE(estimated_completion_tokens, 0) - ?), "
+                "estimated_cost_usd = MAX(0, COALESCE(estimated_cost_usd, 0) - ?) "
+                "WHERE session_id = ?",
+                (
+                    usage_totals["prompt_tokens"] + usage_totals["completion_tokens"],
+                    usage_totals["prompt_tokens"],
+                    usage_totals["completion_tokens"],
+                    usage_totals["cache_read_tokens"],
+                    usage_totals["cache_write_tokens"],
+                    usage_totals["cost_usd"],
+                    usage_totals["estimated_prompt_tokens"],
+                    usage_totals["estimated_completion_tokens"],
+                    usage_totals["estimated_cost_usd"],
+                    session_id,
+                ),
+            )
+            if restored_checkpoint_turn_ids:
+                placeholders = ",".join("?" for _ in restored_checkpoint_turn_ids)
+                conn.execute(
+                    "UPDATE file_checkpoints SET restored = 1 "
+                    f"WHERE session_id = ? AND turn_id IN ({placeholders})",
+                    (session_id, *restored_checkpoint_turn_ids),
+                )
+            if turn_ids:
+                placeholders = ",".join("?" for _ in turn_ids)
+                conn.execute(
+                    f"DELETE FROM turn_journal WHERE session_id = ? "
+                    f"AND turn_id IN ({placeholders})",
+                    (session_id, *turn_ids),
+                )
+            conn.execute(
                 "UPDATE sessions SET context_summary = '', updated_at = ? "
                 "WHERE session_id = ?",
                 (_serialize_datetime(_utc_now()), session_id),
             )
         return self.load_session(session_id)
+
+    def file_checkpoints_for_turns(
+        self, session_id: str, turn_ids: list[str]
+    ) -> list[sqlite3.Row]:
+        """Return unrestored checkpoints newest-first for selected turns."""
+
+        if not turn_ids:
+            return []
+        placeholders = ",".join("?" for _ in turn_ids)
+        with closing(get_db_connection(self.db_path)) as conn:
+            return conn.execute(
+                "SELECT * FROM file_checkpoints WHERE session_id = ? "
+                f"AND turn_id IN ({placeholders}) AND restored = 0 "
+                "ORDER BY checkpoint_id DESC",
+                (session_id, *turn_ids),
+            ).fetchall()
 
     def save_file_checkpoint(
         self,
@@ -1159,7 +1337,13 @@ class SessionStore:
                 ),
             )
 
-    def save_tool_call(self, session_id: str, record: ToolCallRecord) -> None:
+    def save_tool_call(
+        self,
+        session_id: str,
+        record: ToolCallRecord,
+        *,
+        turn_id: str | None = None,
+    ) -> None:
         """Save or update a tool execution record."""
 
         with closing(get_db_connection(self.db_path)) as conn, conn:
@@ -1174,9 +1358,10 @@ class SessionStore:
                     executed,
                     result,
                     error,
-                    timestamp
+                    timestamp,
+                    turn_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(call_id) DO UPDATE SET
                     session_id = excluded.session_id,
                     tool_name = excluded.tool_name,
@@ -1185,7 +1370,8 @@ class SessionStore:
                     executed = excluded.executed,
                     result = excluded.result,
                     error = excluded.error,
-                    timestamp = excluded.timestamp
+                    timestamp = excluded.timestamp,
+                    turn_id = COALESCE(excluded.turn_id, tool_calls.turn_id)
                 """,
                 (
                     record.call_id,
@@ -1197,6 +1383,7 @@ class SessionStore:
                     record.result,
                     record.error,
                     _serialize_datetime(record.timestamp),
+                    turn_id,
                 ),
             )
 

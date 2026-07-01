@@ -91,6 +91,13 @@ resolves an exact persisted title, while `/rename TITLE` sets that title.
 `/review` supports worktree, staged, commit, and branch-versus-base scopes.
 `/diff --turn` shows the latest Ash checkpoint diff and refuses if files changed
 after Ash's edit; `/diff --staged` and `/diff path` keep showing Git diffs.
+`/rewind COUNT` truncates complete persisted turns at a message boundary.
+Add `--files` to restore all checkpointed direct file edits from the removed
+turns as well. Combined rewind preflights every file hash, handles repeated
+edits newest-first, adjusts persisted token/cost totals, and rolls files back
+to their current state if the database update fails. It refuses split-turn
+boundaries, post-edit conflicts, incomplete checkpoints, and legacy transcript
+records that predate durable turn IDs.
 `/plan on` enables editable sprint plans for multi-step requests; type `e` at
 the plan prompt to revise the generated contract in `$VISUAL` or `$EDITOR`,
 then `y` to approve and execute it.

@@ -52,7 +52,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
     with get_db_connection(db_path) as conn:
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 5
+            == 6
         )
         audit_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(audit_logs)")
@@ -67,6 +67,15 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
         assert "estimated_completion_tokens" in session_columns
         assert "estimated_cost_usd" in session_columns
         assert "project_key" in session_columns
+        assert "turn_id" in {
+            row["name"] for row in conn.execute("PRAGMA table_info(messages)")
+        }
+        assert "turn_id" in {
+            row["name"] for row in conn.execute("PRAGMA table_info(tool_calls)")
+        }
+        assert "usage_json" in {
+            row["name"] for row in conn.execute("PRAGMA table_info(turn_journal)")
+        }
 
 
 def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
@@ -94,7 +103,7 @@ def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     store = SessionStore(db_path)
 
     assert store.load_session("legacy").session_id == "legacy"
-    backups = list(tmp_path.glob("legacy.db.before-v5-migration.*.backup"))
+    backups = list(tmp_path.glob("legacy.db.before-v6-migration.*.backup"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as conn:
         assert conn.execute("SELECT session_id FROM sessions").fetchone()[0] == "legacy"

@@ -91,7 +91,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Session picker/list/search | Verified locally | Bare `-r` and `/resume` open a searchable, keyboard-navigable, project-scoped picker with metadata-only filtering and on-demand bounded transcript preview; top-level list/search also supports JSON output ([Claude Code session behavior](https://code.claude.com/docs/en/sessions)) |
 | Session naming | Verified locally | Rename and stable persisted display names |
 | Fork session | Verified locally | New durable session from a selected message boundary |
-| Rewind conversation | Partial | Transcript rewind is durable; combined transcript-plus-file rewind remains |
+| Rewind conversation | Verified locally | Complete-turn transcript rewind plus optional conflict-preflighted multi-turn file restoration; usage totals are adjusted and filesystem changes roll forward if the database phase fails |
 | File checkpoints/undo | Verified locally | Direct edit tools capture per-turn bytes/hashes and refuse conflict overwrites |
 | Session export/import | Verified locally | Versioned redacted JSONL/Markdown export and validated JSONL import |
 | Crash recovery | Partial | Durable turn journal reconciles interrupted turns; interrupted-tool compensation remains |
@@ -130,7 +130,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/rename`, `/fork` | Verified locally | Session organization and transcript branching |
 | `/compact`, `/context` | Verified locally | Context compaction, budget inspection, and last-turn cache hit metrics |
 | `/cancel` | Verified locally | Cancel the active provider/tool turn while retaining already completed work |
-| `/clear`, `/rewind`, `/undo` | Verified locally | New-session clear, transcript rewind, and conflict-aware file undo |
+| `/clear`, `/rewind`, `/undo` | Verified locally | New-session clear, complete-turn transcript rewind with optional `--files`, and conflict-aware latest file undo |
 | `/diff` | Verified locally | Current, staged, path-scoped Git diff plus latest per-turn checkpoint diff with conflict refusal |
 | `/review` | Verified locally | Bounded reviews for worktree/untracked, staged, commit, or current branch versus base |
 | `/plan` mode | Verified locally | Explicit toggle, editable sprint contract, approval gate, and execution transition |

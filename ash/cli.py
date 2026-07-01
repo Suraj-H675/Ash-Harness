@@ -888,20 +888,39 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 print(f"Forked session {session.session_id}", flush=True)
                 continue
             if command.name == "rewind":
-                if loop.current_session is None or len(arguments) != 1:
+                with_files = arguments[1:] == ["--files"]
+                if (
+                    loop.current_session is None
+                    or len(arguments) not in {1, 2}
+                    or (len(arguments) == 2 and not with_files)
+                ):
                     print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
                     continue
                 try:
                     count = int(arguments[0])
-                    session = loop.session_store.rewind_session(
-                        loop.current_session.session_id, count
-                    )
-                except ValueError as exc:
+                    if with_files:
+                        from core.checkpoints import rewind_session_with_files
+
+                        session, restored = rewind_session_with_files(
+                            loop.session_store,
+                            loop.safety_guard,
+                            loop.current_session.session_id,
+                            count,
+                        )
+                    else:
+                        restored = []
+                        session = loop.session_store.rewind_session(
+                            loop.current_session.session_id, count
+                        )
+                except (RuntimeError, ValueError) as exc:
                     print(f"Error: {exc}", file=sys.stderr, flush=True)
                     continue
                 loop.current_session = session
                 loop.ui.load_session_transcript(session)
-                print(f"Rewound transcript to {len(session.messages)} messages.")
+                suffix = f" and restored {len(restored)} file(s)" if with_files else ""
+                print(
+                    f"Rewound transcript to {len(session.messages)} messages{suffix}."
+                )
                 continue
             if command.name == "undo":
                 from core.checkpoints import undo_latest_checkpoint

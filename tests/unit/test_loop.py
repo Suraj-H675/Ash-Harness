@@ -6,7 +6,7 @@ from core.loop import AshLoop
 from tools.base import BaseTool, ToolResult, ToolMiddleware, ToolMiddlewareSkip
 from config import AshConfig
 from context.turn import TurnContext
-from core.session import Message, SessionStore
+from core.session import Message, SessionStore, get_db_connection
 from providers.base import ProviderABC, StreamChunk
 from providers.capabilities import ProviderCapabilities
 from providers.retry import ProviderCircuitBreaker, ProviderCircuitOpen
@@ -315,6 +315,13 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
         "turn.usage",
     ]
     assert ui.events[-2]["output"] == "hello"
+    assert loop.turn_context is not None
+    with get_db_connection(store.db_path) as connection:
+        tool_turn = connection.execute(
+            "SELECT turn_id FROM tool_calls WHERE session_id = ?",
+            (loop.current_session.session_id,),
+        ).fetchone()
+    assert tool_turn["turn_id"] == loop.turn_context.turn_id
 
 
 @pytest.mark.asyncio
@@ -453,6 +460,14 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
     assert usage.cache_read_tokens == 60
     assert usage.cache_write_tokens == 20
     assert usage.cost_usd == pytest.approx(0.000152)
+    assert loop.turn_context is not None
+    assert store.rewind_turn_ids(session.session_id, 0) == [loop.turn_context.turn_id]
+    with get_db_connection(store.db_path) as connection:
+        persisted_turn = connection.execute(
+            "SELECT usage_json FROM turn_journal WHERE turn_id = ?",
+            (loop.turn_context.turn_id,),
+        ).fetchone()
+    assert '"prompt_tokens": 100' in persisted_turn["usage_json"]
 
 
 @pytest.mark.asyncio
