@@ -125,6 +125,9 @@ class PluginCatalog:
 
 
 def _validate_manifest(manifest: PluginManifest, root: Path) -> None:
+    for path in (root, *root.rglob("*")):
+        if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+            raise ValueError(f"plugin tree contains a link: {path}")
     validate_plugin_identity(manifest)
     for field, values in (
         ("commands", manifest.commands),

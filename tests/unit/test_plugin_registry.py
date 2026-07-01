@@ -203,3 +203,21 @@ def test_plugin_agent_paths_use_declared_or_default_locations(tmp_path) -> None:
     found = PluginCatalog(((root, "user"),)).discover()
 
     assert found[0].agent_paths() == (agent,)
+
+
+def test_plugin_catalog_rejects_linked_component_tree(tmp_path) -> None:
+    root = tmp_path / "plugins"
+    plugin = root / "example"
+    plugin.mkdir(parents=True)
+    outside = tmp_path / "outside.md"
+    outside.write_text("external instructions")
+    try:
+        (plugin / "linked.md").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    (plugin / "plugin.json").write_text(json.dumps({"name": "example"}))
+
+    catalog = PluginCatalog(((root, "project"),))
+
+    assert catalog.discover() == []
+    assert "plugin tree contains a link" in next(iter(catalog.errors.values()))
