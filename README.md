@@ -52,6 +52,9 @@ ash permissions deny write_file --exact 'file_path=".env"'
 ash permissions allow run_command --command-prefix pytest
 ash sandbox status --json        # inspect effective command isolation
 ash sandbox build                # explicitly build the optional baseline image
+ash agents branches              # inspect isolated worker branches
+ash agents apply ash-agent/ID    # cherry-pick a worker after review
+ash agents discard ash-agent/ID --yes
 ```
 
 The authenticated server exposes synchronous turns at `/v1/turn` and live
@@ -78,6 +81,15 @@ checklists outside the REPL.
 `~/.ash`. Type `@path` or `@"path with spaces"` to attach bounded workspace
 text or a directory listing to a prompt; secret, binary, oversized, and
 out-of-workspace paths are rejected.
+
+Provider-backed subagents run bounded Ash loops with role-specific tools.
+Researchers and reviewers are read-only; coders receive scoped edit tools;
+testers receive shell execution only when a full OS sandbox is active. Coder
+and tester roles default to locked Git worktrees and retain committed changes
+on `ash-agent/*` branches without modifying the lead worktree. The lead must be
+clean when a worktree is created or applied. Use `/agents`, `/agents stop ID`,
+and `/agents resume ID` for live status and lifecycle control; queued steering
+messages are consumed at model-iteration boundaries and marked delivered.
 
 Project-controlled config and extensions are disabled until the workspace is trusted.
 API keys are stored in `~/.ash/.env` with restricted permissions. Custom

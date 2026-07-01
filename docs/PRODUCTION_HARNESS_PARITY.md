@@ -137,7 +137,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/sandbox` | Verified locally | Active backend, tier, capabilities, and network policy |
 | `/mcp` | Partial | Top-level add/remove/list/status config supports JSON and env/header metadata; REPL status/tools/resources/prompts use live clients; auth and richer lifecycle remain |
 | `/skills`, `/plugins`, `/hooks` | Partial | Skills/plugins/hooks are inspectable with trust-gated top-level extension inventory and `/hooks`; enable/disable/reload lifecycle remains |
-| `/agents` | Partial | Slash status/stop for live agents plus top-level persisted status/report/message inspection and queued steering; resume remains |
+| `/agents` | Verified locally | Slash status/stop/resume, persisted status/report/message inspection, live queued steering/stop consumption with delivery acknowledgement, and isolated branch list/apply/discard lifecycle |
 | `/doctor` | Verified locally | Runs the local health report in-session |
 | Shell escape (`!`) | Verified locally | Commands use the normal policy, sandbox, persistence, and audit path |
 | File mention/completion (`@`) | Partial | Workspace file/directory completion and bounded text expansion; fuzzy symbols/images/MCP remain |
@@ -201,14 +201,14 @@ Research is clean-room: proprietary or leaked source is not used.
 
 | Capability | Ash status | Required production behavior |
 |---|---|---|
-| Spawn subagent tool | Partial | Real bounded provider-backed worker with persisted report; worker tools remain restricted |
-| Parallel agents | Partial test harness only | Bounded scheduling, cancellation, token/cost limits |
+| Spawn subagent tool | Verified locally | Real bounded provider-backed Ash loop, persisted reports, role-scoped tool manifests, background execution, cancellation, and no recursive spawning |
+| Parallel agents | Partial | Background workers and bounded orchestrator scheduling are verified; aggregate token/cost ceilings remain |
 | Agent status/output | Partial | Live slash status plus top-level persisted status/report/message inspection; full TUI view remains |
-| Agent messaging | Partial | Typed SQLite IPC is persisted, inspectable, and queueable from the top-level CLI; runtime consumption, backpressure, and delivery acknowledgements remain |
-| Role tool policies | Partial | Enforced by central policy engine |
-| Worktree isolation | Missing in production | Create/merge/cleanup Git worktrees safely |
+| Agent messaging | Verified locally | Typed SQLite IPC is persisted and inspectable; running workers consume steer/stop messages, acknowledge delivery, and enforce pending-message backpressure |
+| Role tool policies | Verified locally | Read/search baseline, coder-only scoped edits, sandbox-required tester commands, and no recursive spawn tool |
+| Worktree isolation | Verified locally | Clean-lead precondition, locked `ash-agent/*` branches, bounded commit, deterministic cleanup, safe list/cherry-pick/discard commands, and conflict abort |
 | Result consolidation | Partial test harness only | Evidence-linked summaries and conflict handling |
-| Agent steering/stop | Partial | Slash stop and top-level queued steering exist; live worker consumption, resume, and TUI steering remain |
+| Agent steering/stop | Verified locally | In-process stop, persisted stop, live steering at safe iteration boundaries, delivery state, and report-based resume; isolated changes must be applied before continuation |
 
 ## 11. Automation And Integration
 
