@@ -26,10 +26,14 @@ from ui.headless import HeadlessUI
 
 if TYPE_CHECKING:
     from config import AshConfig
+    from plugins.agents import AgentDefinition
 
 
 class SpawnAgentArgs(BaseModel):
-    role: str = Field("general", description=f"One of: {', '.join(AGENT_ROLES)}")
+    role: str = Field(
+        "general",
+        description="A built-in role or discovered custom agent name.",
+    )
     task: str = Field(..., min_length=1, max_length=20_000)
     agent_id: str | None = Field(
         None,
@@ -54,6 +58,7 @@ class SpawnAgentTool(BaseTool):
         max_return_chars: int = 20_000,
         config: "AshConfig | None" = None,
         max_turn_iterations: int = 12,
+        custom_agents: dict[str, "AgentDefinition"] | None = None,
     ) -> None:
         super().__init__(safety_guard)
         self._shared_state = shared_state
@@ -61,16 +66,27 @@ class SpawnAgentTool(BaseTool):
         self._max_return_chars = max_return_chars
         self._config = config
         self._max_turn_iterations = max_turn_iterations
+        self._custom_agents = dict(custom_agents or {})
+        if self._custom_agents:
+            roles = ", ".join((*AGENT_ROLES, *sorted(self._custom_agents)))
+            self.description = (
+                f"Run a bounded worker on a focused subtask. Roles: {roles}."
+            )
         self._tasks: dict[str, asyncio.Task[AgentReport]] = {}
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = SpawnAgentArgs(**kwargs)
-        if args.role not in AGENT_ROLES:
+        agent_definition = self._custom_agents.get(args.role)
+        if args.role not in AGENT_ROLES and agent_definition is None:
+            expected = (*AGENT_ROLES, *sorted(self._custom_agents))
             return ToolResult(
                 success=False,
                 output="",
-                error=f"Unknown role {args.role!r}; expected one of {AGENT_ROLES}",
+                error=f"Unknown role {args.role!r}; expected one of {expected}",
             )
+        execution_role = (
+            agent_definition.base_role if agent_definition is not None else args.role
+        )
 
         agent_id = args.agent_id or f"spawned-{uuid.uuid4().hex[:8]}"
         existing = self._shared_state.get_status(agent_id)
@@ -83,7 +99,9 @@ class SpawnAgentTool(BaseTool):
 
         isolation = args.isolation
         if isolation == "auto":
-            isolation = "worktree" if args.role in {"coder", "tester"} else "shared"
+            isolation = (
+                "worktree" if execution_role in {"coder", "tester"} else "shared"
+            )
         worker_workspace = Path(self.safety_guard.project_root)
         worktree_manager: WorktreeManager | None = None
         lease: WorktreeLease | None = None
@@ -115,6 +133,8 @@ class SpawnAgentTool(BaseTool):
             try:
                 summary = await self._run_worker_loop(
                     role=context["role"],
+                    execution_role=execution_role,
+                    agent_definition=agent_definition,
                     task=context["task"],
                     workspace=worker_workspace,
                     agent_id=context["agent_id"],
@@ -171,9 +191,11 @@ class SpawnAgentTool(BaseTool):
             metadata={
                 "isolation": isolation,
                 "workspace": str(worker_workspace),
+                "base_role": execution_role,
                 **({"branch": lease.branch} if lease is not None else {}),
             },
             workspace_root=worker_workspace,
+            allow_custom_role=agent_definition is not None,
         )
 
         async def execute_agent() -> AgentReport:
@@ -224,6 +246,8 @@ class SpawnAgentTool(BaseTool):
         self,
         *,
         role: str,
+        execution_role: str,
+        agent_definition: "AgentDefinition | None",
         task: str,
         workspace: Path,
         agent_id: str,
@@ -242,7 +266,19 @@ class SpawnAgentTool(BaseTool):
                 else "ash-sandbox:latest"
             ),
         )
-        tools = _worker_tools(role, guard, sandbox)
+        tools = _worker_tools(execution_role, guard, sandbox)
+        if agent_definition is not None and agent_definition.allowed_tools:
+            unknown_tools = sorted(set(agent_definition.allowed_tools) - tools.keys())
+            if unknown_tools:
+                raise ValueError(
+                    f"custom agent {role!r} requests unavailable tools: "
+                    + ", ".join(unknown_tools)
+                )
+            tools = {
+                name: tool
+                for name, tool in tools.items()
+                if name in agent_definition.allowed_tools
+            }
         worker_store = SessionStore(
             Path(self._shared_state.db_path).with_name("agent-sessions.db")
         )
@@ -264,6 +300,11 @@ class SpawnAgentTool(BaseTool):
             "complete the focused task. Do not spawn other agents. Return concise "
             "findings with file paths, commands, and test evidence."
         )
+        if agent_definition is not None:
+            instructions = (
+                f"{instructions}\n\nCustom agent instructions:\n"
+                f"{agent_definition.instructions}"
+            )
         loop = AshLoop(
             session_store=worker_store,
             provider=provider,

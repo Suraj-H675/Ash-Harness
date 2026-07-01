@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from mcp.server import load_mcp_servers
+from plugins.agents import AgentCatalog, AgentSource
 from plugins.lifecycle import (
     PluginLifecycleError,
     install_local_plugin,
@@ -20,7 +21,7 @@ from plugins.registry import PluginCatalog
 from plugins.skills import SkillCatalog, SkillSource
 from safety.trust import canonical_workspace, is_workspace_trusted
 
-ExtensionKind = Literal["all", "skills", "plugins", "hooks"]
+ExtensionKind = Literal["all", "skills", "agents", "plugins", "hooks"]
 PluginAction = Literal["install", "enable", "disable", "uninstall"]
 
 
@@ -28,6 +29,14 @@ PluginAction = Literal["install", "enable", "disable", "uninstall"]
 class SkillSummary:
     name: str
     description: str
+    path: str
+
+
+@dataclass(frozen=True)
+class AgentSummary:
+    name: str
+    description: str
+    base_role: str
     path: str
 
 
@@ -42,6 +51,7 @@ class PluginSummary:
     commands: tuple[str, ...]
     hooks: tuple[str, ...]
     mcp_servers: tuple[str, ...]
+    agents: tuple[str, ...]
     enabled: bool
 
 
@@ -59,6 +69,7 @@ class ExtensionInventory:
     workspace: str
     project_trusted: bool
     skills: tuple[SkillSummary, ...]
+    agents: tuple[AgentSummary, ...]
     plugins: tuple[PluginSummary, ...]
     hooks: tuple[HookConfigSummary, ...]
     errors: tuple[str, ...]
@@ -68,6 +79,7 @@ class ExtensionInventory:
             "workspace": self.workspace,
             "project_trusted": self.project_trusted,
             "skills": [asdict(item) for item in self.skills],
+            "agents": [asdict(item) for item in self.agents],
             "plugins": [asdict(item) for item in self.plugins],
             "hooks": [asdict(item) for item in self.hooks],
             "errors": list(self.errors),
@@ -112,6 +124,19 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
     )
     skill_catalog = SkillCatalog(tuple(skill_roots))
     discovered_skills = skill_catalog.discover()
+    agent_sources: list[Path | AgentSource] = [Path.home() / ".ash" / "agents"]
+    if trusted:
+        agent_sources.append(workspace / ".ash" / "agents")
+    agent_sources.extend(
+        AgentSource(
+            paths=plugin.agent_paths(),
+            namespace=plugin.manifest.name,
+        )
+        for plugin in discovered_plugins
+        if plugin.enabled
+    )
+    agent_catalog = AgentCatalog(tuple(agent_sources))
+    discovered_agents = agent_catalog.discover()
 
     errors = state_errors + [
         f"Invalid plugin {path}: {error}"
@@ -120,6 +145,10 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
     errors.extend(
         f"Invalid skill {path}: {error}"
         for path, error in sorted(skill_catalog.errors.items())
+    )
+    errors.extend(
+        f"Invalid agent {path}: {error}"
+        for path, error in sorted(agent_catalog.errors.items())
     )
     hooks, hook_errors = _discover_hooks(hook_paths)
     errors.extend(hook_errors)
@@ -148,6 +177,15 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
             )
             for skill in sorted(discovered_skills, key=lambda item: item.name)
         ),
+        agents=tuple(
+            AgentSummary(
+                name=agent.name,
+                description=agent.description,
+                base_role=agent.base_role,
+                path=str(agent.path),
+            )
+            for agent in sorted(discovered_agents, key=lambda item: item.name)
+        ),
         plugins=tuple(
             PluginSummary(
                 name=plugin.manifest.name,
@@ -166,6 +204,9 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
                     item
                     for item in plugin.manifest.mcp_servers
                     if isinstance(item, str)
+                ),
+                agents=tuple(
+                    item for item in plugin.manifest.agents if isinstance(item, str)
                 ),
                 enabled=plugin.enabled,
             )
@@ -206,6 +247,14 @@ def render_extension_inventory(
             for skill in inventory.skills
         )
         if not inventory.skills:
+            lines.append("  (none)")
+    if kind in {"all", "agents"}:
+        lines.append("Agents:")
+        lines.extend(
+            f"  {agent.name} [{agent.base_role}]: {agent.description} ({agent.path})"
+            for agent in inventory.agents
+        )
+        if not inventory.agents:
             lines.append("  (none)")
     if kind in {"all", "plugins"}:
         lines.append("Plugins:")

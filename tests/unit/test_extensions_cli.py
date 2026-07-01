@@ -264,3 +264,29 @@ def test_extensions_inventory_validates_enabled_plugin_mcp(
     inventory = discover_extensions(workspace)
 
     assert "MCP config must be an object" in inventory.errors[0]
+
+
+def test_extensions_inventory_lists_namespaced_plugin_agents(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    plugin = home / ".ash" / "plugins" / "example"
+    agent = plugin / "agents" / "reviewer.md"
+    agent.parent.mkdir(parents=True)
+    agent.write_text(
+        "---\ndescription: Review changes\nbase-role: reviewer\n---\n"
+        "Review correctness.\n",
+        encoding="utf-8",
+    )
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "example"}), encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    inventory = discover_extensions(workspace)
+
+    assert inventory.agents[0].name == "example:reviewer"
+    assert inventory.agents[0].base_role == "reviewer"

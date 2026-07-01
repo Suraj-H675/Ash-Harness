@@ -188,3 +188,18 @@ def test_plugin_mcp_paths_use_declared_or_default_locations(tmp_path) -> None:
     found = PluginCatalog(((root, "user"),)).discover()
 
     assert found[0].mcp_paths() == (mcp,)
+
+
+def test_plugin_agent_paths_use_declared_or_default_locations(tmp_path) -> None:
+    root = tmp_path / "plugins"
+    plugin = root / "example"
+    agent = plugin / "custom" / "reviewer.md"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("Review code")
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "example", "agents": ["custom/reviewer.md"]})
+    )
+
+    found = PluginCatalog(((root, "user"),)).discover()
+
+    assert found[0].agent_paths() == (agent,)

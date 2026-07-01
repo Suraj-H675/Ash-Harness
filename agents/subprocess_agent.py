@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -41,6 +42,7 @@ AGENT_ROLES: tuple[str, ...] = (
     "reviewer",
     "general",
 )
+_CUSTOM_ROLE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 
 
 @dataclass(frozen=True)
@@ -108,8 +110,11 @@ class SubprocessAgent:
         enforcement_guard: Callable[[str], bool] | None = None,
         sandbox_tier: int = 1,
         workspace_root: Path | None = None,
+        allow_custom_role: bool = False,
     ) -> None:
-        if role not in AGENT_ROLES:
+        if role not in AGENT_ROLES and (
+            not allow_custom_role or not _CUSTOM_ROLE.fullmatch(role)
+        ):
             raise ValueError(f"Unknown role {role!r}; expected one of {AGENT_ROLES}")
         self.agent_id = agent_id
         self.role = role

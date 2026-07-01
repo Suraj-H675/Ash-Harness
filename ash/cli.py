@@ -244,6 +244,7 @@ def _build_tools(
         WriteFileTool,
     )
     from tools.git import AutoCommitTool, GitDiffTool, GitLogTool, GitStatusTool
+    from plugins.agents import AgentCatalog, AgentSource
     from plugins.skills import (
         ActivateSkillTool,
         ListSkillsTool,
@@ -270,13 +271,28 @@ def _build_tools(
         tuple(plugin_roots),
         disabled_plugins=load_extension_state().disabled_plugins,
     )
+    active_plugins = plugin_catalog.discover()
     skill_roots.extend(
         SkillSource(
             paths=plugin.skill_paths(),
             namespace=plugin.manifest.name,
         )
-        for plugin in plugin_catalog.discover()
+        for plugin in active_plugins
     )
+    agent_sources: list[Path | AgentSource] = [Path.home() / ".ash" / "agents"]
+    if allow_project_extensions:
+        agent_sources.append(root / ".ash" / "agents")
+    agent_sources.extend(
+        AgentSource(
+            paths=plugin.agent_paths(),
+            namespace=plugin.manifest.name,
+        )
+        for plugin in active_plugins
+    )
+    agent_definitions = {
+        definition.name: definition
+        for definition in AgentCatalog(tuple(agent_sources)).discover()
+    }
     catalog = SkillCatalog(tuple(skill_roots))
     tools: list[BaseTool] = [
         ReadFileTool(safety_guard),
@@ -313,6 +329,7 @@ def _build_tools(
                 SharedState(agent_db_path),
                 provider_factory,
                 config=runtime_config,
+                custom_agents=agent_definitions,
             )
         )
     if repo_map is not None:
@@ -1342,6 +1359,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=[
             "all",
             "skills",
+            "agents",
             "plugins",
             "hooks",
             "install",
