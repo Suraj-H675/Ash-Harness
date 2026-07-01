@@ -68,7 +68,7 @@ Research is clean-room: proprietary or leaked source is not used.
 
 | Capability | Ash status | Required production behavior |
 |---|---|---|
-| Token accounting | Partial | Provider usage, cached input, completion, and configured cache-aware costs are normalized and persisted; visible estimate uncertainty remains |
+| Token accounting | Verified locally | Provider usage and cache tokens are normalized; missing usage is estimated from the compacted prompt and streamed/native response, marked provider/estimated/mixed across TUI and structured surfaces, and estimated token/cost portions are persisted separately |
 | Context budget allocation | Verified locally | Configurable system/tool/history/repo-map/memory budgets are enforced before compaction and shown by `/context`; text, directory, and image attachments have a model-counted combined cap that defaults to 25% of usable input context and refuses overflow without silent clipping |
 | Automatic compaction | Verified locally | Threshold-based extractive summary retains recent tool call/result pairs |
 | Manual `/compact` | Verified locally | Forces compaction while preserving the durable transcript |

@@ -22,7 +22,7 @@ AuditAction = Literal[
     "tool_call", "command_run", "file_write", "safety_block", "user_approval"
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 class SessionStorageError(RuntimeError):
@@ -92,6 +92,13 @@ class SessionUsage(BaseModel):
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     cost_usd: float = 0.0
+    estimated_prompt_tokens: int = 0
+    estimated_completion_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+
+    @property
+    def has_estimates(self) -> bool:
+        return bool(self.estimated_prompt_tokens or self.estimated_completion_tokens)
 
 
 _db_write_locks: dict[str, asyncio.Lock] = {}
@@ -262,6 +269,8 @@ class SessionStore:
                 self._migrate_v3(conn)
             if from_version < 4:
                 self._migrate_v4(conn)
+            if from_version < 5:
+                self._migrate_v5(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -345,6 +354,22 @@ class SessionStore:
             (4, _serialize_datetime(_utc_now())),
         )
 
+    def _migrate_v5(self, conn: sqlite3.Connection) -> None:
+        """Track the estimated portions of persisted token and cost totals."""
+
+        for col_spec in (
+            ("estimated_prompt_tokens", "INTEGER DEFAULT 0"),
+            ("estimated_completion_tokens", "INTEGER DEFAULT 0"),
+            ("estimated_cost_usd", "REAL DEFAULT 0"),
+        ):
+            col_name, col_type = col_spec
+            if not _column_exists(conn, "sessions", col_name):
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (5, _serialize_datetime(_utc_now())),
+        )
+
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
     ) -> Path:
@@ -397,7 +422,10 @@ class SessionStore:
                     total_prompt_tokens INTEGER DEFAULT 0,
                     total_completion_tokens INTEGER DEFAULT 0,
                     total_cache_read_tokens INTEGER DEFAULT 0,
-                    total_cache_write_tokens INTEGER DEFAULT 0
+                    total_cache_write_tokens INTEGER DEFAULT 0,
+                    estimated_prompt_tokens INTEGER DEFAULT 0,
+                    estimated_completion_tokens INTEGER DEFAULT 0,
+                    estimated_cost_usd REAL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS messages (
@@ -782,7 +810,10 @@ class SessionStore:
                 "COALESCE(total_completion_tokens, 0) AS completion_tokens, "
                 "COALESCE(total_cache_read_tokens, 0) AS cache_read_tokens, "
                 "COALESCE(total_cache_write_tokens, 0) AS cache_write_tokens, "
-                "COALESCE(total_cost_usd, 0) AS cost_usd "
+                "COALESCE(total_cost_usd, 0) AS cost_usd, "
+                "COALESCE(estimated_prompt_tokens, 0) AS estimated_prompt_tokens, "
+                "COALESCE(estimated_completion_tokens, 0) AS estimated_completion_tokens, "
+                "COALESCE(estimated_cost_usd, 0) AS estimated_cost_usd "
                 "FROM sessions WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
@@ -1093,6 +1124,9 @@ class SessionStore:
         *,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
+        estimated_prompt_tokens: int = 0,
+        estimated_completion_tokens: int = 0,
+        estimated_cost_usd: float = 0.0,
     ) -> None:
         """Accumulate one turn's token and explicitly configured cost totals."""
 
@@ -1105,7 +1139,10 @@ class SessionStore:
                     total_prompt_tokens = COALESCE(total_prompt_tokens, 0) + ?,
                     total_completion_tokens = COALESCE(total_completion_tokens, 0) + ?,
                     total_cache_read_tokens = COALESCE(total_cache_read_tokens, 0) + ?,
-                    total_cache_write_tokens = COALESCE(total_cache_write_tokens, 0) + ?
+                    total_cache_write_tokens = COALESCE(total_cache_write_tokens, 0) + ?,
+                    estimated_prompt_tokens = COALESCE(estimated_prompt_tokens, 0) + ?,
+                    estimated_completion_tokens = COALESCE(estimated_completion_tokens, 0) + ?,
+                    estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + ?
                 WHERE session_id = ?
                 """,
                 (
@@ -1115,6 +1152,9 @@ class SessionStore:
                     total_completion_tokens,
                     cache_read_tokens,
                     cache_write_tokens,
+                    estimated_prompt_tokens,
+                    estimated_completion_tokens,
+                    estimated_cost_usd,
                     session_id,
                 ),
             )

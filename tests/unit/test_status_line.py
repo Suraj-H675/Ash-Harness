@@ -20,6 +20,8 @@ def test_status_line_includes_runtime_git_cost_and_sandbox(tmp_path: Path) -> No
         0.0123,
         cache_read_tokens=7,
         cache_write_tokens=2,
+        estimated_prompt_tokens=3,
+        estimated_cost_usd=0.004,
     )
     loop = SimpleNamespace(
         current_session=session,
@@ -39,7 +41,7 @@ def test_status_line_includes_runtime_git_cost_and_sandbox(tmp_path: Path) -> No
 
     assert "ctx ~123/900" in rendered
     assert "cache:7r/2w" in rendered
-    assert "$0.0123" in rendered
+    assert "~$0.0123" in rendered
     assert "sb:scoped" in rendered
     assert "sb:scoped!" in rendered
     assert f"s:{session.session_id[:8]}" in rendered

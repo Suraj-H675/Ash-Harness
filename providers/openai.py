@@ -174,6 +174,7 @@ class OpenAIProvider(ProviderABC):
                         prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
                         completion_tokens=(getattr(usage, "completion_tokens", 0) or 0),
                         cache_read_tokens=getattr(details, "cached_tokens", 0) or 0,
+                        usage_source="provider",
                     )
                 continue
 
@@ -225,6 +226,7 @@ class OpenAIProvider(ProviderABC):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 cache_read_tokens=cache_read_tokens,
+                usage_source="provider" if usage is not None else "unavailable",
                 stop_reason=stop_reason,
                 # Surface complete native tool calls so the loop can use their
                 # real IDs instead of generating random UUIDs.

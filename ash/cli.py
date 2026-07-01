@@ -765,6 +765,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             + (
                                 f"{session_usage.prompt_tokens} prompt, "
                                 f"{session_usage.completion_tokens} completion"
+                                + (
+                                    " "
+                                    f"({session_usage.estimated_prompt_tokens} prompt, "
+                                    f"{session_usage.estimated_completion_tokens} completion estimated)"
+                                    if session_usage.has_estimates
+                                    else " (provider reported)"
+                                )
                                 if session_usage is not None
                                 else "0 prompt, 0 completion"
                             ),
@@ -775,7 +782,17 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                                 if session_usage is not None
                                 else "0 read, 0 written"
                             ),
-                            f"Cost: ${(session_usage.cost_usd if session_usage is not None else 0.0):.6f}",
+                            "Cost: "
+                            + (
+                                f"${session_usage.cost_usd:.6f}"
+                                + (
+                                    f" (${session_usage.estimated_cost_usd:.6f} estimated)"
+                                    if session_usage.estimated_cost_usd > 0
+                                    else ""
+                                )
+                                if session_usage is not None
+                                else "$0.000000"
+                            ),
                         )
                     ),
                     flush=True,
@@ -962,6 +979,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     f"; last cache={last_usage['cache_read_tokens']} read/"
                     f"{last_usage['cache_write_tokens']} written "
                     f"({float(last_usage['cache_hit_rate']):.1%} hit)"
+                    f"; last usage={last_usage['usage_source']}"
                     f"{budget_suffix}",
                     flush=True,
                 )

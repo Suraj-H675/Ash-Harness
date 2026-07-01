@@ -112,6 +112,11 @@ class DeepSeekProvider(ProviderABC):
                 model=self._model_name,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                usage_source=(
+                    "provider"
+                    if is_done and getattr(chunk, "usage", None) is not None
+                    else "unavailable"
+                ),
                 stop_reason=stop_reason,
                 native_tool_calls=list(completed) if completed else None,
             )

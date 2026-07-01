@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Protocol, runtime_checkable
+from typing import Any, AsyncGenerator, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 from providers.capabilities import ProviderCapabilities, infer_capabilities
@@ -27,6 +27,7 @@ class StreamChunk(BaseModel):
     completion_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    usage_source: Literal["provider", "estimated", "unavailable"] = "unavailable"
     stop_reason: str | None = None
     model: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)

@@ -277,6 +277,15 @@ sent to custom OpenAI-compatible endpoints or local models. Cache reads,
 writes, hit rate, and configured costs are visible through `/status`,
 `/context`, JSON output, the SDK, HTTP, and JSON-RPC.
 
+Turn usage also reports `usage_source` as `provider`, `estimated`, or `mixed`.
+When a provider omits usage, Ash uses its configured model token counter for
+the actual compacted prompt and streamed response, marks those counts as
+estimated, and records estimated prompt, completion, and configured-cost
+portions separately in session totals. `/status` labels estimated portions,
+the status line prefixes a cost containing estimates with `~`, and structured
+surfaces include `has_estimates` and `cost_is_estimated` rather than presenting
+fallback counts as exact.
+
 Provider requests use one harness-level resilience policy. Only transient
 connection, timeout, 408/409/425/429, and 5xx failures before the first stream
 chunk are retried; authentication, validation, quota-exhaustion, and partial

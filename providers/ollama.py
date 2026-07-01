@@ -88,6 +88,12 @@ class OllamaProvider(ProviderABC):
                         model=self._model_name,
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
+                        usage_source=(
+                            "provider"
+                            if is_done
+                            and ("prompt_eval_count" in data or "eval_count" in data)
+                            else "unavailable"
+                        ),
                         stop_reason=stop_reason,
                     )
         except httpx.HTTPError as exc:

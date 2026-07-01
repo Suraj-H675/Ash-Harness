@@ -100,6 +100,8 @@ async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
         assert result.completion_tokens == 10
         assert result.cache_read_tokens == 80
         assert result.cache_write_tokens == 5
+        assert result.usage_source == "provider"
+        assert result.usage["has_estimates"] is False
         assert result.usage["cache_hit_rate"] == 0.8
         assert client.sessions()[0].session_id == result.session_id
     finally:
@@ -159,6 +161,10 @@ async def test_async_sdk_serializes_prompts_on_one_session(tmp_path) -> None:
 
     assert first.response == second.response == "done"
     assert provider.maximum_active == 1
+    assert first.usage_source == "estimated"
+    assert first.estimated_prompt_tokens == first.prompt_tokens > 0
+    assert first.estimated_completion_tokens == first.completion_tokens > 0
+    assert first.usage["has_estimates"] is True
 
 
 @pytest.mark.asyncio

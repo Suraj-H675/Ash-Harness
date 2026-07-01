@@ -220,6 +220,7 @@ async def test_queued_steering_is_persisted_and_applied_to_running_turn(tmp_path
     assert [event["type"] for event in ui.events] == [
         "turn.steering.queued",
         "turn.steering.applied",
+        "turn.usage",
     ]
     loaded = store.load_session(loop.current_session.session_id)
     steering = next(
@@ -311,8 +312,9 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
         "tool.requested",
         "tool.started",
         "tool.completed",
+        "turn.usage",
     ]
-    assert ui.events[-1]["output"] == "hello"
+    assert ui.events[-2]["output"] == "hello"
 
 
 @pytest.mark.asyncio
@@ -437,14 +439,62 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
         "completion_tokens": 5,
         "cache_read_tokens": 60,
         "cache_write_tokens": 20,
+        "usage_source": "provider",
+        "estimated_prompt_tokens": 0,
+        "estimated_completion_tokens": 0,
+        "has_estimates": False,
         "cache_hit_rate": 0.6,
         "cost_usd": pytest.approx(0.000152),
+        "estimated_cost_usd": 0.0,
+        "cost_is_estimated": False,
     }
     usage = store.get_session_usage(session.session_id)
     assert usage.prompt_tokens == 100
     assert usage.cache_read_tokens == 60
     assert usage.cache_write_tokens == 20
     assert usage.cost_usd == pytest.approx(0.000152)
+
+
+@pytest.mark.asyncio
+async def test_missing_provider_usage_is_estimated_marked_and_persisted(tmp_path):
+    store = SessionStore(tmp_path / "estimated-usage.db")
+    config = AshConfig(
+        model="openai/budget-test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        max_context_tokens=200,
+        max_completion_tokens=20,
+        model_pricing_usd_per_million={
+            "openai/budget-test": {"input": 2.0, "output": 10.0}
+        },
+    )
+    loop = AshLoop(
+        store,
+        BudgetProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=config,
+    )
+
+    session = await loop.start_session()
+    assert await loop.run_turn("measure estimated usage") == "done"
+
+    usage = loop.last_turn_usage
+    assert usage["usage_source"] == "estimated"
+    assert usage["has_estimates"] is True
+    assert usage["estimated_prompt_tokens"] == usage["prompt_tokens"]
+    assert usage["estimated_completion_tokens"] == usage["completion_tokens"]
+    assert int(usage["prompt_tokens"]) > 0
+    assert int(usage["completion_tokens"]) > 0
+    assert usage["cost_is_estimated"] is True
+    assert usage["estimated_cost_usd"] == usage["cost_usd"]
+
+    persisted = store.get_session_usage(session.session_id)
+    assert persisted.estimated_prompt_tokens == usage["prompt_tokens"]
+    assert persisted.estimated_completion_tokens == usage["completion_tokens"]
+    assert persisted.estimated_cost_usd == usage["estimated_cost_usd"]
 
 
 @pytest.mark.asyncio

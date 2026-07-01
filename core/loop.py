@@ -371,7 +371,11 @@ class AshLoop:
         self._last_turn_completion_tokens = 0
         self._last_cache_read_tokens = 0
         self._last_cache_write_tokens = 0
+        self._last_estimated_prompt_tokens = 0
+        self._last_estimated_completion_tokens = 0
+        self._last_usage_source = "unavailable"
         self._last_turn_cost_usd = 0.0
+        self._last_estimated_cost_usd = 0.0
         self.skill_nudge_interval = skill_nudge_interval
         self._iterations_since_skill_use = 0
         self.continuous_mode = continuous_mode
@@ -499,17 +503,24 @@ class AshLoop:
         return self._turn_running
 
     @property
-    def last_turn_usage(self) -> dict[str, int | float]:
+    def last_turn_usage(self) -> dict[str, int | float | str | bool]:
         prompt = self._last_turn_prompt_tokens
+        has_estimates = self._last_usage_source in {"estimated", "mixed"}
         return {
             "prompt_tokens": prompt,
             "completion_tokens": self._last_turn_completion_tokens,
             "cache_read_tokens": self._last_cache_read_tokens,
             "cache_write_tokens": self._last_cache_write_tokens,
+            "usage_source": self._last_usage_source,
+            "estimated_prompt_tokens": self._last_estimated_prompt_tokens,
+            "estimated_completion_tokens": self._last_estimated_completion_tokens,
+            "has_estimates": has_estimates,
             "cache_hit_rate": (
                 self._last_cache_read_tokens / prompt if prompt else 0.0
             ),
             "cost_usd": self._last_turn_cost_usd,
+            "estimated_cost_usd": self._last_estimated_cost_usd,
+            "cost_is_estimated": self._last_estimated_cost_usd > 0,
         }
 
     async def run_turn(
@@ -633,6 +644,9 @@ class AshLoop:
         total_completion_tokens = 0
         total_cache_read_tokens = 0
         total_cache_write_tokens = 0
+        total_estimated_prompt_tokens = 0
+        total_estimated_completion_tokens = 0
+        usage_sources: set[str] = set()
         iteration = 0
         iteration_budget = self.max_turn_iterations
         maximum_iteration_budget = self.max_turn_iterations + self.max_steering_messages
@@ -655,11 +669,16 @@ class AshLoop:
                 turn_completion_tokens,
                 turn_cache_read_tokens,
                 turn_cache_write_tokens,
+                turn_usage_source,
             ) = await self._stream_one_completion(messages)
             total_prompt_tokens += turn_prompt_tokens
             total_completion_tokens += turn_completion_tokens
             total_cache_read_tokens += turn_cache_read_tokens
             total_cache_write_tokens += turn_cache_write_tokens
+            usage_sources.add(turn_usage_source)
+            if turn_usage_source == "estimated":
+                total_estimated_prompt_tokens += turn_prompt_tokens
+                total_estimated_completion_tokens += turn_completion_tokens
 
             # Persist the assistant turn.
             assistant_message = Message(
@@ -759,6 +778,14 @@ class AshLoop:
         completion = int(total_completion_tokens) if total_completion_tokens else 0
         cache_read = int(total_cache_read_tokens) if total_cache_read_tokens else 0
         cache_write = int(total_cache_write_tokens) if total_cache_write_tokens else 0
+        estimated_prompt = int(total_estimated_prompt_tokens)
+        estimated_completion = int(total_estimated_completion_tokens)
+        if not usage_sources:
+            usage_source = "unavailable"
+        elif len(usage_sources) == 1:
+            usage_source = next(iter(usage_sources))
+        else:
+            usage_source = "mixed"
         pricing: dict[str, float] = {}
         if self._config is not None:
             pricing = self._config.model_pricing_usd_per_million.get(
@@ -771,11 +798,22 @@ class AshLoop:
             cache_write_tokens=cache_write,
             pricing=pricing,
         )
+        estimated_cost_usd = _calculate_turn_cost(
+            prompt_tokens=estimated_prompt,
+            completion_tokens=estimated_completion,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+            pricing=pricing,
+        )
         self._last_turn_prompt_tokens = prompt
         self._last_turn_completion_tokens = completion
         self._last_cache_read_tokens = cache_read
         self._last_cache_write_tokens = cache_write
+        self._last_estimated_prompt_tokens = estimated_prompt
+        self._last_estimated_completion_tokens = estimated_completion
+        self._last_usage_source = usage_source
         self._last_turn_cost_usd = turn_cost_usd
+        self._last_estimated_cost_usd = estimated_cost_usd
         usage_payload = self.last_turn_usage
         self.turn_context.set("usage", usage_payload)
         if prompt > 0 or completion > 0:
@@ -787,6 +825,9 @@ class AshLoop:
                 turn_cost_usd,
                 cache_read_tokens=cache_read,
                 cache_write_tokens=cache_write,
+                estimated_prompt_tokens=estimated_prompt,
+                estimated_completion_tokens=estimated_completion,
+                estimated_cost_usd=estimated_cost_usd,
             )
 
         if self.auto_commit:
@@ -930,7 +971,7 @@ class AshLoop:
     async def _stream_one_completion(
         self,
         messages: list[dict[str, Any]],
-    ) -> tuple[str, list[dict[str, Any]], int, int, int, int]:
+    ) -> tuple[str, list[dict[str, Any]], int, int, int, int, str]:
         """Stream one completion with normalized token and cache usage."""
 
         # Build OpenAI-format tools list for providers that support native tool_calls.
@@ -942,11 +983,13 @@ class AshLoop:
 
         parser = StreamingXMLParser()
         text_chunks: list[str] = []
+        response_fragments: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         prompt_tokens = 0
         completion_tokens = 0
         cache_read_tokens = 0
         cache_write_tokens = 0
+        usage_source = "unavailable"
         native_tool_calls_from_api: list[dict[str, Any]] = []
         maximum_attempts = int(getattr(self._config, "provider_max_attempts", 3))
         retry_base_delay = float(
@@ -968,6 +1011,7 @@ class AshLoop:
                             for fragment in (chunk.content, chunk.tool_call_delta):
                                 if not fragment:
                                     continue
+                                response_fragments.append(fragment)
                                 for event in parser.feed(fragment):
                                     self._handle_event(event, text_chunks, tool_calls)
                             if chunk.native_tool_calls:
@@ -979,6 +1023,16 @@ class AshLoop:
                                 completion_tokens = chunk.completion_tokens
                                 cache_read_tokens = chunk.cache_read_tokens
                                 cache_write_tokens = chunk.cache_write_tokens
+                                usage_source = chunk.usage_source
+                                if usage_source == "unavailable" and any(
+                                    (
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        cache_read_tokens,
+                                        cache_write_tokens,
+                                    )
+                                ):
+                                    usage_source = "provider"
                         break
                     except asyncio.CancelledError:
                         raise
@@ -1052,6 +1106,27 @@ class AshLoop:
                 _normalize_native_tool_call(call) for call in native_tool_calls_from_api
             ]
 
+        if usage_source == "unavailable":
+            prompt_tokens = self._last_context_tokens or max(
+                0,
+                int(
+                    self.provider.count_tokens(
+                        json.dumps(messages, default=str, separators=(",", ":"))
+                    )
+                ),
+            )
+            completion_payload = "".join(response_fragments)
+            if native_tool_calls_from_api:
+                completion_payload += json.dumps(
+                    native_tool_calls_from_api, default=str, separators=(",", ":")
+                )
+            completion_tokens = max(
+                0, int(self.provider.count_tokens(completion_payload))
+            )
+            cache_read_tokens = 0
+            cache_write_tokens = 0
+            usage_source = "estimated"
+
         return (
             "".join(text_chunks),
             tool_calls,
@@ -1059,6 +1134,7 @@ class AshLoop:
             completion_tokens,
             cache_read_tokens,
             cache_write_tokens,
+            usage_source,
         )
 
     def _handle_event(

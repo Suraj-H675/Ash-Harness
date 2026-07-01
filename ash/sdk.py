@@ -37,20 +37,31 @@ class AshResult:
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     cost_usd: float = 0.0
+    usage_source: str = "unavailable"
+    estimated_prompt_tokens: int = 0
+    estimated_completion_tokens: int = 0
+    estimated_cost_usd: float = 0.0
 
     @property
-    def usage(self) -> dict[str, int | float]:
+    def usage(self) -> dict[str, int | float | str | bool]:
+        has_estimates = self.usage_source in {"estimated", "mixed"}
         return {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "cache_read_tokens": self.cache_read_tokens,
             "cache_write_tokens": self.cache_write_tokens,
+            "usage_source": self.usage_source,
+            "estimated_prompt_tokens": self.estimated_prompt_tokens,
+            "estimated_completion_tokens": self.estimated_completion_tokens,
+            "has_estimates": has_estimates,
             "cache_hit_rate": (
                 self.cache_read_tokens / self.prompt_tokens
                 if self.prompt_tokens
                 else 0.0
             ),
             "cost_usd": self.cost_usd,
+            "estimated_cost_usd": self.estimated_cost_usd,
+            "cost_is_estimated": self.estimated_cost_usd > 0,
         }
 
 
@@ -195,6 +206,10 @@ class AshClient:
             cache_read_tokens=int(usage["cache_read_tokens"]),
             cache_write_tokens=int(usage["cache_write_tokens"]),
             cost_usd=float(usage["cost_usd"]),
+            usage_source=str(usage["usage_source"]),
+            estimated_prompt_tokens=int(usage["estimated_prompt_tokens"]),
+            estimated_completion_tokens=int(usage["estimated_completion_tokens"]),
+            estimated_cost_usd=float(usage["estimated_cost_usd"]),
         )
 
     async def stream_prompt(self, text: str) -> AsyncIterator[AshEvent]:

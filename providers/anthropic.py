@@ -232,6 +232,7 @@ class AnthropicProvider(ProviderABC):
                 completion_tokens=getattr(usage, "output_tokens", 0) or 0,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
+                usage_source="provider" if usage is not None else "unavailable",
                 stop_reason=stop_reason,
                 model=self._model_name,
                 native_tool_calls=native_tool_calls or None,

@@ -733,6 +733,7 @@ async def test_openai_prompt_cache_and_usage_only_chunk() -> None:
     assert chunks[-1].prompt_tokens == 1200
     assert chunks[-1].completion_tokens == 10
     assert chunks[-1].cache_read_tokens == 1024
+    assert chunks[-1].usage_source == "provider"
     assert client.completions.kwargs["stream_options"] == {"include_usage": True}
     assert client.completions.kwargs["prompt_cache_key"] == "ash-project-test"
     assert client.completions.kwargs["prompt_cache_retention"] == "24h"
@@ -821,6 +822,7 @@ async def test_anthropic_prompt_cache_normalizes_usage() -> None:
     assert chunks[-1].prompt_tokens == 1550
     assert chunks[-1].completion_tokens == 20
     assert chunks[-1].cache_read_tokens == 1000
+    assert chunks[-1].usage_source == "provider"
     assert chunks[-1].cache_write_tokens == 500
 
 
