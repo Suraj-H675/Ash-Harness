@@ -75,8 +75,10 @@ The authenticated server exposes synchronous turns at `/v1/turn` and live
 SSE turn events at `/v1/turn/stream`; non-loopback binding requires
 `--allow-remote`.
 
-Inside the terminal, `/help` lists session, context, model, diff, review,
-permissions, sandbox, skills, plugins, export, and diagnostic commands.
+Inside an interactive terminal, `/help` opens a full-screen searchable command
+reference; redirected input and screen-reader mode keep the linear text output.
+It covers session, context, model, diff, review, permissions, sandbox, skills,
+plugins, export, and diagnostic commands.
 Prefix a command with `!` to run it through the same permission and sandbox
 policy as model tool calls while streaming bounded stdout and stderr live.
 `@path` attachments are capped at 25% of usable model input context by default;

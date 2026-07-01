@@ -456,6 +456,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     from ui.turn_input import InteractiveTurnController
     from ui.output import ReplPrinter
     from ui.notifications import TerminalNotifier
+    from ui.help_overlay import show_help_overlay
 
     command_roots = [(Path.home() / ".ash" / "commands", "user")]
     plugin_roots = [(Path.home() / ".ash" / "plugins", "user")]
@@ -701,7 +702,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             if command.name == "exit":
                 return 0
             if command.name == "help":
-                print(render_help(" ".join(arguments) or None), flush=True)
+                help_query = " ".join(arguments)
+                if prompt_input.interactive and not config.screen_reader_mode:
+                    await show_help_overlay(initial_query=help_query)
+                else:
+                    print(render_help(help_query or None), flush=True)
                 continue
             if command.name == "status":
                 session = loop.current_session
