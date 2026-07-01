@@ -7,7 +7,7 @@ import platform
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from pydantic import BaseModel, Field
 
@@ -47,10 +47,12 @@ class BackgroundProcessTool(BaseTool):
         safety_guard: SafetyGuard,
         *,
         sandbox_manager: SandboxManager | None = None,
+        environment_allowlist: Iterable[str] = (),
     ) -> None:
         super().__init__(safety_guard)
         self.jobs: dict[str, Job] = {}
         self.sandbox_manager = sandbox_manager
+        self.environment_allowlist = tuple(environment_allowlist)
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = BackgroundProcessArgs(**kwargs)
@@ -98,7 +100,11 @@ class BackgroundProcessTool(BaseTool):
         backend_name = "scoped"
         if self.sandbox_manager is not None:
             try:
-                invocation = self.sandbox_manager.prepare(argv, cwd=Path(cwd))
+                invocation = self.sandbox_manager.prepare(
+                    argv,
+                    cwd=Path(cwd),
+                    passthrough_env_names=self.environment_allowlist,
+                )
             except SandboxBackendUnavailable as exc:
                 return ToolResult(
                     success=False,
@@ -110,7 +116,9 @@ class BackgroundProcessTool(BaseTool):
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd,
-            env=build_scrubbed_command_env(self.safety_guard.project_root),
+            env=build_scrubbed_command_env(
+                self.safety_guard.project_root, self.environment_allowlist
+            ),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

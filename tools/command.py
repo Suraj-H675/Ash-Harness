@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import platform
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from pydantic import BaseModel, Field
 
 from core.redaction import StreamingRedactor
+from safety.environment import build_scrubbed_environment
 from safety.guard import SafetyGuard, SafetyViolation
 from sandbox._base import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable
 from sandbox.manager import SandboxManager, SandboxResult
@@ -32,27 +32,6 @@ POWERSHELL_FILE_CMDLETS = (
     "rename-item",
     "new-item",
 )
-SAFE_ENV_KEYS = frozenset(
-    {
-        "PATH",
-        "HOME",
-        "USER",
-        "USERNAME",
-        "LOGNAME",
-        "SHELL",
-        "TERM",
-        "TMPDIR",
-        "TEMP",
-        "TMP",
-        "LANG",
-        "PYTHONIOENCODING",
-        "SYSTEMROOT",
-        "WINDIR",
-        "COMSPEC",
-        "PATHEXT",
-    }
-)
-SAFE_ENV_PREFIXES = ("LC_",)
 
 
 class RunCommandArgs(BaseModel):
@@ -78,12 +57,14 @@ class RunCommandTool(BaseTool):
         *,
         project_root: Path | None = None,
         sandbox_manager: SandboxManager | None = None,
+        environment_allowlist: Iterable[str] = (),
     ) -> None:
         super().__init__(safety_guard)
         self.project_root = (
             project_root if project_root is not None else safety_guard.project_root
         )
         self.sandbox_manager = sandbox_manager
+        self.environment_allowlist = tuple(environment_allowlist)
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = RunCommandArgs(**kwargs)
@@ -120,7 +101,10 @@ class RunCommandTool(BaseTool):
                     argv,
                     args.timeout_seconds,
                     cwd,
-                    env=build_scrubbed_command_env(self.project_root),
+                    env=build_scrubbed_command_env(
+                        self.project_root, self.environment_allowlist
+                    ),
+                    passthrough_env_names=self.environment_allowlist,
                     stream_callback=streamer,
                 )
 
@@ -128,7 +112,9 @@ class RunCommandTool(BaseTool):
                 args.command_line,
                 args.timeout_seconds,
                 cwd,
-                env=build_scrubbed_command_env(self.project_root),
+                env=build_scrubbed_command_env(
+                    self.project_root, self.environment_allowlist
+                ),
                 stream_callback=streamer,
             )
         finally:
@@ -141,6 +127,7 @@ class RunCommandTool(BaseTool):
         cwd: str | None,
         *,
         env: dict[str, str],
+        passthrough_env_names: tuple[str, ...],
         stream_callback: "_CommandEventStreamer",
     ) -> ToolResult:
         assert self.sandbox_manager is not None
@@ -153,6 +140,7 @@ class RunCommandTool(BaseTool):
                 cwd=cwd_path,
                 timeout=timeout_seconds,
                 env=env,
+                passthrough_env_names=passthrough_env_names,
                 stream_callback=stream_callback,
             )
         except SandboxBackendUnavailable as exc:
@@ -286,15 +274,11 @@ def contains_forbidden_windows_chain(command_line: str) -> bool:
     return any(chain in command_line for chain in (";", "&&", "||"))
 
 
-def build_scrubbed_command_env(project_root: Path | None = None) -> dict[str, str]:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key in SAFE_ENV_KEYS
-        or any(key.startswith(prefix) for prefix in SAFE_ENV_PREFIXES)
-    }
-    if "PATH" not in env:
-        env["PATH"] = os.defpath
+def build_scrubbed_command_env(
+    project_root: Path | None = None,
+    environment_allowlist: Iterable[str] = (),
+) -> dict[str, str]:
+    env = build_scrubbed_environment(environment_allowlist)
     if project_root is not None:
         env["ASH_WORKSPACE_ROOT"] = str(project_root)
     return env

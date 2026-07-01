@@ -347,6 +347,23 @@ def test_docker_wrap_includes_security_flags(tmp_path: Path) -> None:
     assert argv[-2:] == ["echo", "hi"]
 
 
+def test_docker_forwards_environment_by_name_without_exposing_value(
+    tmp_path: Path,
+) -> None:
+    fake = tmp_path / "docker"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    backend = DockerSandbox(workspace_root=tmp_path, docker_path=str(fake))
+
+    argv = backend.wrap(
+        ["echo", "hi"], passthrough_env_names=["PACKAGE_REGISTRY_TOKEN"]
+    )
+
+    token_index = argv.index("PACKAGE_REGISTRY_TOKEN")
+    assert argv[token_index - 1] == "--env"
+    assert all("secret-value" not in argument for argument in argv)
+
+
 def test_docker_with_network_omits_none_flag(tmp_path: Path) -> None:
     fake = tmp_path / "docker"
     fake.write_text("#!/bin/sh\n")

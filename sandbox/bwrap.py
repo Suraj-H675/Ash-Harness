@@ -81,7 +81,13 @@ class BubblewrapSandbox(SandboxBackend):
             return False
         return Path(self.bwrap_path).exists()
 
-    def wrap(self, command: Sequence[str], *, cwd: Path | None = None) -> list[str]:
+    def wrap(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        passthrough_env_names: Sequence[str] = (),
+    ) -> list[str]:
         """Build a full ``bwrap … -- command`` argv list."""
 
         if not self.is_available():
@@ -153,9 +159,9 @@ class BubblewrapSandbox(SandboxBackend):
                 )
             args.extend(["--chdir", str(cwd_resolved)])
 
-        # Environment scrubbing: keep PATH and HOME minimal so the
-        # child cannot inherit host secrets.
-        args.append("--clearenv")
+        # The manager starts bwrap with an already scrubbed environment. Keep
+        # it so explicitly allowlisted variables reach the child, while
+        # replacing host-specific PATH and HOME with sandbox values.
         args.extend(["--setenv", "PATH", "/usr/bin:/bin"])
         args.extend(["--setenv", "HOME", str(scratch)])
 

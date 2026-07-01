@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from typing import Any
 
 import httpx
 
 from mcp.server import MCPServerConfig
+from safety.environment import build_scrubbed_environment
 from sandbox.process_utils import process_group_options, terminate_process_tree
 
 
@@ -66,7 +66,7 @@ class MCPClient:
         self._initialized = True
 
     async def _connect_stdio(self) -> None:
-        env = {**os.environ, **self.config.resolved_env}
+        env = build_scrubbed_environment(overrides=self.config.resolved_env)
         self._process = await asyncio.create_subprocess_exec(
             self.config.resolved_command,
             *self.config.resolved_args,

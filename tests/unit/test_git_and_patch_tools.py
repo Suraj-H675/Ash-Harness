@@ -1,4 +1,5 @@
 import asyncio
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -178,6 +179,37 @@ async def test_auto_commit_surfaces_hook_failure_output(tmp_path: Path) -> None:
     assert result.success is False
     assert "git commit failed with exit code" in (result.error or "")
     assert "hook failed" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_auto_commit_scrubs_hook_environment_except_explicit_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX Git hook environment test")
+    await _init_repo(tmp_path)
+    target = tmp_path / "tracked.txt"
+    target.write_text("old\n")
+    await _git(tmp_path, "add", "tracked.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    target.write_text("new\n")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-leak")
+    monkeypatch.setenv("BUILD_CHANNEL", "nightly")
+    hook = tmp_path / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf '%s|%s' \"${UNRELATED_SECRET-unset}\" "
+        '"${BUILD_CHANNEL-unset}" > hook-env.txt\n'
+    )
+    hook.chmod(0o755)
+
+    result = await AutoCommitTool(
+        SafetyGuard(tmp_path), environment_allowlist=["BUILD_CHANNEL"]
+    ).run(message="scrubbed hook", paths=["tracked.txt"])
+
+    assert result.success is True
+    assert (tmp_path / "hook-env.txt").read_text() == "unset|nightly"
 
 
 @pytest.mark.asyncio

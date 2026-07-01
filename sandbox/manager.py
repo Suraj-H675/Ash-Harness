@@ -14,6 +14,7 @@ already obtained informed consent for unisolated execution.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import sys
 import time
@@ -267,6 +268,7 @@ class SandboxManager:
         cwd: Path | None = None,
         timeout: int | None = None,
         env: dict[str, str] | None = None,
+        passthrough_env_names: Sequence[str] = (),
         stream_callback: ProcessStreamCallback | None = None,
     ) -> SandboxResult:
         """
@@ -281,7 +283,11 @@ class SandboxManager:
             raise ValueError("command must be a non-empty sequence")
 
         deadline = timeout if timeout is not None else self.timeout_seconds
-        invocation = self.prepare(command, cwd=cwd)
+        invocation = self.prepare(
+            command,
+            cwd=cwd,
+            passthrough_env_names=passthrough_env_names,
+        )
         if invocation.tier == SANDBOX_TIER_SCOPED:
             return await _run_scoped(
                 _ScopedBackend(),
@@ -308,6 +314,7 @@ class SandboxManager:
         command: Sequence[str],
         *,
         cwd: Path | None = None,
+        passthrough_env_names: Sequence[str] = (),
     ) -> SandboxInvocation:
         """Prepare a command for foreground or managed background execution."""
 
@@ -315,7 +322,11 @@ class SandboxManager:
             raise ValueError("command must be a non-empty sequence")
         try:
             backend = self._build_backend(self._tier)
-            wrapped = backend.wrap(command, cwd=cwd)
+            wrapped = backend.wrap(
+                command,
+                cwd=cwd,
+                passthrough_env_names=passthrough_env_names,
+            )
         except SandboxBackendUnavailable:
             if not self.allow_scoped_fallback:
                 raise
@@ -409,7 +420,13 @@ class _ScopedBackend(SandboxBackend):
     def is_available(self) -> bool:
         return True
 
-    def wrap(self, command: Sequence[str], *, cwd: Path | None = None) -> list[str]:
+    def wrap(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        passthrough_env_names: Sequence[str] = (),
+    ) -> list[str]:
         return list(command)
 
 
@@ -429,7 +446,7 @@ async def _run_scoped(
     process = await asyncio.create_subprocess_exec(
         *command,
         cwd=str(cwd) if cwd is not None else None,
-        env=env,
+        env=env if env is not None else {"PATH": os.defpath},
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         **process_group_options(),
@@ -530,7 +547,13 @@ class _SandboxExecBackend(SandboxBackend):
     def is_available(self) -> bool:
         return has_sandbox_exec()
 
-    def wrap(self, command: Sequence[str], *, cwd: Path | None = None) -> list[str]:
+    def wrap(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        passthrough_env_names: Sequence[str] = (),
+    ) -> list[str]:
         if not self.is_available():
             raise SandboxBackendUnavailable("sandbox-exec not available")
         if self.workspace_root is None:

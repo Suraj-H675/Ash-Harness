@@ -12,11 +12,12 @@ import asyncio
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 from pydantic import BaseModel, Field
 
 from core.redaction import find_secret_candidates
+from safety.environment import build_scrubbed_environment
 from safety.guard import SafetyGuard
 from tools.base import BaseTool, ToolResult, count_output_tokens
 
@@ -107,6 +108,15 @@ class AutoCommitTool(BaseTool):
     )
     args_schema = AutoCommitArgs
 
+    def __init__(
+        self,
+        safety_guard: SafetyGuard,
+        *,
+        environment_allowlist: Iterable[str] = (),
+    ) -> None:
+        super().__init__(safety_guard)
+        self.environment_allowlist = tuple(environment_allowlist)
+
     async def run(self, **kwargs: Any) -> ToolResult:
         args = AutoCommitArgs(**kwargs)
 
@@ -148,7 +158,7 @@ class AutoCommitTool(BaseTool):
                     error=f"Refused to stage path outside Git workspace: {raw!r}",
                 )
             resolved_paths.append(relative.as_posix())
-        staged_before = await _cached_paths(workspace_root)
+        staged_before = await _cached_paths(workspace_root, self.environment_allowlist)
         if staged_before is None:
             return ToolResult(
                 success=False,
@@ -168,7 +178,7 @@ class AutoCommitTool(BaseTool):
         stage_cmd = ["add", "--", *resolved_paths]
 
         stage_code, stage_stdout, stage_stderr = await _run_git(
-            workspace_root, stage_cmd
+            workspace_root, stage_cmd, self.environment_allowlist
         )
         if stage_code != 0:
             return ToolResult(
@@ -180,7 +190,7 @@ class AutoCommitTool(BaseTool):
             )
 
         # Skip commit if there's nothing staged.
-        staged_after = await _cached_paths(workspace_root)
+        staged_after = await _cached_paths(workspace_root, self.environment_allowlist)
         if staged_after is None:
             return ToolResult(
                 success=False,
@@ -214,6 +224,7 @@ class AutoCommitTool(BaseTool):
                 "--",
                 *resolved_paths,
             ],
+            self.environment_allowlist,
         )
         if scan_code != 0:
             return ToolResult(
@@ -257,6 +268,7 @@ class AutoCommitTool(BaseTool):
                 "-m",
                 args.message,
             ],
+            self.environment_allowlist,
         )
         if commit_code != 0:
             return ToolResult(
@@ -273,7 +285,11 @@ class AutoCommitTool(BaseTool):
         )
 
 
-async def _run_git(cwd: Path, args: Sequence[str]) -> tuple[int, str, str]:
+async def _run_git(
+    cwd: Path,
+    args: Sequence[str],
+    environment_allowlist: Iterable[str] = (),
+) -> tuple[int, str, str]:
     """Run ``git <args>`` in ``cwd`` and return (exit, stdout, stderr)."""
 
     cmd = ["git", *args]
@@ -281,6 +297,7 @@ async def _run_git(cwd: Path, args: Sequence[str]) -> tuple[int, str, str]:
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(cwd),
+        env=build_scrubbed_environment(environment_allowlist),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -292,8 +309,14 @@ async def _run_git(cwd: Path, args: Sequence[str]) -> tuple[int, str, str]:
     )
 
 
-async def _cached_paths(cwd: Path) -> list[str] | None:
-    code, stdout, _ = await _run_git(cwd, ["diff", "--cached", "--name-only", "-z"])
+async def _cached_paths(
+    cwd: Path, environment_allowlist: Iterable[str] = ()
+) -> list[str] | None:
+    code, stdout, _ = await _run_git(
+        cwd,
+        ["diff", "--cached", "--name-only", "-z"],
+        environment_allowlist,
+    )
     if code != 0:
         return None
     return sorted(path for path in stdout.split("\0") if path)
@@ -388,6 +411,7 @@ async def auto_commit_turn(
     message: str | None = None,
     paths: list[Path] | None = None,
     safety_guard: SafetyGuard | None = None,
+    environment_allowlist: Iterable[str] = (),
 ) -> ToolResult:
     """Convenience wrapper used by the loop to record a per-turn commit."""
 
@@ -396,7 +420,7 @@ async def auto_commit_turn(
         or f"ash: turn complete at {datetime.now(timezone.utc).isoformat(timespec='seconds')}"
     )
     guard = safety_guard or SafetyGuard(project_root=workspace_root)
-    tool = AutoCommitTool(guard)
+    tool = AutoCommitTool(guard, environment_allowlist=environment_allowlist)
     payload: dict[str, Any] = {"message": body}
     if paths:
         payload["paths"] = [str(p) for p in paths]

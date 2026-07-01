@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from safety.environment import build_scrubbed_environment
+
 MAX_MCP_CONFIG_BYTES = 256 * 1024
 MCP_SERVER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -123,7 +125,7 @@ class MCPServerManager:
         if config.transport != "stdio":
             raise ValueError(f"Unknown MCP transport: {config.transport}")
 
-        env = {**os.environ, **config.resolved_env}
+        env = build_scrubbed_environment(overrides=config.resolved_env)
 
         # Spawn subprocess. stderr=DEVNULL avoids deadlock when the subprocess
         # writes to stderr — we never read it, so PIPE would fill and block.

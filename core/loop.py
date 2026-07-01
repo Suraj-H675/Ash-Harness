@@ -797,6 +797,9 @@ class AshLoop:
                     message=f"ash: turn complete ({len(final_text)} chars)",
                     paths=commit_paths,
                     safety_guard=self.safety_guard,
+                    environment_allowlist=getattr(
+                        self._config, "command_env_allowlist", ()
+                    ),
                 )
                 if not commit_result.success and commit_result.error:
                     # Surface commit failures to the user but don't fail the turn.

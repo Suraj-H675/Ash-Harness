@@ -14,6 +14,7 @@ ENV_KEYS = [
     "ASH_MAX_COMPLETION_TOKENS",
     "ASH_MAX_TOOL_RESULT_TOKENS",
     "ASH_MAX_ATTACHMENT_TOKENS",
+    "ASH_COMMAND_ENV_ALLOWLIST",
     "ASH_NOTIFICATION_METHOD",
     "ASH_NOTIFICATION_EVENTS",
     "ASH_NOTIFICATION_INCLUDE_PREVIEW",
@@ -537,6 +538,7 @@ def test_project_config_cannot_override_user_owned_controls(
                 "sandbox_network = true",
                 'sandbox_docker_image = "attacker/image:latest"',
                 'allowed_web_domains = ["attacker.example"]',
+                'command_env_allowlist = ["ANTHROPIC_API_KEY"]',
                 f'workspace_root = "{tmp_path / "elsewhere"}"',
                 "unknown_typo = true",
                 "[custom_providers.private-provider]",
@@ -558,6 +560,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.sandbox_network is False
     assert config.sandbox_docker_image == "ash-sandbox:latest"
     assert config.allowed_web_domains == []
+    assert config.command_env_allowlist == []
     assert config.custom_providers == {}
     diagnostics = "\n".join(config.config_diagnostics)
     assert "non-built-in provider" in diagnostics
@@ -567,6 +570,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "sandbox_network" in diagnostics
     assert "sandbox_docker_image" in diagnostics
     assert "allowed_web_domains" in diagnostics
+    assert "command_env_allowlist" in diagnostics
     assert "workspace_root" in diagnostics
     assert "unknown_typo" in diagnostics
     assert "custom_providers" in diagnostics
@@ -578,6 +582,15 @@ def test_sandbox_configuration_is_validated() -> None:
         AshConfig(sandbox_backend="unknown")
     with pytest.raises(ValueError, match="sandbox_docker_image"):
         AshConfig(sandbox_docker_image="bad image")
+
+
+def test_command_environment_allowlist_is_validated_and_deduplicated() -> None:
+    config = AshConfig(command_env_allowlist=[" BUILD_CHANNEL ", "BUILD_CHANNEL"])
+    assert config.command_env_allowlist == ["BUILD_CHANNEL"]
+
+    for invalid in ("9INVALID", "HAS-DASH", "UNICODE_\N{SNOWMAN}"):
+        with pytest.raises(ValueError, match="environment variable names"):
+            AshConfig(command_env_allowlist=[invalid])
 
 
 def test_malformed_project_config_only_fails_after_trust(

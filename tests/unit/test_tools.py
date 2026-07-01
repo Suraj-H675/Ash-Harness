@@ -681,6 +681,28 @@ async def test_run_command_scrubs_secret_environment(
 
 
 @pytest.mark.asyncio
+async def test_run_command_forwards_only_explicitly_allowlisted_environment(
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BUILD_CHANNEL", "nightly")
+    monkeypatch.setenv("UNLISTED_SECRET", "must-not-leak")
+    script = (
+        "import os; "
+        "print(os.getenv('BUILD_CHANNEL', 'missing')); "
+        "print(os.getenv('UNLISTED_SECRET', 'missing'))"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+    result = await RunCommandTool(guard, environment_allowlist=["BUILD_CHANNEL"]).run(
+        command_line=command
+    )
+
+    assert result.success is True
+    assert result.output.splitlines() == ["nightly", "missing"]
+
+
+@pytest.mark.asyncio
 async def test_run_command_enforces_timeout(guard: SafetyGuard) -> None:
     command = (
         f"{shlex.quote(sys.executable)} -c {shlex.quote('import time; time.sleep(2)')}"
@@ -757,6 +779,20 @@ def test_auto_commit_tool_is_in_default_tools():
     assert tools["auto_commit"].name == "auto_commit"
     assert "replace_file_edits" in tools
     assert tools["replace_file_edits"].name == "replace_file_edits"
+
+
+def test_default_command_tools_receive_environment_allowlist(tmp_path: Path) -> None:
+    from ash.__main__ import _build_tools
+    from config import AshConfig
+
+    tools = _build_tools(
+        SafetyGuard(project_root=tmp_path),
+        runtime_config=AshConfig(command_env_allowlist=["BUILD_CHANNEL"]),
+    )
+
+    assert tools["run_command"].environment_allowlist == ("BUILD_CHANNEL",)
+    assert tools["background_process"].environment_allowlist == ("BUILD_CHANNEL",)
+    assert tools["auto_commit"].environment_allowlist == ("BUILD_CHANNEL",)
 
 
 @pytest.mark.asyncio

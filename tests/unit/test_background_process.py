@@ -1,4 +1,6 @@
 import asyncio
+import shlex
+import sys
 from unittest.mock import Mock
 
 import pytest
@@ -22,6 +24,36 @@ async def test_background_process_start_poll_and_close(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_background_process_forwards_allowlisted_environment(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DEV_SERVER_PORT", "4312")
+    monkeypatch.setenv("PRIVATE_TOKEN", "must-not-leak")
+    script = (
+        "import os; "
+        "print(os.getenv('DEV_SERVER_PORT', 'missing')); "
+        "print(os.getenv('PRIVATE_TOKEN', 'missing'))"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    tool = BackgroundProcessTool(
+        SafetyGuard(tmp_path), environment_allowlist=["DEV_SERVER_PORT"]
+    )
+
+    started = await tool.run(action="start", command=command)
+    job_id = started.output.split()[1]
+    output = ""
+    for _ in range(20):
+        await asyncio.sleep(0.02)
+        polled = await tool.run(action="poll", job_id=job_id)
+        output += polled.output
+        if "4312\nmissing" in output:
+            break
+
+    assert "4312\nmissing" in output
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_background_process_uses_sandbox_manager(tmp_path) -> None:
     manager = Mock()
     manager.tier = SANDBOX_TIER_BWRAP
@@ -40,7 +72,11 @@ async def test_background_process_uses_sandbox_manager(tmp_path) -> None:
 
     assert "isolated" in polled.output
     assert "[test-sandbox]" in polled.output
-    manager.prepare.assert_called_once()
+    manager.prepare.assert_called_once_with(
+        ["/bin/sh", "-c", "printf ignored"],
+        cwd=tmp_path,
+        passthrough_env_names=(),
+    )
     await tool.aclose()
 
 

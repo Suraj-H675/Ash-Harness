@@ -2,6 +2,8 @@
 import json
 import io
 import sys
+from unittest.mock import Mock, patch
+
 import pytest
 import httpx
 from core.loop import AshLoop
@@ -177,6 +179,28 @@ def test_manager_starts_and_stops_server() -> None:
     assert manager.get_server("test-server") is None
 
 
+def test_manager_scrubs_host_secrets_and_keeps_explicit_server_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-leak")
+    manager = MCPServerManager()
+    config = MCPServerConfig(
+        name="test-server",
+        command="server",
+        args=[],
+        env={"SERVER_TOKEN": "explicit-value"},
+    )
+    process = Mock()
+
+    with patch("mcp.server.subprocess.Popen", return_value=process) as popen:
+        manager.start_server(config)
+
+    environment = popen.call_args.kwargs["env"]
+    assert environment["SERVER_TOKEN"] == "explicit-value"
+    assert "UNRELATED_SECRET" not in environment
+    assert environment["PATH"]
+
+
 def test_manager_stop_all() -> None:
     manager = MCPServerManager()
     for i in range(3):
@@ -194,7 +218,7 @@ def test_manager_stop_all() -> None:
 
 
 FAKE_MCP_SERVER = r"""
-import json, sys
+import json, os, sys
 for line in sys.stdin:
     message = json.loads(line)
     if "id" not in message:
@@ -205,7 +229,10 @@ for line in sys.stdin:
     elif method == "tools/list":
         result = {"tools": [{"name": "echo", "description": "Echo text", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}]}
     elif method == "tools/call":
-        result = {"content": [{"type": "text", "text": message["params"]["arguments"]["text"]}], "isError": False}
+        text = message["params"]["arguments"]["text"]
+        if text == "__environment__":
+            text = f"{os.getenv('SERVER_TOKEN', 'missing')}|{os.getenv('UNRELATED_SECRET', 'missing')}"
+        result = {"content": [{"type": "text", "text": text}], "isError": False}
     elif method == "resources/list":
         result = {"resources": [{"uri": "file:///example", "name": "example"}]}
     elif method == "prompts/list":
@@ -245,6 +272,26 @@ async def test_async_client_initializes_lists_and_calls_tools() -> None:
         assert tools[0]["name"] == "echo"
         result = await client.call_tool("echo", {"text": "hello"})
         assert result["content"][0]["text"] == "hello"
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_async_client_scrubs_host_secrets_and_keeps_explicit_server_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-leak")
+    config = MCPServerConfig(
+        name="fake",
+        command=sys.executable,
+        args=["-u", "-c", FAKE_MCP_SERVER],
+        env={"SERVER_TOKEN": "explicit-value"},
+    )
+    client = MCPClient(config)
+    await client.connect()
+    try:
+        result = await client.call_tool("echo", {"text": "__environment__"})
+        assert result["content"][0]["text"] == "explicit-value|missing"
     finally:
         await client.disconnect()
 

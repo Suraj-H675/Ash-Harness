@@ -420,6 +420,13 @@ class AshConfig(BaseSettings):
         default=["format", "rm -rf", "Remove-Item"],
         description="Command patterns that immediately fail SafetyGuard checks.",
     )
+    command_env_allowlist: list[str] = Field(
+        default_factory=list,
+        description=(
+            "User-owned environment variable names explicitly forwarded to shell "
+            "commands. Values are read from the Ash process environment at execution time."
+        ),
+    )
     allowed_web_domains: list[str] = Field(
         default_factory=list,
         description=(
@@ -595,6 +602,27 @@ class AshConfig(BaseSettings):
                 )
             normalized.append(item)
         return sorted(set(normalized))
+
+    @field_validator("command_env_allowlist")
+    @classmethod
+    def validate_command_env_allowlist(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw in value:
+            name = raw.strip()
+            first = name[:1]
+            if not name or not (first.isascii() and (first.isalpha() or first == "_")):
+                raise ValueError(
+                    "command_env_allowlist entries must be environment variable names"
+                )
+            if not all(
+                character.isascii() and (character.isalnum() or character == "_")
+                for character in name
+            ):
+                raise ValueError(
+                    "command_env_allowlist entries must be environment variable names"
+                )
+            normalized.append(name)
+        return list(dict.fromkeys(normalized))
 
     @field_validator("input_mode")
     @classmethod

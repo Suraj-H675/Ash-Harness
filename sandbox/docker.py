@@ -57,7 +57,13 @@ class DockerSandbox(SandboxBackend):
             pass
         return Path(self.docker_path).exists()
 
-    def wrap(self, command: Sequence[str], *, cwd: Path | None = None) -> list[str]:
+    def wrap(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        passthrough_env_names: Sequence[str] = (),
+    ) -> list[str]:
         """Build a full ``docker run --rm … image command`` argv list."""
 
         if not self.is_available():
@@ -87,6 +93,8 @@ class DockerSandbox(SandboxBackend):
             args.extend(["--memory", self.memory_limit])
         if self.cpus is not None:
             args.extend(["--cpus", str(self.cpus)])
+        for name in passthrough_env_names:
+            args.extend(["--env", name])
 
         # Bind-mount the workspace and the output directory if given.
         container_cwd: str | None = None

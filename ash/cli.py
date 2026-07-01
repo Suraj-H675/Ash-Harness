@@ -304,13 +304,27 @@ def _build_tools(
             safety_guard,
             project_root=root,
             sandbox_manager=sandbox_manager,
+            environment_allowlist=(
+                runtime_config.command_env_allowlist if runtime_config else ()
+            ),
         ),
-        AutoCommitTool(safety_guard),
+        AutoCommitTool(
+            safety_guard,
+            environment_allowlist=(
+                runtime_config.command_env_allowlist if runtime_config else ()
+            ),
+        ),
         GitStatusTool(safety_guard),
         GitDiffTool(safety_guard),
         GitLogTool(safety_guard),
         ApplyPatchTool(safety_guard),
-        BackgroundProcessTool(safety_guard, sandbox_manager=sandbox_manager),
+        BackgroundProcessTool(
+            safety_guard,
+            sandbox_manager=sandbox_manager,
+            environment_allowlist=(
+                runtime_config.command_env_allowlist if runtime_config else ()
+            ),
+        ),
         AskUserTool(safety_guard),
         ListDirectoryTool(safety_guard),
         GlobFilesTool(safety_guard),

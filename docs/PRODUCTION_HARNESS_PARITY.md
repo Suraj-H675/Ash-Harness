@@ -177,7 +177,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Dry-run mode | Verified after fix | No side effects, including hooks and subagents |
 | OS sandbox | Partial | Fail-closed workspace-write Bubblewrap on Linux, scoped `sandbox-exec` profile on macOS, verified Docker image fallback on all platforms, and clearly labeled approval-controlled direct mode; native Windows AppContainer remains |
 | Network isolation | Verified locally | Bubblewrap network namespace, macOS profile rules, and Docker `none` networking default to blocked; `web_fetch` separately enforces public-host validation and optional domains |
-| Environment scrubbing | Partial | Child processes receive a scrubbed operational env and tool outputs are redacted; explicit secret allowlist remains |
+| Environment scrubbing | Verified locally | Foreground/background commands and Git hooks receive only a scrubbed operational env plus an explicit user-owned variable-name allowlist; MCP stdio servers receive only explicit server env; project config cannot grant command variables, isolated backends preserve the policy, and Docker arguments never contain values |
 | Prompt-injection isolation | Partial | Untrusted content provenance and tool-policy enforcement |
 | Secret scanning/redaction | Verified locally | Runtime logs, persisted messages/tool calls, tool output, and exports are redacted; auto-commit blocks high-confidence secrets in staged additions without echoing values |
 | Audit log | Partial | Tool approvals, blocks, and outcomes are persisted with a tamper-evident hash chain plus CLI list/verify/export; broader non-tool decision coverage remains |

@@ -35,5 +35,11 @@ class SandboxBackend:
     def is_available(self) -> bool:  # pragma: no cover - default
         return False
 
-    def wrap(self, command: Sequence[str], *, cwd: Path | None = None) -> list[str]:
+    def wrap(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        passthrough_env_names: Sequence[str] = (),
+    ) -> list[str]:
         raise NotImplementedError

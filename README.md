@@ -173,12 +173,20 @@ project `.ash/config.toml`:
 sandbox_backend = "auto" # auto, native, docker, or direct
 sandbox_network = false
 sandbox_docker_image = "ash-sandbox:latest"
+command_env_allowlist = ["BUILD_CHANNEL", "NPM_CONFIG_REGISTRY"]
 ```
 
 `auto` prefers Bubblewrap on Linux or `sandbox-exec` on macOS, then a locally
 available Docker image. Windows uses the Docker fallback. `ash sandbox build`
 builds the packaged Python, Node.js, Go, Rust, Java, and native-build baseline;
 it is an explicit operation and Ash never downloads or builds it at startup.
+Shell commands receive only a small operational environment by default. Add
+variable names to `command_env_allowlist` in user configuration when build or
+development commands need them; values are read from Ash's process environment
+at execution time. Repository configuration cannot alter this allowlist, and
+Docker forwarding uses variable names rather than embedding values in process
+arguments. The same scrubbed base applies to Git hooks and MCP stdio servers;
+MCP variables must be declared in that server's `env` configuration.
 
 ## Configuration
 
