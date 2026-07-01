@@ -244,3 +244,23 @@ def test_extensions_inventory_validates_enabled_plugin_hooks(
     inventory = discover_extensions(workspace)
 
     assert "pre_tool hooks must be a list" in inventory.errors[0]
+
+
+def test_extensions_inventory_validates_enabled_plugin_mcp(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    plugin = home / ".ash" / "plugins" / "example"
+    plugin.mkdir(parents=True)
+    (plugin / ".mcp.json").write_text("[]", encoding="utf-8")
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "example"}), encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    inventory = discover_extensions(workspace)
+
+    assert "MCP config must be an object" in inventory.errors[0]

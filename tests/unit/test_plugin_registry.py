@@ -173,3 +173,18 @@ def test_plugin_hook_paths_use_declared_or_default_locations(tmp_path) -> None:
     found = PluginCatalog(((root, "user"),)).discover()
 
     assert found[0].hook_paths() == (hook,)
+
+
+def test_plugin_mcp_paths_use_declared_or_default_locations(tmp_path) -> None:
+    root = tmp_path / "plugins"
+    plugin = root / "example"
+    mcp = plugin / "config" / "mcp.json"
+    mcp.parent.mkdir(parents=True)
+    mcp.write_text("{}")
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "example", "mcpServers": ["config/mcp.json"]})
+    )
+
+    found = PluginCatalog(((root, "user"),)).discover()
+
+    assert found[0].mcp_paths() == (mcp,)

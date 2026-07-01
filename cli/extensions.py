@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from mcp.server import load_mcp_servers
 from plugins.lifecycle import (
     PluginLifecycleError,
     install_local_plugin,
@@ -40,6 +41,7 @@ class PluginSummary:
     skills: tuple[str, ...]
     commands: tuple[str, ...]
     hooks: tuple[str, ...]
+    mcp_servers: tuple[str, ...]
     enabled: bool
 
 
@@ -121,6 +123,19 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
     )
     hooks, hook_errors = _discover_hooks(hook_paths)
     errors.extend(hook_errors)
+    for plugin in discovered_plugins:
+        if not plugin.enabled:
+            continue
+        for path in plugin.mcp_paths():
+            try:
+                load_mcp_servers(
+                    path,
+                    namespace=plugin.manifest.name,
+                    cwd=plugin.root,
+                    environment={"ASH_PLUGIN_ROOT": str(plugin.root)},
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                errors.append(f"Invalid plugin MCP config {path}: {exc}")
 
     return ExtensionInventory(
         workspace=canonical_workspace(workspace),
@@ -146,6 +161,11 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
                 ),
                 hooks=tuple(
                     item for item in plugin.manifest.hooks if isinstance(item, str)
+                ),
+                mcp_servers=tuple(
+                    item
+                    for item in plugin.manifest.mcp_servers
+                    if isinstance(item, str)
                 ),
                 enabled=plugin.enabled,
             )

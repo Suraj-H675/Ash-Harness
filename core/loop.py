@@ -36,7 +36,7 @@ from core.session import (
 )
 from core.redaction import redact_text, redact_value
 from ash_logging import get_logger
-from mcp.server import load_mcp_servers
+from mcp.server import MCPServerConfig, load_mcp_servers
 from providers.base import ProviderABC, TokenCounterLike
 from providers.capabilities import ProviderCapabilities
 from providers.retry import (
@@ -292,6 +292,7 @@ class AshLoop:
         onnx_model_path: Path | None = None,
         chroma_persist_dir: Path | None = None,
         mcp_config_path: Path | None = None,
+        mcp_configs: dict[str, MCPServerConfig] | None = None,
         config: "AshConfig | None" = None,
         max_steering_messages: int = 20,
     ) -> None:
@@ -379,9 +380,15 @@ class AshLoop:
         self.current_session: Session | None = None
         self.recovered_turns = 0
         self._mcp_runtime: Any | None = None
-        self._mcp_configs = {}
+        self._mcp_configs = dict(mcp_configs or {})
         if mcp_config_path is not None and mcp_config_path.exists():
-            self._mcp_configs = load_mcp_servers(mcp_config_path)
+            loaded_mcp_configs = load_mcp_servers(mcp_config_path)
+            duplicates = self._mcp_configs.keys() & loaded_mcp_configs.keys()
+            if duplicates:
+                raise ValueError(
+                    "duplicate MCP server name(s): " + ", ".join(sorted(duplicates))
+                )
+            self._mcp_configs.update(loaded_mcp_configs)
 
     def __del__(self) -> None:
         # Async resources are released by ``aclose``; no subprocess work is

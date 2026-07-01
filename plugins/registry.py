@@ -45,6 +45,17 @@ class DiscoveredPlugin:
         default = self.root / "hooks" / "hooks.json"
         return (default,) if default.is_file() else ()
 
+    def mcp_paths(self) -> tuple[Path, ...]:
+        declared = tuple(
+            self.root / item
+            for item in self.manifest.mcp_servers
+            if isinstance(item, str)
+        )
+        if declared:
+            return declared
+        default = self.root / ".mcp.json"
+        return (default,) if default.is_file() else ()
+
 
 class PluginCatalog:
     """Discover declarative plugin manifests from explicitly allowed roots."""

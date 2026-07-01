@@ -10,7 +10,10 @@ from mcp.server import (
     MCPServerConfig,
     MCPServerInstance,
     MCPServerManager,
+    MCPConfigSource,
+    MAX_MCP_CONFIG_BYTES,
     load_mcp_servers,
+    load_mcp_server_sources,
     save_mcp_servers,
     expand_env_vars,
 )
@@ -34,6 +37,79 @@ def test_load_mcp_servers_from_file(tmp_path: Path) -> None:
     assert "github" in servers
     assert servers["github"].command == "npx"
     assert servers["github"].args == ["-y", "@modelcontextprotocol/server-github"]
+
+
+def test_load_mcp_sources_namespaces_plugin_servers(tmp_path: Path) -> None:
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    path = plugin / ".mcp.json"
+    path.write_text(
+        json.dumps(
+            {"mcpServers": {"local": {"command": "server", "env": {"TOKEN": "value"}}}}
+        )
+    )
+
+    servers = load_mcp_server_sources(
+        [
+            MCPConfigSource(
+                path,
+                namespace="example",
+                cwd=plugin,
+                environment=(("ASH_PLUGIN_ROOT", str(plugin)),),
+            )
+        ]
+    )
+
+    config = servers["example__local"]
+    assert config.cwd == str(plugin)
+    assert config.env == {"TOKEN": "value", "ASH_PLUGIN_ROOT": str(plugin)}
+
+
+def test_load_mcp_sources_rejects_duplicate_names(tmp_path: Path) -> None:
+    paths = []
+    for name in ("first", "second"):
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps({"same": {"command": "server"}}))
+        paths.append(MCPConfigSource(path))
+
+    with pytest.raises(ValueError, match="duplicate MCP server"):
+        load_mcp_server_sources(paths)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ([], "must be an object"),
+        ({"mcpServers": []}, "mcpServers must be an object"),
+        ({"bad name": {"command": "server"}}, "invalid MCP server name"),
+        ({"server": "invalid"}, "must be an object"),
+        ({"server": {"args": []}}, "requires a command"),
+        (
+            {"server": {"command": "server", "args": [1]}},
+            "args must be a list of strings",
+        ),
+        (
+            {"server": {"transport": "http", "url": ""}},
+            "requires a url",
+        ),
+    ],
+)
+def test_load_mcp_servers_rejects_invalid_config(
+    tmp_path: Path, payload, message: str
+) -> None:
+    path = tmp_path / ".mcp.json"
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match=message):
+        load_mcp_servers(path)
+
+
+def test_load_mcp_servers_rejects_oversized_config(tmp_path: Path) -> None:
+    path = tmp_path / ".mcp.json"
+    path.write_bytes(b" " * (MAX_MCP_CONFIG_BYTES + 1))
+
+    with pytest.raises(ValueError, match="exceeds 256 KiB"):
+        load_mcp_servers(path)
 
 
 def test_expand_env_vars() -> None:
@@ -181,6 +257,32 @@ async def test_runtime_registers_namespaced_tool(tmp_path: Path) -> None:
         assert "resource text" in resource.output
         prompt = await tools["mcp_get_prompt"].run(server="fake", name="review")
         assert "review it" in prompt.output
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_applies_plugin_mcp_working_directory_and_environment(
+    tmp_path: Path,
+) -> None:
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    server = FAKE_MCP_SERVER.replace(
+        'message["params"]["arguments"]["text"]',
+        "__import__('os').getcwd() + '|' + __import__('os').environ['ASH_PLUGIN_ROOT']",
+    )
+    config = MCPServerConfig(
+        name="example__fake",
+        command=sys.executable,
+        args=["-u", "-c", server],
+        env={"ASH_PLUGIN_ROOT": str(plugin)},
+        cwd=str(plugin),
+    )
+    runtime = MCPRuntime({"example__fake": config}, SafetyGuard(tmp_path))
+    tools = await runtime.start()
+    try:
+        result = await tools["mcp__example__fake__echo"].run(text="ignored")
+        assert result.output == f"{plugin}|{plugin}"
     finally:
         await runtime.close()
 

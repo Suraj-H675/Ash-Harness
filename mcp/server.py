@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+MAX_MCP_CONFIG_BYTES = 256 * 1024
+MCP_SERVER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 @dataclass(frozen=True)
@@ -22,6 +26,7 @@ class MCPServerConfig:
     transport: str = "stdio"  # "stdio" | "sse" | "http" | "websocket"
     url: str = ""  # for SSE/HTTP/WebSocket
     headers: dict[str, str] | None = None
+    cwd: str = ""
 
     def __post_init__(self) -> None:
         if self.transport not in {"stdio", "http", "sse", "websocket"}:
@@ -49,17 +54,40 @@ class MCPServerConfig:
             key: expand_env_vars(value) for key, value in (self.headers or {}).items()
         }
 
+    @property
+    def resolved_cwd(self) -> str | None:
+        return expand_env_vars(self.cwd) if self.cwd else None
+
     @classmethod
-    def from_dict(cls, name: str, data: dict[str, Any]) -> MCPServerConfig:
+    def from_dict(
+        cls,
+        name: str,
+        data: dict[str, Any],
+        *,
+        cwd: str = "",
+        environment: dict[str, str] | None = None,
+    ) -> MCPServerConfig:
+        _validate_server_data(name, data)
+        env = dict(data.get("env", {}))
+        env.update(environment or {})
         return cls(
             name=name,
             command=data.get("command", ""),
             args=data.get("args", []),
-            env=data.get("env", {}),
+            env=env,
             transport=data.get("transport", "stdio"),
             url=data.get("url", ""),
             headers=data.get("headers", {}),
+            cwd=cwd or str(data.get("cwd", "")),
         )
+
+
+@dataclass(frozen=True)
+class MCPConfigSource:
+    path: Path
+    namespace: str = ""
+    cwd: Path | None = None
+    environment: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -105,6 +133,7 @@ class MCPServerManager:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            cwd=config.resolved_cwd,
         )
 
         instance = MCPServerInstance(
@@ -150,21 +179,64 @@ class MCPServerManager:
         return list(self._servers.values())
 
 
-def load_mcp_servers(config_path: Path | None = None) -> dict[str, MCPServerConfig]:
+def load_mcp_servers(
+    config_path: Path | None = None,
+    *,
+    namespace: str = "",
+    cwd: Path | None = None,
+    environment: dict[str, str] | None = None,
+) -> dict[str, MCPServerConfig]:
     """Load MCP server definitions from .mcp.json."""
     if config_path is None:
         config_path = Path(".mcp.json")
     if not config_path.exists():
         return {}
+    if config_path.stat().st_size > MAX_MCP_CONFIG_BYTES:
+        raise ValueError(f"MCP config exceeds 256 KiB: {config_path}")
 
     with config_path.open() as f:
         raw = json.load(f)
 
+    if not isinstance(raw, dict):
+        raise ValueError(f"MCP config must be an object: {config_path}")
+    if "mcpServers" in raw:
+        wrapped = raw["mcpServers"]
+        if not isinstance(wrapped, dict):
+            raise ValueError(f"mcpServers must be an object: {config_path}")
+        raw = wrapped
+
     servers = {}
     for name, data in raw.items():
-        if isinstance(data, dict) and ("command" in data or "url" in data):
-            servers[name] = MCPServerConfig.from_dict(name, data)
+        if not isinstance(name, str) or not MCP_SERVER_NAME.fullmatch(name):
+            raise ValueError(f"invalid MCP server name: {name!r}")
+        if not isinstance(data, dict):
+            raise ValueError(f"MCP server {name!r} must be an object")
+        resolved_name = f"{namespace}__{name}" if namespace else name
+        servers[resolved_name] = MCPServerConfig.from_dict(
+            resolved_name,
+            data,
+            cwd=str(cwd) if cwd is not None else "",
+            environment=environment,
+        )
     return servers
+
+
+def load_mcp_server_sources(
+    sources: list[MCPConfigSource],
+) -> dict[str, MCPServerConfig]:
+    merged: dict[str, MCPServerConfig] = {}
+    for source in sources:
+        loaded = load_mcp_servers(
+            source.path,
+            namespace=source.namespace,
+            cwd=source.cwd,
+            environment=dict(source.environment),
+        )
+        duplicates = sorted(merged.keys() & loaded.keys())
+        if duplicates:
+            raise ValueError("duplicate MCP server name(s): " + ", ".join(duplicates))
+        merged.update(loaded)
+    return merged
 
 
 def save_mcp_servers(
@@ -183,6 +255,7 @@ def save_mcp_servers(
             "transport": config.transport,
             "url": config.url,
             "headers": config.headers or {},
+            **({"cwd": config.cwd} if config.cwd else {}),
         }
         for name, config in sorted(servers.items())
     }
@@ -208,3 +281,34 @@ def save_mcp_servers(
 def expand_env_vars(value: str) -> str:
     """Expand ${VAR} and $VAR in strings."""
     return os.path.expandvars(value)
+
+
+def _validate_server_data(name: str, data: dict[str, Any]) -> None:
+    transport = data.get("transport", "stdio")
+    if transport not in {"stdio", "http", "sse", "websocket"}:
+        raise ValueError(f"Unknown MCP transport: {transport}")
+    command = data.get("command", "")
+    url = data.get("url", "")
+    args = data.get("args", [])
+    env = data.get("env", {})
+    headers = data.get("headers", {})
+    cwd = data.get("cwd", "")
+    if not isinstance(command, str) or not isinstance(url, str):
+        raise ValueError(f"MCP server {name!r} command and url must be strings")
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        raise ValueError(f"MCP server {name!r} args must be a list of strings")
+    if not isinstance(env, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in env.items()
+    ):
+        raise ValueError(f"MCP server {name!r} env must contain string values")
+    if not isinstance(headers, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in headers.items()
+    ):
+        raise ValueError(f"MCP server {name!r} headers must contain string values")
+    if not isinstance(cwd, str):
+        raise ValueError(f"MCP server {name!r} cwd must be a string")
+    if transport == "stdio" and not command:
+        raise ValueError(f"stdio MCP server {name!r} requires a command")
+    if transport != "stdio" and not url:
+        raise ValueError(f"{transport} MCP server {name!r} requires a url")

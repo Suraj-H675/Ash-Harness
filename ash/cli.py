@@ -2241,6 +2241,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error loading hooks: {exc}", file=sys.stderr)
         return 2
 
+    from mcp.server import MCPConfigSource, load_mcp_server_sources
+
+    mcp_sources: list[MCPConfigSource] = []
+    if workspace_trusted:
+        mcp_sources.append(MCPConfigSource(config.workspace_root / ".mcp.json"))
+    mcp_sources.extend(
+        MCPConfigSource(
+            path=path,
+            namespace=plugin.manifest.name,
+            cwd=plugin.root,
+            environment=(("ASH_PLUGIN_ROOT", str(plugin.root)),),
+        )
+        for plugin in active_plugins
+        for path in plugin.mcp_paths()
+    )
+    try:
+        mcp_configs = load_mcp_server_sources(mcp_sources)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Error loading MCP servers: {exc}", file=sys.stderr)
+        return 2
+
     loop = AshLoop(
         session_store=session_store,
         provider=provider,
@@ -2254,9 +2275,7 @@ def main(argv: list[str] | None = None) -> int:
         config=config,
         max_steering_messages=config.steering_queue_limit,
         safety_tier=config.safety_tier,
-        mcp_config_path=(
-            config.workspace_root / ".mcp.json" if workspace_trusted else None
-        ),
+        mcp_configs=mcp_configs,
         enable_semantic_memory=config.memory_backend != "off",
         memory_backend=config.memory_backend,
         embedding_provider=config.embedding_provider,

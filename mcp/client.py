@@ -74,6 +74,7 @@ class MCPClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            cwd=self.config.resolved_cwd,
             **process_group_options(),
         )
         self._reader_task = asyncio.create_task(self._read_stdio())
