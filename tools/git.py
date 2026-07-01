@@ -9,18 +9,22 @@ the model finishes a turn (and any tools ran).
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 from pydantic import BaseModel, Field
 
+from core.redaction import find_secret_candidates
 from safety.guard import SafetyGuard
 from tools.base import BaseTool, ToolResult, count_output_tokens
 
 
 DEFAULT_COMMIT_AUTHOR = "ash <ash@local>"
 DEFAULT_GIT_OUTPUT_LIMIT = 100_000
+MAX_SECRET_FINDINGS = 20
+_DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
 class GitStatusArgs(BaseModel):
@@ -199,6 +203,48 @@ class AutoCommitTool(BaseTool):
                 output="No changes to commit.",
                 token_count=0,
             )
+        scan_code, scan_stdout, scan_stderr = await _run_git(
+            workspace_root,
+            [
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-color",
+                "--unified=0",
+                "--",
+                *resolved_paths,
+            ],
+        )
+        if scan_code != 0:
+            return ToolResult(
+                success=False,
+                output=scan_stdout,
+                error=_format_git_failure(
+                    "git diff for secret scan",
+                    scan_code,
+                    scan_stdout,
+                    scan_stderr,
+                ),
+            )
+        secret_findings = _scan_added_secret_findings(scan_stdout)
+        if secret_findings:
+            rendered = ", ".join(
+                f"{location} ({kind})"
+                for location, kind in secret_findings[:MAX_SECRET_FINDINGS]
+            )
+            suffix = (
+                f", and {len(secret_findings) - MAX_SECRET_FINDINGS} more"
+                if len(secret_findings) > MAX_SECRET_FINDINGS
+                else ""
+            )
+            return ToolResult(
+                success=False,
+                output="Changes remain staged for inspection.",
+                error=(
+                    "Potential secret detected in staged additions; commit refused: "
+                    f"{rendered}{suffix}"
+                ),
+            )
 
         commit_code, commit_stdout, commit_stderr = await _run_git(
             workspace_root,
@@ -280,6 +326,32 @@ def _format_git_failure(
     if stdout.strip():
         parts.append(f"stdout:\n{stdout.strip()}")
     return "\n".join(parts)
+
+
+def _scan_added_secret_findings(diff: str) -> list[tuple[str, str]]:
+    findings: list[tuple[str, str]] = []
+    path = "(unknown path)"
+    new_line = 0
+    in_hunk = False
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            raw_path = line[4:]
+            path = raw_path[2:] if raw_path.startswith("b/") else raw_path
+            continue
+        hunk = _DIFF_HUNK.match(line)
+        if hunk is not None:
+            new_line = int(hunk.group(1))
+            in_hunk = True
+            continue
+        if not in_hunk or line.startswith("\\"):
+            continue
+        if line.startswith("+"):
+            for finding in find_secret_candidates(line[1:]):
+                findings.append((f"{path}:{new_line}", finding.kind))
+            new_line += 1
+        elif not line.startswith("-"):
+            new_line += 1
+    return findings
 
 
 async def _git_result(cwd: Path, args: Sequence[str]) -> ToolResult:

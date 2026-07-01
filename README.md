@@ -101,6 +101,9 @@ denial (`x`), and an explicit argv-prefix project rule for simple commands
 command-prefix rule and continue to require exact approval. Persisted
 allow/ask/deny rules use stable IDs and can be listed or removed with
 `ash permissions`; deny rules take precedence over ask and allow rules.
+Ash auto-commit scans staged added lines for high-confidence credentials and
+private keys, refuses the commit without echoing values, and leaves changes
+staged for inspection.
 Use `ash plans list`, `ash plans show <sprint-id>`, and
 `ash plans update <sprint-id> <item> <status>` to inspect or update persisted
 checklists outside the REPL.

@@ -157,7 +157,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Symbol/code search | Verified locally | Read-only `find_symbol` and `find_references` tools use the incremental Tree-sitter index, exact locations, case controls, globs, and bounded results |
 | Shell execution | Verified locally | Foreground and managed background commands share fail-closed sandbox injection, process-tree termination, and child env scrubbing; foreground stdout/stderr stream as call-correlated, incrementally redacted, bounded events through inline TUI, viewport, SDK, and stream-JSON surfaces |
 | Git status/diff/log | Verified locally | Read-only bounded Git inspection tools |
-| Git commit | Verified locally | Explicit staging scope is required, unrelated pre-staged paths are refused, and Git hook/stdout/stderr failures are surfaced with exit codes |
+| Git commit | Verified locally | Explicit staging scope is required, unrelated pre-staged paths are refused, staged additions are secret-scanned, and Git hook/stdout/stderr failures are surfaced with exit codes |
 | Tests/build/lint diagnostics | Partial | Parse diagnostics and feed concise structured failures |
 | Web fetch/search | Partial | Guarded HTTP(S) `web_fetch` includes optional domain allowlist; search and citation workflow remain |
 | Ask-user tool | Verified locally | Typed blocking question with bounded options and explicit empty-answer failure |
@@ -179,7 +179,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Network isolation | Verified locally | Bubblewrap network namespace, macOS profile rules, and Docker `none` networking default to blocked; `web_fetch` separately enforces public-host validation and optional domains |
 | Environment scrubbing | Partial | Child processes receive a scrubbed operational env and tool outputs are redacted; explicit secret allowlist remains |
 | Prompt-injection isolation | Partial | Untrusted content provenance and tool-policy enforcement |
-| Secret scanning/redaction | Partial | Runtime logs, persisted messages/tool calls, tool output, and exports are redacted; pre-commit scanning remains |
+| Secret scanning/redaction | Verified locally | Runtime logs, persisted messages/tool calls, tool output, and exports are redacted; auto-commit blocks high-confidence secrets in staged additions without echoing values |
 | Audit log | Partial | Tool approvals, blocks, and outcomes are persisted with a tamper-evident hash chain plus CLI list/verify/export; broader non-tool decision coverage remains |
 | Enterprise policy layers | Missing | System/admin policy that lower scopes cannot override |
 

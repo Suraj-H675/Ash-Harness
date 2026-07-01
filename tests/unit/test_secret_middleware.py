@@ -1,6 +1,11 @@
 import pytest
 
-from core.redaction import StreamingRedactor, redact_text, redact_value
+from core.redaction import (
+    StreamingRedactor,
+    find_secret_candidates,
+    redact_text,
+    redact_value,
+)
 from core.secret_middleware import SecretRedactionMiddleware
 from tools.base import ToolResult
 
@@ -43,3 +48,30 @@ def test_streaming_redactor_withholds_unbounded_tokens() -> None:
     assert emitted == "[long unbroken output token withheld]"
     assert redactor.feed("still-hidden ") == ""
     assert redactor.feed("safe\n") == "safe\n"
+
+
+def test_secret_candidate_scanner_reports_kinds_without_values() -> None:
+    private_key = "-----BEGIN PRIVATE KEY-----"
+    provider_key = "sk-proj-abcdefghijklmnopqrstuvwxyz"
+    findings = find_secret_candidates(
+        f"{private_key}\nOPENAI_API_KEY={provider_key}\npassword=hunter2-secret"
+    )
+
+    assert [(finding.kind, finding.line_number) for finding in findings] == [
+        ("private key", 1),
+        ("provider API key", 2),
+        ("secret assignment", 2),
+        ("secret assignment", 3),
+    ]
+    assert provider_key not in repr(findings)
+
+
+def test_secret_candidate_scanner_ignores_placeholders() -> None:
+    assert (
+        find_secret_candidates(
+            'api_key="your_api_key_here"\n'
+            'password="EXAMPLE_PASSWORD"\n'
+            'auth_token="${AUTH_TOKEN}"'
+        )
+        == ()
+    )

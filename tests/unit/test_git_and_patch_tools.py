@@ -178,3 +178,27 @@ async def test_auto_commit_surfaces_hook_failure_output(tmp_path: Path) -> None:
     assert result.success is False
     assert "git commit failed with exit code" in (result.error or "")
     assert "hook failed" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_auto_commit_refuses_staged_secret_without_echoing_value(
+    tmp_path: Path,
+) -> None:
+    await _init_repo(tmp_path)
+    target = tmp_path / "config.env"
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz"
+    target.write_text(f"OPENAI_API_KEY={secret}\n")
+
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run(
+        message="unsafe secret",
+        paths=["config.env"],
+    )
+
+    assert result.success is False
+    assert "Potential secret detected" in (result.error or "")
+    assert "config.env:1" in (result.error or "")
+    assert "provider API key" in (result.error or "")
+    assert secret not in (result.error or "")
+    assert result.output == "Changes remain staged for inspection."
+    status = await GitStatusTool(SafetyGuard(tmp_path)).run()
+    assert "A  config.env" in status.output
