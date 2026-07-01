@@ -42,6 +42,15 @@ class ApplyPatchTool(BaseTool):
                 success=True,
                 output=f"Patch is valid for {len(paths)} file(s); no files changed.",
             )
+        try:
+            for path in paths:
+                self.safety_guard.validate_mutation_path(path)
+        except SafetyViolation as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Patch path changed after validation: {exc}",
+            )
         applied = await _git_apply(
             self.safety_guard.project_root, args.patch, check=False
         )
@@ -71,13 +80,13 @@ def extract_patch_paths(patch: str, guard: SafetyGuard) -> set[str]:
                 raise ValueError("unsupported diff header")
             for item in parts[2:]:
                 normalized = _normalize_patch_path(item)
-                guard.validate_path(normalized)
+                guard.validate_mutation_path(normalized)
                 paths.add(normalized)
             continue
         if not candidate or candidate == "/dev/null":
             continue
         normalized = _normalize_patch_path(candidate)
-        guard.validate_path(normalized)
+        guard.validate_mutation_path(normalized)
         paths.add(normalized)
     if not paths:
         raise ValueError("no file paths were found")

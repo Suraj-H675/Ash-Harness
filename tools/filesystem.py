@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import difflib
 import hashlib
-import os
-import tempfile
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from safety.guard import SafetyGuard
+from safety.scoped_io import (
+    ScopedFileChanged,
+    ScopedIOError,
+    atomic_write_scoped_text,
+    read_scoped_bytes,
+)
 from tools.base import BaseTool, ToolResult, count_output_tokens
 
 
@@ -130,7 +134,7 @@ class ReadFileTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ReadFileArgs(**kwargs)
-        resolved_path = self.safety_guard.validate_path(args.file_path)
+        resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
 
         if not resolved_path.exists():
             return ToolResult(
@@ -142,10 +146,21 @@ class ReadFileTool(BaseTool):
             return ToolResult(
                 success=False, output="", error=f"Error: Not a file: {args.file_path}"
             )
-        if _is_binary_file(resolved_path):
+        try:
+            _, raw_content = read_scoped_bytes(resolved_path, self.safety_guard)
+        except (OSError, ScopedIOError) as exc:
+            return ToolResult(success=False, output="", error=f"Error: {exc}")
+        if _is_binary_content(raw_content):
             return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
 
-        original_text = resolved_path.read_text(encoding="utf-8")
+        try:
+            original_text = raw_content.decode("utf-8")
+        except UnicodeDecodeError:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Error: File is not valid UTF-8 text.",
+            )
         lines = original_text.splitlines()
         if args.end_line is not None and args.end_line < args.start_line:
             return ToolResult(
@@ -189,20 +204,22 @@ class WriteFileTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = WriteFileArgs(**kwargs)
-        resolved_path = self.safety_guard.validate_path(args.file_path)
+        resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
 
         if resolved_path.exists() and not args.overwrite:
             return ToolResult(success=False, output="", error=EXISTS_ERROR)
 
-        error = _prepare_atomic_text_write(
-            resolved_path,
-            safety_guard=self.safety_guard,
-            display_path=args.file_path,
-        )
-        if error is not None:
-            return ToolResult(success=False, output="", error=error)
-
-        _atomic_write_text(resolved_path, args.content)
+        try:
+            atomic_write_scoped_text(
+                resolved_path,
+                args.content,
+                self.safety_guard,
+                overwrite=args.overwrite,
+            )
+        except FileExistsError:
+            return ToolResult(success=False, output="", error=EXISTS_ERROR)
+        except (OSError, ScopedIOError) as exc:
+            return ToolResult(success=False, output="", error=f"Error: {exc}")
         return ToolResult(
             success=True,
             output=f"Wrote {len(args.content)} characters to {resolved_path}.",
@@ -223,7 +240,7 @@ class ReplaceFileContentTool(BaseTool):
                 success=False, output="", error="Error: end_line must be >= start_line."
             )
 
-        resolved_path = self.safety_guard.validate_path(args.file_path)
+        resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
         if not resolved_path.exists():
             return ToolResult(
                 success=False,
@@ -234,10 +251,21 @@ class ReplaceFileContentTool(BaseTool):
             return ToolResult(
                 success=False, output="", error=f"Error: Not a file: {args.file_path}"
             )
-        if _is_binary_file(resolved_path):
+        try:
+            _, raw_content = read_scoped_bytes(resolved_path, self.safety_guard)
+        except (OSError, ScopedIOError) as exc:
+            return ToolResult(success=False, output="", error=f"Error: {exc}")
+        if _is_binary_content(raw_content):
             return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
 
-        original_text = resolved_path.read_text(encoding="utf-8")
+        try:
+            original_text = raw_content.decode("utf-8")
+        except UnicodeDecodeError:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Error: File is not valid UTF-8 text.",
+            )
         actual_sha256 = _sha256_text(original_text)
         stale_error = _validate_expected_sha256(args.expected_sha256, actual_sha256)
         if stale_error is not None:
@@ -273,7 +301,22 @@ class ReplaceFileContentTool(BaseTool):
         replacement_lines = replacement.splitlines(keepends=True)
         new_text = "".join(lines[:start_index] + replacement_lines + lines[end_index:])
 
-        _atomic_write_text(resolved_path, new_text)
+        try:
+            atomic_write_scoped_text(
+                resolved_path,
+                new_text,
+                self.safety_guard,
+                overwrite=True,
+                expected_sha256=actual_sha256,
+            )
+        except ScopedFileChanged:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Error: File changed during edit. Read it again before editing.",
+            )
+        except (OSError, ScopedIOError) as exc:
+            return ToolResult(success=False, output="", error=f"Error: {exc}")
         return ToolResult(
             success=True,
             output=(
@@ -292,7 +335,7 @@ class ReplaceFileEditsTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ReplaceFileEditsArgs(**kwargs)
-        resolved_path = self.safety_guard.validate_path(args.file_path)
+        resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
         if not resolved_path.exists():
             return ToolResult(
                 success=False,
@@ -303,10 +346,21 @@ class ReplaceFileEditsTool(BaseTool):
             return ToolResult(
                 success=False, output="", error=f"Error: Not a file: {args.file_path}"
             )
-        if _is_binary_file(resolved_path):
+        try:
+            _, raw_content = read_scoped_bytes(resolved_path, self.safety_guard)
+        except (OSError, ScopedIOError) as exc:
+            return ToolResult(success=False, output="", error=f"Error: {exc}")
+        if _is_binary_content(raw_content):
             return ToolResult(success=False, output="", error=BINARY_FILE_ERROR)
 
-        original_text = resolved_path.read_text(encoding="utf-8")
+        try:
+            original_text = raw_content.decode("utf-8")
+        except UnicodeDecodeError:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Error: File is not valid UTF-8 text.",
+            )
         actual_sha256 = _sha256_text(original_text)
         stale_error = _validate_expected_sha256(args.expected_sha256, actual_sha256)
         if stale_error is not None:
@@ -350,7 +404,22 @@ class ReplaceFileEditsTool(BaseTool):
             new_lines[edit.start_line - 1 : edit.end_line] = replacement.splitlines(
                 keepends=True
             )
-        _atomic_write_text(resolved_path, "".join(new_lines))
+        try:
+            atomic_write_scoped_text(
+                resolved_path,
+                "".join(new_lines),
+                self.safety_guard,
+                overwrite=True,
+                expected_sha256=actual_sha256,
+            )
+        except ScopedFileChanged:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Error: File changed during edit. Read it again before editing.",
+            )
+        except (OSError, ScopedIOError) as exc:
+            return ToolResult(success=False, output="", error=f"Error: {exc}")
         return ToolResult(
             success=True,
             output=f"Applied {len(args.edits)} edits to {resolved_path}.",
@@ -368,17 +437,16 @@ class WholeEditTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = WholeEditArgs(**kwargs)
-        resolved_path = self.safety_guard.validate_path(args.file_path)
-
-        error = _prepare_atomic_text_write(
-            resolved_path,
-            safety_guard=self.safety_guard,
-            display_path=args.file_path,
-        )
-        if error is not None:
-            return ToolResult(success=False, output="", error=error)
-
-        _atomic_write_text(resolved_path, args.content)
+        resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
+        try:
+            atomic_write_scoped_text(
+                resolved_path,
+                args.content,
+                self.safety_guard,
+                overwrite=True,
+            )
+        except (OSError, ScopedIOError) as exc:
+            return ToolResult(success=False, output="", error=f"Error: {exc}")
         return ToolResult(
             success=True,
             output=f"Whole-edit applied to {resolved_path} ({len(args.content)} chars).",
@@ -401,9 +469,8 @@ async def replace_file_edits(safety_guard: SafetyGuard, **kwargs: Any) -> ToolRe
     return await ReplaceFileEditsTool(safety_guard).run(**kwargs)
 
 
-def _is_binary_file(path: Path) -> bool:
-    with path.open("rb") as file:
-        return b"\x00" in file.read(BINARY_DETECTION_BYTES)
+def _is_binary_content(content: bytes) -> bool:
+    return b"\x00" in content[:BINARY_DETECTION_BYTES]
 
 
 def _normalize_line_endings(content: str) -> str:
@@ -481,41 +548,3 @@ def _build_mismatch_error(expected: str, actual: str) -> str:
         )
     )
     return f"Error: target_content does not match the specified line range.\n{diff}"
-
-
-def _prepare_atomic_text_write(
-    path: Path,
-    *,
-    safety_guard: SafetyGuard,
-    display_path: str,
-) -> str | None:
-    parent = path.parent
-    safety_guard.validate_path(parent)
-    parent.mkdir(parents=True, exist_ok=True)
-
-    if path.exists() and not os.access(path, os.W_OK):
-        return f"Error: File is not writable: {display_path}"
-    if not os.access(parent, os.W_OK):
-        return f"Error: Directory is not writable: {parent}"
-    return None
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            newline="",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temp_file:
-            temp_file.write(content)
-            temp_path = Path(temp_file.name)
-
-        os.replace(temp_path, path)
-    finally:
-        if temp_path is not None and temp_path.exists():
-            temp_path.unlink()

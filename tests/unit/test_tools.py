@@ -165,11 +165,128 @@ async def test_write_file_atomic_write_preserves_exact_newlines(
 
 
 @pytest.mark.asyncio
+async def test_read_file_reports_invalid_utf8_without_traceback(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    (project_root / "legacy.txt").write_bytes(b"valid prefix\xff")
+
+    result = await ReadFileTool(guard).run(file_path="legacy.txt")
+
+    assert result.success is False
+    assert result.error == "Error: File is not valid UTF-8 text."
+
+
+@pytest.mark.asyncio
 async def test_write_file_blocks_paths_outside_project(
     guard: SafetyGuard,
 ) -> None:
     with pytest.raises(SafetyViolation):
         await WriteFileTool(guard).run(file_path="../outside.txt", content="nope")
+
+
+@pytest.mark.asyncio
+async def test_write_file_does_not_clobber_file_created_during_write(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import filesystem
+
+    target = project_root / "new.txt"
+    real_write = filesystem.atomic_write_scoped_text
+
+    def racing_write(*args, **kwargs):
+        target.write_text("created concurrently", encoding="utf-8")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(filesystem, "atomic_write_scoped_text", racing_write)
+    result = await WriteFileTool(guard).run(file_path="new.txt", content="agent")
+
+    assert result.success is False
+    assert result.error == EXISTS_ERROR
+    assert target.read_text(encoding="utf-8") == "created concurrently"
+
+
+@pytest.mark.asyncio
+async def test_write_file_blocks_parent_symlink_swap_race(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = project_root / "src"
+    parent.mkdir()
+    outside = project_root.parent / "outside"
+    outside.mkdir()
+    original_validate = guard.validate_mutation_path
+    calls = 0
+
+    def racing_validate(path):
+        nonlocal calls
+        result = original_validate(path)
+        calls += 1
+        if calls == 3:
+            parent.rename(project_root / "src-original")
+            try:
+                parent.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"Symlink creation is unavailable: {exc}")
+        return result
+
+    monkeypatch.setattr(guard, "validate_mutation_path", racing_validate)
+    result = await WriteFileTool(guard).run(file_path="src/new.txt", content="agent")
+
+    assert result.success is False
+    assert not (outside / "new.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_edit_detects_file_change_during_atomic_write(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import filesystem
+
+    target = project_root / "doc.txt"
+    target.write_text("old\n", encoding="utf-8")
+    real_write = filesystem.atomic_write_scoped_text
+
+    def racing_write(*args, **kwargs):
+        target.write_text("concurrent\n", encoding="utf-8")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(filesystem, "atomic_write_scoped_text", racing_write)
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        start_line=1,
+        end_line=1,
+        target_content="old",
+        replacement_content="new",
+    )
+
+    assert result.success is False
+    assert "changed during edit" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == "concurrent\n"
+
+
+@pytest.mark.asyncio
+async def test_atomic_overwrite_preserves_executable_mode(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "script.sh"
+    target.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    target.chmod(0o755)
+
+    result = await WriteFileTool(guard).run(
+        file_path="script.sh",
+        content="#!/bin/sh\nexit 0\n",
+        overwrite=True,
+    )
+
+    assert result.success is True
+    assert target.stat().st_mode & 0o777 == 0o755
 
 
 @pytest.mark.asyncio
