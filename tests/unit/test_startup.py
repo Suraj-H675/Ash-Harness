@@ -55,3 +55,19 @@ assert ash.tools.__name__ == 'tools'
         timeout=10,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_direct_legacy_submodule_import_remains_compatible() -> None:
+    script = """
+import ash.tools.command
+import tools.command
+assert ash.tools.command is tools.command
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
