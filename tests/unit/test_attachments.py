@@ -52,6 +52,19 @@ def test_mentions_reject_escape_binary_sensitive_and_oversized_paths(
         expand_file_mentions("@large.txt", guard)
 
 
+def test_mentions_reject_in_scope_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("content", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        expand_file_mentions("@link.txt", SafetyGuard(tmp_path))
+
+
 def test_workspace_path_completer_handles_files_spaces_and_directories(
     tmp_path: Path,
 ) -> None:

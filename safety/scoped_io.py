@@ -43,6 +43,63 @@ def read_scoped_bytes(path: str | Path, guard: SafetyGuard) -> tuple[Path, bytes
     return target, _fallback_read(target, guard)
 
 
+def list_scoped_directory(
+    path: str | Path,
+    guard: SafetyGuard,
+) -> tuple[Path, list[tuple[str, bool]]]:
+    """List names and directory flags without following workspace links."""
+
+    target = guard.validate_mutation_path(path)
+    if _supports_anchored_io():
+        if target == guard.project_root:
+            flags = (
+                os.O_RDONLY
+                | _flag("O_DIRECTORY")
+                | _flag("O_CLOEXEC")
+                | _flag("O_NOFOLLOW")
+            )
+            directory_fd = os.open(guard.project_root, flags)
+        else:
+            with _open_parent(target, guard, create=False) as (parent_fd, name):
+                flags = (
+                    os.O_RDONLY
+                    | _flag("O_DIRECTORY")
+                    | _flag("O_CLOEXEC")
+                    | _flag("O_NOFOLLOW")
+                )
+                try:
+                    directory_fd = os.open(name, flags, dir_fd=parent_fd)
+                except OSError as exc:
+                    raise _scoped_open_error(target, exc) from exc
+        try:
+            entries: list[tuple[str, bool]] = []
+            for name in os.listdir(directory_fd):
+                metadata = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                entries.append((name, stat.S_ISDIR(metadata.st_mode)))
+            return target, entries
+        finally:
+            os.close(directory_fd)
+
+    before = _fallback_identity(target)
+    assert before is not None
+    if not stat.S_ISDIR(before.st_mode):
+        raise ScopedIOError(f"not a directory: {target}")
+    entries = [
+        (entry.name, entry.is_dir(follow_symlinks=False))
+        for entry in os.scandir(target)
+    ]
+    guard.validate_mutation_path(target)
+    after = _fallback_identity(target)
+    assert after is not None
+    if not _same_snapshot(before, after):
+        raise ScopedFileChanged(f"directory changed while listing: {target}")
+    return target, entries
+
+
 def atomic_write_scoped_text(
     path: str | Path,
     content: str,

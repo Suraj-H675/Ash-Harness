@@ -9,6 +9,7 @@ from safety.guard import SafetyGuard, SafetyViolation
 from safety.scoped_io import (
     ScopedFileChanged,
     atomic_write_scoped_text,
+    list_scoped_directory,
     read_scoped_bytes,
 )
 
@@ -81,3 +82,19 @@ def test_fallback_no_overwrite_is_atomic(tmp_path) -> None:
         )
 
     assert target.read_text(encoding="utf-8") == "existing"
+
+
+def test_scoped_directory_listing_does_not_follow_child_links(tmp_path) -> None:
+    (tmp_path / "folder").mkdir()
+    (tmp_path / "file.txt").write_text("x", encoding="utf-8")
+    link = tmp_path / "linked-folder"
+    try:
+        link.symlink_to(tmp_path / "folder", target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+
+    _, entries = list_scoped_directory(tmp_path, SafetyGuard(tmp_path))
+
+    assert ("folder", True) in entries
+    assert ("file.txt", False) in entries
+    assert ("linked-folder", False) in entries

@@ -7,7 +7,8 @@ import re
 from pathlib import Path
 
 from safety.guard import SafetyGuard, SafetyViolation
-from tools.filesystem import _is_binary_file
+from safety.scoped_io import list_scoped_directory, read_scoped_bytes
+from tools.filesystem import _is_binary_content
 
 
 MENTION_PATTERN = re.compile(r"@(?:\"([^\"]+)\"|'([^']+)'|([^\s]+))")
@@ -38,7 +39,7 @@ def expand_file_mentions(prompt: str, guard: SafetyGuard) -> str:
     for match in MENTION_PATTERN.finditer(prompt):
         raw_path = next(group for group in match.groups() if group is not None)
         try:
-            path = guard.validate_path(raw_path)
+            path = guard.validate_mutation_path(raw_path)
         except SafetyViolation as exc:
             raise ValueError(f"Invalid attachment @{raw_path}: {exc}") from exc
         if not path.exists():
@@ -51,28 +52,40 @@ def expand_file_mentions(prompt: str, guard: SafetyGuard) -> str:
         attached.add(path)
         relative = path.relative_to(guard.project_root).as_posix()
         if path.is_dir():
-            entries = sorted(path.iterdir(), key=lambda item: item.name.casefold())
+            try:
+                _, entries = list_scoped_directory(path, guard)
+            except OSError as exc:
+                raise ValueError(
+                    f"Cannot safely list attachment @{raw_path}: {exc}"
+                ) from exc
+            entries.sort(key=lambda item: item[0].casefold())
             truncated = len(entries) > MAX_DIRECTORY_ENTRIES
             lines = [
-                f"{item.name}{'/' if item.is_dir() else ''}"
-                for item in entries[:MAX_DIRECTORY_ENTRIES]
+                f"{name}{'/' if is_directory else ''}"
+                for name, is_directory in entries[:MAX_DIRECTORY_ENTRIES]
             ]
             if truncated:
                 lines.append("[directory listing truncated]")
             content = "\n".join(lines)
             kind = "directory"
         elif path.is_file():
-            if path.stat().st_size > MAX_ATTACHMENT_BYTES:
+            try:
+                _, raw_content = read_scoped_bytes(path, guard)
+            except OSError as exc:
+                raise ValueError(
+                    f"Cannot safely read attachment @{raw_path}: {exc}"
+                ) from exc
+            if len(raw_content) > MAX_ATTACHMENT_BYTES:
                 raise ValueError(
                     f"Attachment @{raw_path} exceeds {MAX_ATTACHMENT_BYTES} bytes"
                 )
-            if _is_binary_file(path):
+            if _is_binary_content(raw_content):
                 raise ValueError(
                     f"Attachment @{raw_path} is binary; image/binary attachments "
                     "require a multimodal model path"
                 )
             try:
-                content = path.read_text(encoding="utf-8")
+                content = raw_content.decode("utf-8")
             except UnicodeError as exc:
                 raise ValueError(f"Attachment @{raw_path} is not UTF-8 text") from exc
             kind = "file"
