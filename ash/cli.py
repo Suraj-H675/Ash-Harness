@@ -1316,14 +1316,26 @@ def main(argv: list[str] | None = None) -> int:
     permissions_clear.add_argument("--yes", action="store_true")
     permissions_clear.add_argument("--json", action="store_true")
     extensions_parser = subparsers.add_parser(
-        "extensions", help="Inspect trusted skills, plugins, and hooks"
+        "extensions", help="Inspect and manage skills, plugins, and hooks"
     )
     extensions_parser.add_argument(
-        "kind",
+        "extensions_action",
         nargs="?",
-        choices=["all", "skills", "plugins", "hooks"],
+        choices=[
+            "all",
+            "skills",
+            "plugins",
+            "hooks",
+            "install",
+            "enable",
+            "disable",
+            "uninstall",
+        ],
         default="all",
     )
+    extensions_parser.add_argument("extensions_target", nargs="?")
+    extensions_parser.add_argument("--replace", action="store_true")
+    extensions_parser.add_argument("--yes", action="store_true")
     extensions_parser.add_argument("--json", action="store_true")
     agents_parser = subparsers.add_parser(
         "agents", help="Inspect persisted subagent status and reports"
@@ -1904,17 +1916,55 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "extensions":
-        from cli.extensions import discover_extensions, render_extension_inventory
-
-        extension_config = AshConfig.load()
-        inventory = discover_extensions(extension_config.workspace_root)
-        print(
-            render_extension_inventory(
-                inventory,
-                kind=args.kind,
-                json_output=args.json,
-            )
+        from cli.extensions import (
+            discover_extensions,
+            manage_local_plugin,
+            render_extension_inventory,
+            render_plugin_action,
         )
+        from plugins.lifecycle import PluginLifecycleError
+
+        action = args.extensions_action
+        if action in {"install", "enable", "disable", "uninstall"}:
+            if not args.extensions_target:
+                print(
+                    f"Error: `ash extensions {action}` requires a target",
+                    file=sys.stderr,
+                )
+                return 2
+            if args.replace and action != "install":
+                print("Error: --replace is only valid with install", file=sys.stderr)
+                return 2
+            if args.yes and action != "uninstall":
+                print("Error: --yes is only valid with uninstall", file=sys.stderr)
+                return 2
+            try:
+                result = manage_local_plugin(
+                    action,
+                    args.extensions_target,
+                    replace=args.replace,
+                    confirmed=args.yes,
+                )
+            except (OSError, PluginLifecycleError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 2
+            print(render_plugin_action(result, json_output=args.json))
+        else:
+            if args.extensions_target or args.replace or args.yes:
+                print(
+                    "Error: inventory actions do not accept a target, --replace, or --yes",
+                    file=sys.stderr,
+                )
+                return 2
+            extension_config = AshConfig.load()
+            inventory = discover_extensions(extension_config.workspace_root)
+            print(
+                render_extension_inventory(
+                    inventory,
+                    kind=action,
+                    json_output=args.json,
+                )
+            )
         return 0
 
     if args.command == "serve":

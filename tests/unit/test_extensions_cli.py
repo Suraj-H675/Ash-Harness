@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from ash.cli import main
 from cli.extensions import discover_extensions, render_extension_inventory
 from safety.trust import set_workspace_trusted
@@ -167,3 +169,57 @@ def test_extensions_inventory_reports_invalid_lifecycle_state(
     inventory = discover_extensions(workspace)
 
     assert "invalid extension state" in inventory.errors[0]
+
+
+def test_extensions_cli_installs_disables_enables_and_uninstalls_local_plugin(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    source = tmp_path / "source"
+    _write_plugin(tmp_path, "source")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert main(["extensions", "install", str(source), "--json"]) == 0
+    installed = json.loads(capsys.readouterr().out)
+    assert installed["name"] == "source"
+    assert installed["enabled"] is True
+
+    assert main(["extensions", "disable", "source", "--json"]) == 0
+    disabled = json.loads(capsys.readouterr().out)
+    assert disabled["enabled"] is False
+    inventory = discover_extensions(workspace)
+    assert inventory.plugins[0].enabled is False
+
+    assert main(["extensions", "enable", "source", "--json"]) == 0
+    enabled = json.loads(capsys.readouterr().out)
+    assert enabled["enabled"] is True
+
+    assert main(["extensions", "uninstall", "source"]) == 2
+    assert "confirmation" in capsys.readouterr().err
+    assert main(["extensions", "uninstall", "source", "--yes", "--json"]) == 0
+    removed = json.loads(capsys.readouterr().out)
+    assert removed["removed"] is True
+    assert not (home / ".ash" / "plugins" / "source").exists()
+
+
+def test_extensions_cli_requires_management_target(capsys) -> None:
+    assert main(["extensions", "install"]) == 2
+    assert "requires a target" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["extensions", "plugins", "extra"],
+        ["extensions", "disable", "example", "--replace"],
+        ["extensions", "enable", "example", "--yes"],
+    ],
+)
+def test_extensions_cli_rejects_irrelevant_arguments(arguments, capsys) -> None:
+    assert main(arguments) == 2
+    assert "Error:" in capsys.readouterr().err

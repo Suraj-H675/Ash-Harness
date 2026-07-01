@@ -7,12 +7,20 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from plugins.lifecycle import PluginLifecycleError, load_extension_state
+from plugins.lifecycle import (
+    PluginLifecycleError,
+    install_local_plugin,
+    load_extension_state,
+    set_plugin_enabled,
+    uninstall_local_plugin,
+    user_plugin_root,
+)
 from plugins.registry import PluginCatalog
 from plugins.skills import SkillCatalog, SkillSource
 from safety.trust import canonical_workspace, is_workspace_trusted
 
 ExtensionKind = Literal["all", "skills", "plugins", "hooks"]
+PluginAction = Literal["install", "enable", "disable", "uninstall"]
 
 
 @dataclass(frozen=True)
@@ -188,6 +196,79 @@ def render_extension_inventory(
         lines.append("Errors:")
         lines.extend(f"  {error}" for error in inventory.errors)
     return "\n".join(lines)
+
+
+def manage_local_plugin(
+    action: PluginAction,
+    target: str,
+    *,
+    replace: bool = False,
+    confirmed: bool = False,
+) -> dict[str, Any]:
+    if action == "install":
+        load_extension_state()
+        installed = install_local_plugin(Path(target), replace=replace)
+        set_plugin_enabled(installed.name, enabled=True)
+        return {
+            "action": action,
+            "name": installed.name,
+            "version": installed.version,
+            "root": str(installed.root),
+            "enabled": True,
+        }
+
+    plugin = _installed_user_plugin(target)
+    if action == "enable":
+        set_plugin_enabled(target, enabled=True)
+        enabled = True
+    elif action == "disable":
+        set_plugin_enabled(target, enabled=False)
+        enabled = False
+    else:
+        uninstall_local_plugin(target, confirmed=confirmed)
+        return {
+            "action": action,
+            "name": target,
+            "version": plugin.manifest.version,
+            "root": str(plugin.root),
+            "removed": True,
+        }
+    return {
+        "action": action,
+        "name": target,
+        "version": plugin.manifest.version,
+        "root": str(plugin.root),
+        "enabled": enabled,
+    }
+
+
+def render_plugin_action(result: dict[str, Any], *, json_output: bool) -> str:
+    if json_output:
+        return json.dumps(result, sort_keys=True)
+    action = str(result["action"])
+    name = str(result["name"])
+    if action == "install":
+        return f"Installed and enabled {name} {result['version']} at {result['root']}"
+    if action == "uninstall":
+        return f"Uninstalled {name} from {result['root']}"
+    return f"{action.capitalize()}d {name}"
+
+
+def _installed_user_plugin(name: str):
+    state = load_extension_state()
+    catalog = PluginCatalog(
+        ((user_plugin_root(), "user"),),
+        disabled_plugins=state.disabled_plugins,
+    )
+    plugins = catalog.discover(include_disabled=True)
+    matched = next((plugin for plugin in plugins if plugin.manifest.name == name), None)
+    if matched is not None:
+        return matched
+    expected = user_plugin_root() / name / "plugin.json"
+    detail = catalog.errors.get(str(expected))
+    if detail:
+        raise PluginLifecycleError(f"installed plugin {name!r} is invalid: {detail}")
+    raise PluginLifecycleError(f"plugin is not installed in user scope: {name}")
 
 
 def _discover_hooks(
