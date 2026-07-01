@@ -44,7 +44,11 @@ ash                              # interactive terminal session
 ash -p "inspect and test this repo"  # one-shot prompt
 ash --ci -p "inspect only"          # no prompts; stream-json by default
 ash -p "summarize" --output-format json
-ash --session SESSION_ID         # resume a durable session
+ash -c                          # continue this project's latest session
+ash -r                          # choose from searchable project sessions
+ash -r SESSION_ID_OR_NAME       # resume an exact durable session
+ash -c --fork-session           # branch latest history under a new ID
+ash --session SESSION_ID        # legacy explicit-ID compatibility
 ash mcp add local -- python server.py
 ash trust add .                  # allow project ASH.md, skills, hooks, MCP
 ash update                       # explicitly check GitHub releases
@@ -73,6 +77,9 @@ SSE turn events at `/v1/turn/stream`; non-loopback binding requires
 
 Inside the terminal, `/help` lists session, context, model, diff, review,
 permissions, sandbox, skills, plugins, export, and diagnostic commands.
+`/resume` opens the project-scoped session picker; type to filter, use arrow
+keys to navigate, `Space` to preview, and `Enter` to resume. `/resume NAME`
+resolves an exact persisted title, while `/rename TITLE` sets that title.
 `/review` supports worktree, staged, commit, and branch-versus-base scopes.
 `/plan on` enables editable sprint plans for multi-step requests; type `e` at
 the plan prompt to revise the generated contract in `$VISUAL` or `$EDITOR`,

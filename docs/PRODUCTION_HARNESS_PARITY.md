@@ -17,7 +17,8 @@ historical intent and do not prove that a feature works.
 
 ## Public Benchmarks
 
-- Claude Code official docs: <https://code.claude.com/docs/en/overview>
+- Claude Code official docs: <https://code.claude.com/docs/en/overview>,
+  <https://code.claude.com/docs/en/sessions>
 - Codex CLI docs and source: <https://developers.openai.com/codex/cli/features>,
   <https://github.com/openai/codex>
 - Gemini CLI docs and source: <https://geminicli.com/docs/>,
@@ -86,8 +87,8 @@ Research is clean-room: proprietary or leaked source is not used.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | Durable sessions | Verified locally | SQLite schema migrations, lifecycle, integrity checks, backup, and restore |
-| Resume by ID | Verified locally | Restores existing durable sessions and reports a classified session error for missing ids |
-| Session picker/list/search | Partial | Slash and top-level cwd-scoped session list/search are verified with JSON output; full-screen picker remains |
+| Resume and continue | Verified locally | `-c` resumes the latest project session; `-r` and `/resume` accept exact IDs or case-insensitive names with ambiguity and wrong-project refusal |
+| Session picker/list/search | Verified locally | Bare `-r` and `/resume` open a searchable, keyboard-navigable, project-scoped picker with metadata-only filtering and on-demand bounded transcript preview; top-level list/search also supports JSON output ([Claude Code session behavior](https://code.claude.com/docs/en/sessions)) |
 | Session naming | Verified locally | Rename and stable persisted display names |
 | Fork session | Verified locally | New durable session from a selected message boundary |
 | Rewind conversation | Partial | Transcript rewind is durable; combined transcript-plus-file rewind remains |
