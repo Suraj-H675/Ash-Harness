@@ -259,18 +259,23 @@ def _build_tools(
 
     root = project_root if project_root is not None else safety_guard.project_root
     skill_roots: list[Path | SkillSource] = [Path.home() / ".ash" / "skills"]
+    from plugins.lifecycle import load_extension_state
     from plugins.registry import PluginCatalog
 
     plugin_roots = [(Path.home() / ".ash" / "plugins", "user")]
     if allow_project_extensions:
         skill_roots.append(root / ".ash" / "skills")
         plugin_roots.append((root / ".ash" / "plugins", "project"))
+    plugin_catalog = PluginCatalog(
+        tuple(plugin_roots),
+        disabled_plugins=load_extension_state().disabled_plugins,
+    )
     skill_roots.extend(
         SkillSource(
             paths=plugin.skill_paths(),
             namespace=plugin.manifest.name,
         )
-        for plugin in PluginCatalog(tuple(plugin_roots)).discover()
+        for plugin in plugin_catalog.discover()
     )
     catalog = SkillCatalog(tuple(skill_roots))
     tools: list[BaseTool] = [
@@ -793,20 +798,26 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 print(result.output or "No matching skills.", flush=True)
                 continue
             if command.name == "plugins":
+                from plugins.lifecycle import load_extension_state
                 from plugins.registry import PluginCatalog
                 from safety.trust import is_workspace_trusted
 
                 roots = [(Path.home() / ".ash" / "plugins", "user")]
                 if is_workspace_trusted(loop.project_root):
                     roots.append((loop.project_root / ".ash" / "plugins", "project"))
-                catalog = PluginCatalog(tuple(roots))
-                discovered = catalog.discover()
+                catalog = PluginCatalog(
+                    tuple(roots),
+                    disabled_plugins=load_extension_state().disabled_plugins,
+                )
+                discovered = catalog.discover(include_disabled=True)
                 if not discovered:
                     print("No plugins discovered.")
                 for plugin in discovered:
                     print(
                         f"{plugin.manifest.name} {plugin.manifest.version} "
-                        f"[{plugin.source}] - {plugin.manifest.description}"
+                        f"[{plugin.source}; "
+                        f"{'enabled' if plugin.enabled else 'disabled'}] - "
+                        f"{plugin.manifest.description}"
                     )
                 for path, error in catalog.errors.items():
                     print(f"Invalid plugin {path}: {error}", file=sys.stderr)

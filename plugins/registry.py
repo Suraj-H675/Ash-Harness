@@ -13,6 +13,7 @@ class DiscoveredPlugin:
     manifest: PluginManifest
     root: Path
     source: str
+    enabled: bool = True
 
     def skill_paths(self) -> tuple[Path, ...]:
         if self.manifest.skills:
@@ -30,19 +31,30 @@ class DiscoveredPlugin:
 class PluginCatalog:
     """Discover declarative plugin manifests from explicitly allowed roots."""
 
-    def __init__(self, roots: tuple[tuple[Path, str], ...]) -> None:
+    def __init__(
+        self,
+        roots: tuple[tuple[Path, str], ...],
+        *,
+        disabled_plugins: frozenset[str] = frozenset(),
+    ) -> None:
         self.roots = roots
+        self.disabled_plugins = disabled_plugins
         self.errors: dict[str, str] = {}
 
-    def discover(self) -> list[DiscoveredPlugin]:
+    def discover(self, *, include_disabled: bool = False) -> list[DiscoveredPlugin]:
         plugins: dict[str, DiscoveredPlugin] = {}
         self.errors.clear()
         for root, source in self.roots:
             if not root.is_dir():
                 continue
             for path in sorted(root.glob("*/plugin.json")):
+                if path.parent.name in self.disabled_plugins and not include_disabled:
+                    continue
                 try:
                     manifest = PluginManifest.load(path)
+                    enabled = manifest.name not in self.disabled_plugins
+                    if not enabled and not include_disabled:
+                        continue
                     _validate_manifest(manifest, path.parent)
                 except Exception as exc:  # noqa: BLE001
                     self.errors[str(path)] = str(exc)
@@ -54,7 +66,9 @@ class PluginCatalog:
                         f"{existing.root / 'plugin.json'}"
                     )
                     continue
-                plugins[manifest.name] = DiscoveredPlugin(manifest, path.parent, source)
+                plugins[manifest.name] = DiscoveredPlugin(
+                    manifest, path.parent, source, enabled
+                )
         return list(plugins.values())
 
 

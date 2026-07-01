@@ -129,3 +129,41 @@ def test_extensions_cli_reports_invalid_skill_without_hiding_valid_skills(
 
     assert [skill["name"] for skill in payload["skills"]] == ["valid"]
     assert "Invalid skill" in payload["errors"][0]
+
+
+def test_extensions_inventory_keeps_disabled_plugin_but_removes_its_skills(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    _write_plugin(home / ".ash" / "plugins", "example")
+    state_path = home / ".ash" / "extensions.json"
+    state_path.write_text(
+        json.dumps({"version": 1, "disabled_plugins": ["example"]}),
+        encoding="utf-8",
+    )
+
+    inventory = discover_extensions(workspace)
+
+    assert inventory.plugins[0].enabled is False
+    assert inventory.skills == ()
+
+
+def test_extensions_inventory_reports_invalid_lifecycle_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    state_path = home / ".ash" / "extensions.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text('{"version": 999}', encoding="utf-8")
+
+    inventory = discover_extensions(workspace)
+
+    assert "invalid extension state" in inventory.errors[0]

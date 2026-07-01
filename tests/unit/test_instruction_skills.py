@@ -1,5 +1,6 @@
 import pytest
 
+from ash.cli import _build_tools
 from plugins.skills import (
     MAX_SKILL_BYTES,
     ActivateSkillTool,
@@ -115,3 +116,29 @@ def test_instruction_skill_source_namespaces_explicit_paths(tmp_path) -> None:
     catalog = SkillCatalog((SkillSource(paths=(declared,), namespace="example"),))
 
     assert [skill.name for skill in catalog.discover()] == ["example:review"]
+
+
+@pytest.mark.asyncio
+async def test_default_tools_exclude_disabled_plugin_skills(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    plugin = home / ".ash" / "plugins" / "example"
+    skill = plugin / "skills" / "review"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Review\nReview code.\n", encoding="utf-8")
+    (plugin / "plugin.json").write_text(
+        '{"name": "example", "skills": ["skills/review/SKILL.md"]}',
+        encoding="utf-8",
+    )
+    state = home / ".ash" / "extensions.json"
+    state.write_text(
+        '{"version": 1, "disabled_plugins": ["example"]}', encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    tools = _build_tools(SafetyGuard(tmp_path), tmp_path)
+    result = await tools["list_skills"].run()
+
+    assert result.success is True
+    assert result.output == ""

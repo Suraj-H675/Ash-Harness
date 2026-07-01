@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from plugins.lifecycle import PluginLifecycleError, load_extension_state
 from plugins.registry import PluginCatalog
 from plugins.skills import SkillCatalog, SkillSource
 from safety.trust import canonical_workspace, is_workspace_trusted
@@ -29,6 +30,7 @@ class PluginSummary:
     source: str
     root: str
     skills: tuple[str, ...]
+    enabled: bool
 
 
 @dataclass(frozen=True)
@@ -69,8 +71,16 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
         plugin_roots.append((workspace / ".ash" / "plugins", "project"))
         hook_paths.append((workspace / ".ash" / "hooks.json", "project"))
 
-    plugin_catalog = PluginCatalog(tuple(plugin_roots))
-    discovered_plugins = plugin_catalog.discover()
+    state_errors: list[str] = []
+    try:
+        disabled_plugins = load_extension_state().disabled_plugins
+    except PluginLifecycleError as exc:
+        disabled_plugins = frozenset()
+        state_errors.append(str(exc))
+    plugin_catalog = PluginCatalog(
+        tuple(plugin_roots), disabled_plugins=disabled_plugins
+    )
+    discovered_plugins = plugin_catalog.discover(include_disabled=True)
     skill_roots: list[Path | SkillSource] = [user_skill_root]
     if trusted:
         skill_roots.append(workspace / ".ash" / "skills")
@@ -80,11 +90,12 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
             namespace=plugin.manifest.name,
         )
         for plugin in discovered_plugins
+        if plugin.enabled
     )
     skill_catalog = SkillCatalog(tuple(skill_roots))
     discovered_skills = skill_catalog.discover()
 
-    errors = [
+    errors = state_errors + [
         f"Invalid plugin {path}: {error}"
         for path, error in sorted(plugin_catalog.errors.items())
     ]
@@ -114,6 +125,7 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
                 source=plugin.source,
                 root=str(plugin.root),
                 skills=tuple(plugin.manifest.skills),
+                enabled=plugin.enabled,
             )
             for plugin in sorted(
                 discovered_plugins, key=lambda item: item.manifest.name
@@ -156,7 +168,8 @@ def render_extension_inventory(
     if kind in {"all", "plugins"}:
         lines.append("Plugins:")
         lines.extend(
-            f"  {plugin.name} {plugin.version} [{plugin.source}] - "
+            f"  {plugin.name} {plugin.version} [{plugin.source}; "
+            f"{'enabled' if plugin.enabled else 'disabled'}] - "
             f"{plugin.description or '(no description)'}"
             for plugin in inventory.plugins
         )

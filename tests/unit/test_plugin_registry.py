@@ -66,3 +66,16 @@ def test_plugin_skill_paths_use_declared_or_default_locations(tmp_path) -> None:
     found = PluginCatalog(((root, "user"),)).discover()
 
     assert found[0].skill_paths() == (declared,)
+
+
+def test_plugin_catalog_excludes_disabled_plugins_by_default(tmp_path) -> None:
+    root = tmp_path / "plugins"
+    plugin = root / "example"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.json").write_text(json.dumps({"name": "example"}))
+    catalog = PluginCatalog(((root, "user"),), disabled_plugins=frozenset({"example"}))
+
+    assert catalog.discover() == []
+    discovered = catalog.discover(include_disabled=True)
+    assert len(discovered) == 1
+    assert discovered[0].enabled is False
