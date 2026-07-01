@@ -166,7 +166,7 @@ Research is clean-room: proprietary or leaked source is not used.
 
 | Capability | Ash status | Required production behavior |
 |---|---|---|
-| Workspace path boundary | Partial | File tools and command effects; symlink/race-safe behavior |
+| Workspace path boundary | Verified locally | Canonical scope checks plus symlink/junction rejection; POSIX reads, directory listings, creates, no-clobber writes, edits, and patches use descriptor-anchored no-follow operations, with identity/content revalidation fallback on Windows |
 | Trusted-folder prompt | Verified locally | Project instructions, skills, hooks, plugins, and MCP are trust-gated |
 | Fine-grained policy engine | Partial | Deny-first then ask/allow precedence, mode circuit breakers, stable scoped rules, and conservative command-prefix parsing are enforced; tool-specific path/domain grammar and managed policy layers remain |
 | Approval persistence | Verified locally | Atomic mode-0600 versioned rules, version-1 migration, stable IDs, exact session/project scopes, command-prefix project scopes, scoped denial, slash/top-level inspection, removal, and clear |

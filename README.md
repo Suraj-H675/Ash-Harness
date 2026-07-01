@@ -86,6 +86,13 @@ Network fetches use the `web_fetch` tool and require normal tool approval;
 private, loopback, reserved, non-HTTP, oversized, and unsupported-content URLs
 are refused before request content reaches the model.
 
+Workspace file reads, attachments, writes, exact edits, and patches reject
+symlink/junction mutation paths. On POSIX, Ash walks from an open workspace
+descriptor with no-follow operations and performs atomic directory-anchored
+writes; the cross-platform fallback revalidates path identity and content
+before replacement. Concurrent no-overwrite creation and stale edits fail
+without clobbering the other process's data.
+
 Shell commands use a fail-closed workspace sandbox when one is available:
 Bubblewrap on Linux, `sandbox-exec` on macOS, or a verified
 `ash-sandbox:latest` Docker image (including Docker Desktop on Windows).
