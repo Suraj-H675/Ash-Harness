@@ -22,21 +22,28 @@ class InstructionSkill:
     path: Path
 
 
+@dataclass(frozen=True)
+class SkillSource:
+    paths: tuple[Path, ...]
+    namespace: str = ""
+
+
 class SkillCatalog:
-    def __init__(self, roots: tuple[Path, ...]) -> None:
-        self.roots = roots
+    def __init__(self, roots: tuple[Path | SkillSource, ...]) -> None:
+        self.sources = tuple(
+            source if isinstance(source, SkillSource) else SkillSource(paths=(source,))
+            for source in roots
+        )
         self._skills: dict[str, InstructionSkill] = {}
         self.errors: dict[str, str] = {}
 
     def discover(self) -> list[InstructionSkill]:
         discovered: dict[str, InstructionSkill] = {}
         self.errors.clear()
-        for root in self.roots:
-            if not root.is_dir():
-                continue
-            for path in sorted(root.rglob("SKILL.md")):
+        for source in self.sources:
+            for path in _skill_paths(source.paths):
                 try:
-                    skill = parse_instruction_skill(path)
+                    skill = parse_instruction_skill(path, namespace=source.namespace)
                 except (OSError, UnicodeError, ValueError) as exc:
                     self.errors[str(path)] = str(exc)
                     continue
@@ -62,7 +69,17 @@ class SkillCatalog:
         return self._skills.get(name)
 
 
-def parse_instruction_skill(path: Path) -> InstructionSkill:
+def _skill_paths(paths: tuple[Path, ...]) -> list[Path]:
+    discovered: set[Path] = set()
+    for candidate in paths:
+        if candidate.is_file() and candidate.name == "SKILL.md":
+            discovered.add(candidate)
+        elif candidate.is_dir():
+            discovered.update(candidate.rglob("SKILL.md"))
+    return sorted(discovered)
+
+
+def parse_instruction_skill(path: Path, *, namespace: str = "") -> InstructionSkill:
     if path.stat().st_size > MAX_SKILL_BYTES:
         raise ValueError("skill file exceeds 512 KiB")
     text = path.read_text(encoding="utf-8")
@@ -96,7 +113,7 @@ def parse_instruction_skill(path: Path) -> InstructionSkill:
     if not instructions:
         raise ValueError("skill instructions are empty")
     return InstructionSkill(
-        name=name,
+        name=f"{namespace}:{name}" if namespace else name,
         description=description,
         instructions=instructions,
         path=path,

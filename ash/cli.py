@@ -244,7 +244,12 @@ def _build_tools(
         WriteFileTool,
     )
     from tools.git import AutoCommitTool, GitDiffTool, GitLogTool, GitStatusTool
-    from plugins.skills import ActivateSkillTool, ListSkillsTool, SkillCatalog
+    from plugins.skills import (
+        ActivateSkillTool,
+        ListSkillsTool,
+        SkillCatalog,
+        SkillSource,
+    )
     from tools.ask_user import AskUserTool
     from tools.patch import ApplyPatchTool
     from tools.process import BackgroundProcessTool
@@ -253,7 +258,7 @@ def _build_tools(
     from tools.symbols import FindReferencesTool, FindSymbolTool
 
     root = project_root if project_root is not None else safety_guard.project_root
-    skill_roots = [Path.home() / ".ash" / "skills"]
+    skill_roots: list[Path | SkillSource] = [Path.home() / ".ash" / "skills"]
     from plugins.registry import PluginCatalog
 
     plugin_roots = [(Path.home() / ".ash" / "plugins", "user")]
@@ -261,7 +266,11 @@ def _build_tools(
         skill_roots.append(root / ".ash" / "skills")
         plugin_roots.append((root / ".ash" / "plugins", "project"))
     skill_roots.extend(
-        plugin.root for plugin in PluginCatalog(tuple(plugin_roots)).discover()
+        SkillSource(
+            paths=plugin.skill_paths(),
+            namespace=plugin.manifest.name,
+        )
+        for plugin in PluginCatalog(tuple(plugin_roots)).discover()
     )
     catalog = SkillCatalog(tuple(skill_roots))
     tools: list[BaseTool] = [

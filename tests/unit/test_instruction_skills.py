@@ -5,6 +5,7 @@ from plugins.skills import (
     ActivateSkillTool,
     ListSkillsTool,
     SkillCatalog,
+    SkillSource,
 )
 from safety.guard import SafetyGuard
 
@@ -101,3 +102,16 @@ def test_instruction_skill_discovery_rejects_oversized_file(tmp_path) -> None:
 
     assert catalog.discover() == []
     assert "exceeds 512 KiB" in catalog.errors[str(path)]
+
+
+def test_instruction_skill_source_namespaces_explicit_paths(tmp_path) -> None:
+    declared = tmp_path / "plugin" / "custom" / "review" / "SKILL.md"
+    undeclared = tmp_path / "plugin" / "private" / "hidden" / "SKILL.md"
+    declared.parent.mkdir(parents=True)
+    undeclared.parent.mkdir(parents=True)
+    declared.write_text("# Review\nReview code.\n", encoding="utf-8")
+    undeclared.write_text("# Hidden\nDo not load.\n", encoding="utf-8")
+
+    catalog = SkillCatalog((SkillSource(paths=(declared,), namespace="example"),))
+
+    assert [skill.name for skill in catalog.discover()] == ["example:review"]

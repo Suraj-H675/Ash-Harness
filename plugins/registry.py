@@ -14,6 +14,18 @@ class DiscoveredPlugin:
     root: Path
     source: str
 
+    def skill_paths(self) -> tuple[Path, ...]:
+        if self.manifest.skills:
+            return tuple(self.root / relative for relative in self.manifest.skills)
+        defaults = []
+        root_skill = self.root / "SKILL.md"
+        skill_directory = self.root / "skills"
+        if root_skill.is_file():
+            defaults.append(root_skill)
+        if skill_directory.is_dir():
+            defaults.append(skill_directory)
+        return tuple(defaults)
+
 
 class PluginCatalog:
     """Discover declarative plugin manifests from explicitly allowed roots."""
@@ -35,10 +47,14 @@ class PluginCatalog:
                 except Exception as exc:  # noqa: BLE001
                     self.errors[str(path)] = str(exc)
                     continue
-                plugins.setdefault(
-                    manifest.name,
-                    DiscoveredPlugin(manifest, path.parent, source),
-                )
+                existing = plugins.get(manifest.name)
+                if existing is not None:
+                    self.errors[str(path)] = (
+                        f"duplicate plugin name {manifest.name!r}; already provided by "
+                        f"{existing.root / 'plugin.json'}"
+                    )
+                    continue
+                plugins[manifest.name] = DiscoveredPlugin(manifest, path.parent, source)
         return list(plugins.values())
 
 

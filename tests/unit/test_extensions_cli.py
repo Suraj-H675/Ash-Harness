@@ -57,7 +57,7 @@ def test_extension_inventory_discovers_user_extensions(
 
     assert payload["project_trusted"] is False
     assert {skill["name"] for skill in payload["skills"]} == {
-        "plugin-review",
+        "example:plugin-review",
         "review",
     }
     assert payload["plugins"][0]["name"] == "example"

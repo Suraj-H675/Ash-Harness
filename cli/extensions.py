@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from plugins.registry import PluginCatalog
-from plugins.skills import SkillCatalog
+from plugins.skills import SkillCatalog, SkillSource
 from safety.trust import canonical_workspace, is_workspace_trusted
 
 ExtensionKind = Literal["all", "skills", "plugins", "hooks"]
@@ -71,10 +71,16 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
 
     plugin_catalog = PluginCatalog(tuple(plugin_roots))
     discovered_plugins = plugin_catalog.discover()
-    skill_roots = [user_skill_root]
+    skill_roots: list[Path | SkillSource] = [user_skill_root]
     if trusted:
         skill_roots.append(workspace / ".ash" / "skills")
-    skill_roots.extend(plugin.root for plugin in discovered_plugins)
+    skill_roots.extend(
+        SkillSource(
+            paths=plugin.skill_paths(),
+            namespace=plugin.manifest.name,
+        )
+        for plugin in discovered_plugins
+    )
     skill_catalog = SkillCatalog(tuple(skill_roots))
     discovered_skills = skill_catalog.discover()
 
