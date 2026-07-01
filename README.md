@@ -79,6 +79,8 @@ Inside the terminal, `/help` lists session, context, model, diff, review,
 permissions, sandbox, skills, plugins, export, and diagnostic commands.
 Prefix a command with `!` to run it through the same permission and sandbox
 policy as model tool calls while streaming bounded stdout and stderr live.
+`@path` attachments are capped at 25% of usable model input context by default;
+set `max_attachment_tokens` (or `ASH_MAX_ATTACHMENT_TOKENS`) for an explicit cap.
 `/resume` opens the project-scoped session picker; type to filter, use arrow
 keys to navigate, `Space` to preview, and `Enter` to resume. `/resume NAME`
 resolves an exact persisted title, while `/rename TITLE` sets that title.

@@ -69,7 +69,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | Token accounting | Partial | Provider usage, cached input, completion, and configured cache-aware costs are normalized and persisted; visible estimate uncertainty remains |
-| Context budget allocation | Partial | Configurable system/tool/history/repo-map/memory budgets are enforced before compaction and shown by `/context`; file attachment budgets remain |
+| Context budget allocation | Verified locally | Configurable system/tool/history/repo-map/memory budgets are enforced before compaction and shown by `/context`; text, directory, and image attachments have a model-counted combined cap that defaults to 25% of usable input context and refuses overflow without silent clipping |
 | Automatic compaction | Verified locally | Threshold-based extractive summary retains recent tool call/result pairs |
 | Manual `/compact` | Verified locally | Forces compaction while preserving the durable transcript |
 | Tool-output pruning | Verified locally | Stale large results are pruned in provider context while preserving call identity and durable data |
@@ -113,7 +113,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Configurable keybindings | Verified locally | Cross-platform newline/editor actions with collision validation |
 | Vim input mode | Verified locally | Optional Emacs or Vim prompt-toolkit editing mode |
 | External editor | Verified locally | Prompt-toolkit external-editor integration |
-| Image/file attachments | Verified locally | Scoped text/directory and bounded PNG/JPEG/GIF/WebP `@path` inputs, vision capability refusal, native Anthropic/OpenAI blocks, fixed image token estimates, and metadata-only persistence |
+| Image/file attachments | Verified locally | Scoped text/directory and bounded PNG/JPEG/GIF/WebP `@path` inputs, vision capability refusal, model-relative attachment token budgets, native Anthropic/OpenAI blocks, fixed image token estimates, and metadata-only persistence |
 | Prompt history search | Verified locally | Persistent prompt-toolkit file history and reverse search |
 | Desktop notifications | Verified locally | Opt-in completion/approval events, conservative OSC 9/BEL auto detection, tmux passthrough, TTY gating, control-character stripping, bounded optional previews, and failure isolation ([Claude Code behavior](https://code.claude.com/docs/en/terminal-config), [Codex backend](https://github.com/openai/codex/tree/main/codex-rs/tui/src/notifications)) |
 | Accessibility | Partial | Dedicated screen-reader mode forces linear non-rewriting output, inline rendering, no color/token bar, reduced motion, and a reduced-dynamic prompt; native assistive-technology runtime evidence remains |
