@@ -245,6 +245,7 @@ def _build_tools(
     agent_db_path: Path | None = None,
     allowed_web_domains: list[str] | tuple[str, ...] | None = None,
     repo_map: Any | None = None,
+    runtime_config: AshConfig | None = None,
 ) -> dict[str, Any]:
     from plugins.skills import ActivateSkillTool, ListSkillsTool, SkillCatalog
     from tools.ask_user import AskUserTool
@@ -300,6 +301,7 @@ def _build_tools(
                 safety_guard,
                 SharedState(agent_db_path),
                 provider_factory,
+                config=runtime_config,
             )
         )
     if repo_map is not None:
@@ -2029,6 +2031,7 @@ def main(argv: list[str] | None = None) -> int:
         agent_db_path=config.db_directory / "agents.db",
         allowed_web_domains=config.allowed_web_domains,
         repo_map=repo_map,
+        runtime_config=config,
     )
 
     from context.instructions import (

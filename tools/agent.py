@@ -3,24 +3,40 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from pydantic import BaseModel, Field
 
 from agents.shared_state import SharedState
 from agents.subprocess_agent import AGENT_ROLES, AgentReport, SubprocessAgent
+from agents.worktree import WorktreeError, WorktreeLease, WorktreeManager
+from core.loop import AshLoop
+from core.session import SessionStore
 from providers.base import ProviderABC
 from safety.guard import SafetyGuard
+from sandbox import SandboxManager
 from tools.base import BaseTool, ToolResult, count_output_tokens
+from ui.headless import HeadlessUI
+
+if TYPE_CHECKING:
+    from config import AshConfig
 
 
 class SpawnAgentArgs(BaseModel):
     role: str = Field("general", description=f"One of: {', '.join(AGENT_ROLES)}")
     task: str = Field(..., min_length=1, max_length=20_000)
-    agent_id: str | None = None
+    agent_id: str | None = Field(
+        None,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
     background: bool = False
+    isolation: str = Field("auto", pattern="^(auto|shared|worktree)$")
 
 
 class SpawnAgentTool(BaseTool):
@@ -35,11 +51,15 @@ class SpawnAgentTool(BaseTool):
         provider_factory: Callable[[], ProviderABC],
         *,
         max_return_chars: int = 20_000,
+        config: "AshConfig | None" = None,
+        max_turn_iterations: int = 12,
     ) -> None:
         super().__init__(safety_guard)
         self._shared_state = shared_state
         self._provider_factory = provider_factory
         self._max_return_chars = max_return_chars
+        self._config = config
+        self._max_turn_iterations = max_turn_iterations
         self._tasks: dict[str, asyncio.Task[AgentReport]] = {}
 
     async def run(self, **kwargs: Any) -> ToolResult:
@@ -52,30 +72,92 @@ class SpawnAgentTool(BaseTool):
             )
 
         agent_id = args.agent_id or f"spawned-{uuid.uuid4().hex[:8]}"
+        existing = self._shared_state.get_status(agent_id)
+        if existing is not None and existing.status in {"idle", "working"}:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Subagent {agent_id!r} is already running.",
+            )
 
-        async def provider_runner(context: dict[str, Any]) -> str:
-            provider = self._provider_factory()
-            chunks: list[str] = []
+        isolation = args.isolation
+        if isolation == "auto":
+            isolation = "worktree" if args.role in {"coder", "tester"} else "shared"
+        worker_workspace = Path(self.safety_guard.project_root)
+        worktree_manager: WorktreeManager | None = None
+        lease: WorktreeLease | None = None
+        if isolation == "worktree":
+            digest = hashlib.sha256(str(worker_workspace).encode()).hexdigest()[:12]
+            worktree_manager = WorktreeManager(
+                worker_workspace,
+                Path(self._shared_state.db_path).parent / "worktrees" / digest,
+            )
             try:
-                messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            f"You are a focused {context['role']} subagent. "
-                            "Return concise findings with concrete evidence. "
-                            "You cannot modify files or call tools in this worker."
-                        ),
-                    },
-                    {"role": "user", "content": context["task"]},
-                ]
-                async for chunk in provider.stream_chat(messages, tools=None):
-                    if chunk.content:
-                        chunks.append(chunk.content)
-                    if sum(map(len, chunks)) >= self._max_return_chars:
-                        break
-            finally:
-                await provider.aclose()
-            return "".join(chunks)[: self._max_return_chars]
+                lease = await worktree_manager.create(agent_id)
+            except WorktreeError as exc:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Could not create isolated subagent worktree: {exc}",
+                )
+            worker_workspace = lease.path
+
+        branch_state: dict[str, str | None] = {"commit": None}
+        cleanup_state = {"done": False}
+
+        async def provider_runner(context: dict[str, Any]) -> AgentReport:
+            started = datetime.now(timezone.utc)
+            artifacts: dict[str, Any] = {
+                "isolation": isolation,
+                "workspace": str(worker_workspace),
+            }
+            try:
+                summary = await self._run_worker_loop(
+                    role=context["role"],
+                    task=context["task"],
+                    workspace=worker_workspace,
+                    agent_id=context["agent_id"],
+                )
+                success = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                summary = f"Subagent failed: {exc}"
+                success = False
+            if lease is not None and worktree_manager is not None:
+                try:
+                    commit = await worktree_manager.commit_changes(
+                        lease,
+                        message=f"ash agent {agent_id}: {args.task[:120]}",
+                    )
+                except WorktreeError as exc:
+                    summary = f"{summary}\nWorktree commit failed: {exc}"
+                    success = False
+                else:
+                    branch_state["commit"] = commit
+                    if commit is not None:
+                        artifacts.update({"branch": lease.branch, "commit": commit})
+                try:
+                    await worktree_manager.remove(
+                        lease,
+                        keep_branch=branch_state["commit"] is not None,
+                    )
+                except WorktreeError as exc:
+                    summary = f"{summary}\nWorktree cleanup failed: {exc}"
+                    success = False
+                else:
+                    cleanup_state["done"] = True
+            finished = datetime.now(timezone.utc)
+            return AgentReport(
+                agent_id=context["agent_id"],
+                role=context["role"],
+                task=context["task"],
+                success=success,
+                summary=summary[: self._max_return_chars],
+                artifacts=artifacts,
+                started_at=started,
+                finished_at=finished,
+            )
 
         agent = SubprocessAgent(
             agent_id=agent_id,
@@ -85,23 +167,120 @@ class SpawnAgentTool(BaseTool):
             runner=provider_runner,
             tool_allowlist=(),
             return_budget=self._max_return_chars,
-            workspace_root=Path(self.safety_guard.project_root),
+            metadata={
+                "isolation": isolation,
+                "workspace": str(worker_workspace),
+                **({"branch": lease.branch} if lease is not None else {}),
+            },
+            workspace_root=worker_workspace,
         )
+
+        async def execute_agent() -> AgentReport:
+            try:
+                return await agent.run_in_process()
+            finally:
+                if (
+                    lease is not None
+                    and worktree_manager is not None
+                    and not cleanup_state["done"]
+                ):
+                    try:
+                        await worktree_manager.remove(
+                            lease,
+                            keep_branch=branch_state["commit"] is not None,
+                        )
+                    except WorktreeError:
+                        # Preserve the original worker failure/cancellation. The
+                        # locked worktree remains visible to `git worktree list`.
+                        pass
+
         if args.background:
-            task = asyncio.create_task(agent.run_in_process())
+            task = asyncio.create_task(execute_agent())
             self._tasks[agent_id] = task
-            task.add_done_callback(lambda _task: self._tasks.pop(agent_id, None))
+
+            def finish_background(completed: asyncio.Task[AgentReport]) -> None:
+                self._finish_background_task(agent_id, completed)
+
+            task.add_done_callback(finish_background)
             return ToolResult(
                 success=True,
                 output=f"Started subagent {agent_id} in background.",
             )
-        report = await agent.run_in_process()
+        report = await execute_agent()
+        output = report.summary
+        branch = report.artifacts.get("branch")
+        commit = report.artifacts.get("commit")
+        if branch and commit:
+            output += f"\nIsolated changes: branch={branch} commit={commit}"
         return ToolResult(
             success=report.success,
-            output=report.summary,
-            token_count=count_output_tokens(report.summary),
+            output=output,
+            token_count=count_output_tokens(output),
             error=None if report.success else report.summary,
         )
+
+    async def _run_worker_loop(
+        self,
+        *,
+        role: str,
+        task: str,
+        workspace: Path,
+        agent_id: str,
+    ) -> str:
+        provider = self._provider_factory()
+        guard = SafetyGuard(workspace)
+        sandbox = SandboxManager(
+            workspace_root=workspace,
+            network=False,
+            backend_preference=(
+                self._config.sandbox_backend if self._config is not None else "auto"
+            ),
+            docker_image=(
+                self._config.sandbox_docker_image
+                if self._config is not None
+                else "ash-sandbox:latest"
+            ),
+        )
+        tools = _worker_tools(role, guard, sandbox)
+        worker_store = SessionStore(
+            Path(self._shared_state.db_path).with_name("agent-sessions.db")
+        )
+        worker_config = (
+            self._config.model_copy(
+                update={
+                    "workspace_root": workspace,
+                    "safety_tier": "auto_approve",
+                    "enable_sprint_planning": False,
+                    "memory_backend": "off",
+                }
+            )
+            if self._config is not None
+            else None
+        )
+        instructions = (
+            f"You are Ash subagent {agent_id}, acting only as {role}. "
+            f"Your workspace is {workspace}. Use the available tools to inspect and "
+            "complete the focused task. Do not spawn other agents. Return concise "
+            "findings with file paths, commands, and test evidence."
+        )
+        loop = AshLoop(
+            session_store=worker_store,
+            provider=provider,
+            safety_guard=guard,
+            ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+            project_root=workspace,
+            tools=tools,
+            safety_tier="auto_approve",
+            system_prompt=instructions,
+            max_turn_iterations=self._max_turn_iterations,
+            config=worker_config,
+            enable_semantic_memory=False,
+        )
+        try:
+            await loop.start_session()
+            return (await loop.run_turn(task))[: self._max_return_chars]
+        finally:
+            await loop.aclose()
 
     async def aclose(self) -> None:
         tasks = list(self._tasks.values())
@@ -109,6 +288,22 @@ class SpawnAgentTool(BaseTool):
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._shared_state.close()
+
+    def _finish_background_task(
+        self,
+        agent_id: str,
+        task: asyncio.Task[AgentReport],
+    ) -> None:
+        self._tasks.pop(agent_id, None)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._shared_state.update_status(
+                agent_id,
+                "failed",
+                current_task=f"background worker failed: {error}",
+            )
 
     async def stop(self, agent_id: str) -> bool:
         task = self._tasks.get(agent_id)
@@ -131,3 +326,51 @@ class SpawnAgentTool(BaseTool):
             }
             for status in self._shared_state.list_agents()
         ]
+
+
+def _worker_tools(
+    role: str,
+    guard: SafetyGuard,
+    sandbox: SandboxManager,
+) -> dict[str, BaseTool]:
+    from tools.filesystem import (
+        ReadFileTool,
+        ReplaceFileContentTool,
+        ReplaceFileEditsTool,
+        WholeEditTool,
+        WriteFileTool,
+    )
+    from tools.git import GitDiffTool, GitLogTool, GitStatusTool
+    from tools.patch import ApplyPatchTool
+    from tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
+
+    tools: list[BaseTool] = [
+        ReadFileTool(guard),
+        ListDirectoryTool(guard),
+        GlobFilesTool(guard),
+        SearchTextTool(guard),
+        GitStatusTool(guard),
+        GitDiffTool(guard),
+        GitLogTool(guard),
+    ]
+    if role == "coder":
+        tools.extend(
+            [
+                WriteFileTool(guard),
+                ReplaceFileContentTool(guard),
+                ReplaceFileEditsTool(guard),
+                WholeEditTool(guard),
+                ApplyPatchTool(guard),
+            ]
+        )
+    if role == "tester" and sandbox.is_fully_isolated():
+        from tools.command import RunCommandTool
+
+        tools.append(
+            RunCommandTool(
+                guard,
+                project_root=guard.project_root,
+                sandbox_manager=sandbox,
+            )
+        )
+    return {tool.name: tool for tool in tools}

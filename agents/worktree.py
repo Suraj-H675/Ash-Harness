@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from sandbox.process_utils import process_group_options, terminate_process_tree
+
 
 class WorktreeError(RuntimeError):
     """A managed worktree operation could not be completed safely."""
@@ -179,8 +181,13 @@ async def _run_git(
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **process_group_options(),
     )
-    stdout, stderr = await process.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        await terminate_process_tree(process)
+        raise
     result = GitResult(
         process.returncode if process.returncode is not None else -1,
         stdout.decode("utf-8", errors="replace"),

@@ -1,5 +1,6 @@
 import pytest
 import asyncio
+import subprocess
 
 from agents.shared_state import SharedState
 from providers.base import ProviderABC, StreamChunk
@@ -49,4 +50,103 @@ async def test_background_agent_can_be_stopped(tmp_path) -> None:
     assert state.get_status("slow-worker").status == "working"
     assert await tool.stop("slow-worker") is True
     assert state.get_status("slow-worker").status == "failed"
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_coder_agent_edits_isolated_worktree_and_returns_branch(tmp_path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    (repository / "file.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+    class CodingProvider(FakeProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "write-1",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "file.txt",
+                                "content": "worker\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="implemented and verified", is_done=True)
+
+    state = SharedState(tmp_path / "state" / "agents.db")
+    tool = SpawnAgentTool(SafetyGuard(repository), state, CodingProvider)
+
+    result = await tool.run(
+        role="coder",
+        task="update file",
+        agent_id="coder-1",
+    )
+
+    assert result.success is True
+    assert "implemented and verified" in result.output
+    assert "branch=ash-agent/coder-1" in result.output
+    assert (repository / "file.txt").read_text(encoding="utf-8") == "base\n"
+    assert (
+        subprocess.run(
+            ["git", "show", "ash-agent/coder-1:file.txt"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == "worker\n"
+    )
+    report_messages = state.fetch_messages("lead", undelivered_only=False)
+    report = report_messages[-1].content
+    assert report["artifacts"]["branch"] == "ash-agent/coder-1"
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_shared_coder_requires_explicit_isolation_choice(tmp_path) -> None:
+    class InspectingProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            assert tools is not None
+            tool_names = {item["function"]["name"] for item in tools}
+            assert "write_file" in tool_names
+            assert "spawn_agent" not in tool_names
+            yield StreamChunk(content="inspected tools", is_done=True)
+
+    state = SharedState(tmp_path / "state" / "agents.db")
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, InspectingProvider)
+
+    result = await tool.run(
+        role="coder",
+        task="inspect",
+        isolation="shared",
+    )
+
+    assert result.success is True
     await tool.aclose()

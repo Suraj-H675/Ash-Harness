@@ -111,6 +111,7 @@ class AshClient:
             provider_factory=lambda: _build_provider(runtime_config),
             agent_db_path=runtime_config.db_directory / "agents.db",
             repo_map=repo_map,
+            runtime_config=runtime_config,
         )
         loop = AshLoop(
             session_store=store,
