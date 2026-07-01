@@ -24,7 +24,7 @@ def test_unknown_command_has_helpful_error() -> None:
 def test_help_lists_core_session_commands() -> None:
     rendered = render_help()
     assert "/sessions [query]" in rendered
-    assert "/resume <session-id>" in rendered
+    assert "/resume [session]" in rendered
     assert "/status" in rendered
     assert "/cancel" in rendered
     assert "/review [worktree|staged|commit REF|branch BASE]" in rendered

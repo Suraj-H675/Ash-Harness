@@ -24,7 +24,7 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("models", "List known models", "/models"),
     SlashCommand("new", "Start a new session", "/new", aliases=("clear",)),
     SlashCommand("sessions", "List or search recent sessions", "/sessions [query]"),
-    SlashCommand("resume", "Resume a session by ID", "/resume <session-id>"),
+    SlashCommand("resume", "Resume a session by ID or name", "/resume [session]"),
     SlashCommand("rename", "Rename the current session", "/rename <title>"),
     SlashCommand(
         "fork", "Fork the session at a message boundary", "/fork [message-count]"

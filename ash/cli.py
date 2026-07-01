@@ -802,12 +802,28 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     )
                 continue
             if command.name == "resume":
-                if len(arguments) != 1:
+                if len(arguments) > 1:
                     print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
                     continue
                 try:
-                    session = await loop.start_session(arguments[0])
-                except KeyError as exc:
+                    selected_session_id: str | None
+                    if arguments:
+                        summary = loop.session_store.resolve_session(
+                            arguments[0], str(loop.project_root)
+                        )
+                        selected_session_id = summary.session_id
+                    else:
+                        from cli.sessions import pick_session
+
+                        selected_session_id = await pick_session(
+                            loop.session_store,
+                            project_path=str(loop.project_root),
+                        )
+                        if selected_session_id is None:
+                            print("Resume cancelled.", flush=True)
+                            continue
+                    session = await loop.start_session(selected_session_id)
+                except (KeyError, ValueError) as exc:
                     print(f"Error: {exc}", file=sys.stderr, flush=True)
                     continue
                 loop.ui.load_session_transcript(session)
@@ -1631,10 +1647,32 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Override ASH_DB_DIRECTORY for this run.",
     )
-    parser.add_argument(
+    session_group = parser.add_mutually_exclusive_group()
+    session_group.add_argument(
         "--session",
         default=None,
         help="Restore an existing session by id instead of creating a new one.",
+    )
+    session_group.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_session",
+        action="store_true",
+        help="Continue the most recently updated session in this project.",
+    )
+    session_group.add_argument(
+        "-r",
+        "--resume",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="SESSION",
+        help="Resume by id/name, or open the interactive session picker.",
+    )
+    parser.add_argument(
+        "--fork-session",
+        action="store_true",
+        help="Fork the resumed session instead of appending to it.",
     )
     parser.add_argument(
         "-p",
@@ -2356,6 +2394,32 @@ def main(argv: list[str] | None = None) -> int:
             config.session_retention_days,
             project_path=str(config.workspace_root.resolve()),
         )
+    startup_session_id = args.session
+    if args.continue_session or args.resume is not None or args.fork_session:
+        from cli.sessions import select_startup_session
+
+        try:
+            startup_selection = asyncio.run(
+                select_startup_session(
+                    session_store,
+                    project_path=str(config.workspace_root),
+                    continue_session=args.continue_session,
+                    resume=args.resume,
+                    legacy_session_id=args.session,
+                    fork_session=args.fork_session,
+                    interactive=(
+                        args.prompt is None
+                        and sys.stdin.isatty()
+                        and sys.stdout.isatty()
+                    ),
+                )
+            )
+        except (KeyError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        if startup_selection.cancelled:
+            return 0
+        startup_session_id = startup_selection.session_id
     safety_guard = SafetyGuard(
         project_root=config.workspace_root,
         blocklist_commands=config.command_blocklist,
@@ -2519,7 +2583,7 @@ def main(argv: list[str] | None = None) -> int:
                     loop,
                     config,
                     prompt=args.prompt,
-                    session_id=args.session,
+                    session_id=startup_session_id,
                     ui=ui,
                     json_schema_path=args.json_schema,
                 )
@@ -2533,7 +2597,7 @@ def main(argv: list[str] | None = None) -> int:
                 loop,
                 config,
                 sandbox_manager,
-                session_id=args.session,
+                session_id=startup_session_id,
             )
         )
     except KeyboardInterrupt:

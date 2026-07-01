@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from ash.cli import main
-from cli.sessions import list_session_summaries, render_session_summaries
+from cli.sessions import (
+    list_session_summaries,
+    render_session_summaries,
+    select_startup_session,
+)
 from core.session import Message, SessionStore
 
 
@@ -104,3 +111,81 @@ def test_sessions_cli_rejects_invalid_limit(tmp_path: Path, capsys) -> None:
 
     assert status == 2
     assert "limit must be positive" in capsys.readouterr().err
+
+
+def test_startup_continue_selects_latest_project_session(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    first = store.create_session(str(tmp_path))
+    store.create_session(str(tmp_path))
+    store.rename_session(first.session_id, "most recently touched")
+
+    selection = asyncio.run(
+        select_startup_session(
+            store,
+            project_path=str(tmp_path),
+            continue_session=True,
+        )
+    )
+
+    assert selection.session_id == first.session_id
+    assert selection.cancelled is False
+
+
+def test_startup_resume_supports_name_and_fork(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    original = store.create_session(str(tmp_path))
+    store.rename_session(original.session_id, "auth refactor")
+
+    selection = asyncio.run(
+        select_startup_session(
+            store,
+            project_path=str(tmp_path),
+            resume="AUTH REFACTOR",
+            fork_session=True,
+        )
+    )
+
+    assert selection.session_id != original.session_id
+    assert store.load_session(selection.session_id).title == "auth refactor (fork)"
+
+
+def test_bare_resume_requires_tty_and_honors_picker_cancel(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    store.create_session(str(tmp_path))
+
+    with pytest.raises(ValueError, match="interactive terminal"):
+        asyncio.run(
+            select_startup_session(
+                store,
+                project_path=str(tmp_path),
+                resume="",
+                interactive=False,
+            )
+        )
+
+    async def cancel() -> None:
+        return None
+
+    selection = asyncio.run(
+        select_startup_session(
+            store,
+            project_path=str(tmp_path),
+            resume="",
+            interactive=True,
+            picker=cancel,
+        )
+    )
+    assert selection.cancelled is True
+
+
+def test_continue_reports_empty_project(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+
+    with pytest.raises(ValueError, match="no session found"):
+        asyncio.run(
+            select_startup_session(
+                store,
+                project_path=str(tmp_path),
+                continue_session=True,
+            )
+        )
