@@ -56,7 +56,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "Show, stop, or resume subagents",
         "/agents [stop|resume AGENT_ID]",
     ),
-    SlashCommand("diff", "Show the current Git diff", "/diff [--staged] [path]"),
+    SlashCommand(
+        "diff",
+        "Show the current Git diff or latest Ash turn checkpoint diff",
+        "/diff [--staged|--turn] [path]",
+    ),
     SlashCommand(
         "review",
         "Review Git changes with the active model",

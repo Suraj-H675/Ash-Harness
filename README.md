@@ -87,6 +87,8 @@ set `max_attachment_tokens` (or `ASH_MAX_ATTACHMENT_TOKENS`) for an explicit cap
 keys to navigate, `Space` to preview, and `Enter` to resume. `/resume NAME`
 resolves an exact persisted title, while `/rename TITLE` sets that title.
 `/review` supports worktree, staged, commit, and branch-versus-base scopes.
+`/diff --turn` shows the latest Ash checkpoint diff and refuses if files changed
+after Ash's edit; `/diff --staged` and `/diff path` keep showing Git diffs.
 `/plan on` enables editable sprint plans for multi-step requests; type `e` at
 the plan prompt to revise the generated contract in `$VISUAL` or `$EDITOR`,
 then `y` to approve and execute it.

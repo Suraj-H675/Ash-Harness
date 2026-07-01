@@ -1121,9 +1121,38 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 continue
             if command.name == "diff":
                 staged = "--staged" in arguments
-                paths = [argument for argument in arguments if argument != "--staged"]
+                turn_diff = "--turn" in arguments
+                if staged and turn_diff:
+                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                paths = [
+                    argument
+                    for argument in arguments
+                    if argument not in {"--staged", "--turn"}
+                ]
                 if len(paths) > 1:
                     print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                if turn_diff:
+                    if paths:
+                        print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                        continue
+                    if loop.current_session is None:
+                        print("No active session.", flush=True)
+                        continue
+                    from core.checkpoints import diff_latest_checkpoint
+
+                    try:
+                        print(
+                            diff_latest_checkpoint(
+                                loop.session_store,
+                                loop.safety_guard,
+                                loop.current_session.session_id,
+                            ),
+                            flush=True,
+                        )
+                    except RuntimeError as exc:
+                        print(f"Error: {exc}", file=sys.stderr, flush=True)
                     continue
                 result = await loop.tools["git_diff"].run(
                     staged=staged, path=paths[0] if paths else ""

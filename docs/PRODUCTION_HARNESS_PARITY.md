@@ -131,7 +131,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/compact`, `/context` | Verified locally | Context compaction, budget inspection, and last-turn cache hit metrics |
 | `/cancel` | Verified locally | Cancel the active provider/tool turn while retaining already completed work |
 | `/clear`, `/rewind`, `/undo` | Verified locally | New-session clear, transcript rewind, and conflict-aware file undo |
-| `/diff` | Partial | Current/staged/path Git diff; per-turn checkpoint diff remains |
+| `/diff` | Verified locally | Current, staged, path-scoped Git diff plus latest per-turn checkpoint diff with conflict refusal |
 | `/review` | Verified locally | Bounded reviews for worktree/untracked, staged, commit, or current branch versus base |
 | `/plan` mode | Verified locally | Explicit toggle, editable sprint contract, approval gate, and execution transition |
 | `/permissions` | Verified locally | Inspect/change mode plus versioned project allow/ask/deny rules with stable IDs, exact/string-prefix/argv-prefix matchers, JSON output, precise removal, and legacy migration ([Claude Code rule model](https://code.claude.com/docs/en/permissions)) |
