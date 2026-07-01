@@ -19,7 +19,7 @@ def _write_skill(root: Path, name: str, description: str) -> None:
 
 def _write_plugin(root: Path, name: str) -> None:
     plugin = root / name
-    skill = plugin / "skills" / "review"
+    skill = plugin / "skills" / "plugin-review"
     skill.mkdir(parents=True)
     (skill / "SKILL.md").write_text("# Review\n", encoding="utf-8")
     (plugin / "plugin.json").write_text(
@@ -28,7 +28,7 @@ def _write_plugin(root: Path, name: str) -> None:
                 "name": name,
                 "version": "1.0.0",
                 "description": "Plugin description",
-                "skills": ["skills/review/SKILL.md"],
+                "skills": ["skills/plugin-review/SKILL.md"],
             }
         ),
         encoding="utf-8",
@@ -56,7 +56,10 @@ def test_extension_inventory_discovers_user_extensions(
     payload = json.loads(render_extension_inventory(inventory, json_output=True))
 
     assert payload["project_trusted"] is False
-    assert payload["skills"][0]["name"] == "review"
+    assert {skill["name"] for skill in payload["skills"]} == {
+        "plugin-review",
+        "review",
+    }
     assert payload["plugins"][0]["name"] == "example"
     assert payload["hooks"][0]["session_start"] == 1
     assert payload["errors"] == []
@@ -103,3 +106,26 @@ def test_extensions_cli_reports_invalid_hook_config(
 
     assert payload["hooks"] == []
     assert "pre_tool hooks must be a list" in payload["errors"][0]
+
+
+def test_extensions_cli_reports_invalid_skill_without_hiding_valid_skills(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    skill_root = home / ".ash" / "skills"
+    _write_skill(skill_root, "valid", "Valid skill")
+    invalid = skill_root / "invalid"
+    invalid.mkdir(parents=True)
+    (invalid / "SKILL.md").write_bytes(b"\xff\xfe")
+
+    assert main(["extensions", "skills", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert [skill["name"] for skill in payload["skills"]] == ["valid"]
+    assert "Invalid skill" in payload["errors"][0]

@@ -76,11 +76,16 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
         skill_roots.append(workspace / ".ash" / "skills")
     skill_roots.extend(plugin.root for plugin in discovered_plugins)
     skill_catalog = SkillCatalog(tuple(skill_roots))
+    discovered_skills = skill_catalog.discover()
 
     errors = [
         f"Invalid plugin {path}: {error}"
         for path, error in sorted(plugin_catalog.errors.items())
     ]
+    errors.extend(
+        f"Invalid skill {path}: {error}"
+        for path, error in sorted(skill_catalog.errors.items())
+    )
     hooks, hook_errors = _discover_hooks(hook_paths)
     errors.extend(hook_errors)
 
@@ -93,7 +98,7 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
                 description=skill.description,
                 path=str(skill.path),
             )
-            for skill in sorted(skill_catalog.discover(), key=lambda item: item.name)
+            for skill in sorted(discovered_skills, key=lambda item: item.name)
         ),
         plugins=tuple(
             PluginSummary(

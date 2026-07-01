@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 from safety.guard import SafetyGuard
 from tools.base import BaseTool, ToolResult, count_output_tokens
 
+MAX_SKILL_BYTES = 512 * 1024
+
 
 @dataclass(frozen=True)
 class InstructionSkill:
@@ -24,16 +26,28 @@ class SkillCatalog:
     def __init__(self, roots: tuple[Path, ...]) -> None:
         self.roots = roots
         self._skills: dict[str, InstructionSkill] = {}
+        self.errors: dict[str, str] = {}
 
     def discover(self) -> list[InstructionSkill]:
         discovered: dict[str, InstructionSkill] = {}
+        self.errors.clear()
         for root in self.roots:
-            if not root.exists():
+            if not root.is_dir():
                 continue
             for path in sorted(root.rglob("SKILL.md")):
-                skill = parse_instruction_skill(path)
-                if skill.name not in discovered:
-                    discovered[skill.name] = skill
+                try:
+                    skill = parse_instruction_skill(path)
+                except (OSError, UnicodeError, ValueError) as exc:
+                    self.errors[str(path)] = str(exc)
+                    continue
+                existing = discovered.get(skill.name)
+                if existing is not None:
+                    self.errors[str(path)] = (
+                        f"duplicate skill name {skill.name!r}; already provided by "
+                        f"{existing.path}"
+                    )
+                    continue
+                discovered[skill.name] = skill
         self._skills = discovered
         return list(discovered.values())
 
@@ -49,6 +63,8 @@ class SkillCatalog:
 
 
 def parse_instruction_skill(path: Path) -> InstructionSkill:
+    if path.stat().st_size > MAX_SKILL_BYTES:
+        raise ValueError("skill file exceeds 512 KiB")
     text = path.read_text(encoding="utf-8")
     metadata: dict[str, str] = {}
     body = text
@@ -61,16 +77,28 @@ def parse_instruction_skill(path: Path) -> InstructionSkill:
                     metadata[key.strip().casefold()] = value.strip().strip("\"'")
             body = text[end + 5 :]
     name = metadata.get("name") or path.parent.name
+    if (
+        not name
+        or name in {".", ".."}
+        or any(character.isspace() for character in name)
+        or any(character in name for character in ("/", "\\", "\x00"))
+    ):
+        raise ValueError(
+            "skill name must be a non-empty path-safe identifier without whitespace"
+        )
     description = metadata.get("description", "")
     if not description:
         description = next(
             (line.lstrip("# ").strip() for line in body.splitlines() if line.strip()),
             "Instruction skill",
         )
+    instructions = body.strip()
+    if not instructions:
+        raise ValueError("skill instructions are empty")
     return InstructionSkill(
         name=name,
         description=description,
-        instructions=body.strip(),
+        instructions=instructions,
         path=path,
     )
 
