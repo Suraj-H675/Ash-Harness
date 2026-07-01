@@ -36,6 +36,15 @@ class DiscoveredPlugin:
         default = self.root / "commands"
         return (default,) if default.is_dir() else ()
 
+    def hook_paths(self) -> tuple[Path, ...]:
+        declared = tuple(
+            self.root / item for item in self.manifest.hooks if isinstance(item, str)
+        )
+        if declared:
+            return declared
+        default = self.root / "hooks" / "hooks.json"
+        return (default,) if default.is_file() else ()
+
 
 class PluginCatalog:
     """Discover declarative plugin manifests from explicitly allowed roots."""

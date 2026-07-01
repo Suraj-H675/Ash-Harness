@@ -6,8 +6,10 @@ import asyncio
 import json
 import os
 import re
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from string import Template
 from typing import Any, Callable, cast
 
 from hooks.registry import (
@@ -20,11 +22,20 @@ from hooks.registry import (
 from sandbox.process_utils import process_group_options, terminate_process_tree
 
 
+@dataclass(frozen=True)
+class HookConfigSource:
+    path: Path
+    cwd: Path | None = None
+    environment: tuple[tuple[str, str], ...] = ()
+
+
 def load_command_hooks(
-    paths: list[Path], *, timeout_seconds: float = 10.0
+    paths: list[Path | HookConfigSource], *, timeout_seconds: float = 10.0
 ) -> HookRegistry:
     registry = HookRegistry(timeout_seconds=timeout_seconds)
-    for path in paths:
+    for item in paths:
+        source = item if isinstance(item, HookConfigSource) else HookConfigSource(item)
+        path = source.path
         if not path.is_file():
             continue
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -34,10 +45,15 @@ def load_command_hooks(
             matcher, command = _parse(item, path)
 
             async def pre(
-                name: str, arguments: dict[str, Any], command=command
+                name: str,
+                arguments: dict[str, Any],
+                command=command,
+                source=source,
             ) -> None:
                 await _run(
-                    command, {"event": "pre_tool", "tool": name, "arguments": arguments}
+                    command,
+                    {"event": "pre_tool", "tool": name, "arguments": arguments},
+                    source=source,
                 )
 
             registry.register_pre_tool(PreToolUseHook(matcher, pre))
@@ -45,7 +61,11 @@ def load_command_hooks(
             matcher, command = _parse(item, path)
 
             async def post(
-                name: str, arguments: dict[str, Any], result: Any, command=command
+                name: str,
+                arguments: dict[str, Any],
+                result: Any,
+                command=command,
+                source=source,
             ) -> None:
                 serializable = (
                     result.model_dump() if hasattr(result, "model_dump") else result
@@ -58,6 +78,7 @@ def load_command_hooks(
                         "arguments": arguments,
                         "result": serializable,
                     },
+                    source=source,
                 )
 
             registry.register_post_tool(PostToolUseHook(matcher, post))
@@ -66,7 +87,7 @@ def load_command_hooks(
 
             callback = cast(
                 Callable[[], HookCallbackResult],
-                partial(_session_start, command),
+                partial(_session_start, command, source),
             )
             registry.register_session_start(SessionStartHook(callback))
     return registry
@@ -86,15 +107,23 @@ def _parse(
     return re.compile(pattern), command
 
 
-async def _run(command: list[str], payload: dict[str, Any]) -> str | None:
+async def _run(
+    command: list[str],
+    payload: dict[str, Any],
+    *,
+    source: HookConfigSource,
+) -> str | None:
     allowed = {"PATH", "HOME", "USER", "TMPDIR", "TEMP", "SystemRoot", "COMSPEC"}
     environment = {key: value for key, value in os.environ.items() if key in allowed}
+    environment.update(source.environment)
+    expanded_command = [_expand(part, environment) for part in command]
     process = await asyncio.create_subprocess_exec(
-        *command,
+        *expanded_command,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=environment,
+        cwd=source.cwd,
         **process_group_options(),
     )
     try:
@@ -111,5 +140,9 @@ async def _run(command: list[str], payload: dict[str, Any]) -> str | None:
     return text or None
 
 
-async def _session_start(command: list[str]) -> str | None:
-    return await _run(command, {"event": "session_start"})
+async def _session_start(command: list[str], source: HookConfigSource) -> str | None:
+    return await _run(command, {"event": "session_start"}, source=source)
+
+
+def _expand(value: str, environment: dict[str, str]) -> str:
+    return Template(value).safe_substitute(environment)

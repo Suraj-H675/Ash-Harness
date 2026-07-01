@@ -223,3 +223,24 @@ def test_extensions_cli_requires_management_target(capsys) -> None:
 def test_extensions_cli_rejects_irrelevant_arguments(arguments, capsys) -> None:
     assert main(arguments) == 2
     assert "Error:" in capsys.readouterr().err
+
+
+def test_extensions_inventory_validates_enabled_plugin_hooks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    plugin = home / ".ash" / "plugins" / "example"
+    hook = plugin / "hooks" / "hooks.json"
+    hook.parent.mkdir(parents=True)
+    hook.write_text('{"pre_tool": "invalid"}', encoding="utf-8")
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "example"}), encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    inventory = discover_extensions(workspace)
+
+    assert "pre_tool hooks must be a list" in inventory.errors[0]

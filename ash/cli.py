@@ -2212,11 +2212,29 @@ def main(argv: list[str] | None = None) -> int:
         discovered_instructions,
         instruction_diagnostics,
     )
-    from hooks.config import load_command_hooks
+    from hooks.config import HookConfigSource, load_command_hooks
 
-    hook_paths = [Path.home() / ".ash" / "hooks.json"]
+    hook_paths: list[Path | HookConfigSource] = [Path.home() / ".ash" / "hooks.json"]
+    plugin_roots = [(Path.home() / ".ash" / "plugins", "user")]
     if workspace_trusted:
         hook_paths.append(config.workspace_root / ".ash" / "hooks.json")
+        plugin_roots.append((config.workspace_root / ".ash" / "plugins", "project"))
+    from plugins.lifecycle import load_extension_state
+    from plugins.registry import PluginCatalog
+
+    active_plugins = PluginCatalog(
+        tuple(plugin_roots),
+        disabled_plugins=load_extension_state().disabled_plugins,
+    ).discover()
+    hook_paths.extend(
+        HookConfigSource(
+            path=path,
+            cwd=plugin.root,
+            environment=(("ASH_PLUGIN_ROOT", str(plugin.root)),),
+        )
+        for plugin in active_plugins
+        for path in plugin.hook_paths()
+    )
     try:
         hooks = load_command_hooks(hook_paths)
     except (OSError, ValueError) as exc:

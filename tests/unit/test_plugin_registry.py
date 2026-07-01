@@ -158,3 +158,18 @@ def test_plugin_command_paths_use_declared_or_default_locations(tmp_path) -> Non
     found = PluginCatalog(((root, "user"),)).discover()
 
     assert found[0].command_paths() == (command,)
+
+
+def test_plugin_hook_paths_use_declared_or_default_locations(tmp_path) -> None:
+    root = tmp_path / "plugins"
+    plugin = root / "example"
+    hook = plugin / "custom" / "hooks.json"
+    hook.parent.mkdir(parents=True)
+    hook.write_text("{}")
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "example", "hooks": ["custom/hooks.json"]})
+    )
+
+    found = PluginCatalog(((root, "user"),)).discover()
+
+    assert found[0].hook_paths() == (hook,)

@@ -38,6 +38,8 @@ class PluginSummary:
     source: str
     root: str
     skills: tuple[str, ...]
+    commands: tuple[str, ...]
+    hooks: tuple[str, ...]
     enabled: bool
 
 
@@ -89,6 +91,12 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
         tuple(plugin_roots), disabled_plugins=disabled_plugins
     )
     discovered_plugins = plugin_catalog.discover(include_disabled=True)
+    hook_paths.extend(
+        (path, f"plugin:{plugin.manifest.name}")
+        for plugin in discovered_plugins
+        if plugin.enabled
+        for path in plugin.hook_paths()
+    )
     skill_roots: list[Path | SkillSource] = [user_skill_root]
     if trusted:
         skill_roots.append(workspace / ".ash" / "skills")
@@ -133,6 +141,12 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
                 source=plugin.source,
                 root=str(plugin.root),
                 skills=tuple(plugin.manifest.skills),
+                commands=tuple(
+                    item for item in plugin.manifest.commands if isinstance(item, str)
+                ),
+                hooks=tuple(
+                    item for item in plugin.manifest.hooks if isinstance(item, str)
+                ),
                 enabled=plugin.enabled,
             )
             for plugin in sorted(
