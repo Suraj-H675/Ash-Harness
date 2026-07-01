@@ -51,7 +51,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
     with get_db_connection(db_path) as conn:
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 3
+            == 4
         )
         audit_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(audit_logs)")
@@ -62,6 +62,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
         }
         assert "total_cache_read_tokens" in session_columns
         assert "total_cache_write_tokens" in session_columns
+        assert "project_key" in session_columns
 
 
 def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
@@ -89,7 +90,7 @@ def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     store = SessionStore(db_path)
 
     assert store.load_session("legacy").session_id == "legacy"
-    backups = list(tmp_path.glob("legacy.db.before-v3-migration.*.backup"))
+    backups = list(tmp_path.glob("legacy.db.before-v4-migration.*.backup"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as conn:
         assert conn.execute("SELECT session_id FROM sessions").fetchone()[0] == "legacy"
@@ -298,6 +299,23 @@ def test_get_recent_session_summaries(tmp_path: Path) -> None:
     assert len(summaries) == 2
     assert any("hello" in s for s in summaries)
     assert any("goodbye" in s for s in summaries)
+
+
+def test_session_scope_resolves_equivalent_project_paths(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(project, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+    store = SessionStore(tmp_path / "test.db")
+    session = store.create_session(str(alias))
+
+    listed = store.list_sessions(project_path=str(project))
+
+    assert [item.session_id for item in listed] == [session.session_id]
+    assert session.project_path == str(project.resolve())
 
 
 def test_list_and_rename_sessions(tmp_path: Path) -> None:

@@ -22,7 +22,7 @@ AuditAction = Literal[
     "tool_call", "command_run", "file_write", "safety_block", "user_approval"
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 class SessionStorageError(RuntimeError):
@@ -96,6 +96,14 @@ _db_write_locks_guard = threading.Lock()
 
 def _normalize_db_path(db_path: str | Path) -> str:
     return str(Path(db_path).expanduser().resolve())
+
+
+def normalize_project_path(project_path: str | Path) -> str:
+    """Return the stable platform-aware identity used for session scoping."""
+
+    return os.path.normcase(
+        os.path.realpath(os.path.expanduser(os.fspath(project_path)))
+    )
 
 
 def _utc_now() -> datetime:
@@ -248,6 +256,8 @@ class SessionStore:
                 self._migrate_v2(conn)
             if from_version < 3:
                 self._migrate_v3(conn)
+            if from_version < 4:
+                self._migrate_v4(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -307,6 +317,28 @@ class SessionStore:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
             (3, _serialize_datetime(_utc_now())),
+        )
+
+    def _migrate_v4(self, conn: sqlite3.Connection) -> None:
+        """Index a canonical project identity for reliable resume filtering."""
+
+        if not _column_exists(conn, "sessions", "project_key"):
+            conn.execute("ALTER TABLE sessions ADD COLUMN project_key TEXT DEFAULT ''")
+        rows = conn.execute("SELECT session_id, project_path FROM sessions").fetchall()
+        conn.executemany(
+            "UPDATE sessions SET project_key = ? WHERE session_id = ?",
+            (
+                (normalize_project_path(row["project_path"]), row["session_id"])
+                for row in rows
+            ),
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_project_updated "
+            "ON sessions(project_key, updated_at DESC)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (4, _serialize_datetime(_utc_now())),
         )
 
     def backup(
@@ -486,9 +518,10 @@ class SessionStore:
     def create_session(self, project_path: str, *, model: str = "") -> Session:
         """Create a new session record in SQLite and return its model."""
 
+        canonical_project_path = normalize_project_path(project_path)
         session = Session(
             session_id=str(uuid4()),
-            project_path=project_path,
+            project_path=canonical_project_path,
             created_at=_utc_now(),
             updated_at=_utc_now(),
             model=model,
@@ -499,13 +532,14 @@ class SessionStore:
             conn.execute(
                 """
                 INSERT INTO sessions (
-                    session_id, project_path, created_at, updated_at, model
+                    session_id, project_path, project_key, created_at, updated_at, model
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session.session_id,
                     session.project_path,
+                    canonical_project_path,
                     _serialize_datetime(session.created_at),
                     _serialize_datetime(updated_at),
                     session.model,
@@ -631,8 +665,8 @@ class SessionStore:
         clauses: list[str] = []
         params: list[Any] = []
         if project_path is not None:
-            clauses.append("s.project_path = ?")
-            params.append(project_path)
+            clauses.append("s.project_key = ?")
+            params.append(normalize_project_path(project_path))
         if query:
             clauses.append("(s.title LIKE ? OR s.session_id LIKE ?)")
             pattern = f"%{query}%"
@@ -692,9 +726,9 @@ class SessionStore:
         if retention_days < 1:
             raise ValueError("retention_days must be positive")
         cutoff = _utc_now() - timedelta(days=retention_days)
-        clause = " AND project_path = ?" if project_path is not None else ""
+        clause = " AND project_key = ?" if project_path is not None else ""
         params: tuple[Any, ...] = (
-            (_serialize_datetime(cutoff), project_path)
+            (_serialize_datetime(cutoff), normalize_project_path(project_path))
             if project_path is not None
             else (_serialize_datetime(cutoff),)
         )
@@ -1331,11 +1365,11 @@ class SessionStore:
                        GROUP_CONCAT(m.content, '\n') as messages
                 FROM sessions s
                 JOIN messages m ON m.session_id = s.session_id
-                WHERE s.project_path = ?
+                WHERE s.project_key = ?
                 GROUP BY s.session_id
                 ORDER BY s.created_at DESC
                 LIMIT ?
                 """,
-                (project_path, limit),
+                (normalize_project_path(project_path), limit),
             ).fetchall()
         return [row["messages"] for row in rows]
