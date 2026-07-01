@@ -1320,6 +1320,13 @@ def main(argv: list[str] | None = None) -> int:
     agents_send.add_argument("--json-content", action="store_true")
     agents_send.add_argument("--force", action="store_true")
     agents_send.add_argument("--json", action="store_true")
+    agents_branches = agents_subparsers.add_parser("branches")
+    agents_branches.add_argument("--json", action="store_true")
+    agents_apply = agents_subparsers.add_parser("apply")
+    agents_apply.add_argument("branch")
+    agents_discard = agents_subparsers.add_parser("discard")
+    agents_discard.add_argument("branch")
+    agents_discard.add_argument("--yes", action="store_true")
     serve_parser = subparsers.add_parser(
         "serve", help="Run the authenticated local Ash HTTP API"
     )
@@ -1751,11 +1758,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "agents":
+        from agents.worktree import WorktreeError
         from cli.agents import (
+            apply_agent_branch,
+            discard_agent_branch,
             list_agent_messages,
+            list_agent_branches,
             list_agent_reports,
             list_agent_statuses,
             render_agent_messages,
+            render_agent_branches,
             render_agent_reports,
             render_agent_statuses,
             render_sent_agent_message,
@@ -1764,6 +1776,7 @@ def main(argv: list[str] | None = None) -> int:
 
         agents_config = AshConfig.load()
         database = agents_config.db_directory / "agents.db"
+        worktree_storage = agents_config.db_directory / "worktrees"
         try:
             if args.agents_action == "list":
                 print(
@@ -1779,6 +1792,51 @@ def main(argv: list[str] | None = None) -> int:
                         json_output=args.json,
                     )
                 )
+            elif args.agents_action == "branches":
+                branches = asyncio.run(
+                    list_agent_branches(
+                        agents_config.workspace_root,
+                        worktree_storage,
+                    )
+                )
+                if args.json:
+                    print(
+                        json.dumps(
+                            {
+                                "branches": [
+                                    {"branch": branch, "commit": commit}
+                                    for branch, commit in branches
+                                ]
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                else:
+                    print(render_agent_branches(branches))
+            elif args.agents_action == "apply":
+                commit = asyncio.run(
+                    apply_agent_branch(
+                        agents_config.workspace_root,
+                        worktree_storage,
+                        args.branch,
+                    )
+                )
+                print(f"Applied {args.branch} ({commit[:12]}).")
+            elif args.agents_action == "discard":
+                if not args.yes:
+                    print(
+                        "Error: discarding an agent branch requires --yes",
+                        file=sys.stderr,
+                    )
+                    return 2
+                asyncio.run(
+                    discard_agent_branch(
+                        agents_config.workspace_root,
+                        worktree_storage,
+                        args.branch,
+                    )
+                )
+                print(f"Discarded {args.branch}.")
             else:
                 if args.agents_action == "messages":
                     print(
@@ -1807,7 +1865,7 @@ def main(argv: list[str] | None = None) -> int:
                             json_output=args.json,
                         )
                     )
-        except ValueError as exc:
+        except (ValueError, WorktreeError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
         return 0

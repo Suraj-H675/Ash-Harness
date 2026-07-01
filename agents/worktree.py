@@ -134,6 +134,57 @@ class WorktreeManager:
             await self._git("branch", "-D", lease.branch, check=False)
         await self._git("worktree", "prune", "--expire", "now", check=False)
 
+    async def list_agent_branches(self) -> list[tuple[str, str]]:
+        result = await self._git(
+            "for-each-ref",
+            "--format=%(refname:short)%09%(objectname)",
+            "refs/heads/ash-agent/",
+        )
+        branches: list[tuple[str, str]] = []
+        for line in result.stdout.splitlines():
+            branch, separator, commit = line.partition("\t")
+            if separator and branch and commit:
+                branches.append((branch, commit))
+        return branches
+
+    async def apply_branch(self, branch: str, *, delete_branch: bool = True) -> str:
+        _validate_agent_branch(branch)
+        status = await self._git(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        )
+        if status.stdout:
+            raise WorktreeError("applying agent changes requires a clean lead worktree")
+        commit = (await self._git("rev-parse", "--verify", branch)).stdout.strip()
+        hooks = self.storage_root / "empty-hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        result = await self._git(
+            "-c",
+            f"core.hooksPath={hooks}",
+            "-c",
+            "commit.gpgsign=false",
+            "cherry-pick",
+            commit,
+            check=False,
+        )
+        if result.returncode != 0:
+            await self._git("cherry-pick", "--abort", check=False)
+            raise WorktreeError(
+                result.stderr.strip() or f"agent branch {branch} conflicts with HEAD"
+            )
+        if delete_branch:
+            await self._git("branch", "-D", branch)
+        return commit
+
+    async def discard_branch(self, branch: str) -> None:
+        _validate_agent_branch(branch)
+        result = await self._git("branch", "-D", branch, check=False)
+        if result.returncode != 0:
+            raise WorktreeError(
+                result.stderr.strip() or f"could not delete agent branch {branch}"
+            )
+
     async def _repository_root(self) -> Path:
         result = await self._git("rev-parse", "--show-toplevel")
         return Path(result.stdout.strip()).resolve()
@@ -209,3 +260,9 @@ def _safe_agent_id(agent_id: str) -> str:
             "agent_id must contain only letters, numbers, dots, underscores, or hyphens"
         )
     return normalized
+
+
+def _validate_agent_branch(branch: str) -> None:
+    if not branch.startswith("ash-agent/"):
+        raise WorktreeError("only ash-agent/* branches can be managed")
+    _safe_agent_id(branch.removeprefix("ash-agent/"))

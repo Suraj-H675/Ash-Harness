@@ -60,6 +60,33 @@ def test_worktree_agent_commits_branch_without_mutating_lead(
     assert _git(repository, "show", f"{lease.branch}:file.txt") == "worker"
 
 
+def test_worktree_agent_branch_can_be_applied_and_removed(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    manager = WorktreeManager(repository, tmp_path / "agents")
+
+    async def run():
+        lease = await manager.create("coder-apply")
+        (lease.path / "file.txt").write_text("applied\n", encoding="utf-8")
+        await manager.commit_changes(lease, message="agent change")
+        await manager.remove(lease, keep_branch=True)
+        branches = await manager.list_agent_branches()
+        commit = await manager.apply_branch(lease.branch)
+        return lease, branches, commit
+
+    lease, branches, commit = asyncio.run(run())
+
+    assert (lease.branch, commit) in branches
+    assert repository.joinpath("file.txt").read_text(encoding="utf-8") == "applied\n"
+    result = subprocess.run(
+        ["git", "show-ref", "--verify", f"refs/heads/{lease.branch}"],
+        cwd=repository,
+        check=False,
+    )
+    assert result.returncode != 0
+
+
 def test_worktree_without_changes_removes_branch(
     repository: Path,
     tmp_path: Path,
@@ -94,3 +121,20 @@ def test_worktree_rejects_unsafe_agent_id(repository: Path, tmp_path: Path) -> N
 
     with pytest.raises(WorktreeError, match="agent_id"):
         asyncio.run(manager.create("../escape"))
+
+
+def test_worktree_apply_rejects_dirty_lead(repository: Path, tmp_path: Path) -> None:
+    manager = WorktreeManager(repository, tmp_path / "agents")
+
+    async def prepare():
+        lease = await manager.create("coder-dirty")
+        (lease.path / "file.txt").write_text("worker\n", encoding="utf-8")
+        await manager.commit_changes(lease, message="agent change")
+        await manager.remove(lease, keep_branch=True)
+        return lease
+
+    lease = asyncio.run(prepare())
+    (repository / "local.txt").write_text("dirty\n", encoding="utf-8")
+
+    with pytest.raises(WorktreeError, match="clean lead worktree"):
+        asyncio.run(manager.apply_branch(lease.branch))

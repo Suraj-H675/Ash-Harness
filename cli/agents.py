@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.shared_state import SharedState
+from agents.worktree import WorktreeManager
 
 
 def list_agent_statuses(db_path: str | Path) -> list[dict[str, Any]]:
@@ -199,6 +200,35 @@ def render_sent_agent_message(
         f"{message['sender_id']} -> {message['recipient_id']} "
         f"{message['message_type']}."
     )
+
+
+async def list_agent_branches(
+    workspace: Path,
+    storage_root: Path,
+) -> list[tuple[str, str]]:
+    return await WorktreeManager(workspace, storage_root).list_agent_branches()
+
+
+async def apply_agent_branch(
+    workspace: Path,
+    storage_root: Path,
+    branch: str,
+) -> str:
+    return await WorktreeManager(workspace, storage_root).apply_branch(branch)
+
+
+async def discard_agent_branch(
+    workspace: Path,
+    storage_root: Path,
+    branch: str,
+) -> None:
+    await WorktreeManager(workspace, storage_root).discard_branch(branch)
+
+
+def render_agent_branches(branches: list[tuple[str, str]]) -> str:
+    if not branches:
+        return "No isolated agent branches."
+    return "\n".join(f"{branch} {commit[:12]}" for branch, commit in branches)
 
 
 def _summarize_content(content: Any) -> str:

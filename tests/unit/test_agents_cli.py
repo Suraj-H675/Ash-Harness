@@ -7,6 +7,7 @@ from pathlib import Path
 from agents.shared_state import SharedState
 from ash.cli import main
 from cli.agents import (
+    render_agent_branches,
     list_agent_messages,
     list_agent_reports,
     list_agent_statuses,
@@ -16,6 +17,13 @@ from cli.agents import (
     render_sent_agent_message,
     send_agent_message,
 )
+
+
+def test_render_agent_branches() -> None:
+    assert render_agent_branches([]) == "No isolated agent branches."
+    assert render_agent_branches([("ash-agent/coder", "a" * 40)]) == (
+        "ash-agent/coder aaaaaaaaaaaa"
+    )
 
 
 def test_agent_status_renderer_emits_json(tmp_path: Path) -> None:
@@ -108,6 +116,19 @@ def test_agents_cli_lists_persisted_statuses(
 
     assert payload["agents"][0]["agent_id"] == "agent-a"
     assert payload["agents"][0]["current_task"] == "fix tests"
+
+
+def test_agents_cli_discard_requires_explicit_confirmation(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(tmp_path / "db"))
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+
+    assert main(["agents", "discard", "ash-agent/coder"]) == 2
+    assert "requires --yes" in capsys.readouterr().err
 
 
 def test_agents_cli_lists_reports_and_rejects_invalid_limit(
