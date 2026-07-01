@@ -89,7 +89,11 @@ Use `ash plans list`, `ash plans show <sprint-id>`, and
 checklists outside the REPL.
 `Alt+Enter` or `Ctrl+J` inserts a newline; prompt history is stored under
 `~/.ash`. Type `@path` or `@"path with spaces"` to attach bounded workspace
-text or a directory listing to a prompt; secret, binary, oversized, and
+text, a directory listing, or PNG/JPEG/GIF/WebP images to a prompt. Images are
+accepted only when the active provider/model advertises vision support, are
+bounded to 5 MB each and 10 MB combined, and travel as native Anthropic/OpenAI
+image blocks. Session storage retains only path/media/hash descriptors, never
+base64 payloads. Secret, unsupported binary, oversized, linked, and
 out-of-workspace paths are rejected.
 
 Provider-backed subagents run bounded Ash loops with role-specific tools.

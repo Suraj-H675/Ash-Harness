@@ -112,7 +112,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Configurable keybindings | Verified locally | Cross-platform newline/editor actions with collision validation |
 | Vim input mode | Verified locally | Optional Emacs or Vim prompt-toolkit editing mode |
 | External editor | Verified locally | Prompt-toolkit external-editor integration |
-| Image/file attachments | Partial | Safe bounded text/directory `@path` expansion and completion; image/provider blocks remain |
+| Image/file attachments | Verified locally | Scoped text/directory and bounded PNG/JPEG/GIF/WebP `@path` inputs, vision capability refusal, native Anthropic/OpenAI blocks, fixed image token estimates, and metadata-only persistence |
 | Prompt history search | Verified locally | Persistent prompt-toolkit file history and reverse search |
 | Desktop notifications | Verified locally | Opt-in completion/approval events, conservative OSC 9/BEL auto detection, tmux passthrough, TTY gating, control-character stripping, bounded optional previews, and failure isolation ([Claude Code behavior](https://code.claude.com/docs/en/terminal-config), [Codex backend](https://github.com/openai/codex/tree/main/codex-rs/tui/src/notifications)) |
 | Accessibility | Partial | Dedicated screen-reader mode forces linear non-rewriting output, inline rendering, no color/token bar, reduced motion, and a reduced-dynamic prompt; native assistive-technology runtime evidence remains |
@@ -140,7 +140,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/agents` | Verified locally | Slash status/stop/resume, persisted status/report/message inspection, live queued steering/stop consumption with delivery acknowledgement, and isolated branch list/apply/discard lifecycle |
 | `/doctor` | Verified locally | Runs the local health report in-session |
 | Shell escape (`!`) | Verified locally | Commands use the normal policy, sandbox, persistence, and audit path |
-| File mention/completion (`@`) | Partial | Workspace file/directory completion and bounded text expansion; fuzzy symbols/images/MCP remain |
+| File mention/completion (`@`) | Partial | Workspace file/directory completion plus bounded text, directory, and vision image expansion; fuzzy symbols and MCP resources remain |
 | Custom commands | Verified locally | User/trusted-project Markdown commands, arguments, namespacing, listing, completion |
 
 ## 7. Built-In Coding Tools
