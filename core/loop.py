@@ -328,6 +328,7 @@ class AshLoop:
         self.repo_map = repo_map
         self.auto_commit = auto_commit
         self.auto_commit_paths = list(auto_commit_paths or [])
+        self._turn_modified_paths: set[Path] = set()
         self._repo_map_active_files: list[Path] = []
         for path in self.auto_commit_paths:
             candidate = path if path.is_absolute() else self.project_root / path
@@ -558,6 +559,7 @@ class AshLoop:
 
         from context.turn import TurnContext
 
+        self._turn_modified_paths = set()
         self.turn_context = TurnContext(
             session_id=session.session_id,
             turn_id=str(uuid4()),
@@ -788,15 +790,17 @@ class AshLoop:
             )
 
         if self.auto_commit:
-            commit_result = await auto_commit_turn(
-                self.project_root,
-                message=f"ash: turn complete ({len(final_text)} chars)",
-                paths=self.auto_commit_paths or None,
-                safety_guard=self.safety_guard,
-            )
-            if not commit_result.success and commit_result.error:
-                # Surface commit failures to the user but don't fail the turn.
-                self.ui.console.print(f"auto_commit failed: {commit_result.error}")
+            commit_paths = self.auto_commit_paths or sorted(self._turn_modified_paths)
+            if commit_paths:
+                commit_result = await auto_commit_turn(
+                    self.project_root,
+                    message=f"ash: turn complete ({len(final_text)} chars)",
+                    paths=commit_paths,
+                    safety_guard=self.safety_guard,
+                )
+                if not commit_result.success and commit_result.error:
+                    # Surface commit failures to the user but don't fail the turn.
+                    self.ui.console.print(f"auto_commit failed: {commit_result.error}")
 
         _log.info(f"turn complete, {len(final_text)} chars returned")
         self.session_store.complete_turn(self.turn_context.turn_id)
@@ -1327,6 +1331,7 @@ class AshLoop:
                 }
             )
             self._record_repo_map_activity(tool_name, arguments, tool_result)
+            self._record_turn_file_mutation(tool_name, arguments, tool_result)
             if tool_result.success:
                 self.circuit_breaker.record_success()
             else:
@@ -1372,21 +1377,8 @@ class AshLoop:
     ) -> None:
         if self.repo_map is None or not result.success:
             return
-        paths: set[str] = set()
-        if tool_name == "apply_patch":
-            try:
-                from tools.patch import extract_patch_paths
-
-                paths = extract_patch_paths(
-                    str(arguments.get("patch", "")), self.safety_guard
-                )
-            except (TypeError, ValueError):
-                return
-        elif tool_name in REPO_MAP_FILE_TOOLS:
-            file_path = arguments.get("file_path")
-            if isinstance(file_path, str) and file_path:
-                paths.add(file_path)
-        else:
+        paths = self._tool_paths(tool_name, arguments)
+        if not paths:
             return
 
         for path in paths:
@@ -1397,6 +1389,40 @@ class AshLoop:
             self._remember_repo_file(resolved)
         if tool_name in FILE_WRITE_TOOLS and not bool(arguments.get("dry_run", False)):
             self._repo_map_dirty = True
+
+    def _record_turn_file_mutation(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: ToolResult,
+    ) -> None:
+        if (
+            tool_name not in FILE_WRITE_TOOLS
+            or not result.success
+            or bool(arguments.get("dry_run", False))
+        ):
+            return
+        for path in self._tool_paths(tool_name, arguments):
+            try:
+                self._turn_modified_paths.add(self.safety_guard.validate_path(path))
+            except Exception:  # noqa: BLE001 - auto-commit capture is best-effort
+                continue
+
+    def _tool_paths(self, tool_name: str, arguments: dict[str, Any]) -> set[str]:
+        if tool_name == "apply_patch":
+            try:
+                from tools.patch import extract_patch_paths
+
+                return extract_patch_paths(
+                    str(arguments.get("patch", "")), self.safety_guard
+                )
+            except (TypeError, ValueError):
+                return set()
+        if tool_name in REPO_MAP_FILE_TOOLS:
+            file_path = arguments.get("file_path")
+            if isinstance(file_path, str) and file_path:
+                return {file_path}
+        return set()
 
     def _append_tool_audit(
         self,

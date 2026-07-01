@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from safety.guard import SafetyGuard
-from tools.git import GitDiffTool, GitLogTool, GitStatusTool
+from tools.git import AutoCommitTool, GitDiffTool, GitLogTool, GitStatusTool
 from tools.patch import ApplyPatchTool
 
 
@@ -17,11 +17,15 @@ async def _git(root: Path, *args: str) -> None:
     assert process.returncode == 0
 
 
+async def _init_repo(root: Path) -> None:
+    await _git(root, "init", "-q")
+    await _git(root, "config", "user.email", "test@example.com")
+    await _git(root, "config", "user.name", "Test")
+
+
 @pytest.mark.asyncio
 async def test_git_inspection_and_patch(tmp_path: Path) -> None:
-    await _git(tmp_path, "init", "-q")
-    await _git(tmp_path, "config", "user.email", "test@example.com")
-    await _git(tmp_path, "config", "user.name", "Test")
+    await _init_repo(tmp_path)
     target = tmp_path / "hello.txt"
     target.write_text("old\n")
     await _git(tmp_path, "add", "hello.txt")
@@ -109,3 +113,68 @@ async def test_patch_revalidates_path_after_check(tmp_path: Path) -> None:
     assert result.success is False
     assert "changed after validation" in (result.error or "")
     assert outside.read_text(encoding="utf-8") == "outside\n"
+
+
+@pytest.mark.asyncio
+async def test_auto_commit_requires_explicit_paths(tmp_path: Path) -> None:
+    await _init_repo(tmp_path)
+    target = tmp_path / "tracked.txt"
+    target.write_text("old\n")
+    await _git(tmp_path, "add", "tracked.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    target.write_text("new\n")
+    (tmp_path / "untracked.txt").write_text("do not include\n")
+
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run(message="unsafe")
+
+    assert result.success is False
+    assert "explicit path scope" in (result.error or "")
+    status = await GitStatusTool(SafetyGuard(tmp_path)).run()
+    assert " M tracked.txt" in status.output
+    assert "?? untracked.txt" in status.output
+
+
+@pytest.mark.asyncio
+async def test_auto_commit_refuses_unrelated_prestaged_paths(tmp_path: Path) -> None:
+    await _init_repo(tmp_path)
+    scoped = tmp_path / "scoped.txt"
+    unrelated = tmp_path / "unrelated.txt"
+    scoped.write_text("old\n")
+    unrelated.write_text("old\n")
+    await _git(tmp_path, "add", "scoped.txt", "unrelated.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    scoped.write_text("new\n")
+    unrelated.write_text("new\n")
+    await _git(tmp_path, "add", "unrelated.txt")
+
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run(
+        message="scoped only",
+        paths=["scoped.txt"],
+    )
+
+    assert result.success is False
+    assert "pre-staged paths outside explicit scope" in (result.error or "")
+    log = await GitLogTool(SafetyGuard(tmp_path)).run(limit=1)
+    assert "initial" in log.output
+
+
+@pytest.mark.asyncio
+async def test_auto_commit_surfaces_hook_failure_output(tmp_path: Path) -> None:
+    await _init_repo(tmp_path)
+    target = tmp_path / "tracked.txt"
+    target.write_text("old\n")
+    await _git(tmp_path, "add", "tracked.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    target.write_text("new\n")
+    hook = tmp_path / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\necho hook failed >&2\nexit 1\n")
+    hook.chmod(0o755)
+
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run(
+        message="should fail",
+        paths=["tracked.txt"],
+    )
+
+    assert result.success is False
+    assert "git commit failed with exit code" in (result.error or "")
+    assert "hook failed" in (result.error or "")

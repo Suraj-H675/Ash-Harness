@@ -260,10 +260,10 @@ def test_repo_map_refreshes_after_successful_write(
     assert "fresh" in second_system
 
 
-def test_auto_commit_creates_commit_on_turn_completion(
+def test_auto_commit_skips_unrelated_preexisting_work_without_tool_edits(
     git_workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
 ) -> None:
-    # Make a tracked file, then a fresh untracked file.
+    # Make a tracked file, then a fresh untracked file before Ash edits anything.
     (git_workspace / "tracked.py").write_text("x = 1\n")
     subprocess.run(
         ["git", "add", "tracked.py"], cwd=git_workspace, check=True, capture_output=True
@@ -293,16 +293,15 @@ def test_auto_commit_creates_commit_on_turn_completion(
         ["git", "log", "--oneline"], cwd=git_workspace, capture_output=True, text=True
     )
     commits = log.stdout.strip().splitlines()
-    assert len(commits) == 2
-    assert "turn complete" in commits[0]
-    # The auto-commit must include the new file.
-    show = subprocess.run(
-        ["git", "show", "--stat", "HEAD"],
+    assert len(commits) == 1
+    assert "seed" in commits[0]
+    status = subprocess.run(
+        ["git", "status", "--short"],
         cwd=git_workspace,
         capture_output=True,
         text=True,
     )
-    assert "new_file.py" in show.stdout
+    assert "?? new_file.py" in status.stdout
 
 
 def test_auto_commit_disabled_by_default(

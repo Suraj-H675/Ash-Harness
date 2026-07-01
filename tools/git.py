@@ -88,7 +88,7 @@ class AutoCommitArgs(BaseModel):
     message: str = Field(..., description="Commit message body.")
     paths: list[str] = Field(
         default_factory=list,
-        description="Workspace-relative paths to stage. Empty means stage everything tracked.",
+        description="Explicit workspace-relative paths to stage and commit.",
     )
     author: str = Field(
         DEFAULT_COMMIT_AUTHOR,
@@ -115,23 +115,53 @@ class AutoCommitTool(BaseTool):
                 error=f"SafetyGuard missing project_root: {exc}",
             )
 
-        # Stage the requested paths (or all tracked files when none given).
-        if args.paths:
-            resolved_paths: list[str] = []
-            for raw in args.paths:
-                try:
-                    resolved = self.safety_guard.validate_path(raw)
-                except Exception as exc:  # SafetyViolation or ValueError
-                    return ToolResult(
-                        success=False,
-                        output="",
-                        error=f"Refused to stage out-of-scope path {raw!r}: {exc}",
-                    )
-                resolved_paths.append(str(resolved))
-            stage_cmd = ["add", "--", *resolved_paths]
-        else:
-            # No explicit paths: stage all updates + new files in the workspace.
-            stage_cmd = ["add", "-A", "--", "."]
+        if not args.paths:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "Refused to auto-commit without an explicit path scope; "
+                    "pass paths=[...] to avoid committing unrelated work."
+                ),
+            )
+
+        resolved_paths: list[str] = []
+        for raw in args.paths:
+            try:
+                resolved = self.safety_guard.validate_path(raw)
+            except Exception as exc:  # SafetyViolation or ValueError
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Refused to stage out-of-scope path {raw!r}: {exc}",
+                )
+            try:
+                relative = resolved.relative_to(workspace_root)
+            except ValueError:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Refused to stage path outside Git workspace: {raw!r}",
+                )
+            resolved_paths.append(relative.as_posix())
+        staged_before = await _cached_paths(workspace_root)
+        if staged_before is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error="git diff --cached failed before staging",
+            )
+        unrelated_before = _paths_outside_scope(staged_before, resolved_paths)
+        if unrelated_before:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "Refused to commit pre-staged paths outside explicit scope: "
+                    + ", ".join(unrelated_before[:20])
+                ),
+            )
+        stage_cmd = ["add", "--", *resolved_paths]
 
         stage_code, stage_stdout, stage_stderr = await _run_git(
             workspace_root, stage_cmd
@@ -140,14 +170,30 @@ class AutoCommitTool(BaseTool):
             return ToolResult(
                 success=False,
                 output=stage_stdout,
-                error=f"git add failed: {stage_stderr.strip()}",
+                error=_format_git_failure(
+                    "git add", stage_code, stage_stdout, stage_stderr
+                ),
             )
 
         # Skip commit if there's nothing staged.
-        diff_code, diff_stdout, _ = await _run_git(
-            workspace_root, ["diff", "--cached", "--name-only"]
-        )
-        if diff_code != 0 or not diff_stdout.strip():
+        staged_after = await _cached_paths(workspace_root)
+        if staged_after is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error="git diff --cached failed after staging",
+            )
+        unrelated_after = _paths_outside_scope(staged_after, resolved_paths)
+        if unrelated_after:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "Refused to commit staged paths outside explicit scope: "
+                    + ", ".join(unrelated_after[:20])
+                ),
+            )
+        if not staged_after:
             return ToolResult(
                 success=True,
                 output="No changes to commit.",
@@ -170,7 +216,9 @@ class AutoCommitTool(BaseTool):
             return ToolResult(
                 success=False,
                 output=commit_stdout,
-                error=f"git commit failed: {commit_stderr.strip()}",
+                error=_format_git_failure(
+                    "git commit", commit_code, commit_stdout, commit_stderr
+                ),
             )
 
         return ToolResult(
@@ -196,6 +244,42 @@ async def _run_git(cwd: Path, args: Sequence[str]) -> tuple[int, str, str]:
         stdout_bytes.decode("utf-8", errors="replace"),
         stderr_bytes.decode("utf-8", errors="replace"),
     )
+
+
+async def _cached_paths(cwd: Path) -> list[str] | None:
+    code, stdout, _ = await _run_git(cwd, ["diff", "--cached", "--name-only", "-z"])
+    if code != 0:
+        return None
+    return sorted(path for path in stdout.split("\0") if path)
+
+
+def _paths_outside_scope(paths: Sequence[str], scopes: Sequence[str]) -> list[str]:
+    return [
+        path
+        for path in paths
+        if not any(_path_in_scope(path, scope) for scope in scopes)
+    ]
+
+
+def _path_in_scope(path: str, scope: str) -> bool:
+    normalized_scope = scope.strip("/") or "."
+    if normalized_scope == ".":
+        return True
+    return path == normalized_scope or path.startswith(f"{normalized_scope}/")
+
+
+def _format_git_failure(
+    operation: str,
+    code: int,
+    stdout: str,
+    stderr: str,
+) -> str:
+    parts = [f"{operation} failed with exit code {code}."]
+    if stderr.strip():
+        parts.append(f"stderr:\n{stderr.strip()}")
+    if stdout.strip():
+        parts.append(f"stdout:\n{stdout.strip()}")
+    return "\n".join(parts)
 
 
 async def _git_result(cwd: Path, args: Sequence[str]) -> ToolResult:

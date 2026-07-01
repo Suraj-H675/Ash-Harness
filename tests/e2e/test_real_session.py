@@ -222,6 +222,7 @@ def test_e2e_session_auto_commits_each_turn(tmp_path: Path) -> None:
     workspace = tmp_path / "project"
     workspace.mkdir()
     _git_init(workspace)
+    (workspace / "unrelated.txt").write_text("leave me alone\n")
     db_path = tmp_path / "s.db"
 
     provider = SessionProvider(
@@ -260,6 +261,14 @@ def test_e2e_session_auto_commits_each_turn(tmp_path: Path) -> None:
     # Seed + two auto-commits.
     assert len(commits) == 3
     assert sum("turn complete" in c for c in commits) == 2
+    status = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "?? unrelated.txt" in status.stdout
 
 
 def test_e2e_session_respects_safety_tier_dry_run(tmp_path: Path) -> None:
