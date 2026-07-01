@@ -16,29 +16,13 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from config import AshConfig
-from core.loop import AshLoop
-from core.session import SessionStore
-from exceptions import classify_exception, format_error
-from providers.base import ProviderABC
-from safety.guard import SafetyGuard
-from tools.command import RunCommandTool
-from tools.base import BaseTool
-from tools.filesystem import (
-    ReadFileTool,
-    ReplaceFileContentTool,
-    ReplaceFileEditsTool,
-    WholeEditTool,
-    WriteFileTool,
-)
-from tools.git import AutoCommitTool, GitDiffTool, GitLogTool, GitStatusTool
-from ui.terminal import TerminalUI
-from ash_logging import get_logger
-
-
-_log = get_logger(__name__)
+if TYPE_CHECKING:
+    from config import AshConfig
+    from core.loop import AshLoop
+    from providers.base import ProviderABC
+    from safety.guard import SafetyGuard
 
 
 KNOWN_PROVIDERS = frozenset(
@@ -78,6 +62,9 @@ def _emit_config_diagnostics(config: AshConfig) -> None:
 
 
 def _load_config_or_report(**overrides: Any) -> tuple[AshConfig | None, int]:
+    from config import AshConfig
+    from exceptions import classify_exception, format_error
+
     try:
         return (
             AshConfig.load(
@@ -247,6 +234,16 @@ def _build_tools(
     repo_map: Any | None = None,
     runtime_config: AshConfig | None = None,
 ) -> dict[str, Any]:
+    from tools.base import BaseTool
+    from tools.command import RunCommandTool
+    from tools.filesystem import (
+        ReadFileTool,
+        ReplaceFileContentTool,
+        ReplaceFileEditsTool,
+        WholeEditTool,
+        WriteFileTool,
+    )
+    from tools.git import AutoCommitTool, GitDiffTool, GitLogTool, GitStatusTool
     from plugins.skills import ActivateSkillTool, ListSkillsTool, SkillCatalog
     from tools.ask_user import AskUserTool
     from tools.patch import ApplyPatchTool
@@ -328,7 +325,9 @@ def _build_repo_map(config: AshConfig):
             exclude_patterns=config.repo_map_exclude_patterns,
         )
     except OSError as exc:
-        _log.warning("repository map unavailable: {}", exc)
+        from ash_logging import get_logger
+
+        get_logger(__name__).warning("repository map unavailable: {}", exc)
         return None
 
 
@@ -417,6 +416,7 @@ async def _interactive_model_picker(
 
 
 async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
+    from ui.terminal import TerminalUI
     from cli.custom_commands import CustomCommandCatalog
     from cli.slash import parse_slash_command, render_help
     from safety.trust import is_workspace_trusted
@@ -1435,6 +1435,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.prompt is not None and "--output-format" not in raw_argv:
             args.output_format = "stream-json"
 
+    from config import AshConfig
+    from core.session import SessionStore
+    from exceptions import classify_exception, format_error
+
     if args.command == "setup":
         from cli.setup import cmd_setup
 
@@ -2038,6 +2042,9 @@ def main(argv: list[str] | None = None) -> int:
             config = loaded_config
 
     from safety.grants import PermissionGrantError, load_permission_rules
+    from core.loop import AshLoop
+    from safety.guard import SafetyGuard
+    from ui.terminal import TerminalUI
 
     try:
         permission_rules = load_permission_rules(config.workspace_root)
@@ -2207,6 +2214,8 @@ async def _bootstrap_and_repl(
     *,
     session_id: str | None,
 ) -> int:
+    from exceptions import classify_exception, format_error
+
     try:
         await loop.start_session(session_id)
         return await _repl(loop, config, sandbox_manager)
@@ -2227,6 +2236,8 @@ async def _bootstrap_and_headless(
     ui: Any,
     json_schema_path: Path | None = None,
 ) -> int:
+    from exceptions import classify_exception, format_error
+
     try:
         session = await loop.start_session(session_id)
         schema = None
