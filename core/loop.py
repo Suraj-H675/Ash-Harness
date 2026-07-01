@@ -227,6 +227,16 @@ def _audit_action_for_tool(tool_name: str) -> AuditAction:
     return "tool_call"
 
 
+def _canonical_message_content(message: Message) -> Any:
+    image_blocks = message.metadata.get("image_blocks")
+    if message.role != "user" or not isinstance(image_blocks, list):
+        return message.content
+    return [
+        {"type": "text", "text": message.content},
+        *image_blocks,
+    ]
+
+
 def _calculate_turn_cost(
     *,
     prompt_tokens: int,
@@ -497,7 +507,12 @@ class AshLoop:
             "cost_usd": self._last_turn_cost_usd,
         }
 
-    async def run_turn(self, user_input: str) -> str:
+    async def run_turn(
+        self,
+        user_input: str,
+        *,
+        user_metadata: dict[str, Any] | None = None,
+    ) -> str:
         """Run one turn while preventing unsafe concurrent session mutation."""
 
         if self._turn_running:
@@ -505,7 +520,7 @@ class AshLoop:
         previous_turn_id = self.turn_context.turn_id if self.turn_context else None
         self._turn_running = True
         try:
-            return await self._run_turn(user_input)
+            return await self._run_turn(user_input, user_metadata=user_metadata)
         except asyncio.CancelledError:
             current_turn_id = self.turn_context.turn_id if self.turn_context else None
             if current_turn_id is not None and current_turn_id != previous_turn_id:
@@ -522,7 +537,12 @@ class AshLoop:
         finally:
             self._turn_running = False
 
-    async def _run_turn(self, user_input: str) -> str:
+    async def _run_turn(
+        self,
+        user_input: str,
+        *,
+        user_metadata: dict[str, Any] | None = None,
+    ) -> str:
         """Run a single user turn to completion and return the final text."""
 
         _log.info("turn started")
@@ -584,11 +604,17 @@ class AshLoop:
             role="user",
             content=user_input,
             timestamp=_utc_now(),
+            metadata=dict(user_metadata or {}),
         )
+        persisted_metadata = dict(user_message.metadata)
+        persisted_metadata.pop("image_blocks", None)
         self.session_store.save_message(
             session.session_id,
             user_message.model_copy(
-                update={"content": redact_text(user_message.content)}
+                update={
+                    "content": redact_text(user_message.content),
+                    "metadata": redact_value(persisted_metadata),
+                }
             ),
         )
         # Keep the in-memory session mirror in sync so subsequent
@@ -1588,7 +1614,7 @@ class AshLoop:
             for message in session.messages:
                 msg_dict: dict[str, Any] = {
                     "role": message.role,
-                    "content": message.content,
+                    "content": _canonical_message_content(message),
                 }
                 if message.role == "assistant" and message.metadata.get("tool_calls"):
                     msg_dict["tool_calls"] = message.metadata["tool_calls"]
@@ -1648,7 +1674,7 @@ class AshLoop:
         for message in session.messages:
             msg_dict = {
                 "role": message.role,
-                "content": message.content,
+                "content": _canonical_message_content(message),
             }
             if message.role == "assistant" and message.metadata.get("tool_calls"):
                 msg_dict["tool_calls"] = message.metadata["tool_calls"]

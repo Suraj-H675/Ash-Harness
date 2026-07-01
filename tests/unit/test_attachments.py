@@ -6,7 +6,7 @@ import pytest
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
-from cli.attachments import expand_file_mentions
+from cli.attachments import expand_file_mentions, prepare_file_mentions
 from safety.guard import SafetyGuard
 from ui.prompt import AshCompleter
 
@@ -76,3 +76,31 @@ def test_workspace_path_completer_handles_files_spaces_and_directories(
     inserted = {item.text for item in root_items}
     assert "@src/" in inserted
     assert '@"some file.py"' in inserted
+
+
+def test_prepare_file_mentions_builds_bounded_canonical_image(tmp_path: Path) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"image-data")
+
+    prepared = prepare_file_mentions(
+        "inspect @image.png", SafetyGuard(tmp_path), allow_images=True
+    )
+
+    assert 'kind="image" path="image.png"' in prepared.prompt
+    assert len(prepared.images) == 1
+    assert prepared.images[0].media_type == "image/png"
+    metadata = prepared.message_metadata()
+    assert metadata is not None
+    assert metadata["image_blocks"][0]["type"] == "image"
+    assert "data" not in metadata["images"][0]
+
+
+def test_prepare_file_mentions_rejects_image_for_nonvision_model(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "image.jpg").write_bytes(b"\xff\xd8\xff" + b"image-data")
+
+    with pytest.raises(ValueError, match="does not support vision"):
+        prepare_file_mentions(
+            "inspect @image.jpg", SafetyGuard(tmp_path), allow_images=False
+        )

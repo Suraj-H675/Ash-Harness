@@ -65,8 +65,33 @@ def prepare_anthropic_messages(
             else:
                 conversation.append({"role": "user", "content": [block]})
             continue
-        conversation.append({"role": role, "content": content})
+        conversation.append(
+            {"role": role, "content": _prepare_anthropic_content(content)}
+        )
     return "\n\n".join(system_blocks), conversation
+
+
+def _prepare_anthropic_content(content: Any) -> Any:
+    if not isinstance(content, list):
+        return content
+    prepared: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "image":
+            prepared.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": str(block.get("media_type", "")),
+                        "data": str(block.get("data", "")),
+                    },
+                }
+            )
+        elif block.get("type") == "text":
+            prepared.append({"type": "text", "text": str(block.get("text", ""))})
+    return prepared
 
 
 def prepare_anthropic_tools(

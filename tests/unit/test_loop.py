@@ -851,3 +851,50 @@ async def test_provider_circuit_fails_fast_then_allows_probe(tmp_path):
     assert response == "online"
     assert provider.calls == 3
     assert circuit.snapshot(loop._provider_circuit_key)["failures"] == 0
+
+
+class ImageCaptureProvider(ProviderABC):
+    model_name = "vision-test"
+
+    def __init__(self) -> None:
+        self.messages = []
+
+    def count_tokens(self, text):
+        return len(str(text))
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        self.messages = messages
+        yield StreamChunk(content="image inspected", is_done=True)
+
+
+@pytest.mark.asyncio
+async def test_image_blocks_reach_provider_but_are_not_persisted(tmp_path):
+    provider = ImageCaptureProvider()
+    store = SessionStore(tmp_path / "images.db")
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+    metadata = {
+        "image_blocks": [{"type": "image", "media_type": "image/png", "data": "YWJj"}],
+        "images": [
+            {"path": "image.png", "media_type": "image/png", "sha256": "digest"}
+        ],
+    }
+
+    response = await loop.run_turn("inspect image", user_metadata=metadata)
+
+    assert response == "image inspected"
+    user_content = next(
+        message["content"] for message in provider.messages if message["role"] == "user"
+    )
+    assert user_content[1]["data"] == "YWJj"
+    assert loop.current_session is not None
+    loaded = store.load_session(loop.current_session.session_id)
+    persisted = loaded.messages[0].metadata
+    assert "image_blocks" not in persisted
+    assert persisted["images"][0]["path"] == "image.png"
+    await loop.aclose()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from core.loop import AshLoop
 from safety.grants import (
@@ -49,7 +49,12 @@ class InteractiveTurnController:
         self._approval_complete = asyncio.Event()
         self._approval_complete.set()
 
-    async def run(self, user_input: str) -> str | None:
+    async def run(
+        self,
+        user_input: str,
+        *,
+        user_metadata: dict[str, Any] | None = None,
+    ) -> str | None:
         """Return the final response, or ``None`` when the user cancels."""
 
         self.ui.record_user_input(user_input)
@@ -57,7 +62,9 @@ class InteractiveTurnController:
         previous_plan_approval = self.loop.on_plan_approval
         self.loop.on_tool_approval = self._request_approval
         self.loop.on_plan_approval = self._request_plan_approval
-        turn = asyncio.create_task(self.loop.run_turn(user_input))
+        turn = asyncio.create_task(
+            self.loop.run_turn(user_input, user_metadata=user_metadata)
+        )
         try:
             while not turn.done():
                 steering_read = asyncio.create_task(self.prompt_input.read("steer> "))

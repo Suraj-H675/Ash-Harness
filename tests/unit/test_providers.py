@@ -603,6 +603,37 @@ def test_anthropic_message_translation_uses_tool_blocks():
     assert prepared[1]["content"][0]["tool_use_id"] == "call-1"
 
 
+def test_provider_message_translation_converts_canonical_images() -> None:
+    from providers.anthropic import prepare_anthropic_messages
+    from providers.openai import prepare_openai_messages
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "inspect"},
+                {"type": "image", "media_type": "image/png", "data": "YWJj"},
+            ],
+        }
+    ]
+
+    openai_messages = prepare_openai_messages(messages)
+    _, anthropic_messages = prepare_anthropic_messages(messages)
+
+    assert openai_messages[0]["content"][1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,YWJj"},
+    }
+    assert anthropic_messages[0]["content"][1] == {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "YWJj",
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_openai_provider_stream_chat_signature():
     from providers.openai import OpenAIProvider

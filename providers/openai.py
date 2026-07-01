@@ -33,6 +33,7 @@ def prepare_openai_messages(
             for key, value in message.items()
             if key in {"role", "content", "name", "tool_call_id"}
         }
+        item["content"] = _prepare_openai_content(item.get("content", ""))
         canonical_calls = message.get("tool_calls")
         if canonical_calls:
             item["tool_calls"] = [
@@ -47,6 +48,27 @@ def prepare_openai_messages(
                 for call in canonical_calls
             ]
         prepared.append(item)
+    return prepared
+
+
+def _prepare_openai_content(content: Any) -> Any:
+    if not isinstance(content, list):
+        return content
+    prepared: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "image":
+            media_type = str(block.get("media_type", ""))
+            data = str(block.get("data", ""))
+            prepared.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{data}"},
+                }
+            )
+        elif block.get("type") == "text":
+            prepared.append({"type": "text", "text": str(block.get("text", ""))})
     return prepared
 
 

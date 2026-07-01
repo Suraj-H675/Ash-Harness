@@ -1,6 +1,10 @@
 import pytest
 
-from context.history import ContextBudgetAllocator, HistoryCompactor
+from context.history import (
+    IMAGE_TOKEN_ESTIMATE,
+    ContextBudgetAllocator,
+    HistoryCompactor,
+)
 
 
 def count_words(text: str) -> int:
@@ -130,3 +134,54 @@ def test_context_budget_allocator_rejects_invalid_weights() -> None:
             completion_reserve=10,
             weights={"unknown": 1},
         )
+
+
+def test_image_payload_uses_fixed_token_estimate() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "inspect"},
+                {
+                    "type": "image",
+                    "media_type": "image/png",
+                    "data": "A" * 1_000_000,
+                },
+            ],
+        },
+    ]
+    result = HistoryCompactor(
+        max_context_tokens=10_000,
+        completion_reserve=100,
+    ).compact(messages, count_tokens=count_words)
+
+    assert IMAGE_TOKEN_ESTIMATE <= result.estimated_tokens < IMAGE_TOKEN_ESTIMATE + 50
+
+
+def test_compaction_summary_never_contains_image_base64() -> None:
+    secret_payload = "SENSITIVE_BASE64_PAYLOAD"
+    messages = [
+        {"role": "system", "content": "system"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "old image"},
+                {
+                    "type": "image",
+                    "media_type": "image/png",
+                    "data": secret_payload,
+                },
+            ],
+        },
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "current"},
+    ]
+    result = HistoryCompactor(
+        max_context_tokens=10_000,
+        completion_reserve=100,
+        recent_messages=2,
+    ).compact(messages, count_tokens=count_words, force=True)
+
+    assert secret_payload not in result.summary
+    assert "[image: image/png]" in result.summary

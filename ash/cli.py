@@ -1343,11 +1343,20 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
         # Normal turn
         try:
-            from cli.attachments import expand_file_mentions
+            from cli.attachments import prepare_file_mentions
 
+            user_metadata: dict[str, Any] | None = None
             if expand_mentions:
-                user_input = expand_file_mentions(user_input, loop.safety_guard)
-            response = await turn_controller.run(user_input)
+                prepared = prepare_file_mentions(
+                    user_input,
+                    loop.safety_guard,
+                    allow_images=loop.provider.capabilities.vision,
+                )
+                user_input = prepared.prompt
+                user_metadata = prepared.message_metadata()
+            response = await turn_controller.run(
+                user_input, user_metadata=user_metadata
+            )
             if response is None:
                 continue
         except EOFError:
@@ -2562,9 +2571,16 @@ async def _bootstrap_and_headless(
     json_schema_path: Path | None = None,
 ) -> int:
     from exceptions import classify_exception, format_error
+    from cli.attachments import prepare_file_mentions
 
     try:
         session = await loop.start_session(session_id)
+        prepared = prepare_file_mentions(
+            prompt,
+            loop.safety_guard,
+            allow_images=loop.provider.capabilities.vision,
+        )
+        prompt = prepared.prompt
         schema = None
         if json_schema_path is not None:
             schema = _load_json_schema(json_schema_path)
@@ -2572,7 +2588,10 @@ async def _bootstrap_and_headless(
                 f"{prompt}\n\nReturn only JSON matching this schema:\n"
                 f"{json.dumps(schema, ensure_ascii=False)}"
             )
-        response = await loop.run_turn(prompt)
+        response = await loop.run_turn(
+            prompt,
+            user_metadata=prepared.message_metadata(),
+        )
         payload = {
             "response": response,
             "session_id": session.session_id,

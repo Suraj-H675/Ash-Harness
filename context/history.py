@@ -14,6 +14,7 @@ DEFAULT_CONTEXT_BUDGET_WEIGHTS: dict[str, float] = {
     "repo_map": 0.10,
     "memory": 0.10,
 }
+IMAGE_TOKEN_ESTIMATE = 1024
 
 
 @dataclass(frozen=True)
@@ -338,7 +339,7 @@ class HistoryCompactor:
         lines.append("Compacted events:")
         for message in messages:
             role = str(message.get("role", "unknown"))
-            content = str(message.get("content", "")).strip()
+            content = _summary_content(message.get("content", "")).strip()
             content = " ".join(content.split())
             if len(content) > 500:
                 content = content[:497] + "..."
@@ -359,5 +360,47 @@ class HistoryCompactor:
         messages: list[dict[str, Any]],
         count_tokens: Callable[[str], int],
     ) -> int:
-        payload = json.dumps(messages, ensure_ascii=False, default=str)
-        return max(0, int(count_tokens(payload)))
+        sanitized, image_count = _without_image_data(messages)
+        payload = json.dumps(sanitized, ensure_ascii=False, default=str)
+        return max(0, int(count_tokens(payload))) + image_count * IMAGE_TOKEN_ESTIMATE
+
+
+def _without_image_data(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    sanitized: list[dict[str, Any]] = []
+    image_count = 0
+    for message in messages:
+        copied = dict(message)
+        content = copied.get("content")
+        if isinstance(content, list):
+            blocks: list[Any] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image":
+                    image_count += 1
+                    blocks.append(
+                        {
+                            "type": "image",
+                            "media_type": block.get("media_type", ""),
+                            "data": "[binary image omitted from token estimate]",
+                        }
+                    )
+                else:
+                    blocks.append(block)
+            copied["content"] = blocks
+        sanitized.append(copied)
+    return sanitized, image_count
+
+
+def _summary_content(content: Any) -> str:
+    if not isinstance(content, list):
+        return str(content)
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            parts.append(str(block.get("text", "")))
+        elif block.get("type") == "image":
+            parts.append(f"[image: {block.get('media_type', 'unknown')}]")
+    return " ".join(parts)
