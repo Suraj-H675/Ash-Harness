@@ -13,6 +13,7 @@ ENV_KEYS = [
     "ASH_MAX_CONTEXT_TOKENS",
     "ASH_MAX_COMPLETION_TOKENS",
     "ASH_MAX_TOOL_RESULT_TOKENS",
+    "ASH_MAX_ATTACHMENT_TOKENS",
     "ASH_NOTIFICATION_METHOD",
     "ASH_NOTIFICATION_EVENTS",
     "ASH_NOTIFICATION_INCLUDE_PREVIEW",
@@ -183,6 +184,45 @@ def test_future_config_schema_version_is_refused(tmp_path: Path) -> None:
             AshConfig.load()
     finally:
         AshConfig.model_config["toml_file"] = original_toml_file
+
+
+def test_attachment_budget_defaults_to_quarter_of_usable_context() -> None:
+    small = AshConfig(
+        model="ollama/test",
+        max_context_tokens=8000,
+        max_completion_tokens=2000,
+    )
+    large = AshConfig(
+        model="ollama/test",
+        max_context_tokens=128000,
+        max_completion_tokens=4000,
+    )
+    explicit = AshConfig(
+        model="ollama/test",
+        max_context_tokens=8000,
+        max_completion_tokens=2000,
+        max_attachment_tokens=777,
+    )
+
+    assert small.attachment_token_budget == 1500
+    assert large.attachment_token_budget == 16000
+    assert explicit.attachment_token_budget == 777
+
+
+def test_context_reserves_reject_impossible_attachment_budget() -> None:
+    with pytest.raises(ValueError, match="max_completion_tokens"):
+        AshConfig(
+            model="ollama/test",
+            max_context_tokens=1000,
+            max_completion_tokens=1000,
+        )
+    with pytest.raises(ValueError, match="max_attachment_tokens"):
+        AshConfig(
+            model="ollama/test",
+            max_context_tokens=1000,
+            max_completion_tokens=100,
+            max_attachment_tokens=901,
+        )
 
 
 def test_config_loads_without_api_key(

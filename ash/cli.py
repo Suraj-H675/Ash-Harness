@@ -1361,6 +1361,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     user_input,
                     loop.safety_guard,
                     allow_images=loop.provider.capabilities.vision,
+                    token_budget=config.attachment_token_budget,
+                    count_tokens=loop.provider.count_tokens,
                 )
                 user_input = prepared.prompt
                 user_metadata = prepared.message_metadata()
@@ -2640,6 +2642,8 @@ async def _bootstrap_and_headless(
                 prompt,
                 safety_guard,
                 allow_images=provider.capabilities.vision,
+                token_budget=config.attachment_token_budget,
+                count_tokens=provider.count_tokens,
             )
             if safety_guard is not None and provider is not None
             else PreparedAttachments(prompt)

@@ -39,6 +39,7 @@ PROJECT_CONFIG_FIELDS = frozenset(
         "max_context_tokens",
         "max_completion_tokens",
         "max_tool_result_tokens",
+        "max_attachment_tokens",
         "steering_queue_limit",
         "prompt_cache_enabled",
         "prompt_cache_retention",
@@ -254,6 +255,14 @@ class AshConfig(BaseSettings):
     max_tool_result_tokens: int = Field(
         20000,
         description="Limit for single tool response strings before middle truncation.",
+    )
+    max_attachment_tokens: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Combined attachment token cap; 0 selects 25% of usable input context "
+            "up to 16000 tokens."
+        ),
     )
     steering_queue_limit: int = Field(
         20,
@@ -666,6 +675,17 @@ class AshConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_context_reserves(self) -> "AshConfig":
+        if self.max_completion_tokens >= self.max_context_tokens:
+            raise ValueError("max_completion_tokens must be below max_context_tokens")
+        usable = self.max_context_tokens - self.max_completion_tokens
+        if self.max_attachment_tokens > usable:
+            raise ValueError(
+                "max_attachment_tokens must not exceed the usable input context"
+            )
+        return self
+
+    @model_validator(mode="after")
     def apply_screen_reader_preferences(self) -> "AshConfig":
         if not self.screen_reader_mode:
             return self
@@ -679,6 +699,13 @@ class AshConfig(BaseSettings):
     def provider(self) -> str:
         """Parse provider from the model string."""
         return self.model.split("/", 1)[0]
+
+    @property
+    def attachment_token_budget(self) -> int:
+        if self.max_attachment_tokens:
+            return self.max_attachment_tokens
+        usable = self.max_context_tokens - self.max_completion_tokens
+        return max(1, min(16_000, usable // 4))
 
     @property
     def model_name(self) -> str:

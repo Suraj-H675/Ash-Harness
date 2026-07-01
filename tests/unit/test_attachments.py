@@ -104,3 +104,57 @@ def test_prepare_file_mentions_rejects_image_for_nonvision_model(
         prepare_file_mentions(
             "inspect @image.jpg", SafetyGuard(tmp_path), allow_images=False
         )
+
+
+def test_prepare_file_mentions_enforces_combined_token_budget(tmp_path: Path) -> None:
+    (tmp_path / "first.txt").write_text("a" * 40, encoding="utf-8")
+    (tmp_path / "second.txt").write_text("b" * 40, encoding="utf-8")
+    guard = SafetyGuard(tmp_path)
+
+    with pytest.raises(ValueError, match=r"@second\.txt.*budget is 100"):
+        prepare_file_mentions(
+            "review @first.txt @second.txt",
+            guard,
+            allow_images=False,
+            token_budget=100,
+            count_tokens=len,
+        )
+
+
+def test_prepare_file_mentions_reports_attachment_token_usage(tmp_path: Path) -> None:
+    (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
+
+    prepared = prepare_file_mentions(
+        "review @note.txt",
+        SafetyGuard(tmp_path),
+        allow_images=False,
+        token_budget=1000,
+        count_tokens=lambda text: len(text.split()),
+    )
+
+    assert 0 < prepared.attachment_tokens <= 1000
+
+
+def test_image_attachment_budget_includes_fixed_vision_estimate(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "image.png").write_bytes(b"\x89PNG\r\n\x1a\nimage")
+
+    with pytest.raises(ValueError, match="1025 tokens"):
+        prepare_file_mentions(
+            "inspect @image.png",
+            SafetyGuard(tmp_path),
+            allow_images=True,
+            token_budget=1023,
+            count_tokens=lambda _: 0,
+        )
+
+
+def test_attachment_budget_requires_counter_pair(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="provided together"):
+        prepare_file_mentions(
+            "nothing",
+            SafetyGuard(tmp_path),
+            allow_images=False,
+            token_budget=100,
+        )
