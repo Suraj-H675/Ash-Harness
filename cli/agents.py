@@ -105,6 +105,15 @@ def send_agent_message(
             raise ValueError(
                 f"recipient {recipient_id!r} is not registered; use --force to queue anyway"
             )
+        pending = state.fetch_messages(
+            recipient_id,
+            undelivered_only=True,
+            limit=101,
+        )
+        if len(pending) >= 100:
+            raise ValueError(
+                f"recipient {recipient_id!r} already has 100 pending messages"
+            )
         if json_content:
             try:
                 payload = json.loads(content)

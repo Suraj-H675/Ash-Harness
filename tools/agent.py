@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -278,9 +279,57 @@ class SpawnAgentTool(BaseTool):
         )
         try:
             await loop.start_session()
-            return (await loop.run_turn(task))[: self._max_return_chars]
+            turn = asyncio.create_task(loop.run_turn(task))
+            inbox = asyncio.create_task(
+                self._consume_worker_messages(loop, agent_id, turn)
+            )
+            try:
+                return (await turn)[: self._max_return_chars]
+            finally:
+                inbox.cancel()
+                await asyncio.gather(inbox, return_exceptions=True)
         finally:
             await loop.aclose()
+
+    async def _consume_worker_messages(
+        self,
+        loop: AshLoop,
+        agent_id: str,
+        turn: asyncio.Task[str],
+    ) -> None:
+        while not turn.done():
+            messages = self._shared_state.fetch_messages(
+                agent_id,
+                undelivered_only=True,
+                limit=25,
+            )
+            delivered: list[int] = []
+            for message in messages:
+                if message.message_type == "stop":
+                    self._shared_state.update_status(
+                        agent_id,
+                        "failed",
+                        current_task="stopped by persisted message",
+                    )
+                    delivered.append(message.message_id)
+                    turn.cancel()
+                    break
+                if message.message_type not in {"steer", "message"}:
+                    continue
+                content = message.content.get("content", message.content)
+                steering = (
+                    content
+                    if isinstance(content, str)
+                    else json.dumps(content, ensure_ascii=False, sort_keys=True)
+                )
+                try:
+                    loop.queue_steering(steering)
+                except (OverflowError, ValueError):
+                    continue
+                delivered.append(message.message_id)
+            if delivered:
+                self._shared_state.mark_delivered(delivered)
+            await asyncio.sleep(0.1)
 
     async def aclose(self) -> None:
         tasks = list(self._tasks.values())

@@ -150,3 +150,106 @@ async def test_shared_coder_requires_explicit_isolation_choice(tmp_path) -> None
 
     assert result.success is True
     await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_agent_consumes_and_acknowledges_steering(tmp_path) -> None:
+    class SteeringProvider(FakeProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+            self.started = asyncio.Event()
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                self.started.set()
+                await asyncio.sleep(0.25)
+                yield StreamChunk(content="initial", is_done=True)
+            else:
+                assert any(
+                    message["role"] == "user" and message["content"] == "focus tests"
+                    for message in messages
+                )
+                yield StreamChunk(content="redirected", is_done=True)
+
+    provider = SteeringProvider()
+    state = SharedState(tmp_path / "state" / "agents.db")
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, lambda: provider)
+    started = await tool.run(
+        role="reviewer",
+        task="inspect",
+        agent_id="steered-worker",
+        background=True,
+    )
+    assert started.success is True
+    await provider.started.wait()
+    message_id = state.send_to_agent(
+        "lead",
+        "steered-worker",
+        "steer",
+        "focus tests",
+    )
+
+    for _ in range(30):
+        status = state.get_status("steered-worker")
+        if status is not None and status.status == "completed":
+            break
+        await asyncio.sleep(0.05)
+    else:
+        pytest.fail("steered worker did not complete")
+
+    message = next(
+        item
+        for item in state.fetch_messages("steered-worker", undelivered_only=False)
+        if item.message_id == message_id
+    )
+    assert message.delivered is True
+    report = state.fetch_messages("lead", undelivered_only=False)[-1]
+    assert report.content["summary"] == "redirected"
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_agent_honors_persisted_stop_message(tmp_path) -> None:
+    class WaitingProvider(FakeProvider):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.started.set()
+            await asyncio.sleep(10)
+            yield StreamChunk(content="late", is_done=True)
+
+    provider = WaitingProvider()
+    state = SharedState(tmp_path / "state" / "agents.db")
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, lambda: provider)
+    await tool.run(
+        role="reviewer",
+        task="wait",
+        agent_id="stopped-worker",
+        background=True,
+    )
+    await provider.started.wait()
+    message_id = state.send_message(
+        "lead",
+        "stopped-worker",
+        "stop",
+        {},
+    )
+
+    for _ in range(30):
+        status = state.get_status("stopped-worker")
+        if status is not None and status.status == "failed":
+            break
+        await asyncio.sleep(0.05)
+    else:
+        pytest.fail("persisted stop was not consumed")
+
+    message = next(
+        item
+        for item in state.fetch_messages("stopped-worker", undelivered_only=False)
+        if item.message_id == message_id
+    )
+    assert message.delivered is True
+    assert "persisted message" in state.get_status("stopped-worker").current_task
+    await tool.aclose()
