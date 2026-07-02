@@ -6,7 +6,7 @@ from core.loop import AshLoop
 from tools.base import BaseTool, ToolResult, ToolMiddleware, ToolMiddlewareSkip
 from config import AshConfig
 from context.turn import TurnContext
-from core.session import Message, SessionStore, get_db_connection
+from core.session import Message, SessionStore, ToolCallRecord, get_db_connection
 from providers.base import ProviderABC, StreamChunk
 from providers.capabilities import ProviderCapabilities
 from providers.retry import ProviderCircuitBreaker, ProviderCircuitOpen
@@ -109,6 +109,17 @@ class CaptureTool(BaseTool):
         return ToolResult(success=True, output=kwargs["text"])
 
 
+class BlockingCaptureTool(CaptureTool):
+    def __init__(self, safety_guard):
+        super().__init__(safety_guard)
+        self.started = asyncio.Event()
+
+    async def run(self, **kwargs):
+        self.started.set()
+        await asyncio.Event().wait()
+        return ToolResult(success=True, output="unreachable")
+
+
 class BudgetTool(BaseTool):
     name = "budget_tool"
     description = "tool " * 80
@@ -161,6 +172,36 @@ class EventUI(TerminalUI):
 
     def emit_event(self, payload):
         self.events.append(payload)
+
+
+@pytest.mark.asyncio
+async def test_resuming_session_recovers_pending_tool_and_emits_details(tmp_path):
+    store = SessionStore(tmp_path / "recovery.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "turn-crashed", "run")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id="call-command",
+            tool_name="run_command",
+            arguments={"command_line": "build"},
+            approved=True,
+            executed=False,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id="turn-crashed",
+    )
+    ui = EventUI()
+    loop = AshLoop(store, MockProvider(), SafetyGuard(tmp_path), ui, tmp_path)
+
+    await loop.start_session(session.session_id)
+
+    assert loop.recovered_turns == 1
+    assert loop.recovery_summary is not None
+    assert loop.recovery_summary.needs_attention is True
+    event = next(event for event in ui.events if event["type"] == "session.recovery")
+    assert event["unknown_calls"] == ["run_command (call-command)"]
+    assert event["needs_attention"] is True
 
 
 class SteeringProvider(ProviderABC):
@@ -275,6 +316,44 @@ async def test_turn_running_state_resets_after_cancellation(tmp_path):
         loop.session_store.reconcile_interrupted_turns(loop.current_session.session_id)
         == 0
     )
+
+
+@pytest.mark.asyncio
+async def test_approved_tool_intent_is_durable_before_execution_finishes(tmp_path):
+    provider = NativeToolProvider()
+    tool = BlockingCaptureTool(SafetyGuard(tmp_path))
+    store = SessionStore(tmp_path / "pending-tool.db")
+    loop = AshLoop(
+        store,
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+    )
+
+    turn = asyncio.create_task(loop.run_turn("use the capture tool"))
+    await tool.started.wait()
+    assert loop.current_session is not None
+    assert loop.turn_context is not None
+    with get_db_connection(store.db_path) as connection:
+        pending = connection.execute(
+            "SELECT approved, executed, turn_id FROM tool_calls WHERE call_id = ?",
+            ("call-native-1",),
+        ).fetchone()
+    assert pending["approved"] == 1
+    assert pending["executed"] == 0
+    assert pending["turn_id"] == loop.turn_context.turn_id
+
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    recovered = store.load_session(loop.current_session.session_id).tool_calls[0]
+    assert recovered.executed is True
+    assert "outcome is unknown" in (recovered.error or "")
+    assert loop.recovery_summary is not None
+    assert loop.recovery_summary.needs_attention is True
 
 
 @pytest.mark.asyncio

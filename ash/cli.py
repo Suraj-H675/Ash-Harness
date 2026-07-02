@@ -742,6 +742,14 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             f"Session: {session.session_id if session else '(none)'}",
                             f"Title: {(session.title or '(untitled)') if session else '(none)'}",
                             f"Recovered interrupted turns: {loop.recovered_turns}",
+                            "Recovery attention: "
+                            + (
+                                f"{len(loop.recovery_summary.unknown_calls)} unknown tool(s), "
+                                f"{len(loop.recovery_summary.unresolved_files)} unresolved file(s)"
+                                if loop.recovery_summary is not None
+                                and loop.recovery_summary.needs_attention
+                                else "none"
+                            ),
                             "Capabilities: "
                             + ", ".join(
                                 label
@@ -2641,10 +2649,14 @@ def main(argv: list[str] | None = None) -> int:
     from core.checkpoints import FileCheckpointMiddleware
     from core.secret_middleware import SecretRedactionMiddleware
 
-    def checkpoint_context() -> tuple[str, str] | None:
+    def checkpoint_context() -> tuple[str, str, str] | None:
         if loop.current_session is None or loop.turn_context is None:
             return None
-        return loop.current_session.session_id, loop.turn_context.turn_id
+        return (
+            loop.current_session.session_id,
+            loop.turn_context.turn_id,
+            str(loop.turn_context.get("tool_call_id", "")),
+        )
 
     loop.tool_middlewares.append(
         FileCheckpointMiddleware(session_store, safety_guard, checkpoint_context)
@@ -2697,6 +2709,17 @@ async def _bootstrap_and_repl(
 
     try:
         await loop.start_session(session_id)
+        if loop.recovery_summary is not None and loop.recovered_turns:
+            summary = loop.recovery_summary
+            print(
+                "Recovered "
+                f"{summary.interrupted_turns} interrupted turn(s): "
+                f"{summary.compensated_calls} tool call(s) compensated; "
+                f"{len(summary.unknown_calls)} unknown tool outcome(s); "
+                f"{len(summary.unresolved_files)} unresolved file(s).",
+                file=sys.stderr if summary.needs_attention else sys.stdout,
+                flush=True,
+            )
         return await _repl(loop, config, sandbox_manager)
     except Exception as exc:  # noqa: BLE001
         error = classify_exception(exc)
@@ -2754,6 +2777,8 @@ async def _bootstrap_and_headless(
             "context_tokens": loop._last_context_tokens,
             "usage": loop.last_turn_usage,
         }
+        if loop.recovery_summary is not None and loop.recovered_turns:
+            payload["recovery"] = loop.recovery_summary.to_dict()
         if schema is not None:
             payload["structured_output"] = validate_structured_output(response, schema)
         ui.emit_result(payload)

@@ -6,6 +6,7 @@ import difflib
 import hashlib
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,12 +27,35 @@ MAX_CHECKPOINT_BYTES = 20 * 1024 * 1024
 MAX_CHECKPOINT_DIFF_LINES = 400
 
 
+@dataclass(frozen=True)
+class RecoverySummary:
+    interrupted_turns: int = 0
+    compensated_calls: int = 0
+    compensated_files: tuple[Path, ...] = ()
+    unknown_calls: tuple[str, ...] = ()
+    unresolved_files: tuple[Path, ...] = ()
+
+    @property
+    def needs_attention(self) -> bool:
+        return bool(self.unknown_calls or self.unresolved_files)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "interrupted_turns": self.interrupted_turns,
+            "compensated_calls": self.compensated_calls,
+            "compensated_files": [str(path) for path in self.compensated_files],
+            "unknown_calls": list(self.unknown_calls),
+            "unresolved_files": [str(path) for path in self.unresolved_files],
+            "needs_attention": self.needs_attention,
+        }
+
+
 class FileCheckpointMiddleware(ToolMiddleware):
     def __init__(
         self,
         store: SessionStore,
         guard: SafetyGuard,
-        context_provider: Callable[[], tuple[str, str] | None],
+        context_provider: Callable[[], tuple[str, str] | tuple[str, str, str] | None],
     ) -> None:
         self.store = store
         self.guard = guard
@@ -44,7 +68,7 @@ class FileCheckpointMiddleware(ToolMiddleware):
         context = self.context_provider()
         if context is None or tool_name not in EDIT_TOOLS:
             return
-        session_id, turn_id = context
+        session_id, turn_id, call_id = _checkpoint_context(context)
         for path in self._paths(tool_name, arguments):
             existed = path.is_file()
             content = path.read_bytes() if existed else None
@@ -59,6 +83,7 @@ class FileCheckpointMiddleware(ToolMiddleware):
                 existed=existed,
                 before_content=content,
                 before_mode=mode,
+                call_id=call_id,
             )
 
     async def after_tool(
@@ -67,10 +92,16 @@ class FileCheckpointMiddleware(ToolMiddleware):
         context = self.context_provider()
         if context is None or tool_name not in EDIT_TOOLS or not result.success:
             return
-        session_id, turn_id = context
+        session_id, turn_id, call_id = _checkpoint_context(context)
         for path in self._paths(tool_name, arguments):
             digest = _digest(path)
-            self.store.finish_file_checkpoint(session_id, turn_id, str(path), digest)
+            self.store.finish_file_checkpoint(
+                session_id,
+                turn_id,
+                str(path),
+                digest,
+                call_id=call_id,
+            )
 
     def _paths(self, tool_name: str, arguments: dict[str, Any]) -> list[Path]:
         if tool_name == "apply_patch":
@@ -80,6 +111,177 @@ class FileCheckpointMiddleware(ToolMiddleware):
         return [self.guard.validate_path(str(raw_path))] if raw_path else []
 
 
+def _checkpoint_context(
+    context: tuple[str, str] | tuple[str, str, str],
+) -> tuple[str, str, str]:
+    if len(context) == 2:
+        return context[0], context[1], ""
+    return context
+
+
+def recover_interrupted_turns(
+    store: SessionStore,
+    guard: SafetyGuard,
+    session_id: str,
+) -> RecoverySummary:
+    """Compensate provably interrupted direct edits and flag unknown effects."""
+
+    turns = store.started_turns(session_id)
+    compensated_calls: list[str] = []
+    compensated_files: list[Path] = []
+    unknown_calls: list[str] = []
+    unresolved_files: list[Path] = []
+
+    for turn in turns:
+        turn_id = str(turn["turn_id"])
+        pending = store.pending_tool_calls(session_id, turn_id)
+        pending_ids = [str(row["call_id"]) for row in pending]
+        call_errors: dict[str, str] = {}
+        restored_checkpoint_ids: list[int] = []
+        turn_compensated: list[str] = []
+        turn_unknown: list[dict[str, str]] = []
+        turn_unresolved: list[str] = []
+
+        for call in pending:
+            call_id = str(call["call_id"])
+            tool_name = str(call["tool_name"])
+            if tool_name not in EDIT_TOOLS:
+                error = (
+                    "Ash stopped while this tool was running; its outcome is unknown. "
+                    "Inspect the workspace before continuing."
+                )
+                call_errors[call_id] = error
+                unknown_calls.append(f"{tool_name} ({call_id})")
+                turn_unknown.append({"call_id": call_id, "tool": tool_name})
+                continue
+
+            rows = store.file_checkpoints_for_call(session_id, turn_id, call_id)
+            if not rows:
+                error = (
+                    "Ash stopped before a file checkpoint was durable; the tool outcome "
+                    "is unknown. Inspect the workspace before continuing."
+                )
+                call_errors[call_id] = error
+                unknown_calls.append(f"{tool_name} ({call_id})")
+                turn_unknown.append({"call_id": call_id, "tool": tool_name})
+                continue
+            safe_rows: list[tuple[Any, Path]] = []
+            conflicts: list[Path] = []
+            for row in rows:
+                path = guard.validate_path(row["path"])
+                before_digest = _checkpoint_before_digest(row)
+                current_digest = _digest(path)
+                after_digest = row["after_sha256"]
+                if current_digest == before_digest:
+                    safe_rows.append((row, path))
+                elif after_digest is not None and current_digest == after_digest:
+                    safe_rows.append((row, path))
+                else:
+                    conflicts.append(path)
+
+            if conflicts:
+                error = (
+                    "Ash stopped during this file edit, but the affected file changed "
+                    "again; automatic rollback was refused."
+                )
+                call_errors[call_id] = error
+                for path in conflicts:
+                    unresolved_files.append(path)
+                    turn_unresolved.append(_relative_display(path, guard.project_root))
+                continue
+
+            rows_to_restore = [
+                (row, path)
+                for row, path in safe_rows
+                if _digest(path) != _checkpoint_before_digest(row)
+            ]
+            _restore_checkpoint_rows(rows_to_restore)
+            restored_checkpoint_ids.extend(
+                int(row["checkpoint_id"]) for row, _ in safe_rows
+            )
+            compensated_calls.append(f"{tool_name} ({call_id})")
+            turn_compensated.append(call_id)
+            compensated_files.extend(path for _, path in rows_to_restore)
+            call_errors[call_id] = (
+                "Interrupted file edit was rolled back during startup recovery."
+            )
+
+        unmatched = store.unmatched_incomplete_checkpoints(
+            session_id, turn_id, pending_ids
+        )
+        for row in unmatched:
+            path = guard.validate_path(row["path"])
+            if _digest(path) == _checkpoint_before_digest(row):
+                restored_checkpoint_ids.append(int(row["checkpoint_id"]))
+            else:
+                unresolved_files.append(path)
+                turn_unresolved.append(_relative_display(path, guard.project_root))
+
+        status = (
+            "needs_attention"
+            if turn_unknown or turn_unresolved
+            else "compensated"
+            if turn_compensated or restored_checkpoint_ids
+            else "interrupted"
+        )
+        report: dict[str, Any] = {
+            "turn_id": turn_id,
+            "status": status,
+            "compensated_calls": turn_compensated,
+            "unknown_calls": turn_unknown,
+            "unresolved_files": list(dict.fromkeys(turn_unresolved)),
+        }
+        store.finalize_interrupted_recovery(
+            session_id,
+            turn_id,
+            call_errors=call_errors,
+            restored_checkpoint_ids=list(dict.fromkeys(restored_checkpoint_ids)),
+            recovery=report,
+        )
+
+    return RecoverySummary(
+        interrupted_turns=len(turns),
+        compensated_calls=len(compensated_calls),
+        compensated_files=tuple(dict.fromkeys(compensated_files)),
+        unknown_calls=tuple(unknown_calls),
+        unresolved_files=tuple(dict.fromkeys(unresolved_files)),
+    )
+
+
+def _checkpoint_before_digest(row: Any) -> str:
+    if not bool(row["existed"]):
+        return "missing"
+    return hashlib.sha256(bytes(row["before_content"] or b"")).hexdigest()
+
+
+def _restore_checkpoint_rows(rows: list[tuple[Any, Path]]) -> None:
+    originals: dict[Path, tuple[bool, bytes, int | None]] = {}
+    for _, path in rows:
+        existed = path.is_file()
+        originals[path] = (
+            existed,
+            path.read_bytes() if existed else b"",
+            path.stat().st_mode if existed else None,
+        )
+    try:
+        for row, path in rows:
+            if bool(row["existed"]):
+                _atomic_restore(path, bytes(row["before_content"] or b""))
+                if row["before_mode"] is not None:
+                    os.chmod(path, int(row["before_mode"]))
+            else:
+                path.unlink(missing_ok=True)
+    except OSError:
+        for path, (existed, content, mode) in originals.items():
+            if existed:
+                _atomic_restore(path, content)
+                if mode is not None:
+                    os.chmod(path, mode)
+            else:
+                path.unlink(missing_ok=True)
+        raise
+
+
 def undo_latest_checkpoint(
     store: SessionStore, guard: SafetyGuard, session_id: str
 ) -> list[Path]:
@@ -87,11 +289,7 @@ def undo_latest_checkpoint(
     if not rows:
         return []
     paths = [guard.validate_path(row["path"]) for row in rows]
-    conflicts = [
-        str(path)
-        for row, path in zip(rows, paths, strict=True)
-        if _digest(path) != row["after_sha256"]
-    ]
+    conflicts = _checkpoint_chain_conflicts(rows, paths)
     if conflicts:
         raise RuntimeError(
             "Undo refused because files changed after Ash's edit: "
@@ -105,7 +303,7 @@ def undo_latest_checkpoint(
         else:
             path.unlink(missing_ok=True)
     store.mark_file_checkpoints_restored(session_id, rows[0]["turn_id"])
-    return paths
+    return list(dict.fromkeys(paths))
 
 
 def rewind_session_with_files(
@@ -203,11 +401,7 @@ def diff_latest_checkpoint(
     if not rows:
         return "No checkpointed file changes for this session."
     paths = [guard.validate_path(row["path"]) for row in rows]
-    conflicts = [
-        str(path)
-        for row, path in zip(rows, paths, strict=True)
-        if _digest(path) != row["after_sha256"]
-    ]
+    conflicts = _checkpoint_chain_conflicts(rows, paths)
     if conflicts:
         raise RuntimeError(
             "Checkpoint diff refused because files changed after Ash's edit: "
@@ -216,7 +410,10 @@ def diff_latest_checkpoint(
 
     lines: list[str] = []
     truncated = False
+    earliest_by_path: dict[Path, Any] = {}
     for row, path in zip(rows, paths, strict=True):
+        earliest_by_path[path] = row
+    for path, row in earliest_by_path.items():
         before = bytes(row["before_content"] or b"") if bool(row["existed"]) else b""
         after = path.read_bytes() if path.is_file() else b""
         if _looks_binary(before) or _looks_binary(after):
@@ -248,6 +445,17 @@ def diff_latest_checkpoint(
     if truncated:
         lines.append("[checkpoint diff truncated]")
     return "\n".join(lines) if lines else "No checkpoint diff."
+
+
+def _checkpoint_chain_conflicts(rows: list[Any], paths: list[Path]) -> list[str]:
+    simulated: dict[Path, str] = {}
+    conflicts: list[str] = []
+    for row, path in zip(rows, paths, strict=True):
+        current = simulated.setdefault(path, _digest(path))
+        if row["after_sha256"] is None or current != row["after_sha256"]:
+            conflicts.append(str(path))
+        simulated[path] = _checkpoint_before_digest(row)
+    return list(dict.fromkeys(conflicts))
 
 
 def _digest(path: Path) -> str:

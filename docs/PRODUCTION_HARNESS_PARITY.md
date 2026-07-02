@@ -94,7 +94,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Rewind conversation | Verified locally | Complete-turn transcript rewind plus optional conflict-preflighted multi-turn file restoration; usage totals are adjusted and filesystem changes roll forward if the database phase fails |
 | File checkpoints/undo | Verified locally | Direct edit tools capture per-turn bytes/hashes and refuse conflict overwrites |
 | Session export/import | Verified locally | Versioned redacted JSONL/Markdown export and validated JSONL import |
-| Crash recovery | Partial | Durable turn journal reconciles interrupted turns; interrupted-tool compensation remains |
+| Crash recovery | Verified locally | Approved tool intent is persisted before execution; resume and cancellation compensate only hash-proven in-flight direct edits, preserve earlier completed edits, persist idempotent outcomes, and flag non-file or conflicting effects for inspection |
 | Session retention | Verified locally | Configurable automatic cleanup plus explicit project prune and vacuum |
 | Cost/token history | Partial | Model-specific pricing, no hardcoded provider assumptions |
 

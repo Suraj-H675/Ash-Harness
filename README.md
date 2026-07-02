@@ -98,6 +98,13 @@ edits newest-first, adjusts persisted token/cost totals, and rolls files back
 to their current state if the database update fails. It refuses split-turn
 boundaries, post-edit conflicts, incomplete checkpoints, and legacy transcript
 records that predate durable turn IDs.
+When a resumed session contains a turn interrupted during tool execution, Ash
+uses the persisted approved-call intent and per-call checkpoint to compensate
+only that in-flight direct file edit. It restores a file only when its hash is
+still the recorded post-edit or pre-edit state. Changed/incomplete files and
+non-file tools such as commands are never guessed: they are marked as needing
+attention, persisted in the recovery report, emitted as `session.recovery`, and
+shown by `/status`. A successful recovery is idempotent across another crash.
 `/plan on` enables editable sprint plans for multi-step requests; type `e` at
 the plan prompt to revise the generated contract in `$VISUAL` or `$EDITOR`,
 then `y` to approve and execute it.

@@ -151,10 +151,14 @@ class AshClient:
         )
         loop.permission_policy.set_persistent_rules(permission_rules)
 
-        def checkpoint_context() -> tuple[str, str] | None:
+        def checkpoint_context() -> tuple[str, str, str] | None:
             if loop.current_session is None or loop.turn_context is None:
                 return None
-            return loop.current_session.session_id, loop.turn_context.turn_id
+            return (
+                loop.current_session.session_id,
+                loop.turn_context.turn_id,
+                str(loop.turn_context.get("tool_call_id", "")),
+            )
 
         loop.tool_middlewares.extend(
             [

@@ -396,6 +396,7 @@ class AshLoop:
             )
         self.current_session: Session | None = None
         self.recovered_turns = 0
+        self.recovery_summary: Any | None = None
         self._mcp_runtime: Any | None = None
         self._mcp_tool_names: set[str] = set()
         self._mcp_configs = dict(mcp_configs or {})
@@ -442,9 +443,21 @@ class AshLoop:
 
         if session_id is not None:
             self.current_session = self.session_store.load_session(session_id)
-            self.recovered_turns = self.session_store.reconcile_interrupted_turns(
-                session_id
+            from core.checkpoints import recover_interrupted_turns
+
+            self.recovery_summary = recover_interrupted_turns(
+                self.session_store,
+                self.safety_guard,
+                session_id,
             )
+            self.recovered_turns = self.recovery_summary.interrupted_turns
+            if self.recovered_turns:
+                self.ui.emit_event(
+                    {
+                        "type": "session.recovery",
+                        **self.recovery_summary.to_dict(),
+                    }
+                )
             return self.current_session
 
         # New session: optionally recall recent context from prior sessions
@@ -540,7 +553,22 @@ class AshLoop:
         except asyncio.CancelledError:
             current_turn_id = self.turn_context.turn_id if self.turn_context else None
             if current_turn_id is not None and current_turn_id != previous_turn_id:
-                self.session_store.interrupt_turn(current_turn_id)
+                try:
+                    from core.checkpoints import recover_interrupted_turns
+
+                    if self.current_session is None:
+                        raise RuntimeError("cancelled turn has no active session")
+                    self.recovery_summary = recover_interrupted_turns(
+                        self.session_store,
+                        self.safety_guard,
+                        self.current_session.session_id,
+                    )
+                    self.recovered_turns = self.recovery_summary.interrupted_turns
+                except Exception as exc:  # noqa: BLE001 - preserve cancellation semantics
+                    _log.warning(
+                        "cancel recovery failed for {}: {}", current_turn_id, exc
+                    )
+                    self.session_store.interrupt_turn(current_turn_id)
             discarded = len(self._steering_messages)
             self._steering_messages.clear()
             self.ui.emit_event(
@@ -1300,6 +1328,13 @@ class AshLoop:
                 )
                 continue
 
+            # Persist approved intent before execution so a fresh process can
+            # distinguish an interrupted tool from an unstarted request.
+            self.session_store.save_tool_call(
+                session.session_id,
+                record,
+                turn_id=self.turn_context.turn_id if self.turn_context else None,
+            )
             tool = self.tools.get(tool_name)
             if tool is None:
                 record.error = f"Unknown tool: {tool_name}"
@@ -1333,6 +1368,8 @@ class AshLoop:
                 continue
 
             self.ui.emit_event({"type": "tool.started", **event_base})
+            if self.turn_context is not None:
+                self.turn_context.set("tool_call_id", record.call_id)
             try:
                 if self.hooks is not None:
                     await self.hooks.fire_pre_tool(tool_name, arguments)
@@ -1351,11 +1388,21 @@ class AshLoop:
                 tool_result = await self._apply_middlewares_after(
                     tool_name, arguments, tool_result
                 )
+                if self.turn_context is not None:
+                    self.turn_context.data.pop("tool_call_id", None)
+            except asyncio.CancelledError:
+                if self.turn_context is not None:
+                    self.turn_context.data.pop("tool_call_id", None)
+                raise
             except ToolMiddlewareSkip:
+                if self.turn_context is not None:
+                    self.turn_context.data.pop("tool_call_id", None)
                 tool_result = ToolResult(
                     success=True, output="skipped by middleware", error=None
                 )
             except Exception as exc:  # noqa: BLE001 — we want any error captured
+                if self.turn_context is not None:
+                    self.turn_context.data.pop("tool_call_id", None)
                 record.executed = True
                 record.error = str(exc)
                 self.session_store.save_tool_call(

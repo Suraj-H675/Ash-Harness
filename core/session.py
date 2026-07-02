@@ -22,7 +22,7 @@ AuditAction = Literal[
     "tool_call", "command_run", "file_write", "safety_block", "user_approval"
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 
 class SessionStorageError(RuntimeError):
@@ -273,6 +273,8 @@ class SessionStore:
                 self._migrate_v5(conn)
             if from_version < 6:
                 self._migrate_v6(conn)
+            if from_version < 7:
+                self._migrate_v7(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -394,6 +396,54 @@ class SessionStore:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
             (6, _serialize_datetime(_utc_now())),
+        )
+
+    def _migrate_v7(self, conn: sqlite3.Connection) -> None:
+        """Identify checkpointed tool calls and persist crash recovery outcomes."""
+
+        if not _column_exists(conn, "file_checkpoints", "call_id"):
+            conn.executescript(
+                """
+                CREATE TABLE file_checkpoints_v7 (
+                    checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    existed INTEGER NOT NULL CHECK(existed IN (0, 1)),
+                    before_content BLOB,
+                    before_mode INTEGER,
+                    after_sha256 TEXT,
+                    restored INTEGER NOT NULL DEFAULT 0 CHECK(restored IN (0, 1)),
+                    created_at TIMESTAMP NOT NULL,
+                    call_id TEXT NOT NULL DEFAULT '',
+                    UNIQUE(session_id, turn_id, call_id, path),
+                    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+                );
+                INSERT INTO file_checkpoints_v7 (
+                    checkpoint_id, session_id, turn_id, tool_name, path, existed,
+                    before_content, before_mode, after_sha256, restored, created_at,
+                    call_id
+                )
+                SELECT checkpoint_id, session_id, turn_id, tool_name, path, existed,
+                       before_content, before_mode, after_sha256, restored, created_at,
+                       ''
+                FROM file_checkpoints;
+                DROP TABLE file_checkpoints;
+                ALTER TABLE file_checkpoints_v7 RENAME TO file_checkpoints;
+                """
+            )
+        if not _column_exists(conn, "turn_journal", "recovery_json"):
+            conn.execute(
+                "ALTER TABLE turn_journal ADD COLUMN recovery_json TEXT DEFAULT '{}'"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_checkpoints_call "
+            "ON file_checkpoints(session_id, turn_id, call_id)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (7, _serialize_datetime(_utc_now())),
         )
 
     def backup(
@@ -519,6 +569,7 @@ class SessionStore:
                     started_at TIMESTAMP NOT NULL,
                     completed_at TIMESTAMP,
                     usage_json TEXT DEFAULT '{}',
+                    recovery_json TEXT DEFAULT '{}',
                     FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
                 );
 
@@ -537,7 +588,8 @@ class SessionStore:
                     after_sha256 TEXT,
                     restored INTEGER NOT NULL DEFAULT 0 CHECK(restored IN (0, 1)),
                     created_at TIMESTAMP NOT NULL,
-                    UNIQUE(session_id, turn_id, path),
+                    call_id TEXT NOT NULL DEFAULT '',
+                    UNIQUE(session_id, turn_id, call_id, path),
                     FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
                 );
 
@@ -927,6 +979,116 @@ class SessionStore:
             )
             return cursor.rowcount
 
+    def started_turns(self, session_id: str) -> list[sqlite3.Row]:
+        """Return unfinished turns newest-first without mutating them."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            return conn.execute(
+                "SELECT * FROM turn_journal WHERE session_id = ? "
+                "AND status = 'started' ORDER BY started_at DESC, turn_id DESC",
+                (session_id,),
+            ).fetchall()
+
+    def pending_tool_calls(self, session_id: str, turn_id: str) -> list[sqlite3.Row]:
+        """Return approved calls that never persisted an execution outcome."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            return conn.execute(
+                "SELECT * FROM tool_calls WHERE session_id = ? AND turn_id = ? "
+                "AND approved = 1 AND executed = 0 ORDER BY timestamp, call_id",
+                (session_id, turn_id),
+            ).fetchall()
+
+    def file_checkpoints_for_call(
+        self, session_id: str, turn_id: str, call_id: str
+    ) -> list[sqlite3.Row]:
+        """Return unrestored checkpoints belonging to one tool call."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            return conn.execute(
+                "SELECT * FROM file_checkpoints WHERE session_id = ? "
+                "AND turn_id = ? AND call_id = ? AND restored = 0 "
+                "ORDER BY checkpoint_id DESC",
+                (session_id, turn_id, call_id),
+            ).fetchall()
+
+    def unmatched_incomplete_checkpoints(
+        self, session_id: str, turn_id: str, pending_call_ids: list[str]
+    ) -> list[sqlite3.Row]:
+        """Return legacy/incomplete checkpoints not owned by a pending call."""
+
+        parameters: list[Any] = [session_id, turn_id]
+        exclusion = ""
+        if pending_call_ids:
+            placeholders = ",".join("?" for _ in pending_call_ids)
+            exclusion = f" AND call_id NOT IN ({placeholders})"
+            parameters.extend(pending_call_ids)
+        with closing(get_db_connection(self.db_path)) as conn:
+            return conn.execute(
+                "SELECT * FROM file_checkpoints WHERE session_id = ? "
+                "AND turn_id = ? AND restored = 0 AND after_sha256 IS NULL"
+                + exclusion
+                + " ORDER BY checkpoint_id",
+                parameters,
+            ).fetchall()
+
+    def finalize_interrupted_recovery(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        call_errors: dict[str, str],
+        restored_checkpoint_ids: list[int],
+        recovery: dict[str, Any],
+    ) -> None:
+        """Atomically persist one startup recovery decision."""
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            for call_id, error in call_errors.items():
+                conn.execute(
+                    "UPDATE tool_calls SET executed = 1, error = ? "
+                    "WHERE session_id = ? AND turn_id = ? AND call_id = ?",
+                    (error, session_id, turn_id, call_id),
+                )
+            if restored_checkpoint_ids:
+                placeholders = ",".join("?" for _ in restored_checkpoint_ids)
+                conn.execute(
+                    "UPDATE file_checkpoints SET restored = 1 "
+                    f"WHERE session_id = ? AND checkpoint_id IN ({placeholders})",
+                    (session_id, *restored_checkpoint_ids),
+                )
+            conn.execute(
+                "UPDATE turn_journal SET status = 'interrupted', completed_at = ?, "
+                "recovery_json = ? WHERE session_id = ? AND turn_id = ? "
+                "AND status = 'started'",
+                (
+                    _serialize_datetime(_utc_now()),
+                    json.dumps(recovery, sort_keys=True),
+                    session_id,
+                    turn_id,
+                ),
+            )
+
+    def interrupted_recovery_reports(self, session_id: str) -> list[dict[str, Any]]:
+        """Return persisted non-empty startup recovery reports newest-first."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT recovery_json FROM turn_journal WHERE session_id = ? "
+                "AND status = 'interrupted' AND recovery_json != '{}' "
+                "ORDER BY completed_at DESC, turn_id DESC",
+                (session_id,),
+            ).fetchall()
+        reports: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                value = json.loads(row["recovery_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                reports.append(value)
+        return reports
+
     def rewind_turn_ids(
         self,
         session_id: str,
@@ -1105,6 +1267,7 @@ class SessionStore:
         existed: bool,
         before_content: bytes | None,
         before_mode: int | None,
+        call_id: str = "",
     ) -> None:
         """Save the first pre-edit state for one path in a turn."""
         with closing(get_db_connection(self.db_path)) as conn, conn:
@@ -1112,8 +1275,8 @@ class SessionStore:
                 """
                 INSERT OR IGNORE INTO file_checkpoints
                     (session_id, turn_id, tool_name, path, existed,
-                     before_content, before_mode, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     before_content, before_mode, created_at, call_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -1124,17 +1287,24 @@ class SessionStore:
                     before_content,
                     before_mode,
                     _serialize_datetime(_utc_now()),
+                    call_id,
                 ),
             )
 
     def finish_file_checkpoint(
-        self, session_id: str, turn_id: str, path: str, after_sha256: str
+        self,
+        session_id: str,
+        turn_id: str,
+        path: str,
+        after_sha256: str,
+        *,
+        call_id: str = "",
     ) -> None:
         with closing(get_db_connection(self.db_path)) as conn, conn:
             conn.execute(
                 "UPDATE file_checkpoints SET after_sha256 = ? "
-                "WHERE session_id = ? AND turn_id = ? AND path = ?",
-                (after_sha256, session_id, turn_id, path),
+                "WHERE session_id = ? AND turn_id = ? AND call_id = ? AND path = ?",
+                (after_sha256, session_id, turn_id, call_id, path),
             )
 
     def latest_file_checkpoints(self, session_id: str) -> list[sqlite3.Row]:
@@ -1151,7 +1321,7 @@ class SessionStore:
             return conn.execute(
                 "SELECT * FROM file_checkpoints "
                 "WHERE session_id = ? AND turn_id = ? AND restored = 0 "
-                "ORDER BY checkpoint_id",
+                "ORDER BY checkpoint_id DESC",
                 (session_id, turn["turn_id"]),
             ).fetchall()
 

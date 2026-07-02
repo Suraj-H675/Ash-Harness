@@ -52,7 +52,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
     with get_db_connection(db_path) as conn:
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 6
+            == 7
         )
         audit_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(audit_logs)")
@@ -75,6 +75,12 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
         }
         assert "usage_json" in {
             row["name"] for row in conn.execute("PRAGMA table_info(turn_journal)")
+        }
+        assert "recovery_json" in {
+            row["name"] for row in conn.execute("PRAGMA table_info(turn_journal)")
+        }
+        assert "call_id" in {
+            row["name"] for row in conn.execute("PRAGMA table_info(file_checkpoints)")
         }
 
 
@@ -103,10 +109,65 @@ def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     store = SessionStore(db_path)
 
     assert store.load_session("legacy").session_id == "legacy"
-    backups = list(tmp_path.glob("legacy.db.before-v6-migration.*.backup"))
+    backups = list(tmp_path.glob("legacy.db.before-v7-migration.*.backup"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as conn:
         assert conn.execute("SELECT session_id FROM sessions").fetchone()[0] == "legacy"
+
+
+def test_v7_migration_preserves_checkpoints_and_adds_call_granularity(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "v6.db"
+    store = SessionStore(db_path)
+    session = store.create_session(str(tmp_path))
+    with get_db_connection(db_path) as conn, conn:
+        conn.execute("DROP INDEX IF EXISTS idx_file_checkpoints_call")
+        conn.execute("DROP TABLE file_checkpoints")
+        conn.executescript(
+            """
+            CREATE TABLE file_checkpoints (
+                checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                existed INTEGER NOT NULL CHECK(existed IN (0, 1)),
+                before_content BLOB,
+                before_mode INTEGER,
+                after_sha256 TEXT,
+                restored INTEGER NOT NULL DEFAULT 0 CHECK(restored IN (0, 1)),
+                created_at TIMESTAMP NOT NULL,
+                UNIQUE(session_id, turn_id, path)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO file_checkpoints "
+            "(session_id, turn_id, tool_name, path, existed, before_content, "
+            "created_at) VALUES (?, 'turn-1', 'whole_edit', 'file.txt', 1, ?, ?)",
+            (session.session_id, b"before", datetime.now(timezone.utc).isoformat()),
+        )
+        conn.execute("DELETE FROM schema_migrations WHERE version = 7")
+
+    migrated = SessionStore(db_path)
+
+    rows = migrated.file_checkpoints_for_turns(session.session_id, ["turn-1"])
+    assert len(rows) == 1
+    assert rows[0]["before_content"] == b"before"
+    assert rows[0]["call_id"] == ""
+    migrated.save_file_checkpoint(
+        session.session_id,
+        "turn-1",
+        "whole_edit",
+        "file.txt",
+        existed=True,
+        before_content=b"second",
+        before_mode=None,
+        call_id="call-2",
+    )
+    assert len(migrated.file_checkpoints_for_turns(session.session_id, ["turn-1"])) == 2
+    assert len(list(tmp_path.glob("v6.db.before-v7-migration.*.backup"))) == 1
 
 
 def test_newer_database_schema_is_refused(tmp_path: Path) -> None:
