@@ -1,8 +1,9 @@
 # tests/unit/test_mcp.py
+import asyncio
 import json
 import io
 import sys
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import httpx
@@ -225,7 +226,7 @@ for line in sys.stdin:
         continue
     method = message["method"]
     if method == "initialize":
-        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}
+        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}, "resources": {}, "prompts": {}}, "serverInfo": {"name": "fake", "version": "1"}}
     elif method == "tools/list":
         result = {"tools": [{"name": "echo", "description": "Echo text", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}]}
     elif method == "tools/call":
@@ -235,6 +236,8 @@ for line in sys.stdin:
         result = {"content": [{"type": "text", "text": text}], "isError": False}
     elif method == "resources/list":
         result = {"resources": [{"uri": "file:///example", "name": "example"}]}
+    elif method == "resources/templates/list":
+        result = {"resourceTemplates": [{"uriTemplate": "file:///{path}", "name": "file"}]}
     elif method == "prompts/list":
         result = {"prompts": [{"name": "review", "description": "Review"}]}
     elif method == "resources/read":
@@ -268,6 +271,9 @@ async def test_async_client_initializes_lists_and_calls_tools() -> None:
     client = MCPClient(config)
     await client.connect()
     try:
+        assert client.protocol_version == "2025-06-18"
+        assert client.server_info == {"name": "fake", "version": "1"}
+        assert client.supports_server_capability("tools") is True
         tools = await client.list_tools()
         assert tools[0]["name"] == "echo"
         result = await client.call_tool("echo", {"text": "hello"})
@@ -313,6 +319,12 @@ async def test_runtime_registers_namespaced_tool(tmp_path: Path) -> None:
         assert result.output == "hello"
         assert (await runtime.list_resources())[0]["uri"] == "file:///example"
         assert (await runtime.list_prompts())[0]["name"] == "review"
+        listed_resources = await tools["mcp_list_resources"].run(server="fake")
+        listed_templates = await tools["mcp_list_resource_templates"].run()
+        listed_prompts = await tools["mcp_list_prompts"].run()
+        assert "file:///example" in listed_resources.output
+        assert "file:///{path}" in listed_templates.output
+        assert "review" in listed_prompts.output
         resource = await tools["mcp_read_resource"].run(
             server="fake", uri="file:///example"
         )
@@ -380,10 +392,12 @@ async def test_loop_reloads_mcp_tools_without_restarting_session(
 @pytest.mark.asyncio
 async def test_streamable_http_tracks_session_and_parses_sse() -> None:
     seen_session = []
+    seen_protocol = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "DELETE":
             seen_session.append(request.headers.get("Mcp-Session-Id"))
+            seen_protocol.append(request.headers.get("MCP-Protocol-Version"))
             return httpx.Response(204)
         payload = json.loads(request.content)
         if "id" not in payload:
@@ -402,6 +416,7 @@ async def test_streamable_http_tracks_session_and_parses_sse() -> None:
                 },
             )
         assert request.headers["Mcp-Session-Id"] == "session-1"
+        assert request.headers["MCP-Protocol-Version"] == "2025-06-18"
         return httpx.Response(
             200,
             json={"jsonrpc": "2.0", "id": payload["id"], "result": {"tools": []}},
@@ -423,4 +438,144 @@ async def test_streamable_http_tracks_session_and_parses_sse() -> None:
     assert await client.list_tools() == []
     await client.disconnect()
     assert seen_session == ["session-1"]
+    assert seen_protocol == ["2025-06-18"]
     await http.aclose()
+
+
+INTERACTIVE_MCP_SERVER = r"""
+import json, sys
+pending_tools_id = None
+root_uri = ""
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "initialize":
+        result = {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"tools": {"listChanged": True}, "logging": {}},
+            "serverInfo": {"name": "interactive", "version": "1"},
+            "instructions": "server guidance",
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif message.get("method") == "notifications/initialized":
+        print(json.dumps({"jsonrpc": "2.0", "id": "roots-1", "method": "roots/list", "params": {}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": "ready"}}), flush=True)
+    elif message.get("method") == "tools/list":
+        if root_uri:
+            result = {"tools": [{"name": "root", "description": root_uri, "inputSchema": {"type": "object"}}]}
+            print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+        else:
+            pending_tools_id = message["id"]
+    elif message.get("id") == "roots-1" and "result" in message:
+        root_uri = message["result"]["roots"][0]["uri"]
+        if pending_tools_id is not None:
+            result = {"tools": [{"name": "root", "description": root_uri, "inputSchema": {"type": "object"}}]}
+            print(json.dumps({"jsonrpc": "2.0", "id": pending_tools_id, "result": result}), flush=True)
+            pending_tools_id = None
+"""
+
+
+@pytest.mark.asyncio
+async def test_stdio_dispatches_server_requests_and_notifications(
+    tmp_path: Path,
+) -> None:
+    notifications: list[tuple[str, dict]] = []
+    client = MCPClient(
+        MCPServerConfig(
+            name="interactive",
+            command=sys.executable,
+            args=["-u", "-c", INTERACTIVE_MCP_SERVER],
+            env={},
+        ),
+        roots=(tmp_path,),
+        notification_handler=lambda method, params: notifications.append(
+            (method, params)
+        ),
+    )
+
+    await client.connect()
+    try:
+        instructions = client.server_instructions
+        tools = await client.list_tools()
+        for _ in range(20):
+            if notifications:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await client.disconnect()
+
+    assert instructions == "server guidance"
+    assert tools[0]["description"] == tmp_path.resolve().as_uri()
+    assert notifications == [
+        ("notifications/message", {"level": "info", "data": "ready"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_http_tool_listing_follows_pagination() -> None:
+    cursors: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        method = payload.get("method")
+        if method == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if "id" not in payload:
+            return httpx.Response(202)
+        cursor = payload.get("params", {}).get("cursor")
+        cursors.append(cursor)
+        result = (
+            {"tools": [{"name": "first"}], "nextCursor": "page-2"}
+            if cursor is None
+            else {"tools": [{"name": "second"}]}
+        )
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    try:
+        tools = await client.list_tools()
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+    assert [tool["name"] for tool in tools] == ["first", "second"]
+    assert cursors == [None, "page-2"]
+
+
+@pytest.mark.asyncio
+async def test_request_timeout_sends_cancellation_notification() -> None:
+    client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
+    client._request_stdio = AsyncMock(side_effect=asyncio.TimeoutError())
+    client.notify = AsyncMock()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await client.request("tools/call", {"name": "slow"})
+
+    client.notify.assert_awaited_once_with(
+        "notifications/cancelled",
+        {"requestId": 1, "reason": "tools/call timed out"},
+    )
