@@ -2,8 +2,10 @@
 
 from hooks.registry import (
     Hook,
+    HookDiagnostic,
     HookRegistry,
     HookResult,
+    LifecycleHook,
     PostToolUseHook,
     PreToolUseHook,
     SessionStartHook,
@@ -11,8 +13,10 @@ from hooks.registry import (
 
 __all__ = [
     "Hook",
+    "HookDiagnostic",
     "HookRegistry",
     "HookResult",
+    "LifecycleHook",
     "PostToolUseHook",
     "PreToolUseHook",
     "SessionStartHook",

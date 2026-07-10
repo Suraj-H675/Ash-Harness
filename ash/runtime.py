@@ -275,11 +275,22 @@ def build_runtime(
         ),
         instruction_diagnostics,
     )
+    project_hook_environment = (("ASH_PROJECT_ROOT", str(config.workspace_root)),)
     hook_sources: list[Path | HookConfigSource] = [
-        Path.home() / ".ash" / "hooks.json"
+        HookConfigSource(
+            Path.home() / ".ash" / "hooks.json",
+            cwd=config.workspace_root,
+            environment=project_hook_environment,
+        )
     ]
     if trusted:
-        hook_sources.append(config.workspace_root / ".ash" / "hooks.json")
+        hook_sources.append(
+            HookConfigSource(
+                config.workspace_root / ".ash" / "hooks.json",
+                cwd=config.workspace_root,
+                environment=project_hook_environment,
+            )
+        )
     hook_sources.extend(
         HookConfigSource(
             path=path,
@@ -331,6 +342,7 @@ def build_runtime(
         chroma_persist_dir=config.chroma_persist_dir,
     )
     loop.permission_policy.set_persistent_rules(rules)
+    hooks.set_event_sink(loop._emit_event)
 
     def checkpoint_context() -> tuple[str, str, str] | None:
         if loop.current_session is None or loop.turn_context is None:

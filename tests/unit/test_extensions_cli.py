@@ -53,7 +53,12 @@ def test_extension_inventory_discovers_user_extensions(
     hooks_path = home / ".ash" / "hooks.json"
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
     hooks_path.write_text(
-        json.dumps({"session_start": [{"command": ["echo", "hello"]}]}),
+        json.dumps(
+            {
+                "session_start": [{"command": ["echo", "hello"]}],
+                "turn_end": [{"command": ["echo", "done"]}],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -67,6 +72,7 @@ def test_extension_inventory_discovers_user_extensions(
     }
     assert payload["plugins"][0]["name"] == "example"
     assert payload["hooks"][0]["session_start"] == 1
+    assert payload["hooks"][0]["turn_end"] == 1
     assert payload["errors"] == []
 
 
@@ -111,6 +117,27 @@ def test_extensions_cli_reports_invalid_hook_config(
 
     assert payload["hooks"] == []
     assert "pre_tool hooks must be a list" in payload["errors"][0]
+
+
+def test_extension_inventory_validates_new_lifecycle_hook_commands(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    hook_path = home / ".ash" / "hooks.json"
+    hook_path.parent.mkdir(parents=True)
+    hook_path.write_text(
+        json.dumps({"turn_end": [{"command": ["echo", 123]}]}),
+        encoding="utf-8",
+    )
+
+    inventory = discover_extensions(workspace)
+
+    assert inventory.hooks == ()
+    assert "arguments must be strings" in inventory.errors[0]
 
 
 def test_extensions_cli_reports_invalid_skill_without_hiding_valid_skills(

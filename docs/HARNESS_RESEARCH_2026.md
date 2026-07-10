@@ -333,7 +333,7 @@ not remove them.
 | Subagents | Strong local | Worktrees, roles, shared state, steering, and reports exist; no remote A2A or workflow DAG runtime. |
 | Agent Skills | Strong after `5dcbf51` | Standard parsing and progressive disclosure now exist; controlled script execution and compatibility diagnostics remain. |
 | Plugins | Partial | Declarative skills/commands/agents/hooks/MCP only; no versioned executable SDK or providers/channels/services. |
-| Hooks | Partial | Pre-tool, post-tool, session-start only; no full lifecycle, ordering, mutation contract, or isolation. |
+| Hooks | Strong partial | Hook contract v1 covers bounded/redacted session, turn, model, tool, and error lifecycle with fail-closed pre-tool denial and isolated observers. Context-compaction/config/permission-change events and explicit ordering remain. |
 | MCP | Strong partial | 2025-11-25 negotiation, tools/resources/templates/prompts, roots, sampling, elicitation, progress, logging, cancellation, pagination, and server requests exist; OAuth and experimental tasks remain. |
 | Safety/sandbox | Strong | Needs remote/plugin identity capabilities, network proxy policy, stronger resource limits, and platform CI. |
 | CLI/TUI/SDK/API | Strong local | CLI, SDK, and HTTP server now share one trusted runtime assembler and versioned events; no ACP adapter, WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, or channel adapters. |
@@ -405,7 +405,7 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 987 passed, 8 environment-dependent skips on Python
+- Current verification: 1002 passed, 8 environment-dependent skips on Python
   3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
   race is covered by Ash's portable process completion helper.
 
@@ -438,7 +438,9 @@ sessions migrate, and provider/tool fakes cover the state machine.
    and OAuth; gate experimental tasks.
 2. Define plugin API v1 and an out-of-process plugin host; migrate declarative
    plugins as a zero-code plugin type.
-3. Expand lifecycle hooks and add tool search/profiles.
+3. Expand lifecycle hooks and add tool search/profiles: bounded hook contract v1
+   covers session/turn/model/tool/error events and failure semantics; context
+   compaction events, explicit ordering, tool search, and profiles remain.
 4. Implement ACP server mode and a conformance test client.
 
 Exit criterion: external clients and extensions can use Ash without importing

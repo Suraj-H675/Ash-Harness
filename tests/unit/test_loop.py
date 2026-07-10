@@ -7,11 +7,13 @@ from tools.base import BaseTool, ToolResult, ToolMiddleware, ToolMiddlewareSkip
 from config import AshConfig
 from context.turn import TurnContext
 from core.session import Message, SessionStore, ToolCallRecord, get_db_connection
+from hooks.registry import HookRegistry, LifecycleHook, SessionStartHook
 from providers.base import ProviderABC, StreamChunk
 from providers.capabilities import ProviderCapabilities
 from providers.retry import ProviderCircuitBreaker, ProviderCircuitOpen
 from safety.grants import PermissionRule, RuleEffect
 from safety.guard import SafetyGuard
+from safety.policy import PermissionMode
 from ui.terminal import TerminalUI
 from tools.filesystem import ReadFileTool
 from pathlib import Path
@@ -162,6 +164,25 @@ class BudgetProvider(ProviderABC):
         yield StreamChunk(content="done", is_done=True)
 
 
+class FailingLifecycleProvider(ProviderABC):
+    model_name = "failing-lifecycle"
+
+    def count_tokens(self, text):
+        return 0
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        raise RuntimeError("OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz")
+        yield  # pragma: no cover
+
+
+class ReportedFailureTool(BaseTool):
+    name = "reported_failure"
+    args_schema = None
+
+    async def run(self, **kwargs):
+        return ToolResult(success=False, output="", error="reported failure")
+
+
 class CacheUsageProvider(ProviderABC):
     model_name = "cache-test"
 
@@ -194,6 +215,133 @@ class EventUI(TerminalUI):
 
     def emit_event(self, payload):
         self.events.append(payload)
+
+
+@pytest.mark.asyncio
+async def test_model_failure_emits_paired_lifecycle_and_closes_turn(tmp_path):
+    observed = []
+    hooks = HookRegistry()
+
+    async def capture(payload):
+        observed.append(payload)
+
+    for event in ("pre_model", "post_model", "turn_error", "turn_end"):
+        hooks.register_lifecycle(LifecycleHook(event, capture))
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        provider_max_attempts=1,
+    )
+    store = SessionStore(tmp_path / "model-failure.db")
+    loop = AshLoop(
+        store,
+        FailingLifecycleProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        hooks=hooks,
+        config=config,
+    )
+    session = await loop.start_session()
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        await loop.run_turn("fail")
+
+    assert [(item["event"], item.get("status")) for item in observed] == [
+        ("pre_model", None),
+        ("post_model", "error"),
+        ("turn_error", None),
+        ("turn_end", "error"),
+    ]
+    assert "sk-proj" not in observed[1]["error"]
+    assert store.started_turns(session.session_id) == []
+
+
+@pytest.mark.asyncio
+async def test_tool_error_lifecycle_covers_unknown_and_reported_failures(tmp_path):
+    observed = []
+    hooks = HookRegistry()
+
+    async def capture(payload):
+        observed.append(payload)
+
+    hooks.register_lifecycle(LifecycleHook("tool_error", capture))
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "tool-errors.db")
+    tool = ReportedFailureTool(guard)
+    loop = AshLoop(
+        store,
+        BudgetProvider(),
+        guard,
+        EventUI(),
+        tmp_path,
+        hooks=hooks,
+        tools={tool.name: tool},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+    loop.turn_context = TurnContext(session.session_id, "turn-tools")
+    store.start_turn(session.session_id, "turn-tools", "tools")
+
+    results = await loop._execute_tool_calls(
+        [
+            {
+                "call_id": "unknown-call",
+                "name": "missing_tool",
+                "arguments": {
+                    "value": "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz"
+                },
+            },
+            {
+                "call_id": "failure-call",
+                "name": "reported_failure",
+                "arguments": {},
+            },
+        ],
+        session,
+    )
+
+    assert [item["success"] for item in results] == [False, False]
+    assert [item["tool"] for item in observed] == [
+        "missing_tool",
+        "reported_failure",
+    ]
+    assert "sk-proj" not in str(observed[0]["arguments"])
+    assert observed[1]["error"] == "reported failure"
+
+
+@pytest.mark.asyncio
+async def test_dry_run_suppresses_all_hook_side_effects_and_can_be_reenabled(tmp_path):
+    observed = []
+    hooks = HookRegistry()
+
+    async def session_start(_payload):
+        observed.append("session_start")
+
+    async def turn_start(_payload):
+        observed.append("turn_start")
+
+    hooks.register_session_start(SessionStartHook(session_start))
+    hooks.register_lifecycle(LifecycleHook("turn_start", turn_start))
+    loop = AshLoop(
+        SessionStore(tmp_path / "dry-run-hooks.db"),
+        BudgetProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(safety_tier="dry_run"),
+        tmp_path,
+        hooks=hooks,
+        safety_tier="dry_run",
+    )
+
+    await loop.start_session()
+    await loop.run_turn("inspect")
+    assert observed == []
+
+    loop.permission_policy.mode = PermissionMode.INTERACTIVE
+    await loop.start_session()
+    assert observed == ["session_start"]
 
 
 @pytest.mark.asyncio

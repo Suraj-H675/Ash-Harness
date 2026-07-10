@@ -368,11 +368,22 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         if next_agents.errors:
             raise ValueError(next(iter(next_agents.errors.values())))
 
+        project_hook_environment = (("ASH_PROJECT_ROOT", str(loop.project_root)),)
         hook_sources: list[Path | HookConfigSource] = [
-            Path.home() / ".ash" / "hooks.json"
+            HookConfigSource(
+                Path.home() / ".ash" / "hooks.json",
+                cwd=loop.project_root,
+                environment=project_hook_environment,
+            )
         ]
         if trusted:
-            hook_sources.append(loop.project_root / ".ash" / "hooks.json")
+            hook_sources.append(
+                HookConfigSource(
+                    loop.project_root / ".ash" / "hooks.json",
+                    cwd=loop.project_root,
+                    environment=project_hook_environment,
+                )
+            )
         hook_sources.extend(
             HookConfigSource(
                 path,
@@ -416,6 +427,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             spawn_tool.set_custom_agents(
                 {agent.name: agent for agent in discovered_agents}
             )
+        next_hooks.set_event_sink(loop._emit_event)
         loop.hooks = next_hooks
         mcp_errors = await loop.reload_mcp_servers(next_mcp)
         custom_commands = next_commands

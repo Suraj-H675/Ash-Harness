@@ -10,7 +10,11 @@ from typing import Any, Literal
 from mcp.server import load_mcp_servers
 from plugins.agents import AgentCatalog, AgentSource
 from cli.custom_commands import CommandSource, CustomCommandCatalog
-from hooks.config import HookConfigSource, load_command_hooks
+from hooks.config import (
+    MAX_HOOK_CONFIG_BYTES,
+    HookConfigSource,
+    load_command_hooks,
+)
 from plugins.manifest import PluginManifest
 from plugins.lifecycle import (
     PluginLifecycleError,
@@ -66,6 +70,13 @@ class HookConfigSummary:
     pre_tool: int = 0
     post_tool: int = 0
     session_start: int = 0
+    session_end: int = 0
+    turn_start: int = 0
+    turn_end: int = 0
+    turn_error: int = 0
+    pre_model: int = 0
+    post_model: int = 0
+    tool_error: int = 0
 
 
 @dataclass(frozen=True)
@@ -272,11 +283,26 @@ def render_extension_inventory(
             lines.append("  (none)")
     if kind in {"all", "hooks"}:
         lines.append("Hooks:")
-        lines.extend(
-            f"  {hook.path} [{hook.source}]: pre_tool={hook.pre_tool}, "
-            f"post_tool={hook.post_tool}, session_start={hook.session_start}"
-            for hook in inventory.hooks
-        )
+        for hook in inventory.hooks:
+            counts = {
+                name: getattr(hook, name)
+                for name in (
+                    "pre_tool",
+                    "post_tool",
+                    "session_start",
+                    "session_end",
+                    "turn_start",
+                    "turn_end",
+                    "turn_error",
+                    "pre_model",
+                    "post_model",
+                    "tool_error",
+                )
+            }
+            active = ", ".join(
+                f"{name}={count}" for name, count in counts.items() if count
+            )
+            lines.append(f"  {hook.path} [{hook.source}]: {active or 'empty'}")
         if not inventory.hooks:
             lines.append("  (none)")
     if inventory.errors:
@@ -479,18 +505,27 @@ def _discover_hooks(
         if not path.is_file():
             continue
         try:
+            if path.stat().st_size > MAX_HOOK_CONFIG_BYTES:
+                raise ValueError("hook config exceeds 1 MiB")
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("hook config must be an object")
-            hooks.append(
-                HookConfigSummary(
-                    path=str(path),
-                    source=source,
-                    pre_tool=_count_hook_entries(payload, "pre_tool"),
-                    post_tool=_count_hook_entries(payload, "post_tool"),
-                    session_start=_count_hook_entries(payload, "session_start"),
-                )
+            summary = HookConfigSummary(
+                path=str(path),
+                source=source,
+                pre_tool=_count_hook_entries(payload, "pre_tool"),
+                post_tool=_count_hook_entries(payload, "post_tool"),
+                session_start=_count_hook_entries(payload, "session_start"),
+                session_end=_count_hook_entries(payload, "session_end"),
+                turn_start=_count_hook_entries(payload, "turn_start"),
+                turn_end=_count_hook_entries(payload, "turn_end"),
+                turn_error=_count_hook_entries(payload, "turn_error"),
+                pre_model=_count_hook_entries(payload, "pre_model"),
+                post_model=_count_hook_entries(payload, "post_model"),
+                tool_error=_count_hook_entries(payload, "tool_error"),
             )
+            load_command_hooks([path])
+            hooks.append(summary)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             errors.append(f"Invalid hook config {path}: {exc}")
     return hooks, errors

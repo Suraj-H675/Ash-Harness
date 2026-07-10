@@ -163,6 +163,10 @@ content before changing the active version. `/plugins` manages local plugins
 inside a session and `/reload-plugins` atomically refreshes commands,
 completion, skills, agents, hooks, and MCP servers without restarting Ash.
 Project plugins remain disabled until their workspace is trusted.
+Command hooks use the versioned, bounded lifecycle contract documented in
+[Hook Contract v1](docs/HOOKS_V1.md). Critical `pre_tool` gates fail closed;
+session, turn, model, post-tool, and error observers cannot corrupt completed
+runtime work when they fail.
 Modern `SKILL.md` instruction skills never execute embedded code. The legacy
 Python/Markdown executable-skill API is disabled by default; compatibility
 callers must opt in explicitly, and even then may use only tools supplied by

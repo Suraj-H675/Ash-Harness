@@ -14,6 +14,10 @@ from typing import Any
 ProcessStreamCallback = Callable[[str, str], None]
 
 
+class ProcessOutputLimitExceeded(RuntimeError):
+    """A managed subprocess exceeded its configured capture budget."""
+
+
 def process_group_options() -> dict[str, Any]:
     """Options that place a child in an independently terminable group."""
 
@@ -66,6 +70,7 @@ async def communicate_process(
     *,
     input_data: bytes | None = None,
     stream_callback: ProcessStreamCallback | None = None,
+    max_output_bytes: int | None = None,
 ) -> tuple[bytes, bytes]:
     """Drain pipes without relying on a racy subprocess waiter notification."""
 
@@ -85,10 +90,17 @@ async def communicate_process(
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+    if max_output_bytes is not None and max_output_bytes < 1:
+        raise ValueError("max_output_bytes must be positive")
+    output_limit_exceeded = False
+    captured_total = 0
+    read_total = 0
+
     async def read_stream(
         stream: asyncio.StreamReader | None,
         stream_name: str,
     ) -> bytes:
+        nonlocal captured_total, output_limit_exceeded, read_total
         if stream is None:
             return b""
         chunks: list[bytes] = []
@@ -96,7 +108,17 @@ async def communicate_process(
             chunk = await stream.read(4096)
             if not chunk:
                 break
-            chunks.append(chunk)
+            read_total += len(chunk)
+            if max_output_bytes is None or captured_total < max_output_bytes:
+                remaining = (
+                    len(chunk)
+                    if max_output_bytes is None
+                    else max_output_bytes - captured_total
+                )
+                chunks.append(chunk[:remaining])
+                captured_total += min(len(chunk), remaining)
+            if max_output_bytes is not None and read_total > max_output_bytes:
+                output_limit_exceeded = True
             text = chunk.decode("utf-8", errors="replace")
             if stream_callback is not None:
                 try:
@@ -118,4 +140,8 @@ async def communicate_process(
         write_stdin(),
         wait_for_returncode(),
     )
+    if output_limit_exceeded:
+        raise ProcessOutputLimitExceeded(
+            f"subprocess output exceeded {max_output_bytes} bytes"
+        )
     return stdout, stderr

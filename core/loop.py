@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from core.planner import Planner
     from core.sprint import SprintExecution
     from hooks import HookRegistry
+    from hooks.registry import HookEvent
     from memory.vector import (
         Chunk,
         EmbeddingAdapter,
@@ -316,6 +317,7 @@ class AshLoop:
         self.system_prompt = system_prompt or _default_system_prompt(project_root)
         if additional_instructions:
             self.system_prompt = f"{self.system_prompt}\n\n{additional_instructions}"
+        self._base_system_prompt = self.system_prompt
         self.token_counter = token_counter
         self.max_turn_iterations = max_turn_iterations
         if max_steering_messages < 1:
@@ -398,6 +400,7 @@ class AshLoop:
         self._mcp_runtime: Any | None = None
         self._mcp_tool_names: set[str] = set()
         self._mcp_configs = dict(mcp_configs or {})
+        self._hook_session_open = False
         if mcp_config_path is not None and mcp_config_path.exists():
             loaded_mcp_configs = load_mcp_servers(mcp_config_path)
             duplicates = self._mcp_configs.keys() & loaded_mcp_configs.keys()
@@ -421,6 +424,7 @@ class AshLoop:
     async def aclose(self) -> None:
         """Deterministically release provider and subprocess resources."""
 
+        await self._fire_session_end("shutdown")
         self._flush_runtime_events()
         if self._mcp_runtime is not None:
             await self._mcp_runtime.close()
@@ -431,6 +435,35 @@ class AshLoop:
             return_exceptions=True,
         )
         await self.provider.aclose()
+
+    async def _fire_session_end(self, reason: str) -> None:
+        hooks = self._active_hooks()
+        if (
+            not self._hook_session_open
+            or hooks is None
+            or self.current_session is None
+        ):
+            return
+        self._hook_session_open = False
+        await hooks.fire_lifecycle(
+            "session_end",
+            {
+                "session_id": self.current_session.session_id,
+                "reason": reason,
+            },
+        )
+
+    def _active_hooks(self) -> "HookRegistry | None":
+        if self.permission_policy.mode.value == "dry_run":
+            return None
+        return self.hooks
+
+    async def _fire_hook_lifecycle(
+        self, event: "HookEvent", payload: dict[str, Any]
+    ) -> None:
+        hooks = self._active_hooks()
+        if hooks is not None:
+            await hooks.fire_lifecycle(event, payload)
 
     def _envelope_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         session = getattr(self, "current_session", None)
@@ -483,6 +516,14 @@ class AshLoop:
         if self._mcp_configs and self._mcp_runtime is None:
             await self._start_mcp_runtime()
 
+        if self.current_session is not None and self._hook_session_open:
+            reason = (
+                "reload" if session_id == self.current_session.session_id else "switch"
+            )
+            await self._fire_session_end(reason)
+            self.current_session = None
+        self.system_prompt = self._base_system_prompt
+
         if session_id is not None:
             self.current_session = self.session_store.load_session(session_id)
             from core.checkpoints import recover_interrupted_turns
@@ -500,6 +541,20 @@ class AshLoop:
                         **self.recovery_summary.to_dict(),
                     }
                 )
+            hooks = self._active_hooks()
+            self._hook_session_open = hooks is not None
+            if hooks is not None:
+                await hooks.fire_session_start(
+                    {
+                        "session_id": self.current_session.session_id,
+                        "source": "resume",
+                        "project_path": self.current_session.project_path,
+                        "model": self.provider.model_name,
+                    }
+                )
+                injected = hooks.get_injected_prompt()
+                if injected:
+                    self.system_prompt = f"{self.system_prompt}\n\n{injected}"
             return self.current_session
 
         # New session: optionally recall recent context from prior sessions
@@ -513,16 +568,24 @@ class AshLoop:
                     f"{self.system_prompt}\n\n## Recent Context\n{memory_context}"
                 )
 
-        if self.hooks is not None:
-            await self.hooks.fire_session_start()
-            injected = self.hooks.get_injected_prompt()
-            if injected:
-                self.system_prompt = f"{self.system_prompt}\n\n{injected}"
-
         session = self.session_store.create_session(
             str(self.project_root), model=self.provider.model_name
         )
         self.current_session = session
+        hooks = self._active_hooks()
+        self._hook_session_open = hooks is not None
+        if hooks is not None:
+            await hooks.fire_session_start(
+                {
+                    "session_id": session.session_id,
+                    "source": "new",
+                    "project_path": session.project_path,
+                    "model": self.provider.model_name,
+                }
+            )
+            injected = hooks.get_injected_prompt()
+            if injected:
+                self.system_prompt = f"{self.system_prompt}\n\n{injected}"
         return session
 
     async def reload_mcp_servers(
@@ -619,13 +682,35 @@ class AshLoop:
                     "discarded_steering": discarded,
                 }
             )
+            await self._fire_hook_lifecycle(
+                "turn_end",
+                {
+                    "session_id": (
+                        self.current_session.session_id
+                        if self.current_session is not None
+                        else None
+                    ),
+                    "turn_id": current_turn_id,
+                    "status": "cancelled",
+                },
+            )
             raise
         except Exception as exc:
             current_turn_id = self.turn_context.turn_id if self.turn_context else None
             if current_turn_id is not None and current_turn_id != previous_turn_id:
-                self._emit_event(
-                    {"type": "turn.error", "error": redact_text(str(exc))}
-                )
+                self.session_store.interrupt_turn(current_turn_id)
+                self._emit_event({"type": "turn.error", "error": redact_text(str(exc))})
+            payload = {
+                "session_id": (
+                    self.current_session.session_id
+                    if self.current_session is not None
+                    else None
+                ),
+                "turn_id": current_turn_id,
+                "error": redact_text(str(exc)),
+            }
+            await self._fire_hook_lifecycle("turn_error", payload)
+            await self._fire_hook_lifecycle("turn_end", {**payload, "status": "error"})
             raise
         finally:
             self._flush_runtime_events()
@@ -657,6 +742,14 @@ class AshLoop:
             session.session_id, self.turn_context.turn_id, user_input
         )
         self._emit_event({"type": "turn.started"})
+        await self._fire_hook_lifecycle(
+            "turn_start",
+            {
+                "session_id": session.session_id,
+                "turn_id": self.turn_context.turn_id,
+                "input": redact_text(user_input),
+            },
+        )
 
         # 0. Optional V5 sprint planning phase. Triggered only when the
         # loop is configured with a planner AND the user input looks
@@ -693,6 +786,16 @@ class AshLoop:
                             "context_tokens": self._last_context_tokens,
                             "usage": self.last_turn_usage,
                         }
+                    )
+                    await self._fire_hook_lifecycle(
+                        "turn_end",
+                        {
+                            "session_id": session.session_id,
+                            "turn_id": self.turn_context.turn_id,
+                            "status": "completed",
+                            "response": response,
+                            "usage": self.last_turn_usage,
+                        },
                     )
                     return response
                 execution.start()
@@ -752,15 +855,69 @@ class AshLoop:
                         f"// From {hit.file_path}:\n{hit.content[:500]}" for hit in hits
                     )
             messages = self._build_messages(session)
-            (
-                assistant_text,
-                tool_calls,
-                turn_prompt_tokens,
-                turn_completion_tokens,
-                turn_cache_read_tokens,
-                turn_cache_write_tokens,
-                turn_usage_source,
-            ) = await self._stream_one_completion(messages)
+            await self._fire_hook_lifecycle(
+                "pre_model",
+                {
+                    "session_id": session.session_id,
+                    "turn_id": self.turn_context.turn_id,
+                    "model": self.provider.model_name,
+                    "iteration": iteration,
+                    "message_count": len(messages),
+                    "tool_count": len(self.tools),
+                },
+            )
+            try:
+                (
+                    assistant_text,
+                    tool_calls,
+                    turn_prompt_tokens,
+                    turn_completion_tokens,
+                    turn_cache_read_tokens,
+                    turn_cache_write_tokens,
+                    turn_usage_source,
+                ) = await self._stream_one_completion(messages)
+            except asyncio.CancelledError:
+                await self._fire_hook_lifecycle(
+                    "post_model",
+                    {
+                        "session_id": session.session_id,
+                        "turn_id": self.turn_context.turn_id,
+                        "model": self.provider.model_name,
+                        "iteration": iteration,
+                        "status": "cancelled",
+                    },
+                )
+                raise
+            except Exception as exc:
+                await self._fire_hook_lifecycle(
+                    "post_model",
+                    {
+                        "session_id": session.session_id,
+                        "turn_id": self.turn_context.turn_id,
+                        "model": self.provider.model_name,
+                        "iteration": iteration,
+                        "status": "error",
+                        "error": redact_text(str(exc)),
+                    },
+                )
+                raise
+            await self._fire_hook_lifecycle(
+                "post_model",
+                {
+                    "session_id": session.session_id,
+                    "turn_id": self.turn_context.turn_id,
+                    "model": self.provider.model_name,
+                    "iteration": iteration,
+                    "status": "completed",
+                    "response": redact_text(assistant_text),
+                    "tool_call_count": len(tool_calls),
+                    "prompt_tokens": turn_prompt_tokens,
+                    "completion_tokens": turn_completion_tokens,
+                    "cache_read_tokens": turn_cache_read_tokens,
+                    "cache_write_tokens": turn_cache_write_tokens,
+                    "usage_source": turn_usage_source,
+                },
+            )
             total_prompt_tokens += turn_prompt_tokens
             total_completion_tokens += turn_completion_tokens
             total_cache_read_tokens += turn_cache_read_tokens
@@ -804,6 +961,15 @@ class AshLoop:
                     self._continuous_turns += 1
                     follow_up = "Continue the previous task. What is the next step?"
                     self.session_store.complete_turn(self.turn_context.turn_id)
+                    await self._fire_hook_lifecycle(
+                        "turn_end",
+                        {
+                            "session_id": session.session_id,
+                            "turn_id": self.turn_context.turn_id,
+                            "status": "continued",
+                            "response": redact_text(assistant_text),
+                        },
+                    )
                     return await self._run_turn(follow_up)
                 break
 
@@ -952,6 +1118,16 @@ class AshLoop:
                 "context_tokens": self._last_context_tokens,
                 "usage": self.last_turn_usage,
             }
+        )
+        await self._fire_hook_lifecycle(
+            "turn_end",
+            {
+                "session_id": session.session_id,
+                "turn_id": self.turn_context.turn_id,
+                "status": "completed",
+                "response": redact_text(final_text),
+                "usage": self.last_turn_usage,
+            },
         )
         return final_text
 
@@ -1293,6 +1469,29 @@ class AshLoop:
             await mw.after_tool(tool_name, arguments, result)
         return result
 
+    async def _fire_tool_error_hook(
+        self,
+        session: Session,
+        *,
+        call_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        error: str,
+    ) -> None:
+        await self._fire_hook_lifecycle(
+            "tool_error",
+            {
+                "session_id": session.session_id,
+                "turn_id": (
+                    self.turn_context.turn_id if self.turn_context is not None else None
+                ),
+                "call_id": call_id,
+                "tool": tool_name,
+                "arguments": redact_value(arguments),
+                "error": redact_text(error),
+            },
+        )
+
     async def _execute_tool_calls(
         self,
         tool_calls: list[dict[str, Any]],
@@ -1437,6 +1636,13 @@ class AshLoop:
                 self._emit_event(
                     {"type": "tool.error", **event_base, "error": record.error}
                 )
+                await self._fire_tool_error_hook(
+                    session,
+                    call_id=record.call_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    error=record.error,
+                )
                 results.append(
                     {
                         "success": False,
@@ -1450,8 +1656,9 @@ class AshLoop:
             if self.turn_context is not None:
                 self.turn_context.set("tool_call_id", record.call_id)
             try:
-                if self.hooks is not None:
-                    await self.hooks.fire_pre_tool(tool_name, arguments)
+                hooks = self._active_hooks()
+                if hooks is not None:
+                    await hooks.fire_pre_tool(tool_name, arguments)
                 await self._apply_middlewares_before(tool_name, arguments, tool)
                 with tool.event_context(event_base):
                     result_dict = await _execute_with_retry(tool, tool_name, arguments)
@@ -1462,8 +1669,8 @@ class AshLoop:
                     truncated=result_dict.get("truncated", False),
                     token_count=result_dict.get("token_count", 0),
                 )
-                if self.hooks is not None:
-                    await self.hooks.fire_post_tool(tool_name, arguments, tool_result)
+                if hooks is not None:
+                    await hooks.fire_post_tool(tool_name, arguments, tool_result)
                 tool_result = await self._apply_middlewares_after(
                     tool_name, arguments, tool_result
                 )
@@ -1508,6 +1715,13 @@ class AshLoop:
                         "error": redact_text(str(exc)),
                     }
                 )
+                await self._fire_tool_error_hook(
+                    session,
+                    call_id=record.call_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    error=str(exc),
+                )
                 results.append(
                     {
                         "success": False,
@@ -1549,6 +1763,14 @@ class AshLoop:
                     "truncated": tool_result.truncated,
                 }
             )
+            if not tool_result.success:
+                await self._fire_tool_error_hook(
+                    session,
+                    call_id=record.call_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    error=tool_result.error or "tool reported failure",
+                )
 
             results.append(
                 {

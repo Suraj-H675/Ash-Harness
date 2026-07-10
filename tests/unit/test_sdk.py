@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 
 import pytest
 
@@ -160,7 +161,17 @@ async def test_async_sdk_applies_trusted_project_extensions(
             {
                 "pre_tool": [
                     {"matcher": "write_file", "command": ["true"]}
-                ]
+                ],
+                "session_start": [
+                    {
+                        "command": [
+                            sys.executable,
+                            "-c",
+                            "import os; print(os.getcwd() + '|' + "
+                            "os.environ['ASH_PROJECT_ROOT'])",
+                        ]
+                    }
+                ],
             }
         ),
         encoding="utf-8",
@@ -183,6 +194,7 @@ async def test_async_sdk_applies_trusted_project_extensions(
         web_tool = client.loop.tools["web_fetch"]
 
         assert "PROJECT_RUNTIME_INSTRUCTION" in client.loop.system_prompt
+        assert f"{workspace}|{workspace}" in client.loop.system_prompt
         assert "project-review: Review this project" in listed.output
         assert client.loop.hooks is not None
         assert len(client.loop.hooks._pre_tool) == 1
@@ -225,6 +237,76 @@ async def test_async_sdk_excludes_untrusted_project_extensions(
 
         assert "UNTRUSTED_PROJECT_INSTRUCTION" not in client.loop.system_prompt
         assert "project-review" not in listed.output
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_delivers_full_command_hook_lifecycle(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    hooks = home / ".ash" / "hooks.json"
+    hooks.parent.mkdir(parents=True)
+    output = tmp_path / "events.jsonl"
+    command = [
+        sys.executable,
+        "-c",
+        "import json,sys; p=json.load(sys.stdin); "
+        "open(sys.argv[1],'a').write(json.dumps(p)+'\\n'); "
+        "print(json.dumps({'additional_context':'SESSION CONTEXT'}) "
+        "if p['event']=='session_start' else '')",
+        str(output),
+    ]
+    hooks.write_text(
+        json.dumps(
+            {
+                event: [{"command": command}]
+                for event in (
+                    "session_start",
+                    "turn_start",
+                    "pre_model",
+                    "post_model",
+                    "turn_end",
+                    "session_end",
+                )
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+
+    client = await AshClient.create(config=config, provider=SDKProvider())
+    result = await client.prompt(
+        "hello OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz"
+    )
+    new_session_id = await client.new_session()
+    assert client.loop.system_prompt.count("SESSION CONTEXT") == 1
+    await client.close()
+
+    events = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [event["event"] for event in events] == [
+        "session_start",
+        "turn_start",
+        "pre_model",
+        "post_model",
+        "turn_end",
+        "session_end",
+        "session_start",
+        "session_end",
+    ]
+    assert all(event["schema_version"] == 1 for event in events)
+    assert all(event["session_id"] == result.session_id for event in events[:6])
+    assert all(event["session_id"] == new_session_id for event in events[6:])
+    assert events[0]["source"] == "new"
+    assert "sk-proj" not in events[1]["input"]
+    assert events[4]["status"] == "completed"
+    assert events[5]["reason"] == "switch"
+    assert events[7]["reason"] == "shutdown"
 
 
 @pytest.mark.asyncio
