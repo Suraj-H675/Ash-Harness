@@ -65,6 +65,15 @@ def test_registry_registers_and_builds_provider() -> None:
     assert registry.names() == ("example",)
 
 
+def test_registry_preserves_provider_owned_family() -> None:
+    registry = ProviderRegistry()
+    registry.register("example", lambda config, model: RegistryProvider(model))
+
+    provider = registry.build(AshConfig(model="example/model"))
+
+    assert provider.provider_family == "registry-test"
+
+
 def test_registry_rejects_duplicates_without_explicit_replace() -> None:
     registry = ProviderRegistry()
     registry.register("example", lambda config, model: RegistryProvider(model))

@@ -53,6 +53,7 @@ class ProviderABC(ABC):
     """
 
     provider_family = "custom"
+    _ash_declared_capabilities: ProviderCapabilities | None = None
 
     @abstractmethod
     async def stream_chat(
@@ -87,4 +88,7 @@ class ProviderABC(ABC):
 
     @property
     def capabilities(self) -> ProviderCapabilities:
+        declared = self._ash_declared_capabilities
+        if isinstance(declared, ProviderCapabilities):
+            return declared
         return infer_capabilities(self.provider_family, self.model_name)

@@ -9,6 +9,11 @@ from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable
 
 from providers.base import ProviderABC
+from providers.capabilities import (
+    CapabilityRegistry,
+    CapabilityResolver,
+    get_capability_registry,
+)
 
 if TYPE_CHECKING:
     from config import AshConfig
@@ -21,8 +26,12 @@ ProviderFactory = Callable[["AshConfig", str], ProviderABC]
 class ProviderRegistry:
     """Resolve ``provider/model`` selections through lazy provider factories."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, capability_registry: CapabilityRegistry | None = None
+    ) -> None:
         self._factories: dict[str, ProviderFactory] = {}
+        self._capabilities = capability_registry or get_capability_registry()
+        self._owned_capability_families: set[str] = set()
         self._lock = RLock()
 
     def register(
@@ -31,6 +40,7 @@ class ProviderRegistry:
         factory: ProviderFactory,
         *,
         replace: bool = False,
+        capabilities: CapabilityResolver | None = None,
     ) -> None:
         normalized = name.strip().casefold()
         if not PROVIDER_NAME.fullmatch(normalized):
@@ -40,11 +50,23 @@ class ProviderRegistry:
         with self._lock:
             if normalized in self._factories and not replace:
                 raise ValueError(f"provider {normalized!r} is already registered")
+            if capabilities is not None:
+                self._capabilities.register(
+                    normalized,
+                    capabilities,
+                    replace=(replace or normalized in self._owned_capability_families),
+                )
+                self._owned_capability_families.add(normalized)
             self._factories[normalized] = factory
 
     def unregister(self, name: str) -> bool:
+        normalized = name.strip().casefold()
         with self._lock:
-            return self._factories.pop(name.strip().casefold(), None) is not None
+            removed = self._factories.pop(normalized, None) is not None
+            if normalized in self._owned_capability_families:
+                self._capabilities.unregister(normalized)
+                self._owned_capability_families.discard(normalized)
+            return removed
 
     def names(self) -> tuple[str, ...]:
         with self._lock:
@@ -71,7 +93,14 @@ class ProviderRegistry:
         with self._lock:
             factory = self._factories.get(provider_name)
         if factory is not None:
-            return factory(config, model_name)
+            provider = factory(config, model_name)
+            if provider.provider_family == "custom":
+                provider.provider_family = provider_name
+            if provider_name in self._owned_capability_families:
+                provider._ash_declared_capabilities = self._capabilities.resolve(
+                    provider_name, model_name
+                )
+            return provider
         if provider_name in config.custom_providers:
             return _build_custom_openai_provider(config, provider_name, model_name)
         raise ValueError(f"Unknown provider in model string: {provider_name!r}")

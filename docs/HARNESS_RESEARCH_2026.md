@@ -325,7 +325,7 @@ not remove them.
 | Domain | State on 2026-07-10 | Key gap |
 |---|---|---|
 | Agent loop and streaming | Partial | Public event schema v1 now spans runtime, tools, SDK, stream JSON, SSE, and JSON-RPC discovery; the loop remains monolithic and legacy XML fallback is mixed into canonical behavior. |
-| Provider layer | Partial | Built-ins and custom OpenAI-compatible endpoints now resolve through a dynamic registry; auth/discovery/modalities remain limited. |
+| Provider layer | Strong partial | Built-ins, embedders, declared model capabilities, and custom OpenAI-compatible endpoints resolve through thread-safe linked registries; auth/discovery and non-text modalities remain limited. |
 | Coding tools | Strong | No PTY terminal session, tool search, browser, web search, media, scheduler, or messaging. |
 | Context budgets | Strong partial | Provider totals now include reserved tool schemas; typed hashed fragments expose source/trust provenance; deterministic compaction preserves task/path/action/outcome state and redacts persisted summaries. Model-assisted compaction remains. |
 | Sessions/recovery | Strong linear | SQLite schema v8 now persists redacted, cursor-replayable canonical events across SDK/HTTP/JSON-RPC; within-session trees, labels, and branch summaries remain. |
@@ -416,7 +416,7 @@ scheduled task.
    event schema v1 is complete; result/request schemas remain.
 3. Introduce provider and capability registries; move CLI provider branching
    behind them: provider registry and shared runtime assembly are complete;
-   capability registry remains.
+   capability registry and real SDK runtime registration are complete.
 4. Add typed context fragments and a model-assisted compactor with deterministic
    fallback: typed provenance and strengthened deterministic fallback are
    complete; model-assisted compaction remains.
