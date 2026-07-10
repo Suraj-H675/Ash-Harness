@@ -30,6 +30,7 @@ class HeadlessUI:
         self._event_enricher: Callable[[dict[str, Any]], dict[str, Any]] = (
             envelope_event
         )
+        self._runtime_events_bound = False
 
     @property
     def has_approval_callback(self) -> bool:
@@ -42,7 +43,7 @@ class HeadlessUI:
         return None
 
     def print_token(self, text: str) -> None:
-        if not text:
+        if not text or self._runtime_events_bound:
             return
         event = self._prepare({"type": "assistant.delta", "text": text})
         self._notify(event)
@@ -50,7 +51,7 @@ class HeadlessUI:
             self._emit(event)
 
     def print_thought(self, text: str) -> None:
-        if not text:
+        if not text or self._runtime_events_bound:
             return
         event = self._prepare({"type": "reasoning.delta", "text": text})
         self._notify(event)
@@ -58,6 +59,8 @@ class HeadlessUI:
             self._emit(event)
 
     def update_token_count(self, current: int, maximum: int | None = None) -> None:
+        if self._runtime_events_bound:
+            return
         event = self._prepare(
             {"type": "context.usage", "current": current, "maximum": maximum}
         )
@@ -111,6 +114,7 @@ class HeadlessUI:
         """Bind runtime context enrichment for UI-originated stream events."""
 
         self._event_enricher = enricher
+        self._runtime_events_bound = True
 
     def _prepare(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._event_enricher(dict(payload))

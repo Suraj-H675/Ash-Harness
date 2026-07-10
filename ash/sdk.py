@@ -104,9 +104,13 @@ class AshEvent:
     @classmethod
     def from_wire(cls, payload: dict[str, Any]) -> "AshEvent":
         event = envelope_event(payload)
+        data = event_data(event)
+        if event["type"] == "turn.completed" and event["session_id"]:
+            # Retain the pre-v1 SDK location while exposing typed metadata.
+            data.setdefault("session_id", event["session_id"])
         return cls(
             type=event["type"],
-            data=event_data(event),
+            data=data,
             schema_version=event["schema_version"],
             event_id=event["event_id"],
             timestamp=event["timestamp"],
@@ -132,6 +136,12 @@ class AshEvent:
         if include_type:
             payload["type"] = self.type
         return payload
+
+
+@dataclass(frozen=True)
+class AshEventRecord:
+    sequence: int
+    event: AshEvent
 
 
 class AshClient:
@@ -227,9 +237,14 @@ class AshClient:
             if not isinstance(ui, HeadlessUI):
                 raise RuntimeError("stream_prompt requires Ash's headless event UI")
             queue: asyncio.Queue[AshEvent] = asyncio.Queue()
+            terminal_seen = False
 
             def receive(payload: dict[str, Any]) -> None:
-                queue.put_nowait(AshEvent.from_wire(payload))
+                nonlocal terminal_seen
+                event = AshEvent.from_wire(payload)
+                if event.type in {"turn.completed", "turn.error", "turn.cancelled"}:
+                    terminal_seen = True
+                queue.put_nowait(event)
 
             unsubscribe = ui.subscribe(receive)
 
@@ -239,26 +254,27 @@ class AshClient:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
-                    queue.put_nowait(
-                        AshEvent("turn.error", {"error": redact_text(str(exc))})
-                    )
+                    if not terminal_seen:
+                        queue.put_nowait(
+                            AshEvent("turn.error", {"error": redact_text(str(exc))})
+                        )
                     return
-                queue.put_nowait(
-                    AshEvent(
-                        "turn.completed",
-                        {
-                            "response": result.response,
-                            "session_id": result.session_id,
-                            "model": result.model,
-                            "context_tokens": result.context_tokens,
-                            "usage": result.usage,
-                        },
+                if not terminal_seen:
+                    queue.put_nowait(
+                        AshEvent(
+                            "turn.completed",
+                            {
+                                "response": result.response,
+                                "session_id": result.session_id,
+                                "model": result.model,
+                                "context_tokens": result.context_tokens,
+                                "usage": result.usage,
+                            },
+                        )
                     )
-                )
 
             task = asyncio.create_task(run())
             try:
-                yield AshEvent("turn.started", {})
                 while True:
                     event = await queue.get()
                     yield event
@@ -274,6 +290,32 @@ class AshClient:
         return self.loop.session_store.list_sessions(
             project_path=str(self.loop.project_root), query=query, limit=limit
         )
+
+    def events(
+        self,
+        session_id: str | None = None,
+        *,
+        after_sequence: int = 0,
+        turn_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[AshEventRecord]:
+        """Replay persisted events from an exclusive sequence cursor."""
+
+        active_session = self.loop.current_session
+        resolved_session_id = session_id or (
+            active_session.session_id if active_session is not None else None
+        )
+        if resolved_session_id is None:
+            raise RuntimeError("no session is active; provide session_id")
+        return [
+            AshEventRecord(item.sequence, AshEvent.from_wire(item.event))
+            for item in self.loop.session_store.list_runtime_events(
+                resolved_session_id,
+                after_sequence=after_sequence,
+                turn_id=turn_id,
+                limit=limit,
+            )
+        ]
 
     async def resume(self, session_id: str) -> str:
         async with self._turn_lock:

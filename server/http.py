@@ -139,6 +139,31 @@ def create_app(
             ]
         }
 
+    @app.get("/v1/sessions/{session_id}/events", dependencies=[Depends(authorize)])
+    async def session_events(
+        session_id: str,
+        after_sequence: int = 0,
+        turn_id: str | None = None,
+        limit: int = 1000,
+    ) -> dict:
+        try:
+            records = client.events(
+                session_id,
+                after_sequence=after_sequence,
+                turn_id=turn_id,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "events": [
+                {"sequence": item.sequence, "event": item.event.to_wire()}
+                for item in records
+            ],
+            "next_sequence": records[-1].sequence if records else after_sequence,
+        }
+
     @app.post("/v1/sessions", dependencies=[Depends(authorize)])
     async def new_session() -> dict[str, str]:
         return {"session_id": await client.new_session()}

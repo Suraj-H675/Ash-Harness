@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from ash.sdk import AshResult
+from ash.sdk import AshEvent, AshEventRecord, AshResult
 from server.jsonrpc import JSONRPCServer
 
 
@@ -44,6 +44,21 @@ class FakeClient:
     def sessions(self, query="", limit=20):
         return []
 
+    def events(
+        self,
+        session_id=None,
+        *,
+        after_sequence=0,
+        turn_id=None,
+        limit=1000,
+    ):
+        return [
+            AshEventRecord(
+                after_sequence + 1,
+                AshEvent("turn.started", {"session_id": session_id}),
+            )
+        ]
+
     async def close(self):
         return None
 
@@ -58,6 +73,24 @@ async def test_jsonrpc_initialize_advertises_versioned_contracts() -> None:
 
     assert response["result"]["protocol_version"] == 1
     assert response["result"]["capabilities"]["event_schema_version"] == 1
+    assert response["result"]["capabilities"]["event_replay"] is True
+
+
+@pytest.mark.asyncio
+async def test_jsonrpc_event_replay_returns_next_cursor() -> None:
+    server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
+
+    response = await server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "event/list",
+            "params": {"session_id": "session-1", "after_sequence": 8},
+        }
+    )
+
+    assert response["result"]["events"][0]["sequence"] == 9
+    assert response["result"]["next_sequence"] == 9
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,8 @@
 Ash exposes one additive event envelope across `--output-format stream-json`,
 the Python SDK, and HTTP server-sent events. JSON-RPC clients discover the
 current event schema through `initialize.capabilities.event_schema_version`.
+The runtime batches redacted events into SQLite schema v8 so clients can replay
+them after disconnects or process restarts.
 
 ## Wire fields
 
@@ -50,3 +52,16 @@ The SDK keeps event-specific values in `AshEvent.data` and exposes envelope
 metadata as typed attributes. `AshEvent.to_wire()` reconstructs the wire event.
 For SSE, the event name is sent in the `event:` line and the remaining envelope
 is sent as JSON in the `data:` line.
+
+## Replay
+
+- Python: `client.events(session_id, after_sequence=cursor, limit=1000)`
+- HTTP: `GET /v1/sessions/{session_id}/events?after_sequence={cursor}`
+- JSON-RPC: `event/list` with `session_id`, `after_sequence`, `turn_id`, and
+  `limit` parameters
+
+Replay results contain a monotonically increasing `sequence`, the canonical
+event, and a `next_sequence` cursor at protocol boundaries. Cursors are
+exclusive. Repeating a request is safe because event IDs are unique and event
+insertion is idempotent. Persisted event payloads pass through Ash's secret
+redactor; live UI delivery is unchanged.

@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from ash.sdk import AshEvent, AshResult
+from ash.sdk import AshEvent, AshEventRecord, AshResult
 from server.http import create_app
 
 
@@ -14,6 +14,24 @@ class FakeClient:
 
     def sessions(self, query="", limit=20):
         return []
+
+    def events(
+        self,
+        session_id=None,
+        *,
+        after_sequence=0,
+        turn_id=None,
+        limit=1000,
+    ):
+        return [
+            AshEventRecord(
+                after_sequence + 1,
+                AshEvent(
+                    "turn.completed",
+                    {"response": "done", "session_id": session_id},
+                ),
+            )
+        ]
 
     async def new_session(self):
         return "session-new"
@@ -83,6 +101,27 @@ async def test_http_server_rate_limits_authenticated_requests() -> None:
     ) as http:
         assert (await http.get("/v1/sessions", headers=headers)).status_code == 200
         assert (await http.get("/v1/sessions", headers=headers)).status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_http_server_replays_events_with_cursor() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.get(
+            "/v1/sessions/session-1/events?after_sequence=4", headers=headers
+        )
+
+    assert response.status_code == 200
+    assert response.json()["schema_version"] == 1
+    assert response.json()["events"][0]["sequence"] == 5
+    assert response.json()["next_sequence"] == 5
 
 
 @pytest.mark.asyncio

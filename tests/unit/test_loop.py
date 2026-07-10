@@ -258,10 +258,16 @@ async def test_queued_steering_is_persisted_and_applied_to_running_turn(tmp_path
         for message in second_messages
     )
     assert loop.pending_steering_count == 0
-    assert [event["type"] for event in ui.events] == [
+    assert [
+        event["type"]
+        for event in ui.events
+        if event["type"] != "assistant.delta"
+    ] == [
+        "turn.started",
         "turn.steering.queued",
         "turn.steering.applied",
         "turn.usage",
+        "turn.completed",
     ]
     loaded = store.load_session(loop.current_session.session_id)
     steering = next(
@@ -387,13 +393,22 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
         message for message in second_request if message["role"] == "tool"
     )
     assert tool_message["tool_call_id"] == "call-native-1"
-    assert [event["type"] for event in ui.events] == [
+    assert [
+        event["type"]
+        for event in ui.events
+        if event["type"] != "assistant.delta"
+    ] == [
+        "turn.started",
         "tool.requested",
         "tool.started",
         "tool.completed",
         "turn.usage",
+        "turn.completed",
     ]
-    assert ui.events[-2]["output"] == "hello"
+    completed_tool = next(
+        event for event in ui.events if event["type"] == "tool.completed"
+    )
+    assert completed_tool["output"] == "hello"
     assert loop.turn_context is not None
     with get_db_connection(store.db_path) as connection:
         tool_turn = connection.execute(
@@ -628,7 +643,9 @@ async def test_dry_run_never_executes_native_tool_calls(tmp_path):
     await loop.run_turn("do not execute this")
 
     assert tool.arguments is None
-    assert [event["type"] for event in ui.events[:2]] == [
+    assert [
+        event["type"] for event in ui.events if event["type"].startswith("tool.")
+    ][:2] == [
         "tool.requested",
         "tool.denied",
     ]

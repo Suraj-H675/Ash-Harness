@@ -328,7 +328,7 @@ not remove them.
 | Provider layer | Partial | Built-ins and custom OpenAI-compatible endpoints now resolve through a dynamic registry; auth/discovery/modalities remain limited. |
 | Coding tools | Strong | No PTY terminal session, tool search, browser, web search, media, scheduler, or messaging. |
 | Context budgets | Partial | Deterministic extractive compaction can lose task/file state; context fragments lack provenance types. |
-| Sessions/recovery | Strong linear | No within-session tree, labels, branch summary, or full event replay contract. |
+| Sessions/recovery | Strong linear | SQLite schema v8 now persists redacted, cursor-replayable canonical events across SDK/HTTP/JSON-RPC; within-session trees, labels, and branch summaries remain. |
 | Memory | Partial | FTS/vector/Markdown exist; lifecycle, provenance, expiry, poisoning controls, and user workflow are incomplete. |
 | Subagents | Strong local | Worktrees, roles, shared state, steering, and reports exist; no remote A2A or workflow DAG runtime. |
 | Agent Skills | Strong after `5dcbf51` | Standard parsing and progressive disclosure now exist; controlled script execution and compatibility diagnostics remain. |
@@ -420,7 +420,8 @@ scheduled task.
 4. Add typed context fragments and a model-assisted compactor with deterministic
    fallback.
 5. Add session-tree/event-log foundations without breaking existing SQLite
-   sessions.
+   sessions: schema v8 event storage and replay are complete; session trees
+   remain.
 
 Exit criterion: all current behavior runs through versioned contracts, old
 sessions migrate, and provider/tool fakes cover the state machine.

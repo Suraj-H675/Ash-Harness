@@ -313,6 +313,8 @@ class AshLoop:
         self.ui = ui
         self.project_root = project_root
         self.tools: dict[str, BaseTool] = dict(tools or {})
+        self._pending_runtime_events: list[dict[str, Any]] = []
+        self._pending_runtime_event_ids: set[str] = set()
         set_event_enricher = getattr(self.ui, "set_event_enricher", None)
         if callable(set_event_enricher):
             set_event_enricher(self._envelope_event)
@@ -427,6 +429,7 @@ class AshLoop:
     async def aclose(self) -> None:
         """Deterministically release provider and subprocess resources."""
 
+        self._flush_runtime_events()
         if self._mcp_runtime is not None:
             await self._mcp_runtime.close()
             self._mcp_runtime = None
@@ -443,7 +446,7 @@ class AshLoop:
         call_id = payload.get("call_id")
         if call_id is None and turn_context is not None:
             call_id = turn_context.get("tool_call_id")
-        return envelope_event(
+        event = envelope_event(
             payload,
             context=EventContext(
                 session_id=session.session_id if session is not None else None,
@@ -453,9 +456,32 @@ class AshLoop:
                 operation_id=str(call_id) if call_id else None,
             ),
         )
+        session_id = event.get("session_id")
+        event_id = str(event["event_id"])
+        if (
+            isinstance(session_id, str)
+            and session_id
+            and event_id not in self._pending_runtime_event_ids
+        ):
+            self._pending_runtime_events.append(event)
+            self._pending_runtime_event_ids.add(event_id)
+            if len(self._pending_runtime_events) >= 64:
+                self._flush_runtime_events()
+        return event
 
     def _emit_event(self, payload: dict[str, Any]) -> None:
-        self.ui.emit_event(self._envelope_event(payload))
+        event = self._envelope_event(payload)
+        self.ui.emit_event(event)
+        if event["type"] in {"turn.completed", "turn.cancelled", "turn.error"}:
+            self._flush_runtime_events()
+
+    def _flush_runtime_events(self) -> None:
+        if not self._pending_runtime_events:
+            return
+        events = self._pending_runtime_events
+        self.session_store.save_runtime_events(events)
+        self._pending_runtime_events = []
+        self._pending_runtime_event_ids.clear()
 
     # --- session lifecycle ------------------------------------------------
 
@@ -602,7 +628,15 @@ class AshLoop:
                 }
             )
             raise
+        except Exception as exc:
+            current_turn_id = self.turn_context.turn_id if self.turn_context else None
+            if current_turn_id is not None and current_turn_id != previous_turn_id:
+                self._emit_event(
+                    {"type": "turn.error", "error": redact_text(str(exc))}
+                )
+            raise
         finally:
+            self._flush_runtime_events()
             self._turn_running = False
 
     async def _run_turn(
@@ -630,6 +664,7 @@ class AshLoop:
         self.session_store.start_turn(
             session.session_id, self.turn_context.turn_id, user_input
         )
+        self._emit_event({"type": "turn.started"})
 
         # 0. Optional V5 sprint planning phase. Triggered only when the
         # loop is configured with a planner AND the user input looks
@@ -654,10 +689,20 @@ class AshLoop:
                     execution.abort("rejected by user")
                     self.session_store.save_sprint(session.session_id, execution)
                     self.session_store.complete_turn(self.turn_context.turn_id)
-                    return (
+                    response = (
                         f"Plan rejected. Sprint {execution.contract.contract_id[:8]} aborted; "
                         "no further actions taken."
                     )
+                    self._emit_event(
+                        {
+                            "type": "turn.completed",
+                            "response": response,
+                            "model": self.provider.model_name,
+                            "context_tokens": self._last_context_tokens,
+                            "usage": self.last_turn_usage,
+                        }
+                    )
+                    return response
                 execution.start()
                 self.session_store.save_sprint(session.session_id, execution)
                 # Feed the contract goal into the model so the planning
@@ -907,6 +952,15 @@ class AshLoop:
 
         _log.info(f"turn complete, {len(final_text)} chars returned")
         self.session_store.complete_turn(self.turn_context.turn_id)
+        self._emit_event(
+            {
+                "type": "turn.completed",
+                "response": final_text,
+                "model": self.provider.model_name,
+                "context_tokens": self._last_context_tokens,
+                "usage": self.last_turn_usage,
+            }
+        )
         return final_text
 
     @property
@@ -1205,9 +1259,11 @@ class AshLoop:
     ) -> None:
         kind, payload = event
         if kind == "token" and isinstance(payload, str):
+            self._emit_event({"type": "assistant.delta", "text": payload})
             self.ui.print_token(payload)
             text_chunks.append(payload)
         elif kind == "thought" and isinstance(payload, str):
+            self._emit_event({"type": "reasoning.delta", "text": payload})
             self.ui.print_thought(payload)
         elif kind == "tool_call" and isinstance(payload, dict):
             tool_call = {
@@ -1872,10 +1928,17 @@ class AshLoop:
             )
             if self.turn_context is not None:
                 self.turn_context.set("context_budget", self._last_context_budget)
-            self.ui.update_token_count(
-                result.estimated_tokens,
-                max(1, maximum_context - self._config.max_completion_tokens),
+            maximum_input = max(
+                1, maximum_context - self._config.max_completion_tokens
             )
+            self._emit_event(
+                {
+                    "type": "context.usage",
+                    "current": result.estimated_tokens,
+                    "maximum": maximum_input,
+                }
+            )
+            self.ui.update_token_count(result.estimated_tokens, maximum_input)
             if result.compacted and result.summary != session.context_summary:
                 session.context_summary = result.summary
                 self.session_store.save_context_summary(

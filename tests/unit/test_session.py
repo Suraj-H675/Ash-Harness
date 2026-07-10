@@ -43,16 +43,24 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
             ).fetchall()
         }
 
-    assert {"sessions", "messages", "tool_calls", "audit_logs"}.issubset(table_names)
+    assert {
+        "sessions",
+        "messages",
+        "tool_calls",
+        "audit_logs",
+        "runtime_events",
+    }.issubset(table_names)
     assert {
         "idx_messages_session",
         "idx_tool_calls_session",
         "idx_audit_session",
+        "idx_runtime_events_session_sequence",
+        "idx_runtime_events_turn_sequence",
     }.issubset(index_names)
     with get_db_connection(db_path) as conn:
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 7
+            == 8
         )
         audit_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(audit_logs)")
@@ -109,7 +117,7 @@ def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     store = SessionStore(db_path)
 
     assert store.load_session("legacy").session_id == "legacy"
-    backups = list(tmp_path.glob("legacy.db.before-v7-migration.*.backup"))
+    backups = list(tmp_path.glob("legacy.db.before-v8-migration.*.backup"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as conn:
         assert conn.execute("SELECT session_id FROM sessions").fetchone()[0] == "legacy"
@@ -148,7 +156,7 @@ def test_v7_migration_preserves_checkpoints_and_adds_call_granularity(
             "created_at) VALUES (?, 'turn-1', 'whole_edit', 'file.txt', 1, ?, ?)",
             (session.session_id, b"before", datetime.now(timezone.utc).isoformat()),
         )
-        conn.execute("DELETE FROM schema_migrations WHERE version = 7")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 7")
 
     migrated = SessionStore(db_path)
 
@@ -167,7 +175,53 @@ def test_v7_migration_preserves_checkpoints_and_adds_call_granularity(
         call_id="call-2",
     )
     assert len(migrated.file_checkpoints_for_turns(session.session_id, ["turn-1"])) == 2
-    assert len(list(tmp_path.glob("v6.db.before-v7-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v6.db.before-v8-migration.*.backup"))) == 1
+
+
+def test_runtime_event_log_is_ordered_idempotent_and_redacted(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "events.db")
+    session = store.create_session(str(tmp_path))
+    base = {
+        "schema_version": 1,
+        "timestamp": "2026-07-10T00:00:00+00:00",
+        "source": {"type": "runtime", "id": "ash"},
+        "session_id": session.session_id,
+        "turn_id": "turn-1",
+        "operation_id": None,
+        "parent_event_id": None,
+    }
+    events = [
+        {**base, "event_id": "event-1", "type": "turn.started"},
+        {
+            **base,
+            "event_id": "event-2",
+            "type": "tool.completed",
+            "output": "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz",
+        },
+    ]
+
+    assert store.save_runtime_events(events) == 2
+    assert store.save_runtime_events(events) == 0
+    replay = store.list_runtime_events(session.session_id, limit=1)
+    remainder = store.list_runtime_events(
+        session.session_id, after_sequence=replay[-1].sequence
+    )
+
+    assert [item.event["type"] for item in [*replay, *remainder]] == [
+        "turn.started",
+        "tool.completed",
+    ]
+    assert "sk-proj" not in remainder[0].event["output"]
+    assert "REDACTED" in remainder[0].event["output"]
+
+
+def test_runtime_event_replay_validates_cursor_and_limit(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "events.db")
+
+    with pytest.raises(ValueError, match="after_sequence"):
+        store.list_runtime_events("missing", after_sequence=-1)
+    with pytest.raises(ValueError, match="limit"):
+        store.list_runtime_events("missing", limit=0)
 
 
 def test_newer_database_schema_is_refused(tmp_path: Path) -> None:

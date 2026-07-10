@@ -22,7 +22,7 @@ AuditAction = Literal[
     "tool_call", "command_run", "file_write", "safety_block", "user_approval"
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 
 class SessionStorageError(RuntimeError):
@@ -99,6 +99,11 @@ class SessionUsage(BaseModel):
     @property
     def has_estimates(self) -> bool:
         return bool(self.estimated_prompt_tokens or self.estimated_completion_tokens)
+
+
+class StoredRuntimeEvent(BaseModel):
+    sequence: int
+    event: dict[str, Any]
 
 
 _db_write_locks: dict[str, asyncio.Lock] = {}
@@ -275,6 +280,8 @@ class SessionStore:
                 self._migrate_v6(conn)
             if from_version < 7:
                 self._migrate_v7(conn)
+            if from_version < 8:
+                self._migrate_v8(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -444,6 +451,34 @@ class SessionStore:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
             (7, _serialize_datetime(_utc_now())),
+        )
+
+    def _migrate_v8(self, conn: sqlite3.Connection) -> None:
+        """Add the append-only versioned runtime event log."""
+
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL,
+                turn_id TEXT,
+                operation_id TEXT,
+                event_type TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
+                event_json TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_events_session_sequence
+                ON runtime_events(session_id, sequence);
+            CREATE INDEX IF NOT EXISTS idx_runtime_events_turn_sequence
+                ON runtime_events(session_id, turn_id, sequence);
+            """
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (8, _serialize_datetime(_utc_now())),
         )
 
     def backup(
@@ -1358,6 +1393,82 @@ class SessionStore:
             )
             if cursor.rowcount == 0:
                 raise KeyError(f"Session not found: {session_id}")
+
+    def save_runtime_events(self, events: list[dict[str, Any]]) -> int:
+        """Append a batch of canonical events, ignoring replayed event IDs."""
+
+        if not events:
+            return 0
+        from core.events import EVENT_SCHEMA_VERSION, envelope_event
+        from core.redaction import redact_value
+
+        rows: list[tuple[Any, ...]] = []
+        for raw_event in events:
+            event = envelope_event(raw_event)
+            session_id = event.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
+                raise ValueError("persisted runtime events require a session_id")
+            if event["schema_version"] != EVENT_SCHEMA_VERSION:
+                raise ValueError("runtime event schema version mismatch")
+            redacted = redact_value(event)
+            rows.append(
+                (
+                    event["event_id"],
+                    session_id,
+                    event.get("turn_id"),
+                    event.get("operation_id"),
+                    event["type"],
+                    event["schema_version"],
+                    event["timestamp"],
+                    _canonical_json(redacted),
+                )
+            )
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO runtime_events (
+                    event_id, session_id, turn_id, operation_id, event_type,
+                    schema_version, timestamp, event_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            return conn.total_changes - before
+
+    def list_runtime_events(
+        self,
+        session_id: str,
+        *,
+        after_sequence: int = 0,
+        turn_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[StoredRuntimeEvent]:
+        """Replay session events in insertion order from an exclusive cursor."""
+
+        if after_sequence < 0:
+            raise ValueError("after_sequence cannot be negative")
+        if not 1 <= limit <= 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        query = (
+            "SELECT sequence, event_json FROM runtime_events "
+            "WHERE session_id = ? AND sequence > ?"
+        )
+        parameters: list[Any] = [session_id, after_sequence]
+        if turn_id is not None:
+            query += " AND turn_id = ?"
+            parameters.append(turn_id)
+        query += " ORDER BY sequence ASC LIMIT ?"
+        parameters.append(limit)
+        with closing(get_db_connection(self.db_path)) as conn:
+            rows = conn.execute(query, parameters).fetchall()
+        return [
+            StoredRuntimeEvent(
+                sequence=int(row["sequence"]),
+                event=json.loads(str(row["event_json"])),
+            )
+            for row in rows
+        ]
 
     def fork_session(
         self, session_id: str, *, message_count: int | None = None

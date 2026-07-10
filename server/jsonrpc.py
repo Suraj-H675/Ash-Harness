@@ -20,6 +20,7 @@ class JSONRPCServer:
             "session/new": self._new_session,
             "session/resume": self._resume_session,
             "session/list": self._list_sessions,
+            "event/list": self._list_events,
             "status": self._status,
         }
 
@@ -83,6 +84,7 @@ class JSONRPCServer:
                 "sessions": True,
                 "cancellation": True,
                 "event_schema_version": EVENT_SCHEMA_VERSION,
+                "event_replay": True,
             },
         }
 
@@ -116,6 +118,29 @@ class JSONRPCServer:
             item.model_dump(mode="json")
             for item in self.client.sessions(query=query, limit=limit)
         ]
+
+    async def _list_events(self, params: dict[str, Any]) -> dict[str, Any]:
+        session_id = params.get("session_id")
+        if session_id is not None and not isinstance(session_id, str):
+            raise ValueError("session_id must be a string")
+        records = self.client.events(
+            session_id,
+            after_sequence=int(params.get("after_sequence", 0)),
+            turn_id=params.get("turn_id"),
+            limit=int(params.get("limit", 1000)),
+        )
+        return {
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "events": [
+                {"sequence": item.sequence, "event": item.event.to_wire()}
+                for item in records
+            ],
+            "next_sequence": (
+                records[-1].sequence
+                if records
+                else int(params.get("after_sequence", 0))
+            ),
+        }
 
     async def _status(self, params: dict[str, Any]) -> dict[str, Any]:
         session = self.client.loop.current_session

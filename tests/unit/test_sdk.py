@@ -241,6 +241,16 @@ async def test_async_sdk_streams_real_turn_events(tmp_path) -> None:
     assert events[-1].session_id == events[-1].data["session_id"]
     assert events[-1].data["response"] == "sdk response"
     assert events[-1].data["usage"]["cache_read_tokens"] == 80
+    replay = client.loop.session_store.list_runtime_events(
+        events[-1].session_id or ""
+    )
+    replay_types = [item.event["type"] for item in replay]
+    assert replay_types[0] == "turn.started"
+    assert "assistant.delta" in replay_types
+    assert replay_types[-1] == "turn.completed"
+    assert [item.sequence for item in replay] == sorted(
+        item.sequence for item in replay
+    )
 
 
 @pytest.mark.asyncio
