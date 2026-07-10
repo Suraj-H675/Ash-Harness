@@ -386,8 +386,14 @@ class SandboxManager:
                 network=self.network,
                 image=self.docker_image,
             )
-            if not docker_backend.is_available():
-                raise SandboxBackendUnavailable("docker backend unavailable")
+            # Docker can disappear after startup (daemon stopped, Desktop
+            # restarting, or the configured image removed).  Re-probe here so
+            # an unavailable isolation boundary is never reported as an
+            # ordinary command failure.
+            if not has_docker(self.docker_image):
+                raise SandboxBackendUnavailable(
+                    "docker daemon or configured sandbox image is unavailable"
+                )
             return docker_backend
         if tier == SANDBOX_TIER_BWRAP:
             if sys.platform.startswith("linux"):
