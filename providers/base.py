@@ -8,7 +8,7 @@ from typing import Any, AsyncGenerator, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 from providers.capabilities import ProviderCapabilities, infer_capabilities
-from providers.messages import MessageInput
+from providers.messages import CanonicalToolCall, MessageInput
 
 
 class StreamChunk(BaseModel):
@@ -35,7 +35,7 @@ class StreamChunk(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     # Fully-formed tool calls from providers that support native
     # OpenAI tool_calls streaming (includes real id for tool_call_id).
-    native_tool_calls: list[dict[str, Any]] | None = None
+    native_tool_calls: list[CanonicalToolCall] | None = None
 
 
 @runtime_checkable

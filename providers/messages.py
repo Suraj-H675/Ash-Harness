@@ -8,7 +8,14 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 MAX_CANONICAL_MESSAGES = 10_000
@@ -52,9 +59,26 @@ ContentBlock: TypeAlias = Annotated[
 class CanonicalToolCall(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    call_id: str = Field(..., min_length=1)
+    call_id: str = Field(
+        ...,
+        min_length=1,
+        validation_alias=AliasChoices("call_id", "id"),
+    )
     name: str = Field(..., min_length=1)
     arguments: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("arguments", mode="before")
+    @classmethod
+    def parse_arguments(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("tool-call arguments contain invalid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("tool-call arguments JSON must decode to an object")
+        return parsed
 
     @model_validator(mode="after")
     def validate_arguments(self) -> "CanonicalToolCall":
@@ -63,6 +87,9 @@ class CanonicalToolCall(BaseModel):
         except (TypeError, ValueError) as exc:
             raise ValueError("tool-call arguments must be JSON serializable") from exc
         return self
+
+    def to_wire(self) -> dict[str, Any]:
+        return self.model_dump(mode="python")
 
 
 class CanonicalMessage(BaseModel):

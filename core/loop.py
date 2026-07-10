@@ -40,7 +40,7 @@ from ash_logging import get_logger
 from mcp.server import MCPServerConfig, load_mcp_servers
 from providers.base import ProviderABC, TokenCounterLike
 from providers.capabilities import ProviderCapabilities
-from providers.messages import normalize_messages
+from providers.messages import CanonicalToolCall, normalize_messages
 from providers.retry import (
     ProviderCircuitBreaker,
     classify_provider_failure,
@@ -201,24 +201,15 @@ def _render_tool_response(call_id: str, tool_name: str, result: dict[str, Any]) 
     )
 
 
-def _normalize_native_tool_call(call: dict[str, Any]) -> dict[str, Any]:
+def _normalize_native_tool_call(
+    call: CanonicalToolCall | dict[str, Any],
+) -> dict[str, Any]:
     """Convert a provider-native tool call into Ash's canonical shape."""
 
-    call_id = str(call.get("call_id") or call.get("id") or uuid4())
-    name = str(call.get("name") or "")
-    arguments = call.get("arguments", {})
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            arguments = {"__invalid_json__": arguments}
-    if not isinstance(arguments, dict):
-        arguments = {"value": arguments}
-    return {
-        "call_id": call_id,
-        "name": name,
-        "arguments": arguments,
-    }
+    canonical = (
+        call if isinstance(call, CanonicalToolCall) else CanonicalToolCall.model_validate(call)
+    )
+    return canonical.to_wire()
 
 
 def _audit_action_for_tool(tool_name: str) -> AuditAction:
@@ -1112,7 +1103,7 @@ class AshLoop:
         cache_read_tokens = 0
         cache_write_tokens = 0
         usage_source = "unavailable"
-        native_tool_calls_from_api: list[dict[str, Any]] = []
+        native_tool_calls_from_api: list[CanonicalToolCall] = []
         maximum_attempts = int(getattr(self._config, "provider_max_attempts", 3))
         retry_base_delay = float(
             getattr(self._config, "provider_retry_base_delay", 0.5)

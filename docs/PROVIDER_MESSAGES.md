@@ -33,3 +33,8 @@ Existing `{"role": ..., "content": ...}` mappings remain accepted. Provider
 authors should type `stream_chat` as `Sequence[MessageInput]`; Ash passes a
 validated list of plain mappings so adapters in other processes or languages
 can implement the same wire contract.
+
+Provider responses use `StreamChunk`. Completed native tool calls are parsed
+into `CanonicalToolCall` before the loop sees them: provider `id` aliases become
+`call_id`, JSON argument strings must decode to objects, and malformed calls
+fail the provider turn instead of being executed with guessed arguments.

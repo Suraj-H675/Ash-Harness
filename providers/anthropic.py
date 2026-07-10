@@ -13,7 +13,7 @@ from typing import Any, AsyncGenerator
 
 from context.tokens import AnthropicTokenCounter
 from providers.base import ProviderABC, StreamChunk, TokenCounterLike
-from providers.messages import MessageInput, normalize_messages
+from providers.messages import CanonicalToolCall, MessageInput, normalize_messages
 
 
 class ProviderBackendUnavailable(ImportError):
@@ -215,15 +215,15 @@ class AnthropicProvider(ProviderABC):
             cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
             cache_write_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
             stop_reason = getattr(final_message, "stop_reason", None)
-            native_tool_calls = []
+            native_tool_calls: list[CanonicalToolCall] = []
             for block in getattr(final_message, "content", []) or []:
                 if getattr(block, "type", None) == "tool_use":
                     native_tool_calls.append(
-                        {
-                            "id": block.id,
-                            "name": block.name,
-                            "arguments": block.input,
-                        }
+                        CanonicalToolCall(
+                            call_id=block.id,
+                            name=block.name,
+                            arguments=block.input,
+                        )
                     )
             yield StreamChunk(
                 content="",

@@ -13,7 +13,7 @@ import openai  # type: ignore[import-not-found]
 
 from context.tokens import AnthropicTokenCounter
 from providers.base import ProviderABC, StreamChunk, TokenCounterLike
-from providers.messages import MessageInput
+from providers.messages import CanonicalToolCall, MessageInput
 from providers.openai import prepare_openai_messages
 
 
@@ -77,7 +77,7 @@ class DeepSeekProvider(ProviderABC):
             raise RuntimeError(f"DeepSeek API error: {exc}") from exc
 
         partials: dict[int, Any] = {}
-        completed: list[dict[str, Any]] = []
+        completed: list[CanonicalToolCall] = []
 
         async for chunk in stream:
             delta = chunk.choices[0].delta
@@ -105,7 +105,7 @@ class DeepSeekProvider(ProviderABC):
                     completion_tokens = chunk.usage.completion_tokens or 0
                 stop_reason = chunk.choices[0].finish_reason
                 for partial in partials.values():
-                    completed.append(partial)
+                    completed.append(CanonicalToolCall.model_validate(partial))
                 partials.clear()
 
             yield StreamChunk(

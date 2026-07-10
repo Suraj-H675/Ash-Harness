@@ -413,7 +413,8 @@ scheduled task.
 
 1. Extract canonical events/content/capabilities from the loop and providers:
    event v1, request message/content models, and capability declarations are
-   complete; canonical streamed response blocks remain.
+   complete, including normalized native tool calls; richer canonical streamed
+   media/reasoning blocks remain.
 2. Add schema versioning and golden compatibility tests for SDK/JSON-RPC/HTTP:
    event schema v1 is complete; result/request schemas remain.
 3. Introduce provider and capability registries; move CLI provider branching

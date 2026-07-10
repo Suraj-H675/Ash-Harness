@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from providers.anthropic import prepare_anthropic_messages
+from providers.base import StreamChunk
 from providers.messages import (
     MAX_CANONICAL_MESSAGES,
     CanonicalMessage,
@@ -109,6 +110,35 @@ def test_canonical_tool_arguments_must_be_strict_json() -> None:
             call_id="call-1",
             name="tool",
             arguments={"value": float("nan")},
+        )
+
+
+def test_native_tool_calls_normalize_provider_ids_and_json_arguments() -> None:
+    chunk = StreamChunk(
+        native_tool_calls=[
+            {
+                "id": "provider-call-1",
+                "name": "read_file",
+                "arguments": '{"file_path":"README.md"}',
+            }
+        ]
+    )
+
+    assert chunk.native_tool_calls is not None
+    assert chunk.native_tool_calls[0].to_wire() == {
+        "call_id": "provider-call-1",
+        "name": "read_file",
+        "arguments": {"file_path": "README.md"},
+    }
+
+
+@pytest.mark.parametrize("arguments", ["not-json", "[]", "null", "1"])
+def test_native_tool_calls_reject_non_object_arguments(arguments: str) -> None:
+    with pytest.raises(ValueError, match="tool-call arguments"):
+        StreamChunk(
+            native_tool_calls=[
+                {"id": "call-1", "name": "read_file", "arguments": arguments}
+            ]
         )
 
 

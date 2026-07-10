@@ -9,7 +9,7 @@ import openai  # type: ignore[import-not-found]
 
 from context.tokens import OpenAITokenCounter
 from providers.base import ProviderABC, StreamChunk, TokenCounterLike
-from providers.messages import MessageInput, normalize_messages
+from providers.messages import CanonicalToolCall, MessageInput, normalize_messages
 
 
 class _PartialToolCall:
@@ -162,7 +162,7 @@ class OpenAIProvider(ProviderABC):
         # Buffer for accumulating streaming tool calls.
         partials: dict[int, _PartialToolCall] = {}
         # Completed native tool calls ready to emit.
-        completed: list[dict[str, Any]] = []
+        completed: list[CanonicalToolCall] = []
 
         async for chunk in stream:
             choices = getattr(chunk, "choices", None) or []
@@ -213,11 +213,13 @@ class OpenAIProvider(ProviderABC):
                 stop_reason = choice.finish_reason
                 for partial in partials.values():
                     completed.append(
-                        {
-                            "id": partial.id,
-                            "name": partial.name,
-                            "arguments": partial.arguments,
-                        }
+                        CanonicalToolCall.model_validate(
+                            {
+                                "call_id": partial.id,
+                                "name": partial.name,
+                                "arguments": partial.arguments,
+                            }
+                        )
                     )
                 partials.clear()
 
