@@ -3,7 +3,13 @@
 from context.compaction import Chunk
 from context.tokens import AnthropicTokenCounter, OpenAITokenCounter
 from context.turn import TurnContext
-from context.history import CompactionResult, HistoryCompactor
+from context.history import (
+    CompactionResult,
+    ContextFragment,
+    ContextFragmentKind,
+    ContextTrust,
+    HistoryCompactor,
+)
 
 __all__ = [
     "AnthropicTokenCounter",
@@ -11,5 +17,8 @@ __all__ = [
     "OpenAITokenCounter",
     "TurnContext",
     "CompactionResult",
+    "ContextFragment",
+    "ContextFragmentKind",
+    "ContextTrust",
     "HistoryCompactor",
 ]

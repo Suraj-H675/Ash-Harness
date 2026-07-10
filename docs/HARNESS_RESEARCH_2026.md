@@ -327,7 +327,7 @@ not remove them.
 | Agent loop and streaming | Partial | Public event schema v1 now spans runtime, tools, SDK, stream JSON, SSE, and JSON-RPC discovery; the loop remains monolithic and legacy XML fallback is mixed into canonical behavior. |
 | Provider layer | Partial | Built-ins and custom OpenAI-compatible endpoints now resolve through a dynamic registry; auth/discovery/modalities remain limited. |
 | Coding tools | Strong | No PTY terminal session, tool search, browser, web search, media, scheduler, or messaging. |
-| Context budgets | Partial | Deterministic extractive compaction can lose task/file state; context fragments lack provenance types. |
+| Context budgets | Strong partial | Provider totals now include reserved tool schemas; typed hashed fragments expose source/trust provenance; deterministic compaction preserves task/path/action/outcome state and redacts persisted summaries. Model-assisted compaction remains. |
 | Sessions/recovery | Strong linear | SQLite schema v8 now persists redacted, cursor-replayable canonical events across SDK/HTTP/JSON-RPC; within-session trees, labels, and branch summaries remain. |
 | Memory | Partial | FTS/vector/Markdown exist; lifecycle, provenance, expiry, poisoning controls, and user workflow are incomplete. |
 | Subagents | Strong local | Worktrees, roles, shared state, steering, and reports exist; no remote A2A or workflow DAG runtime. |
@@ -418,7 +418,8 @@ scheduled task.
    behind them: provider registry and shared runtime assembly are complete;
    capability registry remains.
 4. Add typed context fragments and a model-assisted compactor with deterministic
-   fallback.
+   fallback: typed provenance and strengthened deterministic fallback are
+   complete; model-assisted compaction remains.
 5. Add session-tree/event-log foundations without breaking existing SQLite
    sessions: schema v8 event storage and replay are complete; session trees
    remain.

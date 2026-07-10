@@ -195,6 +195,13 @@ def _render_context_budget(report: Any | None) -> str:
     for name, item in report.slices.items():
         suffix = " truncated" if item.truncated else ""
         lines.append(f"  {name}: ~{item.used}/{item.limit}{suffix}")
+    if report.fragments:
+        lines.append("Sources:")
+        for fragment in report.fragments:
+            lines.append(
+                f"  {fragment.kind}: {fragment.source} [{fragment.trust}] "
+                f"sha256={fragment.content_sha256[:12]}"
+            )
     return "\n".join(lines)
 
 

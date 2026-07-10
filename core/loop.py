@@ -1071,16 +1071,22 @@ class AshLoop:
     def _estimate_tool_schema_tokens(self) -> int:
         """Estimate tool declaration tokens reserved outside chat messages."""
 
-        if not self.tools:
+        payload = self._tool_schema_payload()
+        if not payload:
             return 0
-        if _provider_capabilities(self.provider).native_tools:
-            payload: Any = self._tools_to_openai_format(self.tools)
-        else:
-            payload = [
-                {"name": tool.name, "description": getattr(tool, "description", "")}
-                for tool in self.tools.values()
-            ]
         return max(0, int(self.provider.count_tokens(json.dumps(payload, default=str))))
+
+    def _tool_schema_payload(self) -> list[dict[str, Any]]:
+        """Return the exact provider-facing representation used for budgeting."""
+
+        if not self.tools:
+            return []
+        if _provider_capabilities(self.provider).native_tools:
+            return self._tools_to_openai_format(self.tools)
+        return [
+            {"name": tool.name, "description": getattr(tool, "description", "")}
+            for tool in self.tools.values()
+        ]
 
     async def _stream_one_completion(
         self,
@@ -1825,7 +1831,13 @@ class AshLoop:
             memory_section = f"## Relevant Context\n{self._pending_memory_context}"
 
         if self._config is not None:
-            from context.history import ContextBudgetAllocator, HistoryCompactor
+            from context.history import (
+                ContextBudgetAllocator,
+                ContextFragmentKind,
+                ContextTrust,
+                HistoryCompactor,
+                context_fragment,
+            )
 
             maximum_context = min(
                 self._config.max_context_tokens,
@@ -1843,6 +1855,9 @@ class AshLoop:
 
             tool_schema_tokens = self._estimate_tool_schema_tokens()
             budget_usage["tools"] = tool_schema_tokens
+            tool_schema_content = json.dumps(
+                self._tool_schema_payload(), sort_keys=True, default=str
+            )
 
             system_fit = allocator.fit_text(
                 system_content,
@@ -1853,6 +1868,8 @@ class AshLoop:
             if system_fit.truncated:
                 truncated.add("system")
             system_parts = [system_fit.text]
+            repo_fragment_content = ""
+            memory_fragment_content = ""
 
             if repo_section:
                 repo_fit = allocator.fit_text(
@@ -1864,6 +1881,7 @@ class AshLoop:
                 if repo_fit.truncated:
                     truncated.add("repo_map")
                 system_parts.append(repo_fit.text)
+                repo_fragment_content = repo_fit.text
             else:
                 budget_usage["repo_map"] = 0
 
@@ -1877,6 +1895,7 @@ class AshLoop:
                 if memory_fit.truncated:
                     truncated.add("memory")
                 system_parts.append(memory_fit.text)
+                memory_fragment_content = memory_fit.text
             else:
                 budget_usage["memory"] = 0
 
@@ -1896,11 +1915,10 @@ class AshLoop:
                     msg_dict["tool_call_id"] = message.metadata["call_id"]
                 messages.append(msg_dict)
 
-            reserved_tokens = (
+            reserved_message_tokens = (
                 budget_usage["system"]
                 + budget_usage["repo_map"]
                 + budget_usage["memory"]
-                + budget_usage["tools"]
             )
             provider_input_limit = max(1, allocator.input_limit - tool_schema_tokens)
             compactor = HistoryCompactor(
@@ -1917,34 +1935,92 @@ class AshLoop:
                 previous_summary=session.context_summary,
                 force=force_compaction,
             )
-            self._last_context_tokens = result.estimated_tokens
-            budget_usage["history"] = max(0, result.estimated_tokens - reserved_tokens)
+            self._last_context_tokens = result.estimated_tokens + tool_schema_tokens
+            budget_usage["history"] = max(
+                0, result.estimated_tokens - reserved_message_tokens
+            )
             if budget_usage["history"] > budget_limits["history"]:
                 truncated.add("history")
-            self._last_context_budget = allocator.report(
-                limits=budget_limits,
-                usage=budget_usage,
-                truncated=truncated,
-            )
-            if self.turn_context is not None:
-                self.turn_context.set("context_budget", self._last_context_budget)
             maximum_input = max(
                 1, maximum_context - self._config.max_completion_tokens
             )
             self._emit_event(
                 {
                     "type": "context.usage",
-                    "current": result.estimated_tokens,
+                    "current": self._last_context_tokens,
                     "maximum": maximum_input,
                 }
             )
-            self.ui.update_token_count(result.estimated_tokens, maximum_input)
+            self.ui.update_token_count(self._last_context_tokens, maximum_input)
             if result.compacted and result.summary != session.context_summary:
-                session.context_summary = result.summary
+                session.context_summary = redact_text(result.summary)
                 self.session_store.save_context_summary(
                     session.session_id,
-                    result.summary,
+                    session.context_summary,
                 )
+            history_content = json.dumps(
+                result.messages[1:], sort_keys=True, default=str
+            )
+            fragments = (
+                context_fragment(
+                    kind=ContextFragmentKind.SYSTEM,
+                    source="assembled_system_prompt",
+                    trust=ContextTrust.MIXED,
+                    content=system_fit.text,
+                    tokens=budget_usage["system"],
+                    limit=budget_limits["system"],
+                    truncated="system" in truncated,
+                ),
+                context_fragment(
+                    kind=ContextFragmentKind.TOOL_SCHEMA,
+                    source="runtime_tool_registry",
+                    trust=ContextTrust.MIXED,
+                    content=tool_schema_content,
+                    tokens=budget_usage["tools"],
+                    limit=budget_limits["tools"],
+                    truncated="tools" in truncated,
+                    metadata={"tool_count": str(len(self.tools))},
+                ),
+                context_fragment(
+                    kind=ContextFragmentKind.HISTORY,
+                    source="session_transcript",
+                    trust=ContextTrust.SESSION,
+                    content=history_content,
+                    tokens=budget_usage["history"],
+                    limit=budget_limits["history"],
+                    truncated="history" in truncated,
+                    metadata={
+                        "message_count": str(max(0, len(result.messages) - 1)),
+                        "compacted": str(result.compacted).lower(),
+                    },
+                ),
+                context_fragment(
+                    kind=ContextFragmentKind.REPO_MAP,
+                    source="workspace_repository_map",
+                    trust=ContextTrust.PROJECT,
+                    content=repo_fragment_content,
+                    tokens=budget_usage["repo_map"],
+                    limit=budget_limits["repo_map"],
+                    truncated="repo_map" in truncated,
+                ),
+                context_fragment(
+                    kind=ContextFragmentKind.MEMORY,
+                    source="semantic_memory",
+                    trust=ContextTrust.MIXED,
+                    content=memory_fragment_content,
+                    tokens=budget_usage["memory"],
+                    limit=budget_limits["memory"],
+                    truncated="memory" in truncated,
+                ),
+            )
+            self._last_context_budget = allocator.report(
+                limits=budget_limits,
+                usage=budget_usage,
+                truncated=truncated,
+                fragments=fragments,
+            )
+            if self.turn_context is not None:
+                self.turn_context.set("context_budget", self._last_context_budget)
             return result.messages
         messages = [{"role": "system", "content": system_content}]
         if repo_section:

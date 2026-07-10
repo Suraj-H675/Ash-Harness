@@ -3,7 +3,10 @@ import pytest
 from context.history import (
     IMAGE_TOKEN_ESTIMATE,
     ContextBudgetAllocator,
+    ContextFragmentKind,
+    ContextTrust,
     HistoryCompactor,
+    context_fragment,
 )
 
 
@@ -136,6 +139,25 @@ def test_context_budget_allocator_rejects_invalid_weights() -> None:
         )
 
 
+def test_context_fragment_records_provenance_without_content_copy() -> None:
+    fragment = context_fragment(
+        kind=ContextFragmentKind.REPO_MAP,
+        source="workspace_repository_map",
+        trust=ContextTrust.PROJECT,
+        content="bounded repository symbols",
+        tokens=3,
+        limit=10,
+        truncated=False,
+        metadata={"files": "2"},
+    )
+
+    assert fragment.kind == "repo_map"
+    assert fragment.trust == "project"
+    assert len(fragment.content_sha256) == 64
+    assert fragment.metadata == (("files", "2"),)
+    assert not hasattr(fragment, "content")
+
+
 def test_image_payload_uses_fixed_token_estimate() -> None:
     messages = [
         {"role": "system", "content": "system"},
@@ -185,3 +207,47 @@ def test_compaction_summary_never_contains_image_base64() -> None:
 
     assert secret_payload not in result.summary
     assert "[image: image/png]" in result.summary
+
+
+def test_compaction_preserves_task_paths_actions_and_prior_summary_ends() -> None:
+    previous = "ORIGINAL GOAL " + ("middle " * 500) + "LATEST DECISION"
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "Refactor the payment workflow"},
+        {
+            "role": "assistant",
+            "content": "I will keep the public API stable",
+            "tool_calls": [
+                {
+                    "call_id": "call-1",
+                    "name": "write_file",
+                    "arguments": {
+                        "file_path": "src/payments.py",
+                        "content": "implementation",
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "content": "written", "tool_call_id": "call-1"},
+        {"role": "assistant", "content": "The write completed"},
+        {"role": "user", "content": "current request"},
+    ]
+
+    result = HistoryCompactor(
+        max_context_tokens=10_000,
+        completion_reserve=100,
+        recent_messages=2,
+        summary_char_limit=1200,
+    ).compact(
+        messages,
+        count_tokens=count_words,
+        previous_summary=previous,
+        force=True,
+    )
+
+    assert "ORIGINAL GOAL" in result.summary
+    assert "LATEST DECISION" in result.summary
+    assert "User request: Refactor the payment workflow" in result.summary
+    assert "Referenced path: src/payments.py" in result.summary
+    assert "Tool action: write_file" in result.summary
+    assert "Assistant outcome: I will keep the public API stable" in result.summary

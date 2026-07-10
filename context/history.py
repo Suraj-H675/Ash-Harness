@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Callable
 
 
@@ -15,6 +17,35 @@ DEFAULT_CONTEXT_BUDGET_WEIGHTS: dict[str, float] = {
     "memory": 0.10,
 }
 IMAGE_TOKEN_ESTIMATE = 1024
+
+
+class ContextFragmentKind(StrEnum):
+    SYSTEM = "system"
+    TOOL_SCHEMA = "tool_schema"
+    HISTORY = "history"
+    REPO_MAP = "repo_map"
+    MEMORY = "memory"
+
+
+class ContextTrust(StrEnum):
+    BUILT_IN = "built_in"
+    PROJECT = "project"
+    SESSION = "session"
+    MIXED = "mixed"
+
+
+@dataclass(frozen=True)
+class ContextFragment:
+    """Provenance for one exact, bounded provider-input fragment."""
+
+    kind: ContextFragmentKind
+    source: str
+    trust: ContextTrust
+    tokens: int
+    limit: int
+    truncated: bool
+    content_sha256: str
+    metadata: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -33,6 +64,7 @@ class ContextBudgetReport:
     completion_reserve: int
     input_limit: int
     slices: dict[str, ContextBudgetSlice]
+    fragments: tuple[ContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -139,6 +171,7 @@ class ContextBudgetAllocator:
         limits: dict[str, int],
         usage: dict[str, int],
         truncated: set[str] | None = None,
+        fragments: tuple[ContextFragment, ...] = (),
     ) -> ContextBudgetReport:
         truncated = truncated or set()
         slices = {
@@ -155,7 +188,33 @@ class ContextBudgetAllocator:
             completion_reserve=self.completion_reserve,
             input_limit=self.input_limit,
             slices=slices,
+            fragments=fragments,
         )
+
+
+def context_fragment(
+    *,
+    kind: ContextFragmentKind,
+    source: str,
+    trust: ContextTrust,
+    content: str,
+    tokens: int,
+    limit: int,
+    truncated: bool,
+    metadata: dict[str, str] | None = None,
+) -> ContextFragment:
+    """Describe bounded model-visible content without retaining another copy."""
+
+    return ContextFragment(
+        kind=kind,
+        source=source,
+        trust=trust,
+        tokens=tokens,
+        limit=limit,
+        truncated=truncated,
+        content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        metadata=tuple(sorted((metadata or {}).items())),
+    )
 
 
 def normalize_context_budget_weights(
@@ -332,11 +391,14 @@ class HistoryCompactor:
         messages: list[dict[str, Any]],
         previous_summary: str,
     ) -> str:
-        lines: list[str] = []
+        priority_lines: list[str] = []
         if previous_summary:
-            lines.append("Earlier summary:")
-            lines.append(previous_summary[-self.summary_char_limit // 2 :])
-        lines.append("Compacted events:")
+            priority_lines.append("Earlier summary:")
+            priority_lines.append(
+                _preserve_ends(previous_summary, self.summary_char_limit // 3)
+            )
+        priority_lines.extend(_preserved_state_lines(messages))
+        event_lines = ["Compacted events:"]
         for message in messages:
             role = str(message.get("role", "unknown"))
             content = _summary_content(message.get("content", "")).strip()
@@ -351,9 +413,14 @@ class HistoryCompactor:
                 )
                 content = f"{content} tools=[{rendered_calls}]".strip()
             if content:
-                lines.append(f"- {role}: {content}")
-        summary = "\n".join(lines)
-        return summary[-self.summary_char_limit :]
+                event_lines.append(f"- {role}: {content}")
+        priority = "\n".join(priority_lines)
+        events = "\n".join(event_lines)
+        if len(priority) >= self.summary_char_limit:
+            return _preserve_ends(priority, self.summary_char_limit)
+        remaining = self.summary_char_limit - len(priority) - 1
+        bounded_events = _preserve_ends(events, max(0, remaining))
+        return "\n".join(part for part in (priority, bounded_events) if part)
 
     @staticmethod
     def _count(
@@ -404,3 +471,50 @@ def _summary_content(content: Any) -> str:
         elif block.get("type") == "image":
             parts.append(f"[image: {block.get('media_type', 'unknown')}]")
     return " ".join(parts)
+
+
+def _preserved_state_lines(messages: list[dict[str, Any]]) -> list[str]:
+    user_requests: list[str] = []
+    assistant_outcomes: list[str] = []
+    tool_actions: list[str] = []
+    file_paths: set[str] = set()
+    for message in messages:
+        role = str(message.get("role", ""))
+        content = " ".join(_summary_content(message.get("content", "")).split())
+        if role == "user" and content:
+            user_requests.append(content[:500])
+        elif role == "assistant" and content:
+            assistant_outcomes.append(content[:500])
+        for call in message.get("tool_calls") or []:
+            name = str(call.get("name", "?"))
+            arguments = call.get("arguments", {})
+            rendered = json.dumps(arguments, sort_keys=True, default=str)[:500]
+            tool_actions.append(f"{name}({rendered})")
+            if isinstance(arguments, dict):
+                for key, value in arguments.items():
+                    if key in {"file_path", "path", "cwd", "directory_path"} and isinstance(
+                        value, str
+                    ):
+                        file_paths.add(value)
+    lines = ["Preserved task state:"]
+    lines.extend(f"- User request: {item}" for item in user_requests[-5:])
+    lines.extend(f"- Referenced path: {item}" for item in sorted(file_paths)[:20])
+    lines.extend(f"- Tool action: {item}" for item in tool_actions[-20:])
+    lines.extend(f"- Assistant outcome: {item}" for item in assistant_outcomes[-5:])
+    if len(lines) == 1:
+        lines.append("- No extractable state in compacted messages.")
+    return lines
+
+
+def _preserve_ends(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    marker = "\n[...summary middle omitted...]\n"
+    if len(marker) >= limit:
+        return text[:limit]
+    available = limit - len(marker)
+    head = available // 2
+    tail = available - head
+    return text[:head] + marker + text[-tail:]

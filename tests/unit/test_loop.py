@@ -295,6 +295,44 @@ def test_steering_queue_validates_messages_and_capacity(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_persisted_compaction_summary_is_redacted(tmp_path):
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        context_recent_messages=2,
+    )
+    store = SessionStore(tmp_path / "compaction-redaction.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=config,
+    )
+    session = await loop.start_session()
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz"
+    for role, content in (
+        ("user", f"OPENAI_API_KEY={secret}"),
+        ("assistant", "acknowledged"),
+        ("user", "continue"),
+        ("assistant", "current response"),
+    ):
+        message = Message(role=role, content=content, timestamp=datetime.now(timezone.utc))
+        store.save_message(session.session_id, message)
+        session.messages.append(message)
+
+    _, changed = loop.compact_current_context()
+    persisted = store.load_session(session.session_id).context_summary
+
+    assert changed is True
+    assert secret not in persisted
+    assert "REDACTED" in persisted
+
+
+@pytest.mark.asyncio
 async def test_turn_running_state_resets_after_cancellation(tmp_path):
     provider = SteeringProvider()
     ui = EventUI()
@@ -567,6 +605,21 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
         "estimated_cost_usd": 0.0,
         "cost_is_estimated": False,
     }
+    report = loop._last_context_budget
+    assert report is not None
+    assert {str(fragment.kind) for fragment in report.fragments} == {
+        "system",
+        "tool_schema",
+        "history",
+        "repo_map",
+        "memory",
+    }
+    assert all(len(fragment.content_sha256) == 64 for fragment in report.fragments)
+    assert report.slices["tools"].used == 0
+    context_event = next(
+        event for event in ui.events if event["type"] == "context.usage"
+    )
+    assert loop._last_context_tokens == context_event["current"]
     usage = store.get_session_usage(session.session_id)
     assert usage.prompt_tokens == 100
     assert usage.cache_read_tokens == 60
