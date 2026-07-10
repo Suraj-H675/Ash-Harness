@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import importlib.metadata
 import json
-import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -92,134 +90,21 @@ def _config_overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _parse_model_string(model: str) -> tuple[str, str]:
-    """Parse 'provider/model' string into (provider, model_name)."""
-    if "/" not in model:
-        raise ValueError(
-            f"Model string must be in 'provider/model' format, got: {model!r}"
-        )
-    provider, model_name = model.split("/", 1)
-    return provider, model_name
+    from providers.registry import parse_model_string
+
+    return parse_model_string(model)
 
 
 def _build_provider(config: AshConfig) -> ProviderABC:
-    if config.fallback_models:
-        from providers.failover import FailoverProvider
+    from providers.registry import get_provider_registry
 
-        models = [config.model, *config.fallback_models]
-        providers = [
-            _build_provider(
-                config.model_copy(update={"model": model, "fallback_models": []})
-            )
-            for model in models
-        ]
-        return FailoverProvider(providers)
-    prov: ProviderABC
-    provider, model_name = _parse_model_string(config.model)
-    if provider == "anthropic":
-        from providers.anthropic import AnthropicProvider
-
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        base_url = os.environ.get("ANTHROPIC_API_BASE") or None
-        prov = AnthropicProvider(
-            model_name=model_name,
-            api_key=api_key,
-            base_url=base_url,
-        )
-        prov.configure_max_tokens(config.max_completion_tokens)
-        prov.configure_prompt_cache(
-            enabled=config.prompt_cache_enabled and base_url is None,
-            retention=config.prompt_cache_retention,
-        )
-        return prov
-
-    elif provider == "openai":
-        from providers.openai import OpenAIProvider
-
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        base_url = os.environ.get("OPENAI_API_BASE") or None
-        prov = OpenAIProvider(
-            model_name=model_name,
-            api_key=api_key,
-            base_url=base_url,
-        )
-        prov.configure_max_tokens(config.max_completion_tokens)
-        prov.configure_prompt_cache(
-            enabled=config.prompt_cache_enabled and base_url is None,
-            cache_key=_prompt_cache_key(config),
-            retention=config.prompt_cache_retention,
-        )
-        return prov
-
-    elif provider == "ollama":
-        from providers.ollama import OllamaProvider
-
-        base_url = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
-        prov = OllamaProvider(
-            model_name=model_name,
-            base_url=base_url,
-        )
-        prov.configure_max_tokens(config.max_completion_tokens)
-        return prov
-
-    elif provider == "deepseek":
-        from providers.deepseek import DeepSeekProvider
-
-        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-        base_url = os.environ.get("DEEPSEEK_API_BASE") or None
-        prov = DeepSeekProvider(
-            model_name=model_name,
-            api_key=api_key,
-            base_url=base_url,
-        )
-        prov.configure_max_tokens(config.max_completion_tokens)
-        return prov
-
-    elif provider == "groq":
-        from providers.groq import GroqProvider
-
-        api_key = os.environ.get("GROQ_API_KEY", "")
-        base_url = os.environ.get("GROQ_API_BASE") or None
-        prov = GroqProvider(
-            model_name=model_name,
-            api_key=api_key,
-            base_url=base_url,
-        )
-        prov.configure_max_tokens(config.max_completion_tokens)
-        return prov
-
-    elif provider == "openai-compatible":
-        from providers.openai import OpenAIProvider
-
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        base_url = os.environ.get("OPENAI_API_BASE", "")
-        prov = OpenAIProvider(
-            model_name=model_name,
-            api_key=api_key,
-            base_url=base_url if base_url else None,
-        )
-        prov.configure_max_tokens(config.max_completion_tokens)
-        return prov
-
-    elif provider in config.custom_providers:
-        from providers.openai import OpenAIProvider
-
-        cp = config.custom_providers[provider]
-        key_env = cp.get("key_env", "")
-        prov = OpenAIProvider(
-            model_name=model_name,
-            api_key=os.environ.get(key_env, "") if key_env else cp.get("api_key", ""),
-            base_url=cp.get("base_url"),
-        )
-        prov.configure_max_tokens(config.max_completion_tokens)
-        return prov
-
-    raise ValueError(f"Unknown provider in model string: {provider!r}")
+    return get_provider_registry().build(config)
 
 
 def _prompt_cache_key(config: AshConfig) -> str:
-    workspace = str(config.workspace_root.expanduser().resolve()).encode("utf-8")
-    digest = hashlib.sha256(workspace).hexdigest()[:24]
-    return f"ash-project-{digest}"
+    from providers.registry import prompt_cache_key
+
+    return prompt_cache_key(config)
 
 
 def _build_tools(

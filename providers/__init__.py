@@ -7,6 +7,11 @@ from providers.ollama import OllamaProvider
 from providers.deepseek import DeepSeekProvider
 from providers.groq import GroqProvider
 from providers.rate_limiter import TokenBucketRateLimiter
+from providers.registry import (
+    ProviderRegistry,
+    get_provider_registry,
+    parse_model_string,
+)
 
 __all__ = [
     "ProviderABC",
@@ -19,4 +24,7 @@ __all__ = [
     "GroqProvider",
     "ProviderBackendUnavailable",
     "TokenBucketRateLimiter",
+    "ProviderRegistry",
+    "get_provider_registry",
+    "parse_model_string",
 ]
