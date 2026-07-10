@@ -565,10 +565,8 @@ async def test_run_command_executes_with_scoped_cwd(
 ) -> None:
     marker = project_root / "marker.txt"
     marker.write_text("hello", encoding="utf-8")
-    command = (
-        f"{shlex.quote(sys.executable)} -c "
-        f"{shlex.quote('from pathlib import Path; print(Path("marker.txt").read_text())')}"
-    )
+    script = 'from pathlib import Path; print(Path("marker.txt").read_text())'
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
 
     result = await RunCommandTool(guard).run(command_line=command, cwd=".")
 
@@ -584,10 +582,8 @@ async def test_run_command_defaults_to_project_root_cwd(
 ) -> None:
     marker = project_root / "marker.txt"
     marker.write_text("from-root", encoding="utf-8")
-    command = (
-        f"{shlex.quote(sys.executable)} -c "
-        f"{shlex.quote('from pathlib import Path; print(Path("marker.txt").read_text())')}"
-    )
+    script = 'from pathlib import Path; print(Path("marker.txt").read_text())'
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
 
     result = await RunCommandTool(guard).run(command_line=command)
 

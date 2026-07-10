@@ -1713,6 +1713,18 @@ class AshLoop:
         """Build the messages payload for the provider."""
 
         system_content = self.system_prompt
+        try:
+            from plugins.skills import ListSkillsTool, render_available_skills
+
+            list_skills_tool = self.tools.get("list_skills")
+            if isinstance(list_skills_tool, ListSkillsTool):
+                skill_section = render_available_skills(list_skills_tool.catalog)
+                if skill_section:
+                    system_content = f"{system_content}\n\n{skill_section}"
+        except (OSError, UnicodeError, ValueError):
+            # Invalid skills are isolated in catalog diagnostics and must not
+            # prevent the agent runtime from building a usable prompt.
+            pass
         repo_section = ""
         if self.repo_map is not None:
             try:

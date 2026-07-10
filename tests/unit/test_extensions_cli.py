@@ -23,7 +23,10 @@ def _write_plugin(root: Path, name: str) -> None:
     plugin = root / name
     skill = plugin / "skills" / "plugin-review"
     skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text("# Review\n", encoding="utf-8")
+    (skill / "SKILL.md").write_text(
+        "---\nname: plugin-review\ndescription: Review plugin code\n---\n# Review\n",
+        encoding="utf-8",
+    )
     (plugin / "plugin.json").write_text(
         json.dumps(
             {

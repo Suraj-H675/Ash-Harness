@@ -248,6 +248,7 @@ def _build_tools(
     from plugins.skills import (
         ActivateSkillTool,
         ListSkillsTool,
+        ReadSkillResourceTool,
         SkillCatalog,
         SkillSource,
     )
@@ -332,6 +333,7 @@ def _build_tools(
         WebFetchTool(safety_guard, allowed_domains=allowed_web_domains),
         ListSkillsTool(safety_guard, catalog),
         ActivateSkillTool(safety_guard, catalog),
+        ReadSkillResourceTool(safety_guard, catalog),
     ]
     if provider_factory is not None and agent_db_path is not None:
         from agents.shared_state import SharedState
@@ -535,6 +537,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         from plugins.skills import (
             ActivateSkillTool,
             ListSkillsTool,
+            ReadSkillResourceTool,
             SkillCatalog,
             SkillSource,
         )
@@ -629,12 +632,16 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
         list_skills_tool = loop.tools.get("list_skills")
         activate_skill_tool = loop.tools.get("activate_skill")
-        if not isinstance(list_skills_tool, ListSkillsTool) or not isinstance(
-            activate_skill_tool, ActivateSkillTool
+        read_skill_resource_tool = loop.tools.get("read_skill_resource")
+        if (
+            not isinstance(list_skills_tool, ListSkillsTool)
+            or not isinstance(activate_skill_tool, ActivateSkillTool)
+            or not isinstance(read_skill_resource_tool, ReadSkillResourceTool)
         ):
             raise RuntimeError("skill tools are unavailable")
         list_skills_tool.catalog = next_skills
         activate_skill_tool.catalog = next_skills
+        read_skill_resource_tool.catalog = next_skills
         spawn_tool = loop.tools.get("spawn_agent")
         if isinstance(spawn_tool, SpawnAgentTool):
             spawn_tool.set_custom_agents(

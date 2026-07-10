@@ -7,10 +7,16 @@ out of scope.
 
 ## Install
 
-Python 3.12 or newer is required.
+Python 3.11 or newer is required. Install the latest repository version with
+one command:
 
 ```bash
-pipx install .
+pipx install 'git+https://github.com/Suraj-H675/Ash-Harness.git'
+```
+
+Then configure and verify the runtime:
+
+```bash
 ash setup
 ash doctor
 ash
@@ -32,7 +38,8 @@ pip install 'ash[vector]' # ChromaDB and ONNX semantic memory
 For development:
 
 ```bash
-uv sync --group dev --extra server
+pipx install .
+uv sync --group dev
 uv run ash --help
 uv run pytest -q
 ```
