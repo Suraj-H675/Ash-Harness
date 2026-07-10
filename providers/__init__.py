@@ -6,6 +6,14 @@ from providers.capabilities import (
     ProviderCapabilities,
     get_capability_registry,
 )
+from providers.messages import (
+    CanonicalMessage,
+    CanonicalToolCall,
+    ImageContentBlock,
+    MessageInput,
+    TextContentBlock,
+    normalize_messages,
+)
 from providers.anthropic import AnthropicProvider, ProviderBackendUnavailable
 from providers.openai import OpenAIProvider
 from providers.ollama import OllamaProvider
@@ -23,6 +31,12 @@ __all__ = [
     "ProviderCapabilities",
     "CapabilityRegistry",
     "get_capability_registry",
+    "CanonicalMessage",
+    "CanonicalToolCall",
+    "ImageContentBlock",
+    "MessageInput",
+    "TextContentBlock",
+    "normalize_messages",
     "StreamChunk",
     "TokenCounterLike",
     "AnthropicProvider",

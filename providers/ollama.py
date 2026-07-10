@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, AsyncGenerator
 import httpx
 
 from context.tokens import AnthropicTokenCounter
 from providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from providers.messages import MessageInput, normalize_messages
 from providers.retry import ProviderHTTPError
 
 
@@ -39,7 +41,7 @@ class OllamaProvider(ProviderABC):
 
     async def stream_chat(
         self,
-        messages: list[dict[str, Any]],
+        messages: Sequence[MessageInput],
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
@@ -48,7 +50,7 @@ class OllamaProvider(ProviderABC):
             options["num_predict"] = self._max_tokens
         payload = {
             "model": self._model_name,
-            "messages": messages,
+            "messages": normalize_messages(messages),
             "stream": True,
             "options": options,
         }

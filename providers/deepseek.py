@@ -6,12 +6,14 @@ Base URL: https://api.deepseek.com/v1
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, AsyncGenerator
 
 import openai  # type: ignore[import-not-found]
 
 from context.tokens import AnthropicTokenCounter
 from providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from providers.messages import MessageInput
 from providers.openai import prepare_openai_messages
 
 
@@ -55,7 +57,7 @@ class DeepSeekProvider(ProviderABC):
 
     async def stream_chat(
         self,
-        messages: list[dict[str, Any]],
+        messages: Sequence[MessageInput],
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:

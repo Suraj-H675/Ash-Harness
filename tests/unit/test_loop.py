@@ -32,6 +32,12 @@ class MockProvider(ProviderABC):
         )
 
 
+class MustNotRunProvider(MockProvider):
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        raise AssertionError("provider must not receive an invalid message")
+        yield  # pragma: no cover
+
+
 class SpyMiddleware(ToolMiddleware):
     def __init__(self):
         self.before_calls = []
@@ -66,6 +72,22 @@ class EventTool(BaseTool):
     async def run(self, **kwargs):
         self.emit_event({"type": "tool.output", "delta": "live", "stream": "stdout"})
         return ToolResult(success=True, output="live")
+
+
+@pytest.mark.asyncio
+async def test_loop_rejects_invalid_canonical_messages_before_provider(tmp_path):
+    loop = AshLoop(
+        SessionStore(tmp_path / "invalid-message.db"),
+        MustNotRunProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="tool messages require tool_call_id"):
+        await loop._stream_one_completion(
+            [{"role": "tool", "content": "orphaned result"}]
+        )
 
 
 class NativeToolProvider(ProviderABC):

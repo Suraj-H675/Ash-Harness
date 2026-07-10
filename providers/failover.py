@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, AsyncGenerator
 
 from providers.base import ProviderABC, StreamChunk
+from providers.messages import MessageInput
 
 
 class FailoverProvider(ProviderABC):
@@ -28,7 +30,7 @@ class FailoverProvider(ProviderABC):
 
     async def stream_chat(
         self,
-        messages: list[dict[str, Any]],
+        messages: Sequence[MessageInput],
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:

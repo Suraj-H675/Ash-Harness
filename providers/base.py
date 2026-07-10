@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Any, AsyncGenerator, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 from providers.capabilities import ProviderCapabilities, infer_capabilities
+from providers.messages import MessageInput
 
 
 class StreamChunk(BaseModel):
@@ -47,9 +49,9 @@ class ProviderABC(ABC):
     """Common contract every LLM provider adapter must implement.
 
     The loop uses :meth:`stream_chat` to receive an async stream of
-    :class:`StreamChunk` objects. ``messages`` is a list of dicts in the
-    standard ``{"role": ..., "content": ...}`` shape so the loop does not
-    have to know provider-specific message encoding.
+    :class:`StreamChunk` objects. ``messages`` uses Ash's validated canonical
+    shape so the loop does not need provider-specific message encoding.
+    Mapping inputs remain supported for compatibility.
     """
 
     provider_family = "custom"
@@ -58,7 +60,7 @@ class ProviderABC(ABC):
     @abstractmethod
     async def stream_chat(
         self,
-        messages: list[dict[str, Any]],
+        messages: Sequence[MessageInput],
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:

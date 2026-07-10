@@ -8,10 +8,12 @@ surface a clear error to the user instead of crashing mid-turn.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, AsyncGenerator
 
 from context.tokens import AnthropicTokenCounter
 from providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from providers.messages import MessageInput, normalize_messages
 
 
 class ProviderBackendUnavailable(ImportError):
@@ -19,13 +21,13 @@ class ProviderBackendUnavailable(ImportError):
 
 
 def prepare_anthropic_messages(
-    messages: list[dict[str, Any]],
+    messages: Sequence[MessageInput],
 ) -> tuple[str, list[dict[str, Any]]]:
     """Translate Ash's canonical history to Anthropic message blocks."""
 
     system_blocks: list[str] = []
     conversation: list[dict[str, Any]] = []
-    for message in messages:
+    for message in normalize_messages(messages):
         role = message.get("role")
         content = message.get("content", "")
         if role == "system":
@@ -172,7 +174,7 @@ class AnthropicProvider(ProviderABC):
 
     async def stream_chat(
         self,
-        messages: list[dict[str, Any]],
+        messages: Sequence[MessageInput],
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:

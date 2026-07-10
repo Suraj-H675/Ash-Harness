@@ -324,7 +324,7 @@ not remove them.
 
 | Domain | State on 2026-07-10 | Key gap |
 |---|---|---|
-| Agent loop and streaming | Partial | Public event schema v1 now spans runtime, tools, SDK, stream JSON, SSE, and JSON-RPC discovery; the loop remains monolithic and legacy XML fallback is mixed into canonical behavior. |
+| Agent loop and streaming | Partial | Public event schema v1 and validated provider-portable message/content/tool-call inputs now span the runtime and adapters; the loop remains monolithic and legacy XML fallback is mixed into canonical behavior. |
 | Provider layer | Strong partial | Built-ins, embedders, declared model capabilities, and custom OpenAI-compatible endpoints resolve through thread-safe linked registries; auth/discovery and non-text modalities remain limited. |
 | Coding tools | Strong | No PTY terminal session, tool search, browser, web search, media, scheduler, or messaging. |
 | Context budgets | Strong partial | Provider totals now include reserved tool schemas; typed hashed fragments expose source/trust provenance; deterministic compaction preserves task/path/action/outcome state and redacts persisted summaries. Model-assisted compaction remains. |
@@ -411,7 +411,9 @@ scheduled task.
 
 ### Phase 1: runtime contracts
 
-1. Extract canonical events/content/capabilities from the loop and providers.
+1. Extract canonical events/content/capabilities from the loop and providers:
+   event v1, request message/content models, and capability declarations are
+   complete; canonical streamed response blocks remain.
 2. Add schema versioning and golden compatibility tests for SDK/JSON-RPC/HTTP:
    event schema v1 is complete; result/request schemas remain.
 3. Introduce provider and capability registries; move CLI provider branching

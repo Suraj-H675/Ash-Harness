@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import Any, AsyncGenerator
 import openai  # type: ignore[import-not-found]
 
 from context.tokens import OpenAITokenCounter
 from providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from providers.messages import MessageInput, normalize_messages
 
 
 class _PartialToolCall:
@@ -22,12 +24,12 @@ class _PartialToolCall:
 
 
 def prepare_openai_messages(
-    messages: list[dict[str, Any]],
+    messages: Sequence[MessageInput],
 ) -> list[dict[str, Any]]:
     """Translate Ash's canonical tool-call history to OpenAI chat messages."""
 
     prepared: list[dict[str, Any]] = []
-    for message in messages:
+    for message in normalize_messages(messages):
         item = {
             key: value
             for key, value in message.items()
@@ -130,7 +132,7 @@ class OpenAIProvider(ProviderABC):
 
     async def stream_chat(
         self,
-        messages: list[dict[str, Any]],
+        messages: Sequence[MessageInput],
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:

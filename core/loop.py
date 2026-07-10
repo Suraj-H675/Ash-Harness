@@ -40,6 +40,7 @@ from ash_logging import get_logger
 from mcp.server import MCPServerConfig, load_mcp_servers
 from providers.base import ProviderABC, TokenCounterLike
 from providers.capabilities import ProviderCapabilities
+from providers.messages import normalize_messages
 from providers.retry import (
     ProviderCircuitBreaker,
     classify_provider_failure,
@@ -1094,6 +1095,7 @@ class AshLoop:
     ) -> tuple[str, list[dict[str, Any]], int, int, int, int, str]:
         """Stream one completion with normalized token and cache usage."""
 
+        canonical_messages = normalize_messages(messages)
         # Build OpenAI-format tools list for providers that support native tool_calls.
         openai_tools = (
             self._tools_to_openai_format(self.tools)
@@ -1125,7 +1127,7 @@ class AshLoop:
                     emitted = False
                     try:
                         async for chunk in self.provider.stream_chat(
-                            messages, tools=openai_tools
+                            canonical_messages, tools=openai_tools
                         ):
                             emitted = True
                             for fragment in (chunk.content, chunk.tool_call_delta):
