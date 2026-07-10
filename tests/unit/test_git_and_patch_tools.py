@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from safety.guard import SafetyGuard
+from sandbox.process_utils import communicate_process
 from tools.git import AutoCommitTool, GitDiffTool, GitLogTool, GitStatusTool
 from tools.patch import ApplyPatchTool
 
@@ -14,7 +15,7 @@ async def _git(root: Path, *args: str) -> None:
     process = await asyncio.create_subprocess_exec(
         "git", *args, cwd=root, stdout=asyncio.subprocess.PIPE
     )
-    await process.communicate()
+    await communicate_process(process)
     assert process.returncode == 0
 
 
@@ -53,6 +54,16 @@ async def test_git_inspection_and_patch(tmp_path: Path) -> None:
     assert "hello.txt" in status.output
     assert "+new" in diff.output
     assert "initial" in log.output
+
+
+@pytest.mark.asyncio
+async def test_git_inspection_reports_process_timeout(tmp_path: Path) -> None:
+    with patch("tools.git.communicate_process", side_effect=asyncio.TimeoutError):
+        result = await GitStatusTool(SafetyGuard(tmp_path)).run()
+
+    assert result.success is False
+    assert result.output == ""
+    assert "timed out after 30 seconds" in (result.error or "")
 
 
 @pytest.mark.asyncio

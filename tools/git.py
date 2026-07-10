@@ -19,6 +19,11 @@ from pydantic import BaseModel, Field
 from core.redaction import find_secret_candidates
 from safety.environment import build_scrubbed_environment
 from safety.guard import SafetyGuard
+from sandbox.process_utils import (
+    communicate_process,
+    process_group_options,
+    terminate_process_tree,
+)
 from tools.base import BaseTool, ToolResult, count_output_tokens
 
 
@@ -293,19 +298,29 @@ async def _run_git(
     """Run ``git <args>`` in ``cwd`` and return (exit, stdout, stderr)."""
 
     cmd = ["git", *args]
-
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(cwd),
         env=build_scrubbed_environment(environment_allowlist),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **process_group_options(),
     )
-    stdout_bytes, stderr_bytes = await process.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            communicate_process(process), timeout=30
+        )
+    except asyncio.TimeoutError:
+        await terminate_process_tree(process)
+        return (
+            124,
+            "",
+            "git command timed out after 30 seconds",
+        )
     return (
         process.returncode if process.returncode is not None else -1,
-        stdout_bytes.decode("utf-8", errors="replace"),
-        stderr_bytes.decode("utf-8", errors="replace"),
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
     )
 
 

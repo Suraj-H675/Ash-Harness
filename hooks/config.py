@@ -19,7 +19,11 @@ from hooks.registry import (
     PreToolUseHook,
     SessionStartHook,
 )
-from sandbox.process_utils import process_group_options, terminate_process_tree
+from sandbox.process_utils import (
+    communicate_process,
+    process_group_options,
+    terminate_process_tree,
+)
 
 
 @dataclass(frozen=True)
@@ -127,7 +131,9 @@ async def _run(
         **process_group_options(),
     )
     try:
-        stdout, stderr = await process.communicate(json.dumps(payload).encode())
+        stdout, stderr = await communicate_process(
+            process, input_data=json.dumps(payload).encode()
+        )
     except asyncio.CancelledError:
         await terminate_process_tree(process)
         raise

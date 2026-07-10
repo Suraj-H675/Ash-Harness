@@ -10,7 +10,11 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from safety.guard import SafetyGuard, SafetyViolation
-from sandbox.process_utils import process_group_options, terminate_process_tree
+from sandbox.process_utils import (
+    communicate_process,
+    process_group_options,
+    terminate_process_tree,
+)
 from tools.base import BaseTool, ToolResult
 
 
@@ -117,7 +121,7 @@ async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, s
     )
     try:
         stdout, stderr = await asyncio.wait_for(
-            process.communicate(patch.encode("utf-8")), timeout=30
+            communicate_process(process, input_data=patch.encode("utf-8")), timeout=30
         )
     except (asyncio.TimeoutError, asyncio.CancelledError):
         await terminate_process_tree(process)

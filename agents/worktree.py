@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from sandbox.process_utils import process_group_options, terminate_process_tree
+from sandbox.process_utils import (
+    communicate_process,
+    process_group_options,
+    terminate_process_tree,
+)
 
 
 class WorktreeError(RuntimeError):
@@ -235,7 +239,9 @@ async def _run_git(
         **process_group_options(),
     )
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+        stdout, stderr = await asyncio.wait_for(
+            communicate_process(process), timeout=30
+        )
     except (asyncio.TimeoutError, asyncio.CancelledError):
         await terminate_process_tree(process)
         raise

@@ -64,12 +64,26 @@ async def terminate_process_tree(
 async def communicate_process(
     process: asyncio.subprocess.Process,
     *,
+    input_data: bytes | None = None,
     stream_callback: ProcessStreamCallback | None = None,
 ) -> tuple[bytes, bytes]:
-    """Collect both pipes while optionally forwarding decoded chunks."""
+    """Drain pipes without relying on a racy subprocess waiter notification."""
 
-    if stream_callback is None:
-        return await process.communicate()
+    async def write_stdin() -> None:
+        if process.stdin is None:
+            return
+        try:
+            if input_data is not None:
+                process.stdin.write(input_data)
+                await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            process.stdin.close()
+            try:
+                await process.stdin.wait_closed()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     async def read_stream(
         stream: asyncio.StreamReader | None,
@@ -84,16 +98,24 @@ async def communicate_process(
                 break
             chunks.append(chunk)
             text = chunk.decode("utf-8", errors="replace")
-            try:
-                stream_callback(stream_name, text)
-            except Exception:
-                # Rendering and observer failures must never kill user commands.
-                pass
+            if stream_callback is not None:
+                try:
+                    stream_callback(stream_name, text)
+                except Exception:
+                    # Rendering and observer failures must never kill user commands.
+                    pass
         return b"".join(chunks)
 
-    stdout, stderr, _ = await asyncio.gather(
+    async def wait_for_returncode() -> None:
+        # Threaded child watchers can lose a waiter's wakeup in PID namespaces
+        # even after the transport records the exit code. Polling avoids that race.
+        while process.returncode is None:
+            await asyncio.sleep(0.01)
+
+    stdout, stderr, _, _ = await asyncio.gather(
         read_stream(process.stdout, "stdout"),
         read_stream(process.stderr, "stderr"),
-        process.wait(),
+        write_stdin(),
+        wait_for_returncode(),
     )
     return stdout, stderr

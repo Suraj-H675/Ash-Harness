@@ -11,6 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from sandbox.process_utils import communicate_process
 from tools.base import BaseTool, ToolResult, count_output_tokens
 
 
@@ -136,7 +137,7 @@ class SearchTextTool(BaseTool):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await communicate_process(process)
         if process.returncode not in (0, 1):
             return ToolResult(
                 success=False,
