@@ -20,6 +20,8 @@ class JSONRPCServer:
             "session/new": self._new_session,
             "session/resume": self._resume_session,
             "session/list": self._list_sessions,
+            "session/fork": self._fork_session,
+            "session/tree": self._session_tree,
             "event/list": self._list_events,
             "status": self._status,
         }
@@ -85,6 +87,7 @@ class JSONRPCServer:
                 "cancellation": True,
                 "event_schema_version": EVENT_SCHEMA_VERSION,
                 "event_replay": True,
+                "session_tree": True,
             },
         }
 
@@ -117,6 +120,39 @@ class JSONRPCServer:
         return [
             item.model_dump(mode="json")
             for item in self.client.sessions(query=query, limit=limit)
+        ]
+
+    async def _fork_session(self, params: dict[str, Any]) -> dict[str, str]:
+        session_id = params.get("session_id")
+        if session_id is not None and not isinstance(session_id, str):
+            raise ValueError("session_id must be a string")
+        message_count = params.get("message_count")
+        if message_count is not None and (
+            not isinstance(message_count, int)
+            or isinstance(message_count, bool)
+            or message_count < 0
+        ):
+            raise ValueError("message_count must be a non-negative integer")
+        branch_name = params.get("branch_name", "")
+        branch_summary = params.get("branch_summary", "")
+        if not isinstance(branch_name, str) or not isinstance(branch_summary, str):
+            raise ValueError("branch_name and branch_summary must be strings")
+        return {
+            "session_id": await self.client.fork(
+                session_id,
+                message_count=message_count,
+                branch_name=branch_name,
+                branch_summary=branch_summary,
+            )
+        }
+
+    async def _session_tree(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        session_id = params.get("session_id")
+        if session_id is not None and not isinstance(session_id, str):
+            raise ValueError("session_id must be a string")
+        return [
+            item.model_dump(mode="json")
+            for item in self.client.session_tree(session_id)
         ]
 
     async def _list_events(self, params: dict[str, Any]) -> dict[str, Any]:

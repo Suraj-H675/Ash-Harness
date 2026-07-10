@@ -27,8 +27,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("resume", "Resume a session by ID or name", "/resume [session]"),
     SlashCommand("rename", "Rename the current session", "/rename <title>"),
     SlashCommand(
-        "fork", "Fork the session at a message boundary", "/fork [message-count]"
+        "fork",
+        "Fork the session at a message boundary",
+        "/fork [message-count] [branch-name]",
     ),
+    SlashCommand("tree", "Show the current session branch tree", "/tree"),
     SlashCommand(
         "rewind",
         "Rewind transcript, optionally restoring direct file edits",

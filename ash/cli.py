@@ -656,13 +656,23 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 print(f"Renamed session to {loop.current_session.title}", flush=True)
                 continue
             if command.name == "fork":
-                if loop.current_session is None or len(arguments) > 1:
+                if loop.current_session is None:
                     print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
                     continue
                 try:
-                    count = int(arguments[0]) if arguments else None
+                    count: int | None = None
+                    name_parts = arguments
+                    if arguments:
+                        try:
+                            count = int(arguments[0])
+                        except ValueError:
+                            pass
+                        else:
+                            name_parts = arguments[1:]
                     session = loop.session_store.fork_session(
-                        loop.current_session.session_id, message_count=count
+                        loop.current_session.session_id,
+                        message_count=count,
+                        branch_name=" ".join(name_parts),
                     )
                 except ValueError as exc:
                     print(f"Error: {exc}", file=sys.stderr, flush=True)
@@ -670,6 +680,26 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 loop.current_session = session
                 loop.ui.load_session_transcript(session)
                 print(f"Forked session {session.session_id}", flush=True)
+                continue
+            if command.name == "tree":
+                if loop.current_session is None or arguments:
+                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                for node in loop.session_store.session_tree(
+                    loop.current_session.session_id
+                ):
+                    marker = (
+                        "*"
+                        if node.session_id == loop.current_session.session_id
+                        else " "
+                    )
+                    label = node.branch_name or (
+                        "root" if node.parent_session_id is None else "branch"
+                    )
+                    print(
+                        f"{marker} {'  ' * node.depth}{node.session_id}  {label}",
+                        flush=True,
+                    )
                 continue
             if command.name == "rewind":
                 with_files = arguments[1:] == ["--files"]
@@ -1355,8 +1385,11 @@ def main(argv: list[str] | None = None) -> int:
     sessions_parser.add_argument(
         "sessions_action",
         nargs="?",
-        choices=["list"],
+        choices=["list", "tree"],
         default="list",
+    )
+    sessions_parser.add_argument(
+        "--session", help="Session ID or exact title for tree inspection"
     )
     sessions_parser.add_argument("--query", default="")
     sessions_parser.add_argument("--limit", type=int, default=20)
@@ -1807,12 +1840,36 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "sessions":
-        from cli.sessions import list_session_summaries, render_session_summaries
+        from cli.sessions import (
+            list_session_summaries,
+            render_session_summaries,
+            render_session_tree,
+        )
 
         sessions_config = AshConfig.load(
             **({"db_directory": args.db_directory} if args.db_directory else {})
         )
         store = SessionStore(sessions_config.db_directory / "sessions.db")
+        if args.sessions_action == "tree":
+            try:
+                summary = (
+                    store.resolve_session(
+                        args.session, str(sessions_config.workspace_root)
+                    )
+                    if args.session
+                    else store.latest_session(str(sessions_config.workspace_root))
+                )
+                if summary is None:
+                    raise ValueError("no sessions found in this project")
+                tree = store.session_tree(summary.session_id)
+            except (KeyError, ValueError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 2
+            print(render_session_tree(tree, json_output=args.json))
+            return 0
+        if args.session:
+            print("Error: --session requires 'sessions tree'", file=sys.stderr)
+            return 2
         try:
             sessions = list_session_summaries(
                 store,

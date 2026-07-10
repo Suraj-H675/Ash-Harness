@@ -30,6 +30,12 @@ class SteeringRequest(BaseModel):
     input: str = Field(..., min_length=1, max_length=1_000_000)
 
 
+class ForkSessionRequest(BaseModel):
+    message_count: int | None = Field(default=None, ge=0)
+    branch_name: str = Field(default="", max_length=128)
+    branch_summary: str = Field(default="", max_length=12_000)
+
+
 class SlidingWindowLimiter:
     def __init__(self, requests_per_minute: int) -> None:
         if requests_per_minute < 1:
@@ -163,6 +169,33 @@ def create_app(
             ],
             "next_sequence": records[-1].sequence if records else after_sequence,
         }
+
+    @app.get("/v1/sessions/{session_id}/tree", dependencies=[Depends(authorize)])
+    async def session_tree(session_id: str) -> dict:
+        try:
+            tree = client.session_tree(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"sessions": [item.model_dump(mode="json") for item in tree]}
+
+    @app.post("/v1/sessions/{session_id}/fork", dependencies=[Depends(authorize)])
+    async def fork_session(
+        session_id: str, payload: ForkSessionRequest
+    ) -> dict[str, str]:
+        try:
+            forked_id = await client.fork(
+                session_id,
+                message_count=payload.message_count,
+                branch_name=payload.branch_name,
+                branch_summary=payload.branch_summary,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"session_id": forked_id}
 
     @app.post("/v1/sessions", dependencies=[Depends(authorize)])
     async def new_session() -> dict[str, str]:

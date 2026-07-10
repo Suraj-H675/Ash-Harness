@@ -127,7 +127,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/status` | Verified locally | Runtime model/mode/workspace/session plus persisted token, cache, and cost diagnostics |
 | `/model` and `/models` | Partial | Dynamic catalogs, custom/local models, capability display |
 | `/new`, `/resume`, `/sessions` | Verified locally | Durable session lifecycle and missing-ID errors |
-| `/rename`, `/fork` | Verified locally | Session organization and transcript branching |
+| `/rename`, `/fork`, `/tree` | Verified locally | Atomic complete-turn transcript forks, durable parent/root lineage, redacted branch metadata, stable parent-first navigation, and tree-aware retention across CLI/SDK/HTTP/JSON-RPC |
 | `/compact`, `/context` | Verified locally | Context compaction, budget inspection, and last-turn cache hit metrics |
 | `/cancel` | Verified locally | Cancel the active provider/tool turn while retaining already completed work |
 | `/clear`, `/rewind`, `/undo` | Verified locally | New-session clear, complete-turn transcript rewind with optional `--files`, and conflict-aware latest file undo |

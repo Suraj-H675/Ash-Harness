@@ -110,6 +110,32 @@ async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_sdk_forks_activates_and_exposes_session_tree(tmp_path) -> None:
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    async with await AshClient.create(config=config, provider=SDKProvider()) as client:
+        result = await client.prompt("hello")
+        forked_id = await client.fork(
+            result.session_id,
+            branch_name="alternate",
+            branch_summary="try another implementation",
+        )
+        tree = client.session_tree()
+        followup = await client.prompt("continue here")
+
+    assert forked_id != result.session_id
+    assert followup.session_id == forked_id
+    assert [node.session_id for node in tree] == [result.session_id, forked_id]
+    assert tree[0].children == (forked_id,)
+    assert tree[1].parent_session_id == result.session_id
+    assert tree[1].branch_name == "alternate"
+
+
+@pytest.mark.asyncio
 async def test_async_sdk_applies_trusted_project_extensions(
     tmp_path, monkeypatch
 ) -> None:

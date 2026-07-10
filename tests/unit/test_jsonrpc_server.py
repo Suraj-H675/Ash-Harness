@@ -1,8 +1,10 @@
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
 
 from ash.sdk import AshEvent, AshEventRecord, AshResult
+from core.session import SessionLineage
 from server.jsonrpc import JSONRPCServer
 
 
@@ -62,6 +64,25 @@ class FakeClient:
     async def close(self):
         return None
 
+    async def fork(
+        self,
+        session_id=None,
+        *,
+        message_count=None,
+        branch_name="",
+        branch_summary="",
+    ):
+        return "session-fork"
+
+    def session_tree(self, session_id=None):
+        return [
+            SessionLineage(
+                session_id=session_id or "session-1",
+                root_session_id=session_id or "session-1",
+                created_at=datetime.now(timezone.utc),
+            )
+        ]
+
 
 @pytest.mark.asyncio
 async def test_jsonrpc_initialize_advertises_versioned_contracts() -> None:
@@ -74,6 +95,7 @@ async def test_jsonrpc_initialize_advertises_versioned_contracts() -> None:
     assert response["result"]["protocol_version"] == 1
     assert response["result"]["capabilities"]["event_schema_version"] == 1
     assert response["result"]["capabilities"]["event_replay"] is True
+    assert response["result"]["capabilities"]["session_tree"] is True
 
 
 @pytest.mark.asyncio
@@ -91,6 +113,35 @@ async def test_jsonrpc_event_replay_returns_next_cursor() -> None:
 
     assert response["result"]["events"][0]["sequence"] == 9
     assert response["result"]["next_sequence"] == 9
+
+
+@pytest.mark.asyncio
+async def test_jsonrpc_forks_and_lists_session_tree() -> None:
+    server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
+
+    forked = await server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/fork",
+            "params": {
+                "session_id": "session-1",
+                "message_count": 2,
+                "branch_name": "alternate",
+            },
+        }
+    )
+    tree = await server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/tree",
+            "params": {"session_id": "session-1"},
+        }
+    )
+
+    assert forked["result"] == {"session_id": "session-fork"}
+    assert tree["result"][0]["session_id"] == "session-1"
 
 
 @pytest.mark.asyncio

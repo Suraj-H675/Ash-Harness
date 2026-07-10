@@ -328,7 +328,7 @@ not remove them.
 | Provider layer | Strong partial | Built-ins, embedders, declared model capabilities, and custom OpenAI-compatible endpoints resolve through thread-safe linked registries; auth/discovery and non-text modalities remain limited. |
 | Coding tools | Strong | No PTY terminal session, tool search, browser, web search, media, scheduler, or messaging. |
 | Context budgets | Strong partial | Provider totals now include reserved tool schemas; typed hashed fragments expose source/trust provenance; deterministic compaction preserves task/path/action/outcome state and redacts persisted summaries. Model-assisted compaction remains. |
-| Sessions/recovery | Strong linear | SQLite schema v8 now persists redacted, cursor-replayable canonical events across SDK/HTTP/JSON-RPC; within-session trees, labels, and branch summaries remain. |
+| Sessions/recovery | Strong partial | SQLite schema v9 persists redacted cursor-replayable events plus atomic parent-first session trees, bounded branch metadata, safe fork boundaries, tree-aware retention, and SDK/CLI/HTTP/JSON-RPC access. Per-turn config snapshots and richer branch navigation/summarization remain. |
 | Memory | Partial | FTS/vector/Markdown exist; lifecycle, provenance, expiry, poisoning controls, and user workflow are incomplete. |
 | Subagents | Strong local | Worktrees, roles, shared state, steering, and reports exist; no remote A2A or workflow DAG runtime. |
 | Agent Skills | Strong after `5dcbf51` | Standard parsing and progressive disclosure now exist; controlled script execution and compatibility diagnostics remain. |
@@ -405,7 +405,7 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 948 passed, 8 environment-dependent skips on Python
+- Current verification: 987 passed, 8 environment-dependent skips on Python
   3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
   race is covered by Ash's portable process completion helper.
 
@@ -424,8 +424,9 @@ scheduled task.
    fallback: typed provenance and strengthened deterministic fallback are
    complete; model-assisted compaction remains.
 5. Add session-tree/event-log foundations without breaking existing SQLite
-   sessions: schema v8 event storage and replay are complete; session trees
-   remain.
+   sessions: schema v9 event replay and durable atomic session-node trees are
+   complete, including migration backup, branch metadata, boundary validation,
+   tree-aware retention, and public runtime adapters.
 
 Exit criterion: all current behavior runs through versioned contracts, old
 sessions migrate, and provider/tool fakes cover the state machine.

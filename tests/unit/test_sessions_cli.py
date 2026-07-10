@@ -11,6 +11,7 @@ from ash.cli import main
 from cli.sessions import (
     list_session_summaries,
     render_session_summaries,
+    render_session_tree,
     select_startup_session,
 )
 from core.session import Message, SessionStore
@@ -95,6 +96,40 @@ def test_sessions_cli_filters_query_and_all_projects(
     ]
 
 
+def test_sessions_cli_renders_branch_tree_by_title(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db"
+    store = SessionStore(db_dir / "sessions.db")
+    root = store.create_session(str(tmp_path))
+    store.rename_session(root.session_id, "feature work")
+    child = store.fork_session(root.session_id, branch_name="alternative")
+    monkeypatch.chdir(tmp_path)
+
+    status = main(
+        [
+            "--db-directory",
+            str(db_dir),
+            "sessions",
+            "tree",
+            "--session",
+            "FEATURE WORK",
+            "--json",
+        ]
+    )
+
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [node["session_id"] for node in payload["sessions"]] == [
+        root.session_id,
+        child.session_id,
+    ]
+    assert payload["sessions"][1]["branch_name"] == "alternative"
+    assert "alternative" in render_session_tree(store.session_tree(root.session_id))
+
+
 def test_sessions_cli_rejects_invalid_limit(tmp_path: Path, capsys) -> None:
     db_dir = tmp_path / "db"
     SessionStore(db_dir / "sessions.db")
@@ -111,6 +146,25 @@ def test_sessions_cli_rejects_invalid_limit(tmp_path: Path, capsys) -> None:
 
     assert status == 2
     assert "limit must be positive" in capsys.readouterr().err
+
+
+def test_sessions_cli_rejects_tree_only_session_option(tmp_path: Path, capsys) -> None:
+    db_dir = tmp_path / "db"
+    SessionStore(db_dir / "sessions.db")
+
+    status = main(
+        [
+            "--db-directory",
+            str(db_dir),
+            "sessions",
+            "list",
+            "--session",
+            "unused",
+        ]
+    )
+
+    assert status == 2
+    assert "requires 'sessions tree'" in capsys.readouterr().err
 
 
 def test_startup_continue_selects_latest_project_session(tmp_path: Path) -> None:

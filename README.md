@@ -55,6 +55,8 @@ ash -c                          # continue this project's latest session
 ash -r                          # choose from searchable project sessions
 ash -r SESSION_ID_OR_NAME       # resume an exact durable session
 ash -c --fork-session           # branch latest history under a new ID
+ash sessions tree               # inspect the latest conversation tree
+ash sessions tree --session NAME --json
 ash --session SESSION_ID        # legacy explicit-ID compatibility
 ash mcp add local -- python server.py
 ash trust add .                  # allow project ASH.md, skills, hooks, MCP
@@ -78,9 +80,12 @@ ash extensions enable my-plugin
 ash extensions uninstall my-plugin --yes
 ```
 
-The authenticated server exposes synchronous turns at `/v1/turn` and live
-SSE turn events at `/v1/turn/stream`; non-loopback binding requires
-`--allow-remote`.
+The authenticated server exposes synchronous turns at `/v1/turn`, live SSE
+turn events at `/v1/turn/stream`, and durable branching at
+`/v1/sessions/{session_id}/fork` and `/v1/sessions/{session_id}/tree`;
+non-loopback binding requires `--allow-remote`. See
+[durable session branching](docs/SESSION_BRANCHING.md) for integrity and
+retention behavior.
 
 Inside an interactive terminal, `/help` opens a full-screen searchable command
 reference; redirected input and screen-reader mode keep the linear text output.

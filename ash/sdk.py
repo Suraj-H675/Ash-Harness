@@ -13,7 +13,7 @@ from config import AshConfig
 from core.events import EVENT_SCHEMA_VERSION, envelope_event, event_data
 from core.loop import AshLoop
 from core.redaction import redact_text
-from core.session import SessionSummary
+from core.session import SessionLineage, SessionSummary
 from providers.base import ProviderABC
 from ui.headless import HeadlessUI
 
@@ -291,6 +291,17 @@ class AshClient:
             project_path=str(self.loop.project_root), query=query, limit=limit
         )
 
+    def session_tree(self, session_id: str | None = None) -> list[SessionLineage]:
+        """Return the complete lineage tree containing a session."""
+
+        active_session = self.loop.current_session
+        resolved_session_id = session_id or (
+            active_session.session_id if active_session is not None else None
+        )
+        if resolved_session_id is None:
+            raise RuntimeError("no session is active; provide session_id")
+        return self.loop.session_store.session_tree(resolved_session_id)
+
     def events(
         self,
         session_id: str | None = None,
@@ -326,6 +337,33 @@ class AshClient:
     async def new_session(self) -> str:
         async with self._turn_lock:
             session = await self.loop.start_session()
+            self._started = True
+            return session.session_id
+
+    async def fork(
+        self,
+        session_id: str | None = None,
+        *,
+        message_count: int | None = None,
+        branch_name: str = "",
+        branch_summary: str = "",
+    ) -> str:
+        """Fork a session at a complete turn boundary and activate the child."""
+
+        async with self._turn_lock:
+            active_session = self.loop.current_session
+            resolved_session_id = session_id or (
+                active_session.session_id if active_session is not None else None
+            )
+            if resolved_session_id is None:
+                raise RuntimeError("no session is active; provide session_id")
+            forked = self.loop.session_store.fork_session(
+                resolved_session_id,
+                message_count=message_count,
+                branch_name=branch_name,
+                branch_summary=branch_summary,
+            )
+            session = await self.loop.start_session(forked.session_id)
             self._started = True
             return session.session_id
 

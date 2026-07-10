@@ -60,7 +60,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
     with get_db_connection(db_path) as conn:
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 8
+            == 9
         )
         audit_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(audit_logs)")
@@ -75,6 +75,15 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
         assert "estimated_completion_tokens" in session_columns
         assert "estimated_cost_usd" in session_columns
         assert "project_key" in session_columns
+        assert {
+            "parent_session_id",
+            "root_session_id",
+            "fork_message_count",
+            "branch_name",
+            "branch_summary",
+            "depth",
+        }.issubset(session_columns)
+        assert {"idx_sessions_parent", "idx_sessions_root_depth"}.issubset(index_names)
         assert "turn_id" in {
             row["name"] for row in conn.execute("PRAGMA table_info(messages)")
         }
@@ -117,7 +126,7 @@ def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     store = SessionStore(db_path)
 
     assert store.load_session("legacy").session_id == "legacy"
-    backups = list(tmp_path.glob("legacy.db.before-v8-migration.*.backup"))
+    backups = list(tmp_path.glob("legacy.db.before-v9-migration.*.backup"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as conn:
         assert conn.execute("SELECT session_id FROM sessions").fetchone()[0] == "legacy"
@@ -175,7 +184,154 @@ def test_v7_migration_preserves_checkpoints_and_adds_call_granularity(
         call_id="call-2",
     )
     assert len(migrated.file_checkpoints_for_turns(session.session_id, ["turn-1"])) == 2
-    assert len(list(tmp_path.glob("v6.db.before-v8-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v6.db.before-v9-migration.*.backup"))) == 1
+
+
+def test_session_forks_form_a_durable_redacted_tree(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "tree.db")
+    root = store.create_session(str(tmp_path), model="test/model")
+    now = datetime.now(timezone.utc)
+    store.save_message(
+        root.session_id,
+        Message(role="user", content="one", timestamp=now),
+        token_count=3,
+        prompt_tokens=2,
+        turn_id="turn-root",
+    )
+    store.save_message(
+        root.session_id,
+        Message(role="assistant", content="answer", timestamp=now),
+        token_count=4,
+        completion_tokens=3,
+        turn_id="turn-root",
+    )
+
+    child = store.fork_session(
+        root.session_id,
+        message_count=2,
+        branch_name="  alternate   design  ",
+        branch_summary="Use OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz",
+    )
+    grandchild = store.fork_session(child.session_id, branch_name="second pass")
+    sibling = store.fork_session(root.session_id, branch_name="different path")
+    tree = store.session_tree(grandchild.session_id)
+
+    assert [node.session_id for node in tree] == [
+        root.session_id,
+        child.session_id,
+        grandchild.session_id,
+        sibling.session_id,
+    ]
+    assert [node.depth for node in tree] == [0, 1, 2, 1]
+    assert child.parent_session_id == root.session_id
+    assert child.root_session_id == root.session_id
+    assert child.fork_message_count == 2
+    assert child.branch_name == "alternate design"
+    assert "sk-proj" not in child.branch_summary
+    assert "REDACTED" in child.branch_summary
+    assert tree[0].children == (child.session_id, sibling.session_id)
+    assert tree[1].children == (grandchild.session_id,)
+    assert tree[2].children == ()
+    assert [message.content for message in grandchild.messages] == ["one", "answer"]
+    with get_db_connection(store.db_path) as conn:
+        copied = conn.execute(
+            "SELECT token_count, prompt_tokens, completion_tokens, turn_id "
+            "FROM messages WHERE session_id = ? ORDER BY message_id",
+            (child.session_id,),
+        ).fetchall()
+    assert [row["token_count"] for row in copied] == [3, 4]
+    assert [row["prompt_tokens"] for row in copied] == [2, 0]
+    assert [row["completion_tokens"] for row in copied] == [0, 3]
+    assert [row["turn_id"] for row in copied] == [None, None]
+
+
+def test_session_fork_rejects_incomplete_tool_and_turn_boundaries(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "boundaries.db")
+    session = store.create_session(str(tmp_path))
+    now = datetime.now(timezone.utc)
+    store.save_message(
+        session.session_id,
+        Message(
+            role="assistant",
+            content="",
+            timestamp=now,
+            metadata={"tool_calls": [{"id": "call-1"}]},
+        ),
+    )
+    store.save_message(
+        session.session_id,
+        Message(role="tool", content="done", timestamp=now),
+    )
+
+    with pytest.raises(ValueError, match="assistant/tool-call pair"):
+        store.fork_session(session.session_id, message_count=1)
+
+    turn_session = store.create_session(str(tmp_path))
+    store.save_message(
+        turn_session.session_id,
+        Message(role="user", content="work", timestamp=now),
+        turn_id="turn-1",
+    )
+    store.save_message(
+        turn_session.session_id,
+        Message(role="assistant", content="done", timestamp=now),
+        turn_id="turn-1",
+    )
+    with pytest.raises(ValueError, match="splits an Ash turn"):
+        store.fork_session(turn_session.session_id, message_count=1)
+
+
+def test_session_cleanup_deletes_only_complete_inactive_trees(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "cleanup.db")
+    root = store.create_session(str(tmp_path))
+    child = store.fork_session(root.session_id, branch_name="active")
+    stale = "2020-01-01T00:00:00+00:00"
+    with get_db_connection(store.db_path) as conn, conn:
+        conn.execute(
+            "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+            (stale, root.session_id),
+        )
+
+    assert store.cleanup_sessions(30) == 0
+    assert len(store.session_tree(root.session_id)) == 2
+
+    with get_db_connection(store.db_path) as conn, conn:
+        conn.execute(
+            "UPDATE sessions SET updated_at = ? WHERE root_session_id = ?",
+            (stale, root.session_id),
+        )
+    assert store.cleanup_sessions(30) == 2
+    with pytest.raises(KeyError, match="Session not found"):
+        store.load_session(child.session_id)
+
+
+def test_session_fork_rolls_back_the_entire_child_on_copy_failure(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "rollback.db")
+    root = store.create_session(str(tmp_path))
+    store.save_message(
+        root.session_id,
+        Message(
+            role="user",
+            content="cannot copy",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    with get_db_connection(store.db_path) as conn, conn:
+        conn.execute(
+            f"CREATE TRIGGER reject_branch_copy BEFORE INSERT ON messages "
+            f"WHEN NEW.session_id != '{root.session_id}' "
+            "BEGIN SELECT RAISE(ABORT, 'forced copy failure'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced copy failure"):
+        store.fork_session(root.session_id, branch_name="must rollback")
+
+    assert [item.session_id for item in store.list_sessions()] == [root.session_id]
+    assert store.get_session_lineage(root.session_id).children == ()
 
 
 def test_runtime_event_log_is_ordered_idempotent_and_redacted(tmp_path: Path) -> None:

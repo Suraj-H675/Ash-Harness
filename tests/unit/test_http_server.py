@@ -1,7 +1,10 @@
+from datetime import datetime, timezone
+
 import httpx
 import pytest
 
 from ash.sdk import AshEvent, AshEventRecord, AshResult
+from core.session import SessionLineage
 from server.http import create_app
 
 
@@ -38,6 +41,26 @@ class FakeClient:
 
     async def resume(self, session_id):
         return session_id
+
+    async def fork(
+        self,
+        session_id=None,
+        *,
+        message_count=None,
+        branch_name="",
+        branch_summary="",
+    ):
+        return "session-fork"
+
+    def session_tree(self, session_id=None):
+        return [
+            SessionLineage(
+                session_id=session_id or "session-1",
+                root_session_id=session_id or "session-1",
+                created_at=datetime.now(timezone.utc),
+                children=("session-fork",),
+            )
+        ]
 
     async def close(self):
         return None
@@ -122,6 +145,30 @@ async def test_http_server_replays_events_with_cursor() -> None:
     assert response.json()["schema_version"] == 1
     assert response.json()["events"][0]["sequence"] == 5
     assert response.json()["next_sequence"] == 5
+
+
+@pytest.mark.asyncio
+async def test_http_server_forks_and_returns_session_tree() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        forked = await http.post(
+            "/v1/sessions/session-1/fork",
+            json={"message_count": 2, "branch_name": "alternate"},
+            headers=headers,
+        )
+        tree = await http.get("/v1/sessions/session-1/tree", headers=headers)
+
+    assert forked.status_code == 200
+    assert forked.json() == {"session_id": "session-fork"}
+    assert tree.status_code == 200
+    assert tree.json()["sessions"][0]["children"] == ["session-fork"]
 
 
 @pytest.mark.asyncio

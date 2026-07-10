@@ -6,7 +6,7 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from core.session import SessionStore, SessionSummary
+from core.session import SessionLineage, SessionStore, SessionSummary
 
 
 @dataclass(frozen=True)
@@ -116,4 +116,23 @@ def render_session_summaries(
             f"{session.session_id}  {title}  {session.message_count} messages  "
             f"{model}  {session.updated_at.isoformat()}  {session.project_path}"
         )
+    return "\n".join(lines)
+
+
+def render_session_tree(
+    tree: list[SessionLineage],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps(
+            {"sessions": [node.model_dump(mode="json") for node in tree]},
+            sort_keys=True,
+        )
+    lines: list[str] = []
+    for node in tree:
+        label = node.branch_name or (
+            "root" if node.parent_session_id is None else "branch"
+        )
+        lines.append(f"{'  ' * node.depth}{node.session_id}  {label}")
     return "\n".join(lines)

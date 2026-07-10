@@ -22,7 +22,7 @@ AuditAction = Literal[
     "tool_call", "command_run", "file_write", "safety_block", "user_approval"
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 
 
 class SessionStorageError(RuntimeError):
@@ -71,6 +71,12 @@ class Session(BaseModel):
     updated_at: datetime | None = None
     context_summary: str = ""
     model: str = ""
+    parent_session_id: str | None = None
+    root_session_id: str = ""
+    fork_message_count: int | None = None
+    branch_name: str = ""
+    branch_summary: str = ""
+    depth: int = 0
     messages: list[Message] = Field(default_factory=list)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
 
@@ -83,6 +89,23 @@ class SessionSummary(BaseModel):
     updated_at: datetime
     message_count: int = 0
     model: str = ""
+    parent_session_id: str | None = None
+    root_session_id: str = ""
+    fork_message_count: int | None = None
+    branch_name: str = ""
+    depth: int = 0
+
+
+class SessionLineage(BaseModel):
+    session_id: str
+    root_session_id: str
+    parent_session_id: str | None = None
+    fork_message_count: int | None = None
+    branch_name: str = ""
+    branch_summary: str = ""
+    depth: int = 0
+    created_at: datetime
+    children: tuple[str, ...] = ()
 
 
 class SessionUsage(BaseModel):
@@ -172,6 +195,47 @@ def _audit_record_from_row(row: sqlite3.Row) -> "AuditLogRecord":
         previous_hash=str(row["previous_hash"] or ""),
         sha256_hash=str(row["sha256_hash"] or ""),
     )
+
+
+def _lineage_from_row(
+    row: sqlite3.Row,
+    *,
+    children: tuple[str, ...] = (),
+) -> SessionLineage:
+    return SessionLineage(
+        session_id=str(row["session_id"]),
+        root_session_id=str(row["root_session_id"] or row["session_id"]),
+        parent_session_id=row["parent_session_id"],
+        fork_message_count=row["fork_message_count"],
+        branch_name=str(row["branch_name"] or ""),
+        branch_summary=str(row["branch_summary"] or ""),
+        depth=int(row["depth"] or 0),
+        created_at=_deserialize_datetime(str(row["created_at"])),
+        children=children,
+    )
+
+
+def _validate_fork_boundary(messages: list[Message], count: int) -> None:
+    if count <= 0 or count >= len(messages):
+        return
+    retained = messages[count - 1]
+    removed = messages[count]
+    if removed.role == "tool":
+        raise ValueError("message_count splits an assistant/tool-call pair")
+    if retained.role == "assistant" and retained.metadata.get("tool_calls"):
+        raise ValueError("message_count splits an assistant/tool-call pair")
+
+
+def _normalize_branch_metadata(name: str, summary: str) -> tuple[str, str]:
+    from core.redaction import redact_text
+
+    normalized_name = " ".join(name.split())
+    normalized_summary = summary.strip()
+    if len(normalized_name) > 128:
+        raise ValueError("branch_name cannot exceed 128 characters")
+    if len(normalized_summary) > 12_000:
+        raise ValueError("branch_summary cannot exceed 12000 characters")
+    return normalized_name, redact_text(normalized_summary)
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
@@ -282,6 +346,8 @@ class SessionStore:
                 self._migrate_v7(conn)
             if from_version < 8:
                 self._migrate_v8(conn)
+            if from_version < 9:
+                self._migrate_v9(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -481,6 +547,36 @@ class SessionStore:
             (8, _serialize_datetime(_utc_now())),
         )
 
+    def _migrate_v9(self, conn: sqlite3.Connection) -> None:
+        """Add durable conversation-branch lineage."""
+
+        for column, definition in (
+            ("parent_session_id", "TEXT"),
+            ("root_session_id", "TEXT DEFAULT ''"),
+            ("fork_message_count", "INTEGER"),
+            ("branch_name", "TEXT DEFAULT ''"),
+            ("branch_summary", "TEXT DEFAULT ''"),
+            ("depth", "INTEGER DEFAULT 0"),
+        ):
+            if not _column_exists(conn, "sessions", column):
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} {definition}")
+        conn.execute(
+            "UPDATE sessions SET root_session_id = session_id "
+            "WHERE root_session_id IS NULL OR root_session_id = ''"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_parent "
+            "ON sessions(parent_session_id, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_root_depth "
+            "ON sessions(root_session_id, depth, created_at)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (9, _serialize_datetime(_utc_now())),
+        )
+
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
     ) -> Path:
@@ -663,38 +759,103 @@ class SessionStore:
                 """
             )
 
-    def create_session(self, project_path: str, *, model: str = "") -> Session:
-        """Create a new session record in SQLite and return its model."""
-
+    def _create_session_record(
+        self,
+        conn: sqlite3.Connection,
+        project_path: str,
+        *,
+        model: str = "",
+        parent_session_id: str | None = None,
+        fork_message_count: int | None = None,
+        branch_name: str = "",
+        branch_summary: str = "",
+    ) -> Session:
         canonical_project_path = normalize_project_path(project_path)
+        session_id = str(uuid4())
+        normalized_branch_name, normalized_branch_summary = _normalize_branch_metadata(
+            branch_name, branch_summary
+        )
+        root_session_id = session_id
+        depth = 0
+        if parent_session_id is None and fork_message_count is not None:
+            raise ValueError("fork_message_count requires parent_session_id")
+        if parent_session_id is not None:
+            parent = conn.execute(
+                "SELECT project_key, root_session_id, depth, "
+                "(SELECT COUNT(*) FROM messages WHERE session_id = ?) "
+                "AS message_count FROM sessions WHERE session_id = ?",
+                (parent_session_id, parent_session_id),
+            ).fetchone()
+            if parent is None:
+                raise KeyError(f"Session not found: {parent_session_id}")
+            if parent["project_key"] != canonical_project_path:
+                raise ValueError("parent session belongs to a different project")
+            if fork_message_count is None or fork_message_count < 0:
+                raise ValueError("fork_message_count must be non-negative for a branch")
+            parent_message_count = int(parent["message_count"])
+            if fork_message_count > parent_message_count:
+                raise ValueError(
+                    f"fork_message_count cannot exceed parent message count "
+                    f"({parent_message_count})"
+                )
+            root_session_id = parent["root_session_id"] or parent_session_id
+            depth = int(parent["depth"] or 0) + 1
         session = Session(
-            session_id=str(uuid4()),
+            session_id=session_id,
             project_path=canonical_project_path,
             created_at=_utc_now(),
             updated_at=_utc_now(),
             model=model,
+            parent_session_id=parent_session_id,
+            root_session_id=root_session_id,
+            fork_message_count=fork_message_count,
+            branch_name=normalized_branch_name,
+            branch_summary=normalized_branch_summary,
+            depth=depth,
         )
         updated_at = session.updated_at or session.created_at
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
-            conn.execute(
-                """
-                INSERT INTO sessions (
-                    session_id, project_path, project_key, created_at, updated_at, model
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session.session_id,
-                    session.project_path,
-                    canonical_project_path,
-                    _serialize_datetime(session.created_at),
-                    _serialize_datetime(updated_at),
-                    session.model,
-                ),
+        conn.execute(
+            """
+            INSERT INTO sessions (
+                session_id, project_path, project_key, created_at, updated_at,
+                model, parent_session_id, root_session_id, fork_message_count,
+                branch_name, branch_summary, depth
             )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session.session_id,
+                session.project_path,
+                canonical_project_path,
+                _serialize_datetime(session.created_at),
+                _serialize_datetime(updated_at),
+                session.model,
+                session.parent_session_id,
+                session.root_session_id,
+                session.fork_message_count,
+                session.branch_name,
+                session.branch_summary,
+                session.depth,
+            ),
+        )
 
         return session
+
+    def create_session(
+        self,
+        project_path: str,
+        *,
+        model: str = "",
+    ) -> Session:
+        """Create a new session record in SQLite and return its model."""
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            return self._create_session_record(
+                conn,
+                project_path,
+                model=model,
+            )
 
     def load_session(self, session_id: str) -> Session:
         """Load a session with all messages and tool call records."""
@@ -703,7 +864,8 @@ class SessionStore:
             session_row = conn.execute(
                 """
                 SELECT session_id, project_path, created_at, title, updated_at,
-                       context_summary, model
+                       context_summary, model, parent_session_id, root_session_id,
+                       fork_message_count, branch_name, branch_summary, depth
                 FROM sessions
                 WHERE session_id = ?
                 """,
@@ -743,6 +905,12 @@ class SessionStore:
             ),
             context_summary=session_row["context_summary"] or "",
             model=session_row["model"] or "",
+            parent_session_id=session_row["parent_session_id"],
+            root_session_id=session_row["root_session_id"] or session_row["session_id"],
+            fork_message_count=session_row["fork_message_count"],
+            branch_name=session_row["branch_name"] or "",
+            branch_summary=session_row["branch_summary"] or "",
+            depth=int(session_row["depth"] or 0),
             messages=[
                 Message(
                     role=row["role"],
@@ -831,7 +999,9 @@ class SessionStore:
                 f"""
                 SELECT s.session_id, s.project_path, s.title, s.created_at,
                        COALESCE(s.updated_at, s.created_at) AS updated_at,
-                       COUNT(m.message_id) AS message_count, s.model
+                       COUNT(m.message_id) AS message_count, s.model,
+                       s.parent_session_id, s.root_session_id,
+                       s.fork_message_count, s.branch_name, s.depth
                 FROM sessions s
                 LEFT JOIN messages m ON m.session_id = s.session_id
                 {where}
@@ -850,6 +1020,11 @@ class SessionStore:
                 updated_at=_deserialize_datetime(row["updated_at"]),
                 message_count=int(row["message_count"]),
                 model=row["model"] or "",
+                parent_session_id=row["parent_session_id"],
+                root_session_id=row["root_session_id"] or row["session_id"],
+                fork_message_count=row["fork_message_count"],
+                branch_name=row["branch_name"] or "",
+                depth=int(row["depth"] or 0),
             )
             for row in rows
         ]
@@ -872,7 +1047,9 @@ class SessionStore:
                 """
                 SELECT s.session_id, s.project_path, s.title, s.created_at,
                        COALESCE(s.updated_at, s.created_at) AS updated_at,
-                       COUNT(m.message_id) AS message_count, s.model
+                       COUNT(m.message_id) AS message_count, s.model,
+                       s.parent_session_id, s.root_session_id,
+                       s.fork_message_count, s.branch_name, s.depth
                 FROM sessions s
                 LEFT JOIN messages m ON m.session_id = s.session_id
                 WHERE s.project_key = ?
@@ -919,6 +1096,11 @@ class SessionStore:
             updated_at=_deserialize_datetime(row["updated_at"]),
             message_count=int(row["message_count"]),
             model=row["model"] or "",
+            parent_session_id=row["parent_session_id"],
+            root_session_id=row["root_session_id"] or row["session_id"],
+            fork_message_count=row["fork_message_count"],
+            branch_name=row["branch_name"] or "",
+            depth=int(row["depth"] or 0),
         )
 
     def get_session_usage(self, session_id: str) -> SessionUsage:
@@ -949,16 +1131,19 @@ class SessionStore:
         if retention_days < 1:
             raise ValueError("retention_days must be positive")
         cutoff = _utc_now() - timedelta(days=retention_days)
-        clause = " AND project_key = ?" if project_path is not None else ""
+        clause = " WHERE project_key = ?" if project_path is not None else ""
         params: tuple[Any, ...] = (
-            (_serialize_datetime(cutoff), normalize_project_path(project_path))
+            (normalize_project_path(project_path), _serialize_datetime(cutoff))
             if project_path is not None
             else (_serialize_datetime(cutoff),)
         )
         with closing(get_db_connection(self.db_path)) as conn, conn:
             cursor = conn.execute(
-                "DELETE FROM sessions WHERE COALESCE(updated_at, created_at) < ?"
-                + clause,
+                "DELETE FROM sessions WHERE root_session_id IN ("
+                "SELECT root_session_id FROM sessions"
+                + clause
+                + " GROUP BY root_session_id "
+                "HAVING MAX(COALESCE(updated_at, created_at)) < ?) ",
                 params,
             )
             deleted = cursor.rowcount
@@ -1471,9 +1656,14 @@ class SessionStore:
         ]
 
     def fork_session(
-        self, session_id: str, *, message_count: int | None = None
+        self,
+        session_id: str,
+        *,
+        message_count: int | None = None,
+        branch_name: str = "",
+        branch_summary: str = "",
     ) -> Session:
-        """Create a new session containing a prefix of another transcript."""
+        """Create a durable child branch at a complete message boundary."""
 
         source = self.load_session(session_id)
         count = len(source.messages) if message_count is None else message_count
@@ -1481,14 +1671,135 @@ class SessionStore:
             raise ValueError(
                 f"message_count must be between 0 and {len(source.messages)}"
             )
-        fork = self.create_session(source.project_path, model=source.model)
-        title = f"{source.title or source.session_id[:8]} (fork)"
-        self.rename_session(fork.session_id, title)
-        for message in source.messages[:count]:
-            self.save_message(fork.session_id, message)
-        if source.context_summary and count == len(source.messages):
-            self.save_context_summary(fork.session_id, source.context_summary)
+        _validate_fork_boundary(source.messages, count)
+        if 0 < count < len(source.messages):
+            with closing(get_db_connection(self.db_path)) as conn:
+                rows = conn.execute(
+                    "SELECT turn_id FROM messages WHERE session_id = ? "
+                    "ORDER BY message_id",
+                    (source.session_id,),
+                ).fetchall()
+            retained_turn = rows[count - 1]["turn_id"]
+            removed_turn = rows[count]["turn_id"]
+            if retained_turn and retained_turn == removed_turn:
+                raise ValueError(
+                    "message_count splits an Ash turn; choose a turn boundary"
+                )
+        with closing(get_db_connection(self.db_path)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                current_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                        (source.session_id,),
+                    ).fetchone()[0]
+                )
+                if current_count != len(source.messages):
+                    raise RuntimeError(
+                        "session changed during fork; retry the operation"
+                    )
+                fork = self._create_session_record(
+                    conn,
+                    source.project_path,
+                    model=source.model,
+                    parent_session_id=source.session_id,
+                    fork_message_count=count,
+                    branch_name=branch_name,
+                    branch_summary=branch_summary,
+                )
+                title = fork.branch_name or (
+                    f"{source.title or source.session_id[:8]} (fork)"
+                )
+                conn.execute(
+                    "UPDATE sessions SET title = ?, context_summary = ? "
+                    "WHERE session_id = ?",
+                    (
+                        title,
+                        source.context_summary if count == len(source.messages) else "",
+                        fork.session_id,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO messages ("
+                    "session_id, role, content, timestamp, metadata_json, "
+                    "token_count, prompt_tokens, completion_tokens, turn_id) "
+                    "SELECT ?, role, content, timestamp, metadata_json, "
+                    "token_count, prompt_tokens, completion_tokens, NULL "
+                    "FROM messages WHERE session_id = ? "
+                    "ORDER BY message_id LIMIT ?",
+                    (fork.session_id, source.session_id, count),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         return self.load_session(fork.session_id)
+
+    def get_session_lineage(self, session_id: str) -> SessionLineage:
+        """Return one session node and its direct child identifiers."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT session_id, root_session_id, parent_session_id, "
+                "fork_message_count, branch_name, branch_summary, depth, created_at "
+                "FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+            children = conn.execute(
+                "SELECT session_id FROM sessions WHERE parent_session_id = ? "
+                "ORDER BY created_at, session_id",
+                (session_id,),
+            ).fetchall()
+        return _lineage_from_row(
+            row,
+            children=tuple(str(child["session_id"]) for child in children),
+        )
+
+    def session_tree(self, session_id: str) -> list[SessionLineage]:
+        """Return the complete conversation tree in stable parent-first order."""
+
+        node = self.get_session_lineage(session_id)
+        with closing(get_db_connection(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT session_id, root_session_id, parent_session_id, "
+                "fork_message_count, branch_name, branch_summary, depth, created_at "
+                "FROM sessions WHERE root_session_id = ? "
+                "ORDER BY depth, created_at, session_id",
+                (node.root_session_id,),
+            ).fetchall()
+            child_rows = conn.execute(
+                "SELECT parent_session_id, session_id FROM sessions "
+                "WHERE root_session_id = ? AND parent_session_id IS NOT NULL "
+                "ORDER BY created_at, session_id",
+                (node.root_session_id,),
+            ).fetchall()
+        children_by_parent: dict[str, list[str]] = {}
+        for child in child_rows:
+            children_by_parent.setdefault(str(child["parent_session_id"]), []).append(
+                str(child["session_id"])
+            )
+        rows_by_id = {str(row["session_id"]): row for row in rows}
+        ordered_ids: list[str] = []
+        pending = [node.root_session_id]
+        seen: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current in seen or current not in rows_by_id:
+                continue
+            seen.add(current)
+            ordered_ids.append(current)
+            pending.extend(reversed(children_by_parent.get(current, ())))
+        # Preserve visibility if a manually modified database contains an orphan.
+        ordered_ids.extend(session for session in rows_by_id if session not in seen)
+        return [
+            _lineage_from_row(
+                rows_by_id[current],
+                children=tuple(children_by_parent.get(current, ())),
+            )
+            for current in ordered_ids
+        ]
 
     def export_session(self, session_id: str, *, format: str = "jsonl") -> str:
         """Serialize a redacted session transcript for local export."""
@@ -1506,6 +1817,12 @@ class SessionStore:
                     "model": session.model,
                     "title": session.title,
                     "created_at": session.created_at.isoformat(),
+                    "parent_session_id": session.parent_session_id,
+                    "root_session_id": session.root_session_id,
+                    "fork_message_count": session.fork_message_count,
+                    "branch_name": session.branch_name,
+                    "branch_summary": redact_text(session.branch_summary),
+                    "depth": session.depth,
                 }
             ]
             records.extend(
