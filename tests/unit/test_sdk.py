@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -106,6 +107,98 @@ async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
         assert client.sessions()[0].session_id == result.session_id
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_applies_trusted_project_extensions(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    skill = workspace / ".ash" / "skills" / "project-review"
+    skill.mkdir(parents=True)
+    (workspace / "ASH.md").write_text(
+        "Always include PROJECT_RUNTIME_INSTRUCTION.", encoding="utf-8"
+    )
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: project-review\n"
+        "description: Review this project\n"
+        "---\n"
+        "Review the project carefully.\n",
+        encoding="utf-8",
+    )
+    hooks = workspace / ".ash" / "hooks.json"
+    hooks.write_text(
+        json.dumps(
+            {
+                "pre_tool": [
+                    {"matcher": "write_file", "command": ["true"]}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        allowed_web_domains=["docs.example.com"],
+    )
+
+    async with await AshClient.create(
+        config=config,
+        provider=SDKProvider(),
+        workspace_trusted=True,
+    ) as client:
+        listed = await client.loop.tools["list_skills"].run()
+        web_tool = client.loop.tools["web_fetch"]
+
+        assert "PROJECT_RUNTIME_INSTRUCTION" in client.loop.system_prompt
+        assert "project-review: Review this project" in listed.output
+        assert client.loop.hooks is not None
+        assert len(client.loop.hooks._pre_tool) == 1
+        assert web_tool._allowed_domains == ("docs.example.com",)
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_excludes_untrusted_project_extensions(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    skill = workspace / ".ash" / "skills" / "project-review"
+    skill.mkdir(parents=True)
+    (workspace / "ASH.md").write_text(
+        "Always include UNTRUSTED_PROJECT_INSTRUCTION.", encoding="utf-8"
+    )
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: project-review\n"
+        "description: Review this project\n"
+        "---\n"
+        "Review the project carefully.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+
+    async with await AshClient.create(
+        config=config,
+        provider=SDKProvider(),
+        workspace_trusted=False,
+    ) as client:
+        listed = await client.loop.tools["list_skills"].run()
+
+        assert "UNTRUSTED_PROJECT_INSTRUCTION" not in client.loop.system_prompt
+        assert "project-review" not in listed.output
 
 
 @pytest.mark.asyncio

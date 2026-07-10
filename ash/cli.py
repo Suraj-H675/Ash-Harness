@@ -119,148 +119,25 @@ def _build_tools(
     repo_map: Any | None = None,
     runtime_config: AshConfig | None = None,
 ) -> dict[str, Any]:
-    from tools.base import BaseTool
-    from tools.command import RunCommandTool
-    from tools.filesystem import (
-        ReadFileTool,
-        ReplaceFileContentTool,
-        ReplaceFileEditsTool,
-        WholeEditTool,
-        WriteFileTool,
-    )
-    from tools.git import AutoCommitTool, GitDiffTool, GitLogTool, GitStatusTool
-    from plugins.agents import AgentCatalog, AgentSource
-    from plugins.skills import (
-        ActivateSkillTool,
-        ListSkillsTool,
-        ReadSkillResourceTool,
-        SkillCatalog,
-        SkillSource,
-    )
-    from tools.ask_user import AskUserTool
-    from tools.patch import ApplyPatchTool
-    from tools.process import BackgroundProcessTool
-    from tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
-    from tools.web import WebFetchTool
-    from tools.symbols import FindReferencesTool, FindSymbolTool
+    from ash.runtime import build_tools
 
-    root = project_root if project_root is not None else safety_guard.project_root
-    skill_roots: list[Path | SkillSource] = [Path.home() / ".ash" / "skills"]
-    from plugins.lifecycle import load_extension_state
-    from plugins.registry import PluginCatalog
-
-    plugin_roots = [(Path.home() / ".ash" / "plugins", "user")]
-    if allow_project_extensions:
-        skill_roots.append(root / ".ash" / "skills")
-        plugin_roots.append((root / ".ash" / "plugins", "project"))
-    plugin_catalog = PluginCatalog(
-        tuple(plugin_roots),
-        disabled_plugins=load_extension_state().disabled_plugins,
+    return build_tools(
+        safety_guard,
+        project_root,
+        sandbox_manager=sandbox_manager,
+        allow_project_extensions=allow_project_extensions,
+        provider_factory=provider_factory,
+        agent_db_path=agent_db_path,
+        allowed_web_domains=allowed_web_domains,
+        repo_map=repo_map,
+        runtime_config=runtime_config,
     )
-    active_plugins = plugin_catalog.discover()
-    skill_roots.extend(
-        SkillSource(
-            paths=plugin.skill_paths(),
-            namespace=plugin.manifest.name,
-        )
-        for plugin in active_plugins
-    )
-    agent_sources: list[Path | AgentSource] = [Path.home() / ".ash" / "agents"]
-    if allow_project_extensions:
-        agent_sources.append(root / ".ash" / "agents")
-    agent_sources.extend(
-        AgentSource(
-            paths=plugin.agent_paths(),
-            namespace=plugin.manifest.name,
-        )
-        for plugin in active_plugins
-    )
-    agent_definitions = {
-        definition.name: definition
-        for definition in AgentCatalog(tuple(agent_sources)).discover()
-    }
-    catalog = SkillCatalog(tuple(skill_roots))
-    tools: list[BaseTool] = [
-        ReadFileTool(safety_guard),
-        WriteFileTool(safety_guard),
-        ReplaceFileContentTool(safety_guard),
-        ReplaceFileEditsTool(safety_guard),
-        WholeEditTool(safety_guard),
-        RunCommandTool(
-            safety_guard,
-            project_root=root,
-            sandbox_manager=sandbox_manager,
-            environment_allowlist=(
-                runtime_config.command_env_allowlist if runtime_config else ()
-            ),
-        ),
-        AutoCommitTool(
-            safety_guard,
-            environment_allowlist=(
-                runtime_config.command_env_allowlist if runtime_config else ()
-            ),
-        ),
-        GitStatusTool(safety_guard),
-        GitDiffTool(safety_guard),
-        GitLogTool(safety_guard),
-        ApplyPatchTool(safety_guard),
-        BackgroundProcessTool(
-            safety_guard,
-            sandbox_manager=sandbox_manager,
-            environment_allowlist=(
-                runtime_config.command_env_allowlist if runtime_config else ()
-            ),
-        ),
-        AskUserTool(safety_guard),
-        ListDirectoryTool(safety_guard),
-        GlobFilesTool(safety_guard),
-        SearchTextTool(safety_guard),
-        WebFetchTool(safety_guard, allowed_domains=allowed_web_domains),
-        ListSkillsTool(safety_guard, catalog),
-        ActivateSkillTool(safety_guard, catalog),
-        ReadSkillResourceTool(safety_guard, catalog),
-    ]
-    if provider_factory is not None and agent_db_path is not None:
-        from agents.shared_state import SharedState
-        from tools.agent import SpawnAgentTool
-
-        tools.append(
-            SpawnAgentTool(
-                safety_guard,
-                SharedState(agent_db_path),
-                provider_factory,
-                config=runtime_config,
-                custom_agents=agent_definitions,
-            )
-        )
-    if repo_map is not None:
-        tools.extend(
-            [
-                FindSymbolTool(safety_guard, repo_map),
-                FindReferencesTool(safety_guard, repo_map),
-            ]
-        )
-    return {tool.name: tool for tool in tools}
 
 
 def _build_repo_map(config: AshConfig):
-    """Build the optional repository map without making startup depend on indexing."""
+    from ash.runtime import build_repo_map
 
-    if not config.repo_map_enabled:
-        return None
-    from repo.repomap import RepoMap
-
-    try:
-        return RepoMap(
-            config.workspace_root,
-            max_files=config.repo_map_max_files,
-            exclude_patterns=config.repo_map_exclude_patterns,
-        )
-    except OSError as exc:
-        from ash_logging import get_logger
-
-        get_logger(__name__).warning("repository map unavailable: {}", exc)
-        return None
+    return build_repo_map(config)
 
 
 def _print_model_list(config: AshConfig) -> None:
@@ -2358,8 +2235,6 @@ def main(argv: list[str] | None = None) -> int:
             config = loaded_config
 
     from safety.grants import PermissionGrantError, load_permission_rules
-    from core.loop import AshLoop
-    from safety.guard import SafetyGuard
     from ui.terminal import TerminalUI
 
     try:
@@ -2401,11 +2276,6 @@ def main(argv: list[str] | None = None) -> int:
         if startup_selection.cancelled:
             return 0
         startup_session_id = startup_selection.session_id
-    safety_guard = SafetyGuard(
-        project_root=config.workspace_root,
-        blocklist_commands=config.command_blocklist,
-    )
-    provider = _build_provider(config)
     if args.prompt is not None:
         from ui.headless import HeadlessUI
 
@@ -2419,147 +2289,23 @@ def main(argv: list[str] | None = None) -> int:
             reduced_motion=config.reduced_motion,
             screen_reader_mode=config.screen_reader_mode,
         )
-    from sandbox import SandboxManager, auto_approve_safety_error
+    from ash.runtime import build_runtime
+    from sandbox import SandboxBackendUnavailable
 
-    sandbox_manager = SandboxManager(
-        workspace_root=config.workspace_root,
-        network=config.sandbox_network,
-        backend_preference=config.sandbox_backend,
-        docker_image=config.sandbox_docker_image,
-    )
-    safety_error = auto_approve_safety_error(
-        sandbox_manager,
-        allow_unsafe=config.allow_unsafe_auto_approve,
-    )
-    if config.safety_tier == "auto_approve" and safety_error:
-        print(
-            f"Error: {safety_error}",
-            file=sys.stderr,
-        )
-        return 2
-    repo_map = _build_repo_map(config)
-    tools = _build_tools(
-        safety_guard,
-        config.workspace_root,
-        sandbox_manager=sandbox_manager,
-        allow_project_extensions=workspace_trusted,
-        provider_factory=lambda: _build_provider(config),
-        agent_db_path=config.db_directory / "agents.db",
-        allowed_web_domains=config.allowed_web_domains,
-        repo_map=repo_map,
-        runtime_config=config,
-    )
-
-    from context.instructions import (
-        InstructionDiagnostic,
-        discover_instructions,
-        render_instructions,
-    )
-
-    instruction_diagnostics: list[InstructionDiagnostic] = []
-    discovered_instructions = discover_instructions(
-        config.workspace_root,
-        include_project=workspace_trusted,
-        diagnostics=instruction_diagnostics,
-    )
-    instruction_text = render_instructions(
-        discovered_instructions,
-        instruction_diagnostics,
-    )
-    from hooks.config import HookConfigSource, load_command_hooks
-
-    hook_paths: list[Path | HookConfigSource] = [Path.home() / ".ash" / "hooks.json"]
-    plugin_roots = [(Path.home() / ".ash" / "plugins", "user")]
-    if workspace_trusted:
-        hook_paths.append(config.workspace_root / ".ash" / "hooks.json")
-        plugin_roots.append((config.workspace_root / ".ash" / "plugins", "project"))
-    from plugins.lifecycle import load_extension_state
-    from plugins.registry import PluginCatalog
-
-    active_plugins = PluginCatalog(
-        tuple(plugin_roots),
-        disabled_plugins=load_extension_state().disabled_plugins,
-    ).discover()
-    hook_paths.extend(
-        HookConfigSource(
-            path=path,
-            cwd=plugin.root,
-            environment=(("ASH_PLUGIN_ROOT", str(plugin.root)),),
-        )
-        for plugin in active_plugins
-        for path in plugin.hook_paths()
-    )
     try:
-        hooks = load_command_hooks(hook_paths)
-    except (OSError, ValueError) as exc:
-        print(f"Error loading hooks: {exc}", file=sys.stderr)
-        return 2
-
-    from mcp.server import MCPConfigSource, load_mcp_server_sources
-
-    mcp_sources: list[MCPConfigSource] = []
-    if workspace_trusted:
-        mcp_sources.append(MCPConfigSource(config.workspace_root / ".mcp.json"))
-    mcp_sources.extend(
-        MCPConfigSource(
-            path=path,
-            namespace=plugin.manifest.name,
-            cwd=plugin.root,
-            environment=(("ASH_PLUGIN_ROOT", str(plugin.root)),),
+        runtime = build_runtime(
+            config,
+            ui,
+            session_store=session_store,
+            permission_rules=permission_rules,
+            workspace_trusted=workspace_trusted,
+            run_maintenance=False,
         )
-        for plugin in active_plugins
-        for path in plugin.mcp_paths()
-    )
-    try:
-        mcp_configs = load_mcp_server_sources(mcp_sources)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"Error loading MCP servers: {exc}", file=sys.stderr)
+    except (OSError, ValueError, SandboxBackendUnavailable) as exc:
+        print(f"Error initializing runtime: {exc}", file=sys.stderr)
         return 2
-
-    loop = AshLoop(
-        session_store=session_store,
-        provider=provider,
-        safety_guard=safety_guard,
-        ui=ui,
-        project_root=config.workspace_root,
-        repo_map=repo_map,
-        tools=tools,
-        hooks=hooks,
-        additional_instructions=instruction_text,
-        config=config,
-        max_steering_messages=config.steering_queue_limit,
-        safety_tier=config.safety_tier,
-        mcp_configs=mcp_configs,
-        enable_semantic_memory=config.memory_backend != "off",
-        memory_backend=config.memory_backend,
-        embedding_provider=config.embedding_provider,
-        openai_api_key=config.openai_api_key,
-        onnx_model_path=config.onnx_model_path,
-        chroma_persist_dir=config.chroma_persist_dir,
-    )
-    loop.permission_policy.set_persistent_rules(permission_rules)
-    from core.checkpoints import FileCheckpointMiddleware
-    from core.secret_middleware import SecretRedactionMiddleware
-
-    def checkpoint_context() -> tuple[str, str, str] | None:
-        if loop.current_session is None or loop.turn_context is None:
-            return None
-        return (
-            loop.current_session.session_id,
-            loop.turn_context.turn_id,
-            str(loop.turn_context.get("tool_call_id", "")),
-        )
-
-    loop.tool_middlewares.append(
-        FileCheckpointMiddleware(session_store, safety_guard, checkpoint_context)
-    )
-    loop.tool_middlewares.append(SecretRedactionMiddleware())
-
-    if config.enable_sprint_planning:
-        from core.planner import Planner
-
-        loop.planner = Planner(provider)
-        loop.enable_sprint_planning = True
+    loop = runtime.loop
+    sandbox_manager = runtime.sandbox_manager
 
     if args.prompt is not None:
         try:

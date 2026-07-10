@@ -8,18 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
-from ash.cli import _build_provider, _build_repo_map, _build_tools
+from ash.runtime import build_runtime
 from config import AshConfig
-from core.checkpoints import FileCheckpointMiddleware
 from core.loop import AshLoop
-from core.planner import Planner
 from core.redaction import redact_text
-from core.secret_middleware import SecretRedactionMiddleware
-from core.session import SessionStore, SessionSummary
+from core.session import SessionSummary
 from providers.base import ProviderABC
-from safety.grants import load_permission_rules
-from safety.guard import SafetyGuard
-from sandbox import SandboxBackendUnavailable, SandboxManager, auto_approve_safety_error
 from ui.headless import HeadlessUI
 
 
@@ -88,85 +82,23 @@ class AshClient:
         workspace: Path | None = None,
         provider: ProviderABC | None = None,
         approval_callback: ApprovalCallback | None = None,
+        workspace_trusted: bool | None = None,
     ) -> "AshClient":
+        """Create a client, honoring persisted workspace trust unless overridden."""
+
         runtime_config = config or AshConfig.load()
         if workspace is not None:
             runtime_config = runtime_config.model_copy(
                 update={"workspace_root": workspace.resolve()}
             )
-        sandbox = SandboxManager(
-            workspace_root=runtime_config.workspace_root,
-            network=runtime_config.sandbox_network,
-            backend_preference=runtime_config.sandbox_backend,
-            docker_image=runtime_config.sandbox_docker_image,
-        )
-        safety_error = auto_approve_safety_error(
-            sandbox,
-            allow_unsafe=runtime_config.allow_unsafe_auto_approve,
-        )
-        if runtime_config.safety_tier == "auto_approve" and safety_error:
-            raise SandboxBackendUnavailable(safety_error)
-        permission_rules = load_permission_rules(runtime_config.workspace_root)
-        store = SessionStore(runtime_config.db_directory / "sessions.db")
-        guard = SafetyGuard(
-            runtime_config.workspace_root,
-            blocklist_commands=runtime_config.command_blocklist,
-        )
-        active_provider = provider or _build_provider(runtime_config)
-        repo_map = _build_repo_map(runtime_config)
-        tools = _build_tools(
-            guard,
-            runtime_config.workspace_root,
-            sandbox_manager=sandbox,
-            allow_project_extensions=False,
-            provider_factory=lambda: _build_provider(runtime_config),
-            agent_db_path=runtime_config.db_directory / "agents.db",
-            repo_map=repo_map,
-            runtime_config=runtime_config,
-        )
-        loop = AshLoop(
-            session_store=store,
-            provider=active_provider,
-            safety_guard=guard,
+        runtime = build_runtime(
+            runtime_config,
             ui=HeadlessUI(output_format="text", stream=io.StringIO()),
-            project_root=runtime_config.workspace_root,
-            repo_map=repo_map,
-            tools=tools,
-            config=runtime_config,
-            max_steering_messages=runtime_config.steering_queue_limit,
-            planner=(
-                Planner(active_provider)
-                if runtime_config.enable_sprint_planning
-                else None
-            ),
-            enable_sprint_planning=runtime_config.enable_sprint_planning,
-            safety_tier=runtime_config.safety_tier,
-            on_tool_approval=approval_callback,
-            enable_semantic_memory=runtime_config.memory_backend != "off",
-            memory_backend=runtime_config.memory_backend,
-            embedding_provider=runtime_config.embedding_provider,
-            openai_api_key=runtime_config.openai_api_key,
-            onnx_model_path=runtime_config.onnx_model_path,
-            chroma_persist_dir=runtime_config.chroma_persist_dir,
+            provider=provider,
+            workspace_trusted=workspace_trusted,
+            approval_callback=approval_callback,
         )
-        loop.permission_policy.set_persistent_rules(permission_rules)
-
-        def checkpoint_context() -> tuple[str, str, str] | None:
-            if loop.current_session is None or loop.turn_context is None:
-                return None
-            return (
-                loop.current_session.session_id,
-                loop.turn_context.turn_id,
-                str(loop.turn_context.get("tool_call_id", "")),
-            )
-
-        loop.tool_middlewares.extend(
-            [
-                FileCheckpointMiddleware(store, guard, checkpoint_context),
-                SecretRedactionMiddleware(),
-            ]
-        )
-        client = cls(loop, runtime_config)
+        client = cls(runtime.loop, runtime_config)
         await client.start()
         return client
 
