@@ -226,6 +226,10 @@ async def test_async_sdk_streams_real_turn_events(tmp_path) -> None:
         events = [event async for event in client.stream_prompt("hello")]
 
     assert events[0].type == "turn.started"
+    assert all(event.schema_version == 1 for event in events)
+    assert len({event.event_id for event in events}) == len(events)
+    assert all(event.timestamp for event in events)
+    assert all(event.source == {"type": "runtime", "id": "ash"} for event in events)
     assert any(event.type == "context.usage" for event in events)
     assert (
         "".join(
@@ -234,6 +238,7 @@ async def test_async_sdk_streams_real_turn_events(tmp_path) -> None:
         == "sdk response"
     )
     assert events[-1].type == "turn.completed"
+    assert events[-1].session_id == events[-1].data["session_id"]
     assert events[-1].data["response"] == "sdk response"
     assert events[-1].data["usage"]["cache_read_tokens"] == 80
 

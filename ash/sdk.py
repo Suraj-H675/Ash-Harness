@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from ash.runtime import build_runtime
 from config import AshConfig
+from core.events import EVENT_SCHEMA_VERSION, envelope_event, event_data
 from core.loop import AshLoop
 from core.redaction import redact_text
 from core.session import SessionSummary
@@ -63,6 +64,74 @@ class AshResult:
 class AshEvent:
     type: str
     data: dict[str, Any]
+    schema_version: int = EVENT_SCHEMA_VERSION
+    event_id: str = ""
+    timestamp: str = ""
+    source: dict[str, str] = field(default_factory=dict)
+    session_id: str | None = None
+    turn_id: str | None = None
+    operation_id: str | None = None
+    parent_event_id: str | None = None
+
+    def __post_init__(self) -> None:
+        metadata = {
+            "schema_version": self.schema_version,
+            **({"event_id": self.event_id} if self.event_id else {}),
+            **({"timestamp": self.timestamp} if self.timestamp else {}),
+            **({"source": self.source} if self.source else {}),
+            **({"session_id": self.session_id} if self.session_id else {}),
+            **({"turn_id": self.turn_id} if self.turn_id else {}),
+            **({"operation_id": self.operation_id} if self.operation_id else {}),
+            **(
+                {"parent_event_id": self.parent_event_id}
+                if self.parent_event_id
+                else {}
+            ),
+        }
+        payload = envelope_event({"type": self.type, **self.data, **metadata})
+        for name in (
+            "schema_version",
+            "event_id",
+            "timestamp",
+            "source",
+            "session_id",
+            "turn_id",
+            "operation_id",
+            "parent_event_id",
+        ):
+            object.__setattr__(self, name, payload[name])
+
+    @classmethod
+    def from_wire(cls, payload: dict[str, Any]) -> "AshEvent":
+        event = envelope_event(payload)
+        return cls(
+            type=event["type"],
+            data=event_data(event),
+            schema_version=event["schema_version"],
+            event_id=event["event_id"],
+            timestamp=event["timestamp"],
+            source=event["source"],
+            session_id=event["session_id"],
+            turn_id=event["turn_id"],
+            operation_id=event["operation_id"],
+            parent_event_id=event["parent_event_id"],
+        )
+
+    def to_wire(self, *, include_type: bool = True) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "event_id": self.event_id,
+            "timestamp": self.timestamp,
+            "source": dict(self.source),
+            "session_id": self.session_id,
+            "turn_id": self.turn_id,
+            "operation_id": self.operation_id,
+            "parent_event_id": self.parent_event_id,
+            **self.data,
+        }
+        if include_type:
+            payload["type"] = self.type
+        return payload
 
 
 class AshClient:
@@ -160,8 +229,7 @@ class AshClient:
             queue: asyncio.Queue[AshEvent] = asyncio.Queue()
 
             def receive(payload: dict[str, Any]) -> None:
-                event_type = str(payload.pop("type"))
-                queue.put_nowait(AshEvent(event_type, payload))
+                queue.put_nowait(AshEvent.from_wire(payload))
 
             unsubscribe = ui.subscribe(receive)
 

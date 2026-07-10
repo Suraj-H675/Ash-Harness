@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ash.sdk import AshClient
+from core.events import EVENT_SCHEMA_VERSION
 
 
 class TurnRequest(BaseModel):
@@ -91,8 +92,12 @@ def create_app(
             )
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok", "service": "ash"}
+    async def health() -> dict[str, str | int]:
+        return {
+            "status": "ok",
+            "service": "ash",
+            "event_schema_version": EVENT_SCHEMA_VERSION,
+        }
 
     @app.post("/v1/turn", dependencies=[Depends(authorize)])
     async def run_turn(payload: TurnRequest) -> dict:
@@ -109,7 +114,7 @@ def create_app(
     async def stream_turn(payload: TurnRequest) -> StreamingResponse:
         async def events() -> AsyncIterator[str]:
             async for event in client.stream_prompt(payload.input):
-                yield _sse(event.type, event.data)
+                yield _sse(event.type, event.to_wire(include_type=False))
 
         return StreamingResponse(events(), media_type="text/event-stream")
 

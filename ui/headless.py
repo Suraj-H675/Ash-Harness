@@ -9,6 +9,8 @@ from typing import Any, Callable, TextIO
 
 from rich.console import Console
 
+from core.events import envelope_event
+
 
 class HeadlessUI:
     """Consume loop UI events without terminal control sequences."""
@@ -25,6 +27,9 @@ class HeadlessUI:
         self.stream = stream or sys.stdout
         self.console = Console(file=sys.stderr, force_terminal=False, no_color=True)
         self._listeners: set[Callable[[dict[str, Any]], None]] = set()
+        self._event_enricher: Callable[[dict[str, Any]], dict[str, Any]] = (
+            envelope_event
+        )
 
     @property
     def has_approval_callback(self) -> bool:
@@ -37,47 +42,52 @@ class HeadlessUI:
         return None
 
     def print_token(self, text: str) -> None:
-        if text:
-            self._notify({"type": "assistant.delta", "text": text})
-        if self.output_format == "stream-json" and text:
-            self._emit({"type": "assistant.delta", "text": text})
+        if not text:
+            return
+        event = self._prepare({"type": "assistant.delta", "text": text})
+        self._notify(event)
+        if self.output_format == "stream-json":
+            self._emit(event)
 
     def print_thought(self, text: str) -> None:
-        if text:
-            self._notify({"type": "reasoning.delta", "text": text})
-        if self.output_format == "stream-json" and text:
-            self._emit({"type": "reasoning.delta", "text": text})
+        if not text:
+            return
+        event = self._prepare({"type": "reasoning.delta", "text": text})
+        self._notify(event)
+        if self.output_format == "stream-json":
+            self._emit(event)
 
     def update_token_count(self, current: int, maximum: int | None = None) -> None:
-        self._notify({"type": "context.usage", "current": current, "maximum": maximum})
+        event = self._prepare(
+            {"type": "context.usage", "current": current, "maximum": maximum}
+        )
+        self._notify(event)
         if self.output_format == "stream-json":
-            self._emit(
-                {"type": "context.usage", "current": current, "maximum": maximum}
-            )
+            self._emit(event)
 
     def request_tool_approval(self, tool_name: str, arguments: dict[str, Any]) -> bool:
         return False
 
     def show_plan(self, execution: Any) -> bool:
         if self.output_format == "stream-json":
-            self._emit(
+            self._emit(self._prepare(
                 {
                     "type": "plan.denied",
                     "plan_id": execution.contract.contract_id,
                     "reason": "headless mode cannot approve a generated plan",
                 }
-            )
+            ))
         return False
 
     def emit_result(self, payload: dict[str, Any]) -> None:
         if self.output_format in {"json", "stream-json"}:
-            event = {"type": "turn.completed", **payload}
+            event = self._prepare({"type": "turn.completed", **payload})
             self._emit(event)
         else:
             print(payload["response"], file=self.stream, flush=True)
 
     def emit_error(self, payload: dict[str, Any]) -> None:
-        event = {"type": "error", "error": payload}
+        event = self._prepare({"type": "error", "error": payload})
         self._notify(event)
         if self.output_format in {"json", "stream-json"}:
             self._emit(event)
@@ -90,9 +100,20 @@ class HeadlessUI:
                 print(f"Remedy: {remedy}", file=sys.stderr)
 
     def emit_event(self, payload: dict[str, Any]) -> None:
-        self._notify(payload)
+        event = self._prepare(payload)
+        self._notify(event)
         if self.output_format == "stream-json":
-            self._emit(payload)
+            self._emit(event)
+
+    def set_event_enricher(
+        self, enricher: Callable[[dict[str, Any]], dict[str, Any]]
+    ) -> None:
+        """Bind runtime context enrichment for UI-originated stream events."""
+
+        self._event_enricher = enricher
+
+    def _prepare(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._event_enricher(dict(payload))
 
     def _emit(self, payload: dict[str, Any]) -> None:
         print(

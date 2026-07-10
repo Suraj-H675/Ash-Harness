@@ -519,7 +519,25 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
     assert loop._last_turn_cost_usd == pytest.approx(0.000152)
     assert loop.turn_context is not None
     assert loop.turn_context.get("usage")["cache_hit_rate"] == 0.6
-    assert next(event for event in ui.events if event["type"] == "turn.usage") == {
+    usage_event = next(event for event in ui.events if event["type"] == "turn.usage")
+    assert usage_event["schema_version"] == 1
+    assert usage_event["session_id"] == session.session_id
+    assert usage_event["turn_id"] == loop.turn_context.turn_id
+    assert {
+        key: value
+        for key, value in usage_event.items()
+        if key
+        not in {
+            "schema_version",
+            "event_id",
+            "timestamp",
+            "source",
+            "session_id",
+            "turn_id",
+            "operation_id",
+            "parent_event_id",
+        }
+    } == {
         "type": "turn.usage",
         "prompt_tokens": 100,
         "completion_tokens": 5,
@@ -660,7 +678,24 @@ async def test_tool_output_events_inherit_call_context(tmp_path):
     )
 
     output_event = next(event for event in ui.events if event["type"] == "tool.output")
-    assert output_event == {
+    assert output_event["schema_version"] == 1
+    assert output_event["session_id"] == session.session_id
+    assert output_event["operation_id"] == "call-stream-1"
+    assert {
+        key: value
+        for key, value in output_event.items()
+        if key
+        not in {
+            "schema_version",
+            "event_id",
+            "timestamp",
+            "source",
+            "session_id",
+            "turn_id",
+            "operation_id",
+            "parent_event_id",
+        }
+    } == {
         "call_id": "call-stream-1",
         "tool": "event_tool",
         "arguments": {},

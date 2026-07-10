@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, ContextManager, Prot
 from uuid import uuid4
 
 from core.recovery import CircuitBreaker, CircuitBreakerError
+from core.events import EventContext, envelope_event
 from core.session import (
     AuditAction,
     AuditResult,
@@ -312,8 +313,11 @@ class AshLoop:
         self.ui = ui
         self.project_root = project_root
         self.tools: dict[str, BaseTool] = dict(tools or {})
+        set_event_enricher = getattr(self.ui, "set_event_enricher", None)
+        if callable(set_event_enricher):
+            set_event_enricher(self._envelope_event)
         for tool in self.tools.values():
-            tool.set_event_sink(self.ui.emit_event)
+            tool.set_event_sink(self._emit_event)
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self.system_prompt = system_prompt or _default_system_prompt(project_root)
         if additional_instructions:
@@ -433,6 +437,26 @@ class AshLoop:
         )
         await self.provider.aclose()
 
+    def _envelope_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session = getattr(self, "current_session", None)
+        turn_context = getattr(self, "turn_context", None)
+        call_id = payload.get("call_id")
+        if call_id is None and turn_context is not None:
+            call_id = turn_context.get("tool_call_id")
+        return envelope_event(
+            payload,
+            context=EventContext(
+                session_id=session.session_id if session is not None else None,
+                turn_id=(
+                    turn_context.turn_id if turn_context is not None else None
+                ),
+                operation_id=str(call_id) if call_id else None,
+            ),
+        )
+
+    def _emit_event(self, payload: dict[str, Any]) -> None:
+        self.ui.emit_event(self._envelope_event(payload))
+
     # --- session lifecycle ------------------------------------------------
 
     async def start_session(self, session_id: str | None = None) -> Session:
@@ -452,7 +476,7 @@ class AshLoop:
             )
             self.recovered_turns = self.recovery_summary.interrupted_turns
             if self.recovered_turns:
-                self.ui.emit_event(
+                self._emit_event(
                     {
                         "type": "session.recovery",
                         **self.recovery_summary.to_dict(),
@@ -503,7 +527,7 @@ class AshLoop:
         self._mcp_runtime = MCPRuntime(self._mcp_configs, self.safety_guard)
         tools = await self._mcp_runtime.start()
         for tool in tools.values():
-            tool.set_event_sink(self.ui.emit_event)
+            tool.set_event_sink(self._emit_event)
         self.tools.update(tools)
         self._mcp_tool_names = set(tools)
         for name, error in self._mcp_runtime.errors.items():
@@ -571,7 +595,7 @@ class AshLoop:
                     self.session_store.interrupt_turn(current_turn_id)
             discarded = len(self._steering_messages)
             self._steering_messages.clear()
-            self.ui.emit_event(
+            self._emit_event(
                 {
                     "type": "turn.cancelled",
                     "discarded_steering": discarded,
@@ -852,7 +876,7 @@ class AshLoop:
         self.turn_context.set("usage", usage_payload)
         self.session_store.save_turn_usage(self.turn_context.turn_id, usage_payload)
         if prompt > 0 or completion > 0:
-            self.ui.emit_event({"type": "turn.usage", **usage_payload})
+            self._emit_event({"type": "turn.usage", **usage_payload})
             self.session_store.save_session_token_stats(
                 session.session_id,
                 prompt,
@@ -900,7 +924,7 @@ class AshLoop:
                 f"steering queue is full ({self.max_steering_messages} messages)"
             )
         self._steering_messages.append(normalized)
-        self.ui.emit_event(
+        self._emit_event(
             {
                 "type": "turn.steering.queued",
                 "pending": len(self._steering_messages),
@@ -926,7 +950,7 @@ class AshLoop:
             session.messages.append(message)
             applied += 1
         if applied:
-            self.ui.emit_event(
+            self._emit_event(
                 {
                     "type": "turn.steering.applied",
                     "count": applied,
@@ -1088,7 +1112,7 @@ class AshLoop:
                                 snapshot = self.provider_circuit_breaker.snapshot(
                                     self._provider_circuit_key
                                 )
-                                self.ui.emit_event(
+                                self._emit_event(
                                     {
                                         "type": "provider.circuit_opened",
                                         "provider": self._provider_circuit_key,
@@ -1108,7 +1132,7 @@ class AshLoop:
                             max_delay=retry_max_delay,
                         )
                         safe_reason = redact_text(failure.message)
-                        self.ui.emit_event(
+                        self._emit_event(
                             {
                                 "type": "provider.retrying",
                                 "attempt": attempt + 1,
@@ -1251,7 +1275,7 @@ class AshLoop:
                 "tool": tool_name,
                 "arguments": record.arguments,
             }
-            self.ui.emit_event({"type": "tool.requested", **event_base})
+            self._emit_event({"type": "tool.requested", **event_base})
 
             decision = self.permission_policy.evaluate(tool_name, arguments)
             if decision.action == PolicyAction.DENY:
@@ -1312,7 +1336,7 @@ class AshLoop:
                         else "DENIED"
                     ),
                 )
-                self.ui.emit_event(
+                self._emit_event(
                     {
                         "type": "tool.denied",
                         **event_base,
@@ -1355,7 +1379,7 @@ class AshLoop:
                     result="FAILURE",
                 )
                 self.circuit_breaker.record_failure(tool_name)
-                self.ui.emit_event(
+                self._emit_event(
                     {"type": "tool.error", **event_base, "error": record.error}
                 )
                 results.append(
@@ -1367,7 +1391,7 @@ class AshLoop:
                 )
                 continue
 
-            self.ui.emit_event({"type": "tool.started", **event_base})
+            self._emit_event({"type": "tool.started", **event_base})
             if self.turn_context is not None:
                 self.turn_context.set("tool_call_id", record.call_id)
             try:
@@ -1422,7 +1446,7 @@ class AshLoop:
                     result="FAILURE",
                 )
                 self.circuit_breaker.record_failure(tool_name)
-                self.ui.emit_event(
+                self._emit_event(
                     {
                         "type": "tool.error",
                         **event_base,
@@ -1460,7 +1484,7 @@ class AshLoop:
                 },
                 result="SUCCESS" if tool_result.success else "FAILURE",
             )
-            self.ui.emit_event(
+            self._emit_event(
                 {
                     "type": "tool.completed",
                     **event_base,

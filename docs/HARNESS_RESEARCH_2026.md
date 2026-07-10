@@ -324,8 +324,8 @@ not remove them.
 
 | Domain | State on 2026-07-10 | Key gap |
 |---|---|---|
-| Agent loop and streaming | Partial | Large monolithic loop; legacy XML fallback is mixed into canonical behavior; no public event schema version. |
-| Provider layer | Partial | Five built-ins and generic OpenAI endpoint; CLI branching, limited auth/discovery/modalities. |
+| Agent loop and streaming | Partial | Public event schema v1 now spans runtime, tools, SDK, stream JSON, SSE, and JSON-RPC discovery; the loop remains monolithic and legacy XML fallback is mixed into canonical behavior. |
+| Provider layer | Partial | Built-ins and custom OpenAI-compatible endpoints now resolve through a dynamic registry; auth/discovery/modalities remain limited. |
 | Coding tools | Strong | No PTY terminal session, tool search, browser, web search, media, scheduler, or messaging. |
 | Context budgets | Partial | Deterministic extractive compaction can lose task/file state; context fragments lack provenance types. |
 | Sessions/recovery | Strong linear | No within-session tree, labels, branch summary, or full event replay contract. |
@@ -334,9 +334,9 @@ not remove them.
 | Agent Skills | Strong after `5dcbf51` | Standard parsing and progressive disclosure now exist; controlled script execution and compatibility diagnostics remain. |
 | Plugins | Partial | Declarative skills/commands/agents/hooks/MCP only; no versioned executable SDK or providers/channels/services. |
 | Hooks | Partial | Pre-tool, post-tool, session-start only; no full lifecycle, ordering, mutation contract, or isolation. |
-| MCP | Partial | 2025-06-18 tools/resources/prompts; server requests, current auth, roots/sampling/elicitation/progress/cancellation/tasks absent. |
+| MCP | Strong partial | 2025-11-25 negotiation, tools/resources/templates/prompts, roots, sampling, elicitation, progress, logging, cancellation, pagination, and server requests exist; OAuth and experimental tasks remain. |
 | Safety/sandbox | Strong | Needs remote/plugin identity capabilities, network proxy policy, stronger resource limits, and platform CI. |
-| CLI/TUI/SDK/API | Strong local | No ACP adapter, WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, or channel adapters. |
+| CLI/TUI/SDK/API | Strong local | CLI, SDK, and HTTP server now share one trusted runtime assembler and versioned events; no ACP adapter, WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, or channel adapters. |
 | LSP | Absent in practice | `lsp/diagnostics.py` is 26 lines and is not a managed language-server client. |
 | Browser/media | Absent | Must be optional capability packs with explicit profiles, costs, and policy. |
 | Automation/channels | Absent | No durable scheduler, event bus, gateway routing, pairing, or delivery semantics. |
@@ -405,15 +405,18 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 932 passed, 3 environment-dependent skips on Python
-  3.11 and 3.12; Ruff, mypy, wheel, and sdist clean.
+- Current verification: 948 passed, 8 environment-dependent skips on Python
+  3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
+  race is covered by Ash's portable process completion helper.
 
 ### Phase 1: runtime contracts
 
 1. Extract canonical events/content/capabilities from the loop and providers.
-2. Add schema versioning and golden compatibility tests for SDK/JSON-RPC/HTTP.
+2. Add schema versioning and golden compatibility tests for SDK/JSON-RPC/HTTP:
+   event schema v1 is complete; result/request schemas remain.
 3. Introduce provider and capability registries; move CLI provider branching
-   behind them.
+   behind them: provider registry and shared runtime assembly are complete;
+   capability registry remains.
 4. Add typed context fragments and a model-assisted compactor with deterministic
    fallback.
 5. Add session-tree/event-log foundations without breaking existing SQLite

@@ -55,7 +55,9 @@ async def test_http_server_requires_auth_and_runs_turn() -> None:
     async with httpx.AsyncClient(
         transport=transport, base_url="http://testserver"
     ) as http:
-        assert (await http.get("/health")).status_code == 200
+        health = await http.get("/health")
+        assert health.status_code == 200
+        assert health.json()["event_schema_version"] == 1
         assert (await http.post("/v1/turn", json={"input": "hello"})).status_code == 401
         response = await http.post(
             "/v1/turn",
@@ -101,7 +103,8 @@ async def test_http_server_forwards_live_sse_events() -> None:
         assert response.status_code == 200
         assert "event: turn.started" in body
         assert body.count("event: assistant.delta") == 2
-        assert 'data: {"text":"he"}' in body
+        assert '"schema_version":1' in body
+        assert '"text":"he"' in body
         assert "event: turn.completed" in body
 
 

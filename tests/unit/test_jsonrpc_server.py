@@ -49,6 +49,18 @@ class FakeClient:
 
 
 @pytest.mark.asyncio
+async def test_jsonrpc_initialize_advertises_versioned_contracts() -> None:
+    server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
+
+    response = await server.handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize"}
+    )
+
+    assert response["result"]["protocol_version"] == 1
+    assert response["result"]["capabilities"]["event_schema_version"] == 1
+
+
+@pytest.mark.asyncio
 async def test_jsonrpc_turn_validation_and_unknown_method() -> None:
     server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
     response = await server.handle_request(
