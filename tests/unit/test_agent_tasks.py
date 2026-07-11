@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from agents.shared_state import SharedState
-from agents.tasks import AgentTaskBudgetExceeded, AgentTaskError
+from agents.tasks import AgentTaskBudgetExceeded, AgentTaskCreate, AgentTaskError
 
 
 @pytest.fixture
@@ -32,6 +32,66 @@ def test_task_dependencies_claim_in_ready_order(state: SharedState) -> None:
     next_lease = state.tasks.claim_task("worker-b")
     assert next_lease is not None
     assert next_lease.task.task_id == second.task_id
+
+
+def test_task_graph_is_created_atomically_in_any_definition_order(
+    state: SharedState,
+) -> None:
+    tasks = state.tasks.create_tasks(
+        [
+            AgentTaskCreate(
+                "review",
+                task_id="review",
+                parent_task_id="implement",
+                dependencies=("implement",),
+            ),
+            AgentTaskCreate("implement", task_id="implement"),
+        ]
+    )
+
+    assert [task.task_id for task in tasks] == ["review", "implement"]
+    assert state.tasks.get_task("review").parent_task_id == "implement"
+    lease = state.tasks.claim_task("worker")
+    assert lease is not None
+    assert lease.task.task_id == "implement"
+
+
+def test_task_graph_rejects_cycles_and_rolls_back_whole_batch(
+    state: SharedState,
+) -> None:
+    with pytest.raises(ValueError, match="dependency cycle"):
+        state.tasks.create_tasks(
+            [
+                AgentTaskCreate("one", task_id="one", dependencies=("two",)),
+                AgentTaskCreate("two", task_id="two", dependencies=("one",)),
+            ]
+        )
+    assert state.tasks.list_tasks() == []
+
+    with pytest.raises(AgentTaskError, match="unknown dependency"):
+        state.tasks.create_tasks(
+            [
+                AgentTaskCreate("valid", task_id="valid"),
+                AgentTaskCreate(
+                    "invalid", task_id="invalid", dependencies=("missing",)
+                ),
+            ]
+        )
+    assert state.tasks.list_tasks() == []
+
+
+def test_task_graph_collision_does_not_partially_insert(state: SharedState) -> None:
+    state.tasks.create_task("existing", task_id="existing")
+
+    with pytest.raises(AgentTaskError, match="already exists"):
+        state.tasks.create_tasks(
+            [
+                AgentTaskCreate("new", task_id="new"),
+                AgentTaskCreate("collision", task_id="existing"),
+            ]
+        )
+
+    assert {task.task_id for task in state.tasks.list_tasks()} == {"existing"}
 
 
 def test_atomic_capacity_limit_is_shared_across_connections(tmp_path: Path) -> None:
@@ -114,6 +174,45 @@ def test_cancellation_cascades_to_dependent_tasks(state: SharedState) -> None:
     first_events = state.tasks.list_events(event_type="agent.task.cancelled")
     state.tasks.cancel_task("parent", reason="repeated cancellation")
     assert state.tasks.list_events(event_type="agent.task.cancelled") == first_events
+
+
+def test_graph_cancellation_is_atomic_filterable_and_idempotent(
+    state: SharedState,
+) -> None:
+    graph_id = "graph-cancel"
+    state.tasks.create_tasks(
+        [
+            AgentTaskCreate(
+                "one",
+                task_id="graph-one",
+                metadata={"graph_id": graph_id},
+            ),
+            AgentTaskCreate(
+                "two",
+                task_id="graph-two",
+                dependencies=("graph-one",),
+                metadata={"graph_id": graph_id},
+            ),
+        ]
+    )
+    state.tasks.create_task("unrelated", task_id="unrelated")
+    lease = state.tasks.claim_task("worker", task_id="graph-one")
+    assert lease is not None
+    state.tasks.start_task("graph-one", lease.token)
+
+    cancelled = state.tasks.cancel_graph(graph_id, reason="operator stopped graph")
+
+    assert set(cancelled) == {"graph-one", "graph-two"}
+    assert {
+        task.state for task in state.tasks.list_tasks(graph_id=graph_id)
+    } == {"cancelled"}
+    assert state.tasks.get_task("unrelated").state == "queued"
+    first_events = state.tasks.list_events(event_type="agent.task.cancelled")
+    state.tasks.cancel_graph(graph_id, reason="repeated")
+    assert state.tasks.list_events(event_type="agent.task.cancelled") == first_events
+
+    with pytest.raises(AgentTaskError, match="unknown task graph"):
+        state.tasks.cancel_graph("missing-graph")
 
 
 def test_failed_dependency_is_terminally_propagated(state: SharedState) -> None:

@@ -76,6 +76,15 @@ class EventTool(BaseTool):
         return ToolResult(success=True, output="live")
 
 
+class StartTool(MyTestTool):
+    def __init__(self, guard):
+        super().__init__(guard)
+        self.starts = 0
+
+    async def start(self):
+        self.starts += 1
+
+
 @pytest.mark.asyncio
 async def test_loop_rejects_invalid_canonical_messages_before_provider(tmp_path):
     loop = AshLoop(
@@ -215,6 +224,27 @@ class EventUI(TerminalUI):
 
     def emit_event(self, payload):
         self.events.append(payload)
+
+
+@pytest.mark.asyncio
+async def test_runtime_tools_start_once_after_session_is_available(tmp_path):
+    guard = SafetyGuard(tmp_path)
+    tool = StartTool(guard)
+    loop = AshLoop(
+        SessionStore(tmp_path / "tool-start.db"),
+        MockProvider(),
+        guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+    )
+
+    first = await loop.start_session()
+    await loop.start_session(first.session_id)
+
+    assert tool.starts == 1
+    assert loop.current_session is not None
+    await loop.aclose()
 
 
 @pytest.mark.asyncio

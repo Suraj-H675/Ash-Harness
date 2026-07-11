@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -60,6 +61,14 @@ class AshResult:
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_is_estimated": self.estimated_cost_usd > 0,
         }
+
+
+@dataclass(frozen=True)
+class AshDelegationResult:
+    graph_id: str
+    tasks: tuple[dict[str, Any], ...]
+    success: bool
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +171,7 @@ class AshClient:
         config: AshConfig | None = None,
         workspace: Path | None = None,
         provider: ProviderABC | None = None,
+        agent_provider_factory: Callable[[], ProviderABC] | None = None,
         approval_callback: ApprovalCallback | None = None,
         workspace_trusted: bool | None = None,
     ) -> "AshClient":
@@ -176,6 +186,7 @@ class AshClient:
             runtime_config,
             ui=HeadlessUI(output_format="text", stream=io.StringIO()),
             provider=provider,
+            agent_provider_factory=agent_provider_factory,
             workspace_trusted=workspace_trusted,
             approval_callback=approval_callback,
         )
@@ -309,6 +320,7 @@ class AshClient:
         *,
         state: TaskState | None = None,
         owner_agent_id: str | None = None,
+        graph_id: str | None = None,
         limit: int = 100,
     ) -> list[AgentTask]:
         """Return durable subagent tasks from the shared coordination store."""
@@ -318,10 +330,51 @@ class AshClient:
             return shared.tasks.list_tasks(
                 state=state,
                 owner_agent_id=owner_agent_id,
+                graph_id=graph_id,
                 limit=limit,
             )
         finally:
             shared.close()
+
+    def cancel_agent_graph(
+        self,
+        graph_id: str,
+        *,
+        reason: str = "cancelled by SDK caller",
+    ) -> list[str]:
+        """Cancel all nonterminal work in a durable delegated graph."""
+
+        shared = SharedState(self.config.db_directory / "agents.db")
+        try:
+            return shared.tasks.cancel_graph(graph_id, reason=reason)
+        finally:
+            shared.close()
+
+    async def delegate_agents(
+        self,
+        goal: str,
+        tasks: list[dict[str, Any]],
+        *,
+        background: bool = False,
+    ) -> AshDelegationResult:
+        """Submit a durable provider-backed task DAG through the runtime tool."""
+
+        async with self._turn_lock:
+            if not self._started:
+                await self._start_unlocked()
+            tool = self.loop.tools.get("delegate_agents")
+            if tool is None:
+                raise RuntimeError("delegate_agents is unavailable in this runtime")
+            result = await tool.run(goal=goal, tasks=tasks, background=background)
+        if not result.output:
+            raise RuntimeError(result.error or "delegated graph submission failed")
+        payload = json.loads(result.output)
+        return AshDelegationResult(
+            graph_id=str(payload["graph_id"]),
+            tasks=tuple(payload["tasks"]),
+            success=result.success,
+            error=result.error,
+        )
 
     def agent_artifacts(self, task_id: str) -> list[AgentArtifact]:
         """Return durable artifacts produced for one subagent task."""

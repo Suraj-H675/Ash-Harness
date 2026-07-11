@@ -331,7 +331,7 @@ not remove them.
 | Context budgets | Strong partial | Provider totals now include reserved tool schemas; typed hashed fragments expose source/trust provenance; deterministic compaction preserves task/path/action/outcome state and redacts persisted summaries. Model-assisted compaction remains. |
 | Sessions/recovery | Strong partial | SQLite schema v9 persists redacted cursor-replayable events plus atomic parent-first session trees, bounded branch metadata, safe fork boundaries, tree-aware retention, and SDK/CLI/HTTP/JSON-RPC access. Per-turn config snapshots and richer branch navigation/summarization remain. |
 | Memory | Partial | FTS/vector/Markdown exist; lifecycle, provenance, expiry, poisoning controls, and user workflow are incomplete. |
-| Subagents | Strong local | Worktrees, roles, shared state, steering, and reports exist; no remote A2A or workflow DAG runtime. |
+| Subagents | Strong local | Provider-backed roles, shared state, steering, atomic task DAGs, automatic ready-task dispatch, bounded retries, and restart recovery exist; remote A2A and isolated artifact acceptance remain. |
 | Agent Skills | Strong after `5dcbf51` | Standard parsing and progressive disclosure now exist; controlled script execution and compatibility diagnostics remain. |
 | Plugins | Partial | Declarative skills/commands/agents/hooks/MCP only; no versioned executable SDK or providers/channels/services. |
 | Hooks | Strong partial | Hook contract v1 covers bounded/redacted session, turn, model, tool, and error lifecycle with fail-closed pre-tool denial and isolated observers. Context-compaction/config/permission-change events and explicit ordering remain. |
@@ -406,7 +406,7 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 1053 passed, 8 environment-dependent skips on Python
+- Current verification: 1068 passed, 8 environment-dependent skips on Python
   3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
   race is covered by Ash's portable process completion helper.
 
@@ -463,8 +463,9 @@ internal modules, and untrusted contributions cannot bypass policy.
 2. Add workflow DAGs, artifact handoff, budgets, ownership, and cancellation:
    creation-order dependency DAGs, recursive cancellation, dependency-failure
    propagation, enforced token/time budgets, parent/sprint lineage, and typed
-   artifact records are complete foundations; automatic queued-DAG dispatch and
-   artifact acceptance/handoff policies remain.
+   artifact records now feed atomic DAG submission, automatic parallel
+   ready-task dispatch, task-level retry, foreground aggregation, and restart
+   recovery; artifact acceptance/handoff and graph-wide budget policies remain.
 3. Implement A2A server/client adapters with agent cards and policy mapping.
 4. Add remote execution backends after identities and audit semantics exist.
 

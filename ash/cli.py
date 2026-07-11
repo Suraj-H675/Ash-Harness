@@ -1517,6 +1517,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=("queued", "leased", "running", "succeeded", "failed", "cancelled"),
     )
     agents_tasks.add_argument("--owner")
+    agents_tasks.add_argument("--graph", dest="graph_id")
     agents_tasks.add_argument("--limit", type=int, default=100)
     agents_tasks.add_argument("--json", action="store_true")
     agents_events = agents_subparsers.add_parser("events")
@@ -1525,6 +1526,11 @@ def main(argv: list[str] | None = None) -> int:
     agents_events.add_argument("--after", type=int, default=0, dest="after_sequence")
     agents_events.add_argument("--limit", type=int, default=100)
     agents_events.add_argument("--json", action="store_true")
+    agents_cancel = agents_subparsers.add_parser("cancel")
+    agents_cancel.add_argument("graph_id")
+    agents_cancel.add_argument("--reason", default="cancelled by operator")
+    agents_cancel.add_argument("--yes", action="store_true")
+    agents_cancel.add_argument("--json", action="store_true")
     agents_messages = agents_subparsers.add_parser("messages")
     agents_messages.add_argument("--recipient", default="lead")
     agents_messages.add_argument("--all", action="store_true", dest="all_messages")
@@ -2026,9 +2032,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "agents":
+        from agents.tasks import AgentTaskError
         from agents.worktree import WorktreeError
         from cli.agents import (
             apply_agent_branch,
+            cancel_agent_graph,
             discard_agent_branch,
             list_agent_messages,
             list_agent_branches,
@@ -2042,6 +2050,7 @@ def main(argv: list[str] | None = None) -> int:
             render_agent_statuses,
             render_agent_task_events,
             render_agent_tasks,
+            render_cancelled_agent_graph,
             render_sent_agent_message,
             send_agent_message,
         )
@@ -2071,7 +2080,25 @@ def main(argv: list[str] | None = None) -> int:
                             database,
                             task_state=args.state,
                             owner_agent_id=args.owner,
+                            graph_id=args.graph_id,
                             limit=args.limit,
+                        ),
+                        json_output=args.json,
+                    )
+                )
+            elif args.agents_action == "cancel":
+                if not args.yes:
+                    print(
+                        "Error: cancelling an agent graph requires --yes",
+                        file=sys.stderr,
+                    )
+                    return 2
+                print(
+                    render_cancelled_agent_graph(
+                        cancel_agent_graph(
+                            database,
+                            graph_id=args.graph_id,
+                            reason=args.reason,
                         ),
                         json_output=args.json,
                     )
@@ -2162,7 +2189,7 @@ def main(argv: list[str] | None = None) -> int:
                             json_output=args.json,
                         )
                     )
-        except (ValueError, WorktreeError) as exc:
+        except (AgentTaskError, ValueError, WorktreeError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
         return 0

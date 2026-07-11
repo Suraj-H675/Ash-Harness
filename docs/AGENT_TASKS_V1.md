@@ -63,6 +63,30 @@ to 900 and cancels the model turn at the deadline. `ASH_AGENT_LEASE_SECONDS`
 defaults to 30 and controls crash-detection latency. These security and resource
 controls are user-owned and cannot be weakened by project configuration.
 
+## Durable graph dispatch
+
+`delegate_agents` accepts up to 32 keyed tasks in one call. Dependencies refer
+to keys in that call. Ash validates every role, dependency, budget, identifier,
+lineage edge, and cycle before writing, then creates all task rows, dependency
+edges, and creation events in one transaction. A rejected graph leaves no
+partial tasks.
+
+The runtime-owned dispatcher claims every ready task through the same atomic
+lease path as `spawn_agent`, runs independent tasks in parallel up to the
+cross-process capacity limit, and waits for prerequisites before starting
+dependents. Retryable failures are requeued up to `max_attempts`; each attempt
+uses a fresh lease and agent ID. Starting or resuming an Ash runtime wakes the
+dispatcher, so queued work and expired leases continue after a process restart.
+Foreground delegation returns every terminal state, result, and error;
+`background=true` returns after durable submission.
+Graph cancellation is atomic, recursively covers graph dependents, revokes
+active leases, and is observed by local workers at their next 100 ms control
+poll rather than waiting for lease expiry.
+
+Dependent tasks that need predecessor file changes should currently use
+`isolation="shared"`. Isolated worktree commits are recorded as artifacts but
+are not automatically accepted or merged into a dependent worktree.
+
 ## Live subagents
 
 `spawn_agent` creates and immediately claims a durable task before worktree or
@@ -79,8 +103,10 @@ Use the operator interface from any later process:
 ash agents tasks
 ash agents tasks --state running --owner reviewer-1
 ash agents tasks --json
+ash agents tasks --graph GRAPH_ID --json
 ash agents events --task TASK_ID
 ash agents events --type agent.task.failed --after 100 --json
+ash agents cancel GRAPH_ID --yes
 ```
 
 The JSON output includes lineage, dependencies, attempts, budgets, result or
@@ -92,12 +118,25 @@ Embedded callers use the typed equivalents:
 tasks = client.agent_tasks(state="failed", limit=50)
 artifacts = client.agent_artifacts(tasks[0].task_id)
 events = client.agent_task_events(task_id=tasks[0].task_id, after_sequence=0)
+graph = await client.delegate_agents(
+    "review the change",
+    [
+        {"key": "inspect", "role": "researcher", "task": "inspect the code"},
+        {
+            "key": "review",
+            "role": "reviewer",
+            "task": "review the findings",
+            "depends_on": ["inspect"],
+        },
+    ],
+)
+client.cancel_agent_graph(graph.graph_id, reason="superseded")
 ```
 
 ## Current boundary
 
-This contract provides durable scheduling primitives and integrates live
-single-task subagents. Automatic dispatch of a queued multi-stage DAG, dynamic
-dependency insertion, artifact acceptance policies, and remote workers are
-intentionally separate future layers. They must build on these ownership
-transitions rather than bypass them.
+This contract provides durable scheduling primitives, live single-task
+subagents, and automatic dispatch of submitted DAGs. Dynamic dependency
+insertion, artifact acceptance policies, graph-wide budget allocation, and
+remote workers are intentionally separate future layers. They must build on
+these ownership transitions rather than bypass them.

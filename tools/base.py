@@ -55,6 +55,9 @@ class BaseTool(ABC):
     async def aclose(self) -> None:
         """Release optional tool resources."""
 
+    async def start(self) -> None:
+        """Start optional background services after runtime assembly."""
+
     def set_event_sink(self, sink: Callable[[dict[str, Any]], None] | None) -> None:
         """Attach the owning runtime's typed event sink."""
 

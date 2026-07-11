@@ -54,6 +54,7 @@ def list_agent_tasks(
     *,
     task_state: TaskState | None = None,
     owner_agent_id: str | None = None,
+    graph_id: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     state = SharedState(db_path)
@@ -79,9 +80,24 @@ def list_agent_tasks(
             for task in state.tasks.list_tasks(
                 state=task_state,
                 owner_agent_id=owner_agent_id,
+                graph_id=graph_id,
                 limit=limit,
             )
         ]
+    finally:
+        state.close()
+
+
+def cancel_agent_graph(
+    db_path: str | Path,
+    *,
+    graph_id: str,
+    reason: str = "cancelled by operator",
+) -> dict[str, Any]:
+    state = SharedState(db_path)
+    try:
+        task_ids = state.tasks.cancel_graph(graph_id, reason=reason)
+        return {"graph_id": graph_id, "task_ids": task_ids, "reason": reason}
     finally:
         state.close()
 
@@ -280,6 +296,19 @@ def render_agent_task_events(
             else ""
         )
         for item in events
+    )
+
+
+def render_cancelled_agent_graph(
+    cancellation: dict[str, Any],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"cancellation": cancellation}, sort_keys=True)
+    return (
+        f"Cancelled graph {cancellation['graph_id']} "
+        f"({len(cancellation['task_ids'])} tasks)."
     )
 
 

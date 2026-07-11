@@ -314,6 +314,7 @@ class AshLoop:
         self.ui = ui
         self.project_root = project_root
         self.tools: dict[str, BaseTool] = dict(tools or {})
+        self._started_tool_ids: set[int] = set()
         self._plugin_tool_names = {
             name
             for name, tool in self.tools.items()
@@ -568,6 +569,7 @@ class AshLoop:
                 injected = hooks.get_injected_prompt()
                 if injected:
                     self.system_prompt = f"{self.system_prompt}\n\n{injected}"
+            await self._start_runtime_tools()
             return self.current_session
 
         # New session: optionally recall recent context from prior sessions
@@ -599,7 +601,16 @@ class AshLoop:
             injected = hooks.get_injected_prompt()
             if injected:
                 self.system_prompt = f"{self.system_prompt}\n\n{injected}"
+        await self._start_runtime_tools()
         return session
+
+    async def _start_runtime_tools(self) -> None:
+        for tool in self.tools.values():
+            identity = id(tool)
+            if identity in self._started_tool_ids:
+                continue
+            await tool.start()
+            self._started_tool_ids.add(identity)
 
     async def reload_mcp_servers(
         self, configs: dict[str, MCPServerConfig]

@@ -88,6 +88,7 @@ def build_tools(
     from tools.ask_user import AskUserTool
     from tools.base import BaseTool
     from tools.command import RunCommandTool
+    from tools.delegate import DelegateAgentsTool
     from tools.filesystem import (
         ReadFileTool,
         ReplaceFileContentTool,
@@ -167,15 +168,23 @@ def build_tools(
         ReadSkillResourceTool(safety_guard, catalog),
     ]
     if provider_factory is not None and agent_db_path is not None:
-        tools.append(
-            SpawnAgentTool(
-                safety_guard,
-                SharedState(agent_db_path),
-                provider_factory,
-                config=runtime_config,
-                custom_agents=agent_definitions,
-            )
+        spawn_tool = SpawnAgentTool(
+            safety_guard,
+            SharedState(agent_db_path),
+            provider_factory,
+            config=runtime_config,
+            custom_agents=agent_definitions,
         )
+        tools.append(spawn_tool)
+        if runtime_config is not None:
+            tools.append(
+                DelegateAgentsTool(
+                    safety_guard,
+                    SharedState(agent_db_path),
+                    spawn_tool,
+                    runtime_config,
+                )
+            )
     if repo_map is not None:
         tools.extend(
             [
@@ -230,6 +239,7 @@ def build_runtime(
     ui: LoopUI,
     *,
     provider: ProviderABC | None = None,
+    agent_provider_factory: Callable[[], ProviderABC] | None = None,
     session_store: SessionStore | None = None,
     permission_rules: list[PermissionRule] | None = None,
     workspace_trusted: bool | None = None,
@@ -279,7 +289,11 @@ def build_runtime(
         config.workspace_root,
         sandbox_manager=sandbox,
         allow_project_extensions=trusted,
-        provider_factory=lambda: get_provider_registry().build(config),
+        provider_factory=(
+            agent_provider_factory
+            if agent_provider_factory is not None
+            else lambda: get_provider_registry().build(config)
+        ),
         agent_db_path=config.db_directory / "agents.db",
         allowed_web_domains=config.allowed_web_domains,
         repo_map=repo_map,

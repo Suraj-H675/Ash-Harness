@@ -157,6 +157,12 @@ DAGs, cancellation, results, and artifacts are persisted in SQLite. Inspect
 them with `ash agents tasks [--state STATE] [--owner ID] [--json]`.
 Replay their versioned lifecycle with
 `ash agents events [--task ID] [--type TYPE] [--after SEQUENCE] [--json]`.
+For multi-stage work, the provider-facing `delegate_agents` tool atomically
+submits a dependency graph and automatically runs ready tasks in parallel. The
+same workflow is available to embedded callers as
+`await client.delegate_agents(goal, tasks, background=False)`.
+Use `ash agents tasks --graph GRAPH_ID` to inspect one graph and
+`ash agents cancel GRAPH_ID --yes` to revoke its queued and active work.
 
 Plugins are self-contained local directories with a root `plugin.json`.
 Manifests may declare path-based `skills`, `commands`, `agents`, `hooks`, and

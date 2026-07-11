@@ -30,7 +30,9 @@ _LEGACY_PACKAGES = (
     "ui",
 )
 
-_SDK_EXPORTS = frozenset({"AshClient", "AshEvent", "AshEventRecord", "AshResult"})
+_SDK_EXPORTS = frozenset(
+    {"AshClient", "AshDelegationResult", "AshEvent", "AshEventRecord", "AshResult"}
+)
 
 
 class _LegacyAliasLoader:
@@ -99,4 +101,11 @@ def __dir__() -> list[str]:
     return sorted({*globals(), *_SDK_EXPORTS, *_LEGACY_PACKAGES})
 
 
-__all__ = ["__version__", "AshClient", "AshEvent", "AshEventRecord", "AshResult"]
+__all__ = [
+    "__version__",
+    "AshClient",
+    "AshDelegationResult",
+    "AshEvent",
+    "AshEventRecord",
+    "AshResult",
+]

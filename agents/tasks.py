@@ -88,6 +88,34 @@ class AgentTaskEvent:
     event: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class AgentTaskCreate:
+    description: str
+    role: str = "general"
+    task_id: str | None = None
+    parent_task_id: str | None = None
+    sprint_id: str | None = None
+    dependencies: tuple[str, ...] = ()
+    max_attempts: int = 1
+    token_budget: int = 4000
+    time_budget_seconds: float = 900.0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _PreparedTaskCreate:
+    description: str
+    role: str
+    task_id: str
+    parent_task_id: str | None
+    sprint_id: str | None
+    dependencies: tuple[str, ...]
+    max_attempts: int
+    token_budget: int
+    time_budget_seconds: float
+    metadata_json: str
+
+
 class AgentTaskStore:
     """SQLite task scheduler with atomic claims and renewable ownership leases."""
 
@@ -195,72 +223,105 @@ class AgentTaskStore:
         time_budget_seconds: float = 900.0,
         metadata: dict[str, Any] | None = None,
     ) -> AgentTask:
-        description = _bounded_text(description, "task description", 20_000)
-        role = _identifier(role, "task role")
-        identifier = _identifier(task_id or str(uuid.uuid4()), "task id")
-        parent = _optional_identifier(parent_task_id, "parent task id")
-        sprint = _optional_identifier(sprint_id, "sprint id")
-        dependency_ids = tuple(
-            dict.fromkeys(_identifier(item, "dependency") for item in dependencies)
-        )
-        if identifier in dependency_ids:
-            raise ValueError("task cannot depend on itself")
-        if not 1 <= max_attempts <= 10:
-            raise ValueError("max_attempts must be between 1 and 10")
-        if token_budget < 1:
-            raise ValueError("token_budget must be positive")
-        if not 0.1 <= float(time_budget_seconds) <= 86_400:
-            raise ValueError("time_budget_seconds must be between 0.1 and 86400")
-        metadata_json = _bounded_json(metadata or {}, "task metadata")
+        return self.create_tasks(
+            [
+                AgentTaskCreate(
+                    description=description,
+                    role=role,
+                    task_id=task_id,
+                    parent_task_id=parent_task_id,
+                    sprint_id=sprint_id,
+                    dependencies=tuple(dependencies),
+                    max_attempts=max_attempts,
+                    token_budget=token_budget,
+                    time_budget_seconds=time_budget_seconds,
+                    metadata=metadata or {},
+                )
+            ]
+        )[0]
+
+    def create_tasks(
+        self,
+        definitions: Sequence[AgentTaskCreate],
+    ) -> list[AgentTask]:
+        """Atomically validate and create an acyclic task graph."""
+
+        if not 1 <= len(definitions) <= 128:
+            raise ValueError("task graph must contain between 1 and 128 tasks")
+        prepared = [_prepare_task_create(definition) for definition in definitions]
+        identifiers = [definition.task_id for definition in prepared]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("task graph contains duplicate task ids")
+        graph_ids = set(identifiers)
+        _validate_task_graph(prepared, graph_ids)
         now = time.time()
         with self._transaction():
-            self._require_references(parent, sprint, dependency_ids)
-            try:
-                self._conn.execute(
-                    """
-                    INSERT INTO agent_tasks (
-                        task_id, description, role, state, parent_task_id, sprint_id,
-                        max_attempts, token_budget, time_budget_seconds,
-                        metadata_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
+            self._require_graph_references(prepared, graph_ids)
+            for definition in prepared:
+                try:
+                    self._conn.execute(
+                        """
+                        INSERT INTO agent_tasks (
+                            task_id, description, role, state, parent_task_id, sprint_id,
+                            max_attempts, token_budget, time_budget_seconds,
+                            metadata_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            definition.task_id,
+                            definition.description,
+                            definition.role,
+                            (
+                                None
+                                if definition.parent_task_id in graph_ids
+                                else definition.parent_task_id
+                            ),
+                            definition.sprint_id,
+                            definition.max_attempts,
+                            definition.token_budget,
+                            definition.time_budget_seconds,
+                            definition.metadata_json,
+                            now,
+                            now,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise AgentTaskError(
+                        f"cannot create task {definition.task_id!r}: {exc}"
+                    ) from exc
+            self._conn.executemany(
+                "UPDATE agent_tasks SET parent_task_id = ? WHERE task_id = ?",
+                (
+                    (definition.parent_task_id, definition.task_id)
+                    for definition in prepared
+                    if definition.parent_task_id in graph_ids
+                ),
+            )
+            for definition in prepared:
+                self._conn.executemany(
+                    "INSERT INTO agent_task_dependencies "
+                    "(task_id, depends_on_task_id) VALUES (?, ?)",
                     (
-                        identifier,
-                        description,
-                        role,
-                        parent,
-                        sprint,
-                        max_attempts,
-                        token_budget,
-                        float(time_budget_seconds),
-                        metadata_json,
-                        now,
-                        now,
+                        (definition.task_id, dependency)
+                        for dependency in definition.dependencies
                     ),
                 )
-            except sqlite3.IntegrityError as exc:
-                raise AgentTaskError(
-                    f"cannot create task {identifier!r}: {exc}"
-                ) from exc
-            self._conn.executemany(
-                "INSERT INTO agent_task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)",
-                ((identifier, dependency) for dependency in dependency_ids),
-            )
-            self._record_event_locked(
-                identifier,
-                "agent.task.created",
-                now,
-                state="queued",
-                role=role,
-                dependencies=list(dependency_ids),
-                parent_task_id=parent,
-                sprint_id=sprint,
-                token_budget=token_budget,
-                time_budget_seconds=float(time_budget_seconds),
-            )
-        task = self.get_task(identifier)
-        assert task is not None
-        return task
+                self._record_event_locked(
+                    definition.task_id,
+                    "agent.task.created",
+                    now,
+                    state="queued",
+                    role=definition.role,
+                    dependencies=list(definition.dependencies),
+                    parent_task_id=definition.parent_task_id,
+                    sprint_id=definition.sprint_id,
+                    token_budget=definition.token_budget,
+                    time_budget_seconds=definition.time_budget_seconds,
+                )
+        tasks = [self.get_task(identifier) for identifier in identifiers]
+        if any(task is None for task in tasks):  # pragma: no cover - DB invariant
+            raise AgentTaskError("created task graph could not be read back")
+        return [task for task in tasks if task is not None]
 
     def claim_task(
         self,
@@ -468,35 +529,48 @@ class AgentTaskStore:
                 (identifier,),
             ).fetchall()
             task_ids = [str(row["task_id"]) for row in rows]
-            placeholders = ",".join("?" for _ in task_ids)
-            transitioning = [
-                str(row["task_id"])
-                for row in self._conn.execute(
-                    f"""
-                    SELECT task_id FROM agent_tasks
-                    WHERE task_id IN ({placeholders})
-                      AND state NOT IN ('succeeded','failed','cancelled')
-                    """,
-                    task_ids,
-                ).fetchall()
-            ]
-            self._conn.execute(
-                f"""
-                UPDATE agent_tasks SET state = 'cancelled', error = ?,
-                    lease_token_hash = NULL, lease_expires_at = NULL, updated_at = ?
-                WHERE task_id IN ({placeholders}) AND state NOT IN ('succeeded','failed','cancelled')
-                """,
-                (reason, now, *task_ids),
+            self._cancel_task_ids_locked(
+                task_ids,
+                reason,
+                now,
+                root_task_id=identifier,
             )
-            for transitioning_id in transitioning:
-                self._record_event_locked(
-                    transitioning_id,
-                    "agent.task.cancelled",
-                    now,
-                    state="cancelled",
-                    reason=reason,
-                    root_task_id=identifier,
+        return task_ids
+
+    def cancel_graph(
+        self,
+        graph_id: str,
+        *,
+        reason: str = "graph cancelled",
+    ) -> list[str]:
+        identifier = _identifier(graph_id, "graph id")
+        reason = _bounded_text(reason, "cancellation reason", 4096)
+        now = time.time()
+        with self._transaction():
+            rows = self._conn.execute(
+                """
+                WITH RECURSIVE descendants(task_id) AS (
+                    SELECT task_id FROM agent_tasks
+                    WHERE json_extract(metadata_json, '$.graph_id') = ?
+                    UNION
+                    SELECT dependency.task_id
+                    FROM agent_task_dependencies AS dependency
+                    JOIN descendants
+                      ON dependency.depends_on_task_id = descendants.task_id
                 )
+                SELECT task_id FROM descendants
+                """,
+                (identifier,),
+            ).fetchall()
+            if not rows:
+                raise AgentTaskError(f"unknown task graph: {identifier}")
+            task_ids = [str(row["task_id"]) for row in rows]
+            self._cancel_task_ids_locked(
+                task_ids,
+                reason,
+                now,
+                graph_id=identifier,
+            )
         return task_ids
 
     def recover_expired(self) -> list[str]:
@@ -519,6 +593,7 @@ class AgentTaskStore:
         *,
         state: TaskState | None = None,
         owner_agent_id: str | None = None,
+        graph_id: str | None = None,
         limit: int = 100,
     ) -> list[AgentTask]:
         if not 1 <= limit <= 1000:
@@ -533,6 +608,9 @@ class AgentTaskStore:
         if owner_agent_id is not None:
             clauses.append("owner_agent_id = ?")
             params.append(_identifier(owner_agent_id, "owner agent id"))
+        if graph_id is not None:
+            clauses.append("json_extract(metadata_json, '$.graph_id') = ?")
+            params.append(_identifier(graph_id, "graph id"))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._lock, closing(self._conn.cursor()) as cursor:
             rows = cursor.execute(
@@ -542,6 +620,71 @@ class AgentTaskStore:
                 (*params, limit),
             ).fetchall()
             return [self._row_to_task(row) for row in rows]
+
+    def list_ready_tasks(self, *, limit: int = 100) -> list[AgentTask]:
+        """Return queued tasks whose dependencies have all succeeded."""
+
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        now = time.time()
+        with self._transaction():
+            self._recover_expired_locked(now)
+            self._fail_dependency_blocked_locked(now)
+            rows = self._conn.execute(
+                """
+                SELECT task_id FROM agent_tasks AS candidate
+                WHERE state = 'queued'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM agent_task_dependencies AS dependency
+                    JOIN agent_tasks AS prerequisite
+                      ON prerequisite.task_id = dependency.depends_on_task_id
+                    WHERE dependency.task_id = candidate.task_id
+                      AND prerequisite.state <> 'succeeded'
+                  )
+                ORDER BY created_at, task_id LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            identifiers = [str(row["task_id"]) for row in rows]
+        return [self._required_task(identifier) for identifier in identifiers]
+
+    def _cancel_task_ids_locked(
+        self,
+        task_ids: Sequence[str],
+        reason: str,
+        now: float,
+        **event_data: Any,
+    ) -> None:
+        placeholders = ",".join("?" for _ in task_ids)
+        transitioning = [
+            str(row["task_id"])
+            for row in self._conn.execute(
+                f"""
+                SELECT task_id FROM agent_tasks
+                WHERE task_id IN ({placeholders})
+                  AND state NOT IN ('succeeded','failed','cancelled')
+                """,
+                tuple(task_ids),
+            ).fetchall()
+        ]
+        self._conn.execute(
+            f"""
+            UPDATE agent_tasks SET state = 'cancelled', error = ?,
+                lease_token_hash = NULL, lease_expires_at = NULL, updated_at = ?
+            WHERE task_id IN ({placeholders})
+              AND state NOT IN ('succeeded','failed','cancelled')
+            """,
+            (reason, now, *task_ids),
+        )
+        for transitioning_id in transitioning:
+            self._record_event_locked(
+                transitioning_id,
+                "agent.task.cancelled",
+                now,
+                state="cancelled",
+                reason=reason,
+                **event_data,
+            )
 
     def add_artifact(
         self,
@@ -858,36 +1001,47 @@ class AgentTaskStore:
             (event["event_id"], task_id, event_type, event_json, now),
         )
 
-    def _require_references(
+    def _require_graph_references(
         self,
-        parent_task_id: str | None,
-        sprint_id: str | None,
-        dependencies: Sequence[str],
+        definitions: Sequence[_PreparedTaskCreate],
+        graph_ids: set[str],
     ) -> None:
-        if (
-            parent_task_id is not None
-            and self._conn.execute(
-                "SELECT 1 FROM agent_tasks WHERE task_id = ?", (parent_task_id,)
-            ).fetchone()
-            is None
-        ):
-            raise AgentTaskError(f"unknown parent task: {parent_task_id}")
-        if (
-            sprint_id is not None
-            and self._conn.execute(
-                "SELECT 1 FROM sprints WHERE sprint_id = ?", (sprint_id,)
-            ).fetchone()
-            is None
-        ):
-            raise AgentTaskError(f"unknown sprint: {sprint_id}")
-        for dependency in dependencies:
+        placeholders = ",".join("?" for _ in graph_ids)
+        collision = self._conn.execute(
+            f"SELECT task_id FROM agent_tasks WHERE task_id IN ({placeholders}) LIMIT 1",
+            tuple(sorted(graph_ids)),
+        ).fetchone()
+        if collision is not None:
+            raise AgentTaskError(f"task id already exists: {collision['task_id']}")
+        for definition in definitions:
+            parent = definition.parent_task_id
             if (
-                self._conn.execute(
-                    "SELECT 1 FROM agent_tasks WHERE task_id = ?", (dependency,)
+                parent is not None
+                and parent not in graph_ids
+                and self._conn.execute(
+                    "SELECT 1 FROM agent_tasks WHERE task_id = ?", (parent,)
                 ).fetchone()
                 is None
             ):
-                raise AgentTaskError(f"unknown dependency task: {dependency}")
+                raise AgentTaskError(f"unknown parent task: {parent}")
+            sprint = definition.sprint_id
+            if (
+                sprint is not None
+                and self._conn.execute(
+                    "SELECT 1 FROM sprints WHERE sprint_id = ?", (sprint,)
+                ).fetchone()
+                is None
+            ):
+                raise AgentTaskError(f"unknown sprint: {sprint}")
+            for dependency in definition.dependencies:
+                if (
+                    dependency not in graph_ids
+                    and self._conn.execute(
+                        "SELECT 1 FROM agent_tasks WHERE task_id = ?", (dependency,)
+                    ).fetchone()
+                    is None
+                ):
+                    raise AgentTaskError(f"unknown dependency task: {dependency}")
 
     def _required_task(self, task_id: str) -> AgentTask:
         task = self.get_task(task_id)
@@ -960,6 +1114,86 @@ class _ImmediateTransaction:
             self.store._conn.execute("ROLLBACK" if exc_type else "COMMIT")
         finally:
             self.store._lock.release()
+
+
+def _prepare_task_create(definition: AgentTaskCreate) -> _PreparedTaskCreate:
+    if not isinstance(definition, AgentTaskCreate):
+        raise TypeError("task definitions must be AgentTaskCreate instances")
+    description = _bounded_text(definition.description, "task description", 20_000)
+    role = _identifier(definition.role, "task role")
+    identifier = _identifier(definition.task_id or str(uuid.uuid4()), "task id")
+    parent = _optional_identifier(definition.parent_task_id, "parent task id")
+    dependencies = tuple(
+        dict.fromkeys(
+            _identifier(item, "dependency") for item in definition.dependencies
+        )
+    )
+    if identifier in dependencies:
+        raise ValueError("task cannot depend on itself")
+    if parent == identifier:
+        raise ValueError("task cannot be its own parent")
+    if not 1 <= definition.max_attempts <= 10:
+        raise ValueError("max_attempts must be between 1 and 10")
+    if definition.token_budget < 1:
+        raise ValueError("token_budget must be positive")
+    time_budget = float(definition.time_budget_seconds)
+    if not 0.1 <= time_budget <= 86_400:
+        raise ValueError("time_budget_seconds must be between 0.1 and 86400")
+    return _PreparedTaskCreate(
+        description=description,
+        role=role,
+        task_id=identifier,
+        parent_task_id=parent,
+        sprint_id=_optional_identifier(definition.sprint_id, "sprint id"),
+        dependencies=dependencies,
+        max_attempts=definition.max_attempts,
+        token_budget=definition.token_budget,
+        time_budget_seconds=time_budget,
+        metadata_json=_bounded_json(definition.metadata, "task metadata"),
+    )
+
+
+def _validate_task_graph(
+    definitions: Sequence[_PreparedTaskCreate], graph_ids: set[str]
+) -> None:
+    dependency_edges = {
+        definition.task_id: tuple(
+            dependency
+            for dependency in definition.dependencies
+            if dependency in graph_ids
+        )
+        for definition in definitions
+    }
+    parent_edges: dict[str, tuple[str, ...]] = {
+        definition.task_id: (
+            (definition.parent_task_id,)
+            if definition.parent_task_id is not None
+            and definition.parent_task_id in graph_ids
+            else ()
+        )
+        for definition in definitions
+    }
+    _reject_cycles(dependency_edges, "dependency")
+    _reject_cycles(parent_edges, "parent lineage")
+
+
+def _reject_cycles(edges: dict[str, tuple[str, ...]], label: str) -> None:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(task_id: str) -> None:
+        if task_id in visiting:
+            raise ValueError(f"task graph contains a {label} cycle at {task_id!r}")
+        if task_id in visited:
+            return
+        visiting.add(task_id)
+        for dependency in edges[task_id]:
+            visit(dependency)
+        visiting.remove(task_id)
+        visited.add(task_id)
+
+    for task_id in edges:
+        visit(task_id)
 
 
 def _identifier(value: str, label: str) -> str:

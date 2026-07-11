@@ -21,7 +21,13 @@ from agents.subprocess_agent import (
     make_simple_text_task,
     payload_to_report,
 )
-from agents.tasks import AgentArtifact, AgentTask, AgentTaskEvent, AgentTaskLease
+from agents.tasks import (
+    AgentArtifact,
+    AgentTask,
+    AgentTaskCreate,
+    AgentTaskEvent,
+    AgentTaskLease,
+)
 
 
 __all__ = [
@@ -30,6 +36,7 @@ __all__ = [
     "AgentStatus",
     "AgentArtifact",
     "AgentTask",
+    "AgentTaskCreate",
     "AgentTaskEvent",
     "AgentTaskLease",
     "IPCMessage",

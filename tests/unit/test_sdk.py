@@ -127,6 +127,11 @@ async def test_sdk_exposes_typed_durable_agent_tasks_and_artifacts(tmp_path) -> 
         assert lease is not None
         state.tasks.complete_task("sdk-task", lease.token, {"summary": "done"})
         state.tasks.add_artifact("sdk-task", kind="report", uri="artifact://sdk")
+        state.tasks.create_task(
+            "cancel through sdk",
+            task_id="sdk-cancel",
+            metadata={"graph_id": "sdk-graph"},
+        )
 
         tasks = client.agent_tasks(state="succeeded", owner_agent_id="sdk-worker")
         artifacts = client.agent_artifacts("sdk-task")
@@ -140,8 +145,50 @@ async def test_sdk_exposes_typed_durable_agent_tasks_and_artifacts(tmp_path) -> 
         assert [event.event["type"] for event in events] == [
             "agent.task.succeeded"
         ]
+        assert [task.task_id for task in client.agent_tasks(graph_id="sdk-graph")] == [
+            "sdk-cancel"
+        ]
+        assert client.cancel_agent_graph("sdk-graph") == ["sdk-cancel"]
+        assert state.tasks.get_task("sdk-cancel").state == "cancelled"
     finally:
         state.close()
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_sdk_delegates_durable_graph_with_injected_agent_provider(
+    tmp_path,
+) -> None:
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    client = await AshClient.create(
+        config=config,
+        provider=SDKProvider(),
+        agent_provider_factory=SDKProvider,
+    )
+    try:
+        result = await client.delegate_agents(
+            "sdk graph",
+            [
+                {
+                    "key": "inspect",
+                    "role": "reviewer",
+                    "task": "inspect through sdk",
+                    "isolation": "shared",
+                }
+            ],
+        )
+
+        assert result.success is True
+        assert result.tasks[0]["state"] == "succeeded"
+        task = client.agent_tasks(state="succeeded")[0]
+        assert task.metadata["graph_id"] == result.graph_id
+        assert task.result["summary"] == "sdk response"
+    finally:
         await client.close()
 
 

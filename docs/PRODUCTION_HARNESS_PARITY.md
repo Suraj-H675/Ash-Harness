@@ -203,13 +203,13 @@ Research is clean-room: proprietary or leaked source is not used.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | Spawn subagent tool | Verified locally | Real bounded provider-backed Ash loop, persisted reports, role-scoped tool manifests, background execution, cancellation, and no recursive spawning |
-| Parallel agents | Partial | Background workers and bounded orchestrator scheduling are verified; aggregate token/cost ceilings remain |
+| Parallel agents | Partial | Atomic DAG submission, dependency-ready parallel dispatch, cross-process capacity, bounded retries, foreground/background operation, and restart recovery are verified; graph-wide token/cost ceilings remain |
 | Agent status/output | Partial | Live slash status plus top-level persisted status/report/message inspection; full TUI view remains |
 | Agent messaging | Verified locally | Typed SQLite IPC is persisted and inspectable; running workers consume steer/stop messages, acknowledge delivery, and enforce pending-message backpressure |
 | Role tool policies | Verified locally | Read/search baseline, coder-only scoped edits, sandbox-required tester commands, and no recursive spawn tool |
 | Worktree isolation | Verified locally | Clean-lead precondition, locked `ash-agent/*` branches, bounded commit, deterministic cleanup, safe list/cherry-pick/discard commands, and conflict abort |
-| Result consolidation | Partial test harness only | Evidence-linked summaries and conflict handling |
-| Agent steering/stop | Verified locally | In-process stop, persisted stop, live steering at safe iteration boundaries, delivery state, and report-based resume; isolated changes must be applied before continuation |
+| Result consolidation | Partial | Foreground DAG calls return typed terminal results and errors; evidence-linked synthesis and conflict handling remain |
+| Agent steering/stop | Verified locally | In-process stop, persisted stop, atomic graph cancellation with active-turn revocation, live steering at safe iteration boundaries, delivery state, and report-based resume; isolated changes must be applied before continuation |
 
 ## 11. Automation And Integration
 
@@ -220,7 +220,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Streaming JSONL | Verified locally | Typed token, reasoning, context, usage, tool lifecycle, completion, and structured error events |
 | Stdin prompts | Verified locally | Piped stdin and `-p -` enter machine-clean one-shot mode |
 | CI mode | Verified locally | `--ci` disables interactive prompts/ANSI and defaults one-shot output to stream-json |
-| SDK/library API | Verified locally | Async create/prompt/steer/session/lifecycle API with normalized usage independent of the TUI |
+| SDK/library API | Verified locally | Async create/prompt/steer/session/lifecycle/delegation API with explicit subagent provider injection and normalized usage independent of the TUI |
 | JSON-RPC server | Partial | Validated stdio methods, cancellation, lifecycle, and tests; remote transport remains |
 | HTTP server | Verified locally | Bearer auth, rate limits, lifecycle, session/turn/steering routes, live SSE events, cancellation, and safe CLI binding |
 | IDE/ACP integration | Missing | Protocol-based editor integration after CLI core is stable |

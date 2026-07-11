@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from pydantic import BaseModel, Field
 
 from agents.shared_state import SharedState
-from agents.tasks import AgentTaskBudgetExceeded, AgentTaskError
+from agents.tasks import AgentTask, AgentTaskBudgetExceeded, AgentTaskError
 from agents.subprocess_agent import AGENT_ROLES, AgentReport, SubprocessAgent
 from agents.worktree import WorktreeError, WorktreeLease, WorktreeManager
 from core.loop import AshLoop
@@ -82,10 +82,14 @@ class SpawnAgentTool(BaseTool):
         if self._custom_agents:
             self._update_description()
         self._tasks: dict[str, asyncio.Task[AgentReport]] = {}
+        self._dispatcher_task: asyncio.Task[None] | None = None
 
     def set_custom_agents(self, agents: dict[str, "AgentDefinition"]) -> None:
         self._custom_agents = dict(agents)
         self._update_description()
+
+    def supports_role(self, role: str) -> bool:
+        return role in AGENT_ROLES or role in self._custom_agents
 
     def _update_description(self) -> None:
         roles = ", ".join((*AGENT_ROLES, *sorted(self._custom_agents)))
@@ -93,6 +97,152 @@ class SpawnAgentTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = SpawnAgentArgs(**kwargs)
+        return await self._run_args(args)
+
+    async def run_queued_task(self, task_id: str) -> ToolResult:
+        """Claim and launch one dispatcher-owned durable task."""
+
+        durable_task = self._shared_state.tasks.get_task(task_id)
+        if durable_task is None:
+            return ToolResult(success=False, output="", error=f"Unknown task: {task_id}")
+        validation_error = self._queued_task_error(durable_task)
+        if validation_error is not None:
+            return ToolResult(success=False, output="", error=validation_error)
+        metadata = durable_task.metadata
+        attempt_suffix = f"-a{durable_task.attempt + 1}"
+        base_agent_id = str(metadata.get("agent_id") or f"worker-{task_id[:32]}")
+        attempt_agent_id = (
+            base_agent_id[: 64 - len(attempt_suffix)] + attempt_suffix
+        )
+        try:
+            args = SpawnAgentArgs(
+                role=durable_task.role,
+                task=durable_task.description,
+                agent_id=attempt_agent_id,
+                background=True,
+                isolation=str(metadata.get("isolation") or "auto"),
+                parent_task_id=durable_task.parent_task_id,
+            )
+        except ValueError as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Task {task_id!r} has invalid dispatch metadata: {exc}",
+            )
+        return await self._run_args(args, durable_task=durable_task)
+
+    async def start(self) -> None:
+        self.ensure_dispatcher()
+
+    def ensure_dispatcher(self) -> None:
+        if self._dispatcher_task is None or self._dispatcher_task.done():
+            self._dispatcher_task = asyncio.create_task(self._dispatch_ready_tasks())
+            self._dispatcher_task.add_done_callback(self._finish_dispatcher)
+
+    async def wait_for_tasks(self, task_ids: list[str]) -> list[AgentTask]:
+        """Wait until every named task reaches a terminal durable state."""
+
+        if not task_ids:
+            raise ValueError("task_ids must not be empty")
+        self.ensure_dispatcher()
+        while True:
+            dispatcher = self._dispatcher_task
+            if dispatcher is not None and dispatcher.done():
+                error = dispatcher.exception()
+                if error is not None:
+                    raise AgentTaskError(f"agent task dispatcher failed: {error}")
+                self.ensure_dispatcher()
+            tasks = [self._shared_state.tasks.get_task(task_id) for task_id in task_ids]
+            if any(task is None for task in tasks):
+                missing = [
+                    task_id
+                    for task_id, task in zip(task_ids, tasks, strict=True)
+                    if task is None
+                ]
+                raise AgentTaskError(f"unknown tasks while waiting: {missing}")
+            resolved = [task for task in tasks if task is not None]
+            if all(
+                task.state in {"succeeded", "failed", "cancelled"}
+                for task in resolved
+            ):
+                return resolved
+            await asyncio.sleep(0.1)
+
+    def _finish_dispatcher(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._emit_task_lifecycle(
+                "agent.dispatcher.failed",
+                "dispatcher",
+                reason=f"agent task dispatcher failed: {error}",
+            )
+
+    async def _dispatch_ready_tasks(self) -> None:
+        workspace = str(Path(self.safety_guard.project_root).resolve())
+        while True:
+            ready = [
+                task
+                for task in self._shared_state.tasks.list_ready_tasks(limit=1000)
+                if task.metadata.get("dispatchable") is True
+                and task.metadata.get("workspace") == workspace
+            ]
+            for task in ready:
+                validation_error = self._queued_task_error(task)
+                if validation_error is not None:
+                    self._shared_state.tasks.cancel_task(
+                        task.task_id,
+                        reason=f"automatic dispatch refused: {validation_error}",
+                    )
+                    self._emit_task_lifecycle(
+                        "agent.task.cancelled",
+                        task.task_id,
+                        state="cancelled",
+                        reason=validation_error,
+                    )
+                    continue
+                await self.run_queued_task(task.task_id)
+            pending = [
+                task
+                for task in self._shared_state.tasks.list_tasks(limit=1000)
+                if task.state in {"queued", "leased", "running"}
+                and task.metadata.get("dispatchable") is True
+                and task.metadata.get("workspace") == workspace
+            ]
+            if not pending:
+                return
+            await asyncio.sleep(0.1)
+
+    def _queued_task_error(self, task: AgentTask) -> str | None:
+        metadata = task.metadata
+        expected_workspace = str(Path(self.safety_guard.project_root).resolve())
+        if metadata.get("dispatchable") is not True:
+            return f"Task {task.task_id!r} is not marked for automatic dispatch."
+        if metadata.get("workspace") != expected_workspace:
+            return f"Task {task.task_id!r} belongs to another workspace."
+        if task.role not in AGENT_ROLES and task.role not in self._custom_agents:
+            return f"Task {task.task_id!r} has unknown role {task.role!r}."
+        try:
+            SpawnAgentArgs(
+                role=task.role,
+                task=task.description,
+                agent_id=metadata.get("agent_id"),
+                background=True,
+                isolation=str(metadata.get("isolation") or "auto"),
+                parent_task_id=task.parent_task_id,
+            )
+        except ValueError as exc:
+            return f"Task {task.task_id!r} has invalid dispatch metadata: {exc}"
+        return None
+
+    async def _run_args(
+        self,
+        args: SpawnAgentArgs,
+        *,
+        durable_task: AgentTask | None = None,
+    ) -> ToolResult:
+        created_here = durable_task is None
         agent_definition = self._custom_agents.get(args.role)
         if args.role not in AGENT_ROLES and agent_definition is None:
             expected = (*AGENT_ROLES, *sorted(self._custom_agents))
@@ -114,33 +264,44 @@ class SpawnAgentTool(BaseTool):
                 error=f"Subagent {agent_id!r} is already running.",
             )
 
-        try:
-            durable_task = self._shared_state.tasks.create_task(
-                args.task,
+        if durable_task is None:
+            try:
+                durable_task = self._shared_state.tasks.create_task(
+                    args.task,
+                    role=args.role,
+                    task_id=f"agent-task-{uuid.uuid4()}",
+                    parent_task_id=args.parent_task_id,
+                    token_budget=self._task_token_budget,
+                    time_budget_seconds=self._task_time_budget,
+                    metadata={
+                        "agent_id": agent_id,
+                        "background": args.background,
+                        "workspace": str(
+                            Path(self.safety_guard.project_root).resolve()
+                        ),
+                    },
+                )
+            except (AgentTaskError, ValueError) as exc:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Could not create durable subagent task: {exc}",
+                )
+            self._emit_task_lifecycle(
+                "agent.task.created",
+                durable_task.task_id,
+                state="queued",
                 role=args.role,
-                task_id=f"agent-task-{uuid.uuid4()}",
-                parent_task_id=args.parent_task_id,
-                token_budget=self._task_token_budget,
-                time_budget_seconds=self._task_time_budget,
-                metadata={
-                    "agent_id": agent_id,
-                    "background": args.background,
-                    "workspace": str(Path(self.safety_guard.project_root).resolve()),
-                },
+                agent_id=agent_id,
             )
-        except (AgentTaskError, ValueError) as exc:
+        elif durable_task.state != "queued":
             return ToolResult(
                 success=False,
                 output="",
-                error=f"Could not create durable subagent task: {exc}",
+                error=f"Task {durable_task.task_id!r} is {durable_task.state}, not queued.",
             )
-        self._emit_task_lifecycle(
-            "agent.task.created",
-            durable_task.task_id,
-            state="queued",
-            role=args.role,
-            agent_id=agent_id,
-        )
+        task_token_budget = durable_task.token_budget
+        task_time_budget = durable_task.time_budget_seconds
         durable_lease = self._shared_state.tasks.claim_task(
             agent_id,
             task_id=durable_task.task_id,
@@ -148,22 +309,23 @@ class SpawnAgentTool(BaseTool):
             max_active=self._max_concurrency,
         )
         if durable_lease is None:
-            self._shared_state.tasks.cancel_task(
-                durable_task.task_id,
-                reason="subagent concurrency limit reached",
-            )
-            self._emit_task_lifecycle(
-                "agent.task.cancelled",
-                durable_task.task_id,
-                state="cancelled",
-                reason="subagent concurrency limit reached",
-            )
+            if created_here:
+                self._shared_state.tasks.cancel_task(
+                    durable_task.task_id,
+                    reason="subagent concurrency limit reached",
+                )
+                self._emit_task_lifecycle(
+                    "agent.task.cancelled",
+                    durable_task.task_id,
+                    state="cancelled",
+                    reason="subagent concurrency limit reached",
+                )
             return ToolResult(
                 success=False,
                 output="",
                 error=(
-                    "Subagent concurrency limit reached; wait for a running agent "
-                    "to finish before spawning another."
+                    "Task is not ready or the subagent concurrency limit was reached; "
+                    "wait for active work or dependencies to finish."
                 ),
             )
         self._emit_task_lifecycle(
@@ -211,15 +373,20 @@ class SpawnAgentTool(BaseTool):
                 )
                 raise
             except WorktreeError as exc:
-                self._shared_state.tasks.fail_task(
+                failed = self._shared_state.tasks.fail_task(
                     durable_task.task_id,
                     durable_lease.token,
                     f"worktree creation failed: {exc}",
+                    retryable=True,
                 )
                 self._emit_task_lifecycle(
-                    "agent.task.failed",
+                    (
+                        "agent.task.retrying"
+                        if failed.state == "queued"
+                        else "agent.task.failed"
+                    ),
                     durable_task.task_id,
-                    state="failed",
+                    state=failed.state,
                     reason=f"worktree creation failed: {exc}",
                 )
                 return ToolResult(
@@ -248,6 +415,8 @@ class SpawnAgentTool(BaseTool):
                     agent_id=context["agent_id"],
                     durable_task_id=durable_task.task_id,
                     durable_lease_token=durable_lease.token,
+                    token_budget=task_token_budget,
+                    time_budget_seconds=task_time_budget,
                 )
                 artifacts["completion_tokens"] = completion_tokens
                 try:
@@ -344,15 +513,20 @@ class SpawnAgentTool(BaseTool):
                             owner_agent_id=agent_id,
                         )
                     else:
-                        self._shared_state.tasks.fail_task(
+                        failed = self._shared_state.tasks.fail_task(
                             durable_task.task_id,
                             durable_lease.token,
                             report.summary,
+                            retryable=branch_state["commit"] is None,
                         )
                         self._emit_task_lifecycle(
-                            "agent.task.failed",
+                            (
+                                "agent.task.retrying"
+                                if failed.state == "queued"
+                                else "agent.task.failed"
+                            ),
                             durable_task.task_id,
-                            state="failed",
+                            state=failed.state,
                             owner_agent_id=agent_id,
                             reason=report.summary,
                         )
@@ -393,15 +567,20 @@ class SpawnAgentTool(BaseTool):
                 current = self._shared_state.tasks.get_task(durable_task.task_id)
                 if current is not None and current.state in {"leased", "running"}:
                     try:
-                        self._shared_state.tasks.fail_task(
+                        failed = self._shared_state.tasks.fail_task(
                             durable_task.task_id,
                             durable_lease.token,
                             f"subagent execution failed: {exc}",
+                            retryable=True,
                         )
                         self._emit_task_lifecycle(
-                            "agent.task.failed",
+                            (
+                                "agent.task.retrying"
+                                if failed.state == "queued"
+                                else "agent.task.failed"
+                            ),
                             durable_task.task_id,
-                            state="failed",
+                            state=failed.state,
                             reason=f"subagent execution failed: {exc}",
                         )
                     except AgentTaskError:
@@ -462,6 +641,8 @@ class SpawnAgentTool(BaseTool):
         agent_id: str,
         durable_task_id: str,
         durable_lease_token: str,
+        token_budget: int,
+        time_budget_seconds: float,
     ) -> tuple[str, int]:
         provider = self._provider_factory()
         guard = SafetyGuard(workspace)
@@ -500,7 +681,7 @@ class SpawnAgentTool(BaseTool):
                     "safety_tier": "auto_approve",
                     "max_completion_tokens": min(
                         self._config.max_completion_tokens,
-                        self._task_token_budget,
+                        token_budget,
                     ),
                     "enable_sprint_planning": False,
                     "memory_backend": "off",
@@ -548,7 +729,7 @@ class SpawnAgentTool(BaseTool):
             try:
                 response = await asyncio.wait_for(
                     asyncio.shield(turn),
-                    timeout=self._task_time_budget,
+                    timeout=time_budget_seconds,
                 )
                 usage = loop.last_turn_usage
                 completion_tokens = int(usage["completion_tokens"])
@@ -559,7 +740,7 @@ class SpawnAgentTool(BaseTool):
                 turn.cancel()
                 await asyncio.gather(turn, return_exceptions=True)
                 raise TimeoutError(
-                    f"subagent exceeded {self._task_time_budget:g}s time budget"
+                    f"subagent exceeded {time_budget_seconds:g}s time budget"
                 ) from exc
             finally:
                 inbox.cancel()
@@ -578,6 +759,10 @@ class SpawnAgentTool(BaseTool):
     ) -> None:
         next_renewal = 0.0
         while not turn.done():
+            durable_task = self._shared_state.tasks.get_task(durable_task_id)
+            if durable_task is None or durable_task.state not in {"leased", "running"}:
+                turn.cancel()
+                return
             now = asyncio.get_running_loop().time()
             if now >= next_renewal:
                 try:
@@ -624,6 +809,10 @@ class SpawnAgentTool(BaseTool):
             await asyncio.sleep(0.1)
 
     async def aclose(self) -> None:
+        if self._dispatcher_task is not None:
+            self._dispatcher_task.cancel()
+            await asyncio.gather(self._dispatcher_task, return_exceptions=True)
+            self._dispatcher_task = None
         tasks = list(self._tasks.values())
         for task in tasks:
             task.cancel()

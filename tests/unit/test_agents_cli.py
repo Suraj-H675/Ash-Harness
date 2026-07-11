@@ -7,6 +7,7 @@ from pathlib import Path
 from agents.shared_state import SharedState
 from ash.cli import main
 from cli.agents import (
+    cancel_agent_graph,
     list_agent_messages,
     list_agent_reports,
     list_agent_statuses,
@@ -18,6 +19,7 @@ from cli.agents import (
     render_agent_statuses,
     render_agent_task_events,
     render_agent_tasks,
+    render_cancelled_agent_graph,
     render_sent_agent_message,
     send_agent_message,
 )
@@ -113,6 +115,25 @@ def test_agent_task_event_renderer_supports_cursor_and_type_filters(
     assert [item["event"]["type"] for item in payload["events"]] == [
         "agent.task.running"
     ]
+
+
+def test_cancel_agent_graph_renderer_emits_json(tmp_path: Path) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    state.tasks.create_task(
+        "cancel",
+        task_id="cancel",
+        metadata={"graph_id": "graph-cli"},
+    )
+    state.close()
+
+    cancellation = cancel_agent_graph(
+        tmp_path / "agents.db", graph_id="graph-cli", reason="operator"
+    )
+    payload = json.loads(
+        render_cancelled_agent_graph(cancellation, json_output=True)
+    )
+
+    assert payload["cancellation"]["task_ids"] == ["cancel"]
 
 
 def test_agent_message_renderer_emits_json(tmp_path: Path) -> None:
@@ -211,6 +232,35 @@ def test_agents_cli_replays_filtered_task_events(
 
     assert payload["events"][0]["task_id"] == "trace"
     assert payload["events"][0]["event"]["type"] == "agent.task.created"
+
+
+def test_agents_cli_filters_and_cancels_graph_with_confirmation(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db"
+    state = SharedState(db_dir / "agents.db")
+    state.tasks.create_task(
+        "graph task",
+        task_id="graph-task",
+        metadata={"graph_id": "graph-cli"},
+    )
+    state.tasks.create_task("unrelated", task_id="unrelated")
+    state.close()
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+
+    assert main(["agents", "tasks", "--graph", "graph-cli", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [task["task_id"] for task in payload["tasks"]] == ["graph-task"]
+
+    assert main(["agents", "cancel", "graph-cli"]) == 2
+    assert "requires --yes" in capsys.readouterr().err
+    assert main(["agents", "cancel", "graph-cli", "--yes", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cancellation"]["task_ids"] == ["graph-task"]
 
 
 def test_agents_cli_discard_requires_explicit_confirmation(
