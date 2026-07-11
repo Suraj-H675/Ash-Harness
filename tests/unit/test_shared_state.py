@@ -76,3 +76,10 @@ def test_broadcast(state):
         msgs = state.fetch_messages(agent_id, undelivered_only=False)
         assert len(msgs) == 1
         assert msgs[0].content == "checkin"
+
+
+def test_close_is_idempotent(tmp_path: Path) -> None:
+    state = SharedState(tmp_path / "agents.db")
+
+    state.close()
+    state.close()

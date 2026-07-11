@@ -11,9 +11,11 @@ from cli.agents import (
     list_agent_messages,
     list_agent_reports,
     list_agent_statuses,
+    list_agent_tasks,
     render_agent_messages,
     render_agent_reports,
     render_agent_statuses,
+    render_agent_tasks,
     render_sent_agent_message,
     send_agent_message,
 )
@@ -66,6 +68,28 @@ def test_agent_report_renderer_emits_json(tmp_path: Path) -> None:
     assert payload["reports"][0]["summary"] == "looks good"
 
 
+def test_agent_task_renderer_includes_durable_artifacts(tmp_path: Path) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    state.tasks.create_task("implement", task_id="task-1", token_budget=20)
+    lease = state.tasks.claim_task("worker", task_id="task-1")
+    assert lease is not None
+    state.tasks.start_task("task-1", lease.token)
+    state.tasks.record_tokens("task-1", lease.token, 5)
+    state.tasks.complete_task("task-1", lease.token, {"summary": "done"})
+    state.tasks.add_artifact(
+        "task-1", kind="git-commit", uri="ash-agent/worker", metadata={"commit": "abc"}
+    )
+    state.close()
+
+    tasks = list_agent_tasks(tmp_path / "agents.db", task_state="succeeded")
+    payload = json.loads(render_agent_tasks(tasks, json_output=True))
+
+    assert payload["tasks"][0]["task_id"] == "task-1"
+    assert payload["tasks"][0]["used_tokens"] == 5
+    assert payload["tasks"][0]["result"] == {"summary": "done"}
+    assert payload["tasks"][0]["artifacts"][0]["kind"] == "git-commit"
+
+
 def test_agent_message_renderer_emits_json(tmp_path: Path) -> None:
     state = SharedState(tmp_path / "agents.db")
     state.register_agent("agent-a")
@@ -116,6 +140,32 @@ def test_agents_cli_lists_persisted_statuses(
 
     assert payload["agents"][0]["agent_id"] == "agent-a"
     assert payload["agents"][0]["current_task"] == "fix tests"
+
+
+def test_agents_cli_lists_filtered_durable_tasks(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db"
+    state = SharedState(db_dir / "agents.db")
+    state.tasks.create_task("queued", task_id="queued")
+    state.tasks.create_task("active", task_id="active")
+    lease = state.tasks.claim_task("worker", task_id="active")
+    assert lease is not None
+    state.tasks.start_task("active", lease.token)
+    state.close()
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+
+    assert main(["agents", "tasks", "--state", "running", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert [task["task_id"] for task in payload["tasks"]] == ["active"]
+
+    assert main(["agents", "tasks", "--limit", "0"]) == 2
+    assert "limit must be between" in capsys.readouterr().err
 
 
 def test_agents_cli_discard_requires_explicit_confirmation(

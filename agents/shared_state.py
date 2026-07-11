@@ -31,6 +31,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from agents.tasks import AgentTaskStore
+
 
 # --- public type aliases ---------------------------------------------------
 
@@ -89,12 +91,18 @@ class SharedState:
         self._conn.row_factory = sqlite3.Row
         self._write_lock = threading.Lock()
         self._async_lock = asyncio.Lock()
+        self._closed = False
         self._init_db()
+        self.tasks = AgentTaskStore(self.db_path, busy_timeout_ms=busy_timeout_ms)
 
     # --- lifecycle -------------------------------------------------------
 
     def close(self) -> None:
         with self._write_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.tasks.close()
             self._conn.close()
 
     def _init_db(self) -> None:

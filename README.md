@@ -150,6 +150,11 @@ on `ash-agent/*` branches without modifying the lead worktree. The lead must be
 clean when a worktree is created or applied. Use `/agents`, `/agents stop ID`,
 and `/agents resume ID` for live status and lifecycle control; queued steering
 messages are consumed at model-iteration boundaries and marked delivered.
+Every provider-backed worker also runs through the durable task contract in
+[Agent Tasks v1](docs/AGENT_TASKS_V1.md): cross-process capacity admission,
+renewable ownership leases, crash recovery, token/time budgets, dependency
+DAGs, cancellation, results, and artifacts are persisted in SQLite. Inspect
+them with `ash agents tasks [--state STATE] [--owner ID] [--json]`.
 
 Plugins are self-contained local directories with a root `plugin.json`.
 Manifests may declare path-based `skills`, `commands`, `agents`, `hooks`, and

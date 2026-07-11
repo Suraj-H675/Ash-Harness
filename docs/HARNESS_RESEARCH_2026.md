@@ -406,7 +406,7 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 1032 passed, 8 environment-dependent skips on Python
+- Current verification: 1048 passed, 8 environment-dependent skips on Python
   3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
   race is covered by Ash's portable process completion helper.
 
@@ -455,9 +455,15 @@ internal modules, and untrusted contributions cannot bypass policy.
 
 ### Phase 3: durable multi-agent runtime
 
-1. Make local agents use the canonical operation/event/task contracts.
-2. Add workflow DAGs, artifact handoff, budgets, ownership, and cancellation
-   propagation.
+1. Make local agents use the canonical operation/event/task contracts: durable
+   task v1 now backs provider workers with cross-process capacity, renewable
+   hashed leases, crash recovery, stale-owner rejection, result persistence,
+   and operator inspection; canonical task event envelopes remain.
+2. Add workflow DAGs, artifact handoff, budgets, ownership, and cancellation:
+   creation-order dependency DAGs, recursive cancellation, dependency-failure
+   propagation, enforced token/time budgets, parent/sprint lineage, and typed
+   artifact records are complete foundations; automatic queued-DAG dispatch and
+   artifact acceptance/handoff policies remain.
 3. Implement A2A server/client adapters with agent cards and policy mapping.
 4. Add remote execution backends after identities and audit semantics exist.
 

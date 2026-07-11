@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.shared_state import SharedState
+from agents.tasks import TaskState
 from agents.worktree import WorktreeManager
 
 
@@ -43,6 +44,43 @@ def list_agent_reports(db_path: str | Path, *, limit: int = 20) -> list[dict[str
                 limit=limit,
             )
             if message.message_type == "agent_report"
+        ]
+    finally:
+        state.close()
+
+
+def list_agent_tasks(
+    db_path: str | Path,
+    *,
+    task_state: TaskState | None = None,
+    owner_agent_id: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    state = SharedState(db_path)
+    try:
+        return [
+            {
+                **asdict(task),
+                "lease_expires_at": (
+                    task.lease_expires_at.isoformat()
+                    if task.lease_expires_at is not None
+                    else None
+                ),
+                "created_at": task.created_at.isoformat(),
+                "updated_at": task.updated_at.isoformat(),
+                "artifacts": [
+                    {
+                        **asdict(artifact),
+                        "created_at": artifact.created_at.isoformat(),
+                    }
+                    for artifact in state.tasks.list_artifacts(task.task_id)
+                ],
+            }
+            for task in state.tasks.list_tasks(
+                state=task_state,
+                owner_agent_id=owner_agent_id,
+                limit=limit,
+            )
         ]
     finally:
         state.close()
@@ -176,6 +214,25 @@ def render_agent_reports(
         f"{'ok' if item.get('success') else 'failed'}: "
         f"{item.get('summary', '')}"
         for item in reports
+    )
+
+
+def render_agent_tasks(
+    tasks: list[dict[str, Any]],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"tasks": tasks}, sort_keys=True)
+    if not tasks:
+        return "No durable agent tasks recorded."
+    return "\n".join(
+        f"{item['task_id']} [{item['role']}] {item['state']} "
+        f"owner={item['owner_agent_id'] or '-'} "
+        f"attempt={item['attempt']}/{item['max_attempts']} "
+        f"tokens={item['used_tokens']}/{item['token_budget']}: "
+        f"{item['description']}"
+        for item in tasks
     )
 
 

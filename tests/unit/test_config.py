@@ -533,6 +533,10 @@ def test_project_config_cannot_override_user_owned_controls(
             [
                 'model = "private-provider/model"',
                 'safety_tier = "auto_approve"',
+                "max_concurrent_agents = 32",
+                "agent_token_budget = 999999",
+                "agent_time_budget_seconds = 86400",
+                "agent_lease_seconds = 3600",
                 "allow_unsafe_auto_approve = true",
                 "allow_unsafe_plugin_runtime = true",
                 'sandbox_backend = "direct"',
@@ -556,6 +560,10 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.workspace_root == root.resolve()
     assert config.model == "anthropic/claude-sonnet-4-6"
     assert config.safety_tier == "interactive"
+    assert config.max_concurrent_agents == 4
+    assert config.agent_token_budget == 4000
+    assert config.agent_time_budget_seconds == 900
+    assert config.agent_lease_seconds == 30
     assert config.allow_unsafe_auto_approve is False
     assert config.allow_unsafe_plugin_runtime is False
     assert config.sandbox_backend == "auto"
@@ -567,6 +575,10 @@ def test_project_config_cannot_override_user_owned_controls(
     diagnostics = "\n".join(config.config_diagnostics)
     assert "non-built-in provider" in diagnostics
     assert "safety_tier" in diagnostics
+    assert "max_concurrent_agents" in diagnostics
+    assert "agent_token_budget" in diagnostics
+    assert "agent_time_budget_seconds" in diagnostics
+    assert "agent_lease_seconds" in diagnostics
     assert "allow_unsafe_auto_approve" in diagnostics
     assert "allow_unsafe_plugin_runtime" in diagnostics
     assert "sandbox_backend" in diagnostics

@@ -1,0 +1,162 @@
+import time
+from pathlib import Path
+
+import pytest
+
+from agents.shared_state import SharedState
+from agents.tasks import AgentTaskBudgetExceeded, AgentTaskError
+
+
+@pytest.fixture
+def state(tmp_path: Path):
+    value = SharedState(tmp_path / "agents.db")
+    yield value
+    value.close()
+
+
+def test_task_dependencies_claim_in_ready_order(state: SharedState) -> None:
+    first = state.tasks.create_task("inspect", task_id="inspect")
+    second = state.tasks.create_task(
+        "implement",
+        task_id="implement",
+        dependencies=[first.task_id],
+    )
+
+    lease = state.tasks.claim_task("worker-a")
+
+    assert lease is not None
+    assert lease.task.task_id == "inspect"
+    state.tasks.start_task("inspect", lease.token)
+    state.tasks.complete_task("inspect", lease.token, {"summary": "done"})
+    next_lease = state.tasks.claim_task("worker-b")
+    assert next_lease is not None
+    assert next_lease.task.task_id == second.task_id
+
+
+def test_atomic_capacity_limit_is_shared_across_connections(tmp_path: Path) -> None:
+    first_state = SharedState(tmp_path / "agents.db")
+    second_state = SharedState(tmp_path / "agents.db")
+    try:
+        first_state.tasks.create_task("one", task_id="one")
+        first_state.tasks.create_task("two", task_id="two")
+
+        first = first_state.tasks.claim_task("worker-a", max_active=1)
+        second = second_state.tasks.claim_task("worker-b", max_active=1)
+
+        assert first is not None
+        assert second is None
+    finally:
+        first_state.close()
+        second_state.close()
+
+
+def test_stale_lease_is_requeued_then_exhausted(
+    state: SharedState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [time.time()]
+    monkeypatch.setattr("agents.tasks.time.time", lambda: clock[0])
+    state.tasks.create_task("retry", task_id="retry", max_attempts=2)
+    first = state.tasks.claim_task("worker-a", task_id="retry", lease_seconds=1)
+    assert first is not None
+    state.tasks.start_task("retry", first.token)
+    clock[0] += 2
+
+    assert state.tasks.recover_expired() == ["retry"]
+    assert state.tasks.get_task("retry").state == "queued"
+    second = state.tasks.claim_task("worker-b", task_id="retry", lease_seconds=1)
+    assert second is not None
+    clock[0] += 2
+
+    assert state.tasks.recover_expired() == ["retry"]
+    exhausted = state.tasks.get_task("retry")
+    assert exhausted.state == "failed"
+    assert exhausted.error == "worker lease expired"
+
+
+def test_stale_or_wrong_owner_cannot_complete(state: SharedState) -> None:
+    state.tasks.create_task("owned", task_id="owned")
+    lease = state.tasks.claim_task("worker", task_id="owned")
+    assert lease is not None
+
+    with pytest.raises(AgentTaskError, match="another lease"):
+        state.tasks.complete_task("owned", "wrong-token", {})
+
+    state.tasks.cancel_task("owned")
+    with pytest.raises(AgentTaskError, match="not actively leased"):
+        state.tasks.complete_task("owned", lease.token, {})
+
+
+def test_token_budget_fails_task_and_revokes_lease(state: SharedState) -> None:
+    state.tasks.create_task("budgeted", task_id="budgeted", token_budget=10)
+    lease = state.tasks.claim_task("worker", task_id="budgeted")
+    assert lease is not None
+    state.tasks.start_task("budgeted", lease.token)
+    state.tasks.record_tokens("budgeted", lease.token, 8)
+
+    with pytest.raises(AgentTaskBudgetExceeded, match="exceeded"):
+        state.tasks.record_tokens("budgeted", lease.token, 3)
+
+    task = state.tasks.get_task("budgeted")
+    assert task.state == "failed"
+    assert task.used_tokens == 11
+
+
+def test_cancellation_cascades_to_dependent_tasks(state: SharedState) -> None:
+    state.tasks.create_task("parent", task_id="parent")
+    state.tasks.create_task("child", task_id="child", dependencies=["parent"])
+    state.tasks.create_task("grandchild", task_id="grand", dependencies=["child"])
+
+    cancelled = state.tasks.cancel_task("parent", reason="user stopped plan")
+
+    assert set(cancelled) == {"parent", "child", "grand"}
+    assert {task.state for task in state.tasks.list_tasks()} == {"cancelled"}
+
+
+def test_failed_dependency_is_terminally_propagated(state: SharedState) -> None:
+    state.tasks.create_task("parent", task_id="parent")
+    state.tasks.create_task("child", task_id="child", dependencies=["parent"])
+    lease = state.tasks.claim_task("worker", task_id="parent")
+    assert lease is not None
+    state.tasks.fail_task("parent", lease.token, "broken")
+
+    assert state.tasks.claim_task("other") is None
+    child = state.tasks.get_task("child")
+    assert child.state == "failed"
+    assert child.error == "dependency did not succeed"
+
+
+def test_artifacts_are_durable_and_digest_validated(
+    tmp_path: Path,
+) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    state.tasks.create_task("produce", task_id="produce")
+    artifact = state.tasks.add_artifact(
+        "produce",
+        kind="git-commit",
+        uri="refs/heads/ash-agent/worker",
+        sha256="a" * 64,
+        metadata={"commit": "abc"},
+    )
+    state.close()
+
+    reopened = SharedState(tmp_path / "agents.db")
+    try:
+        loaded = reopened.tasks.list_artifacts("produce")
+        assert loaded == [artifact]
+        with pytest.raises(ValueError, match="sha256"):
+            reopened.tasks.add_artifact(
+                "produce", kind="file", uri="output.txt", sha256="bad"
+            )
+    finally:
+        reopened.close()
+
+
+def test_task_contract_rejects_missing_dependencies_and_non_json_metadata(
+    state: SharedState,
+) -> None:
+    with pytest.raises(AgentTaskError, match="unknown dependency"):
+        state.tasks.create_task("bad", dependencies=["missing"])
+    with pytest.raises(ValueError, match="JSON"):
+        state.tasks.create_task("bad", metadata={"value": float("nan")})
+    with pytest.raises(ValueError, match="portable identifier"):
+        state.tasks.create_task("bad", task_id="not portable")

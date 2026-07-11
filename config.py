@@ -396,6 +396,30 @@ class AshConfig(BaseSettings):
         False,
         description="Generate an editable sprint contract for multi-step requests.",
     )
+    max_concurrent_agents: int = Field(
+        4,
+        ge=1,
+        le=32,
+        description="Maximum live provider-backed subagents across Ash processes.",
+    )
+    agent_token_budget: int = Field(
+        4000,
+        ge=1,
+        le=1_000_000,
+        description="Maximum completion tokens consumed by one subagent task.",
+    )
+    agent_time_budget_seconds: float = Field(
+        900.0,
+        ge=1.0,
+        le=86_400.0,
+        description="Maximum wall-clock duration of one subagent task.",
+    )
+    agent_lease_seconds: float = Field(
+        30.0,
+        ge=5.0,
+        le=3600.0,
+        description="Renewable durable ownership lease for a live subagent task.",
+    )
     allow_unsafe_auto_approve: bool = Field(
         False,
         description="Allow full auto mode without an OS-level sandbox.",

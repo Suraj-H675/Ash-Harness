@@ -138,7 +138,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/sandbox` | Verified locally | Active backend, tier, capabilities, and network policy |
 | `/mcp` | Partial | Top-level add/remove/list/status config supports JSON and env/header metadata; REPL status/tools/resources/prompts use live clients; auth and richer lifecycle remain |
 | `/skills`, `/plugins`, `/hooks` | Verified locally | Namespaced components and executable tool protocols are inspectable; local install/enable/disable/confirmed-uninstall and live reload close and replace plugin hosts |
-| `/agents` | Verified locally | Slash status/stop/resume, persisted status/report/message inspection, live queued steering/stop consumption with delivery acknowledgement, and isolated branch list/apply/discard lifecycle |
+| `/agents` | Verified locally | Slash status/stop/resume, persisted status/report/message inspection, live steering/stop acknowledgement, isolated branch lifecycle, and top-level durable task filtering with owner, lease, attempts, budgets, results, and artifacts |
 | `/doctor` | Verified locally | Runs the local health report in-session |
 | Shell escape (`!`) | Verified locally | Commands use the normal policy, sandbox, persistence, and audit path |
 | File mention/completion (`@`) | Partial | Workspace file/directory completion plus bounded text, directory, and vision image expansion; fuzzy symbols and MCP resources remain |

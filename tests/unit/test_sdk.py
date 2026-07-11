@@ -4,6 +4,7 @@ import sys
 
 import pytest
 
+from agents.shared_state import SharedState
 from ash.sdk import AshClient
 from config import AshConfig
 from providers.base import ProviderABC, StreamChunk
@@ -107,6 +108,34 @@ async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
         assert result.usage["cache_hit_rate"] == 0.8
         assert client.sessions()[0].session_id == result.session_id
     finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_sdk_exposes_typed_durable_agent_tasks_and_artifacts(tmp_path) -> None:
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    client = await AshClient.create(config=config, provider=SDKProvider())
+    state = SharedState(config.db_directory / "agents.db")
+    try:
+        state.tasks.create_task("sdk task", task_id="sdk-task")
+        lease = state.tasks.claim_task("sdk-worker", task_id="sdk-task")
+        assert lease is not None
+        state.tasks.complete_task("sdk-task", lease.token, {"summary": "done"})
+        state.tasks.add_artifact("sdk-task", kind="report", uri="artifact://sdk")
+
+        tasks = client.agent_tasks(state="succeeded", owner_agent_id="sdk-worker")
+        artifacts = client.agent_artifacts("sdk-task")
+
+        assert [task.task_id for task in tasks] == ["sdk-task"]
+        assert tasks[0].result == {"summary": "done"}
+        assert [artifact.uri for artifact in artifacts] == ["artifact://sdk"]
+    finally:
+        state.close()
         await client.close()
 
 

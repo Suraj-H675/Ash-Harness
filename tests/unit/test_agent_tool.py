@@ -3,6 +3,7 @@ import asyncio
 import subprocess
 
 from agents.shared_state import SharedState
+from config import AshConfig
 from providers.base import ProviderABC, StreamChunk
 from safety.guard import SafetyGuard
 from tools.agent import SpawnAgentTool
@@ -27,6 +28,11 @@ async def test_spawn_agent_uses_provider_and_persists_report(tmp_path) -> None:
     assert result.success is True
     assert result.output == "evidence: tests pass"
     assert state.get_status("worker").status == "completed"
+    durable = state.tasks.list_tasks()
+    assert len(durable) == 1
+    assert durable[0].state == "succeeded"
+    assert durable[0].owner_agent_id == "worker"
+    assert durable[0].result["summary"] == "evidence: tests pass"
     await tool.aclose()
 
 
@@ -50,6 +56,86 @@ async def test_background_agent_can_be_stopped(tmp_path) -> None:
     assert state.get_status("slow-worker").status == "working"
     assert await tool.stop("slow-worker") is True
     assert state.get_status("slow-worker").status == "failed"
+    assert state.tasks.list_tasks()[0].state == "cancelled"
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_agent_capacity_is_enforced_across_durable_leases(tmp_path) -> None:
+    class SlowProvider(FakeProvider):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.started.set()
+            await asyncio.sleep(10)
+            yield StreamChunk(content="late", is_done=True)
+
+    provider = SlowProvider()
+    state = SharedState(tmp_path / "agents.db")
+    config = AshConfig(workspace_root=tmp_path, max_concurrent_agents=1)
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, lambda: provider, config=config)
+    first = await tool.run(
+        role="reviewer", task="first", agent_id="first", background=True
+    )
+    assert first.success is True
+    await provider.started.wait()
+
+    second = await tool.run(
+        role="reviewer", task="second", agent_id="second", background=True
+    )
+
+    assert second.success is False
+    assert "concurrency limit" in (second.error or "")
+    states = {task.description: task.state for task in state.tasks.list_tasks()}
+    assert states == {"first": "running", "second": "cancelled"}
+    await tool.aclose()
+    reopened = SharedState(tmp_path / "agents.db")
+    try:
+        assert reopened.get_status("first").status == "failed"
+        assert {
+            task.description: task.state for task in reopened.tasks.list_tasks()
+        } == {"first": "cancelled", "second": "cancelled"}
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_token_budget_changes_report_and_task_to_failure(tmp_path) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    config = AshConfig(workspace_root=tmp_path, agent_token_budget=1)
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, FakeProvider, config=config)
+
+    result = await tool.run(role="reviewer", task="inspect tests", agent_id="budget")
+
+    assert result.success is False
+    assert "exceeded token budget" in (result.error or "")
+    assert state.get_status("budget").status == "failed"
+    durable = state.tasks.list_tasks()[0]
+    assert durable.state == "failed"
+    assert durable.used_tokens > durable.token_budget
+    report = state.fetch_messages("lead", undelivered_only=False)[-1]
+    assert report.content["success"] is False
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_agent_time_budget_is_enforced_and_persisted(tmp_path) -> None:
+    class SlowProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            await asyncio.sleep(10)
+            yield StreamChunk(content="late", is_done=True)
+
+    state = SharedState(tmp_path / "agents.db")
+    config = AshConfig(workspace_root=tmp_path, agent_time_budget_seconds=1)
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, SlowProvider, config=config)
+
+    result = await tool.run(role="reviewer", task="wait", agent_id="timed")
+
+    assert result.success is False
+    assert "time budget" in (result.error or "")
+    assert state.get_status("timed").status == "failed"
+    assert state.tasks.list_tasks()[0].state == "failed"
     await tool.aclose()
 
 
@@ -285,6 +371,8 @@ async def test_completed_agent_can_resume_from_persisted_report(tmp_path) -> Non
     assert any(
         status.agent_id.startswith("reviewer-1-r-") for status in state.list_agents()
     )
+    tasks = sorted(state.tasks.list_tasks(), key=lambda task: task.created_at)
+    assert tasks[1].parent_task_id == tasks[0].task_id
     await tool.aclose()
 
 

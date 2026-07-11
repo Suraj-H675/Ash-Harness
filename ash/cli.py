@@ -1511,6 +1511,14 @@ def main(argv: list[str] | None = None) -> int:
     agents_reports = agents_subparsers.add_parser("reports")
     agents_reports.add_argument("--limit", type=int, default=20)
     agents_reports.add_argument("--json", action="store_true")
+    agents_tasks = agents_subparsers.add_parser("tasks")
+    agents_tasks.add_argument(
+        "--state",
+        choices=("queued", "leased", "running", "succeeded", "failed", "cancelled"),
+    )
+    agents_tasks.add_argument("--owner")
+    agents_tasks.add_argument("--limit", type=int, default=100)
+    agents_tasks.add_argument("--json", action="store_true")
     agents_messages = agents_subparsers.add_parser("messages")
     agents_messages.add_argument("--recipient", default="lead")
     agents_messages.add_argument("--all", action="store_true", dest="all_messages")
@@ -2020,10 +2028,12 @@ def main(argv: list[str] | None = None) -> int:
             list_agent_branches,
             list_agent_reports,
             list_agent_statuses,
+            list_agent_tasks,
             render_agent_messages,
             render_agent_branches,
             render_agent_reports,
             render_agent_statuses,
+            render_agent_tasks,
             render_sent_agent_message,
             send_agent_message,
         )
@@ -2043,6 +2053,18 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     render_agent_reports(
                         list_agent_reports(database, limit=args.limit),
+                        json_output=args.json,
+                    )
+                )
+            elif args.agents_action == "tasks":
+                print(
+                    render_agent_tasks(
+                        list_agent_tasks(
+                            database,
+                            task_state=args.state,
+                            owner_agent_id=args.owner,
+                            limit=args.limit,
+                        ),
                         json_output=args.json,
                     )
                 )

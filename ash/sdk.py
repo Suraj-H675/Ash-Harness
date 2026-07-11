@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
+from agents.shared_state import SharedState
+from agents.tasks import AgentArtifact, AgentTask, TaskState
 from ash.runtime import build_runtime
 from config import AshConfig
 from core.events import EVENT_SCHEMA_VERSION, envelope_event, event_data
@@ -301,6 +303,34 @@ class AshClient:
         if resolved_session_id is None:
             raise RuntimeError("no session is active; provide session_id")
         return self.loop.session_store.session_tree(resolved_session_id)
+
+    def agent_tasks(
+        self,
+        *,
+        state: TaskState | None = None,
+        owner_agent_id: str | None = None,
+        limit: int = 100,
+    ) -> list[AgentTask]:
+        """Return durable subagent tasks from the shared coordination store."""
+
+        shared = SharedState(self.config.db_directory / "agents.db")
+        try:
+            return shared.tasks.list_tasks(
+                state=state,
+                owner_agent_id=owner_agent_id,
+                limit=limit,
+            )
+        finally:
+            shared.close()
+
+    def agent_artifacts(self, task_id: str) -> list[AgentArtifact]:
+        """Return durable artifacts produced for one subagent task."""
+
+        shared = SharedState(self.config.db_directory / "agents.db")
+        try:
+            return shared.tasks.list_artifacts(task_id)
+        finally:
+            shared.close()
 
     def events(
         self,
