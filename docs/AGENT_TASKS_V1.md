@@ -37,6 +37,21 @@ after exhaustion. An old worker cannot complete work after recovery or
 reassignment because its token no longer matches. Cancellation clears ownership
 and recursively cancels dependent tasks.
 
+## Events
+
+Every material task transition is written in the same SQLite transaction as
+the state change. The append-only `agent_task_events` log uses the public v1
+event envelope and records creation, claim, start, token accounting, retry,
+recovery, terminal state, dependency propagation, cancellation, and artifact
+registration. Event payloads are redacted before persistence. Lease renewals
+are intentionally not logged because they are high-frequency heartbeats rather
+than state transitions.
+
+`spawn_agent` also publishes creation, claim, start, terminal state, and
+artifact events to the active runtime event sink. Those session-scoped events
+let streaming clients observe current activity; the SQLite task event log is
+the durable source for cross-session and post-crash replay.
+
 ## Budgets
 
 `ASH_MAX_CONCURRENT_AGENTS` defaults to 4 and is enforced transactionally across
@@ -64,6 +79,8 @@ Use the operator interface from any later process:
 ash agents tasks
 ash agents tasks --state running --owner reviewer-1
 ash agents tasks --json
+ash agents events --task TASK_ID
+ash agents events --type agent.task.failed --after 100 --json
 ```
 
 The JSON output includes lineage, dependencies, attempts, budgets, result or
@@ -74,12 +91,13 @@ Embedded callers use the typed equivalents:
 ```python
 tasks = client.agent_tasks(state="failed", limit=50)
 artifacts = client.agent_artifacts(tasks[0].task_id)
+events = client.agent_task_events(task_id=tasks[0].task_id, after_sequence=0)
 ```
 
 ## Current boundary
 
 This contract provides durable scheduling primitives and integrates live
 single-task subagents. Automatic dispatch of a queued multi-stage DAG, dynamic
-dependency insertion, artifact acceptance policies, canonical task event
-envelopes, and remote workers are intentionally separate future layers. They
-must build on these ownership transitions rather than bypass them.
+dependency insertion, artifact acceptance policies, and remote workers are
+intentionally separate future layers. They must build on these ownership
+transitions rather than bypass them.

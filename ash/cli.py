@@ -1519,6 +1519,12 @@ def main(argv: list[str] | None = None) -> int:
     agents_tasks.add_argument("--owner")
     agents_tasks.add_argument("--limit", type=int, default=100)
     agents_tasks.add_argument("--json", action="store_true")
+    agents_events = agents_subparsers.add_parser("events")
+    agents_events.add_argument("--task", dest="task_id")
+    agents_events.add_argument("--type", dest="event_type")
+    agents_events.add_argument("--after", type=int, default=0, dest="after_sequence")
+    agents_events.add_argument("--limit", type=int, default=100)
+    agents_events.add_argument("--json", action="store_true")
     agents_messages = agents_subparsers.add_parser("messages")
     agents_messages.add_argument("--recipient", default="lead")
     agents_messages.add_argument("--all", action="store_true", dest="all_messages")
@@ -2028,11 +2034,13 @@ def main(argv: list[str] | None = None) -> int:
             list_agent_branches,
             list_agent_reports,
             list_agent_statuses,
+            list_agent_task_events,
             list_agent_tasks,
             render_agent_messages,
             render_agent_branches,
             render_agent_reports,
             render_agent_statuses,
+            render_agent_task_events,
             render_agent_tasks,
             render_sent_agent_message,
             send_agent_message,
@@ -2063,6 +2071,19 @@ def main(argv: list[str] | None = None) -> int:
                             database,
                             task_state=args.state,
                             owner_agent_id=args.owner,
+                            limit=args.limit,
+                        ),
+                        json_output=args.json,
+                    )
+                )
+            elif args.agents_action == "events":
+                print(
+                    render_agent_task_events(
+                        list_agent_task_events(
+                            database,
+                            task_id=args.task_id,
+                            event_type=args.event_type,
+                            after_sequence=args.after_sequence,
                             limit=args.limit,
                         ),
                         json_output=args.json,

@@ -16,6 +16,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
+from core.events import envelope_event
+from core.redaction import redact_text
+
 TaskState = Literal[
     "queued",
     "leased",
@@ -76,6 +79,13 @@ class AgentArtifact:
     sha256: str | None
     metadata: dict[str, Any]
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class AgentTaskEvent:
+    sequence: int
+    task_id: str
+    event: dict[str, Any]
 
 
 class AgentTaskStore:
@@ -149,6 +159,15 @@ class AgentTaskStore:
                     created_at REAL NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS agent_task_events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    task_id TEXT NOT NULL REFERENCES agent_tasks(task_id) ON DELETE CASCADE,
+                    event_type TEXT NOT NULL,
+                    event_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_agent_tasks_claim
                     ON agent_tasks(state, created_at);
                 CREATE INDEX IF NOT EXISTS idx_agent_tasks_owner
@@ -157,6 +176,8 @@ class AgentTaskStore:
                     ON agent_task_dependencies(depends_on_task_id);
                 CREATE INDEX IF NOT EXISTS idx_agent_artifacts_task
                     ON agent_artifacts(task_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_agent_task_events_task_sequence
+                    ON agent_task_events(task_id, sequence);
                 """
             )
 
@@ -224,6 +245,18 @@ class AgentTaskStore:
             self._conn.executemany(
                 "INSERT INTO agent_task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)",
                 ((identifier, dependency) for dependency in dependency_ids),
+            )
+            self._record_event_locked(
+                identifier,
+                "agent.task.created",
+                now,
+                state="queued",
+                role=role,
+                dependencies=list(dependency_ids),
+                parent_task_id=parent,
+                sprint_id=sprint,
+                token_budget=token_budget,
+                time_budget_seconds=float(time_budget_seconds),
             )
         task = self.get_task(identifier)
         assert task is not None
@@ -295,6 +328,15 @@ class AgentTaskStore:
             )
             if updated.rowcount != 1:
                 return None
+            self._record_event_locked(
+                str(row["task_id"]),
+                "agent.task.leased",
+                now,
+                state="leased",
+                owner_agent_id=owner,
+                attempt=int(row["attempt"]) + 1,
+                lease_expires_at=_from_epoch(expires).isoformat(),
+            )
         task = self.get_task(str(row["task_id"]))
         assert task is not None
         return AgentTaskLease(task=task, token=token)
@@ -345,11 +387,31 @@ class AgentTaskStore:
                         identifier,
                     ),
                 )
+                self._record_event_locked(
+                    identifier,
+                    "agent.task.failed",
+                    now,
+                    state="failed",
+                    owner_agent_id=str(row["owner_agent_id"]),
+                    reason="token_budget_exceeded",
+                    used_tokens=used,
+                    token_budget=budget,
+                )
                 exceeded_error = f"task {identifier!r} exceeded token budget {budget}"
             else:
                 self._conn.execute(
                     "UPDATE agent_tasks SET used_tokens = ?, updated_at = ? WHERE task_id = ?",
                     (used, now, identifier),
+                )
+                self._record_event_locked(
+                    identifier,
+                    "agent.task.tokens_recorded",
+                    now,
+                    state=str(row["state"]),
+                    owner_agent_id=str(row["owner_agent_id"]),
+                    added_tokens=token_count,
+                    used_tokens=used,
+                    token_budget=budget,
                 )
         if exceeded_error is not None:
             raise AgentTaskBudgetExceeded(exceeded_error)
@@ -407,6 +469,17 @@ class AgentTaskStore:
             ).fetchall()
             task_ids = [str(row["task_id"]) for row in rows]
             placeholders = ",".join("?" for _ in task_ids)
+            transitioning = [
+                str(row["task_id"])
+                for row in self._conn.execute(
+                    f"""
+                    SELECT task_id FROM agent_tasks
+                    WHERE task_id IN ({placeholders})
+                      AND state NOT IN ('succeeded','failed','cancelled')
+                    """,
+                    task_ids,
+                ).fetchall()
+            ]
             self._conn.execute(
                 f"""
                 UPDATE agent_tasks SET state = 'cancelled', error = ?,
@@ -415,6 +488,15 @@ class AgentTaskStore:
                 """,
                 (reason, now, *task_ids),
             )
+            for transitioning_id in transitioning:
+                self._record_event_locked(
+                    transitioning_id,
+                    "agent.task.cancelled",
+                    now,
+                    state="cancelled",
+                    reason=reason,
+                    root_task_id=identifier,
+                )
         return task_ids
 
     def recover_expired(self) -> list[str]:
@@ -494,6 +576,15 @@ class AgentTaskStore:
                 """,
                 (artifact_id, identifier, kind, uri, sha256, metadata_json, now),
             )
+            self._record_event_locked(
+                identifier,
+                "agent.task.artifact.created",
+                now,
+                artifact_id=artifact_id,
+                kind=kind,
+                uri=uri,
+                sha256=sha256,
+            )
         return AgentArtifact(
             artifact_id,
             identifier,
@@ -524,6 +615,44 @@ class AgentTaskStore:
             for row in rows
         ]
 
+    def list_events(
+        self,
+        *,
+        task_id: str | None = None,
+        event_type: str | None = None,
+        after_sequence: int = 0,
+        limit: int = 1000,
+    ) -> list[AgentTaskEvent]:
+        """Replay durable task events in global insertion order."""
+
+        if after_sequence < 0:
+            raise ValueError("after_sequence must be non-negative")
+        if not 1 <= limit <= 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        clauses = ["sequence > ?"]
+        params: list[Any] = [after_sequence]
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(_identifier(task_id, "task id"))
+        if event_type is not None:
+            clauses.append("event_type = ?")
+            params.append(_identifier(event_type, "event type"))
+        with self._lock, closing(self._conn.cursor()) as cursor:
+            rows = cursor.execute(
+                "SELECT sequence, task_id, event_json FROM agent_task_events WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY sequence LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [
+            AgentTaskEvent(
+                sequence=int(row["sequence"]),
+                task_id=str(row["task_id"]),
+                event=_json_object(row["event_json"]),
+            )
+            for row in rows
+        ]
+
     def _transition_owned(
         self, task_id: str, token: str, source: TaskState, target: TaskState
     ) -> AgentTask:
@@ -538,6 +667,14 @@ class AgentTaskStore:
             self._conn.execute(
                 "UPDATE agent_tasks SET state = ?, updated_at = ? WHERE task_id = ?",
                 (target, now, identifier),
+            )
+            self._record_event_locked(
+                identifier,
+                f"agent.task.{target}",
+                now,
+                state=target,
+                owner_agent_id=str(row["owner_agent_id"]),
+                attempt=int(row["attempt"]),
             )
         return self._required_task(identifier)
 
@@ -581,6 +718,23 @@ class AgentTaskStore:
                     identifier,
                 ),
             )
+            event_type = (
+                "agent.task.retrying"
+                if retry
+                else "agent.task.succeeded"
+                if success
+                else "agent.task.failed"
+            )
+            self._record_event_locked(
+                identifier,
+                event_type,
+                now,
+                state=state,
+                owner_agent_id=str(row["owner_agent_id"]),
+                attempt=int(row["attempt"]),
+                retryable=retry,
+                reason=None if success else error_text,
+            )
         return self._required_task(identifier)
 
     def _owned_row(self, task_id: str, token: str, now: float) -> sqlite3.Row:
@@ -623,15 +777,24 @@ class AgentTaskStore:
                     row["task_id"],
                 ),
             )
+            self._record_event_locked(
+                str(row["task_id"]),
+                "agent.task.recovered" if retry else "agent.task.failed",
+                now,
+                state="queued" if retry else "failed",
+                attempt=int(row["attempt"]),
+                retryable=retry,
+                reason="worker lease expired",
+            )
             recovered.append(str(row["task_id"]))
         return recovered
 
     def _fail_dependency_blocked_locked(self, now: float) -> None:
         while True:
-            changed = self._conn.execute(
+            blocked = self._conn.execute(
                 """
-                UPDATE agent_tasks AS candidate
-                SET state = 'failed', error = 'dependency did not succeed', updated_at = ?
+                SELECT candidate.task_id
+                FROM agent_tasks AS candidate
                 WHERE state = 'queued' AND EXISTS (
                     SELECT 1 FROM agent_task_dependencies AS dependency
                     JOIN agent_tasks AS prerequisite
@@ -639,11 +802,61 @@ class AgentTaskStore:
                     WHERE dependency.task_id = candidate.task_id
                       AND prerequisite.state IN ('failed','cancelled')
                 )
-                """,
-                (now,),
+                """
+            ).fetchall()
+            if not blocked:
+                return
+            task_ids = [str(row["task_id"]) for row in blocked]
+            placeholders = ",".join("?" for _ in task_ids)
+            changed = self._conn.execute(
+                """
+                UPDATE agent_tasks
+                SET state = 'failed', error = 'dependency did not succeed', updated_at = ?
+                WHERE state = 'queued' AND task_id IN ("""
+                + placeholders
+                + ")",
+                (now, *task_ids),
             ).rowcount
+            for task_id in task_ids:
+                self._record_event_locked(
+                    task_id,
+                    "agent.task.failed",
+                    now,
+                    state="failed",
+                    reason="dependency did not succeed",
+                )
             if not changed:
                 return
+
+    def _record_event_locked(
+        self,
+        task_id: str,
+        event_type: str,
+        now: float,
+        **data: Any,
+    ) -> None:
+        payload = _redact_event_value(
+            {
+                "type": event_type,
+                "task_id": task_id,
+                **data,
+            }
+        )
+        assert isinstance(payload, dict)
+        event = envelope_event(
+            payload,
+            source={"type": "agent_task", "id": "ash"},
+            timestamp_factory=lambda: _from_epoch(now).isoformat(),
+        )
+        event_json = _bounded_json(event, "task event")
+        self._conn.execute(
+            """
+            INSERT INTO agent_task_events
+                (event_id, task_id, event_type, event_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (event["event_id"], task_id, event_type, event_json, now),
+        )
 
     def _require_references(
         self,
@@ -759,6 +972,16 @@ def _identifier(value: str, label: str) -> str:
 
 def _optional_identifier(value: str | None, label: str) -> str | None:
     return _identifier(value, label) if value is not None else None
+
+
+def _redact_event_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, dict):
+        return {key: _redact_event_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_event_value(item) for item in value]
+    return value
 
 
 def _bounded_text(value: str, label: str, maximum: int) -> str:

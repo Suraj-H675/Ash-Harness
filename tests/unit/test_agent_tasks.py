@@ -1,3 +1,4 @@
+import json
 import time
 from pathlib import Path
 
@@ -110,6 +111,9 @@ def test_cancellation_cascades_to_dependent_tasks(state: SharedState) -> None:
 
     assert set(cancelled) == {"parent", "child", "grand"}
     assert {task.state for task in state.tasks.list_tasks()} == {"cancelled"}
+    first_events = state.tasks.list_events(event_type="agent.task.cancelled")
+    state.tasks.cancel_task("parent", reason="repeated cancellation")
+    assert state.tasks.list_events(event_type="agent.task.cancelled") == first_events
 
 
 def test_failed_dependency_is_terminally_propagated(state: SharedState) -> None:
@@ -160,3 +164,77 @@ def test_task_contract_rejects_missing_dependencies_and_non_json_metadata(
         state.tasks.create_task("bad", metadata={"value": float("nan")})
     with pytest.raises(ValueError, match="portable identifier"):
         state.tasks.create_task("bad", task_id="not portable")
+
+
+def test_task_events_are_ordered_redacted_and_cursor_replayable(
+    tmp_path: Path,
+) -> None:
+    state = SharedState(tmp_path / "events.db")
+    task = state.tasks.create_task(
+        "eventful",
+        task_id="eventful",
+        metadata={"api_key": "sk-abcdefghijklmnop"},
+    )
+    lease = state.tasks.claim_task("worker", task_id=task.task_id)
+    assert lease is not None
+    state.tasks.start_task(task.task_id, lease.token)
+    state.tasks.record_tokens(task.task_id, lease.token, 7)
+    state.tasks.fail_task(
+        task.task_id,
+        lease.token,
+        "provider exposed sk-abcdefghijklmnop",
+        retryable=False,
+    )
+
+    events = state.tasks.list_events(task_id=task.task_id)
+    assert [item.event["type"] for item in events] == [
+        "agent.task.created",
+        "agent.task.leased",
+        "agent.task.running",
+        "agent.task.tokens_recorded",
+        "agent.task.failed",
+    ]
+    assert [item.sequence for item in events] == sorted(
+        item.sequence for item in events
+    )
+    assert all(item.event["schema_version"] == 1 for item in events)
+    assert all(item.event["source"]["type"] == "agent_task" for item in events)
+    assert events[0].event["token_budget"] == 4000
+    assert "sk-abcdefghijklmnop" not in json.dumps(events[-1].event)
+    replay = state.tasks.list_events(
+        after_sequence=events[1].sequence,
+        event_type="agent.task.failed",
+    )
+    assert [item.sequence for item in replay] == [events[-1].sequence]
+
+
+def test_task_events_cover_retry_dependency_failure_and_artifacts(tmp_path: Path) -> None:
+    state = SharedState(tmp_path / "events.db")
+    parent = state.tasks.create_task("parent", task_id="parent", max_attempts=2)
+    state.tasks.create_task("child", task_id="child", dependencies=[parent.task_id])
+    lease = state.tasks.claim_task("worker", task_id=parent.task_id)
+    assert lease is not None
+    state.tasks.start_task(parent.task_id, lease.token)
+    state.tasks.fail_task(parent.task_id, lease.token, "transient", retryable=True)
+    retry = state.tasks.claim_task("worker-2", task_id=parent.task_id)
+    assert retry is not None
+    state.tasks.start_task(parent.task_id, retry.token)
+    state.tasks.fail_task(parent.task_id, retry.token, "terminal")
+    assert state.tasks.claim_task("worker-3") is None
+    state.tasks.add_artifact(parent.task_id, kind="report", uri="report.json")
+
+    event_types = [item.event["type"] for item in state.tasks.list_events()]
+    assert "agent.task.retrying" in event_types
+    assert event_types.count("agent.task.failed") == 2
+    assert "agent.task.artifact.created" in event_types
+
+
+def test_task_event_replay_validates_cursor_filter_and_limit(tmp_path: Path) -> None:
+    state = SharedState(tmp_path / "events.db")
+    state.tasks.create_task("one", task_id="one")
+    with pytest.raises(ValueError, match="after_sequence"):
+        state.tasks.list_events(after_sequence=-1)
+    with pytest.raises(ValueError, match="limit"):
+        state.tasks.list_events(limit=0)
+    with pytest.raises(ValueError, match="portable identifier"):
+        state.tasks.list_events(event_type="not valid")

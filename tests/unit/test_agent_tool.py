@@ -24,6 +24,8 @@ class FakeProvider(ProviderABC):
 async def test_spawn_agent_uses_provider_and_persists_report(tmp_path) -> None:
     state = SharedState(tmp_path / "agents.db")
     tool = SpawnAgentTool(SafetyGuard(tmp_path), state, FakeProvider)
+    emitted: list[dict] = []
+    tool.set_event_sink(emitted.append)
     result = await tool.run(role="reviewer", task="inspect tests", agent_id="worker")
     assert result.success is True
     assert result.output == "evidence: tests pass"
@@ -33,6 +35,13 @@ async def test_spawn_agent_uses_provider_and_persists_report(tmp_path) -> None:
     assert durable[0].state == "succeeded"
     assert durable[0].owner_agent_id == "worker"
     assert durable[0].result["summary"] == "evidence: tests pass"
+    assert [event["type"] for event in emitted] == [
+        "agent.task.created",
+        "agent.task.leased",
+        "agent.task.running",
+        "agent.task.succeeded",
+    ]
+    assert all(event["task_id"] == durable[0].task_id for event in emitted)
     await tool.aclose()
 
 

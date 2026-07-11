@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from agents.shared_state import SharedState
-from agents.tasks import AgentArtifact, AgentTask, TaskState
+from agents.tasks import AgentArtifact, AgentTask, AgentTaskEvent, TaskState
 from ash.runtime import build_runtime
 from config import AshConfig
 from core.events import EVENT_SCHEMA_VERSION, envelope_event, event_data
@@ -329,6 +329,27 @@ class AshClient:
         shared = SharedState(self.config.db_directory / "agents.db")
         try:
             return shared.tasks.list_artifacts(task_id)
+        finally:
+            shared.close()
+
+    def agent_task_events(
+        self,
+        *,
+        task_id: str | None = None,
+        event_type: str | None = None,
+        after_sequence: int = 0,
+        limit: int = 1000,
+    ) -> list[AgentTaskEvent]:
+        """Replay versioned durable subagent task events."""
+
+        shared = SharedState(self.config.db_directory / "agents.db")
+        try:
+            return shared.tasks.list_events(
+                task_id=task_id,
+                event_type=event_type,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
         finally:
             shared.close()
 

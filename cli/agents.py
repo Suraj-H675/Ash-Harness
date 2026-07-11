@@ -86,6 +86,33 @@ def list_agent_tasks(
         state.close()
 
 
+def list_agent_task_events(
+    db_path: str | Path,
+    *,
+    task_id: str | None = None,
+    event_type: str | None = None,
+    after_sequence: int = 0,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    state = SharedState(db_path)
+    try:
+        return [
+            {
+                "sequence": item.sequence,
+                "task_id": item.task_id,
+                "event": item.event,
+            }
+            for item in state.tasks.list_events(
+                task_id=task_id,
+                event_type=event_type,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
+        ]
+    finally:
+        state.close()
+
+
 def list_agent_messages(
     db_path: str | Path,
     *,
@@ -233,6 +260,26 @@ def render_agent_tasks(
         f"tokens={item['used_tokens']}/{item['token_budget']}: "
         f"{item['description']}"
         for item in tasks
+    )
+
+
+def render_agent_task_events(
+    events: list[dict[str, Any]],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"events": events}, sort_keys=True)
+    if not events:
+        return "No durable agent task events recorded."
+    return "\n".join(
+        f"{item['sequence']} {item['task_id']} {item['event']['type']}"
+        + (
+            f" state={item['event']['state']}"
+            if item["event"].get("state")
+            else ""
+        )
+        for item in events
     )
 
 

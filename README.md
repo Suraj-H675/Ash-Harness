@@ -155,6 +155,8 @@ Every provider-backed worker also runs through the durable task contract in
 renewable ownership leases, crash recovery, token/time budgets, dependency
 DAGs, cancellation, results, and artifacts are persisted in SQLite. Inspect
 them with `ash agents tasks [--state STATE] [--owner ID] [--json]`.
+Replay their versioned lifecycle with
+`ash agents events [--task ID] [--type TYPE] [--after SEQUENCE] [--json]`.
 
 Plugins are self-contained local directories with a root `plugin.json`.
 Manifests may declare path-based `skills`, `commands`, `agents`, `hooks`, and

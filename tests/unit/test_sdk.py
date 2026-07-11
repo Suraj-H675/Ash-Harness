@@ -130,10 +130,16 @@ async def test_sdk_exposes_typed_durable_agent_tasks_and_artifacts(tmp_path) -> 
 
         tasks = client.agent_tasks(state="succeeded", owner_agent_id="sdk-worker")
         artifacts = client.agent_artifacts("sdk-task")
+        events = client.agent_task_events(
+            task_id="sdk-task", event_type="agent.task.succeeded"
+        )
 
         assert [task.task_id for task in tasks] == ["sdk-task"]
         assert tasks[0].result == {"summary": "done"}
         assert [artifact.uri for artifact in artifacts] == ["artifact://sdk"]
+        assert [event.event["type"] for event in events] == [
+            "agent.task.succeeded"
+        ]
     finally:
         state.close()
         await client.close()

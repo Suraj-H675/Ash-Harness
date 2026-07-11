@@ -7,14 +7,16 @@ from pathlib import Path
 from agents.shared_state import SharedState
 from ash.cli import main
 from cli.agents import (
-    render_agent_branches,
     list_agent_messages,
     list_agent_reports,
     list_agent_statuses,
+    list_agent_task_events,
     list_agent_tasks,
+    render_agent_branches,
     render_agent_messages,
     render_agent_reports,
     render_agent_statuses,
+    render_agent_task_events,
     render_agent_tasks,
     render_sent_agent_message,
     send_agent_message,
@@ -88,6 +90,29 @@ def test_agent_task_renderer_includes_durable_artifacts(tmp_path: Path) -> None:
     assert payload["tasks"][0]["used_tokens"] == 5
     assert payload["tasks"][0]["result"] == {"summary": "done"}
     assert payload["tasks"][0]["artifacts"][0]["kind"] == "git-commit"
+
+
+def test_agent_task_event_renderer_supports_cursor_and_type_filters(
+    tmp_path: Path,
+) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    state.tasks.create_task("trace", task_id="trace")
+    lease = state.tasks.claim_task("worker", task_id="trace")
+    assert lease is not None
+    state.tasks.start_task("trace", lease.token)
+    state.close()
+
+    all_events = list_agent_task_events(tmp_path / "agents.db", task_id="trace")
+    events = list_agent_task_events(
+        tmp_path / "agents.db",
+        event_type="agent.task.running",
+        after_sequence=all_events[0]["sequence"],
+    )
+    payload = json.loads(render_agent_task_events(events, json_output=True))
+
+    assert [item["event"]["type"] for item in payload["events"]] == [
+        "agent.task.running"
+    ]
 
 
 def test_agent_message_renderer_emits_json(tmp_path: Path) -> None:
@@ -166,6 +191,26 @@ def test_agents_cli_lists_filtered_durable_tasks(
 
     assert main(["agents", "tasks", "--limit", "0"]) == 2
     assert "limit must be between" in capsys.readouterr().err
+
+
+def test_agents_cli_replays_filtered_task_events(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db"
+    state = SharedState(db_dir / "agents.db")
+    state.tasks.create_task("trace", task_id="trace")
+    state.close()
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+
+    assert main(["agents", "events", "--task", "trace", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["events"][0]["task_id"] == "trace"
+    assert payload["events"][0]["event"]["type"] == "agent.task.created"
 
 
 def test_agents_cli_discard_requires_explicit_confirmation(
