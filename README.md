@@ -167,6 +167,11 @@ worktrees without changing the lead branch.
 Use `ash agents tasks --graph GRAPH_ID` to inspect one graph and
 `ash agents cancel GRAPH_ID --yes` to revoke its queued and active work.
 
+Large tool catalogs are deferred automatically above 32 tools. The model uses
+`search_tools` to discover and activate exact schemas for plugin, MCP, and
+built-in capabilities; set `tool_search_threshold = 0` in config to always send
+the full catalog.
+
 Plugins are self-contained local directories with a root `plugin.json`.
 Manifests may declare path-based `skills`, `commands`, `agents`, `hooks`, and
 `mcpServers`; omitted fields use the conventional `skills/`, `commands/`,

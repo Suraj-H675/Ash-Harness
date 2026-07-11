@@ -21,6 +21,20 @@ allocation targets; the combined provider input is the hard constraint. Tool
 schema tokens are reserved before history compaction and are included in the
 reported total.
 
+## Deferred tool schemas
+
+`search_tools` indexes the complete live built-in, plugin, skill, and MCP tool
+catalog. When the catalog exceeds `tool_search_threshold` (32 by default), Ash
+sends only a compact essential set and `search_tools` to the provider. A search
+returns the best matching names, descriptions, and exact input schemas and
+activates those matches for the next model iteration. Activation lasts for the
+current session and resets when the session changes. Set
+`tool_search_threshold = 0` to send the full catalog on every request.
+
+Only visible schemas count against the tools budget. Deferred tools remain in
+the runtime registry and continue through normal validation, permissions,
+hooks, audit, event, and result-persistence paths after activation.
+
 After a request is assembled, `ContextBudgetReport.fragments` records each
 fragment's typed kind, source, trust class, token use and limit, truncation
 state, SHA-256, and non-content metadata. The report intentionally does not

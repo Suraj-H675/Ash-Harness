@@ -529,6 +529,10 @@ class AshLoop:
 
         if self._mcp_configs and self._mcp_runtime is None:
             await self._start_mcp_runtime()
+        search_tool = self.tools.get("search_tools")
+        reset_activations = getattr(search_tool, "reset_activations", None)
+        if callable(reset_activations):
+            reset_activations()
 
         if self.current_session is not None and self._hook_session_open:
             reason = (
@@ -1292,6 +1296,13 @@ class AshLoop:
             )
         return result
 
+    def _provider_tools(self) -> dict[str, BaseTool]:
+        search_tool = self.tools.get("search_tools")
+        visible_tools = getattr(search_tool, "visible_tools", None)
+        if callable(visible_tools):
+            return dict(visible_tools(self.tools))
+        return self.tools
+
     def _estimate_tool_schema_tokens(self) -> int:
         """Estimate tool declaration tokens reserved outside chat messages."""
 
@@ -1303,13 +1314,14 @@ class AshLoop:
     def _tool_schema_payload(self) -> list[dict[str, Any]]:
         """Return the exact provider-facing representation used for budgeting."""
 
-        if not self.tools:
+        provider_tools = self._provider_tools()
+        if not provider_tools:
             return []
         if _provider_capabilities(self.provider).native_tools:
-            return self._tools_to_openai_format(self.tools)
+            return self._tools_to_openai_format(provider_tools)
         return [
             {"name": tool.name, "description": getattr(tool, "description", "")}
-            for tool in self.tools.values()
+            for tool in provider_tools.values()
         ]
 
     async def _stream_one_completion(
@@ -1320,9 +1332,10 @@ class AshLoop:
 
         canonical_messages = normalize_messages(messages)
         # Build OpenAI-format tools list for providers that support native tool_calls.
+        provider_tools = self._provider_tools()
         openai_tools = (
-            self._tools_to_openai_format(self.tools)
-            if self.tools and _provider_capabilities(self.provider).native_tools
+            self._tools_to_openai_format(provider_tools)
+            if provider_tools and _provider_capabilities(self.provider).native_tools
             else None
         )
 

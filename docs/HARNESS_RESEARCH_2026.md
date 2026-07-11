@@ -327,8 +327,8 @@ not remove them.
 |---|---|---|
 | Agent loop and streaming | Partial | Public event schema v1 and validated provider-portable message/content/tool-call inputs now span the runtime and adapters; the loop remains monolithic and legacy XML fallback is mixed into canonical behavior. |
 | Provider layer | Strong partial | Built-ins, embedders, declared model capabilities, and custom OpenAI-compatible endpoints resolve through thread-safe linked registries; auth/discovery and non-text modalities remain limited. |
-| Coding tools | Strong | No PTY terminal session, tool search, browser, web search, media, scheduler, or messaging. |
-| Context budgets | Strong partial | Provider totals now include reserved tool schemas; typed hashed fragments expose source/trust provenance; deterministic compaction preserves task/path/action/outcome state and redacts persisted summaries. Model-assisted compaction remains. |
+| Coding tools | Strong | Exact-schema deferred tool search is live; PTY terminal sessions, browser, web search, media, scheduler, and messaging remain. |
+| Context budgets | Strong partial | Provider totals reserve only currently visible tool schemas; large catalogs defer nonessential tools behind session-scoped search activation. Typed hashed fragments and deterministic compaction preserve provenance and task/path/action/outcome state. Model-assisted compaction remains. |
 | Sessions/recovery | Strong partial | SQLite schema v9 persists redacted cursor-replayable events plus atomic parent-first session trees, bounded branch metadata, safe fork boundaries, tree-aware retention, and SDK/CLI/HTTP/JSON-RPC access. Per-turn config snapshots and richer branch navigation/summarization remain. |
 | Memory | Partial | FTS/vector/Markdown exist; lifecycle, provenance, expiry, poisoning controls, and user workflow are incomplete. |
 | Subagents | Strong local | Provider-backed roles, shared state, steering, atomic DAG dispatch, bounded retries, restart recovery, redacted result context, and branch-verified Git artifact handoff exist; remote A2A and non-Git artifact materialization remain. |
@@ -406,7 +406,7 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 1074 passed, 8 environment-dependent skips on Python
+- Current verification: 1077 passed, 8 environment-dependent skips on Python
   3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
   race is covered by Ash's portable process completion helper.
 
@@ -446,8 +446,9 @@ sessions migrate, and provider/tool fakes cover the state machine.
    plugins. Provider/storage/interface/channel/service contribution kinds remain
    future versioned capabilities.
 3. Expand lifecycle hooks and add tool search/profiles: bounded hook contract v1
-   covers session/turn/model/tool/error events and failure semantics; context
-   compaction events, explicit ordering, tool search, and profiles remain.
+   covers session/turn/model/tool/error events and failure semantics; exact
+   schema tool search now defers large live catalogs and activates matches per
+   session. Context-compaction events, explicit ordering, and profiles remain.
 4. Implement ACP server mode and a conformance test client.
 
 Exit criterion: external clients and extensions can use Ash without importing

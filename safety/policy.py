@@ -36,6 +36,7 @@ READ_ONLY_TOOLS = frozenset(
         "git_log",
         "list_skills",
         "activate_skill",
+        "search_tools",
         "ask_user",
     }
 )

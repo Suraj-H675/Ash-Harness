@@ -101,6 +101,7 @@ def build_tools(
     from tools.process import BackgroundProcessTool
     from tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
     from tools.symbols import FindReferencesTool, FindSymbolTool
+    from tools.tool_search import SearchToolsTool
     from tools.web import WebFetchTool
 
     root = project_root if project_root is not None else safety_guard.project_root
@@ -193,6 +194,14 @@ def build_tools(
             ]
         )
     by_name = {tool.name: tool for tool in tools}
+    tool_search = SearchToolsTool(
+        safety_guard,
+        lambda: by_name,
+        threshold=(runtime_config.tool_search_threshold if runtime_config else 32),
+    )
+    if tool_search.name in by_name:
+        raise ValueError(f"tool collides with an existing tool: {tool_search.name}")
+    by_name[tool_search.name] = tool_search
     plugin_tools = build_plugin_runtime_tools(
         plugins,
         safety_guard,

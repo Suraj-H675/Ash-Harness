@@ -15,7 +15,9 @@ def test_plan_mode_allows_reads() -> None:
     assert decision.action == PolicyAction.ALLOW
 
 
-@pytest.mark.parametrize("tool_name", ["find_symbol", "find_references"])
+@pytest.mark.parametrize(
+    "tool_name", ["find_symbol", "find_references", "search_tools"]
+)
 def test_structural_navigation_tools_are_read_only(tool_name: str) -> None:
     decision = PermissionPolicy("plan").evaluate(tool_name, {"query": "Example"})
     assert decision.action == PolicyAction.ALLOW

@@ -155,6 +155,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | List/glob files | Verified locally | Bounded production tools with workspace scoping |
 | Text/regex search | Verified locally | Ripgrep-backed bounded search with Python fallback |
 | Symbol/code search | Verified locally | Read-only `find_symbol` and `find_references` tools use the incremental Tree-sitter index, exact locations, case controls, globs, and bounded results |
+| Deferred tool search | Verified locally | Large built-in/plugin/MCP catalogs expose an essential set plus `search_tools`; ranked matches return exact schemas, activate on the next iteration, reset per session, and alone consume schema budget |
 | Shell execution | Verified locally | Foreground and managed background commands share fail-closed sandbox injection, process-tree termination, and child env scrubbing; foreground stdout/stderr stream as call-correlated, incrementally redacted, bounded events through inline TUI, viewport, SDK, and stream-JSON surfaces |
 | Git status/diff/log | Verified locally | Read-only bounded Git inspection tools |
 | Git commit | Verified locally | Explicit staging scope is required, unrelated pre-staged paths are refused, staged additions are secret-scanned, and Git hook/stdout/stderr failures are surfaced with exit codes |

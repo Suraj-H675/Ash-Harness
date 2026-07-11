@@ -41,6 +41,7 @@ PROJECT_CONFIG_FIELDS = frozenset(
         "max_tool_result_tokens",
         "max_attachment_tokens",
         "steering_queue_limit",
+        "tool_search_threshold",
         "prompt_cache_enabled",
         "prompt_cache_retention",
         "provider_max_attempts",
@@ -269,6 +270,15 @@ class AshConfig(BaseSettings):
         ge=1,
         le=100,
         description="Maximum user steering messages waiting for a running turn.",
+    )
+    tool_search_threshold: int = Field(
+        32,
+        ge=0,
+        le=1000,
+        description=(
+            "Defer nonessential provider tool schemas above this catalog size; "
+            "0 disables deferred loading."
+        ),
     )
     prompt_cache_enabled: bool = Field(
         True,

@@ -491,7 +491,8 @@ def test_trusted_project_layers_have_precise_precedence_and_provenance(
     )
     nested_config = nested / ".ash" / "config.toml"
     nested_config.write_text(
-        'model = "openai/project-model"\nmax_context_tokens = 64000\n',
+        'model = "openai/project-model"\nmax_context_tokens = 64000\n'
+        "tool_search_threshold = 24\n",
         encoding="utf-8",
     )
     cli_config.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -508,6 +509,7 @@ def test_trusted_project_layers_have_precise_precedence_and_provenance(
     assert config.workspace_root == root.resolve()
     assert config.model == "openai/project-model"
     assert config.max_context_tokens == 64000
+    assert config.tool_search_threshold == 24
     assert config.temperature == 0.4
     assert config.max_completion_tokens == 1234
     assert config.config_source("model") == ("project", str(nested_config))
