@@ -310,6 +310,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             SkillCatalog,
             SkillSource,
         )
+        from plugins.runtime import build_plugin_runtime_tools
         from tools.agent import SpawnAgentTool
 
         trusted = is_workspace_trusted(loop.project_root)
@@ -409,6 +410,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             for path in plugin.mcp_paths()
         )
         next_mcp = load_mcp_server_sources(mcp_sources)
+        next_plugin_tools = build_plugin_runtime_tools(
+            plugins,
+            loop.safety_guard,
+            backend_preference=config.sandbox_backend,
+            docker_image=config.sandbox_docker_image,
+            allow_unisolated=config.allow_unsafe_plugin_runtime,
+        )
 
         list_skills_tool = loop.tools.get("list_skills")
         activate_skill_tool = loop.tools.get("activate_skill")
@@ -429,6 +437,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             )
         next_hooks.set_event_sink(loop._emit_event)
         loop.hooks = next_hooks
+        await loop.reload_plugin_runtime_tools(next_plugin_tools)
         mcp_errors = await loop.reload_mcp_servers(next_mcp)
         custom_commands = next_commands
         discovered_commands = next_discovered_commands
@@ -438,6 +447,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         summary = (
             f"Reloaded {len(plugins)} plugin(s): {len(discovered_skills)} skills, "
             f"{len(discovered_agents)} agents, {len(discovered_commands)} commands, "
+            f"{len(next_plugin_tools)} executable tools, "
             f"{len(hook_sources)} hook config(s), {len(next_mcp)} MCP server(s)."
         )
         if mcp_errors:

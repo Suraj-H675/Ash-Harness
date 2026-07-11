@@ -10,11 +10,115 @@ from typing import Any, Mapping
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, parse
+from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
 
 
 CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION = 1
 MAX_PLUGIN_MANIFEST_BYTES = 128 * 1024
 PLUGIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+PLUGIN_TOOL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+PLUGIN_RUNTIME_PROTOCOL_VERSION = 1
+MAX_PLUGIN_RUNTIME_TOOLS = 64
+PLUGIN_TOOL_NAME_MAX_LENGTH = 64
+
+
+def namespaced_plugin_tool_name(plugin_name: str, tool_name: str) -> str:
+    """Build an injective, provider-portable executable plugin tool name."""
+
+    namespace = plugin_name.replace(".", "_dot_")
+    candidate = f"plugin_{len(plugin_name)}_{namespace}__{tool_name}"
+    if len(candidate) > PLUGIN_TOOL_NAME_MAX_LENGTH:
+        raise ValueError(
+            f"plugin tool name {candidate!r} exceeds "
+            f"{PLUGIN_TOOL_NAME_MAX_LENGTH} characters after namespacing"
+        )
+    if not PLUGIN_TOOL_NAME.fullmatch(candidate):
+        raise ValueError(f"plugin tool name {candidate!r} is not provider-portable")
+    return candidate
+
+
+@dataclass(frozen=True)
+class PluginRuntimeManifest:
+    command: tuple[str, ...]
+    protocol_version: int = PLUGIN_RUNTIME_PROTOCOL_VERSION
+    timeout_seconds: float = 30.0
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "PluginRuntimeManifest":
+        if not isinstance(data, dict):
+            raise ValueError("plugin runtime must be an object")
+        command = data.get("command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or not all(isinstance(part, str) and part for part in command)
+        ):
+            raise ValueError("plugin runtime command must be a non-empty argv list")
+        if len(command) > 128 or any(len(part) > 4096 for part in command):
+            raise ValueError("plugin runtime command is too large")
+        protocol_version = data.get(
+            "protocolVersion",
+            data.get("protocol_version", PLUGIN_RUNTIME_PROTOCOL_VERSION),
+        )
+        if protocol_version != PLUGIN_RUNTIME_PROTOCOL_VERSION:
+            raise ValueError(
+                "plugin runtime protocolVersion must be "
+                f"{PLUGIN_RUNTIME_PROTOCOL_VERSION}"
+            )
+        timeout_seconds = data.get("timeoutSeconds", data.get("timeout_seconds", 30))
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not 0.1 <= float(timeout_seconds) <= 300
+        ):
+            raise ValueError(
+                "plugin runtime timeoutSeconds must be between 0.1 and 300"
+            )
+        return cls(tuple(command), protocol_version, float(timeout_seconds))
+
+
+@dataclass(frozen=True)
+class PluginToolManifest:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "PluginToolManifest":
+        if not isinstance(data, dict):
+            raise ValueError("plugin tool declarations must be objects")
+        name = data.get("name")
+        description = data.get("description")
+        schema = data.get("inputSchema", data.get("input_schema"))
+        if not isinstance(name, str) or not PLUGIN_TOOL_NAME.fullmatch(name):
+            raise ValueError(
+                "plugin tool name must start with a letter and contain only "
+                "letters, numbers, underscores, or hyphens"
+            )
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError("plugin tool description must be a non-empty string")
+        if len(description) > 4096:
+            raise ValueError("plugin tool description cannot exceed 4096 characters")
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            raise ValueError("plugin tool inputSchema must be an object JSON Schema")
+        try:
+            encoded_schema = json.dumps(
+                schema,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "plugin tool inputSchema must contain JSON values"
+            ) from exc
+        if len(encoded_schema.encode("utf-8")) > 128 * 1024:
+            raise ValueError("plugin tool inputSchema exceeds 128 KiB")
+        try:
+            Draft202012Validator.check_schema(schema)
+        except SchemaError as exc:
+            raise ValueError(f"invalid plugin tool inputSchema: {exc.message}") from exc
+        return cls(name, description.strip(), schema)
 
 
 @dataclass
@@ -29,6 +133,8 @@ class PluginManifest:
     mcp_servers: list[str | dict[str, Any]] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
     dependencies: list[dict[str, str]] = field(default_factory=list)
+    runtime: PluginRuntimeManifest | None = None
+    tools: list[PluginToolManifest] = field(default_factory=list)
     # e.g. [{"name": "other-plugin", "version": ">=1.0.0"}]
 
     @classmethod
@@ -73,6 +179,29 @@ class PluginManifest:
             for dependency in dependencies
         ):
             raise ValueError("plugin dependencies must be name/version objects")
+        runtime_data = data.get("runtime")
+        runtime = (
+            PluginRuntimeManifest.from_dict(runtime_data)
+            if runtime_data is not None
+            else None
+        )
+        tool_data = data.get("tools", [])
+        if not isinstance(tool_data, list):
+            raise ValueError("plugin tools must be a list")
+        if len(tool_data) > MAX_PLUGIN_RUNTIME_TOOLS:
+            raise ValueError(
+                f"plugin cannot declare more than {MAX_PLUGIN_RUNTIME_TOOLS} tools"
+            )
+        tools = [PluginToolManifest.from_dict(item) for item in tool_data]
+        if bool(runtime) != bool(tools):
+            raise ValueError("plugin runtime and tools must be declared together")
+        if len({tool.name for tool in tools}) != len(tools):
+            raise ValueError("plugin tool names must be unique")
+        namespaced_tools = [
+            namespaced_plugin_tool_name(name, tool.name) for tool in tools
+        ]
+        if len(set(namespaced_tools)) != len(namespaced_tools):
+            raise ValueError("plugin tool names collide after namespacing")
         return cls(
             name=name,
             version=version,
@@ -84,6 +213,8 @@ class PluginManifest:
             mcp_servers=mcp_servers,
             skills=skills,
             dependencies=dependencies,
+            runtime=runtime,
+            tools=tools,
         )
 
     def check_dependencies(self, installed_plugins: Mapping[str, str]) -> list[str]:

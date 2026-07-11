@@ -166,6 +166,12 @@ class SandboxManager:
     extra_read_only_paths
         Additional read-only paths to expose to tier-2/3 backends
         (e.g. system libraries).
+    workspace_read_only
+        Mount the workspace read-only in isolated backends. Direct execution
+        cannot enforce this and therefore still requires explicit consent.
+    require_read_isolation
+        Skip backends that can prevent writes but still expose arbitrary host
+        files for reading. Executable extensions enable this requirement.
     """
 
     workspace_root: Path | None = None
@@ -173,6 +179,8 @@ class SandboxManager:
     network: bool = False
     timeout_seconds: int = 300
     extra_read_only_paths: tuple[Path, ...] = field(default_factory=tuple)
+    workspace_read_only: bool = False
+    require_read_isolation: bool = False
     allow_scoped_fallback: bool = False
     backend_preference: str = "auto"
     docker_image: str = DEFAULT_IMAGE
@@ -223,7 +231,9 @@ class SandboxManager:
 
         isolated = self.is_fully_isolated()
         if isolated:
-            filesystem = "workspace-write"
+            filesystem = (
+                "workspace-read" if self.workspace_read_only else "workspace-write"
+            )
             network = "enabled" if self.network else "blocked"
             detail = (
                 "Commands are isolated to the workspace and temporary storage; "
@@ -356,7 +366,11 @@ class SandboxManager:
         if use_native and self.preferred_tier >= SANDBOX_TIER_BWRAP:
             if sys.platform.startswith("linux") and self._backend_available("bwrap"):
                 return SANDBOX_TIER_BWRAP
-            if sys.platform == "darwin" and self._backend_available("sandbox_exec"):
+            if (
+                sys.platform == "darwin"
+                and not self.require_read_isolation
+                and self._backend_available("sandbox_exec")
+            ):
                 return SANDBOX_TIER_BWRAP
         if (
             use_docker
@@ -385,6 +399,7 @@ class SandboxManager:
                 workspace_root=self.workspace_root,
                 network=self.network,
                 image=self.docker_image,
+                workspace_read_only=self.workspace_read_only,
             )
             # Docker can disappear after startup (daemon stopped, Desktop
             # restarting, or the configured image removed).  Re-probe here so
@@ -401,14 +416,20 @@ class SandboxManager:
                     workspace_root=self.workspace_root,
                     read_only_paths=self.extra_read_only_paths,
                     network=self.network,
+                    workspace_read_only=self.workspace_read_only,
                 )
                 if not bwrap_backend.is_available():
                     raise SandboxBackendUnavailable("bwrap backend unavailable")
                 return bwrap_backend
             if has_sandbox_exec():
+                if self.require_read_isolation:
+                    raise SandboxBackendUnavailable(
+                        "sandbox-exec does not isolate host file reads"
+                    )
                 return _SandboxExecBackend(
                     workspace_root=self.workspace_root,
                     network=self.network,
+                    workspace_read_only=self.workspace_read_only,
                 )
         return _ScopedBackend()
 
@@ -549,6 +570,7 @@ class _SandboxExecBackend(SandboxBackend):
     tier: SandboxTier = SANDBOX_TIER_BWRAP
     workspace_root: Path | None = None
     network: bool = False
+    workspace_read_only: bool = False
 
     def is_available(self) -> bool:
         return has_sandbox_exec()
@@ -581,23 +603,35 @@ class _SandboxExecBackend(SandboxBackend):
                 raise SandboxBackendUnavailable(
                     f"sandbox cwd is not a directory: {cwd_path}"
                 )
-        profile = _sandbox_exec_profile(root, network=self.network)
+        profile = _sandbox_exec_profile(
+            root,
+            network=self.network,
+            workspace_read_only=self.workspace_read_only,
+        )
         return ["sandbox-exec", "-p", profile, *command]
 
 
-def _sandbox_exec_profile(workspace_root: Path, *, network: bool) -> str:
+def _sandbox_exec_profile(
+    workspace_root: Path,
+    *,
+    network: bool,
+    workspace_read_only: bool = False,
+) -> str:
     root = _escape_sandbox_literal(str(workspace_root))
     network_rules = (
         "(allow network*)"
         if network
         else "(deny network-outbound)\n(deny network-inbound)"
     )
+    workspace_write_rule = (
+        "" if workspace_read_only else f'(allow file-write* (subpath "{root}"))'
+    )
     return f"""(version 1)
 (deny default)
 (allow process-exec)
 (allow process-fork)
 (allow file-read*)
-(allow file-write* (subpath \"{root}\"))
+{workspace_write_rule}
 (allow file-write* (subpath \"/tmp\"))
 (allow file-write* (subpath \"/private/tmp\"))
 (allow sysctl-read)

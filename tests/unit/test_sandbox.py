@@ -244,6 +244,36 @@ def test_manager_status_describes_enforcement(tmp_path: Path) -> None:
     assert status["remediation"] == ""
 
 
+def test_manager_reports_read_only_workspace(tmp_path: Path) -> None:
+    with (
+        patch("sandbox.manager.sys.platform", "linux"),
+        patch("sandbox.manager.has_bwrap", return_value=True),
+        patch("sandbox.manager.has_docker", return_value=False),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            workspace_read_only=True,
+        )
+
+    assert manager.status()["filesystem"] == "workspace-read"
+
+
+def test_read_isolation_requirement_skips_macos_sandbox_exec(
+    tmp_path: Path,
+) -> None:
+    with (
+        patch("sandbox.manager.sys.platform", "darwin"),
+        patch("sandbox.manager.has_sandbox_exec", return_value=True),
+        patch("sandbox.manager.has_docker", return_value=False),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            require_read_isolation=True,
+        )
+
+    assert manager.tier == SANDBOX_TIER_SCOPED
+
+
 # ---------------------------------------------------------------------------
 # Bubblewrap argv construction
 # ---------------------------------------------------------------------------
@@ -306,6 +336,24 @@ def test_bubblewrap_raises_when_binary_missing(tmp_path: Path) -> None:
         backend.wrap(["echo", "hi"])
 
 
+def test_bubblewrap_can_mount_workspace_read_only(tmp_path: Path) -> None:
+    if not sys.platform.startswith("linux"):
+        pytest.skip("bubblewrap backend is Linux-only")
+    fake = tmp_path / "bwrap"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    backend = BubblewrapSandbox(
+        workspace_root=tmp_path,
+        workspace_read_only=True,
+        bwrap_path=str(fake),
+    )
+
+    argv = backend.wrap(["echo", "hi"], cwd=tmp_path)
+
+    root_index = argv.index(str(tmp_path))
+    assert argv[root_index - 1] == "--ro-bind"
+
+
 # ---------------------------------------------------------------------------
 # Docker argv construction
 # ---------------------------------------------------------------------------
@@ -345,6 +393,22 @@ def test_docker_wrap_includes_security_flags(tmp_path: Path) -> None:
     assert argv[argv.index("--workdir") + 1] == "/workspace"
     # Image + command tail.
     assert argv[-2:] == ["echo", "hi"]
+
+
+def test_docker_can_mount_workspace_read_only(tmp_path: Path) -> None:
+    fake = tmp_path / "docker"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    backend = DockerSandbox(
+        workspace_root=tmp_path,
+        workspace_read_only=True,
+        docker_path=str(fake),
+    )
+
+    argv = backend.wrap(["echo", "hi"])
+
+    mount = argv[argv.index("--mount") + 1]
+    assert mount.endswith("target=/workspace,readonly")
 
 
 def test_docker_forwards_environment_by_name_without_exposing_value(
@@ -619,3 +683,16 @@ def test_macos_profile_can_explicitly_allow_network(tmp_path: Path) -> None:
         )[2]
     assert "(allow network*)" in profile
     assert "(deny network-outbound)" not in profile
+
+
+def test_macos_profile_can_deny_workspace_writes(tmp_path: Path) -> None:
+    from sandbox.manager import _SandboxExecBackend
+
+    with patch("sandbox.manager.has_sandbox_exec", return_value=True):
+        profile = _SandboxExecBackend(
+            workspace_root=tmp_path,
+            workspace_read_only=True,
+        ).wrap(["echo", "ok"], cwd=tmp_path)[2]
+
+    assert f'(allow file-write* (subpath "{tmp_path}"))' not in profile
+    assert '(allow file-write* (subpath "/tmp"))' in profile

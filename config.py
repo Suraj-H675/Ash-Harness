@@ -400,6 +400,12 @@ class AshConfig(BaseSettings):
         False,
         description="Allow full auto mode without an OS-level sandbox.",
     )
+    allow_unsafe_plugin_runtime: bool = Field(
+        False,
+        description=(
+            "Allow executable plugins without OS filesystem and network isolation."
+        ),
+    )
     sandbox_backend: str = Field(
         "auto",
         description="Command isolation backend: auto, native, docker, or direct.",

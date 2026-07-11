@@ -15,7 +15,7 @@ from hooks.config import (
     HookConfigSource,
     load_command_hooks,
 )
-from plugins.manifest import PluginManifest
+from plugins.manifest import PluginManifest, namespaced_plugin_tool_name
 from plugins.lifecycle import (
     PluginLifecycleError,
     install_local_plugin,
@@ -60,6 +60,8 @@ class PluginSummary:
     hooks: tuple[str, ...]
     mcp_servers: tuple[str, ...]
     agents: tuple[str, ...]
+    runtime_protocol: int | None
+    tools: tuple[str, ...]
     enabled: bool
 
 
@@ -223,6 +225,15 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
                 agents=tuple(
                     item for item in plugin.manifest.agents if isinstance(item, str)
                 ),
+                runtime_protocol=(
+                    plugin.manifest.runtime.protocol_version
+                    if plugin.manifest.runtime is not None
+                    else None
+                ),
+                tools=tuple(
+                    namespaced_plugin_tool_name(plugin.manifest.name, tool.name)
+                    for tool in plugin.manifest.tools
+                ),
                 enabled=plugin.enabled,
             )
             for plugin in sorted(
@@ -277,6 +288,11 @@ def render_extension_inventory(
             f"  {plugin.name} {plugin.version} [{plugin.source}; "
             f"{'enabled' if plugin.enabled else 'disabled'}] - "
             f"{plugin.description or '(no description)'}"
+            + (
+                f" (runtime v{plugin.runtime_protocol}: {', '.join(plugin.tools)})"
+                if plugin.runtime_protocol is not None
+                else ""
+            )
             for plugin in inventory.plugins
         )
         if not inventory.plugins:

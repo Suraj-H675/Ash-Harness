@@ -126,6 +126,102 @@ def test_check_dependencies_returns_error_for_missing_plugin(tmp_path: Path) -> 
     assert "missing-plugin" in errors[0]
 
 
+def test_manifest_parses_versioned_out_of_process_tool_runtime(tmp_path: Path) -> None:
+    manifest_file = tmp_path / "plugin.json"
+    manifest_file.write_text(
+        json.dumps(
+            {
+                "name": "formatter",
+                "version": "1.0.0",
+                "runtime": {
+                    "command": ["python", "runtime.py"],
+                    "protocolVersion": 1,
+                    "timeoutSeconds": 12.5,
+                },
+                "tools": [
+                    {
+                        "name": "format_text",
+                        "description": "Format supplied text",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                            "additionalProperties": False,
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = PluginManifest.load(manifest_file)
+
+    assert manifest.runtime is not None
+    assert manifest.runtime.command == ("python", "runtime.py")
+    assert manifest.runtime.timeout_seconds == 12.5
+    assert manifest.tools[0].name == "format_text"
+    assert manifest.tools[0].input_schema["required"] == ["text"]
+
+
+@pytest.mark.parametrize(
+    ("runtime", "tools", "message"),
+    [
+        ({"command": ["python", "runtime.py"]}, [], "declared together"),
+        (
+            None,
+            [{"name": "x", "description": "x", "inputSchema": {"type": "object"}}],
+            "declared together",
+        ),
+        (
+            {"command": ["python", "runtime.py"], "protocolVersion": 2},
+            [{"name": "x", "description": "x", "inputSchema": {"type": "object"}}],
+            "protocolVersion",
+        ),
+        (
+            {"command": ["python", "runtime.py"]},
+            [
+                {
+                    "name": "bad.name",
+                    "description": "x",
+                    "inputSchema": {"type": "object"},
+                }
+            ],
+            "tool name",
+        ),
+        (
+            {"command": ["python", "runtime.py"]},
+            [{"name": "valid", "description": "x", "inputSchema": {"type": "array"}}],
+            "object JSON Schema",
+        ),
+    ],
+)
+def test_manifest_rejects_invalid_runtime_contracts(runtime, tools, message) -> None:
+    payload = {"name": "runtime-plugin", "runtime": runtime, "tools": tools}
+    if runtime is None:
+        payload.pop("runtime")
+
+    with pytest.raises(ValueError, match=message):
+        PluginManifest.from_dict(payload)
+
+
+def test_manifest_rejects_tool_name_too_long_after_namespacing() -> None:
+    with pytest.raises(ValueError, match="after namespacing"):
+        PluginManifest.from_dict(
+            {
+                "name": "plugin-with-a-long-but-valid-name",
+                "runtime": {"command": ["python3", "runtime.py"]},
+                "tools": [
+                    {
+                        "name": "tool_name_that_is_individually_valid_but_far_too_long",
+                        "description": "x",
+                        "inputSchema": {"type": "object"},
+                    }
+                ],
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("payload", "message"),
     [

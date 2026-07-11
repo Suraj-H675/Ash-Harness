@@ -161,7 +161,11 @@ constraints. Installation rejects links, path traversal, malformed or
 oversized components, missing enabled dependencies, and invalid replacement
 content before changing the active version. `/plugins` manages local plugins
 inside a session and `/reload-plugins` atomically refreshes commands,
-completion, skills, agents, hooks, and MCP servers without restarting Ash.
+completion, skills, agents, hooks, executable tools, and MCP servers without
+restarting Ash. Executable plugins use the isolated, versioned JSON-RPC stdio
+boundary in [Plugin API v1](docs/PLUGIN_API_V1.md); they are lazy-started,
+receive no ambient secrets or network access, and cannot bypass ordinary tool
+approval, audit, hooks, or dry-run policy.
 Project plugins remain disabled until their workspace is trusted.
 Command hooks use the versioned, bounded lifecycle contract documented in
 [Hook Contract v1](docs/HOOKS_V1.md). Critical `pre_tool` gates fail closed;
@@ -204,6 +208,8 @@ sandbox_backend = "auto" # auto, native, docker, or direct
 sandbox_network = false
 sandbox_docker_image = "ash-sandbox:latest"
 command_env_allowlist = ["BUILD_CHANNEL", "NPM_CONFIG_REGISTRY"]
+# Emergency compatibility only; never project-controlled.
+allow_unsafe_plugin_runtime = false
 ```
 
 `auto` prefers Bubblewrap on Linux or `sandbox-exec` on macOS, then a locally

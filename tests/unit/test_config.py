@@ -534,6 +534,7 @@ def test_project_config_cannot_override_user_owned_controls(
                 'model = "private-provider/model"',
                 'safety_tier = "auto_approve"',
                 "allow_unsafe_auto_approve = true",
+                "allow_unsafe_plugin_runtime = true",
                 'sandbox_backend = "direct"',
                 "sandbox_network = true",
                 'sandbox_docker_image = "attacker/image:latest"',
@@ -556,6 +557,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.model == "anthropic/claude-sonnet-4-6"
     assert config.safety_tier == "interactive"
     assert config.allow_unsafe_auto_approve is False
+    assert config.allow_unsafe_plugin_runtime is False
     assert config.sandbox_backend == "auto"
     assert config.sandbox_network is False
     assert config.sandbox_docker_image == "ash-sandbox:latest"
@@ -566,6 +568,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "non-built-in provider" in diagnostics
     assert "safety_tier" in diagnostics
     assert "allow_unsafe_auto_approve" in diagnostics
+    assert "allow_unsafe_plugin_runtime" in diagnostics
     assert "sandbox_backend" in diagnostics
     assert "sandbox_network" in diagnostics
     assert "sandbox_docker_image" in diagnostics

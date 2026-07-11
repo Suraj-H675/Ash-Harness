@@ -52,6 +52,8 @@ class BubblewrapSandbox(SandboxBackend):
         Extra paths to expose read-only (e.g. system libraries).
     network
         When ``False`` (default), the sandbox cannot reach the network.
+    workspace_read_only
+        Mount plugin or source code read-only while retaining writable tmpfs.
     bwrap_path
         Override the path to the ``bwrap`` binary. When ``None`` the
         manager probes ``shutil.which``.
@@ -64,6 +66,7 @@ class BubblewrapSandbox(SandboxBackend):
     scratch_dir: Path | None = None
     read_only_paths: tuple[Path, ...] = ()
     network: bool = False
+    workspace_read_only: bool = False
     bwrap_path: str | None = None
 
     def __post_init__(self) -> None:
@@ -111,7 +114,8 @@ class BubblewrapSandbox(SandboxBackend):
                 args.extend(["--ro-bind", ro_str, ro_str])
         args.extend(["--proc", "/proc", "--dev", "/dev"])
 
-        # Workspace (read-write) — required for any meaningful work.
+        # Workspace access is caller-selected; commands default to read-write,
+        # while executable extensions use a read-only code mount.
         if self.workspace_root is None:
             raise SandboxBackendUnavailable("bubblewrap requires a workspace root")
         root = Path(self.workspace_root).resolve()
@@ -119,7 +123,8 @@ class BubblewrapSandbox(SandboxBackend):
             raise SandboxBackendUnavailable(
                 f"workspace root is not a directory: {root}"
             )
-        args.extend(["--bind", str(root), str(root)])
+        workspace_bind = "--ro-bind" if self.workspace_read_only else "--bind"
+        args.extend([workspace_bind, str(root), str(root)])
 
         # Scratch directory for ephemeral writes.
         scratch = Path(self.scratch_dir).resolve() if self.scratch_dir else Path("/tmp")

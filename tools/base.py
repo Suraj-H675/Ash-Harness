@@ -22,7 +22,7 @@ class ToolResult(BaseModel):
 class BaseTool(ABC):
     name: str
     description: str
-    args_schema: type[BaseModel]
+    args_schema: type[BaseModel] | None
 
     def __init__(self, safety_guard: SafetyGuard) -> None:
         self.safety_guard = safety_guard
@@ -36,7 +36,21 @@ class BaseTool(ABC):
         """Execute the tool asynchronously."""
 
     def validate_args(self, **kwargs: Any) -> BaseModel:
+        if self.args_schema is None:
+            raise ValueError(f"tool {self.name!r} does not declare an argument model")
         return self.args_schema(**kwargs)
+
+    def json_schema(self) -> dict[str, Any]:
+        """Return the exact provider-facing input schema for this tool."""
+
+        args_schema = getattr(self, "args_schema", None)
+        if args_schema is None:
+            return {}
+        if hasattr(args_schema, "model_json_schema"):
+            return args_schema.model_json_schema()
+        if hasattr(args_schema, "schema"):
+            return args_schema.schema()
+        return {}
 
     async def aclose(self) -> None:
         """Release optional tool resources."""

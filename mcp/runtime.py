@@ -56,7 +56,10 @@ class MCPTool(BaseTool):
         )
 
     async def run(self, **kwargs: Any) -> ToolResult:
-        arguments = self.args_schema(**kwargs).model_dump(exclude_none=True)
+        args_schema = self.args_schema
+        if args_schema is None:  # pragma: no cover - constructor invariant
+            return ToolResult(success=False, output="", error="MCP tool schema unavailable")
+        arguments = args_schema(**kwargs).model_dump(exclude_none=True)
         result = await self.client.call_tool(self.remote_name, arguments)
         content = result.get("content", [])
         rendered: list[str] = []

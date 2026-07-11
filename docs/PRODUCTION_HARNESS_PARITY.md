@@ -137,7 +137,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/permissions` | Verified locally | Inspect/change mode plus versioned project allow/ask/deny rules with stable IDs, exact/string-prefix/argv-prefix matchers, JSON output, precise removal, and legacy migration ([Claude Code rule model](https://code.claude.com/docs/en/permissions)) |
 | `/sandbox` | Verified locally | Active backend, tier, capabilities, and network policy |
 | `/mcp` | Partial | Top-level add/remove/list/status config supports JSON and env/header metadata; REPL status/tools/resources/prompts use live clients; auth and richer lifecycle remain |
-| `/skills`, `/plugins`, `/hooks` | Verified locally | Namespaced components are inspectable; local install/enable/disable/confirmed-uninstall and live reload are wired |
+| `/skills`, `/plugins`, `/hooks` | Verified locally | Namespaced components and executable tool protocols are inspectable; local install/enable/disable/confirmed-uninstall and live reload close and replace plugin hosts |
 | `/agents` | Verified locally | Slash status/stop/resume, persisted status/report/message inspection, live queued steering/stop consumption with delivery acknowledgement, and isolated branch list/apply/discard lifecycle |
 | `/doctor` | Verified locally | Runs the local health report in-session |
 | Shell escape (`!`) | Verified locally | Commands use the normal policy, sandbox, persistence, and audit path |
@@ -192,7 +192,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | MCP tool namespacing | Verified locally | `mcp__server__tool` adapters prevent collisions |
 | MCP resources/prompts | Partial | Browse in TUI and invoke/read through policy-gated model tools |
 | Skills | Verified locally | Bounded standard `SKILL.md` discovery and progressive activation with trust; legacy in-process executable skills are explicit unsafe compatibility only and cannot fabricate tools |
-| Plugins/extensions | Verified locally | Transactional local install/replace, enable/disable/uninstall state, dependency checks, component inventory, project trust, namespacing, and live reload |
+| Plugins/extensions | Verified locally | Transactional local lifecycle, dependencies, inventory, project trust, namespacing, declarative components, and Plugin API v1 tools through strict bounded JSON-RPC subprocesses with read-only/no-network isolation, ordinary policy/audit/events, no side-effect replay, live replacement, and deterministic cleanup |
 | Plugin marketplace | Missing | Signed or trust-reviewed sources; no hardcoded nonexistent registry |
 | Hooks | Strong partial | Versioned session/turn/model/tool/error lifecycle, structured pre-tool denial and session context, critical-versus-observer failure semantics, redacted diagnostics/events, plugin cwd, scrubbed env, timeout, bounded I/O, and process-tree cleanup; context-compaction/config/permission-change hooks remain |
 | Custom agents | Verified locally | User/project/plugin Markdown roles, namespacing, instructions, base-role isolation, and non-escalating tool restrictions |

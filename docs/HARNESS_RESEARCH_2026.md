@@ -34,8 +34,9 @@ missing domains are:
 1. A stable canonical event and provider contract independent of any one model
    API or the legacy XML protocol.
 2. Current MCP client capabilities and authentication.
-3. A versioned executable plugin SDK that can add providers, tools, storage,
-   interfaces, channels, and services without growing the core.
+3. Broader executable plugin capabilities for providers, storage, interfaces,
+   channels, and services. Plugin API v1 now covers isolated tool contributions
+   without importing Ash internals.
 4. Durable session trees and resumable operations rather than only linear
    transcripts and session-level forks.
 5. Remote agent interoperability through A2A and editor/client interoperability
@@ -405,7 +406,7 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 1002 passed, 8 environment-dependent skips on Python
+- Current verification: 1032 passed, 8 environment-dependent skips on Python
   3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
   race is covered by Ash's portable process completion helper.
 
@@ -436,8 +437,14 @@ sessions migrate, and provider/tool fakes cover the state machine.
 1. Upgrade MCP incrementally with negotiated capabilities, server request
    dispatch, progress/cancellation/notifications, roots, sampling, elicitation,
    and OAuth; gate experimental tasks.
-2. Define plugin API v1 and an out-of-process plugin host; migrate declarative
-   plugins as a zero-code plugin type.
+2. Define plugin API v1 and an out-of-process plugin host: complete for tool
+   contributions, including manifest-time Draft 2020-12 schema and namespace
+   validation, strict bounded JSON-RPC stdio, lazy shared hosts, no call replay,
+   secret-free environments, read-only plugin mounts, network and host-read
+   isolation, ordinary approval/audit/hook/event/persistence paths, fail-closed
+   errors, hot reload, deterministic shutdown, and zero-code declarative
+   plugins. Provider/storage/interface/channel/service contribution kinds remain
+   future versioned capabilities.
 3. Expand lifecycle hooks and add tool search/profiles: bounded hook contract v1
    covers session/turn/model/tool/error events and failure semantics; context
    compaction events, explicit ordering, tool search, and profiles remain.

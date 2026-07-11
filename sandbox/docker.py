@@ -40,6 +40,7 @@ class DockerSandbox(SandboxBackend):
     workspace_root: Path | None = None
     output_dir: Path | None = None
     network: bool = False
+    workspace_read_only: bool = False
     memory_limit: str | None = None
     cpus: float | None = None
     docker_path: str | None = None
@@ -104,12 +105,10 @@ class DockerSandbox(SandboxBackend):
                 raise SandboxBackendUnavailable(
                     f"workspace root is not a directory: {root}"
                 )
-            args.extend(
-                [
-                    "--mount",
-                    f"type=bind,source={root},target=/workspace",
-                ]
-            )
+            mount = f"type=bind,source={root},target=/workspace"
+            if self.workspace_read_only:
+                mount += ",readonly"
+            args.extend(["--mount", mount])
             container_cwd = "/workspace"
         if self.output_dir is not None:
             out = Path(self.output_dir).resolve()

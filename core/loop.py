@@ -22,7 +22,15 @@ import json
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, ContextManager, Protocol
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    ContextManager,
+    Protocol,
+    Sequence,
+)
 from uuid import uuid4
 
 from core.recovery import CircuitBreaker, CircuitBreakerError
@@ -306,6 +314,11 @@ class AshLoop:
         self.ui = ui
         self.project_root = project_root
         self.tools: dict[str, BaseTool] = dict(tools or {})
+        self._plugin_tool_names = {
+            name
+            for name, tool in self.tools.items()
+            if bool(getattr(tool, "plugin_runtime_tool", False))
+        }
         self._pending_runtime_events: list[dict[str, Any]] = []
         self._pending_runtime_event_ids: set[str] = set()
         set_event_enricher = getattr(self.ui, "set_event_enricher", None)
@@ -602,11 +615,50 @@ class AshLoop:
             await self._start_mcp_runtime()
         return dict(self._mcp_runtime.errors) if self._mcp_runtime is not None else {}
 
+    async def reload_plugin_runtime_tools(self, tools: Sequence["BaseTool"]) -> None:
+        """Atomically replace executable plugin proxies and stop their old hosts."""
+
+        next_tools = {tool.name: tool for tool in tools}
+        if len(next_tools) != len(tools):
+            raise ValueError("duplicate executable plugin tool name")
+        occupied = self.tools.keys() - self._plugin_tool_names
+        duplicates = occupied & next_tools.keys()
+        if duplicates:
+            await asyncio.gather(
+                *(tool.aclose() for tool in tools),
+                return_exceptions=True,
+            )
+            raise ValueError(
+                "plugin tool collides with an existing tool: "
+                + ", ".join(sorted(duplicates))
+            )
+        old_tools = [
+            self.tools.pop(name)
+            for name in self._plugin_tool_names
+            if name in self.tools
+        ]
+        await asyncio.gather(
+            *(tool.aclose() for tool in old_tools),
+            return_exceptions=True,
+        )
+        for tool in next_tools.values():
+            tool.set_event_sink(self._emit_event)
+        self.tools.update(next_tools)
+        self._plugin_tool_names = set(next_tools)
+
     async def _start_mcp_runtime(self) -> None:
         from mcp.runtime import MCPRuntime
 
         self._mcp_runtime = MCPRuntime(self._mcp_configs, self.safety_guard)
         tools = await self._mcp_runtime.start()
+        duplicates = self.tools.keys() & tools.keys()
+        if duplicates:
+            await self._mcp_runtime.close()
+            self._mcp_runtime = None
+            raise ValueError(
+                "MCP tool collides with an existing tool: "
+                + ", ".join(sorted(duplicates))
+            )
         for tool in tools.values():
             tool.set_event_sink(self._emit_event)
         self.tools.update(tools)
@@ -1216,14 +1268,7 @@ class AshLoop:
         for tool in tools.values():
             if not hasattr(tool, "name") or not hasattr(tool, "description"):
                 continue
-            schema: dict[str, Any] = {}
-            if hasattr(tool, "args_schema") and tool.args_schema is not None:
-                args_schema = tool.args_schema
-                # Support both Pydantic v2 (model_json_schema) and v1-style models.
-                if hasattr(args_schema, "model_json_schema"):
-                    schema = args_schema.model_json_schema()
-                elif hasattr(args_schema, "schema"):
-                    schema = args_schema.schema()
+            schema = tool.json_schema() if hasattr(tool, "json_schema") else {}
             result.append(
                 {
                     "type": "function",

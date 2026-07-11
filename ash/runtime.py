@@ -83,6 +83,7 @@ def build_tools(
         SkillCatalog,
         SkillSource,
     )
+    from plugins.runtime import build_plugin_runtime_tools
     from tools.agent import SpawnAgentTool
     from tools.ask_user import AskUserTool
     from tools.base import BaseTool
@@ -182,7 +183,27 @@ def build_tools(
                 FindReferencesTool(safety_guard, repo_map),
             ]
         )
-    return {tool.name: tool for tool in tools}
+    by_name = {tool.name: tool for tool in tools}
+    plugin_tools = build_plugin_runtime_tools(
+        plugins,
+        safety_guard,
+        backend_preference=(
+            runtime_config.sandbox_backend if runtime_config else "auto"
+        ),
+        docker_image=(
+            runtime_config.sandbox_docker_image
+            if runtime_config
+            else "ash-sandbox:latest"
+        ),
+        allow_unisolated=(
+            runtime_config.allow_unsafe_plugin_runtime if runtime_config else False
+        ),
+    )
+    for tool in plugin_tools:
+        if tool.name in by_name:
+            raise ValueError(f"plugin tool collides with an existing tool: {tool.name}")
+        by_name[tool.name] = tool
+    return by_name
 
 
 def build_repo_map(config: AshConfig) -> Any | None:
