@@ -117,6 +117,84 @@ class WorktreeManager:
         )
         return (await self._git_at(lease.path, "rev-parse", "HEAD")).stdout.strip()
 
+    async def accept_git_artifacts(
+        self,
+        lease: WorktreeLease,
+        artifacts: Sequence[tuple[str, str]],
+    ) -> str | None:
+        """Merge verified retained agent commits into an isolated worktree."""
+
+        self._validate_lease_path(lease)
+        verified: list[str] = []
+        seen: set[str] = set()
+        for branch, expected_commit in artifacts:
+            _validate_agent_branch(branch)
+            if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_commit):
+                raise WorktreeError(
+                    f"artifact for {branch} has an invalid Git commit ID"
+                )
+            actual = (
+                await self._git(
+                    "rev-parse",
+                    "--verify",
+                    f"refs/heads/{branch}^{{commit}}",
+                )
+            ).stdout.strip()
+            if actual != expected_commit:
+                raise WorktreeError(
+                    f"artifact branch {branch} no longer matches recorded commit"
+                )
+            if actual not in seen:
+                verified.append(actual)
+                seen.add(actual)
+
+        accepted = False
+        hooks = self.storage_root / "empty-hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        for commit in verified:
+            ancestor = await self._git_at(
+                lease.path,
+                "merge-base",
+                "--is-ancestor",
+                commit,
+                "HEAD",
+                check=False,
+            )
+            if ancestor.returncode == 0:
+                accepted = True
+                continue
+            if ancestor.returncode != 1:
+                raise WorktreeError(
+                    ancestor.stderr.strip()
+                    or f"could not compare artifact commit {commit}"
+                )
+            result = await self._git_at(
+                lease.path,
+                "-c",
+                f"core.hooksPath={hooks}",
+                "-c",
+                "user.name=Ash Agent",
+                "-c",
+                "user.email=ash-agent@local",
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                commit,
+                check=False,
+            )
+            if result.returncode != 0:
+                await self._git_at(lease.path, "merge", "--abort", check=False)
+                raise WorktreeError(
+                    result.stderr.strip()
+                    or f"artifact commit {commit} conflicts with dependent worktree"
+                )
+            accepted = True
+        if not accepted:
+            return None
+        return (await self._git_at(lease.path, "rev-parse", "HEAD")).stdout.strip()
+
     async def remove(
         self,
         lease: WorktreeLease,
@@ -168,14 +246,43 @@ class WorktreeManager:
             f"core.hooksPath={hooks}",
             "-c",
             "commit.gpgsign=false",
-            "cherry-pick",
-            commit,
+            "merge",
+            "--squash",
+            "--no-commit",
+            branch,
             check=False,
         )
         if result.returncode != 0:
-            await self._git("cherry-pick", "--abort", check=False)
+            await self._git("reset", "--merge", "HEAD", check=False)
             raise WorktreeError(
                 result.stderr.strip() or f"agent branch {branch} conflicts with HEAD"
+            )
+        changed = await self._git("diff", "--cached", "--quiet", check=False)
+        if changed.returncode == 1:
+            committed = await self._git(
+                "-c",
+                f"core.hooksPath={hooks}",
+                "-c",
+                "user.name=Ash Agent",
+                "-c",
+                "user.email=ash-agent@local",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--no-verify",
+                "-m",
+                f"Apply {branch}",
+                check=False,
+            )
+            if committed.returncode != 0:
+                await self._git("reset", "--merge", "HEAD", check=False)
+                raise WorktreeError(
+                    committed.stderr.strip() or f"could not commit agent branch {branch}"
+                )
+        elif changed.returncode != 0:
+            await self._git("reset", "--merge", "HEAD", check=False)
+            raise WorktreeError(
+                changed.stderr.strip() or f"could not inspect agent branch {branch}"
             )
         if delete_branch:
             await self._git("branch", "-D", branch)

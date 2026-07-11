@@ -83,9 +83,15 @@ Graph cancellation is atomic, recursively covers graph dependents, revokes
 active leases, and is observed by local workers at their next 100 ms control
 poll rather than waiting for lease expiry.
 
-Dependent tasks that need predecessor file changes should currently use
-`isolation="shared"`. Isolated worktree commits are recorded as artifacts but
-are not automatically accepted or merged into a dependent worktree.
+Every dependent worker receives bounded, redacted predecessor summaries and
+artifact references labeled as untrusted evidence rather than instructions.
+With `accept_git_artifacts=true` (the default), an isolated task also accepts
+predecessor `git-commit` artifacts only after the retained `ash-agent/*` branch
+resolves to the exact recorded commit. Ash merges verified branches inside the
+dependent worktree with hooks and signing disabled, aborts conflicts, and
+records the accepted commits on the resulting artifact. The lead worktree is
+unchanged until `ash agents apply` explicitly squashes the complete final
+branch.
 
 ## Live subagents
 
@@ -136,7 +142,8 @@ client.cancel_agent_graph(graph.graph_id, reason="superseded")
 ## Current boundary
 
 This contract provides durable scheduling primitives, live single-task
-subagents, and automatic dispatch of submitted DAGs. Dynamic dependency
-insertion, artifact acceptance policies, graph-wide budget allocation, and
-remote workers are intentionally separate future layers. They must build on
-these ownership transitions rather than bypass them.
+subagents, automatic dispatch of submitted DAGs, and verified local Git
+artifact handoff. Dynamic dependency insertion, non-Git artifact
+materialization, graph-wide budget allocation, and remote workers are
+intentionally separate future layers. They must build on these ownership
+transitions rather than bypass them.

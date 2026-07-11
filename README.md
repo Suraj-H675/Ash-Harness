@@ -161,6 +161,9 @@ For multi-stage work, the provider-facing `delegate_agents` tool atomically
 submits a dependency graph and automatically runs ready tasks in parallel. The
 same workflow is available to embedded callers as
 `await client.delegate_agents(goal, tasks, background=False)`.
+Dependent workers receive redacted predecessor results as untrusted evidence;
+isolated tasks verify and merge retained predecessor branches inside their own
+worktrees without changing the lead branch.
 Use `ash agents tasks --graph GRAPH_ID` to inspect one graph and
 `ash agents cancel GRAPH_ID --yes` to revoke its queued and active work.
 

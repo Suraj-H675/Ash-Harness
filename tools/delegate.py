@@ -40,6 +40,10 @@ class DelegatedTaskSpec(BaseModel):
     max_attempts: int = Field(1, ge=1, le=10)
     token_budget: int | None = Field(None, ge=1)
     time_budget_seconds: float | None = Field(None, ge=0.1, le=86_400)
+    accept_git_artifacts: bool = Field(
+        True,
+        description="Merge verified predecessor agent branches into this worktree.",
+    )
 
 
 class DelegateAgentsArgs(BaseModel):
@@ -120,6 +124,7 @@ class DelegateAgentsTool(BaseTool):
                 ),
                 metadata={
                     "agent_id": f"worker-{graph_id[6:]}-{spec.key}",
+                    "accept_git_artifacts": spec.accept_git_artifacts,
                     "dispatchable": True,
                     "graph_id": graph_id,
                     "goal": redact_text(args.goal),

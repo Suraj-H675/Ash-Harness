@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,76 @@ class CancellableProvider(ProviderABC):
         finally:
             type(self).cancelled.set()
         yield  # pragma: no cover
+
+    def count_tokens(self, text: str) -> int:
+        return len(text.split())
+
+
+class WorktreeHandoffProvider(ProviderABC):
+    model_name = "handoff-provider"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.task = ""
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        self.calls += 1
+        if not self.task:
+            self.task = str(messages[-1]["content"])
+        if self.task == "produce change":
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "write-producer",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "file.txt",
+                                "content": "producer\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="producer complete", is_done=True)
+            return
+        assert any(
+            "Dependency handoff follows" in str(message["content"])
+            and "producer complete" in str(message["content"])
+            for message in messages
+            if message["role"] == "system"
+        )
+        if self.calls == 1:
+            yield StreamChunk(
+                native_tool_calls=[
+                    {
+                        "id": "read-consumer",
+                        "name": "read_file",
+                        "arguments": {"file_path": "file.txt"},
+                    }
+                ],
+                is_done=True,
+            )
+        elif self.calls == 2:
+            assert "producer" in str(messages[-1]["content"])
+            yield StreamChunk(
+                native_tool_calls=[
+                    {
+                        "id": "write-consumer",
+                        "name": "write_file",
+                        "arguments": {
+                            "file_path": "file.txt",
+                            "content": "consumer\n",
+                            "overwrite": True,
+                        },
+                    }
+                ],
+                is_done=True,
+            )
+        else:
+            yield StreamChunk(content="consumer complete", is_done=True)
 
     def count_tokens(self, text: str) -> int:
         return len(text.split())
@@ -338,6 +409,97 @@ async def test_external_graph_cancellation_stops_active_provider_turn(
 
 
 @pytest.mark.asyncio
+async def test_dependent_worktree_receives_verified_commit_and_result_context(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    (repository / "file.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    config = AshConfig(
+        workspace_root=repository,
+        db_directory=tmp_path / "db",
+        agent_token_budget=100,
+        agent_time_budget_seconds=10,
+        memory_backend="off",
+    )
+    db_path = config.db_directory / "agents.db"
+    spawn = SpawnAgentTool(
+        SafetyGuard(repository),
+        SharedState(db_path),
+        WorktreeHandoffProvider,
+        config=config,
+    )
+    delegate = DelegateAgentsTool(
+        SafetyGuard(repository), SharedState(db_path), spawn, config
+    )
+
+    result = await delegate.run(
+        goal="handoff",
+        tasks=[
+            {
+                "key": "produce",
+                "role": "coder",
+                "task": "produce change",
+                "isolation": "worktree",
+            },
+            {
+                "key": "consume",
+                "role": "coder",
+                "task": "consume change",
+                "depends_on": ["produce"],
+                "isolation": "worktree",
+            },
+        ],
+    )
+
+    assert result.success is True
+    assert (repository / "file.txt").read_text(encoding="utf-8") == "base\n"
+    state = SharedState(db_path)
+    try:
+        tasks = {task.metadata["task_key"]: task for task in state.tasks.list_tasks()}
+        producer_artifact = state.tasks.list_artifacts(tasks["produce"].task_id)[0]
+        consumer_artifact = state.tasks.list_artifacts(tasks["consume"].task_id)[0]
+        producer_commit = producer_artifact.metadata["commit"]
+        consumer_commit = consumer_artifact.metadata["commit"]
+        assert producer_commit in consumer_artifact.metadata[
+            "accepted_dependency_commits"
+        ]
+        assert subprocess.run(
+            ["git", "merge-base", "--is-ancestor", producer_commit, consumer_commit],
+            cwd=repository,
+            check=False,
+        ).returncode == 0
+        content = subprocess.run(
+            ["git", "show", f"{consumer_artifact.uri}:file.txt"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert content == "consumer\n"
+    finally:
+        state.close()
+        await delegate.aclose()
+        await spawn.aclose()
+
+
+@pytest.mark.asyncio
 async def test_delegate_agents_rejects_invalid_graph_without_partial_tasks(
     tmp_path: Path,
 ) -> None:
@@ -391,5 +553,31 @@ async def test_waiting_graph_surfaces_dispatcher_failure_instead_of_hanging(
 
     with pytest.raises(AgentTaskError, match="dispatcher failed"):
         await asyncio.wait_for(spawn.wait_for_tasks([task.task_id]), timeout=2)
+    await delegate.aclose()
+    await spawn.aclose()
+
+
+@pytest.mark.asyncio
+async def test_dependency_handoff_redacts_predecessor_summary(tmp_path: Path) -> None:
+    config, spawn, delegate = _tools(tmp_path)
+    state = SharedState(config.db_directory / "agents.db")
+    predecessor = state.tasks.create_task("predecessor", task_id="predecessor")
+    lease = state.tasks.claim_task("worker", task_id=predecessor.task_id)
+    assert lease is not None
+    state.tasks.complete_task(
+        predecessor.task_id,
+        lease.token,
+        {"summary": "secret sk-abcdefghijklmnop"},
+    )
+    child = state.tasks.create_task(
+        "child", task_id="child", dependencies=[predecessor.task_id]
+    )
+    state.close()
+
+    context, artifacts = spawn._dependency_handoff(child)
+
+    assert "sk-abcdefghijklmnop" not in context
+    assert "[REDACTED]" in context
+    assert artifacts == []
     await delegate.aclose()
     await spawn.aclose()
