@@ -12,7 +12,9 @@ import argparse
 import asyncio
 import importlib.metadata
 import json
+import re
 import sys
+import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -1578,9 +1580,21 @@ def main(argv: list[str] | None = None) -> int:
     mcp_add.add_argument("--url", default="")
     mcp_add.add_argument("--env", action="append", default=[])
     mcp_add.add_argument("--header", action="append", default=[])
+    mcp_add.add_argument("--auth", choices=["none", "oauth"], default="none")
+    mcp_add.add_argument("--oauth-client-id", default="")
+    mcp_add.add_argument("--oauth-client-secret-env", default="")
+    mcp_add.add_argument("--oauth-scope", default="")
+    mcp_add.add_argument("--oauth-redirect-port", type=int, default=0)
     mcp_add.add_argument("--json", action="store_true")
     mcp_remove = mcp_action_subparsers.add_parser("remove")
     mcp_remove.add_argument("server_name")
+    mcp_login = mcp_action_subparsers.add_parser("login")
+    mcp_login.add_argument("server_name")
+    mcp_login.add_argument("--no-browser", action="store_true")
+    mcp_login.add_argument("--timeout", type=float, default=300.0)
+    mcp_login.add_argument("--scope", default="")
+    mcp_logout = mcp_action_subparsers.add_parser("logout")
+    mcp_logout.add_argument("server_name")
     parser.add_argument(
         "--db-directory",
         type=Path,
@@ -2282,6 +2296,60 @@ def main(argv: list[str] | None = None) -> int:
             save_mcp_servers(servers, path)
             print(f"Removed MCP server {args.server_name}.")
             return 0
+        if args.action in {"login", "logout"}:
+            mcp_config = servers.get(args.server_name)
+            if mcp_config is None:
+                print(
+                    f"Error: MCP server {args.server_name!r} is not configured.",
+                    file=sys.stderr,
+                )
+                return 2
+            if mcp_config.auth != "oauth":
+                print(
+                    f"Error: MCP server {args.server_name!r} does not use OAuth.",
+                    file=sys.stderr,
+                )
+                return 2
+            from mcp.oauth import (
+                MCPOAuthError,
+                MCPOAuthTokenStore,
+                authorize_mcp_server,
+            )
+
+            oauth_store = MCPOAuthTokenStore(args.server_name)
+            if args.action == "logout":
+                credentials_removed = oauth_store.remove()
+                print(
+                    f"Removed OAuth credentials for MCP server {args.server_name}."
+                    if credentials_removed
+                    else f"No OAuth credentials stored for {args.server_name}."
+                )
+                return 0
+            if args.timeout <= 0 or args.timeout > 1800:
+                print(
+                    "Error: --timeout must be greater than 0 and at most 1800 seconds.",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                opener = (lambda url: False) if args.no_browser else webbrowser.open
+                asyncio.run(
+                    authorize_mcp_server(
+                        args.server_name,
+                        mcp_config.resolved_url,
+                        oauth_config=mcp_config.resolved_oauth,
+                        store=oauth_store,
+                        open_browser=opener,
+                        timeout_seconds=args.timeout,
+                        manual_paste=True,
+                        requested_scope=args.scope,
+                    )
+                )
+            except (MCPOAuthError, OSError, ValueError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 2
+            print(f"Authorized MCP server {args.server_name}.")
+            return 0
         command_parts = list(args.server_command)
         if command_parts[:1] == ["--"]:
             command_parts = command_parts[1:]
@@ -2296,6 +2364,23 @@ def main(argv: list[str] | None = None) -> int:
         try:
             env = parse_key_value_options(args.env, label="--env")
             headers = parse_key_value_options(args.header, label="--header")
+            secret_env = args.oauth_client_secret_env.strip()
+            if secret_env and not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*", secret_env
+            ):
+                raise ValueError(
+                    "--oauth-client-secret-env must be an environment variable name"
+                )
+            oauth = {
+                key: value
+                for key, value in {
+                    "client_id": args.oauth_client_id,
+                    "client_secret": f"${{{secret_env}}}" if secret_env else "",
+                    "scope": args.oauth_scope,
+                    "redirect_port": args.oauth_redirect_port,
+                }.items()
+                if value not in {"", 0}
+            }
             servers[args.server_name] = MCPServerConfig(
                 name=args.server_name,
                 command=command_parts[0] if command_parts else "",
@@ -2304,6 +2389,8 @@ def main(argv: list[str] | None = None) -> int:
                 transport=args.transport,
                 url=args.url,
                 headers=headers,
+                auth=args.auth,
+                oauth=oauth,
             )
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)

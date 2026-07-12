@@ -31,6 +31,10 @@ def mcp_servers_payload(servers: dict[str, MCPServerConfig]) -> dict:
                 "url": config.url,
                 "env_keys": sorted(config.env),
                 "header_keys": sorted(config.headers or {}),
+                "auth": config.auth,
+                "oauth_client_configured": bool(
+                    (config.oauth or {}).get("client_id")
+                ),
             }
             for name, config in sorted(servers.items())
         ]
@@ -60,5 +64,8 @@ def render_mcp_servers(
         if item["header_keys"]:
             extras.append("headers=" + ",".join(item["header_keys"]))
         suffix = f" ({'; '.join(extras)})" if extras else ""
-        lines.append(f"{item['name']} [{item['transport']}]: {target}{suffix}")
+        auth = " oauth" if item["auth"] == "oauth" else ""
+        lines.append(
+            f"{item['name']} [{item['transport']}{auth}]: {target}{suffix}"
+        )
     return "\n".join(lines)

@@ -15,6 +15,9 @@ from safety.environment import build_scrubbed_environment
 
 MAX_MCP_CONFIG_BYTES = 256 * 1024
 MCP_SERVER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+MCP_OAUTH_SCOPE = re.compile(
+    r"[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*"
+)
 
 
 @dataclass(frozen=True)
@@ -29,10 +32,19 @@ class MCPServerConfig:
     url: str = ""  # for SSE/HTTP/WebSocket
     headers: dict[str, str] | None = None
     cwd: str = ""
+    auth: str = "none"
+    oauth: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.transport not in {"stdio", "http", "sse", "websocket"}:
             raise ValueError(f"Unknown MCP transport: {self.transport}")
+        if self.auth not in {"none", "oauth"}:
+            raise ValueError(f"Unknown MCP auth mode: {self.auth}")
+        if self.auth == "oauth" and self.transport not in {"http", "sse"}:
+            raise ValueError("MCP OAuth requires the http or sse transport")
+        if self.oauth is not None and not isinstance(self.oauth, dict):
+            raise ValueError("MCP oauth configuration must be an object")
+        _validate_oauth_data(self.name, self.auth, self.oauth or {})
 
     @property
     def resolved_command(self) -> str:
@@ -60,6 +72,19 @@ class MCPServerConfig:
     def resolved_cwd(self) -> str | None:
         return expand_env_vars(self.cwd) if self.cwd else None
 
+    @property
+    def resolved_oauth(self) -> dict[str, Any]:
+        resolved = {
+            key: expand_env_vars(value) if isinstance(value, str) else value
+            for key, value in (self.oauth or {}).items()
+        }
+        configured_secret = str((self.oauth or {}).get("client_secret", ""))
+        if configured_secret and resolved.get("client_secret") == configured_secret:
+            raise ValueError(
+                "MCP OAuth client secret environment variable is not set"
+            )
+        return resolved
+
     @classmethod
     def from_dict(
         cls,
@@ -81,6 +106,8 @@ class MCPServerConfig:
             url=data.get("url", ""),
             headers=data.get("headers", {}),
             cwd=cwd or str(data.get("cwd", "")),
+            auth=data.get("auth", "none"),
+            oauth=data.get("oauth", {}),
         )
 
 
@@ -257,6 +284,8 @@ def save_mcp_servers(
             "transport": config.transport,
             "url": config.url,
             "headers": config.headers or {},
+            "auth": config.auth,
+            **({"oauth": config.oauth or {}} if config.auth == "oauth" else {}),
             **({"cwd": config.cwd} if config.cwd else {}),
         }
         for name, config in sorted(servers.items())
@@ -295,6 +324,8 @@ def _validate_server_data(name: str, data: dict[str, Any]) -> None:
     env = data.get("env", {})
     headers = data.get("headers", {})
     cwd = data.get("cwd", "")
+    auth = data.get("auth", "none")
+    oauth = data.get("oauth", {})
     if not isinstance(command, str) or not isinstance(url, str):
         raise ValueError(f"MCP server {name!r} command and url must be strings")
     if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
@@ -310,7 +341,63 @@ def _validate_server_data(name: str, data: dict[str, Any]) -> None:
         raise ValueError(f"MCP server {name!r} headers must contain string values")
     if not isinstance(cwd, str):
         raise ValueError(f"MCP server {name!r} cwd must be a string")
+    if auth not in {"none", "oauth"}:
+        raise ValueError(f"MCP server {name!r} auth must be none or oauth")
+    if not isinstance(oauth, dict):
+        raise ValueError(f"MCP server {name!r} oauth must be an object")
+    _validate_oauth_data(name, str(auth), oauth)
+    if auth == "oauth" and transport not in {"http", "sse"}:
+        raise ValueError(f"MCP server {name!r} OAuth requires http or sse")
     if transport == "stdio" and not command:
         raise ValueError(f"stdio MCP server {name!r} requires a command")
     if transport != "stdio" and not url:
         raise ValueError(f"{transport} MCP server {name!r} requires a url")
+
+
+def _validate_oauth_data(name: str, auth: str, oauth: dict[str, Any]) -> None:
+    if auth == "none" and oauth:
+        raise ValueError(
+            f"MCP server {name!r} OAuth options require auth mode oauth"
+        )
+    allowed_oauth_keys = {
+        "client_id",
+        "client_secret",
+        "scope",
+        "redirect_port",
+        "client_name",
+    }
+    unknown_oauth = set(oauth) - allowed_oauth_keys
+    if unknown_oauth:
+        raise ValueError(
+            f"MCP server {name!r} has unknown oauth keys: "
+            + ", ".join(sorted(str(key) for key in unknown_oauth))
+        )
+    if any(
+        key != "redirect_port" and not isinstance(value, str)
+        for key, value in oauth.items()
+    ):
+        raise ValueError(f"MCP server {name!r} oauth values must be strings")
+    redirect_port = oauth.get("redirect_port", 0)
+    if not isinstance(redirect_port, int) or not 0 <= redirect_port <= 65535:
+        raise ValueError(f"MCP server {name!r} oauth redirect_port is invalid")
+    client_secret = str(oauth.get("client_secret", ""))
+    if client_secret and not re.fullmatch(
+        r"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})",
+        client_secret,
+    ):
+        raise ValueError(
+            f"MCP server {name!r} oauth client_secret must reference an "
+            "environment variable"
+        )
+    client_id = str(oauth.get("client_id", ""))
+    if len(client_id) > 2048:
+        raise ValueError(f"MCP server {name!r} oauth client_id is too long")
+    if client_secret and not client_id:
+        raise ValueError(
+            f"MCP server {name!r} oauth client_secret requires client_id"
+        )
+    scope = str(oauth.get("scope", "")).strip()
+    if scope and (len(scope) > 8192 or MCP_OAUTH_SCOPE.fullmatch(scope) is None):
+        raise ValueError(f"MCP server {name!r} oauth scope is invalid")
+    if len(str(oauth.get("client_name", ""))) > 100:
+        raise ValueError(f"MCP server {name!r} oauth client_name is too long")

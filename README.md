@@ -2,8 +2,8 @@
 
 Ash is a terminal-native coding agent harness for Linux, macOS, and Windows.
 It supports API-key providers, custom OpenAI-compatible endpoints, and local
-Ollama models. OAuth and subscription-based authentication are intentionally
-out of scope.
+Ollama models. Subscription-based model-provider login is intentionally out of
+scope; protected remote MCP servers support the MCP OAuth 2.1 flow.
 
 ## Install
 
@@ -31,8 +31,8 @@ The default install includes the terminal harness, coding tools, repository
 map, and supported API/local providers. Install optional features explicitly:
 
 ```bash
-pip install 'ash[server]' # authenticated HTTP/SSE API
-pip install 'ash[vector]' # ChromaDB and ONNX semantic memory
+pip install 'ash-ai[server]' # authenticated HTTP/SSE API
+pip install 'ash-ai[vector]' # ChromaDB and ONNX semantic memory
 ```
 
 For development:
@@ -59,9 +59,11 @@ ash sessions tree               # inspect the latest conversation tree
 ash sessions tree --session NAME --json
 ash --session SESSION_ID        # legacy explicit-ID compatibility
 ash mcp add local -- python server.py
+ash mcp add remote --transport http --url https://mcp.example/rpc --auth oauth
+ash mcp login remote            # explicit browser authorization
 ash trust add .                  # allow project ASH.md, skills, hooks, MCP
 ash update                       # explicitly check GitHub releases
-ASH_SERVER_TOKEN=change-me-long-token ash serve # requires ash[server]
+ASH_SERVER_TOKEN=change-me-long-token ash serve # requires ash-ai[server]
 ash storage check --json         # read-only session DB integrity check
 ash storage backup               # consistent timestamped backup
 ash storage restore BACKUP --yes # validated, non-destructive restore
@@ -216,6 +218,55 @@ downloads and service workers disabled; navigation, subresources, and
 WebSockets share the public-host and `allowed_web_domains` policy. The model
 receives bounded ARIA snapshots and stable element references rather than raw
 unbounded DOM content. Password fields are never filled by the browser tool.
+
+Remote MCP servers may use OAuth-protected Streamable HTTP or SSE. Ash
+discovers protected-resource and authorization-server metadata, requires S256
+PKCE, sends the MCP resource indicator, validates callback state, and uses
+dynamic client registration when no client ID is configured and the server
+supports it:
+
+```bash
+ash mcp add docs --transport http --url https://mcp.example/rpc --auth oauth
+ash mcp login docs
+ash mcp status
+ash mcp logout docs
+```
+
+Authorization is always an explicit `ash mcp login`; normal agent runs never
+open a browser or wait for terminal input. Use `--no-browser` to print the URL
+for another browser and paste its final localhost redirect. Access and refresh
+tokens are resource-bound and stored under `~/.ash/mcp-oauth` with private
+permissions; expired tokens refresh automatically, and a rejected refresh asks
+for login again.
+
+If an operation returns OAuth `insufficient_scope`, Ash does not interrupt an
+agent run with a browser. It reports the server-required scopes; authorize the
+step-up explicitly and retry the operation:
+
+```bash
+ash mcp login docs --scope 'files:read files:write'
+```
+
+For an authorization server without dynamic client registration, pre-register
+the loopback redirect port and keep the client secret in an environment
+variable:
+
+```bash
+export MCP_DOCS_CLIENT_SECRET='...'
+ash mcp add docs --transport http --url https://mcp.example/rpc --auth oauth \
+  --oauth-client-id CLIENT_ID \
+  --oauth-client-secret-env MCP_DOCS_CLIENT_SECRET \
+  --oauth-redirect-port 43123 \
+  --oauth-scope 'files:read'
+ash mcp login docs
+```
+
+The configured port must exactly match the registered
+`http://127.0.0.1:PORT/callback` URI. `.mcp.json` stores only the environment
+variable reference, never its resolved client-secret value. A user-hosted
+OAuth Client ID Metadata Document is also supported by passing its HTTPS URL
+as `--oauth-client-id`; its `client_id` and fixed loopback redirect URI must
+match the hosted document exactly.
 
 Workspace file reads, attachments, writes, exact edits, and patches reject
 symlink/junction mutation paths. On POSIX, Ash walks from an open workspace

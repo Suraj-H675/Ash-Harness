@@ -55,6 +55,8 @@ reduce tool selection accuracy, and make the security boundary unreviewable.
 ### Protocols and safety sources
 
 - [Model Context Protocol 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25): lifecycle and capability negotiation; server tools, resources, and prompts; client roots, sampling, and elicitation; progress, cancellation, logging, authorization, and experimental durable tasks.
+- [MCP Authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization): OAuth 2.1 protected-resource discovery, OAuth/OIDC metadata fallback order, Client ID Metadata Documents, preregistration, DCR fallback, S256 PKCE, resource indicators, step-up scope challenges, and token handling requirements.
+- [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728), [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414), [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591), [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707), and [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636): protected-resource metadata, authorization-server metadata, dynamic registration, resource indicators, and PKCE details used by the MCP authorization profile.
 - [Agent Skills specification](https://agentskills.io/specification): `SKILL.md` metadata, naming, optional resources, validation, and progressive disclosure.
 - [Agent2Agent specification 1.0](https://a2a-protocol.org/latest/specification): discovery, modalities, task lifecycle, streaming, and independent agent interoperability.
 - [Agent Client Protocol](https://agentclientprotocol.com/): client/agent initialization, sessions, terminal and filesystem capabilities, modes, session resume/list/close, and registry distribution.
@@ -326,7 +328,7 @@ not remove them.
 
 ## Current Ash Capability Matrix
 
-| Domain | State on 2026-07-10 | Key gap |
+| Domain | State on 2026-07-12 | Key gap |
 |---|---|---|
 | Agent loop and streaming | Partial | Public event schema v1 and validated provider-portable message/content/tool-call inputs now span the runtime and adapters; the loop remains monolithic and legacy XML fallback is mixed into canonical behavior. |
 | Provider layer | Strong partial | Built-ins, embedders, declared model capabilities, and custom OpenAI-compatible endpoints resolve through thread-safe linked registries; auth/discovery and non-text modalities remain limited. |
@@ -338,7 +340,7 @@ not remove them.
 | Agent Skills | Strong after `5dcbf51` | Standard parsing and progressive disclosure now exist; controlled script execution and compatibility diagnostics remain. |
 | Plugins | Partial | Declarative skills/commands/agents/hooks/MCP only; no versioned executable SDK or providers/channels/services. |
 | Hooks | Strong partial | Hook contract v1 covers bounded/redacted session, turn, model, tool, and error lifecycle with fail-closed pre-tool denial and isolated observers. Context-compaction/config/permission-change events and explicit ordering remain. |
-| MCP | Strong partial | 2025-11-25 negotiation, tools/resources/templates/prompts, roots, sampling, elicitation, progress, logging, cancellation, pagination, and server requests exist; OAuth and experimental tasks remain. |
+| MCP | Strong partial | 2025-11-25 negotiation, tools/resources/templates/prompts, roots, sampling, elicitation, progress, logging, cancellation, pagination, server requests, and explicit OAuth 2.1 authorization/refresh/scope step-up exist; experimental tasks and live multi-vendor OAuth conformance remain. |
 | Safety/sandbox | Strong | Needs remote/plugin identity capabilities, network proxy policy, stronger resource limits, and platform CI. |
 | CLI/TUI/SDK/API | Strong local | CLI, SDK, and HTTP server now share one trusted runtime assembler and versioned events; no ACP adapter, WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, or channel adapters. |
 | LSP | Absent in practice | `lsp/diagnostics.py` is 26 lines and is not a managed language-server client. |
@@ -409,7 +411,7 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 1097 passed, 9 environment-dependent skips on Python
+- Current verification: 1121 passed, 9 environment-dependent skips on Python
   3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
   race is covered by Ash's portable process completion helper.
 
@@ -439,7 +441,9 @@ sessions migrate, and provider/tool fakes cover the state machine.
 
 1. Upgrade MCP incrementally with negotiated capabilities, server request
    dispatch, progress/cancellation/notifications, roots, sampling, elicitation,
-   and OAuth; gate experimental tasks.
+   and OAuth: complete through explicit OAuth 2.1 login, private resource-bound
+   credentials, refresh, and one-retry runtime recovery. Experimental tasks
+   remain gated and unimplemented.
 2. Define plugin API v1 and an out-of-process plugin host: complete for tool
    contributions, including manifest-time Draft 2020-12 schema and namespace
    validation, strict bounded JSON-RPC stdio, lazy shared hosts, no call replay,

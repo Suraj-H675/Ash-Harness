@@ -12,6 +12,13 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from mcp.server import MCPServerConfig
+from mcp.oauth import (
+    MCPAuthorizationRequired,
+    MCPOAuthError,
+    MCPOAuthSession,
+    bearer_challenge_parameters,
+    normalize_oauth_scope,
+)
 from safety.environment import build_scrubbed_environment
 from sandbox.process_utils import process_group_options, terminate_process_tree
 
@@ -47,6 +54,7 @@ class MCPClient:
         elicitation_modes: tuple[str, ...] = ("form",),
         notification_handler: NotificationHandler | None = None,
         server_request_handler: ServerRequestHandler | None = None,
+        oauth_session: MCPOAuthSession | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("MCP timeout must be positive")
@@ -76,6 +84,13 @@ class MCPClient:
         self._http: httpx.AsyncClient | None = http_client
         self._owns_http = http_client is None
         self._http_session_id = ""
+        self._oauth = oauth_session
+        if self._oauth is None and config.auth == "oauth":
+            self._oauth = MCPOAuthSession(
+                config.name,
+                config.resolved_url,
+                oauth_config=config.resolved_oauth,
+            )
         self._initialized = False
 
     @property
@@ -105,6 +120,8 @@ class MCPClient:
                 raise MCPProtocolError(f"MCP server {self.config.name!r} has no URL")
             if self._http is None:
                 self._http = httpx.AsyncClient(timeout=self.timeout)
+            if self._oauth is not None and self._oauth.http_client is None:
+                self._oauth.http_client = self._http
         else:
             raise MCPProtocolError(
                 f"Unsupported MCP transport: {self.config.transport}"
@@ -359,11 +376,46 @@ class MCPClient:
             headers["Mcp-Session-Id"] = self._http_session_id
         if self.protocol_version:
             headers["MCP-Protocol-Version"] = self.protocol_version
+        if self._oauth is not None:
+            headers["Authorization"] = await self._oauth.authorization_header()
         response = await self._http.post(
             self.config.resolved_url,
             json=payload,
             headers=headers,
         )
+        if response.status_code == 401 and self._oauth is not None:
+            rejected_access_token = headers["Authorization"].removeprefix("Bearer ")
+            headers["Authorization"] = await self._oauth.authorization_header(
+                force_refresh=True,
+                rejected_access_token=rejected_access_token,
+            )
+            response = await self._http.post(
+                self.config.resolved_url,
+                json=payload,
+                headers=headers,
+            )
+            if response.status_code == 401:
+                raise MCPAuthorizationRequired(
+                    f"MCP server {self.config.name!r} rejected refreshed OAuth "
+                    f"credentials; run `ash mcp login {self.config.name}`"
+                )
+        if response.status_code == 403 and self._oauth is not None:
+            challenge = bearer_challenge_parameters(
+                response.headers.get("www-authenticate", "")
+            )
+            if challenge.get("error", "").casefold() == "insufficient_scope":
+                try:
+                    required_scope = normalize_oauth_scope(
+                        challenge.get("scope", ""), "server-required OAuth scope"
+                    )
+                except MCPOAuthError:
+                    required_scope = ""
+                guidance = f"; required scopes: {required_scope}" if required_scope else ""
+                raise MCPAuthorizationRequired(
+                    f"MCP server {self.config.name!r} requires additional OAuth "
+                    f"scope{guidance}; rerun `ash mcp login {self.config.name}` "
+                    "with --scope set to the server-required scopes"
+                )
         response.raise_for_status()
         session_id = response.headers.get("Mcp-Session-Id")
         if session_id:
@@ -436,6 +488,10 @@ class MCPClient:
         if self._http is not None and self._http_session_id:
             try:
                 headers = {**self.config.resolved_headers}
+                if self._oauth is not None:
+                    headers["Authorization"] = (
+                        await self._oauth.authorization_header()
+                    )
                 headers["Mcp-Session-Id"] = self._http_session_id
                 if self.protocol_version:
                     headers["MCP-Protocol-Version"] = self.protocol_version
@@ -444,7 +500,7 @@ class MCPClient:
                     headers=headers,
                 )
                 response.raise_for_status()
-            except httpx.HTTPError:
+            except (httpx.HTTPError, MCPOAuthError):
                 pass
             self._http_session_id = ""
         if self._http is not None and self._owns_http:

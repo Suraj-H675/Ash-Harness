@@ -82,4 +82,4 @@ asyncio_mode = "auto"
 addopts = ["--import-mode=importlib"]
 
 [tool.ruff]
-extend-exclude = ["project"]
+extend-exclude = ["project", "ref"]

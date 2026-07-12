@@ -143,6 +143,114 @@ def test_save_mcp_servers_round_trip(tmp_path: Path) -> None:
     assert loaded["local"].env == {"TOKEN": "${TOKEN}"}
 
 
+def test_save_mcp_oauth_server_round_trip_and_resolves_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCP_OAUTH_SECRET", "runtime-secret")
+    path = tmp_path / ".mcp.json"
+    config = MCPServerConfig(
+        name="protected",
+        command="",
+        args=[],
+        env={},
+        transport="http",
+        url="https://mcp.example.test/rpc",
+        auth="oauth",
+        oauth={
+            "client_id": "registered-client",
+            "client_secret": "${MCP_OAUTH_SECRET}",
+            "scope": "files:read",
+            "redirect_port": 43123,
+        },
+    )
+
+    save_mcp_servers({"protected": config}, path)
+    loaded = load_mcp_servers(path)["protected"]
+
+    assert loaded.auth == "oauth"
+    assert loaded.oauth == config.oauth
+    assert loaded.resolved_oauth["client_secret"] == "runtime-secret"
+    assert "runtime-secret" not in path.read_text(encoding="utf-8")
+
+
+def test_mcp_oauth_reports_missing_client_secret_environment() -> None:
+    config = MCPServerConfig(
+        name="protected",
+        command="",
+        args=[],
+        env={},
+        transport="http",
+        url="https://mcp.example.test/rpc",
+        auth="oauth",
+        oauth={
+            "client_id": "registered-client",
+            "client_secret": "${ASH_TEST_MISSING_MCP_SECRET}",
+        },
+    )
+
+    with pytest.raises(ValueError, match="environment variable is not set"):
+        _ = config.resolved_oauth
+
+
+def test_mcp_oauth_constructor_rejects_invalid_options_before_save() -> None:
+    with pytest.raises(ValueError, match="options require auth mode oauth"):
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+            oauth={"scope": "files:read"},
+        )
+    with pytest.raises(ValueError, match="redirect_port is invalid"):
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+            auth="oauth",
+            oauth={"redirect_port": -1},
+        )
+
+
+@pytest.mark.parametrize("transport", ["stdio", "websocket"])
+def test_mcp_oauth_rejects_unsupported_transports(transport: str) -> None:
+    with pytest.raises(ValueError, match="requires the http or sse transport"):
+        MCPServerConfig(
+            name="protected",
+            command="server",
+            args=[],
+            env={},
+            transport=transport,
+            auth="oauth",
+        )
+
+
+def test_load_mcp_oauth_rejects_plaintext_client_secret(tmp_path: Path) -> None:
+    path = tmp_path / ".mcp.json"
+    path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "protected": {
+                        "transport": "http",
+                        "url": "https://mcp.example.test/rpc",
+                        "auth": "oauth",
+                        "oauth": {"client_secret": "plaintext-secret"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must reference an environment variable"):
+        load_mcp_servers(path)
+
+
 def test_mcp_secrets_are_resolved_only_at_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
