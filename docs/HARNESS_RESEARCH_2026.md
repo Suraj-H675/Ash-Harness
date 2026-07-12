@@ -59,6 +59,7 @@ reduce tool selection accuracy, and make the security boundary unreviewable.
 - [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728), [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414), [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591), [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707), and [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636): protected-resource metadata, authorization-server metadata, dynamic registration, resource indicators, and PKCE details used by the MCP authorization profile.
 - [Agent Skills specification](https://agentskills.io/specification): `SKILL.md` metadata, naming, optional resources, validation, and progressive disclosure.
 - [Agent2Agent specification 1.0](https://a2a-protocol.org/latest/specification): discovery, modalities, task lifecycle, streaming, and independent agent interoperability.
+- [Official A2A Python SDK](https://github.com/a2aproject/a2a-python): typed 1.0 protobuf models, Agent Card resolution, JSON-RPC/HTTP+JSON transports, server routing, task aggregation, cancellation, and durable database stores used by Ash's adapter and conformance client.
 - [Agent Client Protocol](https://agentclientprotocol.com/): client/agent initialization, sessions, terminal and filesystem capabilities, modes, session resume/list/close, and registry distribution.
 - [ACP Python SDK](https://github.com/agentclientprotocol/python-sdk): official typed protocol models, newline-delimited JSON stdio transport, agent/client routers, capability negotiation, and wire-test primitives used by Ash's v1 adapter.
 - [OpenTelemetry semantic conventions](https://opentelemetry.io/docs/specs/semconv/): standard traces, metrics, logs, errors, and GenAI attributes. Prompt/tool content is sensitive and must be opt-in.
@@ -329,7 +330,7 @@ not remove them.
 
 ## Current Ash Capability Matrix
 
-| Domain | State on 2026-07-12 | Key gap |
+| Domain | State on 2026-07-13 | Key gap |
 |---|---|---|
 | Agent loop and streaming | Partial | Public event schema v1 and validated provider-portable message/content/tool-call inputs now span the runtime and adapters; the loop remains monolithic and legacy XML fallback is mixed into canonical behavior. |
 | Provider layer | Strong partial | Built-ins, embedders, declared model capabilities, and custom OpenAI-compatible endpoints resolve through thread-safe linked registries; auth/discovery and non-text modalities remain limited. |
@@ -337,13 +338,13 @@ not remove them.
 | Context budgets | Strong partial | Provider totals reserve only currently visible tool schemas; large catalogs defer nonessential tools behind session-scoped search activation. Typed hashed fragments and deterministic compaction preserve provenance and task/path/action/outcome state. Model-assisted compaction remains. |
 | Sessions/recovery | Strong partial | SQLite schema v9 persists redacted cursor-replayable events plus atomic parent-first session trees, bounded branch metadata, safe fork boundaries, tree-aware retention, and SDK/CLI/HTTP/JSON-RPC access. Per-turn config snapshots and richer branch navigation/summarization remain. |
 | Memory | Partial | FTS/vector/Markdown exist; lifecycle, provenance, expiry, poisoning controls, and user workflow are incomplete. |
-| Subagents | Strong local | Provider-backed roles, shared state, steering, atomic DAG dispatch, bounded retries, restart recovery, redacted result context, and branch-verified Git artifact handoff exist; remote A2A and non-Git artifact materialization remain. |
+| Subagents | Strong local/remote | Provider-backed local roles, shared state, steering, atomic DAG dispatch, bounded retries, restart recovery, redacted result context, and branch-verified Git artifact handoff exist. Official A2A 1.0 adds authenticated independent-agent discovery/delegation, durable tasks and context continuation, streaming, cancellation, CLI client/server, and policy-gated configured tools; non-Git artifact materialization and richer A2A modalities/auth remain. |
 | Agent Skills | Strong after `5dcbf51` | Standard parsing and progressive disclosure now exist; controlled script execution and compatibility diagnostics remain. |
 | Plugins | Partial | Declarative skills/commands/agents/hooks/MCP only; no versioned executable SDK or providers/channels/services. |
 | Hooks | Strong partial | Hook contract v1 covers bounded/redacted session, turn, model, tool, and error lifecycle with fail-closed pre-tool denial and isolated observers. Context-compaction/config/permission-change events and explicit ordering remain. |
 | MCP | Strong partial | 2025-11-25 negotiation, tools/resources/templates/prompts, roots, sampling, elicitation, progress, logging, cancellation, pagination, server requests, and explicit OAuth 2.1 authorization/refresh/scope step-up exist; experimental tasks and live multi-vendor OAuth conformance remain. |
 | Safety/sandbox | Strong | Needs remote/plugin identity capabilities, network proxy policy, stronger resource limits, and platform CI. |
-| CLI/TUI/SDK/API | Strong local | CLI, SDK, HTTP server, and ACP v1 editor adapter share one trusted runtime assembler and versioned events. ACP has bounded stdio, isolated sessions, durable replay, permission/tool/usage updates, client MCP mapping, and an official-client wire test; richer media/editor callbacks and registry publication remain. WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, and channel adapters remain. |
+| CLI/TUI/SDK/API | Strong local/remote | CLI, SDK, HTTP server, ACP v1, and A2A 1.0 adapters share the trusted runtime and versioned events. ACP provides bounded editor sessions and an official wire test. A2A provides authenticated/durable JSON-RPC and HTTP+JSON tasks, streaming/cancel/continuation, origin-pinned clients, and trusted delegation tools. WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, and channel adapters remain. |
 | LSP | Absent in practice | `lsp/diagnostics.py` is 26 lines and is not a managed language-server client. |
 | Browser/media | Partial | Optional Playwright/Chromium navigation, ARIA snapshots, stable refs, form/click/scroll/history actions, network policy, and deterministic cleanup are live. Screenshots/vision, downloads/uploads, profiles, and other media remain. |
 | Automation/channels | Absent | No durable scheduler, event bus, gateway routing, pairing, or delivery semantics. |
@@ -412,7 +413,7 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 1129 passed, 9 environment-dependent skips on Python
+- Current verification: 1140 passed, 9 environment-dependent skips on Python
   3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
   race is covered by Ash's portable process completion helper.
 
@@ -478,7 +479,9 @@ internal modules, and untrusted contributions cannot bypass policy.
    ready-task dispatch, task-level retry, foreground aggregation, restart
    recovery, redacted dependency context, and conflict-safe verified Git
    artifact handoff; non-Git materialization and graph-wide budgets remain.
-3. Implement A2A server/client adapters with agent cards and policy mapping.
+3. A2A server/client adapters now provide an official 1.0 Agent Card, durable
+   authenticated tasks, streaming, cancellation, CLI calls, project-scoped
+   context continuation, and approval-gated configured delegation tools.
 4. Add remote execution backends after identities and audit semantics exist.
 
 Exit criterion: local and remote agents share one observable lifecycle and can

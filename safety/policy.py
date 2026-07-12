@@ -37,6 +37,7 @@ READ_ONLY_TOOLS = frozenset(
         "list_skills",
         "activate_skill",
         "search_tools",
+        "list_remote_agents",
         "browser_snapshot",
         "ask_user",
     }

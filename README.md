@@ -34,6 +34,7 @@ map, and supported API/local providers. Install optional features explicitly:
 pip install 'ash-ai[server]' # authenticated HTTP/SSE API
 pip install 'ash-ai[vector]' # ChromaDB and ONNX semantic memory
 pip install 'ash-ai[acp]'    # ACP v1 editor/IDE integration
+pip install 'ash-ai[a2a]'    # A2A v1 remote-agent server and client
 ```
 
 For development:
@@ -110,6 +111,57 @@ turn per session. Image, audio, embedded-resource, extra-directory, ACP-MCP,
 mode, fork, and resume capabilities are not advertised until their full
 protocol behavior is implemented. Standard output is reserved for ACP JSONL;
 diagnostics go to standard error.
+
+### Remote agents (A2A 1.0)
+
+Install and verify the optional capability pack, then expose the current
+project on loopback with an operator-owned token:
+
+```bash
+pip install 'ash-ai[a2a]'
+ash a2a check
+export ASH_A2A_TOKEN='replace-with-at-least-16-characters'
+ash a2a serve
+```
+
+The public Agent Card is at `/.well-known/agent-card.json`; JSON-RPC is at
+`/a2a`, and the official HTTP+JSON routes are also mounted under `/a2a`.
+Operational routes require the bearer token and are rate-limited. A remote
+binding additionally requires `--allow-remote` and an explicit HTTPS
+`--public-url`; terminate TLS in a production reverse proxy.
+
+Discover or call another A2A agent with the same out-of-band token convention:
+
+```bash
+ash a2a inspect https://agent.example.com
+ash a2a send https://agent.example.com 'Review the authentication flow'
+ash a2a send https://agent.example.com 'Continue' --context-id CONTEXT --json
+```
+
+To let models delegate through `list_remote_agents` and
+`delegate_remote_agent`, configure explicit endpoints in `~/.ash/a2a.json` or,
+for a trusted workspace, `.ash/a2a.json`:
+
+```json
+{
+  "agents": {
+    "review": {
+      "url": "https://review.example.com",
+      "description": "Independent code reviewer",
+      "token_env": "REVIEW_A2A_TOKEN",
+      "timeout_seconds": 300
+    }
+  }
+}
+```
+
+Tokens are read from the named environment variable and never stored in the
+file or exposed as model arguments. Delegation remains subject to Ash's normal
+approval policy. A2A tasks and context-to-Ash session mappings persist in
+separate SQLite databases; text streaming, polling, task get/list,
+cancellation, and context continuation are supported. Push notifications,
+files/data modalities, extended cards, gRPC, and signed-card trust policy are
+not advertised.
 
 Inside an interactive terminal, `/help` opens a full-screen searchable command
 reference; redirected input and screen-reader mode keep the linear text output.

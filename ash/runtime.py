@@ -188,6 +188,22 @@ def build_tools(
             allowed_domains=allowed_web_domains,
         )
     )
+    from agents.a2a_remote import (
+        DelegateRemoteAgentTool,
+        ListRemoteAgentsTool,
+        load_remote_agent_configs,
+    )
+
+    remote_agents = load_remote_agent_configs(
+        root, include_project=allow_project_extensions
+    )
+    if remote_agents:
+        tools.extend(
+            [
+                ListRemoteAgentsTool(safety_guard, remote_agents),
+                DelegateRemoteAgentTool(safety_guard, remote_agents),
+            ]
+        )
     if provider_factory is not None and agent_db_path is not None:
         spawn_tool = SpawnAgentTool(
             safety_guard,

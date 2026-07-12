@@ -182,6 +182,48 @@ def _check_extensions(config: AshConfig) -> DoctorCheck:
     )
 
 
+def _check_a2a(config: AshConfig) -> DoctorCheck:
+    from agents.a2a_remote import load_remote_agent_configs
+    from safety.trust import is_workspace_trusted
+
+    try:
+        agents = load_remote_agent_configs(
+            config.workspace_root,
+            include_project=is_workspace_trusted(config.workspace_root),
+        )
+    except (OSError, ValueError) as exc:
+        return DoctorCheck(
+            "a2a",
+            "fail",
+            f"Invalid remote-agent configuration: {exc}",
+            "Repair ~/.ash/a2a.json or the trusted project's .ash/a2a.json.",
+        )
+    if not agents:
+        return DoctorCheck("a2a", "pass", "No remote A2A agents configured")
+    if importlib.util.find_spec("a2a") is None:
+        return DoctorCheck(
+            "a2a",
+            "fail",
+            f"{len(agents)} remote agent(s) configured but A2A support is missing",
+            "Install `ash-ai[a2a]`.",
+        )
+    missing = sorted(
+        {
+            agent.token_env
+            for agent in agents.values()
+            if not os.environ.get(agent.token_env)
+        }
+    )
+    if missing:
+        return DoctorCheck(
+            "a2a",
+            "warn",
+            f"{len(agents)} remote agent(s); unset credentials: {', '.join(missing)}",
+            "Set each credential environment variable before delegating.",
+        )
+    return DoctorCheck("a2a", "pass", f"{len(agents)} remote agent(s) ready")
+
+
 async def _check_connectivity(config: AshConfig) -> DoctorCheck:
     provider = config.provider
     if provider == "ollama":
@@ -293,6 +335,7 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
     )
     checks.append(_check_mcp(config))
     checks.append(_check_extensions(config))
+    checks.append(_check_a2a(config))
     if connect:
         checks.append(await _check_connectivity(config))
     return checks

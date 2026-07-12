@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 from cli.doctor import DoctorCheck, render_doctor, run_doctor
-from cli.doctor import _check_browser, _check_storage, _check_web_search
+from cli.doctor import _check_a2a, _check_browser, _check_storage, _check_web_search
 from config import AshConfig
 
 
@@ -77,6 +77,26 @@ def test_browser_doctor_distinguishes_missing_extra_and_binary(
     missing_binary = _check_browser()
     assert missing_binary.status == "warn"
     assert "setup browser" in missing_binary.remedy
+
+
+def test_a2a_doctor_reports_unset_remote_credentials(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    config_path = home / ".ash" / "a2a.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        '{"agents":{"review":{"url":"https://review.example.com",'
+        '"token_env":"REVIEW_TOKEN"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("REVIEW_TOKEN", raising=False)
+
+    check = _check_a2a(AshConfig(workspace_root=tmp_path))
+
+    assert check.status == "warn"
+    assert "REVIEW_TOKEN" in check.message
 
 
 @pytest.mark.asyncio

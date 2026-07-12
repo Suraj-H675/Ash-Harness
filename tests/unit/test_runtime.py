@@ -138,3 +138,54 @@ def test_runtime_merges_explicit_mcp_servers_and_rejects_collisions(
             workspace_trusted=True,
             additional_mcp_configs={collision.name: collision},
         )
+
+
+def test_runtime_registers_only_trusted_configured_remote_agents(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    user_config = home / ".ash" / "a2a.json"
+    project_config = workspace / ".ash" / "a2a.json"
+    user_config.parent.mkdir(parents=True)
+    project_config.parent.mkdir(parents=True)
+    user_config.write_text(
+        '{"agents":{"review":{"url":"https://review.example.com"}}}',
+        encoding="utf-8",
+    )
+    project_config.write_text(
+        '{"agents":{"project":{"url":"https://project.example.com"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+
+    untrusted = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=False,
+    )
+    assert {
+        "list_remote_agents",
+        "delegate_remote_agent",
+    } <= untrusted.loop.tools.keys()
+    assert set(untrusted.loop.tools["list_remote_agents"].agents) == {"review"}
+
+    trusted = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+    )
+    assert set(trusted.loop.tools["list_remote_agents"].agents) == {
+        "review",
+        "project",
+    }

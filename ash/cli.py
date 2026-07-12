@@ -1574,6 +1574,40 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Validate the optional ACP runtime without starting stdio transport",
     )
+    a2a_parser = subparsers.add_parser(
+        "a2a", help="Expose or call agents through Agent2Agent Protocol 1.0"
+    )
+    a2a_subparsers = a2a_parser.add_subparsers(dest="a2a_action", required=True)
+    a2a_subparsers.add_parser("check", help="Validate the optional A2A runtime")
+    a2a_serve = a2a_subparsers.add_parser(
+        "serve", help="Run the authenticated A2A 1.0 HTTP server"
+    )
+    a2a_serve.add_argument("--host", default="127.0.0.1")
+    a2a_serve.add_argument("--port", type=int, default=8770)
+    a2a_serve.add_argument("--public-url")
+    a2a_serve.add_argument("--token-env", default="ASH_A2A_TOKEN")
+    a2a_serve.add_argument("--rate-limit", type=int, default=60)
+    a2a_serve.add_argument("--allow-remote", action="store_true")
+    a2a_serve.add_argument(
+        "--log-level",
+        choices=["critical", "error", "warning", "info", "debug"],
+        default="info",
+    )
+    a2a_inspect = a2a_subparsers.add_parser(
+        "inspect", help="Resolve and print a remote Agent Card"
+    )
+    a2a_inspect.add_argument("url")
+    a2a_inspect.add_argument("--token-env", default="ASH_A2A_TOKEN")
+    a2a_inspect.add_argument("--timeout", type=float, default=30.0)
+    a2a_send = a2a_subparsers.add_parser(
+        "send", help="Send a text task to a remote A2A agent"
+    )
+    a2a_send.add_argument("url")
+    a2a_send.add_argument("prompt", help="Prompt text, or - to read standard input")
+    a2a_send.add_argument("--context-id")
+    a2a_send.add_argument("--token-env", default="ASH_A2A_TOKEN")
+    a2a_send.add_argument("--timeout", type=float, default=300.0)
+    a2a_send.add_argument("--json", action="store_true")
     mcp_subparser = subparsers.add_parser("mcp")
     mcp_action_subparsers = mcp_subparser.add_subparsers(dest="action", required=True)
     mcp_list = mcp_action_subparsers.add_parser("list")
@@ -2285,16 +2319,50 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         try:
             asyncio.run(run_acp_agent())
+        except KeyboardInterrupt:
+            return 130
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"Error: ACP server failed: {exc}", file=sys.stderr)
             return 2
         return 0
+
+    if args.command == "a2a":
+        try:
+            from a2a.client.errors import A2AClientError
+            from a2a.utils.constants import PROTOCOL_VERSION_1_0
+            from cli.a2a import inspect_a2a, send_a2a, serve_a2a
+            from httpx import HTTPError
+        except ModuleNotFoundError as exc:
+            if exc.name == "a2a" or (exc.name or "").startswith("a2a."):
+                print(
+                    "Error: A2A support requires `pip install 'ash-ai[a2a]'`.",
+                    file=sys.stderr,
+                )
+                return 2
+            raise
+        if args.a2a_action == "check":
+            print(f"Ash A2A protocol v{PROTOCOL_VERSION_1_0} is ready.")
+            return 0
+        try:
+            operation = {
+                "serve": serve_a2a,
+                "inspect": inspect_a2a,
+                "send": send_a2a,
+            }[args.a2a_action]
+            return asyncio.run(operation(args))
+        except KeyboardInterrupt:
+            return 130
+        except (A2AClientError, HTTPError, OSError, RuntimeError, ValueError) as exc:
+            print(f"Error: A2A operation failed: {exc}", file=sys.stderr)
+            return 2
 
     if args.command == "serve":
         from cli.serve import serve_http
 
         try:
             return asyncio.run(serve_http(args))
+        except KeyboardInterrupt:
+            return 130
         except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
             error = classify_exception(exc)
             print(format_error(error), file=sys.stderr)
@@ -2395,9 +2463,7 @@ def main(argv: list[str] | None = None) -> int:
             env = parse_key_value_options(args.env, label="--env")
             headers = parse_key_value_options(args.header, label="--header")
             secret_env = args.oauth_client_secret_env.strip()
-            if secret_env and not re.fullmatch(
-                r"[A-Za-z_][A-Za-z0-9_]*", secret_env
-            ):
+            if secret_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", secret_env):
                 raise ValueError(
                     "--oauth-client-secret-env must be an environment variable name"
                 )

@@ -227,6 +227,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | JSON-RPC server | Partial | Validated stdio methods, cancellation, lifecycle, and tests; remote transport remains |
 | HTTP server | Verified locally | Bearer auth, rate limits, lifecycle, session/turn/steering routes, live SSE events, cancellation, and safe CLI binding |
 | IDE/ACP integration | Verified locally | Official ACP Python SDK v1 over bounded JSONL stdio; initialize/new/load/list/prompt/cancel, durable message and redacted tool replay, permission requests, text/resource links, tool/usage streaming, editor-supplied stdio/HTTP/SSE MCP, isolated runtimes, and an official-client wire test. Images/audio/embedded context, extra directories, modes, fork/resume, terminal/filesystem callbacks, and registry publication remain unadvertised. |
+| Remote-agent/A2A integration | Verified locally | Official A2A SDK/spec 1.0 Agent Card, JSON-RPC and HTTP+JSON routes, bearer auth, rate limits, durable SQLite tasks and project-scoped context/session mapping, text artifact streaming, polling/get/list/cancel, CLI inspect/send, trusted configured delegation tools, bounded I/O, origin pinning, and official-client end-to-end tests. Push notifications, files/data, extended cards, gRPC, signed-card verification, and OAuth/mTLS remain unadvertised. |
 
 ## 12. Reliability And Operations
 

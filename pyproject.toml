@@ -62,6 +62,10 @@ browser = [
 acp = [
     "agent-client-protocol>=0.11,<0.12",
 ]
+a2a = [
+    "a2a-sdk[http-server,sqlite]>=1.1,<1.2",
+    "uvicorn>=0.34",
+]
 
 [dependency-groups]
 dev = [
@@ -70,6 +74,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.11",
+    "types-protobuf>=6.30",
     "types-pyyaml>=6.0",
     "uvicorn>=0.34",
 ]
