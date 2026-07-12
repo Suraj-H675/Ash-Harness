@@ -14,7 +14,13 @@ from pathlib import Path
 from packaging.requirements import Requirement
 
 
-OPTIONAL_DISTRIBUTIONS = {"fastapi", "numpy", "uvicorn", "websockets"}
+OPTIONAL_DISTRIBUTIONS = {
+    "fastapi",
+    "numpy",
+    "playwright",
+    "uvicorn",
+    "websockets",
+}
 
 
 def run_ash(
@@ -42,7 +48,7 @@ def run_ash(
 
 
 def assert_distribution_metadata() -> None:
-    installed = distribution("ash")
+    installed = distribution("ash-ai")
     requirements = [Requirement(value) for value in installed.requires or ()]
     base_names = {
         requirement.name.casefold()
@@ -58,6 +64,7 @@ def assert_distribution_metadata() -> None:
     assert 'extra == "server"' in marked["uvicorn"]
     assert 'extra == "vector"' in marked["chromadb"]
     assert 'extra == "vector"' in marked["onnxruntime"]
+    assert 'extra == "browser"' in marked["playwright"]
 
     packaged = {str(path).replace("\\", "/") for path in installed.files or ()}
     assert not any(path.startswith("project/") for path in packaged)

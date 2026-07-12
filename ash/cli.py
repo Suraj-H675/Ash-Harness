@@ -1313,12 +1313,12 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command")
     setup_parser = subparsers.add_parser(
         "setup",
-        help="Configure Ash (provider, API key, model)",
+        help="Configure Ash (model, credentials, web search, browser)",
     )
     setup_parser.add_argument(
         "section",
         nargs="?",
-        choices=["model", "providers", "web", "all"],
+        choices=["model", "providers", "web", "browser", "all"],
         help="Which section to configure",
     )
     setup_parser.add_argument(

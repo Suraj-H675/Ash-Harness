@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 from cli.doctor import DoctorCheck, render_doctor, run_doctor
-from cli.doctor import _check_storage, _check_web_search
+from cli.doctor import _check_browser, _check_storage, _check_web_search
 from config import AshConfig
 
 
@@ -57,6 +57,26 @@ def test_web_search_doctor_reports_auto_detection(
 
     assert check.status == "pass"
     assert "brave" in check.message
+
+
+def test_browser_doctor_distinguishes_missing_extra_and_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cli.doctor.importlib.util.find_spec", lambda name: None)
+    missing_extra = _check_browser()
+    assert missing_extra.status == "warn"
+    assert "ash-ai[browser]" in missing_extra.remedy
+
+    monkeypatch.setattr("cli.doctor.importlib.util.find_spec", lambda name: object())
+    monkeypatch.setattr(
+        "cli.doctor.subprocess.run",
+        lambda *args, **kwargs: type(
+            "Completed", (), {"returncode": 0, "stdout": "", "stderr": ""}
+        )(),
+    )
+    missing_binary = _check_browser()
+    assert missing_binary.status == "warn"
+    assert "setup browser" in missing_binary.remedy
 
 
 @pytest.mark.asyncio

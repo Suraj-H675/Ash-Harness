@@ -87,6 +87,7 @@ def build_tools(
     from tools.agent import SpawnAgentTool
     from tools.ask_user import AskUserTool
     from tools.base import BaseTool
+    from tools.browser import build_browser_tools
     from tools.command import RunCommandTool
     from tools.delegate import DelegateAgentsTool
     from tools.filesystem import (
@@ -177,6 +178,16 @@ def build_tools(
         ActivateSkillTool(safety_guard, catalog),
         ReadSkillResourceTool(safety_guard, catalog),
     ]
+    tools.extend(
+        build_browser_tools(
+            safety_guard,
+            headless=(runtime_config.browser_headless if runtime_config else True),
+            timeout_seconds=(
+                runtime_config.browser_timeout_seconds if runtime_config else 30.0
+            ),
+            allowed_domains=allowed_web_domains,
+        )
+    )
     if provider_factory is not None and agent_db_path is not None:
         spawn_tool = SpawnAgentTool(
             safety_guard,

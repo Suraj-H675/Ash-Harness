@@ -508,6 +508,55 @@ class TestWebSearchSetup:
         assert "BRAVE_SEARCH_API_KEY" in capsys.readouterr().err
 
 
+class TestBrowserSetup:
+    def test_reports_missing_optional_dependency(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys,
+    ) -> None:
+        from cli.setup import SetupOutcome, setup_browser
+
+        monkeypatch.setattr("cli.setup.importlib.util.find_spec", lambda name: None)
+
+        assert setup_browser() == SetupOutcome.ERROR
+        assert "ash-ai[browser]" in capsys.readouterr().err
+
+    def test_existing_browser_never_runs_installer(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from cli.setup import SetupOutcome, setup_browser
+
+        monkeypatch.setattr("cli.setup._browser_is_installed", lambda: True)
+        run = MagicMock(side_effect=AssertionError("installer unexpectedly ran"))
+        monkeypatch.setattr("cli.setup.subprocess.run", run)
+
+        assert setup_browser() == SetupOutcome.SUCCESS
+        run.assert_not_called()
+
+    def test_installs_pinned_chromium_after_confirmation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from cli.setup import SetupOutcome, setup_browser
+
+        states = iter((False, True))
+        monkeypatch.setattr(
+            "cli.setup._browser_is_installed", lambda: next(states)
+        )
+        monkeypatch.setattr("builtins.input", _fake_input([""]))
+        completed = MagicMock(returncode=0)
+        monkeypatch.setattr("cli.setup.subprocess.run", MagicMock(return_value=completed))
+
+        assert setup_browser() == SetupOutcome.SUCCESS
+        from cli import setup
+
+        setup.subprocess.run.assert_called_once_with(
+            [setup.sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False,
+        )
+
+
 class TestSetupNavigation:
     def test_provider_selection_can_cancel(
         self, monkeypatch: pytest.MonkeyPatch

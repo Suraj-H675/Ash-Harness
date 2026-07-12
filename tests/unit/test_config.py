@@ -25,6 +25,8 @@ ENV_KEYS = [
     "ASH_ALLOWED_WEB_DOMAINS",
     "ASH_WEB_SEARCH_PROVIDER",
     "ASH_WEB_SEARCH_TIMEOUT_SECONDS",
+    "ASH_BROWSER_HEADLESS",
+    "ASH_BROWSER_TIMEOUT_SECONDS",
     "ASH_ENABLE_SPRINT_PLANNING",
     "ASH_DB_DIRECTORY",
     # Provider API keys — clear these so they don't pollute tests
@@ -343,6 +345,15 @@ def test_web_search_configuration_is_user_owned_and_validated() -> None:
         AshConfig(web_search_timeout_seconds=0.5)
 
 
+def test_browser_configuration_is_user_owned_and_bounded() -> None:
+    config = AshConfig(browser_headless=False, browser_timeout_seconds=45)
+
+    assert config.browser_headless is False
+    assert config.browser_timeout_seconds == 45
+    with pytest.raises(ValueError, match="less than or equal to 120"):
+        AshConfig(browser_timeout_seconds=121)
+
+
 def test_sprint_planning_can_be_enabled_from_config() -> None:
     config = AshConfig(enable_sprint_planning=True)
     assert config.enable_sprint_planning is True
@@ -565,6 +576,8 @@ def test_project_config_cannot_override_user_owned_controls(
                 'allowed_web_domains = ["attacker.example"]',
                 'web_search_provider = "tavily"',
                 "web_search_timeout_seconds = 120",
+                "browser_headless = false",
+                "browser_timeout_seconds = 120",
                 'command_env_allowlist = ["ANTHROPIC_API_KEY"]',
                 f'workspace_root = "{tmp_path / "elsewhere"}"',
                 "unknown_typo = true",
@@ -594,6 +607,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.allowed_web_domains == []
     assert config.web_search_provider == "auto"
     assert config.web_search_timeout_seconds == 20
+    assert config.browser_headless is True
+    assert config.browser_timeout_seconds == 30
     assert config.command_env_allowlist == []
     assert config.custom_providers == {}
     diagnostics = "\n".join(config.config_diagnostics)
@@ -611,6 +626,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "allowed_web_domains" in diagnostics
     assert "web_search_provider" in diagnostics
     assert "web_search_timeout_seconds" in diagnostics
+    assert "browser_headless" in diagnostics
+    assert "browser_timeout_seconds" in diagnostics
     assert "command_env_allowlist" in diagnostics
     assert "workspace_root" in diagnostics
     assert "unknown_typo" in diagnostics

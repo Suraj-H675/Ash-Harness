@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import platform
 import shutil
 import sqlite3
+import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -88,6 +90,39 @@ def _check_web_search(config: AshConfig) -> DoctorCheck:
         "warn",
         "optional live search is not configured",
         "Run `ash setup web` to configure Brave Search or Tavily.",
+    )
+
+
+def _check_browser() -> DoctorCheck:
+    if importlib.util.find_spec("playwright") is None:
+        return DoctorCheck(
+            "browser",
+            "warn",
+            "optional Playwright package is not installed",
+            "Install `ash-ai[browser]`, then run `ash setup browser`.",
+        )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "--list"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        completed = None
+    output = (
+        (completed.stdout + completed.stderr).casefold()
+        if completed is not None
+        else ""
+    )
+    if completed is not None and completed.returncode == 0 and "chromium" in output:
+        return DoctorCheck("browser", "pass", "Playwright Chromium is installed")
+    return DoctorCheck(
+        "browser",
+        "warn",
+        "Playwright is installed but Chromium is missing",
+        "Run `ash setup browser`.",
     )
 
 
@@ -220,6 +255,7 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
             ),
             _check_credentials(config),
             _check_web_search(config),
+            _check_browser(),
             _check_workspace(config),
             _check_storage(config),
             DoctorCheck(

@@ -209,6 +209,14 @@ and falls back between configured providers only in `auto` mode. Set
 fetch targets and returned search sources. Run `ash setup web` to enter either
 search credential through the hidden-input setup flow.
 
+Browser automation is an optional capability pack. Install with
+`pipx install 'ash-ai[browser]'`, then run `ash setup browser` once to download
+Playwright's pinned Chromium build. Browser pages use an isolated context with
+downloads and service workers disabled; navigation, subresources, and
+WebSockets share the public-host and `allowed_web_domains` policy. The model
+receives bounded ARIA snapshots and stable element references rather than raw
+unbounded DOM content. Password fields are never filled by the browser tool.
+
 Workspace file reads, attachments, writes, exact edits, and patches reject
 symlink/junction mutation paths. On POSIX, Ash walks from an open workspace
 descriptor with no-follow operations and performs atomic directory-anchored

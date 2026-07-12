@@ -7,7 +7,9 @@ storage to ~/.ash/.env and ~/.ash/ash.toml.
 from __future__ import annotations
 
 import getpass
+import importlib.util
 import re
+import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -117,6 +119,16 @@ def run_setup_wizard(args) -> SetupOutcome:
     config = AshConfig.load()
 
     if non_interactive or not is_interactive_stdin():
+        if section == "browser":
+            if _browser_is_installed():
+                print("Playwright Chromium is installed.")
+                return SetupOutcome.SUCCESS
+            print(
+                "Error: browser automation is not installed. Install "
+                "`ash-ai[browser]`, then run `ash setup browser`.",
+                file=sys.stderr,
+            )
+            return SetupOutcome.ERROR
         if section == "web":
             if _has_web_search_configured(config):
                 print(
@@ -157,6 +169,9 @@ def run_setup_wizard(args) -> SetupOutcome:
         if result != SetupOutcome.SUCCESS:
             print("Setup cancelled.", file=sys.stderr)
             return result
+
+    if section == "browser":
+        return setup_browser()
 
     _print_info("Setup complete!")
     return SetupOutcome.SUCCESS
@@ -203,6 +218,65 @@ def setup_web_search() -> SetupOutcome:
             print("  Returning to web search provider selection.")
         except SetupCancelled:
             return SetupOutcome.CANCELLED
+
+
+def setup_browser() -> SetupOutcome:
+    """Install the Chromium build pinned to the optional Playwright package."""
+
+    _print_header("Browser Automation Setup")
+    if importlib.util.find_spec("playwright") is None:
+        print(
+            "  Playwright is not installed. Install Ash with the browser extra:\n"
+            "\n    pipx install 'ash-ai[browser]'\n",
+            file=sys.stderr,
+        )
+        return SetupOutcome.ERROR
+    if _browser_is_installed():
+        _print_info("Playwright Chromium is already installed.")
+        return SetupOutcome.SUCCESS
+    answer = _prompt_setup_text(
+        "  Download the pinned Chromium build (several hundred MB)? [Y/n]: ",
+        allow_empty=True,
+    ).casefold()
+    if answer in {"n", "no"}:
+        return SetupOutcome.CANCELLED
+    completed = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=False,
+    )
+    if completed.returncode != 0:
+        print(
+            "  Chromium installation failed. On supported Linux distributions, "
+            "install required system libraries with `playwright install-deps "
+            "chromium`, then retry.",
+            file=sys.stderr,
+        )
+        return SetupOutcome.ERROR
+    if not _browser_is_installed():
+        print(
+            "  Playwright completed without reporting an installed Chromium build.",
+            file=sys.stderr,
+        )
+        return SetupOutcome.ERROR
+    _print_info("Playwright Chromium is installed.")
+    return SetupOutcome.SUCCESS
+
+
+def _browser_is_installed() -> bool:
+    if importlib.util.find_spec("playwright") is None:
+        return False
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "--list"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    output = (completed.stdout + completed.stderr).casefold()
+    return completed.returncode == 0 and "chromium" in output
 
 
 # ---------------------------------------------------------------------------

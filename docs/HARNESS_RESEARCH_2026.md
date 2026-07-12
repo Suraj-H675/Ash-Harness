@@ -63,6 +63,7 @@ reduce tool selection accuracy, and make the security boundary unreviewable.
 - [NIST AI RMF Generative AI Profile](https://www.nist.gov/publications/artificial-intelligence-risk-management-framework-generative-artificial-intelligence): governance and test/evaluation/verification/validation guidance across the AI lifecycle.
 - [Brave Web Search API](https://api-dashboard.search.brave.com/api-reference/web/search/get): bounded result counts, freshness filters, safe search, authentication, and rate-limit behavior for source-oriented live search.
 - [Tavily Search API](https://docs.tavily.com/documentation/api-reference/endpoint/search): agent-oriented normalized search, freshness ranges, bounded results, and bearer authentication.
+- [Playwright Python](https://playwright.dev/python/docs/library): maintained cross-platform browser automation and version-pinned browser binaries used by Ash's optional isolated browser capability.
 
 ### Reference repository snapshots
 
@@ -329,7 +330,7 @@ not remove them.
 |---|---|---|
 | Agent loop and streaming | Partial | Public event schema v1 and validated provider-portable message/content/tool-call inputs now span the runtime and adapters; the loop remains monolithic and legacy XML fallback is mixed into canonical behavior. |
 | Provider layer | Strong partial | Built-ins, embedders, declared model capabilities, and custom OpenAI-compatible endpoints resolve through thread-safe linked registries; auth/discovery and non-text modalities remain limited. |
-| Coding tools | Strong | Exact-schema deferred tool search plus guarded Brave/Tavily live web search are live; PTY terminal sessions, browser, media, scheduler, and messaging remain. |
+| Coding tools | Strong | Exact-schema deferred tool search, guarded Brave/Tavily live search, and an optional isolated Playwright browser are live; PTY terminal sessions, media, scheduler, and messaging remain. |
 | Context budgets | Strong partial | Provider totals reserve only currently visible tool schemas; large catalogs defer nonessential tools behind session-scoped search activation. Typed hashed fragments and deterministic compaction preserve provenance and task/path/action/outcome state. Model-assisted compaction remains. |
 | Sessions/recovery | Strong partial | SQLite schema v9 persists redacted cursor-replayable events plus atomic parent-first session trees, bounded branch metadata, safe fork boundaries, tree-aware retention, and SDK/CLI/HTTP/JSON-RPC access. Per-turn config snapshots and richer branch navigation/summarization remain. |
 | Memory | Partial | FTS/vector/Markdown exist; lifecycle, provenance, expiry, poisoning controls, and user workflow are incomplete. |
@@ -341,7 +342,7 @@ not remove them.
 | Safety/sandbox | Strong | Needs remote/plugin identity capabilities, network proxy policy, stronger resource limits, and platform CI. |
 | CLI/TUI/SDK/API | Strong local | CLI, SDK, and HTTP server now share one trusted runtime assembler and versioned events; no ACP adapter, WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, or channel adapters. |
 | LSP | Absent in practice | `lsp/diagnostics.py` is 26 lines and is not a managed language-server client. |
-| Browser/media | Absent | Must be optional capability packs with explicit profiles, costs, and policy. |
+| Browser/media | Partial | Optional Playwright/Chromium navigation, ARIA snapshots, stable refs, form/click/scroll/history actions, network policy, and deterministic cleanup are live. Screenshots/vision, downloads/uploads, profiles, and other media remain. |
 | Automation/channels | Absent | No durable scheduler, event bus, gateway routing, pairing, or delivery semantics. |
 | Observability/evals | Absent | Logging and audit exist, but no OTel traces/metrics or task evaluation harness. |
 | Packaging | Improved | Distribution renamed to available `ash-ai`; public PyPI release/signing still required. |
@@ -408,7 +409,7 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 1088 passed, 8 environment-dependent skips on Python
+- Current verification: 1097 passed, 9 environment-dependent skips on Python
   3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
   race is covered by Ash's portable process completion helper.
 
@@ -478,7 +479,8 @@ resume after process interruption.
 
 ### Phase 4: general-purpose capability packs
 
-1. Web search/extraction and dedicated browser profile automation.
+1. Web search and an isolated browser automation baseline are live; richer
+   extraction, persistent browser profiles, vision, uploads, and downloads remain.
 2. Media/document understanding and image/audio/video generation adapters.
 3. Durable scheduler, cron/heartbeat, webhooks, and event triggers.
 4. Gateway identity/routing plus initial WebChat, Telegram, Discord, and Slack

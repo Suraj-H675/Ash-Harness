@@ -484,6 +484,16 @@ class AshConfig(BaseSettings):
         le=120.0,
         description="Wall-clock timeout for one web search provider request.",
     )
+    browser_headless: bool = Field(
+        True,
+        description="Run the optional Playwright browser without a visible window.",
+    )
+    browser_timeout_seconds: float = Field(
+        30.0,
+        ge=1.0,
+        le=120.0,
+        description="Timeout for one browser navigation or interaction.",
+    )
 
     db_directory: Path = Field(
         default=Path.home() / ".ash" / "db",
