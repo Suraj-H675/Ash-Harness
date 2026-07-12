@@ -46,23 +46,36 @@ async def terminate_process_tree(
             stderr=asyncio.subprocess.DEVNULL,
         )
         await killer.wait()
-        await process.wait()
+        await _wait_for_returncode(process, grace_seconds)
         return
 
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
+        await _wait_for_returncode(process, grace_seconds)
         return
-    try:
-        await asyncio.wait_for(process.wait(), timeout=grace_seconds)
+    if await _wait_for_returncode(process, grace_seconds):
         return
-    except asyncio.TimeoutError:
-        pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
+        await _wait_for_returncode(process, grace_seconds)
         return
-    await process.wait()
+    await _wait_for_returncode(process, grace_seconds)
+
+
+async def _wait_for_returncode(
+    process: asyncio.subprocess.Process, timeout: float
+) -> bool:
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        pass
+    deadline = asyncio.get_running_loop().time() + timeout
+    while process.returncode is None and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    return process.returncode is not None
 
 
 async def communicate_process(

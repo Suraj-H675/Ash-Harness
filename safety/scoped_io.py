@@ -22,9 +22,16 @@ class ScopedFileChanged(ScopedIOError):
     """The destination changed between validation and mutation."""
 
 
-def read_scoped_bytes(path: str | Path, guard: SafetyGuard) -> tuple[Path, bytes]:
+def read_scoped_bytes(
+    path: str | Path,
+    guard: SafetyGuard,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[Path, bytes]:
     """Read a regular file without following any workspace link component."""
 
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes cannot be negative")
     target = guard.validate_mutation_path(path)
     if _supports_anchored_io():
         with _open_parent(target, guard, create=False) as (parent_fd, name):
@@ -37,10 +44,10 @@ def read_scoped_bytes(path: str | Path, guard: SafetyGuard) -> tuple[Path, bytes
                 metadata = os.fstat(fd)
                 if not stat.S_ISREG(metadata.st_mode):
                     raise ScopedIOError(f"not a regular file: {target}")
-                return target, _read_all(fd)
+                return target, _read_all(fd, max_bytes=max_bytes)
             finally:
                 os.close(fd)
-    return target, _fallback_read(target, guard)
+    return target, _fallback_read(target, guard, max_bytes=max_bytes)
 
 
 def list_scoped_directory(
@@ -265,14 +272,18 @@ def _anchored_atomic_write(
                     pass
 
 
-def _fallback_read(target: Path, guard: SafetyGuard) -> bytes:
+def _fallback_read(
+    target: Path, guard: SafetyGuard, *, max_bytes: int | None = None
+) -> bytes:
     before = _fallback_identity(target)
     assert before is not None
     with target.open("rb") as handle:
         opened = os.fstat(handle.fileno())
         if not stat.S_ISREG(opened.st_mode) or not _same_file(before, opened):
             raise ScopedFileChanged(f"file changed while opening: {target}")
-        data = handle.read()
+        data = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
+        if max_bytes is not None and len(data) > max_bytes:
+            raise ScopedIOError(f"file exceeds {max_bytes} bytes: {target}")
     guard.validate_mutation_path(target)
     after = _fallback_identity(target)
     assert after is not None
@@ -353,10 +364,19 @@ def _hash_entry(parent_fd: int, name: str, target: Path) -> str:
         os.close(fd)
 
 
-def _read_all(fd: int) -> bytes:
+def _read_all(fd: int, *, max_bytes: int | None = None) -> bytes:
     chunks: list[bytes] = []
-    while chunk := os.read(fd, 1024 * 1024):
+    total = 0
+    while chunk := os.read(
+        fd,
+        min(1024 * 1024, max_bytes + 1 - total)
+        if max_bytes is not None
+        else 1024 * 1024,
+    ):
         chunks.append(chunk)
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise ScopedIOError(f"file exceeds {max_bytes} bytes")
     return b"".join(chunks)
 
 

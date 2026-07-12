@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -8,10 +9,30 @@ import pytest
 from safety.guard import SafetyGuard, SafetyViolation
 from safety.scoped_io import (
     ScopedFileChanged,
+    ScopedIOError,
     atomic_write_scoped_text,
     list_scoped_directory,
     read_scoped_bytes,
 )
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_scoped_read_enforces_byte_limit(tmp_path, fallback: bool) -> None:
+    target = tmp_path / "target.txt"
+    target.write_bytes(b"12345")
+    guard = SafetyGuard(tmp_path)
+
+    mode = (
+        patch("safety.scoped_io._supports_anchored_io", return_value=False)
+        if fallback
+        else nullcontext()
+    )
+    with mode:
+        with pytest.raises(ScopedIOError, match="exceeds 4 bytes"):
+            read_scoped_bytes(target, guard, max_bytes=4)
+        _, content = read_scoped_bytes(target, guard, max_bytes=5)
+
+    assert content == b"12345"
 
 
 def test_scoped_read_rejects_in_scope_symlink(tmp_path) -> None:

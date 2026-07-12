@@ -31,6 +31,7 @@ READ_ONLY_TOOLS = frozenset(
         "search_text",
         "find_symbol",
         "find_references",
+        "lsp",
         "git_status",
         "git_diff",
         "git_log",

@@ -71,6 +71,7 @@ def build_tools(
     repo_map: Any | None = None,
     runtime_config: AshConfig | None = None,
     active_plugins: list[DiscoveredPlugin] | None = None,
+    lsp_manager: Any | None = None,
 ) -> dict[str, Any]:
     """Build the standard tool set and its trusted declarative extensions."""
 
@@ -105,6 +106,7 @@ def build_tools(
     from tools.tool_search import SearchToolsTool
     from tools.web import WebFetchTool
     from tools.web_search import WebSearchTool
+    from tools.lsp import LSPTool
 
     root = project_root if project_root is not None else safety_guard.project_root
     plugins = active_plugins
@@ -178,6 +180,8 @@ def build_tools(
         ActivateSkillTool(safety_guard, catalog),
         ReadSkillResourceTool(safety_guard, catalog),
     ]
+    if lsp_manager is not None:
+        tools.append(LSPTool(safety_guard, lsp_manager))
     tools.extend(
         build_browser_tools(
             safety_guard,
@@ -330,6 +334,17 @@ def build_runtime(
     active_provider = provider or get_provider_registry().build(config)
     plugins = discover_active_plugins(config.workspace_root, include_project=trusted)
     repo_map = build_repo_map(config)
+    lsp_manager = None
+    if trusted and config.lsp_enabled:
+        from lsp.config import load_lsp_server_configs
+        from lsp.manager import LanguageServerManager
+
+        lsp_configs = load_lsp_server_configs(
+            config.workspace_root,
+            include_project=True,
+        )
+        if lsp_configs:
+            lsp_manager = LanguageServerManager(config.workspace_root, lsp_configs)
     tools = build_tools(
         guard,
         config.workspace_root,
@@ -345,6 +360,7 @@ def build_runtime(
         repo_map=repo_map,
         runtime_config=config,
         active_plugins=plugins,
+        lsp_manager=lsp_manager,
     )
 
     instruction_diagnostics: list[InstructionDiagnostic] = []
@@ -438,12 +454,14 @@ def build_runtime(
             str(loop.turn_context.get("tool_call_id", "")),
         )
 
-    loop.tool_middlewares.extend(
-        [
-            FileCheckpointMiddleware(store, guard, checkpoint_context),
-            SecretRedactionMiddleware(),
-        ]
+    loop.tool_middlewares.append(
+        FileCheckpointMiddleware(store, guard, checkpoint_context)
     )
+    if lsp_manager is not None:
+        from lsp.middleware import LSPDiagnosticsMiddleware
+
+        loop.tool_middlewares.append(LSPDiagnosticsMiddleware(lsp_manager, guard))
+    loop.tool_middlewares.append(SecretRedactionMiddleware())
     return RuntimeComponents(
         loop=loop,
         provider=active_provider,

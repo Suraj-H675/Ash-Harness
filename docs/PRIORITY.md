@@ -832,11 +832,12 @@ See `ash/server/jsonrpc.py` (`JSONRPCServer`, `handle_request`).
 
 ---
 
-### ✅ L-15: LSP Diagnostics Integration
+### L-15: Managed LSP Integration
 
-**Status:** IMPLEMENTED — code complete
+**Status:** IMPLEMENTED - supersedes the original diagnostic-emitter sketch
 
-See `ash/lsp/diagnostics.py` (`LSPDiagnosticsEmitter`).
+See `lsp/config.py`, `lsp/client.py`, `lsp/manager.py`, `lsp/middleware.py`,
+`tools/lsp.py`, and `cli/lsp.py`.
 
 ---
 
@@ -979,7 +980,8 @@ Phase 12 (ecosystem):
 | `ash/plugins/registry.py` | L-1 |
 | `ash/server/http.py` | L-13 |
 | `ash/server/jsonrpc.py` | L-14 |
-| `ash/lsp/diagnostics.py` | L-15 |
+| `lsp/config.py`, `lsp/client.py`, `lsp/manager.py`, `lsp/middleware.py` | L-15 |
+| `tools/lsp.py`, `cli/lsp.py` | L-15 |
 | `ash/memory/__init__.py` | H-12🆕 |
 | `ash/memory/vector.py` | H-12🆕 |
 | `ash/memory/markdown_store.py` | L-11 |

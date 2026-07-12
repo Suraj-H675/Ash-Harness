@@ -78,6 +78,56 @@ def test_runtime_loads_project_mcp_only_when_trusted(tmp_path, monkeypatch) -> N
     } <= trusted.loop.tools.keys()
 
 
+def test_runtime_registers_lsp_only_for_trusted_workspace(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    lsp_config = workspace / ".ash" / "lsp.json"
+    lsp_config.parent.mkdir(parents=True)
+    lsp_config.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "fake": {
+                        "command": ["fake-language-server"],
+                        "extensions": {".fake": "fake"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+
+    trusted = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+    )
+    untrusted = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=False,
+    )
+
+    assert "lsp" in trusted.loop.tools
+    assert any(
+        middleware.__class__.__name__ == "LSPDiagnosticsMiddleware"
+        for middleware in trusted.loop.tool_middlewares
+    )
+    assert "lsp" not in untrusted.loop.tools
+
+
 def test_runtime_merges_explicit_mcp_servers_and_rejects_collisions(
     tmp_path, monkeypatch
 ) -> None:

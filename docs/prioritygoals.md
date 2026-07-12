@@ -916,18 +916,10 @@ DO NOT implement any other item from PRIORITY.md.
 
 ### L-15: LSP Diagnostics Integration
 
-```
-/goal l15
-
-You are implementing L-15 from /home/suraj/ash/PRIORITY.md.
-
-Steps:
-1. Read section L-15 in /home/suraj/ash/PRIORITY.md
-2. Create ash/lsp/diagnostics.py with the EXACT code from L-15's "How to Fix"
-3. Run: ruff check ash/lsp/diagnostics.py && ruff format ash/lsp/diagnostics.py
-
-DO NOT implement any other item from PRIORITY.md.
-```
+Superseded on 2026-07-13 by the managed LSP 3.18 implementation in
+`lsp/config.py`, `lsp/client.py`, `lsp/manager.py`, `lsp/middleware.py`,
+`tools/lsp.py`, and `cli/lsp.py`. Do not recreate the former diagnostic-only
+emitter.
 
 ---
 

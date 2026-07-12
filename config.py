@@ -537,6 +537,12 @@ class AshConfig(BaseSettings):
         le=10_000,
         description="Maximum source files indexed by the repository map.",
     )
+    lsp_enabled: bool = Field(
+        True,
+        description=(
+            "Enable installed language servers and post-edit diagnostics in trusted workspaces."
+        ),
+    )
     memory_backend: str = Field(
         "auto",
         description="Memory backend: auto, chroma, fts5, or off.",

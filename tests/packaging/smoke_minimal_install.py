@@ -56,30 +56,44 @@ def assert_distribution_metadata() -> None:
         if requirement.marker is None
     }
     assert not (OPTIONAL_DISTRIBUTIONS & base_names)
-    marked = {
-        requirement.name.casefold(): str(requirement.marker)
-        for requirement in requirements
-    }
-    assert 'extra == "server"' in marked["fastapi"]
-    assert 'extra == "server"' in marked["uvicorn"]
-    assert 'extra == "vector"' in marked["chromadb"]
-    assert 'extra == "vector"' in marked["onnxruntime"]
-    assert 'extra == "browser"' in marked["playwright"]
+    marked: dict[str, list[str]] = {}
+    for requirement in requirements:
+        marked.setdefault(requirement.name.casefold(), []).append(
+            str(requirement.marker)
+        )
+    assert any('extra == "server"' in marker for marker in marked["fastapi"])
+    assert any('extra == "server"' in marker for marker in marked["uvicorn"])
+    assert any('extra == "vector"' in marker for marker in marked["chromadb"])
+    assert any('extra == "vector"' in marker for marker in marked["onnxruntime"])
+    assert any('extra == "browser"' in marker for marker in marked["playwright"])
 
     packaged = {str(path).replace("\\", "/") for path in installed.files or ()}
+    assert {
+        "cli/lsp.py",
+        "lsp/client.py",
+        "lsp/config.py",
+        "lsp/manager.py",
+        "lsp/middleware.py",
+        "tools/lsp.py",
+    } <= packaged
     assert not any(path.startswith("project/") for path in packaged)
     assert not any(path.startswith("tests/") for path in packaged)
 
 
 def main() -> None:
     import ash
+    from lsp.client import LSPClient
+    from lsp.config import load_lsp_server_configs
+    from lsp.manager import LanguageServerManager
     from repo.repomap import calculate_personalized_pagerank
+    from tools.lsp import LSPTool
     from tools.symbols import FindSymbolTool
     from ui.turn_input import InteractiveTurnController
 
     assert Path(ash.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
     assert calculate_personalized_pagerank([[0, 1], [1, 0]], [0])
     assert FindSymbolTool and InteractiveTurnController
+    assert LSPClient and LanguageServerManager and load_lsp_server_configs and LSPTool
     assert_distribution_metadata()
     for module in OPTIONAL_DISTRIBUTIONS:
         assert importlib.util.find_spec(module) is None, module
@@ -125,7 +139,37 @@ def main() -> None:
         )
         assert "requires an interactive terminal" in setup.stderr
 
+        untrusted_lsp = json.loads(
+            run_ash("lsp", "status", "--json", cwd=workspace, env=env).stdout
+        )
+        assert untrusted_lsp["enabled"] is True
+        assert untrusted_lsp["trusted"] is False
+        assert untrusted_lsp["servers"] == []
+
+        lsp_config = home / ".ash" / "lsp.json"
+        lsp_config.parent.mkdir(parents=True, exist_ok=True)
+        lsp_config.write_text(
+            json.dumps(
+                {
+                    "servers": {
+                        "wheel-fake": {
+                            "command": [sys.executable, "-c", "raise SystemExit(0)"],
+                            "extensions": {".fake": "fake"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
         run_ash("trust", "add", str(workspace), cwd=workspace, env=env)
+        trusted_lsp = json.loads(
+            run_ash("lsp", "status", "--json", cwd=workspace, env=env).stdout
+        )
+        assert trusted_lsp["trusted"] is True
+        assert any(
+            server["name"] == "wheel-fake" for server in trusted_lsp["servers"]
+        )
         explained = run_ash(
             "config",
             "explain",
@@ -139,6 +183,7 @@ def main() -> None:
         assert entries["model"]["value"] == "ollama/wheel-smoke"
         assert entries["model"]["source"] == "project"
         assert entries["workspace_root"]["value"] == str(workspace.resolve())
+        assert entries["lsp_enabled"]["value"] is True
 
         server_env = dict(env)
         server_env["ASH_SERVER_TOKEN"] = "0123456789abcdef"

@@ -4,8 +4,15 @@ import sqlite3
 import pytest
 
 from cli.doctor import DoctorCheck, render_doctor, run_doctor
-from cli.doctor import _check_a2a, _check_browser, _check_storage, _check_web_search
+from cli.doctor import (
+    _check_a2a,
+    _check_browser,
+    _check_lsp,
+    _check_storage,
+    _check_web_search,
+)
 from config import AshConfig
+from lsp.config import LSPServerConfig
 
 
 def test_render_doctor_json_has_stable_schema() -> None:
@@ -97,6 +104,36 @@ def test_a2a_doctor_reports_unset_remote_credentials(
 
     assert check.status == "warn"
     assert "REVIEW_TOKEN" in check.message
+
+
+def test_lsp_doctor_reports_untrusted_workspace(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("safety.trust.is_workspace_trusted", lambda workspace: False)
+
+    check = _check_lsp(AshConfig(workspace_root=tmp_path))
+
+    assert check.status == "warn"
+    assert "untrusted" in check.message
+
+
+def test_lsp_doctor_reports_missing_configured_executable(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("safety.trust.is_workspace_trusted", lambda workspace: True)
+    monkeypatch.setattr(
+        "lsp.config.load_lsp_server_configs",
+        lambda workspace, include_project: {
+            "missing": LSPServerConfig(
+                "missing", (str(tmp_path / "not-installed"),), {".x": "x"}
+            )
+        },
+    )
+
+    check = _check_lsp(AshConfig(workspace_root=tmp_path))
+
+    assert check.status == "fail"
+    assert "missing" in check.message
 
 
 @pytest.mark.asyncio

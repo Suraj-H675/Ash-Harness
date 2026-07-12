@@ -120,6 +120,7 @@ def _build_tools(
     allowed_web_domains: list[str] | tuple[str, ...] | None = None,
     repo_map: Any | None = None,
     runtime_config: AshConfig | None = None,
+    lsp_manager: Any | None = None,
 ) -> dict[str, Any]:
     from ash.runtime import build_tools
 
@@ -133,6 +134,7 @@ def _build_tools(
         allowed_web_domains=allowed_web_domains,
         repo_map=repo_map,
         runtime_config=runtime_config,
+        lsp_manager=lsp_manager,
     )
 
 
@@ -1608,6 +1610,41 @@ def main(argv: list[str] | None = None) -> int:
     a2a_send.add_argument("--token-env", default="ASH_A2A_TOKEN")
     a2a_send.add_argument("--timeout", type=float, default=300.0)
     a2a_send.add_argument("--json", action="store_true")
+    lsp_parser = subparsers.add_parser(
+        "lsp", help="Inspect and query managed language servers"
+    )
+    lsp_subparsers = lsp_parser.add_subparsers(dest="lsp_action", required=True)
+    lsp_status = lsp_subparsers.add_parser(
+        "status", help="List detected and configured language servers"
+    )
+    lsp_status.add_argument("--json", action="store_true")
+    lsp_diagnostics = lsp_subparsers.add_parser(
+        "diagnostics", help="Get diagnostics for a workspace file"
+    )
+    lsp_diagnostics.add_argument("file_path")
+    lsp_diagnostics.add_argument("--json", action="store_true")
+    lsp_query = lsp_subparsers.add_parser(
+        "query", help="Run a semantic language-server query"
+    )
+    lsp_query.add_argument(
+        "operation",
+        choices=[
+            "hover",
+            "definition",
+            "references",
+            "implementation",
+            "documentSymbol",
+            "workspaceSymbol",
+            "prepareCallHierarchy",
+            "incomingCalls",
+            "outgoingCalls",
+        ],
+    )
+    lsp_query.add_argument("file_path", nargs="?", default="")
+    lsp_query.add_argument("--line", type=int, default=1)
+    lsp_query.add_argument("--character", type=int, default=1)
+    lsp_query.add_argument("--query", default="")
+    lsp_query.add_argument("--json", action="store_true")
     mcp_subparser = subparsers.add_parser("mcp")
     mcp_action_subparsers = mcp_subparser.add_subparsers(dest="action", required=True)
     mcp_list = mcp_action_subparsers.add_parser("list")
@@ -1743,6 +1780,38 @@ def main(argv: list[str] | None = None) -> int:
         checks = asyncio.run(run_doctor(connect=args.connect))
         print(render_doctor(checks, json_output=args.json_output))
         return 1 if any(check.status == "fail" for check in checks) else 0
+
+    if args.command == "lsp":
+        from cli.lsp import inspect_lsp, render_lsp
+        from core.redaction import redact_text
+
+        config, exit_code = _load_config_or_report(
+            **_config_overrides_from_args(args)
+        )
+        if config is None:
+            return exit_code
+        if args.lsp_action == "query":
+            if args.operation != "workspaceSymbol" and not args.file_path:
+                parser.error("ash lsp query requires FILE except for workspaceSymbol")
+            if args.line < 1 or args.character < 1:
+                parser.error("--line and --character must be positive")
+        try:
+            payload = asyncio.run(
+                inspect_lsp(
+                    config,
+                    action=args.lsp_action,
+                    file_path=getattr(args, "file_path", ""),
+                    operation=getattr(args, "operation", ""),
+                    line=getattr(args, "line", 1),
+                    character=getattr(args, "character", 1),
+                    query=getattr(args, "query", ""),
+                )
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Error: {redact_text(str(exc))}", file=sys.stderr)
+            return 2
+        print(render_lsp(payload, json_output=args.json))
+        return 0
 
     if args.command == "sandbox":
         from cli.sandbox import (

@@ -27,6 +27,7 @@ ENV_KEYS = [
     "ASH_WEB_SEARCH_TIMEOUT_SECONDS",
     "ASH_BROWSER_HEADLESS",
     "ASH_BROWSER_TIMEOUT_SECONDS",
+    "ASH_LSP_ENABLED",
     "ASH_ENABLE_SPRINT_PLANNING",
     "ASH_DB_DIRECTORY",
     # Provider API keys — clear these so they don't pollute tests
@@ -552,6 +553,7 @@ def test_trusted_project_layers_have_precise_precedence_and_provenance(
 def test_project_config_cannot_override_user_owned_controls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from cli import config as cli_config
     from safety.trust import set_workspace_trusted
 
     _use_temporary_trust_store(tmp_path, monkeypatch)
@@ -578,6 +580,7 @@ def test_project_config_cannot_override_user_owned_controls(
                 "web_search_timeout_seconds = 120",
                 "browser_headless = false",
                 "browser_timeout_seconds = 120",
+                "lsp_enabled = true",
                 'command_env_allowlist = ["ANTHROPIC_API_KEY"]',
                 f'workspace_root = "{tmp_path / "elsewhere"}"',
                 "unknown_typo = true",
@@ -587,6 +590,8 @@ def test_project_config_cannot_override_user_owned_controls(
         ),
         encoding="utf-8",
     )
+    cli_config.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    cli_config.CONFIG_FILE.write_text("lsp_enabled = false\n", encoding="utf-8")
     monkeypatch.chdir(root)
     set_workspace_trusted(root, True)
 
@@ -609,6 +614,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.web_search_timeout_seconds == 20
     assert config.browser_headless is True
     assert config.browser_timeout_seconds == 30
+    assert config.lsp_enabled is False
     assert config.command_env_allowlist == []
     assert config.custom_providers == {}
     diagnostics = "\n".join(config.config_diagnostics)
@@ -628,6 +634,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "web_search_timeout_seconds" in diagnostics
     assert "browser_headless" in diagnostics
     assert "browser_timeout_seconds" in diagnostics
+    assert "lsp_enabled" in diagnostics
     assert "command_env_allowlist" in diagnostics
     assert "workspace_root" in diagnostics
     assert "unknown_typo" in diagnostics

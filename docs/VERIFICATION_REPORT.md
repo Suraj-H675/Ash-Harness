@@ -1,5 +1,22 @@
 # Verification Report
 
+> Historical report retained for provenance. Its original suite counts and
+> broad completion claims are not the current release gate; use the dated
+> capability matrix and the latest local verification results instead.
+
+## Managed LSP Verification - 2026-07-13
+
+- Ruff: clean across the repository excluding the untracked reference tree.
+- Mypy: clean across 146 source files.
+- Pytest: 1177 passed, 9 skipped.
+- Real subprocess coverage: initialize/configuration, full and incremental
+  synchronization, push/pull/full/unchanged diagnostics, semantic navigation,
+  bounded writes, stderr propagation, restart backoff, cancellation-safe
+  cleanup, and shutdown/exit.
+- Safety and packaging: trusted configuration, scrubbed environments,
+  external-URI filtering, denied server edits, bounded documents/results,
+  wheel/sdist contents, and a clean minimal-wheel smoke are verified.
+
 ## Summary
 
 **248 unit tests pass, 2 originally-failing tests are now fixed.** One pre-existing integration test failure remains (documented below).
@@ -148,7 +165,7 @@ The test expects the exception to propagate; the actual code catches it internal
 | `context/tokens.py` — Token counters | ✅ Complete | |
 | `ui/terminal.py` — TerminalUI | ✅ Complete | |
 | `ui/parser.py` — StreamingXMLParser | ✅ Complete | State machine correct |
-| `lsp/diagnostics.py` — LSPDiagnosticsEmitter | ✅ Complete | |
+| Managed LSP (`config`, `client`, `manager`, middleware, tool, CLI) | Complete | Real subprocess protocol tests cover initialize/configuration, negotiated positions and incremental sync, push/pull diagnostic clearing, semantic navigation, external-URI filtering, advisory edit behavior, cancellation cleanup, framing rejection, trust gating, and shutdown/exit. |
 | `server/http.py` — FastAPI server | ✅ Complete | |
 | `server/jsonrpc.py` — JSONRPCServer | ✅ Complete | |
 | `config.py` — AshConfig | ✅ Complete | |

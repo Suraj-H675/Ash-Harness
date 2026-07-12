@@ -142,6 +142,34 @@ Handles source-control synchronization.
     2.  After successful tool execution, automatically track modified files.
     3.  Create git commits programmatically on completion of each model loop step to ensure absolute session recovery.
 
+### 2.7 `lsp`
+
+Queries managed Language Server Protocol 3.18 processes for semantic code
+intelligence. Supported operations are `status`, `diagnostics`, `hover`,
+`definition`, `references`, `implementation`, `documentSymbol`,
+`workspaceSymbol`, `prepareCallHierarchy`, `incomingCalls`, and
+`outgoingCalls`.
+
+* `file_path` is required except for `status` and `workspaceSymbol`.
+* `line` and `character` are 1-based user coordinates. The client converts
+  them to the server's negotiated UTF-8, UTF-16, or UTF-32 position units.
+* `query` supplies the workspace-symbol search text.
+* The tool is policy-read-only, but executable server configuration and local
+  `node_modules/.bin` discovery require explicit workspace trust.
+* Server commands run without a shell, use a scrubbed environment plus
+  explicit overrides, cannot apply edits through `workspace/applyEdit`, and
+  are never downloaded by Ash.
+* Framing and documents are capped at 8 MiB. Each client retains at most 16
+  open documents and 32 MiB of synchronized text. Semantic results are capped
+  at 200 items/512 KiB, diagnostics at 100 per file, and stderr at 64 KiB.
+* Full and incremental document sync, save options, pull/full/unchanged
+  diagnostics, versioned push diagnostics, capability checks, external-URI
+  filtering, request timeouts, LRU `didClose`, and process-tree cleanup are
+  enforced.
+* Post-edit diagnostics are advisory and share one three-second overall
+  deadline for at most 20 edited files; they cannot turn a successful edit
+  into a failed edit result.
+
 ---
 
 ## 3. Model Context Protocol (MCP) Integration

@@ -63,7 +63,7 @@ ash --session SESSION_ID        # legacy explicit-ID compatibility
 ash mcp add local -- python server.py
 ash mcp add remote --transport http --url https://mcp.example/rpc --auth oauth
 ash mcp login remote            # explicit browser authorization
-ash trust add .                  # allow project ASH.md, skills, hooks, MCP
+ash trust add .                  # allow project instructions, extensions, MCP, LSP
 ash update                       # explicitly check GitHub releases
 ASH_SERVER_TOKEN=change-me-long-token ash serve # requires ash-ai[server]
 ash storage check --json         # read-only session DB integrity check
@@ -82,6 +82,10 @@ ash extensions plugins --json      # inspect enabled and disabled plugins
 ash extensions disable my-plugin
 ash extensions enable my-plugin
 ash extensions uninstall my-plugin --yes
+ash lsp status --json              # inspect servers without starting them
+ash lsp diagnostics src/app.py
+ash lsp query definition src/app.py --line 12 --character 8
+ash lsp query workspaceSymbol --query App
 ```
 
 The authenticated server exposes synchronous turns at `/v1/turn`, live SSE
@@ -162,6 +166,50 @@ separate SQLite databases; text streaming, polling, task get/list,
 cancellation, and context continuation are supported. Push notifications,
 files/data modalities, extended cards, gRPC, and signed-card trust policy are
 not advertised.
+
+### Managed language servers (LSP 3.18)
+
+Managed LSP support is included in the base install. Ash never downloads or
+installs a language-server binary. It detects installed basedpyright/pyright,
+typescript-language-server, gopls, rust-analyzer, clangd, and
+lua-language-server processes. A server starts lazily for the nearest project
+root and stops with its owning Ash runtime.
+
+The `lsp` tool and `ash lsp` commands support diagnostics, hover, definition,
+references, implementation, document/workspace symbols, and call hierarchy.
+Input line and character coordinates are 1-based; returned protocol ranges are
+0-based. Successful write, replace, and patch tools may append advisory
+diagnostics. A language-server failure never changes whether the edit itself
+succeeded. Rename and code actions are not currently exposed.
+
+Add custom servers or override detected ones in `~/.ash/lsp.json`. A trusted
+workspace may also use `.ash/lsp.json`; project entries take precedence over
+user entries. Set `disabled` to remove a detected or inherited server.
+
+```json
+{
+  "servers": {
+    "example": {
+      "command": ["example-language-server", "--stdio"],
+      "extensions": {".example": "example"},
+      "root_markers": ["example.toml", ".git"],
+      "env": {"EXAMPLE_MODE": "strict"},
+      "initialization_options": {},
+      "settings": {"example": {"diagnostics": true}},
+      "disabled": false
+    }
+  }
+}
+```
+
+Server commands execute directly without a shell and receive a scrubbed
+environment plus explicit `env` overrides. They are host processes, not
+network-isolated sandboxes. For that reason, project LSP configuration and
+workspace `node_modules/.bin` discovery are disabled until `ash trust add` is
+run. Ash rejects server-requested workspace edits and discards semantic results
+that reference files outside the workspace. Set `lsp_enabled = false` in the
+user config, or `ASH_LSP_ENABLED=false`, to disable the capability globally;
+trusted project config cannot override that user-owned control.
 
 Inside an interactive terminal, `/help` opens a full-screen searchable command
 reference; redirected input and screen-reader mode keep the linear text output.

@@ -62,6 +62,7 @@ reduce tool selection accuracy, and make the security boundary unreviewable.
 - [Official A2A Python SDK](https://github.com/a2aproject/a2a-python): typed 1.0 protobuf models, Agent Card resolution, JSON-RPC/HTTP+JSON transports, server routing, task aggregation, cancellation, and durable database stores used by Ash's adapter and conformance client.
 - [Agent Client Protocol](https://agentclientprotocol.com/): client/agent initialization, sessions, terminal and filesystem capabilities, modes, session resume/list/close, and registry distribution.
 - [ACP Python SDK](https://github.com/agentclientprotocol/python-sdk): official typed protocol models, newline-delimited JSON stdio transport, agent/client routers, capability negotiation, and wire-test primitives used by Ash's v1 adapter.
+- [Language Server Protocol 3.18](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/): lifecycle, bounded stdio framing, negotiated document synchronization and position encodings, diagnostics, navigation, symbols, and call hierarchy used by Ash's managed client.
 - [OpenTelemetry semantic conventions](https://opentelemetry.io/docs/specs/semconv/): standard traces, metrics, logs, errors, and GenAI attributes. Prompt/tool content is sensitive and must be opt-in.
 - [OWASP Agentic AI threats and mitigations](https://genai.owasp.org/resource/agentic-ai-threats-and-mitigations/): goal hijacking, tool misuse, identity abuse, supply-chain compromise, unexpected code execution, memory poisoning, and insecure inter-agent communication.
 - [NIST AI RMF Generative AI Profile](https://www.nist.gov/publications/artificial-intelligence-risk-management-framework-generative-artificial-intelligence): governance and test/evaluation/verification/validation guidance across the AI lifecycle.
@@ -220,8 +221,9 @@ packs.
   resume, list, configure, prompt, cancel, and close Ash sessions.
 - A2A client/server mode with agent cards, task lifecycle, streaming,
   authentication, artifacts, and policy mapping.
-- LSP client management for diagnostics, definitions, references, symbols,
-  rename, and code actions. Tree-sitter remains a fallback, not an LSP
+- LSP client management is implemented for diagnostics, hover, definitions,
+  references, implementations, symbols, and call hierarchy. Rename and code
+  actions remain future work. Tree-sitter remains a fallback, not an LSP
   replacement.
 - Stable SDK, JSON-RPC, HTTP/SSE or WebSocket event schemas with explicit
   version negotiation.
@@ -319,6 +321,9 @@ Adopt ordered wildcard permissions, client/server APIs, model/provider
 discovery, LSP integration, session snapshots, configurable primary/subagents,
 and multiple frontends over one backend. Avoid configuration semantics where
 rule ordering is implicit; Ash should expose the winning rule and provenance.
+OpenCode's lazy per-root server lifecycle informed Ash's manager, while Ash
+deliberately requires installed or explicit servers instead of downloading
+language-server binaries during a session.
 
 ### Pi
 
@@ -345,7 +350,7 @@ not remove them.
 | MCP | Strong partial | 2025-11-25 negotiation, tools/resources/templates/prompts, roots, sampling, elicitation, progress, logging, cancellation, pagination, server requests, and explicit OAuth 2.1 authorization/refresh/scope step-up exist; experimental tasks and live multi-vendor OAuth conformance remain. |
 | Safety/sandbox | Strong | Needs remote/plugin identity capabilities, network proxy policy, stronger resource limits, and platform CI. |
 | CLI/TUI/SDK/API | Strong local/remote | CLI, SDK, HTTP server, ACP v1, and A2A 1.0 adapters share the trusted runtime and versioned events. ACP provides bounded editor sessions and an official wire test. A2A provides authenticated/durable JSON-RPC and HTTP+JSON tasks, streaming/cancel/continuation, origin-pinned clients, and trusted delegation tools. WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, and channel adapters remain. |
-| LSP | Absent in practice | `lsp/diagnostics.py` is 26 lines and is not a managed language-server client. |
+| LSP | Verified locally | Bounded LSP 3.18 stdio clients start lazily per root, honor negotiated full/incremental sync and UTF position units, support push/pull diagnostics and semantic queries, filter external URIs, require workspace trust, use scrubbed environments, bound caches/results, and shut down process trees deterministically. Rename, code actions, broader server coverage, and multi-vendor conformance remain. |
 | Browser/media | Partial | Optional Playwright/Chromium navigation, ARIA snapshots, stable refs, form/click/scroll/history actions, network policy, and deterministic cleanup are live. Screenshots/vision, downloads/uploads, profiles, and other media remain. |
 | Automation/channels | Absent | No durable scheduler, event bus, gateway routing, pairing, or delivery semantics. |
 | Observability/evals | Absent | Logging and audit exist, but no OTel traces/metrics or task evaluation harness. |
@@ -495,7 +500,8 @@ resume after process interruption.
 3. Durable scheduler, cron/heartbeat, webhooks, and event triggers.
 4. Gateway identity/routing plus initial WebChat, Telegram, Discord, and Slack
    adapters; other channels remain plugins.
-5. Managed LSP clients and richer code intelligence.
+5. The managed LSP baseline is live. Add rename, code actions, broader server
+   coverage, and cross-vendor conformance without automatic binary downloads.
 
 Exit criterion: each pack installs independently, declares privileges, passes
 policy/sandbox/tracing, and does not inflate unrelated model contexts.

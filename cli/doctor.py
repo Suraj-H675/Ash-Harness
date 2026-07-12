@@ -224,6 +224,56 @@ def _check_a2a(config: AshConfig) -> DoctorCheck:
     return DoctorCheck("a2a", "pass", f"{len(agents)} remote agent(s) ready")
 
 
+def _check_lsp(config: AshConfig) -> DoctorCheck:
+    from lsp.config import lsp_command_available, load_lsp_server_configs
+    from safety.trust import is_workspace_trusted
+
+    if not config.lsp_enabled:
+        return DoctorCheck("lsp", "pass", "Managed LSP is disabled by configuration")
+    if not is_workspace_trusted(config.workspace_root):
+        return DoctorCheck(
+            "lsp",
+            "warn",
+            "Managed LSP is disabled for this untrusted workspace",
+            "Run `ash trust add` after reviewing project-controlled executable configuration.",
+        )
+    try:
+        servers = load_lsp_server_configs(
+            config.workspace_root, include_project=True
+        )
+    except (OSError, ValueError) as exc:
+        return DoctorCheck(
+            "lsp",
+            "fail",
+            f"Invalid language-server configuration: {exc}",
+            "Repair ~/.ash/lsp.json or the trusted project's .ash/lsp.json.",
+        )
+    if not servers:
+        return DoctorCheck(
+            "lsp",
+            "pass",
+            "No supported language servers are installed or configured",
+        )
+    missing = [
+        name
+        for name, server in servers.items()
+        if not lsp_command_available(server, config.workspace_root)
+    ]
+    if missing:
+        return DoctorCheck(
+            "lsp",
+            "fail",
+            "configured server executables are missing: " + ", ".join(sorted(missing)),
+            "Install the server or repair its command in lsp.json.",
+        )
+    return DoctorCheck(
+        "lsp",
+        "pass",
+        "detected/configured servers (not started): " + ", ".join(sorted(servers)),
+        "Run `ash lsp diagnostics FILE` to verify a real server handshake.",
+    )
+
+
 async def _check_connectivity(config: AshConfig) -> DoctorCheck:
     provider = config.provider
     if provider == "ollama":
@@ -336,6 +386,7 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
     checks.append(_check_mcp(config))
     checks.append(_check_extensions(config))
     checks.append(_check_a2a(config))
+    checks.append(_check_lsp(config))
     if connect:
         checks.append(await _check_connectivity(config))
     return checks
