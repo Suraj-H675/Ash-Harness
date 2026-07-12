@@ -469,6 +469,45 @@ class TestCmdSetup:
         assert "doctor --connect" in output
 
 
+class TestWebSearchSetup:
+    def test_saves_hidden_brave_credential_and_provider_selection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+        monkeypatch.setattr("builtins.input", _fake_input(["1"]))
+        monkeypatch.setattr(
+            "cli.setup.getpass.getpass", _FakeGetpass("brave-search-test-key")
+        )
+
+        from cli.setup import SetupOutcome, setup_web_search
+
+        with patch("cli.setup.save_env_values") as save:
+            result = setup_web_search()
+
+        assert result == SetupOutcome.SUCCESS
+        assert save.call_args.args[0] == {
+            "BRAVE_SEARCH_API_KEY": "brave-search-test-key",
+            "ASH_WEB_SEARCH_PROVIDER": "brave",
+        }
+
+    def test_noninteractive_web_setup_requires_search_credential(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys,
+    ) -> None:
+        from cli.setup import cmd_setup
+
+        monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+        monkeypatch.setattr("cli.setup.is_interactive_stdin", lambda: False)
+        args = MagicMock(section="web", quick=False, non_interactive=True)
+
+        assert cmd_setup(args) == 2
+        assert "BRAVE_SEARCH_API_KEY" in capsys.readouterr().err
+
+
 class TestSetupNavigation:
     def test_provider_selection_can_cancel(
         self, monkeypatch: pytest.MonkeyPatch

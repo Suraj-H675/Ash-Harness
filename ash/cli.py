@@ -1318,7 +1318,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_parser.add_argument(
         "section",
         nargs="?",
-        choices=["model", "providers", "all"],
+        choices=["model", "providers", "web", "all"],
         help="Which section to configure",
     )
     setup_parser.add_argument(

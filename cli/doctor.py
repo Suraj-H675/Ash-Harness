@@ -57,6 +57,40 @@ def _check_credentials(config: AshConfig) -> DoctorCheck:
     )
 
 
+def _check_web_search(config: AshConfig) -> DoctorCheck:
+    keys = {
+        "brave": "BRAVE_SEARCH_API_KEY",
+        "tavily": "TAVILY_API_KEY",
+    }
+    selected = config.web_search_provider
+    if selected == "auto":
+        available = [name for name, key in keys.items() if os.environ.get(key)]
+        if available:
+            return DoctorCheck(
+                "web-search",
+                "pass",
+                "auto mode; available providers: " + ", ".join(available),
+            )
+    else:
+        key = keys[selected]
+        if os.environ.get(key):
+            return DoctorCheck(
+                "web-search", "pass", f"{selected} selected; {key} is configured"
+            )
+        return DoctorCheck(
+            "web-search",
+            "warn",
+            f"{selected} selected but {key} is not configured",
+            "Run `ash setup web`.",
+        )
+    return DoctorCheck(
+        "web-search",
+        "warn",
+        "optional live search is not configured",
+        "Run `ash setup web` to configure Brave Search or Tavily.",
+    )
+
+
 def _check_storage(config: AshConfig) -> DoctorCheck:
     try:
         config.db_directory.mkdir(parents=True, exist_ok=True)
@@ -185,6 +219,7 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
                 "config", "pass", f"model={config.model}; mode={config.safety_tier}"
             ),
             _check_credentials(config),
+            _check_web_search(config),
             _check_workspace(config),
             _check_storage(config),
             DoctorCheck(

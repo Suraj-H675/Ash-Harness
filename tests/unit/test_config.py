@@ -23,6 +23,8 @@ ENV_KEYS = [
     "ASH_WORKSPACE_ROOT",
     "ASH_COMMAND_BLOCKLIST",
     "ASH_ALLOWED_WEB_DOMAINS",
+    "ASH_WEB_SEARCH_PROVIDER",
+    "ASH_WEB_SEARCH_TIMEOUT_SECONDS",
     "ASH_ENABLE_SPRINT_PLANNING",
     "ASH_DB_DIRECTORY",
     # Provider API keys — clear these so they don't pollute tests
@@ -35,6 +37,8 @@ ENV_KEYS = [
     "GROQ_API_KEY",
     "GROQ_API_BASE",
     "OLLAMA_API_BASE",
+    "BRAVE_SEARCH_API_KEY",
+    "TAVILY_API_KEY",
     # Backward compat
     "ASH_API_KEY",
     "ASH_MODEL_NAME",
@@ -325,6 +329,20 @@ def test_allowed_web_domains_are_normalized_and_validated() -> None:
         AshConfig(allowed_web_domains=["api.*.example.com"])
 
 
+def test_web_search_configuration_is_user_owned_and_validated() -> None:
+    config = AshConfig(
+        web_search_provider=" BRAVE ",
+        web_search_timeout_seconds=12.5,
+    )
+
+    assert config.web_search_provider == "brave"
+    assert config.web_search_timeout_seconds == 12.5
+    with pytest.raises(ValueError, match="must be auto, brave, or tavily"):
+        AshConfig(web_search_provider="custom-endpoint")
+    with pytest.raises(ValueError, match="greater than or equal to 1"):
+        AshConfig(web_search_timeout_seconds=0.5)
+
+
 def test_sprint_planning_can_be_enabled_from_config() -> None:
     config = AshConfig(enable_sprint_planning=True)
     assert config.enable_sprint_planning is True
@@ -545,6 +563,8 @@ def test_project_config_cannot_override_user_owned_controls(
                 "sandbox_network = true",
                 'sandbox_docker_image = "attacker/image:latest"',
                 'allowed_web_domains = ["attacker.example"]',
+                'web_search_provider = "tavily"',
+                "web_search_timeout_seconds = 120",
                 'command_env_allowlist = ["ANTHROPIC_API_KEY"]',
                 f'workspace_root = "{tmp_path / "elsewhere"}"',
                 "unknown_typo = true",
@@ -572,6 +592,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.sandbox_network is False
     assert config.sandbox_docker_image == "ash-sandbox:latest"
     assert config.allowed_web_domains == []
+    assert config.web_search_provider == "auto"
+    assert config.web_search_timeout_seconds == 20
     assert config.command_env_allowlist == []
     assert config.custom_providers == {}
     diagnostics = "\n".join(config.config_diagnostics)
@@ -587,6 +609,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "sandbox_network" in diagnostics
     assert "sandbox_docker_image" in diagnostics
     assert "allowed_web_domains" in diagnostics
+    assert "web_search_provider" in diagnostics
+    assert "web_search_timeout_seconds" in diagnostics
     assert "command_env_allowlist" in diagnostics
     assert "workspace_root" in diagnostics
     assert "unknown_typo" in diagnostics

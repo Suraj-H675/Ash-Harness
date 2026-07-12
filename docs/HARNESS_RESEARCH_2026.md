@@ -61,6 +61,8 @@ reduce tool selection accuracy, and make the security boundary unreviewable.
 - [OpenTelemetry semantic conventions](https://opentelemetry.io/docs/specs/semconv/): standard traces, metrics, logs, errors, and GenAI attributes. Prompt/tool content is sensitive and must be opt-in.
 - [OWASP Agentic AI threats and mitigations](https://genai.owasp.org/resource/agentic-ai-threats-and-mitigations/): goal hijacking, tool misuse, identity abuse, supply-chain compromise, unexpected code execution, memory poisoning, and insecure inter-agent communication.
 - [NIST AI RMF Generative AI Profile](https://www.nist.gov/publications/artificial-intelligence-risk-management-framework-generative-artificial-intelligence): governance and test/evaluation/verification/validation guidance across the AI lifecycle.
+- [Brave Web Search API](https://api-dashboard.search.brave.com/api-reference/web/search/get): bounded result counts, freshness filters, safe search, authentication, and rate-limit behavior for source-oriented live search.
+- [Tavily Search API](https://docs.tavily.com/documentation/api-reference/endpoint/search): agent-oriented normalized search, freshness ranges, bounded results, and bearer authentication.
 
 ### Reference repository snapshots
 
@@ -327,7 +329,7 @@ not remove them.
 |---|---|---|
 | Agent loop and streaming | Partial | Public event schema v1 and validated provider-portable message/content/tool-call inputs now span the runtime and adapters; the loop remains monolithic and legacy XML fallback is mixed into canonical behavior. |
 | Provider layer | Strong partial | Built-ins, embedders, declared model capabilities, and custom OpenAI-compatible endpoints resolve through thread-safe linked registries; auth/discovery and non-text modalities remain limited. |
-| Coding tools | Strong | Exact-schema deferred tool search is live; PTY terminal sessions, browser, web search, media, scheduler, and messaging remain. |
+| Coding tools | Strong | Exact-schema deferred tool search plus guarded Brave/Tavily live web search are live; PTY terminal sessions, browser, media, scheduler, and messaging remain. |
 | Context budgets | Strong partial | Provider totals reserve only currently visible tool schemas; large catalogs defer nonessential tools behind session-scoped search activation. Typed hashed fragments and deterministic compaction preserve provenance and task/path/action/outcome state. Model-assisted compaction remains. |
 | Sessions/recovery | Strong partial | SQLite schema v9 persists redacted cursor-replayable events plus atomic parent-first session trees, bounded branch metadata, safe fork boundaries, tree-aware retention, and SDK/CLI/HTTP/JSON-RPC access. Per-turn config snapshots and richer branch navigation/summarization remain. |
 | Memory | Partial | FTS/vector/Markdown exist; lifecycle, provenance, expiry, poisoning controls, and user workflow are incomplete. |
@@ -406,7 +408,7 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 1077 passed, 8 environment-dependent skips on Python
+- Current verification: 1088 passed, 8 environment-dependent skips on Python
   3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
   race is covered by Ash's portable process completion helper.
 

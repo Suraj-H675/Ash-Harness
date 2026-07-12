@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 from cli.doctor import DoctorCheck, render_doctor, run_doctor
-from cli.doctor import _check_storage
+from cli.doctor import _check_storage, _check_web_search
 from config import AshConfig
 
 
@@ -45,6 +45,18 @@ def test_storage_check_reports_sqlite_open_failures(
     assert check.name == "storage"
     assert check.status == "fail"
     assert "unable to open database file" in check.message
+
+
+def test_web_search_doctor_reports_auto_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "configured")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    check = _check_web_search(AshConfig(web_search_provider="auto"))
+
+    assert check.status == "pass"
+    assert "brave" in check.message
 
 
 @pytest.mark.asyncio

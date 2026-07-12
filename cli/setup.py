@@ -62,6 +62,20 @@ PROVIDERS = [
         "Custom endpoint with any OpenAI-compatible API",
     ),
 ]
+WEB_SEARCH_PROVIDERS = (
+    (
+        "brave",
+        "Brave Search",
+        "BRAVE_SEARCH_API_KEY",
+        "https://api-dashboard.search.brave.com/",
+    ),
+    (
+        "tavily",
+        "Tavily",
+        "TAVILY_API_KEY",
+        "https://app.tavily.com/",
+    ),
+)
 _PROVIDER_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
 
@@ -103,6 +117,18 @@ def run_setup_wizard(args) -> SetupOutcome:
     config = AshConfig.load()
 
     if non_interactive or not is_interactive_stdin():
+        if section == "web":
+            if _has_web_search_configured(config):
+                print(
+                    f"Web search is configured for {config.web_search_provider}."
+                )
+                return SetupOutcome.SUCCESS
+            print(
+                "Error: web search needs BRAVE_SEARCH_API_KEY or "
+                "TAVILY_API_KEY.",
+                file=sys.stderr,
+            )
+            return SetupOutcome.ERROR
         if _has_provider_configured(config):
             print(f"Ash is configured for {config.model}.")
             print("Run 'ash doctor --connect' to verify endpoint connectivity.")
@@ -126,6 +152,12 @@ def run_setup_wizard(args) -> SetupOutcome:
             print("Setup cancelled.", file=sys.stderr)
             return result
 
+    if section == "web" or (section == "all" and not quick):
+        result = setup_web_search()
+        if result != SetupOutcome.SUCCESS:
+            print("Setup cancelled.", file=sys.stderr)
+            return result
+
     _print_info("Setup complete!")
     return SetupOutcome.SUCCESS
 
@@ -133,6 +165,44 @@ def run_setup_wizard(args) -> SetupOutcome:
 def setup_model_provider(config, *, quick: bool = False) -> SetupOutcome:
     """Provider + model selection — shared entry point from wizard and REPL."""
     return select_provider_and_model(config)
+
+
+def setup_web_search() -> SetupOutcome:
+    """Configure an optional fixed-endpoint live search provider."""
+
+    while True:
+        _print_header("Web Search Configuration")
+        print("Choose a search provider, or skip this optional capability:\n")
+        for index, (_provider, name, env_var, url) in enumerate(
+            WEB_SEARCH_PROVIDERS, 1
+        ):
+            configured = " (configured)" if get_env_value(env_var) else ""
+            print(f"  [{index}] {name}{configured}")
+            print(f"      Create a key: {url}\n")
+        skip_index = len(WEB_SEARCH_PROVIDERS) + 1
+        print(f"  [{skip_index}] Skip\n")
+        try:
+            choice = _prompt_choice(
+                "Enter a number",
+                [str(index) for index in range(1, skip_index + 1)],
+                default=skip_index - 1,
+            )
+            if choice == skip_index - 1:
+                return SetupOutcome.SUCCESS
+            provider, name, env_var, _url = WEB_SEARCH_PROVIDERS[choice]
+            api_key = _prompt_api_key(env_var, f"{name} API key")
+            save_env_values(
+                {
+                    env_var: api_key,
+                    "ASH_WEB_SEARCH_PROVIDER": provider,
+                }
+            )
+            _print_info(f"Configured {name} for live web search.")
+            return SetupOutcome.SUCCESS
+        except SetupBack:
+            print("  Returning to web search provider selection.")
+        except SetupCancelled:
+            return SetupOutcome.CANCELLED
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +673,18 @@ def _has_provider_configured(config) -> bool:
         return True
 
     return False
+
+
+def _has_web_search_configured(config) -> bool:
+    selected = str(getattr(config, "web_search_provider", "auto")).casefold()
+    keys = {
+        "brave": "BRAVE_SEARCH_API_KEY",
+        "tavily": "TAVILY_API_KEY",
+    }
+    if selected == "auto":
+        return any(get_env_value(key) for key in keys.values())
+    key = keys.get(selected)
+    return bool(key and get_env_value(key))
 
 
 def _get_current_model(config) -> str:

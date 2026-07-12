@@ -200,9 +200,14 @@ the policy-wired runtime registry.
 Project-controlled config and extensions are disabled until the workspace is trusted.
 API keys are stored in `~/.ash/.env` with restricted permissions. Custom
 provider metadata is stored separately in `~/.ash/ash.toml`.
-Network fetches use the `web_fetch` tool and require normal tool approval;
-private, loopback, reserved, non-HTTP, oversized, and unsupported-content URLs
-are refused before request content reaches the model.
+Network fetches and live search require normal tool approval. `web_fetch`
+refuses private, loopback, reserved, non-HTTP, oversized, and unsupported
+content. `web_search` auto-detects `BRAVE_SEARCH_API_KEY` or `TAVILY_API_KEY`
+from `~/.ash/.env`, returns normalized source records with provider provenance,
+and falls back between configured providers only in `auto` mode. Set
+`web_search_provider` to pin one provider. `allowed_web_domains` filters both
+fetch targets and returned search sources. Run `ash setup web` to enter either
+search credential through the hidden-input setup flow.
 
 Workspace file reads, attachments, writes, exact edits, and patches reject
 symlink/junction mutation paths. On POSIX, Ash walks from an open workspace

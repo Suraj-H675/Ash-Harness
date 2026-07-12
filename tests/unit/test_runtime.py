@@ -61,6 +61,6 @@ def test_runtime_loads_project_mcp_only_when_trusted(tmp_path, monkeypatch) -> N
 
     assert set(trusted.loop._mcp_configs) == {"project-docs"}
     assert untrusted.loop._mcp_configs == {}
-    assert {"spawn_agent", "delegate_agents", "search_tools"} <= (
+    assert {"spawn_agent", "delegate_agents", "search_tools", "web_search"} <= (
         trusted.loop.tools.keys()
     )

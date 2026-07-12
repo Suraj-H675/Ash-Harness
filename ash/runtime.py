@@ -103,6 +103,7 @@ def build_tools(
     from tools.symbols import FindReferencesTool, FindSymbolTool
     from tools.tool_search import SearchToolsTool
     from tools.web import WebFetchTool
+    from tools.web_search import WebSearchTool
 
     root = project_root if project_root is not None else safety_guard.project_root
     plugins = active_plugins
@@ -164,6 +165,14 @@ def build_tools(
         GlobFilesTool(safety_guard),
         SearchTextTool(safety_guard),
         WebFetchTool(safety_guard, allowed_domains=allowed_web_domains),
+        WebSearchTool(
+            safety_guard,
+            provider=(runtime_config.web_search_provider if runtime_config else "auto"),
+            timeout=(
+                runtime_config.web_search_timeout_seconds if runtime_config else 20.0
+            ),
+            allowed_domains=allowed_web_domains,
+        ),
         ListSkillsTool(safety_guard, catalog),
         ActivateSkillTool(safety_guard, catalog),
         ReadSkillResourceTool(safety_guard, catalog),

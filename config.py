@@ -470,9 +470,19 @@ class AshConfig(BaseSettings):
     allowed_web_domains: list[str] = Field(
         default_factory=list,
         description=(
-            "Optional web_fetch allowlist. Entries are hostnames or wildcard "
+            "Optional web fetch/search allowlist. Entries are hostnames or wildcard "
             "subdomains like *.example.com. Empty allows any public host."
         ),
+    )
+    web_search_provider: str = Field(
+        "auto",
+        description="Web search provider: auto, brave, or tavily.",
+    )
+    web_search_timeout_seconds: float = Field(
+        20.0,
+        ge=1.0,
+        le=120.0,
+        description="Wall-clock timeout for one web search provider request.",
     )
 
     db_directory: Path = Field(
@@ -642,6 +652,14 @@ class AshConfig(BaseSettings):
                 )
             normalized.append(item)
         return sorted(set(normalized))
+
+    @field_validator("web_search_provider")
+    @classmethod
+    def validate_web_search_provider(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"auto", "brave", "tavily"}:
+            raise ValueError("web_search_provider must be auto, brave, or tavily")
+        return normalized
 
     @field_validator("command_env_allowlist")
     @classmethod
