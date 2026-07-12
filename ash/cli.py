@@ -1566,6 +1566,14 @@ def main(argv: list[str] | None = None) -> int:
         choices=["critical", "error", "warning", "info", "debug"],
         default="info",
     )
+    acp_parser = subparsers.add_parser(
+        "acp", help="Run Ash as an Agent Client Protocol v1 stdio agent"
+    )
+    acp_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Validate the optional ACP runtime without starting stdio transport",
+    )
     mcp_subparser = subparsers.add_parser("mcp")
     mcp_action_subparsers = mcp_subparser.add_subparsers(dest="action", required=True)
     mcp_list = mcp_action_subparsers.add_parser("list")
@@ -2258,6 +2266,28 @@ def main(argv: list[str] | None = None) -> int:
                     json_output=args.json,
                 )
             )
+        return 0
+
+    if args.command == "acp":
+        try:
+            from acp import PROTOCOL_VERSION
+            from server.acp import run_acp_agent
+        except ModuleNotFoundError as exc:
+            if exc.name == "acp" or (exc.name or "").startswith("acp."):
+                print(
+                    "Error: ACP support requires `pip install 'ash-ai[acp]'`.",
+                    file=sys.stderr,
+                )
+                return 2
+            raise
+        if args.check:
+            print(f"Ash ACP protocol v{PROTOCOL_VERSION} is ready.")
+            return 0
+        try:
+            asyncio.run(run_acp_agent())
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Error: ACP server failed: {exc}", file=sys.stderr)
+            return 2
         return 0
 
     if args.command == "serve":

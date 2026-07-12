@@ -60,6 +60,7 @@ reduce tool selection accuracy, and make the security boundary unreviewable.
 - [Agent Skills specification](https://agentskills.io/specification): `SKILL.md` metadata, naming, optional resources, validation, and progressive disclosure.
 - [Agent2Agent specification 1.0](https://a2a-protocol.org/latest/specification): discovery, modalities, task lifecycle, streaming, and independent agent interoperability.
 - [Agent Client Protocol](https://agentclientprotocol.com/): client/agent initialization, sessions, terminal and filesystem capabilities, modes, session resume/list/close, and registry distribution.
+- [ACP Python SDK](https://github.com/agentclientprotocol/python-sdk): official typed protocol models, newline-delimited JSON stdio transport, agent/client routers, capability negotiation, and wire-test primitives used by Ash's v1 adapter.
 - [OpenTelemetry semantic conventions](https://opentelemetry.io/docs/specs/semconv/): standard traces, metrics, logs, errors, and GenAI attributes. Prompt/tool content is sensitive and must be opt-in.
 - [OWASP Agentic AI threats and mitigations](https://genai.owasp.org/resource/agentic-ai-threats-and-mitigations/): goal hijacking, tool misuse, identity abuse, supply-chain compromise, unexpected code execution, memory poisoning, and insecure inter-agent communication.
 - [NIST AI RMF Generative AI Profile](https://www.nist.gov/publications/artificial-intelligence-risk-management-framework-generative-artificial-intelligence): governance and test/evaluation/verification/validation guidance across the AI lifecycle.
@@ -342,7 +343,7 @@ not remove them.
 | Hooks | Strong partial | Hook contract v1 covers bounded/redacted session, turn, model, tool, and error lifecycle with fail-closed pre-tool denial and isolated observers. Context-compaction/config/permission-change events and explicit ordering remain. |
 | MCP | Strong partial | 2025-11-25 negotiation, tools/resources/templates/prompts, roots, sampling, elicitation, progress, logging, cancellation, pagination, server requests, and explicit OAuth 2.1 authorization/refresh/scope step-up exist; experimental tasks and live multi-vendor OAuth conformance remain. |
 | Safety/sandbox | Strong | Needs remote/plugin identity capabilities, network proxy policy, stronger resource limits, and platform CI. |
-| CLI/TUI/SDK/API | Strong local | CLI, SDK, and HTTP server now share one trusted runtime assembler and versioned events; no ACP adapter, WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, or channel adapters. |
+| CLI/TUI/SDK/API | Strong local | CLI, SDK, HTTP server, and ACP v1 editor adapter share one trusted runtime assembler and versioned events. ACP has bounded stdio, isolated sessions, durable replay, permission/tool/usage updates, client MCP mapping, and an official-client wire test; richer media/editor callbacks and registry publication remain. WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, and channel adapters remain. |
 | LSP | Absent in practice | `lsp/diagnostics.py` is 26 lines and is not a managed language-server client. |
 | Browser/media | Partial | Optional Playwright/Chromium navigation, ARIA snapshots, stable refs, form/click/scroll/history actions, network policy, and deterministic cleanup are live. Screenshots/vision, downloads/uploads, profiles, and other media remain. |
 | Automation/channels | Absent | No durable scheduler, event bus, gateway routing, pairing, or delivery semantics. |
@@ -411,7 +412,7 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 1121 passed, 9 environment-dependent skips on Python
+- Current verification: 1129 passed, 9 environment-dependent skips on Python
   3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
   race is covered by Ash's portable process completion helper.
 
@@ -456,7 +457,9 @@ sessions migrate, and provider/tool fakes cover the state machine.
    covers session/turn/model/tool/error events and failure semantics; exact
    schema tool search now defers large live catalogs and activates matches per
    session. Context-compaction events, explicit ordering, and profiles remain.
-4. Implement ACP server mode and a conformance test client.
+4. Extend the implemented ACP v1 server and official-client wire test with
+   media/editor callbacks and registry publication only as those capabilities
+   gain complete behavior.
 
 Exit criterion: external clients and extensions can use Ash without importing
 internal modules, and untrusted contributions cannot bypass policy.

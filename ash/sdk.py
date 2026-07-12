@@ -15,6 +15,7 @@ from ash.runtime import build_runtime
 from config import AshConfig
 from core.events import EVENT_SCHEMA_VERSION, envelope_event, event_data
 from core.loop import AshLoop
+from mcp.server import MCPServerConfig
 from core.redaction import redact_text
 from core.session import SessionLineage, SessionSummary
 from providers.base import ProviderABC
@@ -174,6 +175,9 @@ class AshClient:
         agent_provider_factory: Callable[[], ProviderABC] | None = None,
         approval_callback: ApprovalCallback | None = None,
         workspace_trusted: bool | None = None,
+        session_id: str | None = None,
+        additional_mcp_configs: dict[str, MCPServerConfig] | None = None,
+        run_maintenance: bool = True,
     ) -> "AshClient":
         """Create a client, honoring persisted workspace trust unless overridden."""
 
@@ -189,9 +193,15 @@ class AshClient:
             agent_provider_factory=agent_provider_factory,
             workspace_trusted=workspace_trusted,
             approval_callback=approval_callback,
+            additional_mcp_configs=additional_mcp_configs,
+            run_maintenance=run_maintenance,
         )
         client = cls(runtime.loop, runtime_config)
-        await client.start()
+        try:
+            await client.start(session_id)
+        except Exception:
+            await runtime.loop.aclose()
+            raise
         return client
 
     async def start(self, session_id: str | None = None) -> str:
@@ -205,9 +215,14 @@ class AshClient:
         self._started = True
         return session.session_id
 
-    async def prompt(self, text: str) -> AshResult:
+    async def prompt(
+        self,
+        text: str,
+        *,
+        user_metadata: dict[str, Any] | None = None,
+    ) -> AshResult:
         async with self._turn_lock:
-            return await self._prompt_unlocked(text)
+            return await self._prompt_unlocked(text, user_metadata=user_metadata)
 
     async def steer(self, text: str) -> int:
         """Queue guidance for the currently running turn without waiting on it."""
@@ -216,12 +231,17 @@ class AshClient:
             raise RuntimeError("no turn is currently running")
         return self.loop.queue_steering(text)
 
-    async def _prompt_unlocked(self, text: str) -> AshResult:
+    async def _prompt_unlocked(
+        self,
+        text: str,
+        *,
+        user_metadata: dict[str, Any] | None = None,
+    ) -> AshResult:
         if not text.strip():
             raise ValueError("prompt cannot be empty")
         if not self._started:
             await self._start_unlocked()
-        response = await self.loop.run_turn(text)
+        response = await self.loop.run_turn(text, user_metadata=user_metadata)
         assert self.loop.current_session is not None
         usage = self.loop.last_turn_usage
         return AshResult(
@@ -240,7 +260,12 @@ class AshClient:
             estimated_cost_usd=float(usage["estimated_cost_usd"]),
         )
 
-    async def stream_prompt(self, text: str) -> AsyncIterator[AshEvent]:
+    async def stream_prompt(
+        self,
+        text: str,
+        *,
+        user_metadata: dict[str, Any] | None = None,
+    ) -> AsyncIterator[AshEvent]:
         """Yield real runtime deltas and one terminal completion/error event."""
 
         if not text.strip():
@@ -263,7 +288,9 @@ class AshClient:
 
             async def run() -> None:
                 try:
-                    result = await self._prompt_unlocked(text)
+                    result = await self._prompt_unlocked(
+                        text, user_metadata=user_metadata
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -291,7 +318,11 @@ class AshClient:
                 while True:
                     event = await queue.get()
                     yield event
-                    if event.type in {"turn.completed", "turn.error"}:
+                    if event.type in {
+                        "turn.completed",
+                        "turn.error",
+                        "turn.cancelled",
+                    }:
                         break
             finally:
                 unsubscribe()

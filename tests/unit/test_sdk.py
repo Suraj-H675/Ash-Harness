@@ -444,6 +444,54 @@ async def test_async_sdk_streams_real_turn_events(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_sdk_cancelled_event_terminates_stream(tmp_path) -> None:
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    async with await AshClient.create(config=config, provider=SDKProvider()) as client:
+        async def cancelled_prompt(text, *, user_metadata=None):
+            client.loop.ui.emit_event({"type": "turn.cancelled"})
+            raise RuntimeError("cancelled after terminal event")
+
+        client._prompt_unlocked = cancelled_prompt  # type: ignore[method-assign]
+        events = [event async for event in client.stream_prompt("cancel")]
+
+    assert [event.type for event in events] == ["turn.cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_rejects_cross_workspace_session_resume(tmp_path) -> None:
+    first_workspace = tmp_path / "first"
+    second_workspace = tmp_path / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    database = tmp_path / "db"
+    first_config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=first_workspace,
+        db_directory=database,
+        memory_backend="off",
+    )
+    async with await AshClient.create(
+        config=first_config, provider=SDKProvider()
+    ) as first_client:
+        session_id = first_client.loop.current_session.session_id
+
+    second_config = first_config.model_copy(
+        update={"workspace_root": second_workspace}
+    )
+    with pytest.raises(ValueError, match="different workspace"):
+        await AshClient.create(
+            config=second_config,
+            provider=SDKProvider(),
+            session_id=session_id,
+        )
+
+
+@pytest.mark.asyncio
 async def test_async_sdk_serializes_prompts_on_one_session(tmp_path) -> None:
     provider = SerialProvider()
     config = AshConfig(

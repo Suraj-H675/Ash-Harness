@@ -226,7 +226,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | SDK/library API | Verified locally | Async create/prompt/steer/session/lifecycle/delegation API with explicit subagent provider injection and normalized usage independent of the TUI |
 | JSON-RPC server | Partial | Validated stdio methods, cancellation, lifecycle, and tests; remote transport remains |
 | HTTP server | Verified locally | Bearer auth, rate limits, lifecycle, session/turn/steering routes, live SSE events, cancellation, and safe CLI binding |
-| IDE/ACP integration | Missing | Protocol-based editor integration after CLI core is stable |
+| IDE/ACP integration | Verified locally | Official ACP Python SDK v1 over bounded JSONL stdio; initialize/new/load/list/prompt/cancel, durable message and redacted tool replay, permission requests, text/resource links, tool/usage streaming, editor-supplied stdio/HTTP/SSE MCP, isolated runtimes, and an official-client wire test. Images/audio/embedded context, extra directories, modes, fork/resume, terminal/filesystem callbacks, and registry publication remain unadvertised. |
 
 ## 12. Reliability And Operations
 

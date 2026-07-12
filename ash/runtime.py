@@ -18,7 +18,7 @@ from core.planner import Planner
 from core.secret_middleware import SecretRedactionMiddleware
 from core.session import SessionStore
 from hooks.config import HookConfigSource, load_command_hooks
-from mcp.server import MCPConfigSource, load_mcp_server_sources
+from mcp.server import MCPConfigSource, MCPServerConfig, load_mcp_server_sources
 from plugins.lifecycle import load_extension_state
 from plugins.registry import DiscoveredPlugin, PluginCatalog
 from providers.base import ProviderABC
@@ -273,6 +273,7 @@ def build_runtime(
     permission_rules: list[PermissionRule] | None = None,
     workspace_trusted: bool | None = None,
     approval_callback: ApprovalCallback | None = None,
+    additional_mcp_configs: dict[str, MCPServerConfig] | None = None,
     run_maintenance: bool = True,
 ) -> RuntimeComponents:
     """Assemble one runtime with identical extension and safety semantics."""
@@ -380,6 +381,10 @@ def build_runtime(
         for path in plugin.mcp_paths()
     )
     mcp_configs = load_mcp_server_sources(mcp_sources)
+    for name, mcp_config in (additional_mcp_configs or {}).items():
+        if name in mcp_configs:
+            raise ValueError(f"duplicate MCP server name: {name}")
+        mcp_configs[name] = mcp_config
 
     loop = AshLoop(
         session_store=store,

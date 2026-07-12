@@ -33,6 +33,7 @@ map, and supported API/local providers. Install optional features explicitly:
 ```bash
 pip install 'ash-ai[server]' # authenticated HTTP/SSE API
 pip install 'ash-ai[vector]' # ChromaDB and ONNX semantic memory
+pip install 'ash-ai[acp]'    # ACP v1 editor/IDE integration
 ```
 
 For development:
@@ -88,6 +89,27 @@ turn events at `/v1/turn/stream`, and durable branching at
 non-loopback binding requires `--allow-remote`. See
 [durable session branching](docs/SESSION_BRANCHING.md) for integrity and
 retention behavior.
+
+### Editor integration (ACP v1)
+
+Install the capability pack, configure a provider once, and verify the agent:
+
+```bash
+pip install 'ash-ai[acp]'
+ash setup
+ash acp --check
+```
+
+Point an ACP-compatible editor's custom-agent command at `ash` with argument
+`acp` (for example, Zed accepts that command/argument pair). Ash uses the
+editor's workspace as the session boundary and supports new, load, list,
+prompt, cancel, close, text/resource-link content, tool progress, usage, and
+HTTP/SSE/stdio MCP servers. Durable loads replay messages and redacted tool
+activity. Each editor connection is limited to 16 live sessions and one active
+turn per session. Image, audio, embedded-resource, extra-directory, ACP-MCP,
+mode, fork, and resume capabilities are not advertised until their full
+protocol behavior is implemented. Standard output is reserved for ACP JSONL;
+diagnostics go to standard error.
 
 Inside an interactive terminal, `/help` opens a full-screen searchable command
 reference; redirected input and screen-reader mode keep the linear text output.
