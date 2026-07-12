@@ -4,10 +4,10 @@ import json
 import pytest
 
 from ash.runtime import build_runtime
-from config import AshConfig
-from mcp.server import MCPServerConfig
-from providers.base import ProviderABC
-from ui.headless import HeadlessUI
+from ash.config import AshConfig
+from ash.mcp.server import MCPServerConfig
+from ash.providers.base import ProviderABC
+from ash.ui.headless import HeadlessUI
 
 
 class RuntimeProvider(ProviderABC):

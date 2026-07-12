@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from providers.retry import (
+from ash.providers.retry import (
     ProviderCircuitBreaker,
     ProviderCircuitOpen,
     ProviderFailure,
@@ -63,7 +63,7 @@ def test_retry_delay_prefers_header_and_caps_backoff(monkeypatch) -> None:
         )
         == 5.0
     )
-    monkeypatch.setattr("providers.retry.random.uniform", lambda _low, high: high)
+    monkeypatch.setattr("ash.providers.retry.random.uniform", lambda _low, high: high)
     assert (
         retry_delay(
             ProviderFailure("server", True, 503),

@@ -1,4 +1,4 @@
-from core.session import SessionStore
+from ash.core.session import SessionStore
 
 
 def test_session_token_totals_accumulate(tmp_path) -> None:
@@ -27,7 +27,7 @@ def test_session_token_totals_accumulate(tmp_path) -> None:
         estimated_cost_usd=0.006,
     )
 
-    from core.session import get_db_connection
+    from ash.core.session import get_db_connection
 
     connection = get_db_connection(store.db_path)
     try:

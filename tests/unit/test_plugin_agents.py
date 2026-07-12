@@ -5,12 +5,12 @@ import json
 
 import pytest
 
-from agents.shared_state import SharedState
+from ash.agents.shared_state import SharedState
 from ash.cli import _build_tools
-from plugins.agents import AgentCatalog, AgentDefinition, AgentSource
-from providers.base import ProviderABC, StreamChunk
-from safety.guard import SafetyGuard
-from tools.agent import SpawnAgentTool
+from ash.plugins.agents import AgentCatalog, AgentDefinition, AgentSource
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.safety.guard import SafetyGuard
+from ash.tools.agent import SpawnAgentTool
 
 
 def test_agent_catalog_namespaces_declared_plugin_agents(tmp_path: Path) -> None:

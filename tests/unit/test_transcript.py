@@ -1,4 +1,4 @@
-from ui.transcript import Transcript
+from ash.ui.transcript import Transcript
 
 
 def test_transcript_streaming_replaces_immutable_snapshots() -> None:

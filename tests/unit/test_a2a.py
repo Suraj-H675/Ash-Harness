@@ -32,16 +32,16 @@ from a2a.types.a2a_pb2 import (
 from a2a.utils.constants import TransportProtocol
 
 from ash.sdk import AshEvent
-from agents.a2a_remote import (
+from ash.agents.a2a_remote import (
     ListRemoteAgentsTool,
     RemoteAgentConfig,
     load_remote_agent_configs,
     send_remote_agent,
     validate_agent_card_origins,
 )
-from config import AshConfig
-from safety.guard import SafetyGuard
-from server.a2a import A2ASessionRegistry, create_a2a_app
+from ash.config import AshConfig
+from ash.safety.guard import SafetyGuard
+from ash.server.a2a import A2ASessionRegistry, create_a2a_app
 
 
 class FakeAshClient:
@@ -87,7 +87,7 @@ async def test_a2a_official_client_streams_and_resumes_durable_context(
         created.append((requested, client))
         return client
 
-    monkeypatch.setattr("server.a2a.AshClient.create", create_client)
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
     app = create_a2a_app(
         config,
         public_url="http://testserver",
@@ -419,7 +419,7 @@ async def test_a2a_cancel_preempts_active_ash_turn(tmp_path: Path, monkeypatch) 
     async def create_client(**kwargs: Any) -> BlockingAshClient:
         return BlockingAshClient()
 
-    monkeypatch.setattr("server.a2a.AshClient.create", create_client)
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
     app = create_a2a_app(
         config,
         public_url="http://testserver",

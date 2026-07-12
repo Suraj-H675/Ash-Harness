@@ -5,9 +5,9 @@ import socket
 import httpx
 import pytest
 
-from safety.guard import SafetyGuard
-from safety.policy import PermissionPolicy, PolicyAction
-from tools.web import WebFetchTool, _validate_public_url
+from ash.safety.guard import SafetyGuard
+from ash.safety.policy import PermissionPolicy, PolicyAction
+from ash.tools.web import WebFetchTool, _validate_public_url
 
 
 @pytest.fixture
@@ -17,7 +17,7 @@ def guard(tmp_path):
 
 @pytest.mark.asyncio
 async def test_web_fetch_returns_bounded_html_text(monkeypatch, guard) -> None:
-    monkeypatch.setattr("tools.web._ensure_public_host", lambda hostname: None)
+    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["user-agent"].startswith("ash-web-fetch")
@@ -38,7 +38,7 @@ async def test_web_fetch_returns_bounded_html_text(monkeypatch, guard) -> None:
 
 @pytest.mark.asyncio
 async def test_web_fetch_validates_redirect_targets(monkeypatch, guard) -> None:
-    from tools import web
+    from ash.tools import web
 
     original = web._ensure_public_host
 
@@ -47,7 +47,7 @@ async def test_web_fetch_validates_redirect_targets(monkeypatch, guard) -> None:
             return None
         return original(hostname)
 
-    monkeypatch.setattr("tools.web._ensure_public_host", allow_example_only)
+    monkeypatch.setattr("ash.tools.web._ensure_public_host", allow_example_only)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(302, headers={"location": "http://127.0.0.1/private"})
@@ -61,7 +61,7 @@ async def test_web_fetch_validates_redirect_targets(monkeypatch, guard) -> None:
 
 @pytest.mark.asyncio
 async def test_web_fetch_enforces_allowed_domains(monkeypatch, guard) -> None:
-    monkeypatch.setattr("tools.web._ensure_public_host", lambda hostname: None)
+    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -90,7 +90,7 @@ async def test_web_fetch_rejects_redirect_outside_allowed_domains(
     monkeypatch,
     guard,
 ) -> None:
-    monkeypatch.setattr("tools.web._ensure_public_host", lambda hostname: None)
+    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -111,7 +111,7 @@ async def test_web_fetch_rejects_redirect_outside_allowed_domains(
 
 def test_web_fetch_rejects_private_and_non_http_hosts(monkeypatch) -> None:
     with monkeypatch.context() as mp:
-        mp.setattr("tools.web._ensure_public_host", lambda hostname: None)
+        mp.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
         assert "https://example.com" == _validate_public_url("https://example.com")
     with pytest.raises(ValueError, match="Only http"):
         _validate_public_url("file:///etc/passwd")

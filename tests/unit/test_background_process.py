@@ -5,9 +5,9 @@ from unittest.mock import Mock
 
 import pytest
 
-from safety.guard import SafetyGuard
-from sandbox import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable, SandboxInvocation
-from tools.process import BackgroundProcessTool
+from ash.safety.guard import SafetyGuard
+from ash.sandbox import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable, SandboxInvocation
+from ash.tools.process import BackgroundProcessTool
 
 
 @pytest.mark.asyncio

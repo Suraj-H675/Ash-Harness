@@ -5,20 +5,20 @@ from pathlib import Path
 import pytest
 
 from ash.runtime import build_tools
-from config import AshConfig
-from core.loop import AshLoop, _execute_with_retry
-from core.session import SessionStore
-from plugins.manifest import PluginManifest
-from plugins.registry import DiscoveredPlugin
-from plugins.runtime import (
+from ash.config import AshConfig
+from ash.core.loop import AshLoop, _execute_with_retry
+from ash.core.session import SessionStore
+from ash.plugins.manifest import PluginManifest
+from ash.plugins.registry import DiscoveredPlugin
+from ash.plugins.runtime import (
     PluginHostClient,
     PluginRuntimeTool,
     build_plugin_runtime_tools,
     plugin_tool_name,
 )
-from providers.base import ProviderABC, StreamChunk
-from safety.guard import SafetyGuard
-from sandbox import SandboxManager
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.safety.guard import SafetyGuard
+from ash.sandbox import SandboxManager
 
 
 HOST_SOURCE = r"""

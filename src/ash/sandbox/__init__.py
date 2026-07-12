@@ -1,0 +1,53 @@
+"""Subprocess sandboxing primitives for Ash (Sprint 11).
+
+Tiered execution per the V4 roadmap in ASH_MASTER_PLAN_V2.md:
+
+* Tier 1: path-scoped subprocess (always available — the Sprint 4 default).
+* Tier 2: bubblewrap on Linux, sandbox-exec on macOS.
+* Tier 3: ephemeral Docker container.
+
+Ash prefers the compatible native backend, then a verified Docker image.
+Direct execution is labeled as unisolated, and an isolated invocation fails
+closed if its backend disappears.
+"""
+
+from ash.sandbox._base import (
+    SANDBOX_TIER_BWRAP,
+    SANDBOX_TIER_DOCKER,
+    SANDBOX_TIER_SANDBOX_EXEC,
+    SANDBOX_TIER_SCOPED,
+    SandboxBackend,
+    SandboxBackendUnavailable,
+    SandboxTier,
+)
+from ash.sandbox.bwrap import BubblewrapSandbox
+from ash.sandbox.docker import DockerSandbox
+from ash.sandbox.manager import (
+    SandboxManager,
+    SandboxInvocation,
+    SandboxResult,
+    auto_approve_safety_error,
+    has_bwrap,
+    has_docker,
+    has_sandbox_exec,
+)
+
+
+__all__ = [
+    "SANDBOX_TIER_BWRAP",
+    "SANDBOX_TIER_DOCKER",
+    "SANDBOX_TIER_SANDBOX_EXEC",
+    "SANDBOX_TIER_SCOPED",
+    "BubblewrapSandbox",
+    "DockerSandbox",
+    "SandboxBackend",
+    "SandboxBackendUnavailable",
+    "SandboxManager",
+    "SandboxInvocation",
+    "SandboxResult",
+    "SandboxTier",
+    "auto_approve_safety_error",
+    "has_bwrap",
+    "has_docker",
+    "has_sandbox_exec",
+]

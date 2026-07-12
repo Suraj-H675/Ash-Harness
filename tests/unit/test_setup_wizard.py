@@ -50,8 +50,8 @@ class TestHasProviderConfigured:
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         monkeypatch.setenv("HOME", "/tmp")
 
-        with patch("cli.setup.load_config", return_value={}):
-            from cli.setup import _has_provider_configured
+        with patch("ash.commands.setup.load_config", return_value={}):
+            from ash.commands.setup import _has_provider_configured
 
             assert _has_provider_configured(mock_config) is True
 
@@ -64,8 +64,8 @@ class TestHasProviderConfigured:
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         monkeypatch.setenv("HOME", "/tmp")
 
-        with patch("cli.setup.load_config", return_value={}):
-            from cli.setup import _has_provider_configured
+        with patch("ash.commands.setup.load_config", return_value={}):
+            from ash.commands.setup import _has_provider_configured
 
             assert _has_provider_configured(mock_config) is True
 
@@ -86,8 +86,8 @@ class TestHasProviderConfigured:
             monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("HOME", "/tmp")
 
-        with patch("cli.setup.load_config", return_value={}):
-            from cli.setup import _has_provider_configured
+        with patch("ash.commands.setup.load_config", return_value={}):
+            from ash.commands.setup import _has_provider_configured
 
             assert _has_provider_configured(mock_config) is True
 
@@ -103,8 +103,8 @@ class TestHasProviderConfigured:
             monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("HOME", "/tmp")
 
-        with patch("cli.setup.load_config", return_value={}):
-            from cli.setup import _has_provider_configured
+        with patch("ash.commands.setup.load_config", return_value={}):
+            from ash.commands.setup import _has_provider_configured
 
             assert _has_provider_configured(mock_config) is False
 
@@ -114,27 +114,27 @@ class TestGetCurrentModel:
 
     def test_extracts_model_name_from_provider_slash_model(self) -> None:
         """'anthropic/claude-3-5-sonnet' → 'claude-3-5-sonnet'."""
-        from cli.setup import _get_current_model
+        from ash.commands.setup import _get_current_model
 
         mock_config = MagicMock(model="anthropic/claude-3-5-sonnet")
         assert _get_current_model(mock_config) == "claude-3-5-sonnet"
 
     def test_returns_raw_value_if_no_slash(self) -> None:
         """Model without slash is returned as-is."""
-        from cli.setup import _get_current_model
+        from ash.commands.setup import _get_current_model
 
         mock_config = MagicMock(model="llama3")
         assert _get_current_model(mock_config) == "llama3"
 
     def test_empty_model(self) -> None:
         """Empty model returns empty string."""
-        from cli.setup import _get_current_model
+        from ash.commands.setup import _get_current_model
 
         mock_config = MagicMock(model="")
         assert _get_current_model(mock_config) == ""
 
     def test_provider_specific_current_model_does_not_cross_providers(self) -> None:
-        from cli.setup import _get_current_model_for_provider
+        from ash.commands.setup import _get_current_model_for_provider
 
         config = MagicMock(model="anthropic/claude-example")
         assert _get_current_model_for_provider(config, "anthropic") == "claude-example"
@@ -152,19 +152,21 @@ class TestAnthropicFlow:
         # Clean env so get_env_value returns None (no existing key)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         # _prompt_api_key calls getpass once, _prompt_model_list calls input once
-        monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass("sk-ant-test123"))
+        monkeypatch.setattr(
+            "ash.commands.setup.getpass.getpass", _FakeGetpass("sk-ant-test123")
+        )
         monkeypatch.setattr(
             "builtins.input", _fake_input(["", "1"])
         )  # default base URL, model selection
 
-        from cli.setup import ModelProbe, _flow_anthropic
+        from ash.commands.setup import ModelProbe, _flow_anthropic
 
         with (
             patch(
-                "cli.setup._probe_anthropic_models_detailed",
+                "ash.commands.setup._probe_anthropic_models_detailed",
                 return_value=ModelProbe(models=("claude-test",)),
             ),
-            patch("cli.setup.save_env_values") as mock_save,
+            patch("ash.commands.setup.save_env_values") as mock_save,
         ):
             _flow_anthropic("")
             calls = mock_save.call_args.args[0]
@@ -176,18 +178,20 @@ class TestAnthropicFlow:
     def test_cancelled_model_selection_does_not_save_partial_credentials(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from cli.setup import ModelProbe, SetupCancelled, _flow_anthropic
+        from ash.commands.setup import ModelProbe, SetupCancelled, _flow_anthropic
 
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass("sk-new"))
+        monkeypatch.setattr(
+            "ash.commands.setup.getpass.getpass", _FakeGetpass("sk-new")
+        )
         monkeypatch.setattr("builtins.input", _fake_input(["", "c"]))
 
         with (
             patch(
-                "cli.setup._probe_anthropic_models_detailed",
+                "ash.commands.setup._probe_anthropic_models_detailed",
                 return_value=ModelProbe(models=("model",)),
             ),
-            patch("cli.setup.save_env_values") as save,
+            patch("ash.commands.setup.save_env_values") as save,
             pytest.raises(SetupCancelled),
         ):
             _flow_anthropic("")
@@ -203,19 +207,21 @@ class TestGroqFlow:
         """_flow_groq should save the given API key and ASH_MODEL."""
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
-        monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass("gsk_groq_test"))
+        monkeypatch.setattr(
+            "ash.commands.setup.getpass.getpass", _FakeGetpass("gsk_groq_test")
+        )
         monkeypatch.setattr(
             "builtins.input", _fake_input(["1"])
         )  # select model index 1
 
-        from cli.setup import ModelProbe, _flow_groq
+        from ash.commands.setup import ModelProbe, _flow_groq
 
         with (
             patch(
-                "cli.setup._probe_models_detailed",
+                "ash.commands.setup._probe_models_detailed",
                 return_value=ModelProbe(models=("groq-test",)),
             ),
-            patch("cli.setup.save_env_values") as mock_save,
+            patch("ash.commands.setup.save_env_values") as mock_save,
         ):
             _flow_groq("")
             calls = mock_save.call_args.args[0]
@@ -229,11 +235,13 @@ class TestOpenAIFlow:
     def test_custom_base_url_is_used_for_discovery_and_saved_atomically(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from cli.setup import ModelProbe, _flow_openai
+        from ash.commands.setup import ModelProbe, _flow_openai
 
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_BASE", raising=False)
-        monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass("sk-openai"))
+        monkeypatch.setattr(
+            "ash.commands.setup.getpass.getpass", _FakeGetpass("sk-openai")
+        )
         monkeypatch.setattr(
             "builtins.input",
             _fake_input(["https://gateway.example/v1/", "1"]),
@@ -241,10 +249,10 @@ class TestOpenAIFlow:
 
         with (
             patch(
-                "cli.setup._probe_models_detailed",
+                "ash.commands.setup._probe_models_detailed",
                 return_value=ModelProbe(models=("gateway-model",)),
             ) as probe,
-            patch("cli.setup.save_env_values") as save,
+            patch("ash.commands.setup.save_env_values") as save,
         ):
             _flow_openai("")
 
@@ -258,7 +266,7 @@ class TestOpenAIFlow:
 
 class TestDiscoveryRecovery:
     def test_probe_can_retry_then_verify(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from cli.setup import ModelProbe, _discover_models
+        from ash.commands.setup import ModelProbe, _discover_models
 
         monkeypatch.setattr("builtins.input", _fake_input(["r"]))
         probe = MagicMock(
@@ -274,7 +282,7 @@ class TestDiscoveryRecovery:
     def test_probe_can_continue_explicitly_without_verification(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from cli.setup import ModelProbe, _discover_models
+        from ash.commands.setup import ModelProbe, _discover_models
 
         monkeypatch.setattr("builtins.input", _fake_input(["s"]))
 
@@ -304,16 +312,18 @@ class TestOpenaiCompatibleFlow:
                 ]
             ),
         )
-        monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass("sk-cp-test"))
+        monkeypatch.setattr(
+            "ash.commands.setup.getpass.getpass", _FakeGetpass("sk-cp-test")
+        )
 
-        from cli.setup import ModelProbe
+        from ash.commands.setup import ModelProbe
 
         with patch(
-            "cli.setup._probe_models_detailed",
+            "ash.commands.setup._probe_models_detailed",
             return_value=ModelProbe(models=("MiniMax-M2.7",)),
         ):
-            with patch("cli.setup.save_config") as mock_save_config:
-                from cli.setup import _flow_openai_compatible
+            with patch("ash.commands.setup.save_config") as mock_save_config:
+                from ash.commands.setup import _flow_openai_compatible
 
                 _flow_openai_compatible()
                 mock_save_config.assert_called_once()
@@ -345,8 +355,8 @@ class TestProbeModels:
             },
         )
         monkeypatch.setenv("HOME", "/tmp")
-        with patch("cli.setup.httpx.get", return_value=mock_response):
-            from cli.setup import _probe_models
+        with patch("ash.commands.setup.httpx.get", return_value=mock_response):
+            from ash.commands.setup import _probe_models
 
             result = _probe_models("https://api.openai.com/v1", "sk-test")
             assert result == ["gpt-4o", "gpt-4o-mini"]
@@ -354,20 +364,22 @@ class TestProbeModels:
     def test_probe_models_http_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_probe_models returns [] on HTTP error."""
         monkeypatch.setenv("HOME", "/tmp")
-        with patch("cli.setup.httpx.get", side_effect=Exception("network error")):
-            from cli.setup import _probe_models
+        with patch(
+            "ash.commands.setup.httpx.get", side_effect=Exception("network error")
+        ):
+            from ash.commands.setup import _probe_models
 
             result = _probe_models("https://api.openai.com/v1", "sk-test")
             assert result == []
 
     def test_probe_error_redacts_echoed_api_key(self) -> None:
-        from cli.setup import _probe_models_detailed
+        from ash.commands.setup import _probe_models_detailed
 
         response = MagicMock(
             status_code=401,
             text="invalid key sk-secret-value",
         )
-        with patch("cli.setup.httpx.get", return_value=response):
+        with patch("ash.commands.setup.httpx.get", return_value=response):
             result = _probe_models_detailed(
                 "https://api.example.test/v1",
                 "sk-secret-value",
@@ -389,8 +401,8 @@ class TestProbeModels:
             },
         )
         monkeypatch.setenv("HOME", "/tmp")
-        with patch("cli.setup.httpx.get", return_value=mock_response):
-            from cli.setup import _probe_ollama_models
+        with patch("ash.commands.setup.httpx.get", return_value=mock_response):
+            from ash.commands.setup import _probe_ollama_models
 
             result = _probe_ollama_models("http://localhost:11434")
             assert result == ["llama3", "qwen2.5-coder:7b"]
@@ -407,13 +419,13 @@ class TestSetupValidation:
         ],
     )
     def test_base_url_rejects_unsafe_or_ambiguous_values(self, value: str) -> None:
-        from cli.setup import _validate_base_url
+        from ash.commands.setup import _validate_base_url
 
         with pytest.raises(ValueError):
             _validate_base_url(value)
 
     def test_base_url_normalizes_trailing_slash(self) -> None:
-        from cli.setup import _validate_base_url
+        from ash.commands.setup import _validate_base_url
 
         assert _validate_base_url("http://localhost:11434/") == "http://localhost:11434"
 
@@ -432,11 +444,11 @@ class TestCmdSetup:
             non_interactive=False,
         )
 
-        with patch("cli.setup.is_interactive_stdin", return_value=True):
-            from cli.setup import SetupOutcome, cmd_setup
+        with patch("ash.commands.setup.is_interactive_stdin", return_value=True):
+            from ash.commands.setup import SetupOutcome, cmd_setup
 
             with patch(
-                "cli.setup.run_setup_wizard",
+                "ash.commands.setup.run_setup_wizard",
                 return_value=SetupOutcome.SUCCESS,
             ):
                 result = cmd_setup(mock_args)
@@ -445,24 +457,24 @@ class TestCmdSetup:
     def test_cmd_setup_non_interactive_returns_usage_error(
         self, monkeypatch: pytest.MonkeyPatch, capsys
     ) -> None:
-        from cli.setup import cmd_setup
+        from ash.commands.setup import cmd_setup
 
         args = MagicMock(section="model", quick=False, non_interactive=True)
-        monkeypatch.setattr("cli.setup.is_interactive_stdin", lambda: False)
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: False)
 
-        with patch("cli.setup._has_provider_configured", return_value=False):
+        with patch("ash.commands.setup._has_provider_configured", return_value=False):
             assert cmd_setup(args) == 2
         assert "requires an interactive terminal" in capsys.readouterr().err
 
     def test_cmd_setup_non_interactive_accepts_existing_configuration(
         self, monkeypatch: pytest.MonkeyPatch, capsys
     ) -> None:
-        from cli.setup import cmd_setup
+        from ash.commands.setup import cmd_setup
 
         args = MagicMock(section="model", quick=False, non_interactive=True)
-        monkeypatch.setattr("cli.setup.is_interactive_stdin", lambda: False)
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: False)
 
-        with patch("cli.setup._has_provider_configured", return_value=True):
+        with patch("ash.commands.setup._has_provider_configured", return_value=True):
             assert cmd_setup(args) == 0
         output = capsys.readouterr().out
         assert "Ash is configured for" in output
@@ -478,12 +490,12 @@ class TestWebSearchSetup:
         monkeypatch.delenv("TAVILY_API_KEY", raising=False)
         monkeypatch.setattr("builtins.input", _fake_input(["1"]))
         monkeypatch.setattr(
-            "cli.setup.getpass.getpass", _FakeGetpass("brave-search-test-key")
+            "ash.commands.setup.getpass.getpass", _FakeGetpass("brave-search-test-key")
         )
 
-        from cli.setup import SetupOutcome, setup_web_search
+        from ash.commands.setup import SetupOutcome, setup_web_search
 
-        with patch("cli.setup.save_env_values") as save:
+        with patch("ash.commands.setup.save_env_values") as save:
             result = setup_web_search()
 
         assert result == SetupOutcome.SUCCESS
@@ -497,11 +509,11 @@ class TestWebSearchSetup:
         monkeypatch: pytest.MonkeyPatch,
         capsys,
     ) -> None:
-        from cli.setup import cmd_setup
+        from ash.commands.setup import cmd_setup
 
         monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
         monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-        monkeypatch.setattr("cli.setup.is_interactive_stdin", lambda: False)
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: False)
         args = MagicMock(section="web", quick=False, non_interactive=True)
 
         assert cmd_setup(args) == 2
@@ -514,9 +526,11 @@ class TestBrowserSetup:
         monkeypatch: pytest.MonkeyPatch,
         capsys,
     ) -> None:
-        from cli.setup import SetupOutcome, setup_browser
+        from ash.commands.setup import SetupOutcome, setup_browser
 
-        monkeypatch.setattr("cli.setup.importlib.util.find_spec", lambda name: None)
+        monkeypatch.setattr(
+            "ash.commands.setup.importlib.util.find_spec", lambda name: None
+        )
 
         assert setup_browser() == SetupOutcome.ERROR
         assert "ash-ai[browser]" in capsys.readouterr().err
@@ -525,11 +539,11 @@ class TestBrowserSetup:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from cli.setup import SetupOutcome, setup_browser
+        from ash.commands.setup import SetupOutcome, setup_browser
 
-        monkeypatch.setattr("cli.setup._browser_is_installed", lambda: True)
+        monkeypatch.setattr("ash.commands.setup._browser_is_installed", lambda: True)
         run = MagicMock(side_effect=AssertionError("installer unexpectedly ran"))
-        monkeypatch.setattr("cli.setup.subprocess.run", run)
+        monkeypatch.setattr("ash.commands.setup.subprocess.run", run)
 
         assert setup_browser() == SetupOutcome.SUCCESS
         run.assert_not_called()
@@ -538,18 +552,20 @@ class TestBrowserSetup:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from cli.setup import SetupOutcome, setup_browser
+        from ash.commands.setup import SetupOutcome, setup_browser
 
         states = iter((False, True))
         monkeypatch.setattr(
-            "cli.setup._browser_is_installed", lambda: next(states)
+            "ash.commands.setup._browser_is_installed", lambda: next(states)
         )
         monkeypatch.setattr("builtins.input", _fake_input([""]))
         completed = MagicMock(returncode=0)
-        monkeypatch.setattr("cli.setup.subprocess.run", MagicMock(return_value=completed))
+        monkeypatch.setattr(
+            "ash.commands.setup.subprocess.run", MagicMock(return_value=completed)
+        )
 
         assert setup_browser() == SetupOutcome.SUCCESS
-        from cli import setup
+        from ash.commands import setup
 
         setup.subprocess.run.assert_called_once_with(
             [setup.sys.executable, "-m", "playwright", "install", "chromium"],
@@ -561,7 +577,7 @@ class TestSetupNavigation:
     def test_provider_selection_can_cancel(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from cli.setup import SetupOutcome, select_provider_and_model
+        from ash.commands.setup import SetupOutcome, select_provider_and_model
 
         monkeypatch.setattr("builtins.input", _fake_input(["c"]))
 
@@ -570,11 +586,11 @@ class TestSetupNavigation:
     def test_blank_api_key_returns_to_provider_selection(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from cli.setup import SetupOutcome, select_provider_and_model
+        from ash.commands.setup import SetupOutcome, select_provider_and_model
 
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setattr("builtins.input", _fake_input(["1", "c"]))
-        monkeypatch.setattr("cli.setup.getpass.getpass", _FakeGetpass(""))
+        monkeypatch.setattr("ash.commands.setup.getpass.getpass", _FakeGetpass(""))
 
         assert select_provider_and_model(MagicMock(model="")) == SetupOutcome.CANCELLED
 
@@ -593,7 +609,7 @@ class TestLegacyConfigMigration:
 
     @staticmethod
     def _configure_paths(tmp_path: Path) -> None:
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / "home" / ".ash"
         cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
@@ -604,8 +620,8 @@ class TestLegacyConfigMigration:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from cli import config as cli_config
-        from cli.setup import _migrate_old_ash_toml
+        from ash.commands import config as cli_config
+        from ash.commands.setup import _migrate_old_ash_toml
 
         self._configure_paths(tmp_path)
         project = tmp_path / "project"
@@ -665,8 +681,8 @@ class TestLegacyConfigMigration:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        from cli import config as cli_config
-        from cli.setup import _migrate_old_ash_toml
+        from ash.commands import config as cli_config
+        from ash.commands.setup import _migrate_old_ash_toml
 
         self._configure_paths(tmp_path)
         project = tmp_path / "project"
@@ -711,8 +727,8 @@ class TestLegacyConfigMigration:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from cli import config as cli_config
-        from cli.setup import _migrate_old_ash_toml
+        from ash.commands import config as cli_config
+        from ash.commands.setup import _migrate_old_ash_toml
 
         self._configure_paths(tmp_path)
         project = tmp_path / "project"
@@ -742,8 +758,8 @@ class TestLegacyConfigMigration:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from cli import config as cli_config
-        from cli.setup import _migrate_old_ash_toml
+        from ash.commands import config as cli_config
+        from ash.commands.setup import _migrate_old_ash_toml
 
         self._configure_paths(tmp_path)
         project = tmp_path / "project"

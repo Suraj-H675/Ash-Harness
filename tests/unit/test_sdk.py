@@ -4,11 +4,11 @@ import sys
 
 import pytest
 
-from agents.shared_state import SharedState
+from ash.agents.shared_state import SharedState
 from ash.sdk import AshClient
-from config import AshConfig
-from providers.base import ProviderABC, StreamChunk
-from sandbox import SandboxBackendUnavailable
+from ash.config import AshConfig
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.sandbox import SandboxBackendUnavailable
 
 
 class SDKProvider(ProviderABC):
@@ -66,9 +66,9 @@ class SteeringSDKProvider(SDKProvider):
 
 @pytest.mark.asyncio
 async def test_async_sdk_rejects_unisolated_auto_approve(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("sandbox.manager.has_docker", lambda _image: False)
-    monkeypatch.setattr("sandbox.manager.has_bwrap", lambda: False)
-    monkeypatch.setattr("sandbox.manager.has_sandbox_exec", lambda: False)
+    monkeypatch.setattr("ash.sandbox.manager.has_docker", lambda _image: False)
+    monkeypatch.setattr("ash.sandbox.manager.has_bwrap", lambda: False)
+    monkeypatch.setattr("ash.sandbox.manager.has_sandbox_exec", lambda: False)
     config = AshConfig(
         model="ollama/sdk-model",
         workspace_root=tmp_path,
@@ -142,9 +142,7 @@ async def test_sdk_exposes_typed_durable_agent_tasks_and_artifacts(tmp_path) -> 
         assert [task.task_id for task in tasks] == ["sdk-task"]
         assert tasks[0].result == {"summary": "done"}
         assert [artifact.uri for artifact in artifacts] == ["artifact://sdk"]
-        assert [event.event["type"] for event in events] == [
-            "agent.task.succeeded"
-        ]
+        assert [event.event["type"] for event in events] == ["agent.task.succeeded"]
         assert [task.task_id for task in client.agent_tasks(graph_id="sdk-graph")] == [
             "sdk-cancel"
         ]
@@ -241,9 +239,7 @@ async def test_async_sdk_applies_trusted_project_extensions(
     hooks.write_text(
         json.dumps(
             {
-                "pre_tool": [
-                    {"matcher": "write_file", "command": ["true"]}
-                ],
+                "pre_tool": [{"matcher": "write_file", "command": ["true"]}],
                 "session_start": [
                     {
                         "command": [
@@ -431,9 +427,7 @@ async def test_async_sdk_streams_real_turn_events(tmp_path) -> None:
     assert events[-1].session_id == events[-1].data["session_id"]
     assert events[-1].data["response"] == "sdk response"
     assert events[-1].data["usage"]["cache_read_tokens"] == 80
-    replay = client.loop.session_store.list_runtime_events(
-        events[-1].session_id or ""
-    )
+    replay = client.loop.session_store.list_runtime_events(events[-1].session_id or "")
     replay_types = [item.event["type"] for item in replay]
     assert replay_types[0] == "turn.started"
     assert "assistant.delta" in replay_types
@@ -452,6 +446,7 @@ async def test_async_sdk_cancelled_event_terminates_stream(tmp_path) -> None:
         memory_backend="off",
     )
     async with await AshClient.create(config=config, provider=SDKProvider()) as client:
+
         async def cancelled_prompt(text, *, user_metadata=None):
             client.loop.ui.emit_event({"type": "turn.cancelled"})
             raise RuntimeError("cancelled after terminal event")
@@ -480,9 +475,7 @@ async def test_async_sdk_rejects_cross_workspace_session_resume(tmp_path) -> Non
     ) as first_client:
         session_id = first_client.loop.current_session.session_id
 
-    second_config = first_config.model_copy(
-        update={"workspace_root": second_workspace}
-    )
+    second_config = first_config.model_copy(update={"workspace_root": second_workspace})
     with pytest.raises(ValueError, match="different workspace"):
         await AshClient.create(
             config=second_config,

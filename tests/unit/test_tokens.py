@@ -4,12 +4,12 @@ import time
 
 import pytest
 
-from context.tokens import (
+from ash.context.tokens import (
     AnthropicTokenCounter,
     OpenAITokenCounter,
     get_token_counter,
 )
-from providers.rate_limiter import TokenBucketRateLimiter
+from ash.providers.rate_limiter import TokenBucketRateLimiter
 
 
 # --- Token Counter Tests ---

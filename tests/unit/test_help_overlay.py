@@ -2,8 +2,8 @@ import pytest
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from cli.slash import SlashCommand
-from ui.help_overlay import HelpOverlay
+from ash.commands.slash import SlashCommand
+from ash.ui.help_overlay import HelpOverlay
 
 
 @pytest.mark.asyncio

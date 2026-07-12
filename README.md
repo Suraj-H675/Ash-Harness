@@ -25,7 +25,8 @@ ash
 Lightweight commands such as `ash --version` and `ash --help` lazy-load the
 runtime stack; provider SDKs, the agent loop, repository parser, and TUI are
 loaded only when a command needs them. Installed-wheel startup is covered by a
-sub-second regression test while preserving historical `ash.tools.*` imports.
+sub-second regression test. Public Python APIs use the canonical `ash.*`
+namespace.
 
 The default install includes the terminal harness, coding tools, repository
 map, and supported API/local providers. Install optional features explicitly:
@@ -45,6 +46,21 @@ uv sync --group dev
 uv run ash --help
 uv run pytest -q
 ```
+
+## Repository Layout
+
+```text
+src/ash/           installable harness and public Python package
+tests/             unit, integration, end-to-end, and wheel smoke tests
+docs/architecture/ current architecture and parity analysis
+docs/guides/       operational and workflow guides
+docs/reference/    versioned protocol and extension contracts
+docs/archive/      historical plans and completed verification reports
+```
+
+Start with the [documentation index](docs/README.md) for maintained design and
+extension references. Development standards are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Core Usage
 
@@ -92,7 +108,7 @@ The authenticated server exposes synchronous turns at `/v1/turn`, live SSE
 turn events at `/v1/turn/stream`, and durable branching at
 `/v1/sessions/{session_id}/fork` and `/v1/sessions/{session_id}/tree`;
 non-loopback binding requires `--allow-remote`. See
-[durable session branching](docs/SESSION_BRANCHING.md) for integrity and
+[durable session branching](docs/guides/SESSION_BRANCHING.md) for integrity and
 retention behavior.
 
 ### Editor integration (ACP v1)
@@ -275,7 +291,7 @@ clean when a worktree is created or applied. Use `/agents`, `/agents stop ID`,
 and `/agents resume ID` for live status and lifecycle control; queued steering
 messages are consumed at model-iteration boundaries and marked delivered.
 Every provider-backed worker also runs through the durable task contract in
-[Agent Tasks v1](docs/AGENT_TASKS_V1.md): cross-process capacity admission,
+[Agent Tasks v1](docs/reference/AGENT_TASKS_V1.md): cross-process capacity admission,
 renewable ownership leases, crash recovery, token/time budgets, dependency
 DAGs, cancellation, results, and artifacts are persisted in SQLite. Inspect
 them with `ash agents tasks [--state STATE] [--owner ID] [--json]`.
@@ -308,12 +324,12 @@ content before changing the active version. `/plugins` manages local plugins
 inside a session and `/reload-plugins` atomically refreshes commands,
 completion, skills, agents, hooks, executable tools, and MCP servers without
 restarting Ash. Executable plugins use the isolated, versioned JSON-RPC stdio
-boundary in [Plugin API v1](docs/PLUGIN_API_V1.md); they are lazy-started,
+boundary in [Plugin API v1](docs/reference/PLUGIN_API_V1.md); they are lazy-started,
 receive no ambient secrets or network access, and cannot bypass ordinary tool
 approval, audit, hooks, or dry-run policy.
 Project plugins remain disabled until their workspace is trusted.
 Command hooks use the versioned, bounded lifecycle contract documented in
-[Hook Contract v1](docs/HOOKS_V1.md). Critical `pre_tool` gates fail closed;
+[Hook Contract v1](docs/reference/HOOKS_V1.md). Critical `pre_tool` gates fail closed;
 session, turn, model, post-tool, and error observers cannot corrupt completed
 runtime work when they fail.
 Modern `SKILL.md` instruction skills never execute embedded code. The legacy
@@ -548,5 +564,5 @@ threshold. `/status` reports circuit state; cooldown permits a half-open probe,
 and a successful request resets it. Retry reasons are redacted in logs and
 structured events.
 
-See [the production parity checklist](docs/PRODUCTION_HARNESS_PARITY.md) for
+See [the production parity checklist](docs/architecture/PRODUCTION_HARNESS_PARITY.md) for
 implemented and remaining release requirements.

@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from core.session import Message, SessionStore
+from ash.core.session import Message, SessionStore
 
 
 def test_turn_journal_recovery_and_rewind(tmp_path) -> None:

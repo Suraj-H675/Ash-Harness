@@ -6,13 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from cli.storage import (
+from ash.commands.storage import (
     backup_database,
     check_database,
     render_storage_check,
     restore_database,
 )
-from core.session import SessionStorageError, SessionStore
+from ash.core.session import SessionStorageError, SessionStore
 from ash.cli import main
 
 

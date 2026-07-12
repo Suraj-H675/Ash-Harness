@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from ash.cli import main
-from cli.plans import (
+from ash.commands.plans import (
     list_plans,
     render_plan_detail,
     render_plan_summaries,
@@ -12,8 +12,13 @@ from cli.plans import (
     show_plan,
     update_plan_item,
 )
-from core.session import SessionStore
-from core.sprint import ChecklistItem, ChecklistStatus, SprintContract, SprintExecution
+from ash.core.session import SessionStore
+from ash.core.sprint import (
+    ChecklistItem,
+    ChecklistStatus,
+    SprintContract,
+    SprintExecution,
+)
 
 
 def _save_plan(store: SessionStore, project: Path, goal: str) -> str:

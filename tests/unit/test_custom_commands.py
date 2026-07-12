@@ -1,4 +1,4 @@
-from cli.custom_commands import CommandSource, CustomCommandCatalog
+from ash.commands.custom_commands import CommandSource, CustomCommandCatalog
 
 
 def test_custom_command_discovery_namespacing_and_arguments(tmp_path) -> None:

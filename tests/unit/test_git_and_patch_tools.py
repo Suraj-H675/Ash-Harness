@@ -5,10 +5,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from safety.guard import SafetyGuard
-from sandbox.process_utils import communicate_process
-from tools.git import AutoCommitTool, GitDiffTool, GitLogTool, GitStatusTool
-from tools.patch import ApplyPatchTool
+from ash.safety.guard import SafetyGuard
+from ash.sandbox.process_utils import communicate_process
+from ash.tools.git import AutoCommitTool, GitDiffTool, GitLogTool, GitStatusTool
+from ash.tools.patch import ApplyPatchTool
 
 
 async def _git(root: Path, *args: str) -> None:
@@ -58,7 +58,7 @@ async def test_git_inspection_and_patch(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_git_inspection_reports_process_timeout(tmp_path: Path) -> None:
-    with patch("tools.git.communicate_process", side_effect=asyncio.TimeoutError):
+    with patch("ash.tools.git.communicate_process", side_effect=asyncio.TimeoutError):
         result = await GitStatusTool(SafetyGuard(tmp_path)).run()
 
     assert result.success is False
@@ -119,7 +119,7 @@ async def test_patch_revalidates_path_after_check(tmp_path: Path) -> None:
             pytest.skip(f"Symlink creation is unavailable: {exc}")
         return 0, "", ""
 
-    with patch("tools.patch._git_apply", AsyncMock(side_effect=check_then_swap)):
+    with patch("ash.tools.patch._git_apply", AsyncMock(side_effect=check_then_swap)):
         result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(patch=patch_text)
 
     assert result.success is False

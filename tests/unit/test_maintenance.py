@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
-from cli.reset import reset_local_state
-from core.session import SessionStore, get_db_connection
+from ash.commands.reset import reset_local_state
+from ash.core.session import SessionStore, get_db_connection
 
 
 def test_session_retention_and_selective_reset(tmp_path, monkeypatch) -> None:

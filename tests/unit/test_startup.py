@@ -9,7 +9,7 @@ def test_lightweight_cli_import_does_not_load_runtime_stack() -> None:
     script = """
 import sys
 import ash.cli
-blocked = {'openai', 'anthropic', 'core.loop', 'ui.terminal'} & set(sys.modules)
+blocked = {'openai', 'anthropic', 'ash.core.loop', 'ash.ui.terminal'} & set(sys.modules)
 assert not blocked, blocked
 """
     result = subprocess.run(
@@ -45,7 +45,8 @@ import ash
 assert 'ash.sdk' not in sys.modules
 assert ash.AshClient.__name__ == 'AshClient'
 assert 'ash.sdk' in sys.modules
-assert ash.tools.__name__ == 'tools'
+import ash.tools
+assert ash.tools.__name__ == 'ash.tools'
 """
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -57,11 +58,12 @@ assert ash.tools.__name__ == 'tools'
     assert result.returncode == 0, result.stderr
 
 
-def test_direct_legacy_submodule_import_remains_compatible() -> None:
+def test_canonical_submodule_import_has_one_identity() -> None:
     script = """
 import ash.tools.command
-import tools.command
-assert ash.tools.command is tools.command
+from ash.tools import command
+assert ash.tools.command is command
+assert ash.tools.command.__name__ == 'ash.tools.command'
 """
     result = subprocess.run(
         [sys.executable, "-c", script],

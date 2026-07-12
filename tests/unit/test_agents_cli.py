@@ -4,9 +4,9 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agents.shared_state import SharedState
+from ash.agents.shared_state import SharedState
 from ash.cli import main
-from cli.agents import (
+from ash.commands.agents import (
     cancel_agent_graph,
     list_agent_messages,
     list_agent_reports,
@@ -129,9 +129,7 @@ def test_cancel_agent_graph_renderer_emits_json(tmp_path: Path) -> None:
     cancellation = cancel_agent_graph(
         tmp_path / "agents.db", graph_id="graph-cli", reason="operator"
     )
-    payload = json.loads(
-        render_cancelled_agent_graph(cancellation, json_output=True)
-    )
+    payload = json.loads(render_cancelled_agent_graph(cancellation, json_output=True))
 
     assert payload["cancellation"]["task_ids"] == ["cancel"]
 

@@ -38,11 +38,16 @@ dependencies = [
 ash = "ash.cli:main"
 
 [tool.setuptools]
-packages = ["ash", "agents", "cli", "context", "core", "hooks", "lsp", "mcp", "memory", "plugins", "providers", "repo", "safety", "sandbox", "server", "tools", "ui"]
-py-modules = ["ash_logging", "config", "exceptions"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["ash*"]
+namespaces = false
 
 [tool.setuptools.package-data]
-sandbox = ["Dockerfile"]
+ash = ["py.typed"]
+"ash.sandbox" = ["Dockerfile"]
 
 [tool.uv]
 package = true
@@ -85,7 +90,7 @@ Issues = "https://github.com/Suraj-H675/Ash-Harness/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = ["src"]
 asyncio_mode = "auto"
 addopts = ["--import-mode=importlib"]
 

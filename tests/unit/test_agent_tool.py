@@ -2,11 +2,11 @@ import pytest
 import asyncio
 import subprocess
 
-from agents.shared_state import SharedState
-from config import AshConfig
-from providers.base import ProviderABC, StreamChunk
-from safety.guard import SafetyGuard
-from tools.agent import SpawnAgentTool
+from ash.agents.shared_state import SharedState
+from ash.config import AshConfig
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.safety.guard import SafetyGuard
+from ash.tools.agent import SpawnAgentTool
 
 
 class FakeProvider(ProviderABC):

@@ -7,9 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from safety.guard import SafetyGuard, SafetyViolation
-from tools.command import RunCommandTool, decode_stream, quote_powershell_literal_path
-from tools.filesystem import (
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.tools.command import (
+    RunCommandTool,
+    decode_stream,
+    quote_powershell_literal_path,
+)
+from ash.tools.filesystem import (
     BINARY_FILE_ERROR,
     EXISTS_ERROR,
     ReadFileTool,
@@ -279,7 +283,7 @@ async def test_write_file_does_not_clobber_file_created_during_write(
     guard: SafetyGuard,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tools import filesystem
+    from ash.tools import filesystem
 
     target = project_root / "new.txt"
     real_write = filesystem.atomic_write_scoped_bytes
@@ -334,7 +338,7 @@ async def test_edit_detects_file_change_during_atomic_write(
     guard: SafetyGuard,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tools import filesystem
+    from ash.tools import filesystem
 
     target = project_root / "doc.txt"
     target.write_text("old\n", encoding="utf-8")
@@ -766,7 +770,7 @@ async def test_whole_edit_blocks_paths_outside_project(guard: SafetyGuard) -> No
 def test_auto_commit_tool_is_in_default_tools():
     """auto_commit should be in the default tools dict."""
     from ash.__main__ import _build_tools
-    from safety.guard import SafetyGuard
+    from ash.safety.guard import SafetyGuard
     from pathlib import Path
 
     guard = SafetyGuard(project_root=Path("/tmp"))
@@ -779,7 +783,7 @@ def test_auto_commit_tool_is_in_default_tools():
 
 def test_default_command_tools_receive_environment_allowlist(tmp_path: Path) -> None:
     from ash.__main__ import _build_tools
-    from config import AshConfig
+    from ash.config import AshConfig
 
     tools = _build_tools(
         SafetyGuard(project_root=tmp_path),
@@ -794,8 +798,8 @@ def test_default_command_tools_receive_environment_allowlist(tmp_path: Path) -> 
 @pytest.mark.asyncio
 async def test_auto_commit_tool_runs_successfully(tmp_path):
     """AutoCommitTool should create a commit when called with valid args."""
-    from tools.git import AutoCommitTool
-    from safety.guard import SafetyGuard
+    from ash.tools.git import AutoCommitTool
+    from ash.safety.guard import SafetyGuard
     import subprocess
 
     # Initialize a git repo

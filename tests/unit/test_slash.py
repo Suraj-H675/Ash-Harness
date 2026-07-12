@@ -1,6 +1,6 @@
 import pytest
 
-from cli.slash import parse_slash_command, render_help
+from ash.commands.slash import parse_slash_command, render_help
 
 
 def test_parse_normal_prompt_returns_none() -> None:

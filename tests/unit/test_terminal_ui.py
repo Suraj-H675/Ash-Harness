@@ -1,5 +1,5 @@
 # tests/unit/test_terminal_ui.py
-from ui.terminal import TerminalUI
+from ash.ui.terminal import TerminalUI
 from io import StringIO
 from rich.console import Console
 from types import SimpleNamespace

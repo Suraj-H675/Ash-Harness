@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from providers.anthropic import prepare_anthropic_messages
-from providers.base import StreamChunk
-from providers.messages import (
+from ash.providers.anthropic import prepare_anthropic_messages
+from ash.providers.base import StreamChunk
+from ash.providers.messages import (
     MAX_CANONICAL_MESSAGES,
     CanonicalMessage,
     CanonicalToolCall,
@@ -12,8 +12,8 @@ from providers.messages import (
     TextContentBlock,
     normalize_messages,
 )
-from providers.ollama import OllamaProvider
-from providers.openai import prepare_openai_messages
+from ash.providers.ollama import OllamaProvider
+from ash.providers.openai import prepare_openai_messages
 
 
 def test_typed_canonical_messages_round_trip_to_wire_shape() -> None:
@@ -173,7 +173,5 @@ async def test_ollama_validates_messages_before_network_io() -> None:
     provider._client = FailIfCalled()  # type: ignore[assignment]
 
     with pytest.raises(ValueError, match="tool messages require tool_call_id"):
-        async for _ in provider.stream_chat(
-            [{"role": "tool", "content": "orphaned"}]
-        ):
+        async for _ in provider.stream_chat([{"role": "tool", "content": "orphaned"}]):
             pass

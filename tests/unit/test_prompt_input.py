@@ -5,8 +5,8 @@ import pytest
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
-import ui.prompt as prompt_module
-from ui.prompt import PromptInput
+import ash.ui.prompt as prompt_module
+from ash.ui.prompt import PromptInput
 
 
 class TtyStringIO(io.StringIO):

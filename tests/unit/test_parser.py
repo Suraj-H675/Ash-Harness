@@ -3,7 +3,7 @@
 from typing import Iterable
 
 
-from ui.parser import StreamingXMLParser
+from ash.ui.parser import StreamingXMLParser
 
 
 def _drive(parser: StreamingXMLParser, *chunks: str) -> list[tuple[str, object]]:

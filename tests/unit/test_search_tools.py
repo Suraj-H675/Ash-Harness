@@ -1,7 +1,7 @@
 import pytest
 
-from safety.guard import SafetyGuard
-from tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
+from ash.safety.guard import SafetyGuard
+from ash.tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
 
 
 @pytest.mark.asyncio

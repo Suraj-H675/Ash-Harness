@@ -1,6 +1,6 @@
 import io
 
-from ui.notifications import (
+from ash.ui.notifications import (
     NotificationEvent,
     NotificationMethod,
     TerminalNotifier,

@@ -5,9 +5,9 @@ import json
 import httpx
 import pytest
 
-from safety.guard import SafetyGuard
-from safety.policy import PermissionPolicy, PolicyAction
-from tools.web_search import WebSearchTool
+from ash.safety.guard import SafetyGuard
+from ash.safety.policy import PermissionPolicy, PolicyAction
+from ash.tools.web_search import WebSearchTool
 
 
 @pytest.mark.asyncio

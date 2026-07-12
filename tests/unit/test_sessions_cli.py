@@ -8,13 +8,13 @@ from pathlib import Path
 import pytest
 
 from ash.cli import main
-from cli.sessions import (
+from ash.commands.sessions import (
     list_session_summaries,
     render_session_summaries,
     render_session_tree,
     select_startup_session,
 )
-from core.session import Message, SessionStore
+from ash.core.session import Message, SessionStore
 
 
 def test_session_summary_renderer_emits_json(tmp_path: Path) -> None:

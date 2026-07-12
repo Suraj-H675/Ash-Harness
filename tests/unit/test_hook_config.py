@@ -3,8 +3,8 @@ import sys
 
 import pytest
 
-from hooks.config import HookConfigSource, load_command_hooks
-from hooks.registry import HookBlock
+from ash.hooks.config import HookConfigSource, load_command_hooks
+from ash.hooks.registry import HookBlock
 
 
 @pytest.mark.asyncio

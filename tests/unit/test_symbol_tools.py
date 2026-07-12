@@ -2,9 +2,9 @@ from pathlib import Path
 
 import pytest
 
-from repo.repomap import RepoMap
-from safety.guard import SafetyGuard
-from tools.symbols import FindReferencesTool, FindSymbolTool
+from ash.repo.repomap import RepoMap
+from ash.safety.guard import SafetyGuard
+from ash.tools.symbols import FindReferencesTool, FindSymbolTool
 
 
 @pytest.fixture

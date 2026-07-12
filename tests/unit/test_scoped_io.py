@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 import pytest
 
-from safety.guard import SafetyGuard, SafetyViolation
-from safety.scoped_io import (
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import (
     ScopedFileChanged,
     ScopedIOError,
     atomic_write_scoped_text,
@@ -23,7 +23,7 @@ def test_scoped_read_enforces_byte_limit(tmp_path, fallback: bool) -> None:
     guard = SafetyGuard(tmp_path)
 
     mode = (
-        patch("safety.scoped_io._supports_anchored_io", return_value=False)
+        patch("ash.safety.scoped_io._supports_anchored_io", return_value=False)
         if fallback
         else nullcontext()
     )
@@ -49,7 +49,7 @@ def test_scoped_read_rejects_in_scope_symlink(tmp_path) -> None:
 
 
 def test_scoped_atomic_write_detects_in_place_change_before_replace(tmp_path) -> None:
-    from safety import scoped_io
+    from ash.safety import scoped_io
 
     target = tmp_path / "target.txt"
     target.write_text("original", encoding="utf-8")
@@ -61,7 +61,7 @@ def test_scoped_atomic_write_detects_in_place_change_before_replace(tmp_path) ->
         real_write(fd, payload)
         target.write_text("concurrent update", encoding="utf-8")
 
-    with patch("safety.scoped_io._write_all", side_effect=mutate_target):
+    with patch("ash.safety.scoped_io._write_all", side_effect=mutate_target):
         with pytest.raises(ScopedFileChanged, match="changed before replace"):
             atomic_write_scoped_text(
                 target,
@@ -79,7 +79,7 @@ def test_revalidated_fallback_write_and_read(tmp_path) -> None:
     target = tmp_path / "nested" / "file.txt"
     guard = SafetyGuard(tmp_path)
 
-    with patch("safety.scoped_io._supports_anchored_io", return_value=False):
+    with patch("ash.safety.scoped_io._supports_anchored_io", return_value=False):
         atomic_write_scoped_text(target, "hello", guard, overwrite=False)
         resolved, content = read_scoped_bytes(target, guard)
 
@@ -92,7 +92,7 @@ def test_fallback_no_overwrite_is_atomic(tmp_path) -> None:
     target.write_text("existing", encoding="utf-8")
 
     with (
-        patch("safety.scoped_io._supports_anchored_io", return_value=False),
+        patch("ash.safety.scoped_io._supports_anchored_io", return_value=False),
         pytest.raises(FileExistsError),
     ):
         atomic_write_scoped_text(

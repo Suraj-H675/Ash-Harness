@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from core.session import (
+from ash.core.session import (
     Message,
     SessionResolutionError,
     SessionStore,

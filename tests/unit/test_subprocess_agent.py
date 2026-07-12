@@ -1,8 +1,8 @@
 # tests/unit/test_subprocess_agent.py
 import pytest
-from agents.subprocess_agent import SubprocessAgent, make_simple_text_task
-from agents.shared_state import SharedState
-from sandbox._base import SANDBOX_TIER_SCOPED
+from ash.agents.subprocess_agent import SubprocessAgent, make_simple_text_task
+from ash.agents.shared_state import SharedState
+from ash.sandbox._base import SANDBOX_TIER_SCOPED
 import tempfile
 from pathlib import Path
 
@@ -42,15 +42,15 @@ def test_is_tool_allowed_allows_all_when_no_allowlist(shared_state):
 
 
 def test_subagent_spec_sandbox_tier_default():
-    from agents.orchestrator import SubagentSpec
+    from ash.agents.orchestrator import SubagentSpec
 
     spec = SubagentSpec(role="coder", task="test")
     assert spec.sandbox_tier == SANDBOX_TIER_SCOPED  # default
 
 
 def test_subagent_spec_sandbox_tier_override():
-    from agents.orchestrator import SubagentSpec
-    from sandbox._base import SANDBOX_TIER_SANDBOX_EXEC
+    from ash.agents.orchestrator import SubagentSpec
+    from ash.sandbox._base import SANDBOX_TIER_SANDBOX_EXEC
 
     spec = SubagentSpec(
         role="coder", task="test", sandbox_tier=SANDBOX_TIER_SANDBOX_EXEC

@@ -5,20 +5,20 @@ from types import SimpleNamespace
 import pytest
 
 from ash.cli import _bootstrap_and_headless, _bootstrap_and_repl
-from config import AshConfig
-from core.planner import PlannerError
-from core.session import SessionStorageError
-from exceptions import ErrorCategory, classify_exception, format_error
-from safety.guard import SafetyViolation
-from sandbox import SandboxBackendUnavailable
-from ui.headless import HeadlessUI
+from ash.config import AshConfig
+from ash.core.planner import PlannerError
+from ash.core.session import SessionStorageError
+from ash.exceptions import ErrorCategory, classify_exception, format_error
+from ash.safety.guard import SafetyViolation
+from ash.sandbox import SandboxBackendUnavailable
+from ash.ui.headless import HeadlessUI
 
 
 class _ProviderFailure(RuntimeError):
     pass
 
 
-_ProviderFailure.__module__ = "providers.fake"
+_ProviderFailure.__module__ = "ash.providers.fake"
 
 
 def test_classify_config_validation_error() -> None:

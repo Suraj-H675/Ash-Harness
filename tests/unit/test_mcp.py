@@ -7,13 +7,13 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import httpx
-from core.loop import AshLoop
-from core.session import SessionStore
-from providers.base import ProviderABC, StreamChunk
-from safety.guard import SafetyGuard
-from mcp.client import MCPClient
-from mcp.runtime import MCPRuntime
-from mcp.server import (
+from ash.core.loop import AshLoop
+from ash.core.session import SessionStore
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.safety.guard import SafetyGuard
+from ash.mcp.client import MCPClient
+from ash.mcp.runtime import MCPRuntime
+from ash.mcp.server import (
     MCPServerConfig,
     MCPServerInstance,
     MCPServerManager,
@@ -25,7 +25,7 @@ from mcp.server import (
     expand_env_vars,
 )
 from pathlib import Path
-from ui.headless import HeadlessUI
+from ash.ui.headless import HeadlessUI
 
 
 def test_load_mcp_servers_from_file(tmp_path: Path) -> None:
@@ -301,7 +301,7 @@ def test_manager_scrubs_host_secrets_and_keeps_explicit_server_env(
     )
     process = Mock()
 
-    with patch("mcp.server.subprocess.Popen", return_value=process) as popen:
+    with patch("ash.mcp.server.subprocess.Popen", return_value=process) as popen:
         manager.start_server(config)
 
     environment = popen.call_args.kwargs["env"]

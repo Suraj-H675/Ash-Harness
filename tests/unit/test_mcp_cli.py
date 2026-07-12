@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 from ash.cli import main
-from mcp.server import load_mcp_servers
+from ash.mcp.server import load_mcp_servers
 
 
 def test_mcp_cli_add_persists_env_headers_and_json_hides_values(
@@ -191,7 +191,7 @@ def test_mcp_cli_login_is_explicit_and_logout_removes_credentials(
     capsys.readouterr()
 
     authorize = AsyncMock(return_value=None)
-    monkeypatch.setattr("mcp.oauth.authorize_mcp_server", authorize)
+    monkeypatch.setattr("ash.mcp.oauth.authorize_mcp_server", authorize)
 
     assert (
         main(

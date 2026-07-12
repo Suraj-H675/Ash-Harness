@@ -20,9 +20,9 @@ jobs:
         with:
           enable-cache: true
           python-version: "3.12"
-      - run: uv sync --group dev --extra server --extra acp --extra a2a
-      - run: uv run ruff check .
-      - run: uv run mypy ash agents cli config.py context core hooks lsp mcp memory plugins providers repo safety sandbox server tools ui
+      - run: uv sync --group dev --extra server --extra browser --extra acp --extra a2a
+      - run: uv run ruff check src tests
+      - run: uv run mypy src/ash
       - run: uv run pytest -q
       - run: uv build
       - name: Installed CLI smoke test

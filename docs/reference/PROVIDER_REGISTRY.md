@@ -1,0 +1,46 @@
+# Provider And Capability Registry
+
+Normal CLI users configure built-in or OpenAI-compatible providers with
+`ash setup`. Embedders can add a provider implementation without modifying
+Ash's CLI or runtime branches.
+
+```python
+from ash.providers import (
+    ProviderABC,
+    ProviderCapabilities,
+    get_provider_registry,
+)
+
+
+class ExampleProvider(ProviderABC):
+    # Implement model_name, count_tokens, and stream_chat.
+    ...
+
+
+registry = get_provider_registry()
+registry.register(
+    "example",
+    lambda config, model: ExampleProvider(model=model),
+    capabilities=lambda model: ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        context_window=128_000,
+        max_output_tokens=16_000,
+    ),
+)
+```
+
+`AshClient.create(config=AshConfig(model="example/model"))` and all CLI/SDK
+subagent factories then resolve the same registration. If the returned provider
+keeps the default `provider_family="custom"`, Ash binds it to the registered
+family. Explicit provider-owned families are preserved.
+
+Registrations are process-local and thread-safe. Duplicate names fail unless
+`replace=True` is explicit. `unregister()` removes capability declarations
+owned by that provider registration. A resolver must return an immutable
+`ProviderCapabilities`; undeclared families receive stable conservative
+defaults.
+
+Provider registration executes trusted Python code in the Ash host. It is an
+embedding API, not the future untrusted plugin ABI. Out-of-process plugins must
+cross a policy-enforced protocol boundary before they can contribute providers.

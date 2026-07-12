@@ -4,8 +4,8 @@ import httpx
 import pytest
 
 from ash.sdk import AshEvent, AshEventRecord, AshResult
-from core.session import SessionLineage
-from server.http import create_app
+from ash.core.session import SessionLineage
+from ash.server.http import create_app
 
 
 class FakeClient:

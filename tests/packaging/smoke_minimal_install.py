@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from importlib.resources import files
 from importlib.metadata import distribution
 from pathlib import Path
 
@@ -69,34 +70,53 @@ def assert_distribution_metadata() -> None:
 
     packaged = {str(path).replace("\\", "/") for path in installed.files or ()}
     assert {
-        "cli/lsp.py",
-        "lsp/client.py",
-        "lsp/config.py",
-        "lsp/manager.py",
-        "lsp/middleware.py",
-        "tools/lsp.py",
+        "ash/commands/lsp.py",
+        "ash/lsp/client.py",
+        "ash/lsp/config.py",
+        "ash/lsp/manager.py",
+        "ash/lsp/middleware.py",
+        "ash/sandbox/Dockerfile",
+        "ash/tools/lsp.py",
     } <= packaged
+    assert (installed.read_text("top_level.txt") or "").splitlines() == ["ash"]
     assert not any(path.startswith("project/") for path in packaged)
     assert not any(path.startswith("tests/") for path in packaged)
 
 
 def main() -> None:
     import ash
-    from lsp.client import LSPClient
-    from lsp.config import load_lsp_server_configs
-    from lsp.manager import LanguageServerManager
-    from repo.repomap import calculate_personalized_pagerank
-    from tools.lsp import LSPTool
-    from tools.symbols import FindSymbolTool
-    from ui.turn_input import InteractiveTurnController
+    from ash.agents.shared_state import SharedState
+    from ash.agents.subprocess_agent import SubprocessAgent, make_simple_text_task
+    from ash.lsp.client import LSPClient
+    from ash.lsp.config import load_lsp_server_configs
+    from ash.lsp.manager import LanguageServerManager
+    from ash.repo.repomap import calculate_personalized_pagerank
+    from ash.tools.lsp import LSPTool
+    from ash.tools.symbols import FindSymbolTool
+    from ash.ui.turn_input import InteractiveTurnController
 
     assert Path(ash.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
     assert calculate_personalized_pagerank([[0, 1], [1, 0]], [0])
     assert FindSymbolTool and InteractiveTurnController
     assert LSPClient and LanguageServerManager and load_lsp_server_configs and LSPTool
+    assert files("ash.sandbox").joinpath("Dockerfile").is_file()
     assert_distribution_metadata()
     for module in OPTIONAL_DISTRIBUTIONS:
         assert importlib.util.find_spec(module) is None, module
+    for module in ("agents", "cli", "context", "providers", "sandbox", "tools"):
+        assert importlib.util.find_spec(module) is None, module
+
+    console_script = Path(sys.executable).with_name(
+        "ash.exe" if os.name == "nt" else "ash"
+    )
+    console_version = subprocess.run(
+        [str(console_script), "--version"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert console_version.returncode == 0, console_version.stderr
+    assert console_version.stdout.strip().startswith("ash ")
 
     with tempfile.TemporaryDirectory(prefix="ash-wheel-smoke-") as temporary:
         root = Path(temporary)
@@ -126,6 +146,23 @@ def main() -> None:
             }
         }
         env.update({"HOME": str(home), "USERPROFILE": str(home)})
+
+        shared_state = SharedState(root / "agents.db")
+        try:
+            agent = SubprocessAgent(
+                agent_id="wheel-agent",
+                role="general",
+                task="installed wheel smoke",
+                shared_state=shared_state,
+                runner=make_simple_text_task("unused by child"),
+            )
+            process = agent.spawn_subprocess()
+            stdout, stderr = process.communicate(timeout=15)
+            assert process.returncode == 0, stderr or stdout
+            status = shared_state.get_status("wheel-agent")
+            assert status is not None and status.status == "completed"
+        finally:
+            shared_state.close()
 
         version = run_ash("--version", cwd=workspace, env=env)
         assert version.stdout.strip().startswith("ash ")
@@ -167,9 +204,7 @@ def main() -> None:
             run_ash("lsp", "status", "--json", cwd=workspace, env=env).stdout
         )
         assert trusted_lsp["trusted"] is True
-        assert any(
-            server["name"] == "wheel-fake" for server in trusted_lsp["servers"]
-        )
+        assert any(server["name"] == "wheel-fake" for server in trusted_lsp["servers"])
         explained = run_ash(
             "config",
             "explain",

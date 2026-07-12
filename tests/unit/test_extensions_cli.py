@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from ash.cli import main
-from cli.extensions import discover_extensions, render_extension_inventory
-from safety.trust import set_workspace_trusted
+from ash.commands.extensions import discover_extensions, render_extension_inventory
+from ash.safety.trust import set_workspace_trusted
 
 
 def _write_skill(root: Path, name: str, description: str) -> None:

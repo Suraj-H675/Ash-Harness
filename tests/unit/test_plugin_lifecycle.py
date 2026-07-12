@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from plugins.lifecycle import (
+from ash.plugins.lifecycle import (
     PluginLifecycleError,
     install_local_plugin,
     load_extension_state,

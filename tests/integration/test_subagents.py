@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agents import (
+from ash.agents import (
     AGENT_ROLES,
     LEAD_AGENT_ID,
     SharedState,
@@ -472,9 +472,9 @@ async def test_max_concurrency_is_respected(shared_state):
 
 @pytest.mark.asyncio
 async def test_architect_mode_produces_sprint_contract(shared_state, tmp_path):
-    from agents.orchestrator import fanout_for_goal
-    from core.planner import Planner
-    from providers.base import ProviderABC, StreamChunk
+    from ash.agents.orchestrator import fanout_for_goal
+    from ash.core.planner import Planner
+    from ash.providers.base import ProviderABC, StreamChunk
 
     class DummyProvider(ProviderABC):
         model_name = "test"

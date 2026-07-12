@@ -2,7 +2,7 @@
 import json
 import pytest
 
-from plugins.manifest import MAX_PLUGIN_MANIFEST_BYTES, PluginManifest
+from ash.plugins.manifest import MAX_PLUGIN_MANIFEST_BYTES, PluginManifest
 from pathlib import Path
 
 

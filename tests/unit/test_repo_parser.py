@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from repo.parser import SymbolExtractor
+from ash.repo.parser import SymbolExtractor
 
 
 def test_extract_imports_functions_classes_and_methods(tmp_path: Path) -> None:

@@ -28,9 +28,9 @@ from acp.schema import (
 )
 
 from ash.sdk import AshEvent
-from config import AshConfig
-from core.session import Message, SessionStore, ToolCallRecord
-from server.acp import AshACPAgent
+from ash.config import AshConfig
+from ash.core.session import Message, SessionStore, ToolCallRecord
+from ash.server.acp import AshACPAgent
 
 
 class FakeACPConnection:
@@ -153,9 +153,7 @@ async def test_acp_maps_mcp_prompts_events_and_editor_permissions(
         ],
     )
     assert session.session_id == "session-1"
-    assert created[0][1]["docs"].headers == {
-        "Authorization": "Bearer secret"
-    }
+    assert created[0][1]["docs"].headers == {"Authorization": "Bearer secret"}
 
     with pytest.raises(acp.RequestError) as duplicate_header:
         await agent.new_session(
@@ -263,16 +261,12 @@ async def test_acp_cancel_returns_cancelled_stop_reason(tmp_path: Path) -> None:
         mcp_configs: dict[str, Any],
         approval_callback: Any,
     ) -> Any:
-        return BlockingAshClient(
-            session_id or "cancel-session", [], approval_callback
-        )
+        return BlockingAshClient(session_id or "cancel-session", [], approval_callback)
 
     agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
     agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
     session = await agent.new_session(str(tmp_path))
-    prompt = asyncio.create_task(
-        agent.prompt(session.session_id, [text_block("wait")])
-    )
+    prompt = asyncio.create_task(agent.prompt(session.session_id, [text_block("wait")]))
     await asyncio.wait_for(started.wait(), timeout=2)
 
     await agent.cancel(session.session_id)

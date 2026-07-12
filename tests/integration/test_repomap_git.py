@@ -9,15 +9,15 @@ from pathlib import Path
 
 import pytest
 
-from core.loop import AshLoop
-from core.session import SessionStore
-from providers.base import StreamChunk
-from repo.repomap import RepoMap
-from safety.guard import SafetyGuard
-from tools.git import AutoCommitTool
-from tools.filesystem import ReadFileTool, WriteFileTool
-from tools.symbols import FindReferencesTool, FindSymbolTool
-from ui.terminal import TerminalUI
+from ash.core.loop import AshLoop
+from ash.core.session import SessionStore
+from ash.providers.base import StreamChunk
+from ash.repo.repomap import RepoMap
+from ash.safety.guard import SafetyGuard
+from ash.tools.git import AutoCommitTool
+from ash.tools.filesystem import ReadFileTool, WriteFileTool
+from ash.tools.symbols import FindReferencesTool, FindSymbolTool
+from ash.ui.terminal import TerminalUI
 
 
 # --- fakes (mirroring tests/integration/test_loop.py patterns) -------------

@@ -1,0 +1,377 @@
+"""Top-level persisted subagent status and report inspection."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+from ash.agents.shared_state import SharedState
+from ash.agents.tasks import TaskState
+from ash.agents.worktree import WorktreeManager
+
+
+def list_agent_statuses(db_path: str | Path) -> list[dict[str, Any]]:
+    state = SharedState(db_path)
+    try:
+        return [
+            {
+                **asdict(status),
+                "last_heartbeat": status.last_heartbeat.isoformat(),
+            }
+            for status in state.list_agents()
+        ]
+    finally:
+        state.close()
+
+
+def list_agent_reports(db_path: str | Path, *, limit: int = 20) -> list[dict[str, Any]]:
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    state = SharedState(db_path)
+    try:
+        return [
+            {
+                "message_id": message.message_id,
+                "sender_id": message.sender_id,
+                "timestamp": message.timestamp.isoformat(),
+                **message.content,
+            }
+            for message in state.fetch_messages(
+                "lead",
+                undelivered_only=False,
+                limit=limit,
+            )
+            if message.message_type == "agent_report"
+        ]
+    finally:
+        state.close()
+
+
+def list_agent_tasks(
+    db_path: str | Path,
+    *,
+    task_state: TaskState | None = None,
+    owner_agent_id: str | None = None,
+    graph_id: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    state = SharedState(db_path)
+    try:
+        return [
+            {
+                **asdict(task),
+                "lease_expires_at": (
+                    task.lease_expires_at.isoformat()
+                    if task.lease_expires_at is not None
+                    else None
+                ),
+                "created_at": task.created_at.isoformat(),
+                "updated_at": task.updated_at.isoformat(),
+                "artifacts": [
+                    {
+                        **asdict(artifact),
+                        "created_at": artifact.created_at.isoformat(),
+                    }
+                    for artifact in state.tasks.list_artifacts(task.task_id)
+                ],
+            }
+            for task in state.tasks.list_tasks(
+                state=task_state,
+                owner_agent_id=owner_agent_id,
+                graph_id=graph_id,
+                limit=limit,
+            )
+        ]
+    finally:
+        state.close()
+
+
+def cancel_agent_graph(
+    db_path: str | Path,
+    *,
+    graph_id: str,
+    reason: str = "cancelled by operator",
+) -> dict[str, Any]:
+    state = SharedState(db_path)
+    try:
+        task_ids = state.tasks.cancel_graph(graph_id, reason=reason)
+        return {"graph_id": graph_id, "task_ids": task_ids, "reason": reason}
+    finally:
+        state.close()
+
+
+def list_agent_task_events(
+    db_path: str | Path,
+    *,
+    task_id: str | None = None,
+    event_type: str | None = None,
+    after_sequence: int = 0,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    state = SharedState(db_path)
+    try:
+        return [
+            {
+                "sequence": item.sequence,
+                "task_id": item.task_id,
+                "event": item.event,
+            }
+            for item in state.tasks.list_events(
+                task_id=task_id,
+                event_type=event_type,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
+        ]
+    finally:
+        state.close()
+
+
+def list_agent_messages(
+    db_path: str | Path,
+    *,
+    recipient_id: str = "lead",
+    undelivered_only: bool = True,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    state = SharedState(db_path)
+    try:
+        return [
+            {
+                "message_id": message.message_id,
+                "sender_id": message.sender_id,
+                "recipient_id": message.recipient_id,
+                "message_type": message.message_type,
+                "content": message.content,
+                "delivered": message.delivered,
+                "timestamp": message.timestamp.isoformat(),
+            }
+            for message in state.fetch_messages(
+                recipient_id,
+                undelivered_only=undelivered_only,
+                limit=limit,
+            )
+        ]
+    finally:
+        state.close()
+
+
+def send_agent_message(
+    db_path: str | Path,
+    *,
+    recipient_id: str,
+    content: str,
+    sender_id: str = "lead",
+    message_type: str = "steer",
+    json_content: bool = False,
+    require_registered: bool = True,
+) -> dict[str, Any]:
+    recipient_id = recipient_id.strip()
+    sender_id = sender_id.strip()
+    message_type = message_type.strip()
+    if not recipient_id:
+        raise ValueError("recipient must not be empty")
+    if not sender_id:
+        raise ValueError("sender must not be empty")
+    if not message_type:
+        raise ValueError("message type must not be empty")
+
+    state = SharedState(db_path)
+    try:
+        if require_registered and state.get_status(recipient_id) is None:
+            raise ValueError(
+                f"recipient {recipient_id!r} is not registered; use --force to queue anyway"
+            )
+        pending = state.fetch_messages(
+            recipient_id,
+            undelivered_only=True,
+            limit=101,
+        )
+        if len(pending) >= 100:
+            raise ValueError(
+                f"recipient {recipient_id!r} already has 100 pending messages"
+            )
+        if json_content:
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON content: {exc.msg}") from exc
+            if not isinstance(payload, dict):
+                raise ValueError("JSON content must be an object")
+            message_id = state.send_message(
+                sender_id,
+                recipient_id,
+                message_type,
+                payload,
+            )
+        else:
+            payload = {"content": content}
+            message_id = state.send_to_agent(
+                sender_id,
+                recipient_id,
+                message_type,
+                content,
+            )
+        return {
+            "message_id": message_id,
+            "sender_id": sender_id,
+            "recipient_id": recipient_id,
+            "message_type": message_type,
+            "content": payload,
+        }
+    finally:
+        state.close()
+
+
+def render_agent_statuses(
+    statuses: list[dict[str, Any]],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"agents": statuses}, sort_keys=True)
+    if not statuses:
+        return "No subagents recorded."
+    return "\n".join(
+        f"{item['agent_id']} [{item['role']}] {item['status']}: {item['current_task']}"
+        for item in statuses
+    )
+
+
+def render_agent_reports(
+    reports: list[dict[str, Any]],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"reports": reports}, sort_keys=True)
+    if not reports:
+        return "No subagent reports recorded."
+    return "\n".join(
+        f"{item.get('agent_id', item['sender_id'])} "
+        f"[{item.get('role', 'unknown')}] "
+        f"{'ok' if item.get('success') else 'failed'}: "
+        f"{item.get('summary', '')}"
+        for item in reports
+    )
+
+
+def render_agent_tasks(
+    tasks: list[dict[str, Any]],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"tasks": tasks}, sort_keys=True)
+    if not tasks:
+        return "No durable agent tasks recorded."
+    return "\n".join(
+        f"{item['task_id']} [{item['role']}] {item['state']} "
+        f"owner={item['owner_agent_id'] or '-'} "
+        f"attempt={item['attempt']}/{item['max_attempts']} "
+        f"tokens={item['used_tokens']}/{item['token_budget']}: "
+        f"{item['description']}"
+        for item in tasks
+    )
+
+
+def render_agent_task_events(
+    events: list[dict[str, Any]],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"events": events}, sort_keys=True)
+    if not events:
+        return "No durable agent task events recorded."
+    return "\n".join(
+        f"{item['sequence']} {item['task_id']} {item['event']['type']}"
+        + (f" state={item['event']['state']}" if item["event"].get("state") else "")
+        for item in events
+    )
+
+
+def render_cancelled_agent_graph(
+    cancellation: dict[str, Any],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"cancellation": cancellation}, sort_keys=True)
+    return (
+        f"Cancelled graph {cancellation['graph_id']} "
+        f"({len(cancellation['task_ids'])} tasks)."
+    )
+
+
+def render_agent_messages(
+    messages: list[dict[str, Any]],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"messages": messages}, sort_keys=True)
+    if not messages:
+        return "No subagent messages recorded."
+    return "\n".join(
+        f"{item['message_id']} {item['sender_id']} -> {item['recipient_id']} "
+        f"{item['message_type']} "
+        f"{'delivered' if item['delivered'] else 'pending'}: "
+        f"{_summarize_content(item['content'])}"
+        for item in messages
+    )
+
+
+def render_sent_agent_message(
+    message: dict[str, Any],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"message": message}, sort_keys=True)
+    return (
+        f"Queued message {message['message_id']} "
+        f"{message['sender_id']} -> {message['recipient_id']} "
+        f"{message['message_type']}."
+    )
+
+
+async def list_agent_branches(
+    workspace: Path,
+    storage_root: Path,
+) -> list[tuple[str, str]]:
+    return await WorktreeManager(workspace, storage_root).list_agent_branches()
+
+
+async def apply_agent_branch(
+    workspace: Path,
+    storage_root: Path,
+    branch: str,
+) -> str:
+    return await WorktreeManager(workspace, storage_root).apply_branch(branch)
+
+
+async def discard_agent_branch(
+    workspace: Path,
+    storage_root: Path,
+    branch: str,
+) -> None:
+    await WorktreeManager(workspace, storage_root).discard_branch(branch)
+
+
+def render_agent_branches(branches: list[tuple[str, str]]) -> str:
+    if not branches:
+        return "No isolated agent branches."
+    return "\n".join(f"{branch} {commit[:12]}" for branch, commit in branches)
+
+
+def _summarize_content(content: Any) -> str:
+    if isinstance(content, dict):
+        summary = content.get("summary") or content.get("content")
+        if summary is not None:
+            return str(summary)
+    return json.dumps(content, ensure_ascii=False, sort_keys=True)

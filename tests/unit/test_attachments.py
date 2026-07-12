@@ -6,9 +6,9 @@ import pytest
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
-from cli.attachments import expand_file_mentions, prepare_file_mentions
-from safety.guard import SafetyGuard
-from ui.prompt import AshCompleter
+from ash.commands.attachments import expand_file_mentions, prepare_file_mentions
+from ash.safety.guard import SafetyGuard
+from ash.ui.prompt import AshCompleter
 
 
 def test_file_and_directory_mentions_are_bounded_and_marked_untrusted(

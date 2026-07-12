@@ -21,8 +21,8 @@ def test_viewport_restores_terminal_after_live_resize(tmp_path: Path) -> None:
     code = """
 import asyncio
 from pathlib import Path
-from ui.prompt import PromptInput
-from ui.transcript import Transcript
+from ash.ui.prompt import PromptInput
+from ash.ui.transcript import Transcript
 
 async def main():
     prompt = PromptInput(

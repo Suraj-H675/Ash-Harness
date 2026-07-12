@@ -4,9 +4,9 @@ from typing import Any
 
 import pytest
 
-from safety.guard import SafetyGuard
-from safety.policy import PermissionPolicy, PolicyAction
-from tools.browser import (
+from ash.safety.guard import SafetyGuard
+from ash.safety.policy import PermissionPolicy, PolicyAction
+from ash.tools.browser import (
     BrowserBackTool,
     BrowserClickTool,
     BrowserNavigateTool,
@@ -103,7 +103,7 @@ def test_browser_url_policy_blocks_private_non_http_and_disallowed_hosts(
     with pytest.raises(ValueError, match="embedded credentials"):
         _validate_browser_url("https://user:secret@example.com", ())
 
-    monkeypatch.setattr("tools.web._ensure_public_host", lambda hostname: None)
+    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
     assert (
         _validate_browser_url("wss://api.example.com/socket", ("*.example.com",))
         == "wss://api.example.com/socket"
@@ -116,12 +116,16 @@ def test_browser_tools_share_one_lazy_session_and_permissions(tmp_path) -> None:
     tools = build_browser_tools(SafetyGuard(tmp_path))
 
     assert len({id(tool.session) for tool in tools}) == 1
-    assert PermissionPolicy("interactive").evaluate(
-        "browser_snapshot", {}
-    ).action == PolicyAction.ALLOW
-    assert PermissionPolicy("interactive").evaluate(
-        "browser_navigate", {"url": "https://example.com"}
-    ).action == PolicyAction.ASK
+    assert (
+        PermissionPolicy("interactive").evaluate("browser_snapshot", {}).action
+        == PolicyAction.ALLOW
+    )
+    assert (
+        PermissionPolicy("interactive")
+        .evaluate("browser_navigate", {"url": "https://example.com"})
+        .action
+        == PolicyAction.ASK
+    )
 
 
 @pytest.mark.asyncio
@@ -131,7 +135,8 @@ async def test_browser_tool_reports_stale_refs_without_raising(tmp_path) -> None
             raise ValueError("stale or missing")
 
     tool = BrowserClickTool(
-        SafetyGuard(tmp_path), StaleSession()  # type: ignore[arg-type]
+        SafetyGuard(tmp_path),
+        StaleSession(),  # type: ignore[arg-type]
     )
 
     result = await tool.run(ref="e1")

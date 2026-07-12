@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from cli.review import build_review_prompt, collect_review_changes
+from ash.commands.review import build_review_prompt, collect_review_changes
 
 
 def git(root: Path, *arguments: str) -> str:

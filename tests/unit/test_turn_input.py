@@ -6,16 +6,16 @@ import pytest
 from types import SimpleNamespace
 from rich.console import Console
 
-from core.loop import AshLoop
-from core.session import SessionStore
-from providers.base import ProviderABC, StreamChunk
-from safety.grants import RuleEffect, load_permission_rules
-from safety.guard import SafetyGuard
-from safety.policy import PolicyAction
-from tools.filesystem import WriteFileTool
-from ui.terminal import TerminalUI
-from ui.notifications import NotificationEvent
-from ui.turn_input import InteractiveTurnController
+from ash.core.loop import AshLoop
+from ash.core.session import SessionStore
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.safety.grants import RuleEffect, load_permission_rules
+from ash.safety.guard import SafetyGuard
+from ash.safety.policy import PolicyAction
+from ash.tools.filesystem import WriteFileTool
+from ash.ui.terminal import TerminalUI
+from ash.ui.notifications import NotificationEvent
+from ash.ui.turn_input import InteractiveTurnController
 
 
 class RoutedPrompt:

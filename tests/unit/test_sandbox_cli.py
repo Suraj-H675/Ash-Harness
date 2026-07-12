@@ -6,8 +6,12 @@ from unittest.mock import patch
 
 import pytest
 
-from cli.sandbox import build_sandbox_image, render_sandbox_status, sandbox_status
-from config import AshConfig
+from ash.commands.sandbox import (
+    build_sandbox_image,
+    render_sandbox_status,
+    sandbox_status,
+)
+from ash.config import AshConfig
 
 
 def test_sandbox_status_uses_user_configuration(tmp_path) -> None:
@@ -51,8 +55,8 @@ def test_render_sandbox_status_supports_text_and_json() -> None:
 def test_build_sandbox_image_uses_packaged_dockerfile() -> None:
     completed = subprocess.CompletedProcess([], 0)
     with (
-        patch("cli.sandbox.shutil.which", return_value="/usr/bin/docker"),
-        patch("cli.sandbox.subprocess.run", return_value=completed) as run,
+        patch("ash.commands.sandbox.shutil.which", return_value="/usr/bin/docker"),
+        patch("ash.commands.sandbox.subprocess.run", return_value=completed) as run,
     ):
         assert build_sandbox_image("ash-sandbox:test") == 0
 
@@ -67,6 +71,6 @@ def test_build_sandbox_image_uses_packaged_dockerfile() -> None:
 
 
 def test_build_sandbox_image_requires_docker() -> None:
-    with patch("cli.sandbox.shutil.which", return_value=None):
+    with patch("ash.commands.sandbox.shutil.which", return_value=None):
         with pytest.raises(RuntimeError, match="Docker CLI"):
             build_sandbox_image("ash-sandbox:test")

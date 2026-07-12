@@ -14,7 +14,7 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def restore_config_paths():
-    from cli import config as cli_config
+    from ash.commands import config as cli_config
 
     original = (
         cli_config.ASH_DIR,
@@ -40,7 +40,7 @@ class TestAtomicWrite:
         """save_env_value should create ~/.ash/.env with the key=value pair."""
         monkeypatch.setenv("HOME", str(tmp_path))
         # Reload cli.config with patched HOME so ASH_DIR points to tmp_path
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         # Patch the module-level constants
         cli_config.ASH_DIR = tmp_path / ".ash"
@@ -60,7 +60,7 @@ class TestAtomicWrite:
     ) -> None:
         """Verify atomic write: no partial/temp files left behind."""
         monkeypatch.setenv("HOME", str(tmp_path))
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = tmp_path / ".ash" / ".env"
@@ -78,7 +78,7 @@ class TestAtomicWrite:
     ) -> None:
         """save_env_value must set os.environ[key] immediately."""
         monkeypatch.setenv("HOME", str(tmp_path))
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = tmp_path / ".ash" / ".env"
@@ -94,7 +94,7 @@ class TestAtomicWrite:
     ) -> None:
         """Saving one key must not destroy other existing keys."""
         monkeypatch.setenv("HOME", str(tmp_path))
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = tmp_path / ".ash" / ".env"
@@ -114,7 +114,7 @@ class TestAtomicWrite:
     ) -> None:
         """Saving the same key twice replaces the old value."""
         monkeypatch.setenv("HOME", str(tmp_path))
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = tmp_path / ".ash" / ".env"
@@ -131,7 +131,7 @@ class TestAtomicWrite:
         assert "ANTHROPIC_API_KEY=new_key" in content
 
     def test_config_backup_is_verified_and_private(self, tmp_path: Path) -> None:
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
@@ -153,7 +153,7 @@ class TestAtomicWrite:
     def test_config_backup_rejects_symlinks_and_invalid_labels(
         self, tmp_path: Path
     ) -> None:
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
@@ -174,7 +174,7 @@ class TestAtomicWrite:
     def test_migration_record_requires_exact_source_and_backup(
         self, tmp_path: Path
     ) -> None:
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
@@ -193,7 +193,7 @@ class TestAtomicWrite:
     def test_migration_record_rejects_mismatched_or_corrupt_state(
         self, tmp_path: Path
     ) -> None:
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
@@ -214,7 +214,7 @@ class TestAtomicWrite:
     def test_save_env_values_commits_related_settings_together(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
@@ -238,7 +238,7 @@ class TestAtomicWrite:
     def test_save_env_values_rejects_dotenv_injection(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
@@ -251,7 +251,7 @@ class TestAtomicWrite:
     def test_failed_env_write_does_not_mutate_process_environment(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
@@ -270,7 +270,7 @@ class TestAtomicWrite:
     ) -> None:
         """Saved .env file must have mode 0600."""
         monkeypatch.setenv("HOME", str(tmp_path))
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = tmp_path / ".ash" / ".env"
@@ -293,7 +293,7 @@ class TestLoadEnv:
         """os.environ takes priority over .env file."""
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("TEST_KEY", "from_environ")
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = tmp_path / ".ash" / ".env"
@@ -311,7 +311,7 @@ class TestLoadEnv:
         """If not in os.environ, read from .env file."""
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = tmp_path / ".ash" / ".env"
@@ -329,7 +329,7 @@ class TestLoadEnv:
         """Missing key returns None."""
         monkeypatch.delenv("DOES_NOT_EXIST", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = tmp_path / ".ash" / ".env"
@@ -345,7 +345,7 @@ class TestLoadEnv:
     ) -> None:
         """load_env returns all key=value pairs."""
         monkeypatch.setenv("HOME", str(tmp_path))
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = tmp_path / ".ash" / ".env"
@@ -370,7 +370,7 @@ class TestTomlConfig:
     ) -> None:
         """save_config → load_config round-trip preserves custom_providers."""
         monkeypatch.setenv("HOME", str(tmp_path))
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = tmp_path / ".ash" / ".env"
@@ -405,7 +405,7 @@ class TestTomlConfig:
     ) -> None:
         """load_config returns {} if ash.toml does not exist."""
         monkeypatch.setenv("HOME", str(tmp_path))
-        from cli import config as cli_config
+        from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = tmp_path / ".ash" / ".env"
@@ -421,14 +421,14 @@ class TestMaskKey:
 
     def test_mask_key_short_value(self) -> None:
         """Short values are fully masked."""
-        from cli.config import mask_key
+        from ash.commands.config import mask_key
 
         assert mask_key("SHORT") == "****"
 
     def test_mask_key_long_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Long values show first 4 + ... + last 4 chars of the env value."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-abcdefgh1234")
-        from cli.config import mask_key
+        from ash.commands.config import mask_key
 
         result = mask_key("ANTHROPIC_API_KEY")
         assert result.startswith("sk-a")
@@ -442,14 +442,14 @@ class TestIsInteractiveStdin:
     def test_isatty_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When stdin is a TTY, returns True."""
         monkeypatch.setattr(sys, "stdin", io_open_mock(isatty=True))
-        from cli.config import is_interactive_stdin
+        from ash.commands.config import is_interactive_stdin
 
         assert is_interactive_stdin() is True
 
     def test_isatty_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When stdin is not a TTY (piped), returns False."""
         monkeypatch.setattr(sys, "stdin", io_open_mock(isatty=False))
-        from cli.config import is_interactive_stdin
+        from ash.commands.config import is_interactive_stdin
 
         assert is_interactive_stdin() is False
 
@@ -475,8 +475,8 @@ def test_ash_config_loads_saved_provider_key_into_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cli import config as cli_config
-    from config import AshConfig
+    from ash.commands import config as cli_config
+    from ash.config import AshConfig
 
     cli_config.ASH_DIR = tmp_path / ".ash"
     cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
@@ -491,7 +491,7 @@ def test_ash_config_loads_saved_provider_key_into_process(
 
 def test_prompt_cache_key_is_stable_without_exposing_workspace(tmp_path: Path) -> None:
     from ash.cli import _prompt_cache_key
-    from config import AshConfig
+    from ash.config import AshConfig
 
     config = AshConfig(workspace_root=tmp_path / "private-workspace")
 
@@ -507,7 +507,7 @@ def test_model_catalog_rendering_and_shared_input_picker() -> None:
     from types import SimpleNamespace
 
     from ash.cli import AVAILABLE_MODELS, _interactive_model_picker, _render_model_list
-    from config import AshConfig
+    from ash.config import AshConfig
 
     config = AshConfig(model=AVAILABLE_MODELS[0])
     rendered = _render_model_list(config, numbered=True)
@@ -533,8 +533,8 @@ def test_explain_config_reports_sources_and_masks_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cli import config as cli_config
-    from config import AshConfig
+    from ash.commands import config as cli_config
+    from ash.config import AshConfig
 
     cli_config.ASH_DIR = tmp_path / ".ash"
     cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
@@ -570,7 +570,7 @@ def test_explain_config_reports_sources_and_masks_secrets(
 
 
 def test_render_config_explain_json_is_machine_readable() -> None:
-    from cli.config import ConfigExplanation, render_config_explain
+    from ash.commands.config import ConfigExplanation, render_config_explain
 
     rendered = render_config_explain(
         [ConfigExplanation("model", "ollama/test", "env", "ASH_MODEL")],
@@ -594,7 +594,7 @@ def test_config_explain_cli_json_smoke(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     from ash.cli import main
-    from config import AshConfig
+    from ash.config import AshConfig
 
     monkeypatch.setattr(
         AshConfig,

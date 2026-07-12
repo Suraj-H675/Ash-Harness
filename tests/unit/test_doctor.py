@@ -3,16 +3,16 @@ import sqlite3
 
 import pytest
 
-from cli.doctor import DoctorCheck, render_doctor, run_doctor
-from cli.doctor import (
+from ash.commands.doctor import DoctorCheck, render_doctor, run_doctor
+from ash.commands.doctor import (
     _check_a2a,
     _check_browser,
     _check_lsp,
     _check_storage,
     _check_web_search,
 )
-from config import AshConfig
-from lsp.config import LSPServerConfig
+from ash.config import AshConfig
+from ash.lsp.config import LSPServerConfig
 
 
 def test_render_doctor_json_has_stable_schema() -> None:
@@ -47,7 +47,7 @@ def test_storage_check_reports_sqlite_open_failures(
     def fail_connect(*args: object, **kwargs: object) -> None:
         raise sqlite3.OperationalError("unable to open database file")
 
-    monkeypatch.setattr("cli.doctor.sqlite3.connect", fail_connect)
+    monkeypatch.setattr("ash.commands.doctor.sqlite3.connect", fail_connect)
     check = _check_storage(AshConfig(db_directory=tmp_path / "db"))
     assert check.name == "storage"
     assert check.status == "fail"
@@ -69,14 +69,18 @@ def test_web_search_doctor_reports_auto_detection(
 def test_browser_doctor_distinguishes_missing_extra_and_binary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("cli.doctor.importlib.util.find_spec", lambda name: None)
+    monkeypatch.setattr(
+        "ash.commands.doctor.importlib.util.find_spec", lambda name: None
+    )
     missing_extra = _check_browser()
     assert missing_extra.status == "warn"
     assert "ash-ai[browser]" in missing_extra.remedy
 
-    monkeypatch.setattr("cli.doctor.importlib.util.find_spec", lambda name: object())
     monkeypatch.setattr(
-        "cli.doctor.subprocess.run",
+        "ash.commands.doctor.importlib.util.find_spec", lambda name: object()
+    )
+    monkeypatch.setattr(
+        "ash.commands.doctor.subprocess.run",
         lambda *args, **kwargs: type(
             "Completed", (), {"returncode": 0, "stdout": "", "stderr": ""}
         )(),
@@ -109,7 +113,9 @@ def test_a2a_doctor_reports_unset_remote_credentials(
 def test_lsp_doctor_reports_untrusted_workspace(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("safety.trust.is_workspace_trusted", lambda workspace: False)
+    monkeypatch.setattr(
+        "ash.safety.trust.is_workspace_trusted", lambda workspace: False
+    )
 
     check = _check_lsp(AshConfig(workspace_root=tmp_path))
 
@@ -120,9 +126,9 @@ def test_lsp_doctor_reports_untrusted_workspace(
 def test_lsp_doctor_reports_missing_configured_executable(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("safety.trust.is_workspace_trusted", lambda workspace: True)
+    monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda workspace: True)
     monkeypatch.setattr(
-        "lsp.config.load_lsp_server_configs",
+        "ash.lsp.config.load_lsp_server_configs",
         lambda workspace, include_project: {
             "missing": LSPServerConfig(
                 "missing", (str(tmp_path / "not-installed"),), {".x": "x"}

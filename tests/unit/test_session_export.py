@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timezone
 
-from core.session import Message, SessionStore
+from ash.core.session import Message, SessionStore
 
 
 def test_fork_and_redacted_exports(tmp_path) -> None:

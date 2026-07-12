@@ -1,10 +1,10 @@
 import pytest
 
 from ash.sdk import AshClient
-from config import AshConfig
-from providers.base import ProviderABC, StreamChunk
-from providers.capabilities import CapabilityRegistry, ProviderCapabilities
-from providers.registry import ProviderRegistry, get_provider_registry
+from ash.config import AshConfig
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.capabilities import CapabilityRegistry, ProviderCapabilities
+from ash.providers.registry import ProviderRegistry, get_provider_registry
 
 
 class DeclaredProvider(ProviderABC):
@@ -19,7 +19,9 @@ class DeclaredProvider(ProviderABC):
         return len(text.split())
 
     async def stream_chat(self, messages, temperature=0.0, tools=None):
-        yield StreamChunk(content="<response>registered provider</response>", is_done=True)
+        yield StreamChunk(
+            content="<response>registered provider</response>", is_done=True
+        )
 
 
 def test_capability_registry_supports_dynamic_provider_declarations() -> None:

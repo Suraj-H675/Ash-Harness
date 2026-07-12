@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from config import AshConfig, discover_workspace_root, project_config_paths
+from ash.config import AshConfig, discover_workspace_root, project_config_paths
 
 
 ENV_KEYS = [
@@ -54,7 +54,7 @@ def clear_ash_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from cli import config as cli_config
+    from ash.commands import config as cli_config
 
     for key in ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
@@ -445,7 +445,7 @@ def test_model_requires_provider_prefix() -> None:
 
 
 def _use_temporary_trust_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from safety import trust
+    from ash.safety import trust
 
     monkeypatch.setattr(
         trust,
@@ -506,8 +506,8 @@ def test_untrusted_project_config_is_inert(
 def test_trusted_project_layers_have_precise_precedence_and_provenance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from cli import config as cli_config
-    from safety.trust import set_workspace_trusted
+    from ash.commands import config as cli_config
+    from ash.safety.trust import set_workspace_trusted
 
     _use_temporary_trust_store(tmp_path, monkeypatch)
     root = tmp_path / "repo"
@@ -553,8 +553,8 @@ def test_trusted_project_layers_have_precise_precedence_and_provenance(
 def test_project_config_cannot_override_user_owned_controls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from cli import config as cli_config
-    from safety.trust import set_workspace_trusted
+    from ash.commands import config as cli_config
+    from ash.safety.trust import set_workspace_trusted
 
     _use_temporary_trust_store(tmp_path, monkeypatch)
     root = tmp_path / "repo"
@@ -661,7 +661,7 @@ def test_command_environment_allowlist_is_validated_and_deduplicated() -> None:
 def test_malformed_project_config_only_fails_after_trust(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from safety.trust import set_workspace_trusted
+    from ash.safety.trust import set_workspace_trusted
 
     _use_temporary_trust_store(tmp_path, monkeypatch)
     root = tmp_path / "repo"
@@ -691,7 +691,7 @@ def test_explicit_model_override_wins_legacy_environment(
 def test_legacy_dotenv_model_uses_dotenv_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cli import config as cli_config
+    from ash.commands import config as cli_config
 
     cli_config.ensure_ash_dir()
     cli_config.ENV_FILE.write_text(
@@ -710,7 +710,7 @@ def test_legacy_dotenv_model_uses_dotenv_provider(
 def test_dotenv_provenance_is_stable_across_reloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cli import config as cli_config
+    from ash.commands import config as cli_config
 
     cli_config.ensure_ash_dir()
     cli_config.ENV_FILE.write_text(
@@ -733,7 +733,7 @@ def test_dotenv_provenance_is_stable_across_reloads(
 def test_setup_written_settings_keep_dotenv_provenance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from cli import config as cli_config
+    from ash.commands import config as cli_config
 
     cli_config.save_env_values({"ASH_MODEL": "ollama/setup-model"})
 

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from safety.grants import (
+from ash.safety.grants import (
     ArgumentMatcher,
     MatchOperator,
     PermissionGrantError,
@@ -15,7 +15,7 @@ from safety.grants import (
     load_tool_grants,
     set_tool_grant,
 )
-from safety.policy import PermissionPolicy, PolicyAction
+from ash.safety.policy import PermissionPolicy, PolicyAction
 
 
 def test_persistent_grants_round_trip_and_cannot_override_plan(tmp_path, monkeypatch):

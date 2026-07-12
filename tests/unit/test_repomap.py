@@ -10,7 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from repo.repomap import RepoMap, calculate_personalized_pagerank
+from ash.repo.repomap import RepoMap, calculate_personalized_pagerank
 
 
 def test_pagerank_concentrates_on_teleport_node() -> None:
@@ -106,7 +106,7 @@ def test_repomap_skips_ignored_directories(tmp_path: Path) -> None:
 
 
 def test_repomap_excludes_node_modules(tmp_path: Path) -> None:
-    from repo.repomap import RepoMap
+    from ash.repo.repomap import RepoMap
 
     (tmp_path / "src.py").write_text("x = 1")
     node_modules = tmp_path / "node_modules"

@@ -9,8 +9,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from context.compaction import Chunk
-from memory.vector import (
+from ash.context.compaction import Chunk
+from ash.memory.vector import (
     DeterministicEmbedding,
     InMemoryVectorIndex,
     VectorSearchPipeline,
@@ -80,7 +80,7 @@ def test_deterministic_embedding_produces_stable_vectors() -> None:
         assert vec_a == vec_b == vec_c
 
         # Identical text should have cosine similarity of exactly 1.0.
-        from memory.vector import cosine_similarity
+        from ash.memory.vector import cosine_similarity
 
         similarity = cosine_similarity(vec_a, vec_b)
         assert similarity == pytest.approx(1.0)
@@ -98,11 +98,11 @@ def test_deterministic_embedding_produces_stable_vectors() -> None:
 def test_semantic_memory_injects_into_system_prompt(tmp_path: Path) -> None:
     """When semantic memory is enabled, relevant hits are injected into the system prompt."""
 
-    from core.loop import AshLoop
-    from core.session import Session, SessionStore
-    from providers.base import ProviderABC
-    from safety.guard import SafetyGuard
-    from ui.terminal import TerminalUI
+    from ash.core.loop import AshLoop
+    from ash.core.session import Session, SessionStore
+    from ash.providers.base import ProviderABC
+    from ash.safety.guard import SafetyGuard
+    from ash.ui.terminal import TerminalUI
 
     # Set up a minimal loop with semantic memory enabled.
     session_store = MagicMock(spec=SessionStore)

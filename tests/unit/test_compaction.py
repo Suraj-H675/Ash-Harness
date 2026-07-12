@@ -1,6 +1,6 @@
 # tests/unit/test_compaction.py
-from context.compaction import Chunk, sliding_window_chunk
-from core.session import Message
+from ash.context.compaction import Chunk, sliding_window_chunk
+from ash.core.session import Message
 from datetime import datetime, timezone
 
 

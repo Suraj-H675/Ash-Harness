@@ -1,11 +1,11 @@
-from context.instructions import (
+from ash.context.instructions import (
     InstructionDiagnostic,
     discover_instructions,
     lint_instruction_conflicts,
     render_instructions,
     InstructionFile,
 )
-from safety.trust import is_workspace_trusted, set_workspace_trusted
+from ash.safety.trust import is_workspace_trusted, set_workspace_trusted
 
 
 def test_trust_round_trip_uses_canonical_workspace(tmp_path, monkeypatch) -> None:

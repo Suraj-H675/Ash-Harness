@@ -4,10 +4,10 @@ from typing import Any, AsyncGenerator
 
 import pytest
 
-from config import AshConfig
-from providers.base import ProviderABC, StreamChunk
-from providers.failover import FailoverProvider
-from providers.registry import (
+from ash.config import AshConfig
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.failover import FailoverProvider
+from ash.providers.registry import (
     ProviderRegistry,
     create_default_provider_registry,
     parse_model_string,

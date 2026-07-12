@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from plugins.registry import PluginCatalog
+from ash.plugins.registry import PluginCatalog
 
 
 def test_local_plugin_catalog_discovers_valid_manifest(tmp_path) -> None:

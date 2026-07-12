@@ -2,7 +2,7 @@ import asyncio
 import re
 
 import pytest
-from hooks.registry import (
+from ash.hooks.registry import (
     HookBlock,
     HookRegistry,
     LifecycleHook,

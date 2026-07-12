@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from context.compaction import Chunk
-from memory.fts5 import FTS5Index
-from memory.vector import (
+from ash.context.compaction import Chunk
+from ash.memory.fts5 import FTS5Index
+from ash.memory.vector import (
     ChromaIndex,
     DeterministicEmbedding,
     EmbeddingAdapter,

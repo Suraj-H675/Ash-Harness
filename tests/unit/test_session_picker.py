@@ -5,8 +5,8 @@ import pytest
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from core.session import Session, SessionSummary
-from ui.session_picker import SessionPicker
+from ash.core.session import Session, SessionSummary
+from ash.ui.session_picker import SessionPicker
 
 
 def _summary(session_id: str, title: str) -> SessionSummary:

@@ -3,8 +3,8 @@ import sys
 
 from rich.console import Console
 
-from ui.output import ReplPrinter
-from ui.terminal import TerminalUI
+from ash.ui.output import ReplPrinter
+from ash.ui.terminal import TerminalUI
 
 
 def test_inline_repl_printer_preserves_print_contract() -> None:

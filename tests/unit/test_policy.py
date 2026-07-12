@@ -1,7 +1,7 @@
 import pytest
 
-from safety.grants import ArgumentMatcher, MatchOperator, PermissionRule, RuleEffect
-from safety.policy import PermissionPolicy, PolicyAction
+from ash.safety.grants import ArgumentMatcher, MatchOperator, PermissionRule, RuleEffect
+from ash.safety.policy import PermissionPolicy, PolicyAction
 
 
 @pytest.mark.parametrize("mode", ["plan", "dry_run"])

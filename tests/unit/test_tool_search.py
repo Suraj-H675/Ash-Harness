@@ -7,13 +7,13 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, Field
 
-from core.loop import AshLoop
-from core.session import SessionStore
-from providers.base import ProviderABC, StreamChunk
-from safety.guard import SafetyGuard
-from tools.base import BaseTool, ToolResult
-from tools.tool_search import SearchToolsTool
-from ui.headless import HeadlessUI
+from ash.core.loop import AshLoop
+from ash.core.session import SessionStore
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.safety.guard import SafetyGuard
+from ash.tools.base import BaseTool, ToolResult
+from ash.tools.tool_search import SearchToolsTool
+from ash.ui.headless import HeadlessUI
 
 
 class TextArgs(BaseModel):
@@ -83,9 +83,7 @@ class SearchFlowProvider(ProviderABC):
 
     async def stream_chat(self, messages, temperature=0.0, tools=None):
         self.calls += 1
-        names = {
-            item["function"]["name"] for item in (tools or [])
-        }
+        names = {item["function"]["name"] for item in (tools or [])}
         self.tool_names.append(names)
         if self.calls == 1:
             assert names == {"search_tools"}

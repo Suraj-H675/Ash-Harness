@@ -1,13 +1,13 @@
 import pytest
 
-from core.redaction import (
+from ash.core.redaction import (
     StreamingRedactor,
     find_secret_candidates,
     redact_text,
     redact_value,
 )
-from core.secret_middleware import SecretRedactionMiddleware
-from tools.base import ToolResult
+from ash.core.secret_middleware import SecretRedactionMiddleware
+from ash.tools.base import ToolResult
 
 
 def test_redaction_handles_common_secret_shapes() -> None:

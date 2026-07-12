@@ -2,20 +2,20 @@ import asyncio
 
 import pytest
 from datetime import datetime, timezone
-from core.loop import AshLoop
-from tools.base import BaseTool, ToolResult, ToolMiddleware, ToolMiddlewareSkip
-from config import AshConfig
-from context.turn import TurnContext
-from core.session import Message, SessionStore, ToolCallRecord, get_db_connection
-from hooks.registry import HookRegistry, LifecycleHook, SessionStartHook
-from providers.base import ProviderABC, StreamChunk
-from providers.capabilities import ProviderCapabilities
-from providers.retry import ProviderCircuitBreaker, ProviderCircuitOpen
-from safety.grants import PermissionRule, RuleEffect
-from safety.guard import SafetyGuard
-from safety.policy import PermissionMode
-from ui.terminal import TerminalUI
-from tools.filesystem import ReadFileTool
+from ash.core.loop import AshLoop
+from ash.tools.base import BaseTool, ToolResult, ToolMiddleware, ToolMiddlewareSkip
+from ash.config import AshConfig
+from ash.context.turn import TurnContext
+from ash.core.session import Message, SessionStore, ToolCallRecord, get_db_connection
+from ash.hooks.registry import HookRegistry, LifecycleHook, SessionStartHook
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.capabilities import ProviderCapabilities
+from ash.providers.retry import ProviderCircuitBreaker, ProviderCircuitOpen
+from ash.safety.grants import PermissionRule, RuleEffect
+from ash.safety.guard import SafetyGuard
+from ash.safety.policy import PermissionMode
+from ash.ui.terminal import TerminalUI
+from ash.tools.filesystem import ReadFileTool
 from pathlib import Path
 import tempfile
 
@@ -459,9 +459,7 @@ async def test_queued_steering_is_persisted_and_applied_to_running_turn(tmp_path
     )
     assert loop.pending_steering_count == 0
     assert [
-        event["type"]
-        for event in ui.events
-        if event["type"] != "assistant.delta"
+        event["type"] for event in ui.events if event["type"] != "assistant.delta"
     ] == [
         "turn.started",
         "turn.steering.queued",
@@ -520,7 +518,9 @@ async def test_persisted_compaction_summary_is_redacted(tmp_path):
         ("user", "continue"),
         ("assistant", "current response"),
     ):
-        message = Message(role=role, content=content, timestamp=datetime.now(timezone.utc))
+        message = Message(
+            role=role, content=content, timestamp=datetime.now(timezone.utc)
+        )
         store.save_message(session.session_id, message)
         session.messages.append(message)
 
@@ -632,9 +632,7 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
     )
     assert tool_message["tool_call_id"] == "call-native-1"
     assert [
-        event["type"]
-        for event in ui.events
-        if event["type"] != "assistant.delta"
+        event["type"] for event in ui.events if event["type"] != "assistant.delta"
     ] == [
         "turn.started",
         "tool.requested",
@@ -896,9 +894,9 @@ async def test_dry_run_never_executes_native_tool_calls(tmp_path):
     await loop.run_turn("do not execute this")
 
     assert tool.arguments is None
-    assert [
-        event["type"] for event in ui.events if event["type"].startswith("tool.")
-    ][:2] == [
+    assert [event["type"] for event in ui.events if event["type"].startswith("tool.")][
+        :2
+    ] == [
         "tool.requested",
         "tool.denied",
     ]
@@ -1039,7 +1037,7 @@ async def test_on_tool_approval_callback_is_called(tmp_path):
         store = SessionStore(Path(db_dir) / "test.db")
         guard = SafetyGuard(project_root=tmp_path)
         ui = TerminalUI(safety_tier="interactive")
-        from core.recovery import CircuitBreaker
+        from ash.core.recovery import CircuitBreaker
 
         loop = AshLoop(
             store,

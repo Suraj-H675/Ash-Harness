@@ -4,8 +4,8 @@ from datetime import datetime, timezone
 import pytest
 
 from ash.sdk import AshEvent, AshEventRecord, AshResult
-from core.session import SessionLineage
-from server.jsonrpc import JSONRPCServer
+from ash.core.session import SessionLineage
+from ash.server.jsonrpc import JSONRPCServer
 
 
 class FakeLoop:

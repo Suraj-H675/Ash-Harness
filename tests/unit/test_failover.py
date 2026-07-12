@@ -1,8 +1,8 @@
 import pytest
 
-from providers.base import ProviderABC, StreamChunk
-from providers.capabilities import infer_capabilities
-from providers.failover import FailoverProvider
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.capabilities import infer_capabilities
+from ash.providers.failover import FailoverProvider
 
 
 class FakeProvider(ProviderABC):

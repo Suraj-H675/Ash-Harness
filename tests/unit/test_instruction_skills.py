@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from ash.cli import _build_tools
-from plugins.skills import (
+from ash.plugins.skills import (
     MAX_SKILL_BYTES,
     ActivateSkillTool,
     ListSkillsTool,
@@ -13,7 +13,7 @@ from plugins.skills import (
     parse_instruction_skill,
     render_available_skills,
 )
-from safety.guard import SafetyGuard
+from ash.safety.guard import SafetyGuard
 
 
 def _write_skill(

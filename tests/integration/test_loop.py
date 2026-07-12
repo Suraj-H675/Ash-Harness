@@ -9,13 +9,13 @@ from typing import Any, AsyncGenerator
 
 import pytest
 
-from core.loop import AshLoop
-from core.recovery import CircuitBreaker
-from core.session import SessionStore
-from providers.base import StreamChunk
-from safety.guard import SafetyGuard
-from tools.base import BaseTool, ToolResult
-from ui.terminal import TerminalUI
+from ash.core.loop import AshLoop
+from ash.core.recovery import CircuitBreaker
+from ash.core.session import SessionStore
+from ash.providers.base import StreamChunk
+from ash.safety.guard import SafetyGuard
+from ash.tools.base import BaseTool, ToolResult
+from ash.ui.terminal import TerminalUI
 
 
 # ---------------------------------------------------------------------------

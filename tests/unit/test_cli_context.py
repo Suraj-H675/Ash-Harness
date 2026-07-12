@@ -1,5 +1,5 @@
 from ash.cli import _render_context_budget
-from context.history import (
+from ash.context.history import (
     ContextBudgetReport,
     ContextBudgetSlice,
     ContextFragment,

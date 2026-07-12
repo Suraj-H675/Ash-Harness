@@ -5,8 +5,12 @@ import sqlite3
 from pathlib import Path
 
 from ash.cli import main
-from cli.audit import export_audit_log, render_audit_records, render_audit_verification
-from core.session import SessionStore
+from ash.commands.audit import (
+    export_audit_log,
+    render_audit_records,
+    render_audit_verification,
+)
+from ash.core.session import SessionStore
 
 
 def test_audit_renderers_emit_json_payloads(tmp_path: Path) -> None:

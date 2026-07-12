@@ -1,5 +1,5 @@
 # tests/unit/test_turn_context.py
-from context.turn import TurnContext
+from ash.context.turn import TurnContext
 
 
 def test_turn_context_set_get() -> None:

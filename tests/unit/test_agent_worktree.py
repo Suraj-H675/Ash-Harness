@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agents.worktree import WorktreeError, WorktreeManager
+from ash.agents.worktree import WorktreeError, WorktreeManager
 
 
 def _git(root: Path, *args: str) -> str:
@@ -133,7 +133,9 @@ def test_dependent_worktree_accepts_verified_agent_commit(
     assert accepted is not None
     assert content == "producer\n"
     assert repository.joinpath("file.txt").read_text(encoding="utf-8") == "base\n"
-    assert _git(repository, "merge-base", "--is-ancestor", producer.branch, accepted) == ""
+    assert (
+        _git(repository, "merge-base", "--is-ancestor", producer.branch, accepted) == ""
+    )
     assert _git(repository, "rev-parse", consumer.branch) == accepted
 
 

@@ -1,7 +1,7 @@
 import pytest
 
-from safety.guard import SafetyGuard
-from tools.ask_user import AskUserTool
+from ash.safety.guard import SafetyGuard
+from ash.tools.ask_user import AskUserTool
 
 
 @pytest.mark.asyncio

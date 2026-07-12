@@ -10,9 +10,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 import ash.cli as ash_cli
-import cli.lsp as cli_lsp
-import lsp.manager as manager_module
-from lsp.client import (
+import ash.commands.lsp as cli_lsp
+import ash.lsp.manager as manager_module
+from ash.lsp.client import (
     MAX_LSP_DOCUMENT_BYTES,
     LSPClient,
     LSPError,
@@ -20,15 +20,15 @@ from lsp.client import (
     _read_document_text,
     _read_message,
 )
-from lsp.config import LSPServerConfig, load_lsp_server_configs
-from lsp.manager import LanguageServerManager, _has_capability
-from lsp.middleware import LSPDiagnosticsMiddleware
-from safety.guard import SafetyGuard
-from safety.policy import PermissionMode, PermissionPolicy, PolicyAction
-from tools.base import ToolResult
-from tools.lsp import LSPTool
-from cli.lsp import inspect_lsp, render_lsp
-from config import AshConfig
+from ash.lsp.config import LSPServerConfig, load_lsp_server_configs
+from ash.lsp.manager import LanguageServerManager, _has_capability
+from ash.lsp.middleware import LSPDiagnosticsMiddleware
+from ash.safety.guard import SafetyGuard
+from ash.safety.policy import PermissionMode, PermissionPolicy, PolicyAction
+from ash.tools.base import ToolResult
+from ash.tools.lsp import LSPTool
+from ash.commands.lsp import inspect_lsp, render_lsp
+from ash.config import AshConfig
 
 
 FIXTURE_SERVER = Path(__file__).parents[1] / "fixtures" / "fake_lsp_server.py"
@@ -97,9 +97,7 @@ def test_config_rejects_duplicate_keys_and_traversing_markers(
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="duplicate JSON object key"):
-        load_lsp_server_configs(
-            tmp_path, include_project=True, detect_builtins=False
-        )
+        load_lsp_server_configs(tmp_path, include_project=True, detect_builtins=False)
 
     config_path.write_text(
         json.dumps(
@@ -116,17 +114,13 @@ def test_config_rejects_duplicate_keys_and_traversing_markers(
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="duplicate extension"):
-        load_lsp_server_configs(
-            tmp_path, include_project=True, detect_builtins=False
-        )
+        load_lsp_server_configs(tmp_path, include_project=True, detect_builtins=False)
 
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     del payload["servers"]["bad"]["extensions"][".PY"]
     config_path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="relative workspace paths"):
-        load_lsp_server_configs(
-            tmp_path, include_project=True, detect_builtins=False
-        )
+        load_lsp_server_configs(tmp_path, include_project=True, detect_builtins=False)
 
 
 def test_workspace_server_detection_requires_trust_and_executable_bit(
@@ -136,7 +130,7 @@ def test_workspace_server_detection_requires_trust_and_executable_bit(
     executable.parent.mkdir(parents=True)
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(0o644)
-    monkeypatch.setattr("lsp.config.shutil.which", lambda command: None)
+    monkeypatch.setattr("ash.lsp.config.shutil.which", lambda command: None)
 
     assert load_lsp_server_configs(tmp_path, include_project=False) == {}
     assert load_lsp_server_configs(tmp_path, include_project=True) == {}
@@ -156,7 +150,7 @@ def test_disabling_basedpyright_preserves_detected_pyright_fallback(
         '{"servers":{"basedpyright":{"disabled":true}}}', encoding="utf-8"
     )
     monkeypatch.setattr(
-        "lsp.config.shutil.which", lambda command: f"/installed/{command}"
+        "ash.lsp.config.shutil.which", lambda command: f"/installed/{command}"
     )
 
     configs = load_lsp_server_configs(tmp_path, include_project=True)
@@ -171,6 +165,7 @@ def test_disabling_basedpyright_preserves_detected_pyright_fallback(
     configs = load_lsp_server_configs(tmp_path, include_project=True)
     assert "basedpyright" not in configs
     assert configs["pyright"].extensions[".py"] == "python"
+
 
 def test_position_encoding_uses_negotiated_units() -> None:
     text = 'x = "\U0001f600"\n'
@@ -223,9 +218,7 @@ async def test_manager_uses_real_lsp_subprocess(tmp_path: Path) -> None:
         symbols = await manager.query("workspaceSymbol", query="needle")
         assert symbols == [{"name": "needle", "kind": 12}]
 
-        result = await tool.run(
-            operation="documentSymbol", file_path="example.py"
-        )
+        result = await tool.run(operation="documentSymbol", file_path="example.py")
         assert result.success is True
         assert json.loads(result.output) == [{"name": "example", "kind": 12}]
         assert manager.status()[0].status == "running"
@@ -234,7 +227,13 @@ async def test_manager_uses_real_lsp_subprocess(tmp_path: Path) -> None:
 
     events = [json.loads(line) for line in log_path.read_text().splitlines()]
     methods = {event.get("method") for event in events}
-    assert {"initialize", "initialized", "textDocument/didOpen", "shutdown", "exit"} <= methods
+    assert {
+        "initialize",
+        "initialized",
+        "textDocument/didOpen",
+        "shutdown",
+        "exit",
+    } <= methods
 
 
 @pytest.mark.asyncio
@@ -282,12 +281,16 @@ async def test_incremental_sync_and_empty_diagnostics_clear_cache(
         await manager.aclose()
 
     events = [json.loads(line) for line in log_path.read_text().splitlines()]
-    change = next(event for event in events if event.get("method") == "textDocument/didChange")
+    change = next(
+        event for event in events if event.get("method") == "textDocument/didChange"
+    )
     assert change["params"]["contentChanges"][0]["range"]["start"] == {
         "line": 0,
         "character": 0,
     }
-    save = next(event for event in events if event.get("method") == "textDocument/didSave")
+    save = next(
+        event for event in events if event.get("method") == "textDocument/didSave"
+    )
     assert "text" not in save["params"]
     diagnostic_requests = [
         event for event in events if event.get("method") == "textDocument/diagnostic"
@@ -390,9 +393,7 @@ async def test_transient_startup_failure_restarts_after_backoff(
     source.write_text("value = 1\n", encoding="utf-8")
     marker = tmp_path / "failed-once"
     config = fake_config(tmp_path / "lsp.jsonl")
-    config = replace(
-        config, env={**config.env, "FAKE_LSP_FAIL_ONCE_FILE": str(marker)}
-    )
+    config = replace(config, env={**config.env, "FAKE_LSP_FAIL_ONCE_FILE": str(marker)})
     manager = LanguageServerManager(tmp_path, {"fake": config})
     try:
         with pytest.raises(LSPError, match="transient startup failure"):
@@ -510,9 +511,7 @@ async def test_post_edit_diagnostics_are_advisory(tmp_path: Path) -> None:
     middleware = LSPDiagnosticsMiddleware(manager, SafetyGuard(tmp_path))
     result = ToolResult(success=True, output="File written.")
 
-    await middleware.after_tool(
-        "write_file", {"file_path": "example.py"}, result
-    )
+    await middleware.after_tool("write_file", {"file_path": "example.py"}, result)
 
     assert result.success is True
     assert result.output == "File written."
@@ -522,9 +521,7 @@ async def test_post_edit_diagnostics_are_advisory(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_read_message_rejects_duplicate_content_length() -> None:
     reader = asyncio.StreamReader()
-    reader.feed_data(
-        b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}"
-    )
+    reader.feed_data(b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}")
     reader.feed_eof()
     with pytest.raises(LSPError, match="duplicate"):
         await _read_message(reader)
@@ -576,9 +573,9 @@ def test_lsp_cli_status_json(
 async def test_lsp_status_is_side_effect_free_and_renderable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("cli.lsp.is_workspace_trusted", lambda workspace: True)
+    monkeypatch.setattr("ash.commands.lsp.is_workspace_trusted", lambda workspace: True)
     monkeypatch.setattr(
-        "cli.lsp.load_lsp_server_configs",
+        "ash.commands.lsp.load_lsp_server_configs",
         lambda workspace, include_project: {"fake": fake_config(tmp_path / "log")},
     )
     config = AshConfig(
@@ -599,7 +596,9 @@ async def test_lsp_status_is_side_effect_free_and_renderable(
 async def test_lsp_query_refuses_untrusted_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("cli.lsp.is_workspace_trusted", lambda workspace: False)
+    monkeypatch.setattr(
+        "ash.commands.lsp.is_workspace_trusted", lambda workspace: False
+    )
     config = AshConfig(
         model="ollama/test",
         workspace_root=tmp_path,

@@ -26,7 +26,7 @@ from typing import Any, AsyncGenerator, Callable
 import pytest
 from pathlib import Path
 
-from providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 
 
 # ---------------------------------------------------------------------------
@@ -409,11 +409,11 @@ def test_loop_drives_provider_through_tool_callbacks() -> None:
     the tool response in the next turn's messages.
     """
 
-    from core.loop import AshLoop
-    from core.session import SessionStore
-    from safety.guard import SafetyGuard
-    from tools.base import BaseTool, ToolResult
-    from ui.terminal import TerminalUI
+    from ash.core.loop import AshLoop
+    from ash.core.session import SessionStore
+    from ash.safety.guard import SafetyGuard
+    from ash.tools.base import BaseTool, ToolResult
+    from ash.ui.terminal import TerminalUI
 
     class _EchoTool(BaseTool):
         name = "echo"
@@ -498,7 +498,7 @@ def _tmp_db() -> Path:
 
 
 def test_openai_provider_initializes():
-    from providers.openai import OpenAIProvider
+    from ash.providers.openai import OpenAIProvider
 
     provider = OpenAIProvider(model_name="gpt-4o", api_key="test-key")
     assert provider.model_name == "gpt-4o"
@@ -508,10 +508,10 @@ def test_openai_provider_initializes():
 def test_ash_owned_sdk_clients_disable_nested_retries(monkeypatch) -> None:
     import sys
 
-    from providers.anthropic import AnthropicProvider
-    from providers.deepseek import DeepSeekProvider
-    from providers.groq import GroqProvider
-    from providers.openai import OpenAIProvider
+    from ash.providers.anthropic import AnthropicProvider
+    from ash.providers.deepseek import DeepSeekProvider
+    from ash.providers.groq import GroqProvider
+    from ash.providers.openai import OpenAIProvider
 
     openai_calls: list[dict[str, Any]] = []
     anthropic_calls: list[dict[str, Any]] = []
@@ -524,9 +524,9 @@ def test_ash_owned_sdk_clients_disable_nested_retries(monkeypatch) -> None:
         anthropic_calls.append(kwargs)
         return SimpleNamespace()
 
-    monkeypatch.setattr("providers.openai.openai.AsyncOpenAI", openai_client)
-    monkeypatch.setattr("providers.deepseek.openai.AsyncOpenAI", openai_client)
-    monkeypatch.setattr("providers.groq.openai.AsyncOpenAI", openai_client)
+    monkeypatch.setattr("ash.providers.openai.openai.AsyncOpenAI", openai_client)
+    monkeypatch.setattr("ash.providers.deepseek.openai.AsyncOpenAI", openai_client)
+    monkeypatch.setattr("ash.providers.groq.openai.AsyncOpenAI", openai_client)
     monkeypatch.setitem(
         sys.modules,
         "anthropic",
@@ -544,7 +544,7 @@ def test_ash_owned_sdk_clients_disable_nested_retries(monkeypatch) -> None:
 
 
 def test_openai_message_translation_preserves_tool_call_ids():
-    from providers.openai import prepare_openai_messages
+    from ash.providers.openai import prepare_openai_messages
 
     prepared = prepare_openai_messages(
         [
@@ -573,7 +573,7 @@ def test_openai_message_translation_preserves_tool_call_ids():
 
 
 def test_anthropic_message_translation_uses_tool_blocks():
-    from providers.anthropic import prepare_anthropic_messages
+    from ash.providers.anthropic import prepare_anthropic_messages
 
     system, prepared = prepare_anthropic_messages(
         [
@@ -604,8 +604,8 @@ def test_anthropic_message_translation_uses_tool_blocks():
 
 
 def test_provider_message_translation_converts_canonical_images() -> None:
-    from providers.anthropic import prepare_anthropic_messages
-    from providers.openai import prepare_openai_messages
+    from ash.providers.anthropic import prepare_anthropic_messages
+    from ash.providers.openai import prepare_openai_messages
 
     messages = [
         {
@@ -636,8 +636,8 @@ def test_provider_message_translation_converts_canonical_images() -> None:
 
 @pytest.mark.asyncio
 async def test_openai_provider_stream_chat_signature():
-    from providers.openai import OpenAIProvider
-    from providers.base import ProviderABC
+    from ash.providers.openai import OpenAIProvider
+    from ash.providers.base import ProviderABC
 
     provider = OpenAIProvider(model_name="gpt-4o", api_key="test-key")
     assert isinstance(provider, ProviderABC)
@@ -698,7 +698,7 @@ def _openai_chunk(
 
 @pytest.mark.asyncio
 async def test_openai_prompt_cache_and_usage_only_chunk() -> None:
-    from providers.openai import OpenAIProvider
+    from ash.providers.openai import OpenAIProvider
 
     usage = SimpleNamespace(
         prompt_tokens=1200,
@@ -744,7 +744,7 @@ async def test_openai_prompt_cache_and_usage_only_chunk() -> None:
 
 @pytest.mark.asyncio
 async def test_openai_compatible_endpoint_omits_openai_cache_options() -> None:
-    from providers.openai import OpenAIProvider
+    from ash.providers.openai import OpenAIProvider
 
     client = _FakeOpenAIClient([_openai_chunk(finish_reason="stop")])
     provider = OpenAIProvider(
@@ -791,7 +791,7 @@ class _FakeAnthropicMessages:
 
 @pytest.mark.asyncio
 async def test_anthropic_prompt_cache_normalizes_usage() -> None:
-    from providers.anthropic import AnthropicProvider
+    from ash.providers.anthropic import AnthropicProvider
 
     final_message = SimpleNamespace(
         usage=SimpleNamespace(
@@ -827,8 +827,8 @@ async def test_anthropic_prompt_cache_normalizes_usage() -> None:
 
 
 def test_prompt_cache_retention_validation() -> None:
-    from providers.anthropic import AnthropicProvider
-    from providers.openai import OpenAIProvider
+    from ash.providers.anthropic import AnthropicProvider
+    from ash.providers.openai import OpenAIProvider
 
     anthropic = AnthropicProvider("claude-test", "test-key", client=object())
     openai_provider = OpenAIProvider(
@@ -847,7 +847,7 @@ def test_prompt_cache_retention_validation() -> None:
 
 
 def test_ollama_provider_initializes():
-    from providers.ollama import OllamaProvider
+    from ash.providers.ollama import OllamaProvider
 
     provider = OllamaProvider(model_name="llama3", base_url="http://localhost:11434")
     assert provider.model_name == "llama3"

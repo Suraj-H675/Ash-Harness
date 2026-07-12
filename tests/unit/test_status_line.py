@@ -4,10 +4,10 @@ from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
-from config import AshConfig
-from core.session import SessionStore
-from safety.policy import PermissionPolicy
-from ui.status import StatusLine, git_branch
+from ash.config import AshConfig
+from ash.core.session import SessionStore
+from ash.safety.policy import PermissionPolicy
+from ash.ui.status import StatusLine, git_branch
 
 
 def test_status_line_includes_runtime_git_cost_and_sandbox(tmp_path: Path) -> None:

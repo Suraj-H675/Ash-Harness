@@ -1,6 +1,6 @@
 # tests/unit/test_recovery.py
 import pytest
-from core.recovery import CircuitBreaker, CircuitBreakerError
+from ash.core.recovery import CircuitBreaker, CircuitBreakerError
 
 
 def test_circuit_breaker_includes_suggestions_on_trip():

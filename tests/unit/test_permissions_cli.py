@@ -4,9 +4,9 @@ import json
 from pathlib import Path
 
 from ash.cli import main
-from cli.permissions import render_permission_grants
-from safety.grants import load_permission_rules, load_tool_grants, set_tool_grant
-from safety.policy import PermissionPolicy, PolicyAction
+from ash.commands.permissions import render_permission_grants
+from ash.safety.grants import load_permission_rules, load_tool_grants, set_tool_grant
+from ash.safety.policy import PermissionPolicy, PolicyAction
 
 
 def test_permission_grant_renderer_emits_json(tmp_path: Path) -> None:

@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from agents.shared_state import SharedState
-from agents.tasks import AgentTaskBudgetExceeded, AgentTaskCreate, AgentTaskError
+from ash.agents.shared_state import SharedState
+from ash.agents.tasks import AgentTaskBudgetExceeded, AgentTaskCreate, AgentTaskError
 
 
 @pytest.fixture
@@ -115,7 +115,7 @@ def test_stale_lease_is_requeued_then_exhausted(
     state: SharedState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = [time.time()]
-    monkeypatch.setattr("agents.tasks.time.time", lambda: clock[0])
+    monkeypatch.setattr("ash.agents.tasks.time.time", lambda: clock[0])
     state.tasks.create_task("retry", task_id="retry", max_attempts=2)
     first = state.tasks.claim_task("worker-a", task_id="retry", lease_seconds=1)
     assert first is not None
@@ -203,9 +203,9 @@ def test_graph_cancellation_is_atomic_filterable_and_idempotent(
     cancelled = state.tasks.cancel_graph(graph_id, reason="operator stopped graph")
 
     assert set(cancelled) == {"graph-one", "graph-two"}
-    assert {
-        task.state for task in state.tasks.list_tasks(graph_id=graph_id)
-    } == {"cancelled"}
+    assert {task.state for task in state.tasks.list_tasks(graph_id=graph_id)} == {
+        "cancelled"
+    }
     assert state.tasks.get_task("unrelated").state == "queued"
     first_events = state.tasks.list_events(event_type="agent.task.cancelled")
     state.tasks.cancel_graph(graph_id, reason="repeated")
@@ -307,7 +307,9 @@ def test_task_events_are_ordered_redacted_and_cursor_replayable(
     assert [item.sequence for item in replay] == [events[-1].sequence]
 
 
-def test_task_events_cover_retry_dependency_failure_and_artifacts(tmp_path: Path) -> None:
+def test_task_events_cover_retry_dependency_failure_and_artifacts(
+    tmp_path: Path,
+) -> None:
     state = SharedState(tmp_path / "events.db")
     parent = state.tasks.create_task("parent", task_id="parent", max_attempts=2)
     state.tasks.create_task("child", task_id="child", dependencies=[parent.task_id])

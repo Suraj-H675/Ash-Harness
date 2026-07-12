@@ -3,7 +3,12 @@ from uuid import UUID
 
 import pytest
 
-from core.events import EVENT_SCHEMA_VERSION, EventContext, envelope_event, event_data
+from ash.core.events import (
+    EVENT_SCHEMA_VERSION,
+    EventContext,
+    envelope_event,
+    event_data,
+)
 
 
 def test_event_envelope_has_versioned_identity_and_context() -> None:

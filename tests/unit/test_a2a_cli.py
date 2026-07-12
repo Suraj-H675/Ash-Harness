@@ -21,7 +21,7 @@ def test_a2a_client_network_failure_has_stable_cli_error(monkeypatch, capsys) ->
     async def fail(args) -> int:
         raise httpx.ConnectError("connection refused")
 
-    monkeypatch.setattr("cli.a2a.inspect_a2a", fail)
+    monkeypatch.setattr("ash.commands.a2a.inspect_a2a", fail)
 
     assert main(["a2a", "inspect", "https://agent.example.com"]) == 2
     captured = capsys.readouterr()

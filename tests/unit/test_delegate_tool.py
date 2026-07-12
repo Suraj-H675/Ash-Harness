@@ -7,13 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from agents.shared_state import SharedState
-from agents.tasks import AgentTaskCreate, AgentTaskError
-from config import AshConfig
-from providers.base import ProviderABC, StreamChunk
-from safety.guard import SafetyGuard
-from tools.agent import SpawnAgentTool
-from tools.delegate import DelegateAgentsTool
+from ash.agents.shared_state import SharedState
+from ash.agents.tasks import AgentTaskCreate, AgentTaskError
+from ash.config import AshConfig
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.safety.guard import SafetyGuard
+from ash.tools.agent import SpawnAgentTool
+from ash.tools.delegate import DelegateAgentsTool
 
 
 class RecordingProvider(ProviderABC):
@@ -222,7 +222,9 @@ async def test_delegate_agents_runs_dependency_dag_and_aggregates_results(
 
 
 @pytest.mark.asyncio
-async def test_delegate_agents_runs_independent_tasks_in_parallel(tmp_path: Path) -> None:
+async def test_delegate_agents_runs_independent_tasks_in_parallel(
+    tmp_path: Path,
+) -> None:
     _, spawn, delegate = _tools(tmp_path, max_concurrency=2)
     result = await delegate.run(
         goal="parallel inspection",
@@ -477,14 +479,23 @@ async def test_dependent_worktree_receives_verified_commit_and_result_context(
         consumer_artifact = state.tasks.list_artifacts(tasks["consume"].task_id)[0]
         producer_commit = producer_artifact.metadata["commit"]
         consumer_commit = consumer_artifact.metadata["commit"]
-        assert producer_commit in consumer_artifact.metadata[
-            "accepted_dependency_commits"
-        ]
-        assert subprocess.run(
-            ["git", "merge-base", "--is-ancestor", producer_commit, consumer_commit],
-            cwd=repository,
-            check=False,
-        ).returncode == 0
+        assert (
+            producer_commit in consumer_artifact.metadata["accepted_dependency_commits"]
+        )
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "merge-base",
+                    "--is-ancestor",
+                    producer_commit,
+                    consumer_commit,
+                ],
+                cwd=repository,
+                check=False,
+            ).returncode
+            == 0
+        )
         content = subprocess.run(
             ["git", "show", f"{consumer_artifact.uri}:file.txt"],
             cwd=repository,

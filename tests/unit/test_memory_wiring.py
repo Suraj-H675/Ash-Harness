@@ -1,7 +1,7 @@
 import pytest
 
-from context.compaction import Chunk
-from memory import (
+from ash.context.compaction import Chunk
+from ash.memory import (
     DeterministicEmbedding,
     FTS5FallbackIndex,
     InMemoryVectorIndex,

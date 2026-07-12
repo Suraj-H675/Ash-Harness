@@ -11,8 +11,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import httpx
 import pytest
 
-from mcp.client import MCPClient
-from mcp.oauth import (
+from ash.mcp.client import MCPClient
+from ash.mcp.oauth import (
     MCPAuthorizationRequired,
     MCPOAuthError,
     MCPOAuthSession,
@@ -28,7 +28,7 @@ from mcp.oauth import (
     discover_oauth,
     protected_resource_metadata_urls,
 )
-from mcp.server import MCPServerConfig
+from ash.mcp.server import MCPServerConfig
 
 
 def _bundle(resource: str, *, expired: bool = False) -> OAuthBundle:
@@ -282,7 +282,9 @@ async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
                     "scope": "challenge:read",
                 },
             )
-        raise AssertionError(f"unexpected OAuth request: {request.method} {request.url}")
+        raise AssertionError(
+            f"unexpected OAuth request: {request.method} {request.url}"
+        )
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     callback_handler: dict[str, Any] = {}
@@ -315,8 +317,10 @@ async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
 
         async def callback() -> None:
             reader = asyncio.StreamReader()
-            target = redirect.path + "?" + urlencode(
-                {"code": "authorization-code", "state": query["state"][0]}
+            target = (
+                redirect.path
+                + "?"
+                + urlencode({"code": "authorization-code", "state": query["state"][0]})
             )
             reader.feed_data(
                 f"GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".encode()
@@ -357,9 +361,7 @@ async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
     assert bundle.discovery.scopes == ("challenge:read",)
     assert observed["authorization"]["scope"] == ["challenge:read"]
     assert observed["authorization"]["resource"] == [resource]
-    assert observed["registration"]["redirect_uris"][0].startswith(
-        "http://127.0.0.1:"
-    )
+    assert observed["registration"]["redirect_uris"][0].startswith("http://127.0.0.1:")
     assert observed["token_form"]["resource"] == [resource]
     assert store.load(resource).tokens.access_token == "access-token"  # type: ignore[union-attr]
 
@@ -690,8 +692,7 @@ async def test_mcp_client_reports_insufficient_scope_without_interaction() -> No
             403,
             headers={
                 "WWW-Authenticate": (
-                    'Bearer error="insufficient_scope", '
-                    'scope="files:read files:write"'
+                    'Bearer error="insufficient_scope", scope="files:read files:write"'
                 )
             },
         )

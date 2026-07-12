@@ -1,6 +1,6 @@
 import pytest
 
-from context.history import (
+from ash.context.history import (
     IMAGE_TOKEN_ESTIMATE,
     ContextBudgetAllocator,
     ContextFragmentKind,

@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from tools.browser import BrowserSession
+from ash.tools.browser import BrowserSession
 
 
 pytestmark = pytest.mark.skipif(

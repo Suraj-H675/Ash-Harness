@@ -1,7 +1,7 @@
 import io
 import json
 
-from ui.headless import HeadlessUI
+from ash.ui.headless import HeadlessUI
 
 
 def _assert_envelope(payload: dict) -> None:

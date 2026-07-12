@@ -2,8 +2,8 @@ import argparse
 
 import pytest
 
-from cli.serve import serve_http
-from exceptions import AshError
+from ash.commands.serve import serve_http
+from ash.exceptions import AshError
 
 
 def args(**overrides):
@@ -40,7 +40,7 @@ async def test_serve_validates_arguments_before_creating_client(monkeypatch) -> 
     async def fail_create():
         pytest.fail("client must not be created for invalid arguments")
 
-    monkeypatch.setattr("cli.serve.AshClient.create", fail_create)
+    monkeypatch.setattr("ash.commands.serve.AshClient.create", fail_create)
     with pytest.raises(ValueError, match="Port"):
         await serve_http(args(port=0))
     with pytest.raises(ValueError, match="Rate limit"):
@@ -50,7 +50,7 @@ async def test_serve_validates_arguments_before_creating_client(monkeypatch) -> 
 @pytest.mark.asyncio
 async def test_serve_reports_missing_optional_dependencies(monkeypatch) -> None:
     monkeypatch.setenv("ASH_SERVER_TOKEN", "0123456789abcdef")
-    monkeypatch.setattr("cli.serve.uvicorn", None)
+    monkeypatch.setattr("ash.commands.serve.uvicorn", None)
 
     with pytest.raises(AshError, match="optional HTTP server dependencies") as exc:
         await serve_http(args())
@@ -79,8 +79,8 @@ async def test_serve_closes_client_when_server_stops(monkeypatch) -> None:
     async def create_client():
         return Client()
 
-    monkeypatch.setattr("cli.serve.AshClient.create", create_client)
-    monkeypatch.setattr("cli.serve.uvicorn.Server", Server)
+    monkeypatch.setattr("ash.commands.serve.AshClient.create", create_client)
+    monkeypatch.setattr("ash.commands.serve.uvicorn.Server", Server)
 
     assert await serve_http(args()) == 0
     assert closed is True

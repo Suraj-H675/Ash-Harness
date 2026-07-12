@@ -6,8 +6,12 @@ from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from ui.transcript import Transcript
-from ui.viewport import RichTranscriptFormatter, TranscriptViewport, format_transcript
+from ash.ui.transcript import Transcript
+from ash.ui.viewport import (
+    RichTranscriptFormatter,
+    TranscriptViewport,
+    format_transcript,
+)
 
 
 class SizedDummyOutput(DummyOutput):

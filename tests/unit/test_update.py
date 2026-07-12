@@ -6,7 +6,7 @@ import urllib.error
 
 import pytest
 
-from cli.update import check_for_update, render_update_status
+from ash.commands.update import check_for_update, render_update_status
 
 
 class Response(io.BytesIO):

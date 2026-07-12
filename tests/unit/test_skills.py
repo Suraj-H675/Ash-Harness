@@ -9,10 +9,10 @@ from typing import Any
 
 import pytest
 
-from safety.guard import SafetyGuard
-from tools.base import BaseTool, ToolResult
-from tools.registry import SkillIndexEntry, ToolRegistry
-from tools.skills import (
+from ash.safety.guard import SafetyGuard
+from ash.tools.base import BaseTool, ToolResult
+from ash.tools.registry import SkillIndexEntry, ToolRegistry
+from ash.tools.skills import (
     MAX_EXECUTABLE_SKILL_BYTES,
     SkillParseError,
     compile_skill,
