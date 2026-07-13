@@ -7,18 +7,27 @@ import io
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, cast
 
 from ash.agents.shared_state import SharedState
 from ash.agents.tasks import AgentArtifact, AgentTask, AgentTaskEvent, TaskState
-from ash.runtime import build_runtime
+from ash.automation.models import (
+    AutomationJob,
+    AutomationRun,
+    AutomationRunLease,
+    UsageSource,
+)
+from ash.automation.schedules import build_schedule
+from ash.automation.store import AutomationError, AutomationStore
 from ash.config import AshConfig
 from ash.core.events import EVENT_SCHEMA_VERSION, envelope_event, event_data
 from ash.core.loop import AshLoop
-from ash.mcp.server import MCPServerConfig
 from ash.core.redaction import redact_text
 from ash.core.session import SessionLineage, SessionSummary
+from ash.mcp.server import MCPServerConfig
 from ash.providers.base import ProviderABC
+from ash.runtime import build_runtime
+from ash.safety.trust import is_workspace_trusted
 from ash.ui.headless import HeadlessUI
 
 
@@ -36,10 +45,11 @@ class AshResult:
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     cost_usd: float = 0.0
-    usage_source: str = "unavailable"
+    usage_source: UsageSource = "unavailable"
     estimated_prompt_tokens: int = 0
     estimated_completion_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    budget_exhausted: bool = False
 
     @property
     def usage(self) -> dict[str, int | float | str | bool]:
@@ -254,10 +264,11 @@ class AshClient:
             cache_read_tokens=int(usage["cache_read_tokens"]),
             cache_write_tokens=int(usage["cache_write_tokens"]),
             cost_usd=float(usage["cost_usd"]),
-            usage_source=str(usage["usage_source"]),
+            usage_source=cast(UsageSource, str(usage["usage_source"])),
             estimated_prompt_tokens=int(usage["estimated_prompt_tokens"]),
             estimated_completion_tokens=int(usage["estimated_completion_tokens"]),
             estimated_cost_usd=float(usage["estimated_cost_usd"]),
+            budget_exhausted=self.loop._last_turn_budget_exhausted,
         )
 
     async def stream_prompt(
@@ -345,6 +356,159 @@ class AshClient:
         if resolved_session_id is None:
             raise RuntimeError("no session is active; provide session_id")
         return self.loop.session_store.session_tree(resolved_session_id)
+
+    def automations(
+        self,
+        *,
+        include_disabled: bool = False,
+        limit: int = 200,
+    ) -> list[AutomationJob]:
+        """Return durable automations belonging to this client's workspace."""
+
+        with self._automation_store() as store:
+            return store.list_jobs(
+                self.loop.project_root,
+                include_disabled=include_disabled,
+                limit=limit,
+            )
+
+    def automation(self, reference: str) -> AutomationJob | None:
+        """Look up a durable automation by ID or case-insensitive name."""
+
+        with self._automation_store() as store:
+            return store.get_job(reference, workspace=self.loop.project_root)
+
+    def create_automation(
+        self,
+        name: str,
+        prompt: str,
+        *,
+        at: str | None = None,
+        every: str | None = None,
+        cron: str | None = None,
+        timezone: str = "UTC",
+        enabled: bool = True,
+        misfire_grace_seconds: int = 86_400,
+        timeout_seconds: float = 1800.0,
+        token_budget: int = 100_000,
+    ) -> AutomationJob:
+        """Create a validated schedule for unattended execution by an Ash worker."""
+
+        self._require_automation_execution_allowed()
+        schedule = build_schedule(
+            at=at,
+            every=every,
+            cron=cron,
+            timezone_name=timezone,
+        )
+        with self._automation_store() as store:
+            return store.create_job(
+                name=name,
+                prompt=prompt,
+                workspace=self.loop.project_root,
+                schedule=schedule,
+                enabled=enabled,
+                misfire_grace_seconds=misfire_grace_seconds,
+                timeout_seconds=timeout_seconds,
+                token_budget=token_budget,
+            )
+
+    def pause_automation(self, reference: str) -> AutomationJob:
+        """Prevent future scheduled claims without interrupting an active run."""
+
+        with self._automation_store() as store:
+            return store.set_enabled(
+                reference,
+                workspace=self.loop.project_root,
+                enabled=False,
+            )
+
+    def resume_automation(self, reference: str) -> AutomationJob:
+        """Resume future scheduled claims for an existing automation."""
+
+        self._require_automation_execution_allowed()
+        with self._automation_store() as store:
+            return store.set_enabled(
+                reference,
+                workspace=self.loop.project_root,
+                enabled=True,
+            )
+
+    def remove_automation(self, reference: str) -> AutomationJob:
+        """Soft-delete an automation while retaining its durable run history."""
+
+        with self._automation_store() as store:
+            return store.remove_job(reference, workspace=self.loop.project_root)
+
+    def automation_runs(
+        self,
+        automation: str | None = None,
+        *,
+        limit: int = 100,
+    ) -> list[AutomationRun]:
+        """Return newest-first run history, optionally for one automation."""
+
+        with self._automation_store() as store:
+            job_id = None
+            if automation is not None:
+                job = store.get_job(
+                    automation,
+                    workspace=self.loop.project_root,
+                    include_deleted=True,
+                )
+                if job is None:
+                    raise AutomationError(f"automation not found: {automation}")
+                job_id = job.job_id
+            return store.list_runs(
+                workspace=self.loop.project_root,
+                job_id=job_id,
+                limit=limit,
+            )
+
+    def cancel_automation_run(self, run_id: str) -> AutomationRun:
+        """Request cooperative cancellation of a running workspace automation."""
+
+        with self._automation_store() as store:
+            return store.request_cancel(run_id, workspace=self.loop.project_root)
+
+    def claim_automation(
+        self,
+        reference: str,
+        *,
+        worker_id: str,
+        lease_seconds: float | None = None,
+    ) -> AutomationRunLease:
+        """Claim a manual run for an external executor without running it here.
+
+        The returned token is the renewable ownership capability required by
+        :class:`AutomationStore` to finalize the run. Callers must either execute
+        the lease promptly or let recovery mark an expired outcome interrupted.
+        """
+
+        self._require_automation_execution_allowed()
+        duration = (
+            self.config.automation_lease_seconds
+            if lease_seconds is None
+            else lease_seconds
+        )
+        with self._automation_store() as store:
+            return store.claim_manual(
+                reference,
+                workspace=self.loop.project_root,
+                worker_id=worker_id,
+                lease_seconds=duration,
+            )
+
+    def _automation_store(self) -> AutomationStore:
+        return AutomationStore(self.config.db_directory / "automation.db")
+
+    def _require_automation_execution_allowed(self) -> None:
+        if not self.config.automation_enabled:
+            raise AutomationError("durable automation is disabled in Ash configuration")
+        if not is_workspace_trusted(self.loop.project_root):
+            raise AutomationError(
+                "workspace must be trusted before unattended automation can run"
+            )
 
     def agent_tasks(
         self,

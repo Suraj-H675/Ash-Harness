@@ -1444,6 +1444,95 @@ def main(argv: list[str] | None = None) -> int:
     )
     plans_update.add_argument("--notes", default="")
     plans_update.add_argument("--json", action="store_true")
+    cron_parser = subparsers.add_parser(
+        "cron", help="Create and operate durable unattended Ash schedules"
+    )
+    cron_subparsers = cron_parser.add_subparsers(dest="cron_action", required=True)
+    cron_status = cron_subparsers.add_parser(
+        "status", help="Show scheduler, run, and worker liveness for this workspace"
+    )
+    cron_status.add_argument("--json", action="store_true")
+    cron_list = cron_subparsers.add_parser(
+        "list", help="List enabled schedules for this workspace"
+    )
+    cron_list.add_argument("--all", action="store_true", dest="include_disabled")
+    cron_list.add_argument("--json", action="store_true")
+    cron_add = cron_subparsers.add_parser(
+        "add", help="Create one validated one-shot, interval, or cron schedule"
+    )
+    cron_add.add_argument("name")
+    cron_add.add_argument("--prompt", required=True, help="Prompt text, or - for stdin")
+    cron_schedule = cron_add.add_mutually_exclusive_group(required=True)
+    cron_schedule.add_argument("--at", help="Future ISO 8601 timestamp with UTC offset")
+    cron_schedule.add_argument("--every", help="Interval such as 30m, 2h, or 1d")
+    cron_schedule.add_argument(
+        "--cron", dest="cron_expression", help="Five-field cron expression"
+    )
+    cron_add.add_argument(
+        "--timezone", default="UTC", help="IANA timezone for --cron (default: UTC)"
+    )
+    cron_add.add_argument(
+        "--misfire-grace",
+        type=int,
+        default=86_400,
+        help="Maximum lateness in seconds, 0..2592000 (default: 86400)",
+    )
+    cron_add.add_argument(
+        "--timeout",
+        type=float,
+        default=1800.0,
+        help="Whole-turn wall timeout in seconds, 1..86400 (default: 1800)",
+    )
+    cron_add.add_argument(
+        "--token-budget",
+        type=int,
+        default=100_000,
+        help="Aggregate prompt and completion budget, 1..10000000",
+    )
+    cron_add.add_argument("--json", action="store_true")
+    cron_show = cron_subparsers.add_parser(
+        "show", help="Show a schedule and its stored prompt"
+    )
+    cron_show.add_argument("job")
+    cron_show.add_argument("--json", action="store_true")
+    for cron_action, cron_help in (
+        ("pause", "Prevent future claims without cancelling an active run"),
+        ("resume", "Resume future claims for a paused schedule"),
+    ):
+        cron_change = cron_subparsers.add_parser(cron_action, help=cron_help)
+        cron_change.add_argument("job")
+        cron_change.add_argument("--json", action="store_true")
+    cron_remove = cron_subparsers.add_parser(
+        "remove", help="Soft-delete a schedule while retaining run history"
+    )
+    cron_remove.add_argument("job")
+    cron_remove.add_argument("--yes", action="store_true")
+    cron_remove.add_argument("--json", action="store_true")
+    cron_run = cron_subparsers.add_parser(
+        "run", help="Run one schedule immediately through the isolated worker"
+    )
+    cron_run.add_argument("job")
+    cron_run.add_argument("--json", action="store_true")
+    cron_history = cron_subparsers.add_parser(
+        "history", help="Show newest-first terminal and active run history"
+    )
+    cron_history.add_argument("job", nargs="?")
+    cron_history.add_argument("--limit", type=int, default=100)
+    cron_history.add_argument("--json", action="store_true")
+    cron_cancel = cron_subparsers.add_parser(
+        "cancel", help="Request cancellation of one active run"
+    )
+    cron_cancel.add_argument("run_id")
+    cron_cancel.add_argument("--json", action="store_true")
+    cron_worker = cron_subparsers.add_parser(
+        "worker", help="Claim and execute due schedules for this workspace"
+    )
+    cron_worker.add_argument(
+        "--once",
+        action="store_true",
+        help="Drain one due batch; exit 0 on success, 1 on failure, or 130 on stop",
+    )
+    cron_worker.add_argument("--json", action="store_true")
     permissions_parser = subparsers.add_parser(
         "permissions", help="Inspect or change persistent project tool grants"
     )
@@ -2007,6 +2096,249 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Audit log exported: {exported}")
         return 0
 
+    if args.command == "cron":
+        from ash.automation.store import AutomationError
+        from ash.commands.automation import (
+            automation_store,
+            create_job_from_cli,
+            job_payload,
+            render_job,
+            render_jobs,
+            render_runs,
+            render_status,
+            run_manual,
+            run_payload,
+            run_worker,
+        )
+        from ash.safety.trust import is_workspace_trusted
+
+        config, exit_code = _load_config_or_report(**_config_overrides_from_args(args))
+        if config is None:
+            return exit_code
+        json_output = bool(getattr(args, "json", False))
+        try:
+            if args.cron_action == "status":
+                print(render_status(config, json_output=json_output))
+                return 0
+            if args.cron_action == "worker":
+                if not args.once and not json_output:
+                    print(
+                        "Automation worker active for "
+                        f"{config.workspace_root.resolve()}; press Ctrl+C to stop."
+                    )
+                def report_finished(run: Any) -> None:
+                    if args.once:
+                        return
+                    if json_output:
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "automation.run.finished",
+                                    "run": run_payload(run),
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+                    else:
+                        print(render_runs([run]), flush=True)
+
+                automation_summary = asyncio.run(
+                    run_worker(
+                        config,
+                        once=args.once,
+                        on_run_finished=report_finished,
+                    )
+                )
+                if args.once:
+                    if json_output:
+                        print(json.dumps(automation_summary.to_dict(), sort_keys=True))
+                    else:
+                        print(
+                            f"Completed {automation_summary.completed} due automation "
+                            f"run(s): {automation_summary.succeeded} succeeded, "
+                            f"{automation_summary.failed} failed, "
+                            f"{automation_summary.cancelled} cancelled, "
+                            f"{automation_summary.skipped} skipped."
+                        )
+                if automation_summary.stopped:
+                    return 130
+                return 0 if automation_summary.ok else 1
+            with automation_store(config) as cron_store:
+                if args.cron_action == "list":
+                    jobs = cron_store.list_jobs(
+                        config.workspace_root,
+                        include_disabled=args.include_disabled,
+                    )
+                    print(render_jobs(jobs, json_output=json_output))
+                    return 0
+                if args.cron_action == "add":
+                    if not config.automation_enabled:
+                        raise AutomationError(
+                            "automation is disabled by user configuration"
+                        )
+                    if not is_workspace_trusted(config.workspace_root):
+                        raise AutomationError(
+                            "workspace must be trusted before creating unattended "
+                            "automation; run `ash trust add`"
+                        )
+                    prompt = (
+                        sys.stdin.read() if args.prompt == "-" else str(args.prompt)
+                    )
+                    job = create_job_from_cli(
+                        config,
+                        name=args.name,
+                        prompt=prompt,
+                        at=args.at,
+                        every=args.every,
+                        cron=args.cron_expression,
+                        timezone_name=args.timezone,
+                        misfire_grace_seconds=args.misfire_grace,
+                        timeout_seconds=args.timeout,
+                        token_budget=args.token_budget,
+                    )
+                    print(
+                        json.dumps(
+                            job_payload(job, include_prompt=True), sort_keys=True
+                        )
+                        if json_output
+                        else f"Created automation {job.name} ({job.job_id})."
+                    )
+                    return 0
+                if args.cron_action == "show":
+                    shown_job = cron_store.get_job(
+                        args.job, workspace=config.workspace_root
+                    )
+                    if shown_job is None:
+                        raise AutomationError(f"automation not found: {args.job}")
+                    print(render_job(shown_job, json_output=json_output))
+                    return 0
+                if args.cron_action in {"pause", "resume"}:
+                    if (
+                        args.cron_action == "resume"
+                        and not config.automation_enabled
+                    ):
+                        raise AutomationError(
+                            "automation is disabled by user configuration"
+                        )
+                    if args.cron_action == "resume" and not is_workspace_trusted(
+                        config.workspace_root
+                    ):
+                        raise AutomationError(
+                            "workspace must be trusted before resuming unattended "
+                            "automation; run `ash trust add`"
+                        )
+                    changed_job = cron_store.set_enabled(
+                        args.job,
+                        workspace=config.workspace_root,
+                        enabled=args.cron_action == "resume",
+                    )
+                    print(
+                        json.dumps(job_payload(changed_job), sort_keys=True)
+                        if json_output
+                        else (
+                            f"{args.cron_action.title()}d automation "
+                            f"{changed_job.name}."
+                        )
+                    )
+                    return 0
+                if args.cron_action == "remove":
+                    confirmed = args.yes
+                    if not confirmed and sys.stdin.isatty():
+                        confirmed = input(
+                            f"Remove automation {args.job}? [y/N] "
+                        ).strip().casefold() in {"y", "yes"}
+                    if not confirmed:
+                        raise AutomationError(
+                            "automation removal cancelled; pass --yes"
+                        )
+                    removed_job = cron_store.remove_job(
+                        args.job, workspace=config.workspace_root
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "removed": True,
+                                "job_id": removed_job.job_id,
+                                "name": removed_job.name,
+                            },
+                            sort_keys=True,
+                        )
+                        if json_output
+                        else (
+                            f"Removed automation {removed_job.name} "
+                            f"({removed_job.job_id})."
+                        )
+                    )
+                    return 0
+                if args.cron_action == "history":
+                    job_id = None
+                    if args.job:
+                        history_job = cron_store.get_job(
+                            args.job,
+                            workspace=config.workspace_root,
+                            include_deleted=True,
+                        )
+                        if history_job is None:
+                            raise AutomationError(f"automation not found: {args.job}")
+                        job_id = history_job.job_id
+                    runs = cron_store.list_runs(
+                        workspace=config.workspace_root,
+                        job_id=job_id,
+                        limit=args.limit,
+                    )
+                    print(render_runs(runs, json_output=json_output))
+                    return 0
+                if args.cron_action == "cancel":
+                    run = cron_store.get_run(args.run_id)
+                    if (
+                        run is None
+                        or cron_store.get_job(
+                            run.job_id, workspace=config.workspace_root
+                        )
+                        is None
+                    ):
+                        raise AutomationError(
+                            f"automation run not found: {args.run_id}"
+                        )
+                    if run.status != "running":
+                        raise AutomationError(
+                            f"automation run is not running: {args.run_id} "
+                            f"(status={run.status})"
+                        )
+                    run = cron_store.request_cancel(
+                        args.run_id, workspace=config.workspace_root
+                    )
+                    print(
+                        json.dumps(run_payload(run), sort_keys=True)
+                        if json_output
+                        else f"Cancellation requested for {run.run_id}."
+                    )
+                    return 0
+            if args.cron_action == "run":
+                if not is_workspace_trusted(config.workspace_root):
+                    raise AutomationError(
+                        "workspace must be trusted before running unattended "
+                        "automation; run `ash trust add`"
+                    )
+                run = asyncio.run(run_manual(config, args.job))
+                print(
+                    json.dumps(run_payload(run), sort_keys=True)
+                    if json_output
+                    else render_runs([run])
+                )
+                return 0 if run.status == "succeeded" else 1
+        except KeyboardInterrupt:
+            if not json_output:
+                print("Interrupted.", file=sys.stderr)
+            return 130
+        except (AutomationError, OSError, ValueError) as exc:
+            if json_output:
+                print(json.dumps({"error": str(exc)}, sort_keys=True))
+            else:
+                print(f"Error: {exc}", file=sys.stderr)
+            return 2
+
     if args.command == "sessions":
         from ash.commands.sessions import (
             list_session_summaries,
@@ -2378,8 +2710,10 @@ def main(argv: list[str] | None = None) -> int:
             from ash.server.acp import run_acp_agent
         except ModuleNotFoundError as exc:
             if exc.name == "acp" or (exc.name or "").startswith("acp."):
+                from ash.install import pipx_install_command
+
                 print(
-                    "Error: ACP support requires `pip install 'ash-ai[acp]'`.",
+                    f"Error: ACP support requires `{pipx_install_command('acp')}`.",
                     file=sys.stderr,
                 )
                 return 2
@@ -2404,8 +2738,10 @@ def main(argv: list[str] | None = None) -> int:
             from httpx import HTTPError
         except ModuleNotFoundError as exc:
             if exc.name == "a2a" or (exc.name or "").startswith("a2a."):
+                from ash.install import pipx_install_command
+
                 print(
-                    "Error: A2A support requires `pip install 'ash-ai[a2a]'`.",
+                    f"Error: A2A support requires `{pipx_install_command('a2a')}`.",
                     file=sys.stderr,
                 )
                 return 2

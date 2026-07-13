@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 import os
 import platform
 import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -94,12 +95,14 @@ def _check_web_search(config: AshConfig) -> DoctorCheck:
 
 
 def _check_browser() -> DoctorCheck:
+    from ash.install import pipx_install_command
+
     if importlib.util.find_spec("playwright") is None:
         return DoctorCheck(
             "browser",
             "warn",
             "optional Playwright package is not installed",
-            "Install `ash-ai[browser]`, then run `ash setup browser`.",
+            f"Run `{pipx_install_command('browser')}`, then `ash setup browser`.",
         )
     try:
         completed = subprocess.run(
@@ -143,6 +146,112 @@ def _check_storage(config: AshConfig) -> DoctorCheck:
     return DoctorCheck("storage", "pass", str(config.db_directory))
 
 
+def _check_automation(config: AshConfig) -> DoctorCheck:
+    if not config.automation_enabled:
+        return DoctorCheck(
+            "automation", "pass", "Durable automation is disabled by configuration"
+        )
+
+    db = (config.db_directory / "automation.db").expanduser().resolve()
+    if not db.exists():
+        return DoctorCheck("automation", "pass", "No automation database yet")
+
+    try:
+        from ash.automation.store import AUTOMATION_SCHEMA_VERSION
+
+        connection = sqlite3.connect(
+            f"{db.as_uri()}?mode=ro",
+            uri=True,
+            timeout=5,
+        )
+        try:
+            schema_version = int(
+                connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            if schema_version > AUTOMATION_SCHEMA_VERSION:
+                return DoctorCheck(
+                    "automation",
+                    "fail",
+                    f"Automation database schema v{schema_version} is newer than "
+                    f"supported v{AUTOMATION_SCHEMA_VERSION}",
+                    "Upgrade Ash before operating this automation database.",
+                )
+            if schema_version < AUTOMATION_SCHEMA_VERSION:
+                return DoctorCheck(
+                    "automation",
+                    "warn",
+                    f"Automation database schema v{schema_version} requires "
+                    f"migration to v{AUTOMATION_SCHEMA_VERSION}",
+                    "Run `ash cron status` once to apply the local migration, then "
+                    "rerun `ash doctor`.",
+                )
+            quick_check = [
+                str(row[0]) for row in connection.execute("PRAGMA quick_check")
+            ]
+            integrity_errors = [
+                message for message in quick_check if message.casefold() != "ok"
+            ]
+            if integrity_errors:
+                summary = "; ".join(integrity_errors[:3])
+                return DoctorCheck(
+                    "automation",
+                    "fail",
+                    f"Automation database integrity check failed: {summary}",
+                    "Back up the database, then repair or replace automation.db.",
+                )
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                return DoctorCheck(
+                    "automation",
+                    "fail",
+                    "Automation database contains invalid foreign-key references",
+                    "Back up the database, then repair or replace automation.db.",
+                )
+
+            workspace = str(config.workspace_root.expanduser().resolve())
+            enabled_jobs = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM automation_jobs
+                    WHERE workspace = ? AND deleted_at IS NULL AND enabled = 1
+                    """,
+                    (workspace,),
+                ).fetchone()[0]
+            )
+            stale_after = max(config.automation_poll_seconds * 4, 10)
+            live_workers = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM automation_workers
+                    WHERE workspace = ? AND heartbeat_at >= ?
+                    """,
+                    (workspace, time.time() - stale_after),
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        return DoctorCheck(
+            "automation",
+            "fail",
+            f"Cannot validate automation database: {exc}",
+            "Check automation.db permissions and integrity.",
+        )
+
+    if enabled_jobs and not live_workers:
+        return DoctorCheck(
+            "automation",
+            "warn",
+            f"Database healthy; {enabled_jobs} enabled job(s) but no live worker",
+            "Run `ash cron worker` for schedules to fire.",
+        )
+    return DoctorCheck(
+        "automation",
+        "pass",
+        f"Database healthy; {enabled_jobs} enabled job(s), "
+        f"{live_workers} live worker(s)",
+    )
+
+
 def _check_workspace(config: AshConfig) -> DoctorCheck:
     root = config.workspace_root.expanduser().resolve()
     if not root.is_dir():
@@ -183,6 +292,8 @@ def _check_extensions(config: AshConfig) -> DoctorCheck:
 
 
 def _check_a2a(config: AshConfig) -> DoctorCheck:
+    from ash.install import pipx_install_command
+
     from ash.agents.a2a_remote import load_remote_agent_configs
     from ash.safety.trust import is_workspace_trusted
 
@@ -205,7 +316,7 @@ def _check_a2a(config: AshConfig) -> DoctorCheck:
             "a2a",
             "fail",
             f"{len(agents)} remote agent(s) configured but A2A support is missing",
-            "Install `ash-ai[a2a]`.",
+            f"Run `{pipx_install_command('a2a')}`.",
         )
     missing = sorted(
         {
@@ -348,6 +459,7 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
             _check_browser(),
             _check_workspace(config),
             _check_storage(config),
+            _check_automation(config),
             DoctorCheck(
                 "git",
                 "pass" if shutil.which("git") else "warn",

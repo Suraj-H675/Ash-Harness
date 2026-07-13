@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 
 import pytest
@@ -6,11 +7,14 @@ import pytest
 from ash.commands.doctor import DoctorCheck, render_doctor, run_doctor
 from ash.commands.doctor import (
     _check_a2a,
+    _check_automation,
     _check_browser,
     _check_lsp,
     _check_storage,
     _check_web_search,
 )
+from ash.automation.schedules import build_schedule
+from ash.automation.store import AutomationStore
 from ash.config import AshConfig
 from ash.lsp.config import LSPServerConfig
 
@@ -36,9 +40,11 @@ async def test_doctor_reports_local_runtime_without_network(
     assert by_name["runtime"].status == "pass"
     assert by_name["credentials"].status == "pass"
     assert by_name["storage"].status == "pass"
+    assert by_name["automation"].status == "pass"
     assert by_name["extensions"].status == "pass"
     assert "connectivity" not in by_name
     assert not (tmp_path / "db" / ".doctor.sqlite3").exists()
+    assert not (tmp_path / "db" / "automation.db").exists()
 
 
 def test_storage_check_reports_sqlite_open_failures(
@@ -52,6 +58,125 @@ def test_storage_check_reports_sqlite_open_failures(
     assert check.name == "storage"
     assert check.status == "fail"
     assert "unable to open database file" in check.message
+
+
+def test_automation_doctor_does_not_open_database_when_disabled(tmp_path) -> None:
+    database = tmp_path / "db" / "automation.db"
+    database.parent.mkdir()
+    database.write_bytes(b"not a database")
+
+    check = _check_automation(
+        AshConfig(
+            automation_enabled=False,
+            db_directory=database.parent,
+            workspace_root=tmp_path,
+        )
+    )
+
+    assert check.status == "pass"
+    assert "disabled" in check.message
+
+
+def test_automation_doctor_does_not_create_unused_database(tmp_path) -> None:
+    config = AshConfig(
+        db_directory=tmp_path / "db",
+        workspace_root=tmp_path,
+    )
+
+    check = _check_automation(config)
+
+    assert check.status == "pass"
+    assert "No automation database" in check.message
+    assert not (config.db_directory / "automation.db").exists()
+
+
+def test_automation_doctor_warns_for_enabled_job_without_worker(tmp_path) -> None:
+    database = tmp_path / "db" / "automation.db"
+    config = AshConfig(db_directory=database.parent, workspace_root=tmp_path)
+    with AutomationStore(database) as store:
+        store.create_job(
+            name="daily-review",
+            prompt="Review the workspace",
+            workspace=tmp_path,
+            schedule=build_schedule(every="1h"),
+        )
+
+    check = _check_automation(config)
+
+    assert check.status == "warn"
+    assert "1 enabled job(s)" in check.message
+    assert "no live worker" in check.message
+    assert "ash cron worker" in check.remedy
+
+
+def test_automation_doctor_reports_healthy_database_and_live_worker(tmp_path) -> None:
+    database = tmp_path / "db" / "automation.db"
+    config = AshConfig(db_directory=database.parent, workspace_root=tmp_path)
+    with AutomationStore(database) as store:
+        store.create_job(
+            name="daily-review",
+            prompt="Review the workspace",
+            workspace=tmp_path,
+            schedule=build_schedule(every="1h"),
+        )
+        store.heartbeat_worker(
+            worker_id="doctor-test-worker",
+            workspace=tmp_path,
+            pid=os.getpid(),
+            max_concurrent_runs=1,
+        )
+
+    check = _check_automation(config)
+
+    assert check.status == "pass"
+    assert "1 enabled job(s), 1 live worker(s)" in check.message
+
+
+def test_automation_doctor_reports_corrupt_database(tmp_path) -> None:
+    database = tmp_path / "db" / "automation.db"
+    database.parent.mkdir()
+    database.write_bytes(b"not a sqlite database")
+
+    check = _check_automation(
+        AshConfig(db_directory=database.parent, workspace_root=tmp_path)
+    )
+
+    assert check.status == "fail"
+    assert "Cannot validate automation database" in check.message
+
+
+def test_automation_doctor_refuses_future_schema(tmp_path) -> None:
+    database = tmp_path / "db" / "automation.db"
+    database.parent.mkdir()
+    with AutomationStore(database):
+        pass
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA user_version = 999")
+
+    check = _check_automation(
+        AshConfig(db_directory=database.parent, workspace_root=tmp_path)
+    )
+
+    assert check.status == "fail"
+    assert "newer than supported" in check.message
+    assert "Upgrade Ash" in check.remedy
+
+
+def test_automation_doctor_reports_pending_schema_migration(tmp_path) -> None:
+    database = tmp_path / "db" / "automation.db"
+    database.parent.mkdir()
+    with AutomationStore(database):
+        pass
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA user_version = 1")
+
+    check = _check_automation(
+        AshConfig(db_directory=database.parent, workspace_root=tmp_path)
+    )
+
+    assert check.status == "warn"
+    assert "requires migration" in check.message
+    assert "ash cron status" in check.remedy
 
 
 def test_web_search_doctor_reports_auto_detection(

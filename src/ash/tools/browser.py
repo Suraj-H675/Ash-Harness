@@ -69,9 +69,11 @@ class BrowserSession:
             try:
                 from playwright.async_api import async_playwright
             except ImportError as exc:
+                from ash.install import pipx_install_command
+
                 raise BrowserUnavailableError(
-                    "Browser tools require `ash-ai[browser]`; then run "
-                    "`ash setup browser`."
+                    f"Run `{pipx_install_command('browser')}`, then "
+                    "`ash setup browser` to enable browser tools."
                 ) from exc
             try:
                 self._playwright = await async_playwright().start()

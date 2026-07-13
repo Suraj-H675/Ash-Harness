@@ -56,7 +56,7 @@ async def test_serve_reports_missing_optional_dependencies(monkeypatch) -> None:
         await serve_http(args())
 
     assert exc.value.exit_code == 2
-    assert "ash[server]" in exc.value.remedy
+    assert "ash-ai[server]" in exc.value.remedy
 
 
 @pytest.mark.asyncio

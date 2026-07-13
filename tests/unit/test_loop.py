@@ -129,6 +129,64 @@ class NativeToolProvider(ProviderABC):
             yield StreamChunk(content="done", is_done=True)
 
 
+class BudgetExhaustingToolProvider(ProviderABC):
+    model_name = "budget-exhausting-tool-test"
+    capabilities = ProviderCapabilities(native_tools=True, context_window=200)
+
+    def __init__(self):
+        self.calls = 0
+
+    def count_tokens(self, text):
+        return len(str(text).split())
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        self.calls += 1
+        yield StreamChunk(
+            is_done=True,
+            native_tool_calls=[
+                {
+                    "id": "call-budget-1",
+                    "name": "capture",
+                    "arguments": '{"text":"must not run"}',
+                }
+            ],
+            prompt_tokens=16,
+            completion_tokens=4,
+        )
+
+
+class MultiStepBudgetProvider(ProviderABC):
+    model_name = "multi-step-budget-test"
+    capabilities = ProviderCapabilities(native_tools=True, context_window=200)
+
+    def __init__(self):
+        self.calls = 0
+        self.completion_limits = []
+
+    def count_tokens(self, text):
+        return len(str(text).split())
+
+    def configure_max_tokens(self, max_tokens):
+        self.completion_limits.append(max_tokens)
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        self.calls += 1
+        if self.calls > 1:
+            raise AssertionError("aggregate budget must stop the second request")
+        yield StreamChunk(
+            is_done=True,
+            native_tool_calls=[
+                {
+                    "id": "call-budget-step-1",
+                    "name": "capture",
+                    "arguments": '{"text":"first step"}',
+                }
+            ],
+            prompt_tokens=10,
+            completion_tokens=2,
+        )
+
+
 class CaptureTool(BaseTool):
     name = "capture"
     args_schema = None
@@ -652,6 +710,70 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
             (loop.current_session.session_id,),
         ).fetchone()
     assert tool_turn["turn_id"] == loop.turn_context.turn_id
+
+
+@pytest.mark.asyncio
+async def test_turn_token_budget_stops_before_tool_side_effects(tmp_path):
+    provider = BudgetExhaustingToolProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/budget-exhausting-tool-test",
+        max_context_tokens=20,
+        max_completion_tokens=4,
+        max_turn_total_tokens=20,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "turn-budget.db"),
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+        config=config,
+    )
+
+    await loop.start_session()
+    response = await loop.run_turn("use the capture tool")
+
+    assert "Turn token budget exhausted: used 20 of 20 tokens" in response
+    assert tool.arguments is None
+    assert provider.calls == 1
+    assert loop._last_turn_budget_exhausted is True
+    assert loop._last_turn_prompt_tokens + loop._last_turn_completion_tokens == 20
+
+
+@pytest.mark.asyncio
+async def test_turn_token_budget_blocks_next_provider_request(tmp_path):
+    provider = MultiStepBudgetProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/multi-step-budget-test",
+        max_context_tokens=20,
+        max_completion_tokens=4,
+        max_turn_total_tokens=20,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "multi-turn-budget.db"),
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+        config=config,
+    )
+
+    await loop.start_session()
+    response = await loop.run_turn("use one tool step")
+
+    assert "exhausted before another model request" in response
+    assert tool.arguments == {"text": "first step"}
+    assert provider.calls == 1
+    assert provider.completion_limits == [4]
+    assert loop._last_turn_budget_exhausted is True
 
 
 @pytest.mark.asyncio

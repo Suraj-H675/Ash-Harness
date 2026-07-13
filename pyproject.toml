@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.52",
+    "croniter>=6.2.3,<7",
     "httpx>=0.27",
     "jsonschema>=4.23",
     "loguru>=0.7",
@@ -32,6 +33,7 @@ dependencies = [
     "tree-sitter-python>=0.23",
     "tree-sitter-rust>=0.23",
     "tree-sitter-typescript>=0.23",
+    "tzdata>=2026.2",
 ]
 
 [project.scripts]
@@ -79,6 +81,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.11",
+    "types-croniter>=6.2.2.20260518",
     "types-protobuf>=6.30",
     "types-pyyaml>=6.0",
     "uvicorn>=0.34",

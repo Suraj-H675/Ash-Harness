@@ -581,6 +581,9 @@ def test_project_config_cannot_override_user_owned_controls(
                 "browser_headless = false",
                 "browser_timeout_seconds = 120",
                 "lsp_enabled = true",
+                "automation_enabled = true",
+                "automation_max_concurrent_runs = 32",
+                "automation_lease_seconds = 3600",
                 'command_env_allowlist = ["ANTHROPIC_API_KEY"]',
                 f'workspace_root = "{tmp_path / "elsewhere"}"',
                 "unknown_typo = true",
@@ -591,7 +594,10 @@ def test_project_config_cannot_override_user_owned_controls(
         encoding="utf-8",
     )
     cli_config.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    cli_config.CONFIG_FILE.write_text("lsp_enabled = false\n", encoding="utf-8")
+    cli_config.CONFIG_FILE.write_text(
+        "lsp_enabled = false\nautomation_enabled = false\n",
+        encoding="utf-8",
+    )
     monkeypatch.chdir(root)
     set_workspace_trusted(root, True)
 
@@ -615,6 +621,9 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.browser_headless is True
     assert config.browser_timeout_seconds == 30
     assert config.lsp_enabled is False
+    assert config.automation_enabled is False
+    assert config.automation_max_concurrent_runs == 2
+    assert config.automation_lease_seconds == 60
     assert config.command_env_allowlist == []
     assert config.custom_providers == {}
     diagnostics = "\n".join(config.config_diagnostics)
@@ -635,6 +644,9 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "browser_headless" in diagnostics
     assert "browser_timeout_seconds" in diagnostics
     assert "lsp_enabled" in diagnostics
+    assert "automation_enabled" in diagnostics
+    assert "automation_max_concurrent_runs" in diagnostics
+    assert "automation_lease_seconds" in diagnostics
     assert "command_env_allowlist" in diagnostics
     assert "workspace_root" in diagnostics
     assert "unknown_typo" in diagnostics
@@ -728,6 +740,37 @@ def test_dotenv_provenance_is_stable_across_reloads(
     assert second.config_source("safety_tier") == first.config_source("safety_tier")
     assert "ASH_SAFETY_TIER" not in os.environ
     assert os.environ["ANTHROPIC_API_KEY"] == "test-key"
+
+
+def test_dotenv_runtime_credentials_rotate_and_preserve_external_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash import config as config_module
+
+    dotenv = Path(str(AshConfig.model_config["env_file"]))
+    dotenv.parent.mkdir(parents=True)
+    rotating_key = "ASH_TEST_ROTATING_PROVIDER_KEY"
+    external_key = "ASH_TEST_EXTERNAL_PROVIDER_KEY"
+    monkeypatch.delenv(rotating_key, raising=False)
+    monkeypatch.setenv(external_key, "operator-value")
+    dotenv.write_text(
+        f"{rotating_key}=first\n{external_key}=file-value\n", encoding="utf-8"
+    )
+
+    AshConfig.load()
+    assert os.environ[rotating_key] == "first"
+    assert os.environ[external_key] == "operator-value"
+
+    dotenv.write_text(f"{rotating_key}=second\n", encoding="utf-8")
+    AshConfig.load()
+    assert os.environ[rotating_key] == "second"
+    assert os.environ[external_key] == "operator-value"
+
+    dotenv.write_text("", encoding="utf-8")
+    AshConfig.load()
+    assert rotating_key not in os.environ
+    assert os.environ[external_key] == "operator-value"
+    config_module._DOTENV_RUNTIME_VALUES.pop(rotating_key, None)
 
 
 def test_setup_written_settings_keep_dotenv_provenance(

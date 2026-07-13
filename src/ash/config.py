@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,36 @@ CURRENT_CONFIG_SCHEMA_VERSION = 1
 
 _INITIAL_USER_CONFIG_PATH = Path.home() / ".ash" / "ash.toml"
 _INITIAL_DOTENV_PATH = Path.home() / ".ash" / ".env"
+_DOTENV_RUNTIME_LOCK = threading.RLock()
+_DOTENV_RUNTIME_VALUES: dict[str, str] = {}
+
+
+def _publish_dotenv_runtime_values(
+    values: dict[str, str], setting_env_keys: set[str]
+) -> None:
+    """Refresh only non-setting environment values previously injected by Ash."""
+
+    runtime_values = {
+        key: value for key, value in values.items() if key not in setting_env_keys
+    }
+    with _DOTENV_RUNTIME_LOCK:
+        for key, previous in list(_DOTENV_RUNTIME_VALUES.items()):
+            current = os.environ.get(key)
+            if current != previous:
+                _DOTENV_RUNTIME_VALUES.pop(key, None)
+                continue
+            replacement = runtime_values.get(key)
+            if replacement is None:
+                os.environ.pop(key, None)
+                _DOTENV_RUNTIME_VALUES.pop(key, None)
+            else:
+                os.environ[key] = replacement
+                _DOTENV_RUNTIME_VALUES[key] = replacement
+        for key, value in runtime_values.items():
+            if key in _DOTENV_RUNTIME_VALUES or key in os.environ:
+                continue
+            os.environ[key] = value
+            _DOTENV_RUNTIME_VALUES[key] = value
 
 PROJECT_CONFIG_DIRECTORY = ".ash"
 PROJECT_CONFIG_FILENAME = "config.toml"
@@ -252,6 +283,15 @@ class AshConfig(BaseSettings):
     max_completion_tokens: int = Field(
         4000,
         description="Maximum tokens generated in response completion.",
+    )
+    max_turn_total_tokens: int = Field(
+        0,
+        ge=0,
+        le=10_000_000,
+        description=(
+            "Maximum prompt plus completion tokens consumed by one agent turn; "
+            "0 disables the turn-wide limit."
+        ),
     )
     max_tool_result_tokens: int = Field(
         20000,
@@ -503,6 +543,34 @@ class AshConfig(BaseSettings):
         0,
         ge=0,
         description="Delete sessions older than this many days; 0 disables cleanup.",
+    )
+    automation_enabled: bool = Field(
+        True,
+        description="Allow explicitly configured durable automation workers.",
+    )
+    automation_max_concurrent_runs: int = Field(
+        2,
+        ge=1,
+        le=32,
+        description="Maximum automation runs executed concurrently by one worker.",
+    )
+    automation_poll_seconds: float = Field(
+        1.0,
+        ge=0.1,
+        le=60.0,
+        description="Automation worker polling interval in seconds.",
+    )
+    automation_lease_seconds: float = Field(
+        60.0,
+        ge=5.0,
+        le=3600.0,
+        description="Renewable ownership lease duration for an automation run.",
+    )
+    automation_run_retention_days: int = Field(
+        30,
+        ge=1,
+        le=3650,
+        description="Retention period for terminal automation run records.",
     )
 
     mcp_servers: dict[str, Any] = Field(
@@ -1005,9 +1073,7 @@ class AshConfig(BaseSettings):
         setting_env_keys = {
             f"ASH_{field.upper()}" for field in type(self).model_fields
         } | {"ASH_MODEL_NAME", "ASH_PROVIDER"}
-        for key, value in load_env().items():
-            if key not in setting_env_keys:
-                os.environ.setdefault(key, value)
+        _publish_dotenv_runtime_values(load_env(), setting_env_keys)
 
         # Backward compat: if ANTHROPIC_API_KEY is not set but ASH_API_KEY is,
         # promote it so _build_provider() finds the right key.

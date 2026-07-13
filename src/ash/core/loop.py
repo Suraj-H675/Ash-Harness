@@ -386,6 +386,7 @@ class AshLoop:
         self._last_context_budget: Any | None = None
         self._last_turn_prompt_tokens = 0
         self._last_turn_completion_tokens = 0
+        self._last_turn_budget_exhausted = False
         self._last_cache_read_tokens = 0
         self._last_cache_write_tokens = 0
         self._last_estimated_prompt_tokens = 0
@@ -908,7 +909,11 @@ class AshLoop:
         total_cache_write_tokens = 0
         total_estimated_prompt_tokens = 0
         total_estimated_completion_tokens = 0
+        turn_budget_exhausted = False
         usage_sources: set[str] = set()
+        turn_token_budget = int(
+            getattr(self._config, "max_turn_total_tokens", 0)
+        )
         iteration = 0
         iteration_budget = self.max_turn_iterations
         maximum_iteration_budget = self.max_turn_iterations + self.max_steering_messages
@@ -924,6 +929,30 @@ class AshLoop:
                         f"// From {hit.file_path}:\n{hit.content[:500]}" for hit in hits
                     )
             messages = self._build_messages(session)
+            if turn_token_budget > 0:
+                used_before_request = total_prompt_tokens + total_completion_tokens
+                remaining = turn_token_budget - used_before_request
+                estimated_prompt = max(1, self._last_context_tokens)
+                if remaining <= estimated_prompt:
+                    turn_budget_exhausted = True
+                    final_text = (
+                        f"{final_text}\n\n"
+                        "[Turn token budget exhausted before another model request: "
+                        f"used {used_before_request}, next input requires approximately "
+                        f"{estimated_prompt}, budget {turn_token_budget}.]"
+                    ).strip()
+                    break
+                self.provider.configure_max_tokens(
+                    max(
+                        1,
+                        min(
+                            int(getattr(self._config, "max_completion_tokens", 1)),
+                            remaining - estimated_prompt,
+                        ),
+                    )
+                )
+            elif self._config is not None:
+                self.provider.configure_max_tokens(self._config.max_completion_tokens)
             await self._fire_hook_lifecycle(
                 "pre_model",
                 {
@@ -1014,6 +1043,22 @@ class AshLoop:
                 turn_id=self.turn_context.turn_id,
             )
             session.messages.append(assistant_message)
+
+            used_tokens = total_prompt_tokens + total_completion_tokens
+            if turn_token_budget > 0 and (
+                used_tokens > turn_token_budget
+                or (bool(tool_calls) and used_tokens >= turn_token_budget)
+            ):
+                turn_budget_exhausted = True
+                tool_notice = (
+                    " Pending tool calls were not executed." if tool_calls else ""
+                )
+                final_text = (
+                    f"{assistant_text}\n\n"
+                    f"[Turn token budget exhausted: used {used_tokens} of "
+                    f"{turn_token_budget} tokens.{tool_notice}]"
+                ).strip()
+                break
 
             if not tool_calls:
                 final_text = assistant_text
@@ -1137,6 +1182,7 @@ class AshLoop:
         )
         self._last_turn_prompt_tokens = prompt
         self._last_turn_completion_tokens = completion
+        self._last_turn_budget_exhausted = turn_budget_exhausted
         self._last_cache_read_tokens = cache_read
         self._last_cache_write_tokens = cache_write
         self._last_estimated_prompt_tokens = estimated_prompt

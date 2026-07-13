@@ -69,6 +69,7 @@ reduce tool selection accuracy, and make the security boundary unreviewable.
 - [Brave Web Search API](https://api-dashboard.search.brave.com/api-reference/web/search/get): bounded result counts, freshness filters, safe search, authentication, and rate-limit behavior for source-oriented live search.
 - [Tavily Search API](https://docs.tavily.com/documentation/api-reference/endpoint/search): agent-oriented normalized search, freshness ranges, bounded results, and bearer authentication.
 - [Playwright Python](https://playwright.dev/python/docs/library): maintained cross-platform browser automation and version-pinned browser binaries used by Ash's optional isolated browser capability.
+- [croniter](https://pypi.org/project/croniter/): maintained, timezone-aware cron iteration used for fire-time calculation; Ash owns persistence, claims, leases, and execution recovery.
 
 ### Reference repository snapshots
 
@@ -339,7 +340,7 @@ not remove them.
 |---|---|---|
 | Agent loop and streaming | Partial | Public event schema v1 and validated provider-portable message/content/tool-call inputs now span the runtime and adapters; the loop remains monolithic and legacy XML fallback is mixed into canonical behavior. |
 | Provider layer | Strong partial | Built-ins, embedders, declared model capabilities, and custom OpenAI-compatible endpoints resolve through thread-safe linked registries; auth/discovery and non-text modalities remain limited. |
-| Coding tools | Strong | Exact-schema deferred tool search, guarded Brave/Tavily live search, and an optional isolated Playwright browser are live; PTY terminal sessions, media, scheduler, and messaging remain. |
+| Coding tools | Strong | Exact-schema deferred tool search, guarded Brave/Tavily live search, an optional isolated Playwright browser, and policy-routed automation management are live; PTY terminal sessions, media, and messaging remain. |
 | Context budgets | Strong partial | Provider totals reserve only currently visible tool schemas; large catalogs defer nonessential tools behind session-scoped search activation. Typed hashed fragments and deterministic compaction preserve provenance and task/path/action/outcome state. Model-assisted compaction remains. |
 | Sessions/recovery | Strong partial | SQLite schema v9 persists redacted cursor-replayable events plus atomic parent-first session trees, bounded branch metadata, safe fork boundaries, tree-aware retention, and SDK/CLI/HTTP/JSON-RPC access. Per-turn config snapshots and richer branch navigation/summarization remain. |
 | Memory | Partial | FTS/vector/Markdown exist; lifecycle, provenance, expiry, poisoning controls, and user workflow are incomplete. |
@@ -352,7 +353,7 @@ not remove them.
 | CLI/TUI/SDK/API | Strong local/remote | CLI, SDK, HTTP server, ACP v1, and A2A 1.0 adapters share the trusted runtime and versioned events. ACP provides bounded editor sessions and an official wire test. A2A provides authenticated/durable JSON-RPC and HTTP+JSON tasks, streaming/cancel/continuation, origin-pinned clients, and trusted delegation tools. WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, and channel adapters remain. |
 | LSP | Verified locally | Bounded LSP 3.18 stdio clients start lazily per root, honor negotiated full/incremental sync and UTF position units, support push/pull diagnostics and semantic queries, filter external URIs, require workspace trust, use scrubbed environments, bound caches/results, and shut down process trees deterministically. Rename, code actions, broader server coverage, and multi-vendor conformance remain. |
 | Browser/media | Partial | Optional Playwright/Chromium navigation, ARIA snapshots, stable refs, form/click/scroll/history actions, network policy, and deterministic cleanup are live. Screenshots/vision, downloads/uploads, profiles, and other media remain. |
-| Automation/channels | Absent | No durable scheduler, event bus, gateway routing, pairing, or delivery semantics. |
+| Automation/channels | Partial | Durable one-shot/interval/cron prompts, atomic multi-worker claims, renewable leases, cancellation, coalescing, misfire records, CLI/SDK/model tools, liveness diagnostics, and restart recovery are verified. Webhooks, event triggers, gateway routing, pairing, and channel delivery remain. |
 | Observability/evals | Absent | Logging and audit exist, but no OTel traces/metrics or task evaluation harness. |
 | Packaging | Improved | Distribution renamed to available `ash-ai`; public PyPI release/signing still required. |
 
@@ -497,7 +498,8 @@ resume after process interruption.
 1. Web search and an isolated browser automation baseline are live; richer
    extraction, persistent browser profiles, vision, uploads, and downloads remain.
 2. Media/document understanding and image/audio/video generation adapters.
-3. Durable scheduler, cron/heartbeat, webhooks, and event triggers.
+3. Durable scheduler and cron/worker heartbeats are live; add webhooks and
+   external event triggers.
 4. Gateway identity/routing plus initial WebChat, Telegram, Discord, and Slack
    adapters; other channels remain plugins.
 5. The managed LSP baseline is live. Add rename, code actions, broader server

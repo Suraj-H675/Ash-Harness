@@ -64,9 +64,13 @@ async def serve_http(args) -> int:
 
 
 def _server_dependency_error() -> AshError:
+    from ash.install import pipx_install_command
+
     return AshError(
         "The optional HTTP server dependencies are not installed.",
         category=ErrorCategory.CONFIG,
-        remedy="Install them with `pip install 'ash[server]'`, then rerun `ash serve`.",
+        remedy=(
+            f"Run `{pipx_install_command('server')}`, then rerun `ash serve`."
+        ),
         exit_code=2,
     )

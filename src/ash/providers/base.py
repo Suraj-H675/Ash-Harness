@@ -78,6 +78,12 @@ class ProviderABC(ABC):
 
         raise NotImplementedError
 
+    def configure_max_tokens(self, max_tokens: int) -> None:
+        """Apply a per-request completion ceiling when the adapter supports it."""
+
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+
     @property
     @abstractmethod
     def model_name(self) -> str:

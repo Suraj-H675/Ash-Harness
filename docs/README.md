@@ -14,6 +14,7 @@ canonical `ash.*` namespace under `src/ash`.
 ## Guides
 
 - [Context management](guides/CONTEXT_MANAGEMENT.md)
+- [Durable automation](guides/DURABLE_AUTOMATION.md)
 - [Durable session branching](guides/SESSION_BRANCHING.md)
 
 ## Reference

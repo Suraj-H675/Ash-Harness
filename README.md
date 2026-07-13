@@ -32,11 +32,16 @@ The default install includes the terminal harness, coding tools, repository
 map, and supported API/local providers. Install optional features explicitly:
 
 ```bash
-pip install 'ash-ai[server]' # authenticated HTTP/SSE API
-pip install 'ash-ai[vector]' # ChromaDB and ONNX semantic memory
-pip install 'ash-ai[acp]'    # ACP v1 editor/IDE integration
-pip install 'ash-ai[a2a]'    # A2A v1 remote-agent server and client
+pipx install --force 'ash-ai[server] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+pipx install --force 'ash-ai[vector] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+pipx install --force 'ash-ai[acp] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+pipx install --force 'ash-ai[a2a] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
 ```
+
+Choose the extras needed by one installation, for example
+`ash-ai[server,vector]`. The direct Git reference is required until an
+`ash-ai` release is published to PyPI; `--force` also upgrades an existing
+base `pipx` installation into the selected capability pack.
 
 For development:
 
@@ -102,6 +107,9 @@ ash lsp status --json              # inspect servers without starting them
 ash lsp diagnostics src/app.py
 ash lsp query definition src/app.py --line 12 --character 8
 ash lsp query workspaceSymbol --query App
+ash cron add nightly --prompt 'Review open risks' --cron '0 2 * * mon-fri' --timezone UTC
+ash cron status                  # includes worker liveness
+ash cron worker                  # execute due schedules for this workspace
 ```
 
 The authenticated server exposes synchronous turns at `/v1/turn`, live SSE
@@ -116,7 +124,7 @@ retention behavior.
 Install the capability pack, configure a provider once, and verify the agent:
 
 ```bash
-pip install 'ash-ai[acp]'
+pipx install --force 'ash-ai[acp] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
 ash setup
 ash acp --check
 ```
@@ -138,7 +146,7 @@ Install and verify the optional capability pack, then expose the current
 project on loopback with an operator-owned token:
 
 ```bash
-pip install 'ash-ai[a2a]'
+pipx install --force 'ash-ai[a2a] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
 ash a2a check
 export ASH_A2A_TOKEN='replace-with-at-least-16-characters'
 ash a2a serve
@@ -226,6 +234,31 @@ run. Ash rejects server-requested workspace edits and discards semantic results
 that reference files outside the workspace. Set `lsp_enabled = false` in the
 user config, or `ASH_LSP_ENABLED=false`, to disable the capability globally;
 trusted project config cannot override that user-owned control.
+
+### Durable automation
+
+Ash can persist one-shot, interval, and five-field cron prompts in SQLite and
+execute them through the ordinary trusted runtime:
+
+```bash
+cd /path/to/project
+ash trust add .
+ash cron add dependency-review \
+  --prompt 'Review dependency changes, run focused checks, and report risks' \
+  --cron '30 9 * * mon-fri' --timezone Asia/Kolkata
+ash cron worker
+```
+
+Jobs do not run inside the interactive CLI process. Keep one `ash cron worker`
+under a process supervisor for each workspace, or invoke `ash cron worker
+--once` from an external scheduler. `ash cron status` and `ash doctor` warn
+when enabled jobs have no fresh worker heartbeat. Unattended tool calls use the
+normal permission rules: read-only calls proceed, persistent allows proceed,
+and actions that still require a prompt fail closed. Revoking workspace trust
+stops new claims.
+
+See the [durable automation guide](docs/guides/DURABLE_AUTOMATION.md) for
+schedule, crash-recovery, DST, supervision, SDK, and cancellation contracts.
 
 Inside an interactive terminal, `/help` opens a full-screen searchable command
 reference; redirected input and screen-reader mode keep the linear text output.
@@ -350,7 +383,8 @@ fetch targets and returned search sources. Run `ash setup web` to enter either
 search credential through the hidden-input setup flow.
 
 Browser automation is an optional capability pack. Install with
-`pipx install 'ash-ai[browser]'`, then run `ash setup browser` once to download
+`pipx install --force 'ash-ai[browser] @ git+https://github.com/Suraj-H675/Ash-Harness.git'`,
+then run `ash setup browser` once to download
 Playwright's pinned Chromium build. Browser pages use an isolated context with
 downloads and service workers disabled; navigation, subresources, and
 WebSockets share the public-host and `allowed_web_domains` policy. The model

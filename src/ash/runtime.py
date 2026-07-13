@@ -91,6 +91,7 @@ def build_tools(
     from ash.plugins.runtime import build_plugin_runtime_tools
     from ash.tools.agent import SpawnAgentTool
     from ash.tools.ask_user import AskUserTool
+    from ash.tools.automation import ListAutomationsTool, ManageAutomationTool
     from ash.tools.base import BaseTool
     from ash.tools.browser import build_browser_tools
     from ash.tools.command import RunCommandTool
@@ -184,6 +185,14 @@ def build_tools(
         ActivateSkillTool(safety_guard, catalog),
         ReadSkillResourceTool(safety_guard, catalog),
     ]
+    if runtime_config is not None and runtime_config.automation_enabled:
+        automation_store_path = runtime_config.db_directory / "automation.db"
+        tools.extend(
+            [
+                ListAutomationsTool(safety_guard, automation_store_path),
+                ManageAutomationTool(safety_guard, automation_store_path),
+            ]
+        )
     if lsp_manager is not None:
         tools.append(LSPTool(safety_guard, lsp_manager))
     tools.extend(

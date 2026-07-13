@@ -8,10 +8,12 @@ import signal
 import subprocess
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 
 ProcessStreamCallback = Callable[[str, str], None]
+INHERIT_PROCESS_GROUP_ENV = "ASH_INTERNAL_INHERIT_PROCESS_GROUP"
 
 
 class ProcessOutputLimitExceeded(RuntimeError):
@@ -21,6 +23,8 @@ class ProcessOutputLimitExceeded(RuntimeError):
 def process_group_options() -> dict[str, Any]:
     """Options that place a child in an independently terminable group."""
 
+    if os.environ.get(INHERIT_PROCESS_GROUP_ENV) == "1":
+        return {}
     if sys.platform == "win32":
         return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
     return {"start_new_session": True}
@@ -49,19 +53,110 @@ async def terminate_process_tree(
         await _wait_for_returncode(process, grace_seconds)
         return
 
+    descendants = _descendant_pids(process.pid)
+    _signal_posix_processes(process.pid, descendants, signal.SIGTERM)
+    await asyncio.gather(
+        _wait_for_returncode(process, grace_seconds),
+        _wait_for_pids(descendants, grace_seconds),
+    )
+    survivors = [pid for pid in descendants if _pid_exists(pid)]
+    if process.returncode is None or survivors:
+        _signal_posix_processes(process.pid, survivors, signal.SIGKILL)
+        await asyncio.gather(
+            _wait_for_returncode(process, grace_seconds),
+            _wait_for_pids(survivors, grace_seconds),
+        )
+
+
+def _signal_posix_processes(root: int, descendants: list[int], signum: int) -> None:
+    own_group = os.getpgrp()
+    groups: set[int] = set()
+    individual: list[int] = []
+    for pid in [root, *descendants]:
+        try:
+            group = os.getpgid(pid)
+        except ProcessLookupError:
+            continue
+        if group == own_group:
+            individual.append(pid)
+        else:
+            groups.add(group)
+    for group in groups:
+        try:
+            os.killpg(group, signum)
+        except ProcessLookupError:
+            pass
+    for pid in reversed(individual):
+        try:
+            os.kill(pid, signum)
+        except ProcessLookupError:
+            pass
+
+
+def _descendant_pids(root: int) -> list[int]:
+    parents: dict[int, list[int]] = {}
+    proc = Path("/proc")
+    if proc.is_dir():
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                status = (entry / "status").read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                continue
+            pid = ppid = None
+            for line in status.splitlines():
+                if line.startswith("Pid:"):
+                    pid = int(line.split()[1])
+                elif line.startswith("PPid:"):
+                    ppid = int(line.split()[1])
+            if pid is not None and ppid is not None:
+                parents.setdefault(ppid, []).append(pid)
+    else:
+        try:
+            completed = subprocess.run(
+                ["ps", "-axo", "pid=,ppid="],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+        for line in completed.stdout.splitlines() if completed is not None else ():
+            fields = line.split()
+            if len(fields) == 2 and all(field.isdigit() for field in fields):
+                pid, ppid = (int(field) for field in fields)
+                parents.setdefault(ppid, []).append(pid)
+
+    descendants: list[int] = []
+    pending = list(parents.get(root, ()))
+    while pending:
+        pid = pending.pop()
+        descendants.append(pid)
+        pending.extend(parents.get(pid, ()))
+    return descendants
+
+
+def _pid_exists(pid: int) -> bool:
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.kill(pid, 0)
     except ProcessLookupError:
-        await _wait_for_returncode(process, grace_seconds)
-        return
-    if await _wait_for_returncode(process, grace_seconds):
-        return
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        await _wait_for_returncode(process, grace_seconds)
-        return
-    await _wait_for_returncode(process, grace_seconds)
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _wait_for_pids(pids: list[int], timeout: float) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while any(_pid_exists(pid) for pid in pids):
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.01)
+    return True
 
 
 async def _wait_for_returncode(

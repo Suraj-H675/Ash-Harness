@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
+from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from importlib.metadata import distribution
 from pathlib import Path
@@ -56,6 +58,7 @@ def assert_distribution_metadata() -> None:
         for requirement in requirements
         if requirement.marker is None
     }
+    assert {"croniter", "tzdata"} <= base_names
     assert not (OPTIONAL_DISTRIBUTIONS & base_names)
     marked: dict[str, list[str]] = {}
     for requirement in requirements:
@@ -70,6 +73,13 @@ def assert_distribution_metadata() -> None:
 
     packaged = {str(path).replace("\\", "/") for path in installed.files or ()}
     assert {
+        "ash/automation/models.py",
+        "ash/automation/maintenance.py",
+        "ash/automation/runner.py",
+        "ash/automation/schedules.py",
+        "ash/automation/store.py",
+        "ash/automation/worker.py",
+        "ash/commands/automation.py",
         "ash/commands/lsp.py",
         "ash/lsp/client.py",
         "ash/lsp/config.py",
@@ -91,13 +101,14 @@ def main() -> None:
     from ash.lsp.config import load_lsp_server_configs
     from ash.lsp.manager import LanguageServerManager
     from ash.repo.repomap import calculate_personalized_pagerank
+    from ash.sdk import AshClient
     from ash.tools.lsp import LSPTool
     from ash.tools.symbols import FindSymbolTool
     from ash.ui.turn_input import InteractiveTurnController
 
     assert Path(ash.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
     assert calculate_personalized_pagerank([[0, 1], [1, 0]], [0])
-    assert FindSymbolTool and InteractiveTurnController
+    assert AshClient and FindSymbolTool and InteractiveTurnController
     assert LSPClient and LanguageServerManager and load_lsp_server_configs and LSPTool
     assert files("ash.sandbox").joinpath("Dockerfile").is_file()
     assert_distribution_metadata()
@@ -145,7 +156,13 @@ def main() -> None:
                 "OPENAI_API_KEY",
             }
         }
-        env.update({"HOME": str(home), "USERPROFILE": str(home)})
+        env.update(
+            {
+                "HOME": str(home),
+                "USERPROFILE": str(home),
+                "OLLAMA_API_BASE": "http://127.0.0.1:1",
+            }
+        )
 
         shared_state = SharedState(root / "agents.db")
         try:
@@ -220,10 +237,110 @@ def main() -> None:
         assert entries["workspace_root"]["value"] == str(workspace.resolve())
         assert entries["lsp_enabled"]["value"] is True
 
+        created_automation = json.loads(
+            run_ash(
+                "cron",
+                "add",
+                "wheel review",
+                "--prompt",
+                "Review installed automation",
+                "--every",
+                "1h",
+                "--json",
+                cwd=workspace,
+                env=env,
+            ).stdout
+        )
+        assert created_automation["schedule"]["kind"] == "every"
+        named_timezone = json.loads(
+            run_ash(
+                "cron",
+                "add",
+                "wheel weekday",
+                "--prompt",
+                "Review the weekday build",
+                "--cron",
+                "30 9 * * mon-fri",
+                "--timezone",
+                "Asia/Kolkata",
+                "--json",
+                cwd=workspace,
+                env=env,
+            ).stdout
+        )
+        assert named_timezone["schedule"]["timezone"] == "Asia/Kolkata"
+
+        due_at = datetime.now(timezone.utc) + timedelta(seconds=3)
+        due = json.loads(
+            run_ash(
+                "cron",
+                "add",
+                "wheel due failure",
+                "--prompt",
+                "Exercise the installed automation runtime",
+                "--at",
+                due_at.isoformat(),
+                "--timeout",
+                "8",
+                "--json",
+                cwd=workspace,
+                env=env,
+            ).stdout
+        )
+        time.sleep(max(0.0, due_at.timestamp() - time.time()) + 0.2)
+        automation_status = json.loads(
+            run_ash("cron", "status", "--json", cwd=workspace, env=env).stdout
+        )
+        assert automation_status["active_jobs"] == 3
+        assert automation_status["workers"] == []
+        worker_once = json.loads(
+            run_ash(
+                "cron",
+                "worker",
+                "--once",
+                "--json",
+                cwd=workspace,
+                env=env,
+                expected=1,
+            ).stdout
+        )
+        assert worker_once == {
+            "cancelled": 0,
+            "completed": 1,
+            "failed": 1,
+            "interrupted": 0,
+            "ok": False,
+            "skipped": 0,
+            "stopped": False,
+            "succeeded": 0,
+        }
+        history = json.loads(
+            run_ash(
+                "cron",
+                "history",
+                due["job_id"],
+                "--json",
+                cwd=workspace,
+                env=env,
+            ).stdout
+        )
+        assert len(history) == 1
+        assert history[0]["status"] == "failed"
+        assert history[0]["finished_at"] is not None
+
+        doctor = json.loads(
+            run_ash("doctor", "--json", cwd=workspace, env=env).stdout
+        )
+        automation_check = next(
+            check for check in doctor["checks"] if check["name"] == "automation"
+        )
+        assert automation_check["status"] == "warn"
+        assert "no live worker" in automation_check["message"]
+
         server_env = dict(env)
         server_env["ASH_SERVER_TOKEN"] = "0123456789abcdef"
         server = run_ash("serve", cwd=workspace, env=server_env, expected=2)
-        assert "ash[server]" in server.stderr
+        assert "ash-ai[server]" in server.stderr
 
     print("minimal installed-wheel smoke passed")
 

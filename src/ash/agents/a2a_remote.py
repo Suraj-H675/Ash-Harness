@@ -127,10 +127,15 @@ class DelegateRemoteAgentTool(BaseTool):
             )
         except ModuleNotFoundError as exc:
             if exc.name == "a2a" or (exc.name or "").startswith("a2a."):
+                from ash.install import pipx_install_command
+
                 return ToolResult(
                     success=False,
                     output="",
-                    error="A2A support requires `pip install 'ash-ai[a2a]'`.",
+                    error=(
+                        "A2A support requires "
+                        f"`{pipx_install_command('a2a')}`."
+                    ),
                 )
             raise
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:

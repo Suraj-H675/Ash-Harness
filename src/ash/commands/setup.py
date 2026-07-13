@@ -123,9 +123,12 @@ def run_setup_wizard(args) -> SetupOutcome:
             if _browser_is_installed():
                 print("Playwright Chromium is installed.")
                 return SetupOutcome.SUCCESS
+            from ash.install import pipx_install_command
+
             print(
                 "Error: browser automation is not installed. Install "
-                "`ash-ai[browser]`, then run `ash setup browser`.",
+                f"it with `{pipx_install_command('browser')}`, then run "
+                "`ash setup browser`.",
                 file=sys.stderr,
             )
             return SetupOutcome.ERROR
@@ -222,9 +225,11 @@ def setup_browser() -> SetupOutcome:
 
     _print_header("Browser Automation Setup")
     if importlib.util.find_spec("playwright") is None:
+        from ash.install import pipx_install_command
+
         print(
             "  Playwright is not installed. Install Ash with the browser extra:\n"
-            "\n    pipx install 'ash-ai[browser]'\n",
+            f"\n    {pipx_install_command('browser')}\n",
             file=sys.stderr,
         )
         return SetupOutcome.ERROR
