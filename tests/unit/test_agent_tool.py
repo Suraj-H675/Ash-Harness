@@ -5,12 +5,14 @@ import subprocess
 from ash.agents.shared_state import SharedState
 from ash.config import AshConfig
 from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.guard import SafetyGuard
 from ash.tools.agent import SpawnAgentTool
 
 
 class FakeProvider(ProviderABC):
     model_name = "fake"
+    _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
 
     async def stream_chat(self, messages, temperature=0.0, tools=None):
         assert messages[-1]["content"] == "inspect tests"

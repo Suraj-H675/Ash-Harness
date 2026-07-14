@@ -338,7 +338,7 @@ not remove them.
 
 | Domain | State on 2026-07-13 | Key gap |
 |---|---|---|
-| Agent loop and streaming | Partial | Public event schema v1 and validated provider-portable message/content/tool-call inputs now span the runtime and adapters; the loop remains monolithic and legacy XML fallback is mixed into canonical behavior. |
+| Agent loop and streaming | Strong | Public event schema v1, validated provider-portable messages, typed terminal outcomes, and capability-selected native/XML paths span the runtime and adapters. EOF, truncation, filtering, post-terminal output, and cross-protocol calls fail closed; richer provider content blocks and a smaller loop remain. |
 | Provider layer | Strong partial | Built-ins, embedders, declared model capabilities, and custom OpenAI-compatible endpoints resolve through thread-safe linked registries; auth/discovery and non-text modalities remain limited. |
 | Coding tools | Strong | Exact-schema deferred tool search, guarded Brave/Tavily live search, an optional isolated Playwright browser, and policy-routed automation management are live; PTY terminal sessions, media, and messaging remain. |
 | Context budgets | Strong partial | Provider totals reserve only currently visible tool schemas; large catalogs defer nonessential tools behind session-scoped search activation. Typed hashed fragments and deterministic compaction preserve provenance and task/path/action/outcome state. Model-assisted compaction remains. |

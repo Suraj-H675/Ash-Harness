@@ -3,7 +3,9 @@
 from typing import Iterable
 
 
-from ash.ui.parser import StreamingXMLParser
+import pytest
+
+from ash.ui.parser import StreamingXMLParseError, StreamingXMLParser
 
 
 def _drive(parser: StreamingXMLParser, *chunks: str) -> list[tuple[str, object]]:
@@ -93,8 +95,8 @@ def test_fragmented_thought_streams_partial_content() -> None:
 
     # Partial thought yields carry just the new chunk.
     assert events_partial == [("thought", "rea"), ("thought", "soning")]
-    # The closing yield carries the cumulative content.
-    assert events_close == [("thought", "reasoning")]
+    # The close does not replay content already emitted incrementally.
+    assert events_close == []
 
 
 def test_thought_then_text_yields_in_order() -> None:
@@ -282,8 +284,65 @@ def test_thought_with_partial_chunk_emits_only_new_content() -> None:
     # Partial yields should contain only the just-arrived slice.
     assert first == [("thought", "alpha")]
     assert second == [("thought", " beta")]
-    # Final yield contains the full accumulated thought text.
-    assert final == [("thought", "alpha beta")]
+    # The close does not replay content already emitted incrementally.
+    assert final == []
+
+
+def test_finish_preserves_unknown_markup_and_partial_comparison() -> None:
+    parser = StreamingXMLParser()
+
+    assert _drive(parser, "comparison: 1 < 2 and <custom>markup</custom>") == [
+        ("token", "comparison: 1 ")
+    ]
+    assert parser.finish() == [
+        ("token", "< 2 and <custom>markup</custom>")
+    ]
+
+
+def test_finish_rejects_incomplete_tool_control_elements() -> None:
+    parser = StreamingXMLParser()
+    _drive(parser, '<call_tool name="write_file"><arg name="file_path">x')
+
+    with pytest.raises(StreamingXMLParseError, match="incomplete tool argument"):
+        parser.finish()
+
+    assert _drive(parser, "fresh") == [("token", "fresh")]
+
+
+def test_response_body_is_literal_for_every_chunk_boundary() -> None:
+    inner = (
+        'example <call_tool name="capture"><arg name="text">never</arg>'
+        "</call_tool>"
+    )
+    payload = f"<response>{inner}</response>"
+    chunkings = ([payload], ["<response>", inner, "</response>"], list(payload))
+
+    for chunks in chunkings:
+        parser = StreamingXMLParser()
+        events = _drive(parser, *chunks)
+        events.extend(parser.finish())
+
+        assert all(kind == "token" for kind, _ in events)
+        assert "".join(str(value) for _, value in events) == inner
+
+
+def test_recognized_elements_are_processed_in_source_order() -> None:
+    parser = StreamingXMLParser()
+
+    events = _drive(
+        parser,
+        '<call_tool name="first"></call_tool>'
+        "<thought>reason</thought>"
+        "<response>answer</response>"
+        '<call_tool name="second"></call_tool>',
+    )
+
+    assert events == [
+        ("tool_call", {"name": "first", "arguments": {}}),
+        ("thought", "reason"),
+        ("token", "answer"),
+        ("tool_call", {"name": "second", "arguments": {}}),
+    ]
 
 
 def test_consumer_can_iterate_during_streaming() -> None:

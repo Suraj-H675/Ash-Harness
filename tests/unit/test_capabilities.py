@@ -78,7 +78,10 @@ def test_capability_registry_rejects_duplicate_or_invalid_resolvers() -> None:
 
 
 def test_unknown_capability_family_uses_stable_defaults() -> None:
-    assert CapabilityRegistry().resolve("missing", "model") == ProviderCapabilities()
+    capabilities = CapabilityRegistry().resolve("missing", "model")
+
+    assert capabilities == ProviderCapabilities()
+    assert capabilities.native_tools is False
 
 
 @pytest.mark.asyncio

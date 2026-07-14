@@ -1,7 +1,7 @@
 import pytest
 
 from ash.providers.base import ProviderABC, StreamChunk
-from ash.providers.capabilities import infer_capabilities
+from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
 from ash.providers.failover import FailoverProvider
 
 
@@ -31,6 +31,10 @@ class FakeProvider(ProviderABC):
         if self.error:
             raise self.error
         yield StreamChunk(content=self._name, is_done=True)
+
+
+class NativeFakeProvider(FakeProvider):
+    _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
 
 
 @pytest.mark.asyncio
@@ -79,9 +83,47 @@ async def test_failover_failure_diagnostics_are_request_scoped() -> None:
     assert provider.failures == ["primary: new-first"]
 
 
+@pytest.mark.asyncio
+async def test_failover_uses_backup_after_empty_primary_eof() -> None:
+    class EmptyProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            if False:  # pragma: no cover - keep this an async generator
+                yield StreamChunk()
+
+    provider = FailoverProvider([EmptyProvider("empty"), FakeProvider("backup")])
+
+    chunks = [chunk async for chunk in provider.stream_chat([])]
+
+    assert [chunk.content for chunk in chunks] == ["backup"]
+    assert provider.failures == [
+        "empty: provider 'empty' ended before a terminal chunk"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failover_uses_backup_after_metadata_only_terminal_error() -> None:
+    class LimitedProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(is_done=True, stop_reason="rate_limit")
+
+    provider = FailoverProvider([LimitedProvider("limited"), FakeProvider("backup")])
+
+    chunks = [chunk async for chunk in provider.stream_chat([])]
+
+    assert [chunk.content for chunk in chunks] == ["backup"]
+    assert provider.failures == [
+        "limited: provider reported an unsuccessful terminal outcome: rate_limit"
+    ]
+
+
 def test_capabilities_are_conservative_for_local_models() -> None:
     local = infer_capabilities("ollama", "unknown")
     assert local.local is True
     assert local.native_tools is False
     sonnet = infer_capabilities("anthropic", "claude-sonnet-4-6")
     assert sonnet.context_window == 1_000_000
+
+
+def test_failover_rejects_mixed_native_and_fallback_protocols() -> None:
+    with pytest.raises(ValueError, match="must agree on native tool support"):
+        FailoverProvider([NativeFakeProvider("native"), FakeProvider("fallback")])

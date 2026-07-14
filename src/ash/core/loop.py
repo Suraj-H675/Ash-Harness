@@ -5,7 +5,7 @@ V1 minimal loop. The cycle is:
     ingest user prompt
       -> build context (system prompt + session history)
       -> stream chat completion from provider
-      -> parse XML events as they arrive (thought, token, tool_call)
+      -> normalize native tool events or parse the XML fallback protocol
       -> on tool_call: safety-check, request approval, execute, persist
       -> on terminal text: persist assistant message, return
 
@@ -28,6 +28,7 @@ from typing import (
     Awaitable,
     Callable,
     ContextManager,
+    Literal,
     Protocol,
     Sequence,
 )
@@ -47,7 +48,15 @@ from ash.core.session import (
 from ash.core.redaction import redact_text, redact_value
 from ash.logging import get_logger
 from ash.mcp.server import MCPServerConfig, load_mcp_servers
-from ash.providers.base import ProviderABC, TokenCounterLike
+from ash.providers.base import (
+    CompletionOutcome,
+    CompletionStopCategory,
+    ProviderABC,
+    ProviderCompletionError,
+    ProviderTerminalError,
+    TokenCounterLike,
+    completion_stop_category,
+)
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.messages import CanonicalToolCall, normalize_messages
 from ash.providers.retry import (
@@ -155,11 +164,19 @@ SYSTEM_PROMPT_TEMPLATE = """You are Ash, a terminal-native AI coding harness. Yo
 4. NEVER attempt to execute raw destruction commands (e.g. formatting disks, mass deletes).
 
 ### Operational Rules
-1. PLAN BEFORE ACTING: Write out your planned steps inside a `<thought>` tag before invoking any tools.
+1. PLAN BEFORE ACTING: Briefly reason through the necessary steps before invoking tools.
 2. STREAM PROGRESS: Work incrementally. Write files, run tests, and debug errors step-by-step. Do not attempt to write 10 files in one go without verifying compilation.
 3. CONTEXT INTEGRITY: Maintain existing documentation and codebase styles. Do not remove comments unless explicitly told to.
 
-### Tool Call Format
+{tool_protocol}
+"""
+
+NATIVE_TOOL_PROTOCOL = """### Tool Call Format
+Use only the provider's native tool-calling interface for tool invocations. Do not
+write XML tool-call or response wrappers. Return ordinary assistant text directly
+when no tool is required."""
+
+XML_TOOL_PROTOCOL = """### Tool Call Format
 To call a tool, you must output an XML element matching this schema:
 <call_tool name="tool_name">
 <arg name="param1">value1</arg>
@@ -181,10 +198,15 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _default_system_prompt(project_root: Path) -> str:
+def _default_system_prompt(
+    project_root: Path,
+    *,
+    native_tools: bool,
+) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(
         project_path=str(project_root),
         os_platform=_detect_platform(),
+        tool_protocol=(NATIVE_TOOL_PROTOCOL if native_tools else XML_TOOL_PROTOCOL),
     )
 
 
@@ -331,7 +353,10 @@ class AshLoop:
         for tool in self.tools.values():
             tool.set_event_sink(self._emit_event)
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
-        self.system_prompt = system_prompt or _default_system_prompt(project_root)
+        self.system_prompt = system_prompt or _default_system_prompt(
+            project_root,
+            native_tools=_provider_capabilities(provider).native_tools,
+        )
         if additional_instructions:
             self.system_prompt = f"{self.system_prompt}\n\n{additional_instructions}"
         self._base_system_prompt = self.system_prompt
@@ -965,15 +990,7 @@ class AshLoop:
                 },
             )
             try:
-                (
-                    assistant_text,
-                    tool_calls,
-                    turn_prompt_tokens,
-                    turn_completion_tokens,
-                    turn_cache_read_tokens,
-                    turn_cache_write_tokens,
-                    turn_usage_source,
-                ) = await self._stream_one_completion(messages)
+                model_completion = await self._stream_one_completion(messages)
             except asyncio.CancelledError:
                 await self._fire_hook_lifecycle(
                     "post_model",
@@ -999,6 +1016,13 @@ class AshLoop:
                     },
                 )
                 raise
+            assistant_text = model_completion.text
+            tool_calls = [call.to_wire() for call in model_completion.tool_calls]
+            turn_prompt_tokens = model_completion.prompt_tokens
+            turn_completion_tokens = model_completion.completion_tokens
+            turn_cache_read_tokens = model_completion.cache_read_tokens
+            turn_cache_write_tokens = model_completion.cache_write_tokens
+            turn_usage_source = model_completion.usage_source
             await self._fire_hook_lifecycle(
                 "post_model",
                 {
@@ -1375,7 +1399,7 @@ class AshLoop:
     async def _stream_one_completion(
         self,
         messages: list[dict[str, Any]],
-    ) -> tuple[str, list[dict[str, Any]], int, int, int, int, str]:
+    ) -> CompletionOutcome:
         """Stream one completion with normalized token and cache usage."""
 
         canonical_messages = normalize_messages(messages)
@@ -1387,7 +1411,8 @@ class AshLoop:
             else None
         )
 
-        parser = StreamingXMLParser()
+        native_protocol = _provider_capabilities(self.provider).native_tools
+        parser = None if native_protocol else StreamingXMLParser()
         text_chunks: list[str] = []
         response_fragments: list[str] = []
         tool_calls: list[dict[str, Any]] = []
@@ -1395,8 +1420,10 @@ class AshLoop:
         completion_tokens = 0
         cache_read_tokens = 0
         cache_write_tokens = 0
-        usage_source = "unavailable"
+        usage_source: Literal["provider", "estimated", "unavailable"] = "unavailable"
         native_tool_calls_from_api: list[CanonicalToolCall] = []
+        saw_terminal = False
+        terminal_stop_reason: str | None = None
         maximum_attempts = int(getattr(self._config, "provider_max_attempts", 3))
         retry_base_delay = float(
             getattr(self._config, "provider_retry_base_delay", 0.5)
@@ -1408,28 +1435,87 @@ class AshLoop:
             with self.ui.begin_turn():
                 attempt = 1
                 while True:
-                    emitted = False
+                    emitted_output = False
                     try:
                         async for chunk in self.provider.stream_chat(
                             canonical_messages, tools=openai_tools
                         ):
-                            emitted = True
-                            for fragment in (chunk.content, chunk.tool_call_delta):
-                                if not fragment:
-                                    continue
-                                response_fragments.append(fragment)
-                                for event in parser.feed(fragment):
+                            chunk_has_output = bool(
+                                chunk.content
+                                or chunk.tool_call_delta
+                                or chunk.native_tool_calls
+                            )
+                            if saw_terminal and chunk_has_output:
+                                raise ProviderCompletionError(
+                                    "provider emitted output after its terminal chunk"
+                                )
+                            emitted_output = emitted_output or chunk_has_output
+                            if chunk.content:
+                                response_fragments.append(chunk.content)
+                                if parser is None:
+                                    self._handle_event(
+                                        ("token", chunk.content),
+                                        text_chunks,
+                                        tool_calls,
+                                    )
+                                else:
+                                    for event in parser.feed(chunk.content):
+                                        self._handle_event(
+                                            event, text_chunks, tool_calls
+                                        )
+                            if chunk.tool_call_delta and parser is not None:
+                                response_fragments.append(chunk.tool_call_delta)
+                                for event in parser.feed(chunk.tool_call_delta):
                                     self._handle_event(event, text_chunks, tool_calls)
+                            elif chunk.tool_call_delta:
+                                raise ProviderCompletionError(
+                                    "native provider emitted an XML fallback tool delta"
+                                )
                             if chunk.native_tool_calls:
+                                if not native_protocol:
+                                    raise ProviderCompletionError(
+                                        "fallback provider emitted native tool calls "
+                                        "without declaring native tool support"
+                                    )
                                 native_tool_calls_from_api.extend(
                                     chunk.native_tool_calls
                                 )
                             if chunk.is_done:
-                                prompt_tokens = chunk.prompt_tokens
-                                completion_tokens = chunk.completion_tokens
-                                cache_read_tokens = chunk.cache_read_tokens
-                                cache_write_tokens = chunk.cache_write_tokens
-                                usage_source = chunk.usage_source
+                                first_terminal = not saw_terminal
+                                if first_terminal:
+                                    saw_terminal = True
+                                    terminal_stop_reason = chunk.stop_reason
+                                elif chunk.stop_reason is not None:
+                                    next_category = completion_stop_category(
+                                        chunk.stop_reason
+                                    )
+                                    current_category = completion_stop_category(
+                                        terminal_stop_reason
+                                    )
+                                    if (
+                                        terminal_stop_reason is not None
+                                        and next_category != current_category
+                                    ):
+                                        raise ProviderCompletionError(
+                                            "provider emitted conflicting terminal "
+                                            "stop reasons"
+                                        )
+                                    if terminal_stop_reason is None:
+                                        terminal_stop_reason = chunk.stop_reason
+                                authoritative_usage = any(
+                                    (
+                                        chunk.prompt_tokens,
+                                        chunk.completion_tokens,
+                                        chunk.cache_read_tokens,
+                                        chunk.cache_write_tokens,
+                                    )
+                                )
+                                if first_terminal or authoritative_usage:
+                                    prompt_tokens = chunk.prompt_tokens
+                                    completion_tokens = chunk.completion_tokens
+                                    cache_read_tokens = chunk.cache_read_tokens
+                                    cache_write_tokens = chunk.cache_write_tokens
+                                    usage_source = chunk.usage_source
                                 if usage_source == "unavailable" and any(
                                     (
                                         prompt_tokens,
@@ -1439,13 +1525,24 @@ class AshLoop:
                                     )
                                 ):
                                     usage_source = "provider"
+                                if (
+                                    completion_stop_category(terminal_stop_reason)
+                                    == CompletionStopCategory.ERROR
+                                ):
+                                    if emitted_output:
+                                        detail = terminal_stop_reason or "error"
+                                        raise ProviderCompletionError(
+                                            "provider completion was not safe to "
+                                            f"finalize: {detail} (error)"
+                                        )
+                                    raise ProviderTerminalError(terminal_stop_reason)
                         break
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:  # noqa: BLE001
                         failure = classify_provider_failure(exc)
                         if (
-                            emitted
+                            emitted_output
                             or not failure.retriable
                             or attempt >= maximum_attempts
                         ):
@@ -1496,11 +1593,35 @@ class AshLoop:
                             safe_reason,
                         )
                         await asyncio.sleep(delay)
+                        saw_terminal = False
+                        terminal_stop_reason = None
+                        prompt_tokens = 0
+                        completion_tokens = 0
+                        cache_read_tokens = 0
+                        cache_write_tokens = 0
+                        usage_source = "unavailable"
                         attempt += 1
+                if not saw_terminal:
+                    raise ProviderCompletionError(
+                        "provider stream ended before a terminal chunk"
+                    )
+                stop_category = completion_stop_category(terminal_stop_reason)
+                if stop_category != CompletionStopCategory.COMPLETE:
+                    detail = terminal_stop_reason or stop_category.value
+                    raise ProviderCompletionError(
+                        "provider completion was not safe to finalize: "
+                        f"{detail} ({stop_category.value})"
+                    )
+                if parser is not None:
+                    try:
+                        final_events = parser.finish()
+                    except ValueError as exc:
+                        raise ProviderCompletionError(
+                            f"fallback protocol could not be finalized: {exc}"
+                        ) from exc
+                    for event in final_events:
+                        self._handle_event(event, text_chunks, tool_calls)
                 self.provider_circuit_breaker.record_success(self._provider_circuit_key)
-                # Drain the parser's remaining buffer at end-of-stream.
-                for event in parser.feed(""):
-                    self._handle_event(event, text_chunks, tool_calls)
         finally:
             self.ui.finalize_turn()
 
@@ -1533,14 +1654,15 @@ class AshLoop:
             cache_write_tokens = 0
             usage_source = "estimated"
 
-        return (
-            "".join(text_chunks),
-            tool_calls,
-            prompt_tokens,
-            completion_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            usage_source,
+        return CompletionOutcome(
+            text="".join(text_chunks),
+            tool_calls=[CanonicalToolCall.model_validate(call) for call in tool_calls],
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            usage_source=usage_source,
+            stop_reason=terminal_stop_reason,
         )
 
     def _handle_event(

@@ -11,6 +11,7 @@ from ash.agents.shared_state import SharedState
 from ash.agents.tasks import AgentTaskCreate, AgentTaskError
 from ash.config import AshConfig
 from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.guard import SafetyGuard
 from ash.tools.agent import SpawnAgentTool
 from ash.tools.delegate import DelegateAgentsTool
@@ -70,6 +71,7 @@ class CancellableProvider(ProviderABC):
 
 class WorktreeHandoffProvider(ProviderABC):
     model_name = "handoff-provider"
+    _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
 
     def __init__(self) -> None:
         self.calls = 0

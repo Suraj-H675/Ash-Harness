@@ -26,7 +26,13 @@ from typing import Any, AsyncGenerator, Callable
 import pytest
 from pathlib import Path
 
-from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from ash.providers.base import (
+    CompletionStopCategory,
+    ProviderABC,
+    StreamChunk,
+    TokenCounterLike,
+    completion_stop_category,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +269,22 @@ def test_provider_token_counter_uses_word_count() -> None:
 def test_provider_abstract_cannot_be_instantiated() -> None:
     with pytest.raises(TypeError):
         ProviderABC()  # type: ignore[abstract]
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        (None, CompletionStopCategory.COMPLETE),
+        ("stop", CompletionStopCategory.COMPLETE),
+        ("tool_calls", CompletionStopCategory.COMPLETE),
+        ("max_tokens", CompletionStopCategory.TRUNCATED),
+        ("content_filter", CompletionStopCategory.FILTERED),
+        ("rate_limit", CompletionStopCategory.ERROR),
+        ("vendor_unknown_reason", CompletionStopCategory.ERROR),
+    ],
+)
+def test_completion_stop_reasons_normalize_fail_closed(reason, expected) -> None:
+    assert completion_stop_category(reason) == expected
 
 
 # ---------------------------------------------------------------------------

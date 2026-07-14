@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from ash.core.loop import AshLoop
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult
 from ash.tools.tool_search import SearchToolsTool
@@ -73,6 +74,7 @@ async def test_tool_search_ranks_activates_and_resets_exact_schemas(tmp_path) ->
 
 class SearchFlowProvider(ProviderABC):
     model_name = "search-flow"
+    _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
 
     def __init__(self) -> None:
         self.calls = 0

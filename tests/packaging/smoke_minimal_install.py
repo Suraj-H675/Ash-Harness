@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -97,14 +99,20 @@ def main() -> None:
     import ash
     from ash.agents.shared_state import SharedState
     from ash.agents.subprocess_agent import SubprocessAgent, make_simple_text_task
+    from ash.core.loop import AshLoop
+    from ash.core.session import SessionStore
     from ash.lsp.client import LSPClient
     from ash.lsp.config import load_lsp_server_configs
     from ash.lsp.manager import LanguageServerManager
     from ash.repo.repomap import calculate_personalized_pagerank
+    from ash.providers.base import ProviderABC, StreamChunk
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.safety.guard import SafetyGuard
     from ash.sdk import AshClient
     from ash.tools.lsp import LSPTool
     from ash.tools.symbols import FindSymbolTool
     from ash.ui.turn_input import InteractiveTurnController
+    from ash.ui.headless import HeadlessUI
 
     assert Path(ash.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
     assert calculate_personalized_pagerank([[0, 1], [1, 0]], [0])
@@ -163,6 +171,42 @@ def main() -> None:
                 "OLLAMA_API_BASE": "http://127.0.0.1:1",
             }
         )
+
+        class InstalledNativeProvider(ProviderABC):
+            model_name = "installed-native-smoke"
+            _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+            def count_tokens(self, text: str) -> int:
+                return len(text)
+
+            async def stream_chat(self, messages, temperature=0.0, tools=None):
+                yield StreamChunk(
+                    content=(
+                        "comparison: 1 < 2; literal "
+                        '<call_tool name="never_execute"></call_tool>'
+                    ),
+                    is_done=True,
+                    stop_reason="stop",
+                )
+
+        async def verify_native_protocol() -> None:
+            loop = AshLoop(
+                SessionStore(root / "native-protocol.db"),
+                InstalledNativeProvider(),
+                SafetyGuard(project_root=workspace),
+                HeadlessUI(output_format="text", stream=io.StringIO()),
+                workspace,
+            )
+            try:
+                result = await loop.run_turn("preserve native text")
+                assert result == (
+                    "comparison: 1 < 2; literal "
+                    '<call_tool name="never_execute"></call_tool>'
+                )
+            finally:
+                await loop.aclose()
+
+        asyncio.run(verify_native_protocol())
 
         shared_state = SharedState(root / "agents.db")
         try:

@@ -8,7 +8,7 @@ from ash.config import AshConfig
 from ash.context.turn import TurnContext
 from ash.core.session import Message, SessionStore, ToolCallRecord, get_db_connection
 from ash.hooks.registry import HookRegistry, LifecycleHook, SessionStartHook
-from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.base import ProviderABC, ProviderCompletionError, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.retry import ProviderCircuitBreaker, ProviderCircuitOpen
 from ash.safety.grants import PermissionRule, RuleEffect
@@ -103,6 +103,7 @@ async def test_loop_rejects_invalid_canonical_messages_before_provider(tmp_path)
 
 class NativeToolProvider(ProviderABC):
     model_name = "native-test"
+    _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
 
     def __init__(self):
         self.calls = 0
@@ -127,6 +128,29 @@ class NativeToolProvider(ProviderABC):
             )
         else:
             yield StreamChunk(content="done", is_done=True)
+
+
+class NativePlainTextProvider(ProviderABC):
+    model_name = "native-plain-text"
+    _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+    def __init__(self, *, stop_reason="stop", terminal=True):
+        self.stop_reason = stop_reason
+        self.terminal = terminal
+
+    def count_tokens(self, text):
+        return len(text)
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        yield StreamChunk(
+            content=(
+                "comparison: 1 < 2; example "
+                '<call_tool name="capture"><arg name="text">never</arg>'
+                "</call_tool>"
+            ),
+            is_done=self.terminal,
+            stop_reason=self.stop_reason if self.terminal else None,
+        )
 
 
 class BudgetExhaustingToolProvider(ProviderABC):
@@ -218,6 +242,472 @@ class BudgetTool(BaseTool):
 
     async def run(self, **kwargs):
         return ToolResult(success=True, output="ok")
+
+
+@pytest.mark.asyncio
+async def test_native_protocol_preserves_markup_and_never_parses_textual_xml(
+    tmp_path,
+) -> None:
+    provider = NativePlainTextProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "native-markup.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+
+    outcome = await loop._stream_one_completion([])
+
+    assert outcome.text == (
+        "comparison: 1 < 2; example "
+        '<call_tool name="capture"><arg name="text">never</arg></call_tool>'
+    )
+    assert outcome.tool_calls == []
+    assert "provider's native tool-calling interface" in loop.system_prompt
+    assert "<call_tool" not in loop.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_fallback_protocol_retains_xml_instructions(tmp_path) -> None:
+    loop = AshLoop(
+        SessionStore(tmp_path / "fallback-prompt.db"),
+        MockProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+
+    assert "<call_tool" in loop.system_prompt
+    assert "provider's native tool-calling interface" not in loop.system_prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True])
+async def test_provider_eof_never_releases_pending_tool_calls(
+    tmp_path,
+    native: bool,
+) -> None:
+    class EOFProvider(ProviderABC):
+        model_name = "eof-provider"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=native)
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            if native:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "call_id": "eof-call",
+                            "name": "capture",
+                            "arguments": {"text": "never"},
+                        }
+                    ]
+                )
+            else:
+                yield StreamChunk(
+                    content=(
+                        '<call_tool name="capture"><arg name="text">never</arg>'
+                        "</call_tool>"
+                    )
+                )
+
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    loop = AshLoop(
+        SessionStore(tmp_path / f"provider-eof-{native}.db"),
+        EOFProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={"capture": tool},
+    )
+
+    with pytest.raises(ProviderCompletionError, match="before a terminal chunk"):
+        await loop.run_turn("do not execute incomplete output")
+
+    assert tool.arguments is None
+
+
+@pytest.mark.asyncio
+async def test_provider_output_after_terminal_chunk_is_rejected(tmp_path) -> None:
+    class PostTerminalProvider(ProviderABC):
+        model_name = "post-terminal"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="first", is_done=True, stop_reason="stop")
+            yield StreamChunk(content="forbidden")
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "post-terminal.db"),
+        PostTerminalProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+
+    with pytest.raises(ProviderCompletionError, match="after its terminal chunk"):
+        await loop.run_turn("reject post-terminal output")
+
+
+@pytest.mark.asyncio
+async def test_fallback_provider_cannot_inject_native_tool_calls(tmp_path) -> None:
+    class MismatchedProvider(ProviderABC):
+        model_name = "mismatched"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(
+                is_done=True,
+                native_tool_calls=[
+                    {
+                        "call_id": "unexpected-native",
+                        "name": "capture",
+                        "arguments": {"text": "never"},
+                    }
+                ],
+            )
+
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    loop = AshLoop(
+        SessionStore(tmp_path / "mismatched-protocol.db"),
+        MismatchedProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={"capture": tool},
+    )
+
+    with pytest.raises(ProviderCompletionError, match="without declaring"):
+        await loop.run_turn("do not cross protocols")
+
+    assert tool.arguments is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True])
+async def test_truncated_completion_never_releases_tool_calls(
+    tmp_path,
+    native: bool,
+) -> None:
+    class TruncatedProvider(ProviderABC):
+        model_name = "truncated"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=native)
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            if native:
+                yield StreamChunk(
+                    is_done=True,
+                    stop_reason="length",
+                    native_tool_calls=[
+                        {
+                            "call_id": "truncated-call",
+                            "name": "capture",
+                            "arguments": {"text": "never"},
+                        }
+                    ],
+                )
+            else:
+                yield StreamChunk(
+                    content=(
+                        '<call_tool name="capture"><arg name="text">never</arg>'
+                        "</call_tool>"
+                    ),
+                    is_done=True,
+                    stop_reason="length",
+                )
+
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    loop = AshLoop(
+        SessionStore(tmp_path / f"truncated-{native}.db"),
+        TruncatedProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={"capture": tool},
+    )
+
+    with pytest.raises(ProviderCompletionError, match=r"length \(truncated\)"):
+        await loop.run_turn("do not execute truncated output")
+
+    assert tool.arguments is None
+
+
+@pytest.mark.asyncio
+async def test_later_terminal_cannot_upgrade_truncated_tool_call(tmp_path) -> None:
+    class ConflictingTerminalProvider(ProviderABC):
+        model_name = "conflicting-terminal"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(
+                is_done=True,
+                stop_reason="length",
+                native_tool_calls=[
+                    {
+                        "call_id": "truncated-call",
+                        "name": "capture",
+                        "arguments": {"text": "never"},
+                    }
+                ],
+            )
+            yield StreamChunk(is_done=True, stop_reason="stop")
+
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    loop = AshLoop(
+        SessionStore(tmp_path / "conflicting-terminal.db"),
+        ConflictingTerminalProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={"capture": tool},
+    )
+
+    with pytest.raises(ProviderCompletionError, match="conflicting terminal"):
+        await loop.run_turn("do not upgrade truncated calls")
+
+    assert tool.arguments is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("usage_in_tail", [False, True])
+async def test_terminal_usage_tails_preserve_authoritative_accounting(
+    tmp_path,
+    usage_in_tail: bool,
+) -> None:
+    class UsageTailProvider(ProviderABC):
+        model_name = "usage-tail"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return 999
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            usage = {
+                "prompt_tokens": 12,
+                "completion_tokens": 4,
+                "cache_read_tokens": 3,
+                "cache_write_tokens": 2,
+                "usage_source": "provider",
+            }
+            yield StreamChunk(
+                content="done",
+                is_done=True,
+                stop_reason="stop",
+                **({} if usage_in_tail else usage),
+            )
+            yield StreamChunk(
+                is_done=True,
+                **(usage if usage_in_tail else {}),
+            )
+
+    loop = AshLoop(
+        SessionStore(tmp_path / f"usage-tail-{usage_in_tail}.db"),
+        UsageTailProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+
+    outcome = await loop._stream_one_completion([])
+
+    assert outcome.prompt_tokens == 12
+    assert outcome.completion_tokens == 4
+    assert outcome.cache_read_tokens == 3
+    assert outcome.cache_write_tokens == 2
+    assert outcome.usage_source == "provider"
+
+
+@pytest.mark.asyncio
+async def test_native_provider_rejects_xml_tool_delta_channel(tmp_path) -> None:
+    class NativeDeltaProvider(ProviderABC):
+        model_name = "native-delta"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(
+                tool_call_delta='<call_tool name="capture"></call_tool>',
+                is_done=True,
+            )
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "native-delta.db"),
+        NativeDeltaProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+
+    with pytest.raises(ProviderCompletionError, match="XML fallback tool delta"):
+        await loop._stream_one_completion([])
+
+
+@pytest.mark.asyncio
+async def test_incomplete_fallback_call_fails_completion_finalization(tmp_path) -> None:
+    class IncompleteFallbackProvider(ProviderABC):
+        model_name = "incomplete-fallback"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(
+                content='<call_tool name="capture"><arg name="text">unfinished',
+                is_done=True,
+                stop_reason="stop",
+            )
+
+    circuit = ProviderCircuitBreaker()
+    loop = AshLoop(
+        SessionStore(tmp_path / "incomplete-fallback.db"),
+        IncompleteFallbackProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        provider_circuit_breaker=circuit,
+    )
+    circuit.record_failure(loop._provider_circuit_key)
+
+    with pytest.raises(
+        ProviderCompletionError,
+        match="fallback protocol could not be finalized",
+    ):
+        await loop._stream_one_completion([])
+
+    assert circuit.snapshot(loop._provider_circuit_key)["failures"] == 1
+
+
+@pytest.mark.asyncio
+async def test_metadata_terminal_rate_limit_retries_before_output(tmp_path) -> None:
+    class RecoveringRateLimitProvider(ProviderABC):
+        model_name = "recovering-rate-limit"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.calls < 3:
+                yield StreamChunk(is_done=True, stop_reason="rate_limit")
+                return
+            yield StreamChunk(content="recovered", is_done=True, stop_reason="stop")
+
+    provider = RecoveringRateLimitProvider()
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "terminal-rate-limit.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        ui,
+        tmp_path,
+        config=AshConfig(
+            model="openai/test",
+            provider_max_attempts=3,
+            provider_retry_base_delay=0,
+            provider_retry_max_delay=0,
+        ),
+    )
+
+    outcome = await loop._stream_one_completion([])
+
+    assert outcome.text == "recovered"
+    assert provider.calls == 3
+    assert [
+        event["attempt"]
+        for event in ui.events
+        if event["type"] == "provider.retrying"
+    ] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_metadata_terminal_error_records_circuit_failure(
+    tmp_path,
+) -> None:
+    class LimitedProvider(ProviderABC):
+        model_name = "terminal-limit"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(is_done=True, stop_reason="rate_limit")
+
+    circuit = ProviderCircuitBreaker()
+    loop = AshLoop(
+        SessionStore(tmp_path / "terminal-limit-circuit.db"),
+        LimitedProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        provider_circuit_breaker=circuit,
+        config=AshConfig(model="openai/test", provider_max_attempts=1),
+    )
+
+    with pytest.raises(ProviderCompletionError, match="rate_limit"):
+        await loop._stream_one_completion([])
+
+    assert circuit.snapshot(loop._provider_circuit_key)["failures"] == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_error_after_output_is_never_replayed(tmp_path) -> None:
+    class PartialRateLimitProvider(ProviderABC):
+        model_name = "partial-rate-limit"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            yield StreamChunk(
+                content="partial",
+                is_done=True,
+                stop_reason="rate_limit",
+            )
+
+    provider = PartialRateLimitProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "partial-terminal-error.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="openai/test",
+            provider_max_attempts=3,
+            provider_retry_base_delay=0,
+        ),
+    )
+
+    with pytest.raises(ProviderCompletionError, match=r"rate_limit \(error\)"):
+        await loop._stream_one_completion([])
+
+    assert provider.calls == 1
 
 
 class BudgetProvider(ProviderABC):
@@ -1350,9 +1840,9 @@ async def test_provider_retries_transient_failure_before_output(tmp_path):
         ),
     )
 
-    response, *_ = await loop._stream_one_completion([])
+    response = await loop._stream_one_completion([])
 
-    assert response == "recovered"
+    assert response.text == "recovered"
     assert provider.calls == 3
     retries = [event for event in ui.events if event["type"] == "provider.retrying"]
     assert [event["attempt"] for event in retries] == [2, 3]
@@ -1464,8 +1954,8 @@ async def test_provider_circuit_fails_fast_then_allows_probe(tmp_path):
     assert provider.calls == 2
 
     now = 16.0
-    response, *_ = await loop._stream_one_completion([])
-    assert response == "online"
+    response = await loop._stream_one_completion([])
+    assert response.text == "online"
     assert provider.calls == 3
     assert circuit.snapshot(loop._provider_circuit_key)["failures"] == 0
 

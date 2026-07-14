@@ -10,12 +10,17 @@ from typing import Any, Generator, Literal
 class _State(StrEnum):
     TEXT = "TEXT"
     THOUGHT = "THOUGHT"
+    RESPONSE = "RESPONSE"
     TOOL = "TOOL"
     ARG = "ARG"
 
 
 EventType = Literal["token", "thought", "tool_call"]
 Event = tuple[EventType, str | dict[str, Any]]
+
+
+class StreamingXMLParseError(ValueError):
+    """Raised when a fallback-model stream ends inside a control element."""
 
 
 class StreamingXMLParser:
@@ -60,6 +65,8 @@ class StreamingXMLParser:
                 events, progressed = self._process_text_state()
             elif self._state == _State.THOUGHT:
                 events, progressed = self._process_thought_state()
+            elif self._state == _State.RESPONSE:
+                events, progressed = self._process_response_state()
             elif self._state == _State.TOOL:
                 events, progressed = self._process_tool_state()
             elif self._state == _State.ARG:
@@ -83,48 +90,47 @@ class StreamingXMLParser:
         self._current_args = {}
         self._accumulated_text = ""
 
+    def finish(self) -> list[Event]:
+        """Finalize an end-of-stream buffer without silently losing content."""
+
+        if self._state in {_State.TOOL, _State.ARG}:
+            element = "tool argument" if self._state == _State.ARG else "tool call"
+            self.reset()
+            raise StreamingXMLParseError(
+                f"model stream ended inside an incomplete {element}"
+            )
+
+        events: list[Event] = []
+        if self._buffer:
+            kind: EventType = "thought" if self._state == _State.THOUGHT else "token"
+            events.append((kind, self._buffer))
+        self.reset()
+        return events
+
     # --- state processors ------------------------------------------------
 
     def _process_text_state(self) -> tuple[list[Event], bool]:
-        if "<thought>" in self._buffer:
-            pre, post = self._buffer.split("<thought>", 1)
-            events: list[Event] = []
-            if pre:
-                events.append(("token", pre))
-            self._state = _State.THOUGHT
-            self._buffer = post
-            self._accumulated_text = ""
-            return events, True
-
-        if "<response>" in self._buffer:
-            # The model wraps its final user-facing text in <response> tags.
-            # We strip the wrappers and emit the inner content as a token
-            # so the loop can deliver it to the terminal/REPL.
-            pre, post = self._buffer.split("<response>", 1)
-            resp_events: list[Event] = []
-            if pre:
-                resp_events.append(("token", pre))
-            if "</response>" in post:
-                inner, rest = post.split("</response>", 1)
-                if inner:
-                    resp_events.append(("token", inner))
-                self._state = _State.TEXT
-                self._buffer = rest
-            else:
-                # Tag opened but not yet closed — wait for the rest.
-                self._buffer = post
-                return resp_events, False
-            return resp_events, True
-
-        if "<call_tool" in self._buffer:
-            pre, post = self._buffer.split("<call_tool", 1)
-            events = []
-            if pre:
-                events.append(("token", pre))
-            self._state = _State.TOOL
-            self._buffer = post
-            self._current_args = {}
-            self._current_tool_name = None
+        openers = (
+            ("<thought>", _State.THOUGHT),
+            ("<response>", _State.RESPONSE),
+            ("<call_tool", _State.TOOL),
+        )
+        matches = [
+            (index, opener, state)
+            for opener, state in openers
+            if (index := self._buffer.find(opener)) >= 0
+        ]
+        if matches:
+            index, opener, state = min(matches, key=lambda match: match[0])
+            pre = self._buffer[:index]
+            events: list[Event] = [("token", pre)] if pre else []
+            self._buffer = self._buffer[index + len(opener) :]
+            self._state = state
+            if state == _State.THOUGHT:
+                self._accumulated_text = ""
+            elif state == _State.TOOL:
+                self._current_args = {}
+                self._current_tool_name = None
             return events, True
 
         idx = self._buffer.find("<")
@@ -147,13 +153,31 @@ class StreamingXMLParser:
             return [], True
         return [], False
 
+    def _process_response_state(self) -> tuple[list[Event], bool]:
+        closer = "</response>"
+        if closer in self._buffer:
+            inner, post = self._buffer.split(closer, 1)
+            self._state = _State.TEXT
+            self._buffer = post
+            return ([("token", inner)] if inner else []), True
+
+        retained = _partial_suffix_length(self._buffer, closer)
+        safe_length = len(self._buffer) - retained
+        if safe_length <= 0:
+            return [], False
+        safe = self._buffer[:safe_length]
+        self._buffer = self._buffer[safe_length:]
+        return [("token", safe)], True
+
     def _process_thought_state(self) -> tuple[list[Event], bool]:
         if "</thought>" in self._buffer:
             thought_content, post = self._buffer.split("</thought>", 1)
-            self._accumulated_text += thought_content
-            events: list[Event] = [("thought", self._accumulated_text)]
+            events: list[Event] = (
+                [("thought", thought_content)] if thought_content else []
+            )
             self._state = _State.TEXT
             self._buffer = post
+            self._accumulated_text = ""
             return events, True
 
         idx = self._buffer.find("<")
@@ -226,3 +250,13 @@ class StreamingXMLParser:
             self._buffer = self._buffer[idx:]
             return [], True
         return [], False
+
+
+def _partial_suffix_length(value: str, marker: str) -> int:
+    """Return the longest suffix of ``value`` that could start ``marker``."""
+
+    maximum = min(len(value), len(marker) - 1)
+    for length in range(maximum, 0, -1):
+        if marker.startswith(value[-length:]):
+            return length
+    return 0

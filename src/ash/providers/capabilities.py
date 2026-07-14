@@ -9,7 +9,7 @@ from typing import Callable
 
 @dataclass(frozen=True)
 class ProviderCapabilities:
-    native_tools: bool = True
+    native_tools: bool = False
     vision: bool = False
     reasoning: bool = False
     local: bool = False

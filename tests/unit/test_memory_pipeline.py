@@ -100,7 +100,7 @@ def test_semantic_memory_injects_into_system_prompt(tmp_path: Path) -> None:
 
     from ash.core.loop import AshLoop
     from ash.core.session import Session, SessionStore
-    from ash.providers.base import ProviderABC
+    from ash.providers.base import ProviderABC, StreamChunk
     from ash.safety.guard import SafetyGuard
     from ash.ui.terminal import TerminalUI
 
@@ -120,9 +120,7 @@ def test_semantic_memory_injects_into_system_prompt(tmp_path: Path) -> None:
 
     # Simulate a streaming response with no tool calls.
     async def mock_stream(messages, temperature=0.0, tools=None):
-        yield MagicMock(content="Hello, I can help you.", tool_call_delta=None)
-        return
-        yield  # make it a generator
+        yield StreamChunk(content="Hello, I can help you.", is_done=True)
 
     provider.stream_chat = mock_stream
 
@@ -159,7 +157,7 @@ def test_semantic_memory_injects_into_system_prompt(tmp_path: Path) -> None:
 
     async def capturing_stream(messages, temperature=0.0, tools=None):
         captured_messages.extend(messages)
-        yield MagicMock(content="Hi.", tool_call_delta=None)
+        yield StreamChunk(content="Hi.", is_done=True)
 
     provider.stream_chat = capturing_stream
 

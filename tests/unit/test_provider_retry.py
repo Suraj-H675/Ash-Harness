@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ash.providers.base import ProviderTerminalError
 from ash.providers.retry import (
     ProviderCircuitBreaker,
     ProviderCircuitOpen,
@@ -51,6 +52,19 @@ def test_wrapped_connection_and_status_errors_are_classified() -> None:
     failure = classify_provider_failure(wrapper)
     assert failure.status_code == 503
     assert failure.retry_after == 1.25
+
+
+@pytest.mark.parametrize("reason", ["rate_limit", "timeout"])
+def test_retriable_terminal_errors_are_classified_through_wrappers(reason: str) -> None:
+    wrapper = RuntimeError("provider chain failed")
+    wrapper.__cause__ = ProviderTerminalError(reason)
+
+    assert classify_provider_failure(wrapper).retriable is True
+
+
+@pytest.mark.parametrize("reason", ["cancelled", "failed", "vendor_unknown"])
+def test_nonretriable_terminal_errors_fail_closed(reason: str) -> None:
+    assert classify_provider_failure(ProviderTerminalError(reason)).retriable is False
 
 
 def test_retry_delay_prefers_header_and_caps_backoff(monkeypatch) -> None:

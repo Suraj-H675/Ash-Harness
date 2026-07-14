@@ -140,6 +140,16 @@ def classify_provider_failure(error: BaseException) -> ProviderFailure:
         marker in lowered for marker in NON_RETRYABLE_RATE_LIMIT_MARKERS
     ):
         retriable = False
+    explicit_retriable = next(
+        (
+            value
+            for item in chain
+            if isinstance((value := getattr(item, "retriable", None)), bool)
+        ),
+        None,
+    )
+    if explicit_retriable is not None:
+        retriable = explicit_retriable
     return ProviderFailure(message, retriable, status_code, retry_after)
 
 

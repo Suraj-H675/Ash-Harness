@@ -52,9 +52,9 @@ Research is clean-room: proprietary or leaked source is not used.
 
 | Capability | Ash status | Required production behavior |
 |---|---|---|
-| Streaming model loop | Partial | Cancellation-safe, typed events, clean terminal finalization |
-| Native tool calling | Partial | Canonical calls translated correctly for every provider |
-| XML fallback tool protocol | Partial | Keep only for models without native tools; strict parser and validation |
+| Streaming model loop | Verified locally | Cancellation-safe typed events, provider-neutral completion outcomes, mandatory terminal chunks, post-terminal output rejection, fail-closed EOF/truncation/filter handling, and no-replay retry/failover after output |
+| Native tool calling | Partial | Capability-selected native schemas/calls are isolated from text parsing and malformed, truncated, or cross-protocol calls are refused; richer provider reasoning/citation blocks remain |
+| XML fallback tool protocol | Verified locally | Enabled only for explicitly non-native providers, with incremental text/reasoning, literal-markup finalization, incomplete-control rejection, and no native-call crossover |
 | Parallel tool calls | Partial | Independent read-only calls run concurrently with deterministic result order |
 | Turn steering | Verified locally | Bounded durable guidance queue applies at safe iteration boundaries through interactive CLI, SDK, and HTTP |
 | Interrupt/cancel | Verified locally | `/cancel` preempts live interactive turns, propagates cancellation, clears pending steering, and finalizes the turn journal |

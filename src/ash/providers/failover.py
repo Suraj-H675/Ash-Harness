@@ -5,7 +5,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, AsyncGenerator
 
-from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.base import (
+    CompletionStopCategory,
+    ProviderABC,
+    ProviderCompletionError,
+    ProviderTerminalError,
+    StreamChunk,
+    completion_stop_category,
+)
 from ash.providers.messages import MessageInput
 
 
@@ -13,6 +20,14 @@ class FailoverProvider(ProviderABC):
     def __init__(self, providers: list[ProviderABC]) -> None:
         if not providers:
             raise ValueError("at least one provider is required")
+        native_protocols = {
+            provider.capabilities.native_tools for provider in providers
+        }
+        if len(native_protocols) != 1:
+            raise ValueError(
+                "failover providers must agree on native tool support; "
+                "native and XML fallback protocols cannot share one chain"
+            )
         self.providers = providers
         self.active_index = 0
         self.failures: list[str] = []
@@ -37,18 +52,39 @@ class FailoverProvider(ProviderABC):
         last_error: Exception | None = None
         failures: list[str] = []
         for index, provider in enumerate(self.providers):
-            emitted = False
+            emitted_output = False
+            exposed_terminal = False
+            saw_terminal = False
             try:
                 async for chunk in provider.stream_chat(
                     messages, temperature=temperature, tools=tools
                 ):
-                    emitted = True
+                    has_output = bool(
+                        chunk.content
+                        or chunk.tool_call_delta
+                        or chunk.native_tool_calls
+                    )
+                    if (
+                        chunk.is_done
+                        and completion_stop_category(chunk.stop_reason)
+                        == CompletionStopCategory.ERROR
+                        and not emitted_output
+                        and not has_output
+                    ):
+                        raise ProviderTerminalError(chunk.stop_reason)
+                    emitted_output = emitted_output or has_output
+                    saw_terminal = saw_terminal or chunk.is_done
+                    exposed_terminal = exposed_terminal or chunk.is_done
                     self.active_index = index
                     yield chunk
+                if not saw_terminal:
+                    raise ProviderCompletionError(
+                        f"provider {provider.model_name!r} ended before a terminal chunk"
+                    )
                 self.failures = failures
                 return
             except Exception as exc:  # noqa: BLE001
-                if emitted:
+                if emitted_output or exposed_terminal:
                     self.failures = failures
                     raise
                 last_error = exc

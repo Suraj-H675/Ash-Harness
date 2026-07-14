@@ -9,6 +9,7 @@ from ash.agents.shared_state import SharedState
 from ash.cli import _build_tools
 from ash.plugins.agents import AgentCatalog, AgentDefinition, AgentSource
 from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.guard import SafetyGuard
 from ash.tools.agent import SpawnAgentTool
 
@@ -51,6 +52,7 @@ def test_agent_catalog_isolates_invalid_definitions(tmp_path: Path) -> None:
 
 class CustomAgentProvider(ProviderABC):
     model_name = "fake"
+    _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
 
     async def stream_chat(self, messages, temperature=0.0, tools=None):
         assert any(

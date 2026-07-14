@@ -1,6 +1,15 @@
 """Ash LLM provider adapters."""
 
-from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from ash.providers.base import (
+    CompletionOutcome,
+    CompletionStopCategory,
+    ProviderABC,
+    ProviderCompletionError,
+    ProviderTerminalError,
+    StreamChunk,
+    TokenCounterLike,
+    completion_stop_category,
+)
 from ash.providers.capabilities import (
     CapabilityRegistry,
     ProviderCapabilities,
@@ -28,6 +37,11 @@ from ash.providers.registry import (
 
 __all__ = [
     "ProviderABC",
+    "CompletionOutcome",
+    "CompletionStopCategory",
+    "ProviderCompletionError",
+    "ProviderTerminalError",
+    "completion_stop_category",
     "ProviderCapabilities",
     "CapabilityRegistry",
     "get_capability_registry",
