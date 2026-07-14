@@ -11,8 +11,8 @@ from ash.core.loop import AshLoop
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.guard import SafetyGuard
-from ash.mcp.client import MCPClient
-from ash.mcp.runtime import MCPRuntime
+from ash.mcp.client import MCPClient, MCPProtocolError
+from ash.mcp.runtime import MCPRuntime, MCPTool
 from ash.mcp.server import (
     MCPServerConfig,
     MCPServerInstance,
@@ -368,6 +368,725 @@ class IdleProvider(ProviderABC):
         return len(text.split())
 
 
+COMPLEX_MCP_INPUT_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+        "identifier": {"type": "string", "pattern": "^[a-z]+$"},
+    },
+    "type": "object",
+    "properties": {
+        "mode": {"type": "string", "enum": ["safe", "fast"]},
+        "target": {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "path"},
+                        "path": {"$ref": "#/$defs/identifier"},
+                    },
+                    "required": ["kind", "path"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "id"},
+                        "id": {"type": "integer", "minimum": 1},
+                    },
+                    "required": ["kind", "id"],
+                    "additionalProperties": False,
+                },
+            ]
+        },
+        "options": {
+            "anyOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean"}},
+                    "required": ["enabled"],
+                    "additionalProperties": False,
+                },
+            ]
+        },
+        "tags": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "uniqueItems": True,
+        },
+        "limit": {"type": "integer", "minimum": 1},
+    },
+    "required": ["mode", "target", "options", "tags", "limit"],
+    "additionalProperties": False,
+}
+
+
+class StubMCPClient:
+    def __init__(self, result: dict) -> None:
+        self.result = result
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_tool(self, name: str, arguments: dict) -> dict:
+        self.calls.append((name, arguments))
+        return self.result
+
+
+def _mcp_tool(
+    tmp_path: Path,
+    client: StubMCPClient,
+    *,
+    input_schema: dict | None = None,
+    output_schema: dict | None = None,
+    protocol_version: str = "2025-11-25",
+) -> MCPTool:
+    definition = {
+        "name": "complex",
+        "description": "Exercise the complete MCP schema boundary.",
+        "inputSchema": input_schema or COMPLEX_MCP_INPUT_SCHEMA,
+    }
+    if output_schema is not None:
+        definition["outputSchema"] = output_schema
+    return MCPTool(
+        SafetyGuard(tmp_path),
+        client=client,  # type: ignore[arg-type]
+        server_name="test",
+        definition=definition,
+        protocol_version=protocol_version,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_preserves_and_enforces_complete_input_schema(
+    tmp_path: Path,
+) -> None:
+    client = StubMCPClient({"content": [{"type": "text", "text": "ok"}]})
+    tool = _mcp_tool(tmp_path, client)
+    exposed = tool.json_schema()
+
+    assert exposed == COMPLEX_MCP_INPUT_SCHEMA
+    exposed["properties"]["mode"]["enum"].append("mutated")
+    assert tool.json_schema() == COMPLEX_MCP_INPUT_SCHEMA
+
+    arguments = {
+        "mode": "safe",
+        "target": {"kind": "path", "path": "alpha"},
+        "options": None,
+        "tags": ["one", "two"],
+        "limit": 2,
+    }
+    result = await tool.run(**arguments)
+
+    assert result.success is True
+    assert result.output == "ok"
+    assert client.calls == [("complex", arguments)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"mode": "unknown"},
+        {"target": {"kind": "path", "path": "INVALID"}},
+        {"tags": ["same", "same"]},
+        {"limit": "2"},
+        {"extra": True},
+    ],
+)
+async def test_mcp_tool_rejects_invalid_arguments_without_remote_call(
+    tmp_path: Path,
+    overrides: dict,
+) -> None:
+    client = StubMCPClient({"content": []})
+    tool = _mcp_tool(tmp_path, client)
+    arguments = {
+        "mode": "safe",
+        "target": {"kind": "id", "id": 4},
+        "options": {"enabled": True},
+        "tags": ["one"],
+        "limit": 2,
+        **overrides,
+    }
+
+    result = await tool.run(**arguments)
+
+    assert result.success is False
+    assert result.error is not None and "invalid MCP tool arguments" in result.error
+    assert client.calls == []
+
+
+def test_mcp_tool_rejects_invalid_and_unknown_schema_dialects(tmp_path: Path) -> None:
+    client = StubMCPClient({"content": []})
+    with pytest.raises(ValueError, match="not valid JSON Schema"):
+        _mcp_tool(
+            tmp_path,
+            client,
+            input_schema={"type": "object", "required": "not-an-array"},
+        )
+    with pytest.raises(ValueError, match="unsupported JSON Schema dialect"):
+        _mcp_tool(
+            tmp_path,
+            client,
+            input_schema={
+                "$schema": "https://example.invalid/unknown-dialect",
+                "type": "object",
+            },
+        )
+
+    draft7 = _mcp_tool(
+        tmp_path,
+        client,
+        input_schema={
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        },
+    )
+    assert draft7.json_schema()["$schema"].endswith("draft-07/schema#")
+
+
+def test_mcp_tool_rejects_non_object_roots_and_remote_references(
+    tmp_path: Path,
+) -> None:
+    client = StubMCPClient({"content": []})
+    for schema in ({}, {"type": "string"}):
+        with pytest.raises(ValueError, match="root type must be object"):
+            MCPTool(
+                SafetyGuard(tmp_path),
+                client=client,  # type: ignore[arg-type]
+                server_name="test",
+                definition={"name": "invalid", "inputSchema": schema},
+            )
+    with pytest.raises(ValueError, match="non-local reference"):
+        _mcp_tool(
+            tmp_path,
+            client,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "$ref": "http://169.254.169.254/latest/meta-data/"
+                    }
+                },
+            },
+        )
+    with pytest.raises(ValueError, match="root type must be object"):
+        _mcp_tool(
+            tmp_path,
+            client,
+            output_schema={"type": "array"},
+        )
+
+
+def test_mcp_tool_rejects_required_task_execution_until_supported(
+    tmp_path: Path,
+) -> None:
+    client = StubMCPClient({"content": []})
+    with pytest.raises(ValueError, match="requires experimental task execution"):
+        MCPTool(
+            SafetyGuard(tmp_path),
+            client=client,  # type: ignore[arg-type]
+            server_name="test",
+            definition={
+                "name": "task-only",
+                "inputSchema": {"type": "object"},
+                "execution": {"taskSupport": "required"},
+            },
+        )
+
+    optional = MCPTool(
+        SafetyGuard(tmp_path),
+        client=client,  # type: ignore[arg-type]
+        server_name="test",
+        definition={
+            "name": "ordinary-or-task",
+            "inputSchema": {"type": "object"},
+            "execution": {"taskSupport": "optional"},
+        },
+    )
+    assert optional.name == "mcp__test__ordinary-or-task"
+    default_forbidden = MCPTool(
+        SafetyGuard(tmp_path),
+        client=client,  # type: ignore[arg-type]
+        server_name="test",
+        definition={
+            "name": "ordinary",
+            "inputSchema": {"type": "object"},
+            "execution": {},
+        },
+    )
+    assert default_forbidden.name == "mcp__test__ordinary"
+
+
+@pytest.mark.asyncio
+async def test_mcp_schema_regex_cannot_block_runtime_or_reach_server(
+    tmp_path: Path,
+) -> None:
+    client = StubMCPClient({"content": []})
+    tool = _mcp_tool(
+        tmp_path,
+        client,
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string", "pattern": "^(a+)+$"}},
+            "required": ["value"],
+        },
+    )
+
+    result = await asyncio.wait_for(tool.run(value="a" * 32 + "!"), timeout=3)
+
+    assert result.success is False
+    assert result.error is not None
+    assert "deadline" in result.error or "resource limit" in result.error
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_legacy_protocol_uses_draft7_for_implicit_schema(
+    tmp_path: Path,
+) -> None:
+    client = StubMCPClient({"content": [{"type": "text", "text": "ok"}]})
+    tool = _mcp_tool(
+        tmp_path,
+        client,
+        protocol_version="2025-03-26",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "pair": {
+                    "type": "array",
+                    "items": [{"type": "string"}, {"type": "integer"}],
+                    "additionalItems": False,
+                }
+            },
+            "required": ["pair"],
+        },
+        output_schema={
+            "type": "object",
+            "required": ["ignored-for-legacy-protocol"],
+        },
+    )
+
+    result = await tool.run(pair=["one", 2])
+
+    assert result.success is True
+    assert result.output == "ok"
+
+
+@pytest.mark.asyncio
+async def test_mcp_schema_allows_properties_named_like_schema_keywords(
+    tmp_path: Path,
+) -> None:
+    client = StubMCPClient({"content": [{"type": "text", "text": "ok"}]})
+    tool = _mcp_tool(
+        tmp_path,
+        client,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "$ref": {"type": "string"},
+                "patternProperties": {"type": "string"},
+            },
+            "required": ["$ref", "patternProperties"],
+            "additionalProperties": False,
+        },
+    )
+
+    result = await tool.run(**{"$ref": "literal", "patternProperties": "literal"})
+
+    assert result.success is True
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_preserves_rich_result_and_validates_output_schema(
+    tmp_path: Path,
+) -> None:
+    output_schema = {
+        "type": "object",
+        "properties": {"count": {"type": "integer", "minimum": 1}},
+        "required": ["count"],
+        "additionalProperties": False,
+    }
+    remote_result = {
+        "content": [
+            {"type": "text", "text": "two results"},
+            {"type": "image", "mimeType": "image/png", "data": "AAAA"},
+        ],
+        "structuredContent": {"count": 2},
+        "isError": False,
+        "_meta": {"cacheKey": "stable"},
+        "vendorExtension": {"trace": "abc"},
+    }
+    client = StubMCPClient(remote_result)
+    tool = _mcp_tool(
+        tmp_path,
+        client,
+        input_schema={"type": "object", "additionalProperties": False},
+        output_schema=output_schema,
+    )
+
+    result = await tool.run()
+
+    assert result.success is True
+    assert json.loads(result.output) == remote_result
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_preserves_annotated_text_block_envelope(tmp_path: Path) -> None:
+    remote_result = {
+        "content": [
+            {
+                "type": "text",
+                "text": "annotated",
+                "annotations": {"audience": ["assistant"], "priority": 0.8},
+                "_meta": {"trace": "one"},
+                "vendor": "retained",
+            }
+        ]
+    }
+    tool = _mcp_tool(
+        tmp_path,
+        StubMCPClient(remote_result),
+        input_schema={"type": "object"},
+    )
+
+    result = await tool.run()
+
+    assert result.success is True
+    assert json.loads(result.output)["content"] == remote_result["content"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_keeps_structured_only_and_application_error_envelopes(
+    tmp_path: Path,
+) -> None:
+    structured_client = StubMCPClient(
+        {"content": [], "structuredContent": {"items": [1, 2]}}
+    )
+    structured_tool = _mcp_tool(
+        tmp_path,
+        structured_client,
+        input_schema={"type": "object"},
+    )
+    structured = await structured_tool.run()
+    assert json.loads(structured.output) == {
+        "content": [],
+        "structuredContent": {"items": [1, 2]},
+        "isError": False,
+    }
+
+    error_client = StubMCPClient(
+        {
+            "content": [{"type": "text", "text": "retry with another date"}],
+            "structuredContent": {"code": "invalid_date"},
+            "isError": True,
+            "_meta": {"request": "one"},
+        }
+    )
+    error_tool = _mcp_tool(
+        tmp_path,
+        error_client,
+        input_schema={"type": "object"},
+    )
+    failed = await error_tool.run()
+    assert failed.success is False
+    assert failed.error == "retry with another date"
+    assert json.loads(failed.output) == {
+        "content": [{"type": "text", "text": "retry with another date"}],
+        "structuredContent": {"code": "invalid_date"},
+        "isError": True,
+        "_meta": {"request": "one"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remote_result", "message"),
+    [
+        ({"structuredContent": {"value": 1}}, "content is required"),
+        ({"content": None}, "content must be an array"),
+        ({"content": [], "structuredContent": None}, "must be an object"),
+        ({"content": [], "isError": None}, "isError must be a boolean"),
+        ({"content": [], "_meta": None}, "_meta must be an object"),
+    ],
+)
+async def test_mcp_tool_rejects_malformed_results_without_losing_wire_payload(
+    tmp_path: Path,
+    remote_result: dict,
+    message: str,
+) -> None:
+    tool = _mcp_tool(
+        tmp_path,
+        StubMCPClient(remote_result),
+        input_schema={"type": "object"},
+    )
+
+    result = await tool.run()
+
+    assert result.success is False
+    assert result.error is not None and message in result.error
+    assert json.loads(result.output) == remote_result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"type": "text", "text": 7},
+        {"type": "image", "data": "not base64", "mimeType": "image/png"},
+        {"type": "resource", "resource": {"text": "missing uri"}},
+        {"type": "unknown", "value": "extension"},
+    ],
+)
+async def test_mcp_tool_rejects_malformed_content_blocks(
+    tmp_path: Path,
+    content: dict,
+) -> None:
+    remote_result = {"content": [content]}
+    tool = _mcp_tool(
+        tmp_path,
+        StubMCPClient(remote_result),
+        input_schema={"type": "object"},
+    )
+
+    result = await tool.run()
+
+    assert result.success is False
+    assert result.error is not None and "content[0]" in result.error
+    assert json.loads(result.output) == remote_result
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_preserves_invalid_structured_output_for_recovery(
+    tmp_path: Path,
+) -> None:
+    remote_result = {
+        "content": [{"type": "text", "text": "server summary"}],
+        "structuredContent": {"count": "two"},
+    }
+    tool = _mcp_tool(
+        tmp_path,
+        StubMCPClient(remote_result),
+        input_schema={"type": "object"},
+        output_schema={
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"],
+        },
+    )
+
+    result = await tool.run()
+
+    assert result.success is False
+    assert result.error is not None and "invalid MCP structured result" in result.error
+    assert json.loads(result.output)["structuredContent"] == {"count": "two"}
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_requires_structured_content_for_declared_output_schema(
+    tmp_path: Path,
+) -> None:
+    tool = _mcp_tool(
+        tmp_path,
+        StubMCPClient({"content": [{"type": "text", "text": "summary"}]}),
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+    )
+
+    result = await tool.run()
+
+    assert result.success is False
+    assert result.output == "summary"
+    assert result.error is not None and "requires structuredContent" in result.error
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_rejects_non_json_wire_values(tmp_path: Path) -> None:
+    tool = _mcp_tool(
+        tmp_path,
+        StubMCPClient({"content": [], "structuredContent": {"value": float("nan")}}),
+        input_schema={"type": "object"},
+    )
+
+    result = await tool.run()
+
+    assert result.success is False
+    assert result.output == ""
+    assert result.error is not None and "not JSON-serializable" in result.error
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_preserves_protocol_error_data_without_replay(
+    tmp_path: Path,
+) -> None:
+    class ErrorClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call_tool(self, name: str, arguments: dict) -> dict:
+            self.calls += 1
+            raise MCPProtocolError(
+                "tools/call failed (-32602): invalid mode",
+                code=-32602,
+                data={"field": "mode", "expected": ["safe", "fast"]},
+            )
+
+    client = ErrorClient()
+    tool = MCPTool(
+        SafetyGuard(tmp_path),
+        client=client,  # type: ignore[arg-type]
+        server_name="test",
+        definition={"name": "fails", "inputSchema": {"type": "object"}},
+    )
+
+    result = await tool.run()
+
+    assert result.success is False
+    assert client.calls == 1
+    assert json.loads(result.output) == {
+        "error": {
+            "type": "mcp_protocol_error",
+            "message": "tools/call failed (-32602): invalid mode",
+            "code": -32602,
+            "data": {"field": "mode", "expected": ["safe", "fast"]},
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_preserves_explicit_null_protocol_error_data(
+    tmp_path: Path,
+) -> None:
+    class ErrorClient:
+        async def call_tool(self, name: str, arguments: dict) -> dict:
+            raise MCPProtocolError("explicit null", code=-32000, data=None)
+
+    tool = MCPTool(
+        SafetyGuard(tmp_path),
+        client=ErrorClient(),  # type: ignore[arg-type]
+        server_name="test",
+        definition={"name": "fails", "inputSchema": {"type": "object"}},
+    )
+
+    result = await tool.run()
+
+    assert json.loads(result.output)["error"]["data"] is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_output_schema_applies_to_application_errors(tmp_path: Path) -> None:
+    remote_result = {
+        "content": [{"type": "text", "text": "failed"}],
+        "structuredContent": {"code": 7},
+        "isError": True,
+    }
+    tool = _mcp_tool(
+        tmp_path,
+        StubMCPClient(remote_result),
+        input_schema={"type": "object"},
+        output_schema={
+            "type": "object",
+            "properties": {"code": {"type": "string"}},
+            "required": ["code"],
+        },
+    )
+
+    result = await tool.run()
+
+    assert result.success is False
+    assert result.error is not None and "invalid MCP structured result" in result.error
+    assert json.loads(result.output) == remote_result
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_retains_jsonrpc_error_code_and_data() -> None:
+    client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
+    client._request_stdio = AsyncMock(
+        return_value={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32602,
+                "message": "invalid arguments",
+                "data": {"field": "query"},
+            },
+        }
+    )
+
+    with pytest.raises(MCPProtocolError) as caught:
+        await client.request("tools/call", {"name": "search", "arguments": {}})
+
+    assert caught.value.code == -32602
+    assert caught.value.data == {"field": "query"}
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_rejects_boolean_error_code_and_distinguishes_data() -> None:
+    client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
+    client._request_stdio = AsyncMock(
+        return_value={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": True, "message": "invalid", "data": None},
+        }
+    )
+
+    with pytest.raises(MCPProtocolError) as caught:
+        await client.request("tools/call")
+
+    assert caught.value.code is None
+    assert "invalid error code" in str(caught.value)
+    assert caught.value.has_data is True
+    assert caught.value.data is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_runtime_isolates_invalid_tool_schema(tmp_path: Path, monkeypatch) -> None:
+    class CatalogClient:
+        server_capabilities = {"tools": {}}
+
+        def __init__(self, config, *, roots=()) -> None:
+            self.config = config
+
+        async def connect(self) -> None:
+            return None
+
+        def supports_server_capability(self, name: str) -> bool:
+            return name == "tools"
+
+        async def list_tools(self) -> list[dict]:
+            return [
+                {
+                    "name": "broken",
+                    "inputSchema": {"type": "object", "required": "invalid"},
+                },
+                {
+                    "name": "task-only",
+                    "inputSchema": {"type": "object"},
+                    "execution": {"taskSupport": "required"},
+                },
+                {"name": "healthy", "inputSchema": {"type": "object"}},
+            ]
+
+        async def disconnect(self) -> None:
+            return None
+
+    monkeypatch.setattr("ash.mcp.runtime.MCPClient", CatalogClient)
+    config = MCPServerConfig(name="catalog", command="unused", args=[], env={})
+    runtime = MCPRuntime({"catalog": config}, SafetyGuard(tmp_path))
+
+    tools = await runtime.start()
+    try:
+        assert "mcp__catalog__healthy" in tools
+        assert "mcp__catalog__broken" not in tools
+        assert "mcp__catalog__task-only" not in tools
+        assert "not valid JSON Schema" in runtime.errors["catalog:tool:broken"]
+        assert "requires experimental task execution" in runtime.errors[
+            "catalog:tool:task-only"
+        ]
+    finally:
+        await runtime.close()
+
+
 @pytest.mark.asyncio
 async def test_async_client_initializes_lists_and_calls_tools() -> None:
     config = MCPServerConfig(
@@ -386,6 +1105,24 @@ async def test_async_client_initializes_lists_and_calls_tools() -> None:
         assert tools[0]["name"] == "echo"
         result = await client.call_tool("echo", {"text": "hello"})
         assert result["content"][0]["text"] == "hello"
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_stdio_client_accepts_bounded_rich_results_above_64_kib() -> None:
+    config = MCPServerConfig(
+        name="fake",
+        command=sys.executable,
+        args=["-u", "-c", FAKE_MCP_SERVER],
+        env={},
+    )
+    client = MCPClient(config)
+    await client.connect()
+    try:
+        text = "x" * 70_000
+        result = await client.call_tool("echo", {"text": text})
+        assert result["content"] == [{"type": "text", "text": text}]
     finally:
         await client.disconnect()
 
@@ -687,3 +1424,81 @@ async def test_request_timeout_sends_cancellation_notification() -> None:
         "notifications/cancelled",
         {"requestId": 1, "reason": "tools/call timed out"},
     )
+
+
+@pytest.mark.asyncio
+async def test_stdio_send_failure_cleans_pending_future() -> None:
+    client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
+    client._process = Mock(stdin=object())
+    client._send_message = AsyncMock(side_effect=BrokenPipeError("closed"))
+
+    with pytest.raises(BrokenPipeError):
+        await client._request_stdio(9, {"jsonrpc": "2.0", "id": 9})
+
+    assert client._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_stdio_reader_fails_pending_request_on_framing_error() -> None:
+    class BrokenReader:
+        async def readline(self) -> bytes:
+            raise ValueError("line exceeds configured limit")
+
+    client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
+    client._process = Mock(stdout=BrokenReader())
+    future = asyncio.get_running_loop().create_future()
+    client._pending[3] = future
+
+    await client._read_stdio()
+
+    with pytest.raises(MCPProtocolError, match="invalid stdio framing"):
+        await future
+    assert client._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_initialize_timeout_does_not_send_cancellation_notification() -> None:
+    client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
+    client._request_stdio = AsyncMock(side_effect=asyncio.TimeoutError())
+    client.notify = AsyncMock()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await client.request("initialize")
+
+    client.notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_server_cancellation_stops_incoming_request_without_response() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def handle_request(method: str, params: dict) -> dict:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        return {}
+
+    client = MCPClient(
+        MCPServerConfig(name="fake", command="fake", args=[], env={}),
+        server_request_handler=handle_request,
+    )
+    client._send_message = AsyncMock()
+    client._dispatch_incoming(
+        {"jsonrpc": "2.0", "id": "server-1", "method": "custom", "params": {}}
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    client._dispatch_incoming(
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": "server-1", "reason": "no longer needed"},
+        }
+    )
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    client._send_message.assert_not_awaited()

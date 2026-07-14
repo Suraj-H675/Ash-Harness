@@ -190,8 +190,9 @@ Research is clean-room: proprietary or leaked source is not used.
 
 | Capability | Ash status | Required production behavior |
 |---|---|---|
-| MCP stdio client | Strong partial | Current negotiation, tools, resources/templates, prompts, pagination, progress, cancellation, logging, roots, sampling, and elicitation are wired; experimental tasks remain |
+| MCP stdio client | Strong partial | Current negotiation, bounded 8 MiB framing with immediate pending-request failure, tools, resources/templates, prompts, pagination, progress, bidirectional cancellation, logging, roots, sampling, and elicitation are wired; required-task tools fail closed until experimental tasks are implemented |
 | MCP HTTP transport | Strong partial | JSON/SSE HTTP, headers, session IDs, cleanup, and OAuth 2.1 protected-resource plus ordered OAuth/OIDC discovery, S256 PKCE, resource indicators, configured Client ID Metadata Documents/preregistered clients or DCR fallback, private resource-bound token storage, refresh de-duplication, explicit login/logout, and insufficient-scope step-up guidance; experimental tasks and live multi-vendor OAuth conformance remain |
+| MCP schemas/results | Verified locally | Exact version-aware input/output schemas, isolated non-coercing validation with no remote fetches, bounded content checks, complete rich result envelopes, output-schema checks, application-error semantics, and exact JSON-RPC error data are preserved without unsafe call replay |
 | MCP tool namespacing | Verified locally | `mcp__server__tool` adapters prevent collisions |
 | MCP resources/prompts | Partial | Browse in TUI and invoke/read through policy-gated model tools |
 | Skills | Verified locally | Bounded standard `SKILL.md` discovery and progressive activation with trust; legacy in-process executable skills are explicit unsafe compatibility only and cannot fabricate tools |

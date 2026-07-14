@@ -187,38 +187,58 @@ Ash supports direct interaction with external tool servers conforming to the Mod
 ```
 
 ### 3.1 Transport Mechanisms
-1.  **stdio Transport**: Launches the server as a subprocess, writing JSON-RPC 2.0 messages directly to `stdin` and reading responses from `stdout`.
-2.  **SSE (Server-Sent Events) Transport**: Establishes connection via HTTP POST/GET requests to a local or remote daemon.
 
-### 3.2 Dynamic Tool Schema Mapping
-Upon connection, Ash queries the server via JSON-RPC:
-*   **Request**: `{"jsonrpc": "2.0", "method": "tools/list", "id": 1}`
-*   **Response**: Lists name, description, and `inputSchema` for all tools.
+1. **stdio** launches the configured server without a shell, exchanges bounded
+   JSON-RPC messages up to 8 MiB over standard streams, fails pending requests
+   immediately on framing or process errors, and shuts down the process tree.
+2. **Streamable HTTP** exchanges JSON or SSE responses over HTTP, retains MCP
+   session IDs, and supports explicit OAuth 2.1 authorization. Legacy SSE
+   endpoints remain available for compatibility.
 
-Ash dynamically maps the `inputSchema` (which matches JSON Schema draft 7) into a Python Pydantic Model.
-```python
-def json_schema_to_pydantic(name: str, schema_dict: Dict[str, Any]) -> Type[BaseModel]:
-    """Generates a dynamic Pydantic class representing the MCP JSON schema."""
-    from pydantic import create_model
-    fields = {}
-    properties = schema_dict.get("properties", {})
-    required = schema_dict.get("required", [])
+### 3.2 Tool Schema Boundary
 
-    for prop_name, prop_info in properties.items():
-        prop_type = str  # fallback
-        js_type = prop_info.get("type")
-        if js_type == "integer":
-            prop_type = int
-        elif js_type == "boolean":
-            prop_type = bool
-        elif js_type == "array":
-            prop_type = list
+After initialization, Ash paginates `tools/list` and namespaces each remote
+tool as `mcp__<server>__<tool>`. The declared `inputSchema` remains the
+authoritative provider-facing schema; Ash does not translate it into a smaller
+Pydantic type model.
 
-        default = ... if prop_name in required else None
-        fields[prop_name] = (prop_type, Field(default, description=prop_info.get("description", "")))
+* An omitted `$schema` selects JSON Schema 2020-12 for MCP 2025-11-25. Older
+  negotiated revisions use draft 7 for ecosystem compatibility; an explicit
+  supported dialect always takes precedence.
+* Invalid or unsupported dialects and non-object root schemas isolate only the
+  malformed tool.
+* `enum`, composition keywords, local references, nested arrays and objects,
+  and `additionalProperties` retain their original semantics. Remote references
+  are rejected rather than fetched from a server-controlled URI.
+* Arguments are validated without type coercion and must be finite,
+  JSON-serializable data. Invalid arguments never reach the remote server.
+* Instance validation runs in a secret-free subprocess with strict input,
+  output, CPU, memory, and wall-clock limits so hostile schemas cannot block
+  Ash's event loop.
+* `json_schema()` returns a defensive copy of the exact server declaration.
+* Tools that require the experimental MCP task lifecycle are isolated with a
+  catalog diagnostic until Ash implements task-augmented calls; optional-task
+  tools remain callable through the ordinary request path.
 
-    return create_model(name, **fields)
-```
+### 3.3 Tool Result Boundary
+
+MCP `tools/call` results require a `content` array. Ash preserves rich content,
+`structuredContent`, `_meta`, `isError`, and extension fields as one JSON
+envelope. Version-specific text, image, audio, resource-link, and embedded
+resource blocks are checked before model exposure. A successful text-only
+result without annotations, metadata, or extensions is rendered as text for
+compatibility.
+
+When a tool declares `outputSchema`, every result must include matching
+`structuredContent`, including application-error results. Validation failures
+retain the server response for diagnosis but produce a failed tool result.
+`isError: true` is an application result exposed to the model, not a transport
+failure and not a reason to replay the call. JSON-RPC failures similarly retain
+their numeric `code` and distinguish absent `data` from explicit `null`; Ash
+does not automatically repeat a potentially side-effecting call.
+
+See the [MCP tools specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
+and the [2025-11-25 schema](https://modelcontextprotocol.io/specification/2025-11-25/schema).
 
 ---
 

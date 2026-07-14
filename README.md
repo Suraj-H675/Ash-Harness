@@ -397,6 +397,12 @@ PKCE, sends the MCP resource indicator, validates callback state, and uses
 dynamic client registration when no client ID is configured and the server
 supports it:
 
+MCP tool inputs retain their exact draft-aware JSON Schemas and validate
+without coercion in a bounded, secret-free subprocess; remote schema references
+are never fetched. Rich call results preserve validated content blocks,
+structured data, metadata, application errors, and protocol error details;
+side-effecting calls are not replayed after an ambiguous failure.
+
 ```bash
 ash mcp add docs --transport http --url https://mcp.example/rpc --auth oauth
 ash mcp login docs

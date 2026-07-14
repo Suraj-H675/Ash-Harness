@@ -60,7 +60,7 @@ def assert_distribution_metadata() -> None:
         for requirement in requirements
         if requirement.marker is None
     }
-    assert {"croniter", "tzdata"} <= base_names
+    assert {"croniter", "referencing", "tzdata"} <= base_names
     assert not (OPTIONAL_DISTRIBUTIONS & base_names)
     marked: dict[str, list[str]] = {}
     for requirement in requirements:
@@ -87,6 +87,7 @@ def assert_distribution_metadata() -> None:
         "ash/lsp/config.py",
         "ash/lsp/manager.py",
         "ash/lsp/middleware.py",
+        "ash/mcp/schema_worker.py",
         "ash/sandbox/Dockerfile",
         "ash/tools/lsp.py",
     } <= packaged
@@ -104,6 +105,7 @@ def main() -> None:
     from ash.lsp.client import LSPClient
     from ash.lsp.config import load_lsp_server_configs
     from ash.lsp.manager import LanguageServerManager
+    from ash.mcp.runtime import MCPTool
     from ash.repo.repomap import calculate_personalized_pagerank
     from ash.providers.base import ProviderABC, StreamChunk
     from ash.providers.capabilities import ProviderCapabilities
@@ -207,6 +209,59 @@ def main() -> None:
                 await loop.aclose()
 
         asyncio.run(verify_native_protocol())
+
+        class InstalledMCPClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def call_tool(
+                self, name: str, arguments: dict[str, object]
+            ) -> dict[str, object]:
+                self.calls += 1
+                assert name == "inspect"
+                assert arguments == {"mode": "safe"}
+                return {
+                    "content": [{"type": "text", "text": "value: 2"}],
+                    "structuredContent": {"value": 2},
+                    "_meta": {"source": "installed-wheel"},
+                }
+
+        async def verify_mcp_boundary() -> None:
+            input_schema = {
+                "type": "object",
+                "properties": {"mode": {"enum": ["safe"]}},
+                "required": ["mode"],
+                "additionalProperties": False,
+            }
+            client = InstalledMCPClient()
+            tool = MCPTool(
+                SafetyGuard(project_root=workspace),
+                client=client,  # type: ignore[arg-type]
+                server_name="wheel",
+                definition={
+                    "name": "inspect",
+                    "description": "Inspect the installed MCP boundary.",
+                    "inputSchema": input_schema,
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {"value": {"type": "integer"}},
+                        "required": ["value"],
+                        "additionalProperties": False,
+                    },
+                },
+            )
+            assert tool.json_schema() == input_schema
+            invalid = await tool.run(mode="unsafe")
+            assert invalid.success is False
+            assert client.calls == 0
+            valid = await tool.run(mode="safe")
+            assert valid.success is True
+            envelope = json.loads(valid.output)
+            assert envelope["structuredContent"] == {"value": 2}
+            assert envelope["_meta"] == {"source": "installed-wheel"}
+            assert client.calls == 1
+
+        asyncio.run(verify_mcp_boundary())
 
         shared_state = SharedState(root / "agents.db")
         try:

@@ -54,7 +54,7 @@ reduce tool selection accuracy, and make the security boundary unreviewable.
 
 ### Protocols and safety sources
 
-- [Model Context Protocol 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25): lifecycle and capability negotiation; server tools, resources, and prompts; client roots, sampling, and elicitation; progress, cancellation, logging, authorization, and experimental durable tasks.
+- [Model Context Protocol 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25): lifecycle and capability negotiation; draft-aware JSON Schema 2020-12 tool inputs and outputs; content, structured results, metadata, and application errors; server tools, resources, and prompts; client roots, sampling, and elicitation; progress, cancellation, logging, authorization, and experimental durable tasks.
 - [MCP Authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization): OAuth 2.1 protected-resource discovery, OAuth/OIDC metadata fallback order, Client ID Metadata Documents, preregistration, DCR fallback, S256 PKCE, resource indicators, step-up scope challenges, and token handling requirements.
 - [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728), [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414), [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591), [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707), and [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636): protected-resource metadata, authorization-server metadata, dynamic registration, resource indicators, and PKCE details used by the MCP authorization profile.
 - [Agent Skills specification](https://agentskills.io/specification): `SKILL.md` metadata, naming, optional resources, validation, and progressive disclosure.
@@ -336,7 +336,7 @@ not remove them.
 
 ## Current Ash Capability Matrix
 
-| Domain | State on 2026-07-13 | Key gap |
+| Domain | State on 2026-07-14 | Key gap |
 |---|---|---|
 | Agent loop and streaming | Strong | Public event schema v1, validated provider-portable messages, typed terminal outcomes, and capability-selected native/XML paths span the runtime and adapters. EOF, truncation, filtering, post-terminal output, and cross-protocol calls fail closed; richer provider content blocks and a smaller loop remain. |
 | Provider layer | Strong partial | Built-ins, embedders, declared model capabilities, and custom OpenAI-compatible endpoints resolve through thread-safe linked registries; auth/discovery and non-text modalities remain limited. |
@@ -348,7 +348,7 @@ not remove them.
 | Agent Skills | Strong after `5dcbf51` | Standard parsing and progressive disclosure now exist; controlled script execution and compatibility diagnostics remain. |
 | Plugins | Partial | Declarative skills/commands/agents/hooks/MCP only; no versioned executable SDK or providers/channels/services. |
 | Hooks | Strong partial | Hook contract v1 covers bounded/redacted session, turn, model, tool, and error lifecycle with fail-closed pre-tool denial and isolated observers. Context-compaction/config/permission-change events and explicit ordering remain. |
-| MCP | Strong partial | 2025-11-25 negotiation, tools/resources/templates/prompts, roots, sampling, elicitation, progress, logging, cancellation, pagination, server requests, and explicit OAuth 2.1 authorization/refresh/scope step-up exist; experimental tasks and live multi-vendor OAuth conformance remain. |
+| MCP | Strong partial | 2025-11-25 negotiation, bounded large stdio messages, exact version-aware input/output schemas, process-isolated non-coercing validation with no remote-reference retrieval, version-specific content checks, complete structured result envelopes, protocol error data, bidirectional cancellation, tools/resources/templates/prompts, roots, sampling, elicitation, progress, logging, pagination, server requests, and explicit OAuth 2.1 authorization/refresh/scope step-up exist. Required-task tools fail closed until the experimental lifecycle is implemented; tool-list change refresh, resilient HTTP session recovery, experimental tasks, and live multi-vendor OAuth conformance remain. |
 | Safety/sandbox | Strong | Needs remote/plugin identity capabilities, network proxy policy, stronger resource limits, and platform CI. |
 | CLI/TUI/SDK/API | Strong local/remote | CLI, SDK, HTTP server, ACP v1, and A2A 1.0 adapters share the trusted runtime and versioned events. ACP provides bounded editor sessions and an official wire test. A2A provides authenticated/durable JSON-RPC and HTTP+JSON tasks, streaming/cancel/continuation, origin-pinned clients, and trusted delegation tools. WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, and channel adapters remain. |
 | LSP | Verified locally | Bounded LSP 3.18 stdio clients start lazily per root, honor negotiated full/incremental sync and UTF position units, support push/pull diagnostics and semantic queries, filter external URIs, require workspace trust, use scrubbed environments, bound caches/results, and shut down process trees deterministically. Rename, code actions, broader server coverage, and multi-vendor conformance remain. |
@@ -447,11 +447,12 @@ sessions migrate, and provider/tool fakes cover the state machine.
 
 ### Phase 2: standards and extension platform
 
-1. Upgrade MCP incrementally with negotiated capabilities, server request
-   dispatch, progress/cancellation/notifications, roots, sampling, elicitation,
-   and OAuth: complete through explicit OAuth 2.1 login, private resource-bound
-   credentials, refresh, and one-retry runtime recovery. Experimental tasks
-   remain gated and unimplemented.
+1. Upgrade MCP incrementally with negotiated capabilities, exact draft-aware
+   tool schemas, structured result validation, server request dispatch,
+   progress/cancellation/notifications, roots, sampling, elicitation, and OAuth:
+   complete through explicit OAuth 2.1 login, private resource-bound
+   credentials, refresh, and one-retry runtime recovery. Tool-list change
+   refresh, resilient HTTP session recovery, and experimental tasks remain.
 2. Define plugin API v1 and an out-of-process plugin host: complete for tool
    contributions, including manifest-time Draft 2020-12 schema and namespace
    validation, strict bounded JSON-RPC stdio, lazy shared hosts, no call replay,

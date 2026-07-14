@@ -28,14 +28,28 @@ SUPPORTED_PROTOCOL_VERSIONS = frozenset(
     {LATEST_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"}
 )
 MAX_PAGINATION_PAGES = 100
+MAX_STDIO_MESSAGE_BYTES = 8 * 1024 * 1024
 
 RequestHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 NotificationHandler = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 ServerRequestHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+_MISSING = object()
 
 
 class MCPProtocolError(RuntimeError):
     """Raised for JSON-RPC or MCP negotiation failures."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        data: Any = _MISSING,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.has_data = data is not _MISSING
+        self.data = None if data is _MISSING else data
 
 
 class MCPClient:
@@ -78,6 +92,7 @@ class MCPClient:
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._server_tasks: set[asyncio.Task[None]] = set()
+        self._incoming_requests: dict[str | int, asyncio.Task[None]] = {}
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_id = 1
         self._write_lock = asyncio.Lock()
@@ -171,21 +186,52 @@ class MCPClient:
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=self.config.resolved_cwd,
+            limit=MAX_STDIO_MESSAGE_BYTES + 1,
             **process_group_options(),
         )
-        self._reader_task = asyncio.create_task(self._read_stdio())
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
+        self._reader_task = asyncio.create_task(self._read_stdio(self._process))
+        self._stderr_task = asyncio.create_task(self._drain_stderr(self._process))
 
-    async def _read_stdio(self) -> None:
-        assert self._process is not None and self._process.stdout is not None
-        while line := await self._process.stdout.readline():
+    async def _read_stdio(
+        self,
+        process: asyncio.subprocess.Process | None = None,
+    ) -> None:
+        process = process or self._process
+        assert process is not None and process.stdout is not None
+        error: MCPProtocolError | None = None
+        while True:
+            try:
+                line = await process.stdout.readline()
+            except (ValueError, OSError) as exc:
+                error = MCPProtocolError(
+                    f"MCP server {self.config.name!r} sent invalid stdio framing: {exc}"
+                )
+                break
+            if not line:
+                error = MCPProtocolError(
+                    f"MCP server {self.config.name!r} closed its stdout"
+                )
+                break
+            if len(line) > MAX_STDIO_MESSAGE_BYTES:
+                error = MCPProtocolError(
+                    f"MCP server {self.config.name!r} message exceeded "
+                    f"{MAX_STDIO_MESSAGE_BYTES} bytes"
+                )
+                break
             try:
                 message = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if isinstance(message, dict):
                 self._dispatch_incoming(message)
-        error = MCPProtocolError(f"MCP server {self.config.name!r} closed its stdout")
+        assert error is not None
+        self._fail_pending(error)
+        self._initialized = False
+        if self._process is process:
+            self._process = None
+        await terminate_process_tree(process, grace_seconds=0.1)
+
+    def _fail_pending(self, error: MCPProtocolError) -> None:
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(error)
@@ -200,10 +246,23 @@ class MCPClient:
             return
         task = asyncio.create_task(self._handle_incoming(message))
         self._server_tasks.add(task)
-        task.add_done_callback(self._finish_server_task)
+        incoming_id = message.get("id") if "method" in message else None
+        if isinstance(incoming_id, (str, int)) and not isinstance(incoming_id, bool):
+            self._incoming_requests[incoming_id] = task
 
-    def _finish_server_task(self, task: asyncio.Task[None]) -> None:
+        def finish_server_task(finished: asyncio.Task[None]) -> None:
+            self._finish_server_task(finished, incoming_id)
+
+        task.add_done_callback(finish_server_task)
+
+    def _finish_server_task(
+        self,
+        task: asyncio.Task[None],
+        request_id: Any = None,
+    ) -> None:
         self._server_tasks.discard(task)
+        if self._incoming_requests.get(request_id) is task:
+            self._incoming_requests.pop(request_id, None)
         if not task.cancelled():
             task.exception()
 
@@ -215,6 +274,14 @@ class MCPClient:
         if not isinstance(params, dict):
             params = {}
         if "id" not in message:
+            if method == "notifications/cancelled":
+                cancelled_id = params.get("requestId")
+                if isinstance(cancelled_id, (str, int)) and not isinstance(
+                    cancelled_id, bool
+                ):
+                    pending = self._incoming_requests.get(cancelled_id)
+                    if pending is not None:
+                        pending.cancel()
             if self.notification_handler is not None:
                 try:
                     notification_result = self.notification_handler(method, params)
@@ -228,6 +295,8 @@ class MCPClient:
         try:
             result = await self._handle_server_request(method, params)
             response = {"jsonrpc": "2.0", "id": request_id, "result": result}
+        except asyncio.CancelledError:
+            return
         except MCPProtocolError as exc:
             response = {
                 "jsonrpc": "2.0",
@@ -262,9 +331,13 @@ class MCPClient:
             return await self.server_request_handler(method, params)
         raise MCPProtocolError(f"Unsupported MCP client method: {method}")
 
-    async def _drain_stderr(self) -> None:
-        assert self._process is not None and self._process.stderr is not None
-        while await self._process.stderr.readline():
+    async def _drain_stderr(
+        self,
+        process: asyncio.subprocess.Process | None = None,
+    ) -> None:
+        process = process or self._process
+        assert process is not None and process.stderr is not None
+        while await process.stderr.read(4096):
             pass
 
     async def request(
@@ -286,19 +359,37 @@ class MCPClient:
             else:
                 response = await self._request_http(request_id, payload)
         except (asyncio.TimeoutError, httpx.TimeoutException):
-            await self._cancel_request(request_id, f"{method} timed out")
+            if method != "initialize":
+                await self._cancel_request(request_id, f"{method} timed out")
             raise
         except asyncio.CancelledError:
-            await asyncio.shield(
-                self._cancel_request(request_id, f"{method} was cancelled")
-            )
+            if method != "initialize":
+                await asyncio.shield(
+                    self._cancel_request(request_id, f"{method} was cancelled")
+                )
             raise
         if "error" in response:
             error = response["error"]
             if not isinstance(error, dict):
                 raise MCPProtocolError(f"{method} failed with an invalid error")
+            code = error.get("code")
+            message = error.get("message")
+            error_data = {"data": error["data"]} if "data" in error else {}
+            if isinstance(code, bool) or not isinstance(code, int):
+                raise MCPProtocolError(
+                    f"{method} failed with an invalid error code",
+                    **error_data,
+                )
+            if not isinstance(message, str):
+                raise MCPProtocolError(
+                    f"{method} failed with an invalid error message",
+                    code=code,
+                    **error_data,
+                )
             raise MCPProtocolError(
-                f"{method} failed ({error.get('code')}): {error.get('message')}"
+                f"{method} failed ({code}): {message}",
+                code=code,
+                **error_data,
             )
         result = response.get("result", {})
         return result if isinstance(result, dict) else {"value": result}
@@ -310,11 +401,13 @@ class MCPClient:
             raise MCPProtocolError("MCP stdio client is not connected")
         future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        await self._send_message(payload)
         try:
+            await self._send_message(payload)
             return await asyncio.wait_for(future, timeout=self.timeout)
         finally:
             self._pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
 
     async def _request_http(
         self, request_id: int, payload: dict[str, Any]
@@ -487,6 +580,9 @@ class MCPClient:
 
     async def disconnect(self) -> None:
         self._initialized = False
+        self._fail_pending(
+            MCPProtocolError(f"MCP server {self.config.name!r} disconnected")
+        )
         if self._http is not None and self._http_session_id:
             try:
                 headers = {**self.config.resolved_headers}
@@ -523,6 +619,7 @@ class MCPClient:
         self._reader_task = None
         self._stderr_task = None
         self._server_tasks.clear()
+        self._incoming_requests.clear()
         self.protocol_version = ""
         self.server_capabilities = {}
         self.server_info = {}
