@@ -28,15 +28,15 @@ class MCPServerConfig:
     command: str
     args: list[str]
     env: dict[str, str]
-    transport: str = "stdio"  # "stdio" | "sse" | "http" | "websocket"
-    url: str = ""  # for SSE/HTTP/WebSocket
+    transport: str = "stdio"  # "stdio" | "sse" | "http"
+    url: str = ""  # for Streamable HTTP (including the "sse" config alias)
     headers: dict[str, str] | None = None
     cwd: str = ""
     auth: str = "none"
     oauth: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if self.transport not in {"stdio", "http", "sse", "websocket"}:
+        if self.transport not in {"stdio", "http", "sse"}:
             raise ValueError(f"Unknown MCP transport: {self.transport}")
         if self.auth not in {"none", "oauth"}:
             raise ValueError(f"Unknown MCP auth mode: {self.auth}")
@@ -135,7 +135,7 @@ class MCPServerManager:
 
     def start_server(self, config: MCPServerConfig) -> MCPServerInstance:
         """Start an MCP server as a subprocess."""
-        if config.transport in ("sse", "http", "websocket"):
+        if config.transport in ("sse", "http"):
             # Network transports: server is already running externally.
             # Just store the config — no subprocess to manage.
             instance = MCPServerInstance(
@@ -314,7 +314,7 @@ def expand_env_vars(value: str) -> str:
 
 def _validate_server_data(name: str, data: dict[str, Any]) -> None:
     transport = data.get("transport", "stdio")
-    if transport not in {"stdio", "http", "sse", "websocket"}:
+    if transport not in {"stdio", "http", "sse"}:
         raise ValueError(f"Unknown MCP transport: {transport}")
     command = data.get("command", "")
     url = data.get("url", "")

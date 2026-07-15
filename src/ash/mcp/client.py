@@ -28,11 +28,17 @@ SUPPORTED_PROTOCOL_VERSIONS = frozenset(
     {LATEST_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"}
 )
 MAX_PAGINATION_PAGES = 100
+MAX_PAGINATION_SESSION_RESTARTS = 1
 MAX_STDIO_MESSAGE_BYTES = 8 * 1024 * 1024
+MAX_HTTP_SESSION_ID_BYTES = 1024
 
 RequestHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 NotificationHandler = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 ServerRequestHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+SessionReinitializedHandler = Callable[
+    [int, str, dict[str, Any]], Awaitable[bool] | bool
+]
+ToolContractValidator = Callable[[str, str, int], bool]
 _MISSING = object()
 
 
@@ -52,6 +58,15 @@ class MCPProtocolError(RuntimeError):
         self.data = None if data is _MISSING else data
 
 
+class MCPSessionExpired(MCPProtocolError):
+    """A session-bound HTTP POST was rejected because its session expired."""
+
+    def __init__(self, session_id: str, generation: int) -> None:
+        super().__init__("MCP Streamable HTTP session expired with 404 Not Found")
+        self.session_id = session_id
+        self.generation = generation
+
+
 class MCPClient:
     """One initialized MCP connection with negotiated client capabilities."""
 
@@ -68,6 +83,8 @@ class MCPClient:
         elicitation_modes: tuple[str, ...] = ("form",),
         notification_handler: NotificationHandler | None = None,
         server_request_handler: ServerRequestHandler | None = None,
+        session_reinitialized_handler: SessionReinitializedHandler | None = None,
+        tool_contract_validator: ToolContractValidator | None = None,
         oauth_session: MCPOAuthSession | None = None,
     ) -> None:
         if timeout <= 0:
@@ -84,6 +101,8 @@ class MCPClient:
         self.elicitation_modes = tuple(dict.fromkeys(elicitation_modes))
         self.notification_handler = notification_handler
         self.server_request_handler = server_request_handler
+        self.session_reinitialized_handler = session_reinitialized_handler
+        self.tool_contract_validator = tool_contract_validator
         self.protocol_version = ""
         self.server_capabilities: dict[str, Any] = {}
         self.server_info: dict[str, Any] = {}
@@ -99,6 +118,12 @@ class MCPClient:
         self._http: httpx.AsyncClient | None = http_client
         self._owns_http = http_client is None
         self._http_session_id = ""
+        self._pending_initialize_session_id = ""
+        self._session_generation = 0
+        self._session_recovery_lock = asyncio.Lock()
+        self._session_ready = asyncio.Event()
+        self._session_ready.set()
+        self._connect_lock = asyncio.Lock()
         self._oauth = oauth_session
         if self._oauth is None and config.auth == "oauth":
             self._oauth = MCPOAuthSession(
@@ -123,24 +148,39 @@ class MCPClient:
         return capabilities
 
     def supports_server_capability(self, name: str) -> bool:
-        return name in self.server_capabilities
+        return isinstance(self.server_capabilities.get(name), dict)
+
+    @property
+    def session_generation(self) -> int:
+        return self._session_generation
 
     async def connect(self) -> None:
-        if self._initialized:
-            return
-        if self.config.transport == "stdio":
-            await self._connect_stdio()
-        elif self.config.transport in {"http", "sse"}:
-            if not self.config.resolved_url:
-                raise MCPProtocolError(f"MCP server {self.config.name!r} has no URL")
-            if self._http is None:
-                self._http = httpx.AsyncClient(timeout=self.timeout)
-            if self._oauth is not None and self._oauth.http_client is None:
-                self._oauth.http_client = self._http
-        else:
-            raise MCPProtocolError(
-                f"Unsupported MCP transport: {self.config.transport}"
-            )
+        async with self._connect_lock:
+            if self._initialized:
+                return
+            if self.config.transport == "stdio":
+                await self._connect_stdio()
+            elif self.config.transport in {"http", "sse"}:
+                if not self.config.resolved_url:
+                    raise MCPProtocolError(
+                        f"MCP server {self.config.name!r} has no URL"
+                    )
+                if self._http is None:
+                    self._http = httpx.AsyncClient(timeout=self.timeout)
+                if self._oauth is not None and self._oauth.http_client is None:
+                    self._oauth.http_client = self._http
+            else:
+                raise MCPProtocolError(
+                    f"Unsupported MCP transport: {self.config.transport}"
+                )
+            try:
+                await self._initialize_protocol()
+            except BaseException:
+                await asyncio.shield(self.disconnect())
+                raise
+
+    async def _initialize_protocol(self) -> None:
+        self._pending_initialize_session_id = ""
         result = await self.request(
             "initialize",
             {
@@ -153,17 +193,24 @@ class MCPClient:
                     "description": "Extensible local AI agent harness",
                 },
             },
+            _allow_session_recovery=False,
         )
         selected = str(result.get("protocolVersion", ""))
         if selected not in SUPPORTED_PROTOCOL_VERSIONS:
-            await self.disconnect()
             raise MCPProtocolError(
                 f"MCP server selected unsupported protocol version {selected!r}"
             )
         capabilities = result.get("capabilities", {})
         if not isinstance(capabilities, dict):
-            await self.disconnect()
             raise MCPProtocolError("MCP server capabilities must be an object")
+        malformed_capabilities = [
+            name for name, value in capabilities.items() if not isinstance(value, dict)
+        ]
+        if malformed_capabilities:
+            raise MCPProtocolError(
+                "MCP server capabilities must contain objects: "
+                + ", ".join(sorted(malformed_capabilities))
+            )
         self.protocol_version = selected
         self.server_capabilities = capabilities
         self.server_info = (
@@ -173,7 +220,12 @@ class MCPClient:
         )
         instructions = result.get("instructions", "")
         self.server_instructions = instructions if isinstance(instructions, str) else ""
-        await self.notify("notifications/initialized", {})
+        self._http_session_id = self._pending_initialize_session_id
+        self._pending_initialize_session_id = ""
+        self._session_generation += 1
+        await self.notify(
+            "notifications/initialized", {}, _allow_session_recovery=False
+        )
         self._initialized = True
 
     async def _connect_stdio(self) -> None:
@@ -239,6 +291,14 @@ class MCPClient:
 
     def _dispatch_incoming(self, message: dict[str, Any]) -> None:
         request_id = message.get("id")
+        try:
+            _validate_jsonrpc_message(message)
+        except MCPProtocolError as exc:
+            if isinstance(request_id, int) and not isinstance(request_id, bool):
+                future = self._pending.pop(request_id, None)
+                if future is not None and not future.done():
+                    future.set_exception(exc)
+            return
         if "method" not in message and isinstance(request_id, int):
             future = self._pending.pop(request_id, None)
             if future is not None and not future.done():
@@ -344,20 +404,73 @@ class MCPClient:
         self,
         method: str,
         params: dict[str, Any] | None = None,
+        *,
+        _allow_session_recovery: bool = True,
+        _expected_tool_contract: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
-        request_id = self._next_id
-        self._next_id += 1
-        payload = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": params or {},
-        }
+        if self.config.transport != "stdio" and _allow_session_recovery:
+            async with self._session_recovery_lock:
+                if not self._initialized and self._session_generation:
+                    await self._initialize_protocol()
+                readiness = self._session_ready
+            await readiness.wait()
+        if (
+            _expected_tool_contract is not None
+            and self.tool_contract_validator is not None
+            and not self.tool_contract_validator(
+                _expected_tool_contract[0],
+                _expected_tool_contract[1],
+                self._session_generation,
+            )
+        ):
+            raise MCPProtocolError(
+                f"MCP tool {_expected_tool_contract[0]!r} no longer matches "
+                "the active verified server contract"
+            )
+        request_id = 0
+        recovery_attempted = False
         try:
-            if self.config.transport == "stdio":
-                response = await self._request_stdio(request_id, payload)
-            else:
-                response = await self._request_http(request_id, payload)
+            while True:
+                request_id = self._next_id
+                self._next_id += 1
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params or {},
+                }
+                try:
+                    if self.config.transport == "stdio":
+                        response = await self._request_stdio(
+                            request_id,
+                            payload,
+                            expected_tool_contract=_expected_tool_contract,
+                        )
+                    else:
+                        response = await self._request_http(
+                            request_id,
+                            payload,
+                            expected_tool_contract=_expected_tool_contract,
+                            bypass_session_readiness=not _allow_session_recovery,
+                        )
+                    break
+                except MCPSessionExpired as exc:
+                    if not _allow_session_recovery or method == "initialize":
+                        raise
+                    retry_allowed = await self._recover_http_session(
+                        exc, method=method, params=params or {}
+                    )
+                    if recovery_attempted:
+                        raise MCPProtocolError(
+                            f"{method} was rejected after one HTTP session recovery; "
+                            "the operation was not attempted again"
+                        ) from exc
+                    if not retry_allowed:
+                        raise MCPProtocolError(
+                            f"{method} was not retried because the replacement "
+                            "HTTP session changed the server contract"
+                        ) from exc
+                    recovery_attempted = True
         except (asyncio.TimeoutError, httpx.TimeoutException):
             if method != "initialize":
                 await self._cancel_request(request_id, f"{method} timed out")
@@ -395,14 +508,20 @@ class MCPClient:
         return result if isinstance(result, dict) else {"value": result}
 
     async def _request_stdio(
-        self, request_id: int, payload: dict[str, Any]
+        self,
+        request_id: int,
+        payload: dict[str, Any],
+        *,
+        expected_tool_contract: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         if self._process is None or self._process.stdin is None:
             raise MCPProtocolError("MCP stdio client is not connected")
         future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
         try:
-            await self._send_message(payload)
+            await self._send_message(
+                payload, _expected_tool_contract=expected_tool_contract
+            )
             return await asyncio.wait_for(future, timeout=self.timeout)
         finally:
             self._pending.pop(request_id, None)
@@ -410,24 +529,40 @@ class MCPClient:
                 future.cancel()
 
     async def _request_http(
-        self, request_id: int, payload: dict[str, Any]
+        self,
+        request_id: int,
+        payload: dict[str, Any],
+        *,
+        expected_tool_contract: tuple[str, str] | None = None,
+        bypass_session_readiness: bool = False,
     ) -> dict[str, Any]:
-        response_http = await self._post_http(payload)
+        response_http = await self._post_http(
+            payload,
+            expected_tool_contract=expected_tool_contract,
+            bypass_session_readiness=bypass_session_readiness,
+        )
         matching: dict[str, Any] | None = None
         for message in _parse_http_messages(response_http):
             if message.get("id") == request_id and "method" not in message:
+                if matching is not None:
+                    raise MCPProtocolError(
+                        f"MCP HTTP response repeated request id {request_id}"
+                    )
                 matching = message
             else:
-                await self._handle_incoming(message)
+                self._dispatch_incoming(message)
         if matching is None:
             raise MCPProtocolError(f"MCP HTTP response omitted request id {request_id}")
         return matching
 
     async def _cancel_request(self, request_id: int, reason: str) -> None:
+        if self.config.transport != "stdio" and not self._initialized:
+            return
         try:
             await self.notify(
                 "notifications/cancelled",
                 {"requestId": request_id, "reason": reason},
+                _allow_session_recovery=False,
             )
         except (MCPProtocolError, httpx.HTTPError, OSError):
             return
@@ -436,39 +571,135 @@ class MCPClient:
         self,
         method: str,
         params: dict[str, Any] | None = None,
+        *,
+        _allow_session_recovery: bool = True,
     ) -> None:
         await self._send_message(
-            {"jsonrpc": "2.0", "method": method, "params": params or {}}
+            {"jsonrpc": "2.0", "method": method, "params": params or {}},
+            _allow_session_recovery=_allow_session_recovery,
         )
 
-    async def _send_message(self, payload: dict[str, Any]) -> None:
+    async def _send_message(
+        self,
+        payload: dict[str, Any],
+        *,
+        _allow_session_recovery: bool = True,
+        _expected_tool_contract: tuple[str, str] | None = None,
+    ) -> None:
         if self.config.transport == "stdio":
             if self._process is None or self._process.stdin is None:
                 raise MCPProtocolError("MCP stdio client is not connected")
             async with self._write_lock:
+                if (
+                    _expected_tool_contract is not None
+                    and self.tool_contract_validator is not None
+                    and not self.tool_contract_validator(
+                        _expected_tool_contract[0],
+                        _expected_tool_contract[1],
+                        self._session_generation,
+                    )
+                ):
+                    raise MCPProtocolError(
+                        f"MCP tool {_expected_tool_contract[0]!r} no longer matches "
+                        "the active verified server contract"
+                    )
                 self._process.stdin.write(
                     (json.dumps(payload, separators=(",", ":")) + "\n").encode()
                 )
                 await self._process.stdin.drain()
             return
-        response = await self._post_http(payload)
+        if _allow_session_recovery:
+            async with self._session_recovery_lock:
+                if not self._initialized and self._session_generation:
+                    await self._initialize_protocol()
+                readiness = self._session_ready
+            await readiness.wait()
+        try:
+            response = await self._post_http(
+                payload,
+                bypass_session_readiness=not _allow_session_recovery,
+            )
+        except MCPSessionExpired as exc:
+            if not _allow_session_recovery:
+                raise
+            retry_allowed = await self._recover_http_session(
+                exc,
+                method=str(payload.get("method", "")),
+                params=(
+                    payload["params"]
+                    if isinstance(payload.get("params"), dict)
+                    else {}
+                ),
+            )
+            method = payload.get("method")
+            if (
+                not retry_allowed
+                or not isinstance(method, str)
+                or method == "notifications/cancelled"
+            ):
+                return
+            try:
+                response = await self._post_http(payload)
+            except MCPSessionExpired as retry_exc:
+                await self._recover_http_session(
+                    retry_exc,
+                    method=method,
+                    params=(
+                        payload["params"]
+                        if isinstance(payload.get("params"), dict)
+                        else {}
+                    ),
+                )
+                raise MCPProtocolError(
+                    f"{method} was rejected after one HTTP session recovery"
+                ) from retry_exc
         if response.status_code == 202 or not response.content:
             return
         for message in _parse_http_messages(response):
-            await self._handle_incoming(message)
+            self._dispatch_incoming(message)
 
-    async def _post_http(self, payload: dict[str, Any]) -> httpx.Response:
+    async def _post_http(
+        self,
+        payload: dict[str, Any],
+        *,
+        expected_tool_contract: tuple[str, str] | None = None,
+        bypass_session_readiness: bool = False,
+    ) -> httpx.Response:
         if self._http is None:
             raise MCPProtocolError("MCP HTTP client is not connected")
-        headers = {
-            **self.config.resolved_headers,
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        }
-        if self._http_session_id:
-            headers["Mcp-Session-Id"] = self._http_session_id
-        if self.protocol_version:
-            headers["MCP-Protocol-Version"] = self.protocol_version
+        headers = httpx.Headers(self.config.resolved_headers)
+        headers["Accept"] = "application/json, text/event-stream"
+        headers["Content-Type"] = "application/json"
+        is_initialize = payload.get("method") == "initialize"
+        while True:
+            ready = self._session_ready.is_set()
+            sent_session_id = "" if is_initialize else self._http_session_id
+            sent_generation = self._session_generation
+            sent_protocol_version = self.protocol_version
+            if is_initialize or bypass_session_readiness or ready:
+                break
+            await self._session_ready.wait()
+        if (
+            expected_tool_contract is not None
+            and self.tool_contract_validator is not None
+            and not self.tool_contract_validator(
+                expected_tool_contract[0],
+                expected_tool_contract[1],
+                sent_generation,
+            )
+        ):
+            raise MCPProtocolError(
+                f"MCP tool {expected_tool_contract[0]!r} no longer matches "
+                "the active verified server contract"
+            )
+        if sent_session_id:
+            headers["Mcp-Session-Id"] = sent_session_id
+        else:
+            headers.pop("Mcp-Session-Id", None)
+        if sent_protocol_version and not is_initialize:
+            headers["MCP-Protocol-Version"] = sent_protocol_version
+        else:
+            headers.pop("MCP-Protocol-Version", None)
         if self._oauth is not None:
             headers["Authorization"] = await self._oauth.authorization_header()
         response = await self._http.post(
@@ -511,11 +742,67 @@ class MCPClient:
                     f"scope{guidance}; rerun `ash mcp login {self.config.name}` "
                     "with --scope set to the server-required scopes"
                 )
+        if response.status_code == 404 and sent_session_id:
+            raise MCPSessionExpired(sent_session_id, sent_generation)
         response.raise_for_status()
-        session_id = response.headers.get("Mcp-Session-Id")
-        if session_id:
-            self._http_session_id = session_id
+        if is_initialize:
+            session_id = response.headers.get("Mcp-Session-Id", "")
+            if session_id:
+                _validate_http_session_id(session_id)
+                self._pending_initialize_session_id = session_id
         return response
+
+    async def _recover_http_session(
+        self,
+        expired: MCPSessionExpired,
+        *,
+        method: str = "",
+        params: dict[str, Any] | None = None,
+    ) -> bool:
+        async with self._session_recovery_lock:
+            if (
+                self._initialized
+                and self._session_generation != expired.generation
+            ):
+                generation = self._session_generation
+            else:
+                self._initialized = False
+                self._session_ready.clear()
+                self._http_session_id = ""
+                self._pending_initialize_session_id = ""
+                self.protocol_version = ""
+                self.server_capabilities = {}
+                self.server_info = {}
+                self.server_instructions = ""
+                try:
+                    await self._initialize_protocol()
+                except BaseException:
+                    session_to_close = (
+                        self._http_session_id
+                        or self._pending_initialize_session_id
+                    )
+                    self._http_session_id = ""
+                    self._pending_initialize_session_id = ""
+                    try:
+                        if session_to_close:
+                            await asyncio.shield(
+                                self._delete_http_session(session_to_close)
+                            )
+                    finally:
+                        self._session_ready.set()
+                    raise
+                generation = self._session_generation
+        try:
+            if self.session_reinitialized_handler is None:
+                return True
+            result = self.session_reinitialized_handler(
+                generation, method, dict(params or {})
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            return bool(result)
+        finally:
+            self._session_ready.set()
 
     async def list_tools(self) -> list[dict[str, Any]]:
         return await self._list_paginated("tools/list", "tools")
@@ -524,10 +811,15 @@ class MCPClient:
         self,
         name: str,
         arguments: dict[str, Any],
+        *,
+        expected_contract: str | None = None,
     ) -> dict[str, Any]:
         return await self.request(
             "tools/call",
             {"name": name, "arguments": arguments},
+            _expected_tool_contract=(name, expected_contract)
+            if expected_contract is not None
+            else None,
         )
 
     async def list_resources(self) -> list[dict[str, Any]]:
@@ -552,27 +844,65 @@ class MCPClient:
         )
 
     async def _list_paginated(self, method: str, key: str) -> list[dict[str, Any]]:
-        output: list[dict[str, Any]] = []
-        cursor: str | None = None
-        seen: set[str] = set()
-        for _ in range(MAX_PAGINATION_PAGES):
-            result = await self.request(
-                method, {"cursor": cursor} if cursor is not None else {}
-            )
-            values = result.get(key, [])
-            if not isinstance(values, list):
-                raise MCPProtocolError(f"{method} returned non-list {key}")
-            output.extend(item for item in values if isinstance(item, dict))
-            next_cursor = result.get("nextCursor")
-            if next_cursor is None:
-                return output
-            if not isinstance(next_cursor, str) or not next_cursor:
-                raise MCPProtocolError(f"{method} returned an invalid nextCursor")
-            if next_cursor in seen:
-                raise MCPProtocolError(f"{method} repeated pagination cursor")
-            seen.add(next_cursor)
-            cursor = next_cursor
-        raise MCPProtocolError(f"{method} exceeded {MAX_PAGINATION_PAGES} pages")
+        capability = "resources" if method.startswith("resources/") else key
+        for restart in range(MAX_PAGINATION_SESSION_RESTARTS + 1):
+            if self.config.transport != "stdio":
+                async with self._session_recovery_lock:
+                    pass
+            if restart and not self.supports_server_capability(capability):
+                return []
+            output: list[dict[str, Any]] = []
+            cursor: str | None = None
+            seen: set[str] = set()
+            generation = self._session_generation
+            for _ in range(MAX_PAGINATION_PAGES):
+                if self._session_generation != generation:
+                    break
+                try:
+                    result = await self.request(
+                        method,
+                        {"cursor": cursor} if cursor is not None else {},
+                        _allow_session_recovery=False,
+                    )
+                except MCPSessionExpired as exc:
+                    recovered = await self._recover_http_session(
+                        exc, method=method, params={}
+                    )
+                    if not recovered:
+                        raise MCPProtocolError(
+                            f"{method} was not restarted after HTTP session recovery"
+                        ) from exc
+                    if not self.supports_server_capability(capability):
+                        return []
+                    break
+                if self._session_generation != generation:
+                    break
+                values = result.get(key, [])
+                if not isinstance(values, list):
+                    raise MCPProtocolError(f"{method} returned non-list {key}")
+                if not all(isinstance(item, dict) for item in values):
+                    raise MCPProtocolError(
+                        f"{method} returned a non-object {key} entry"
+                    )
+                output.extend(values)
+                next_cursor = result.get("nextCursor")
+                if next_cursor is None:
+                    return output
+                if not isinstance(next_cursor, str) or not next_cursor:
+                    raise MCPProtocolError(f"{method} returned an invalid nextCursor")
+                if next_cursor in seen:
+                    raise MCPProtocolError(f"{method} repeated pagination cursor")
+                seen.add(next_cursor)
+                cursor = next_cursor
+            else:
+                raise MCPProtocolError(
+                    f"{method} exceeded {MAX_PAGINATION_PAGES} pages"
+                )
+            if restart == MAX_PAGINATION_SESSION_RESTARTS:
+                raise MCPProtocolError(
+                    f"{method} session expired repeatedly during pagination"
+                )
+        raise AssertionError("unreachable pagination restart state")
 
     async def notify_roots_changed(self) -> None:
         if self.roots:
@@ -583,22 +913,10 @@ class MCPClient:
         self._fail_pending(
             MCPProtocolError(f"MCP server {self.config.name!r} disconnected")
         )
-        if self._http is not None and self._http_session_id:
-            try:
-                headers = {**self.config.resolved_headers}
-                if self._oauth is not None:
-                    headers["Authorization"] = await self._oauth.authorization_header()
-                headers["Mcp-Session-Id"] = self._http_session_id
-                if self.protocol_version:
-                    headers["MCP-Protocol-Version"] = self.protocol_version
-                response = await self._http.delete(
-                    self.config.resolved_url,
-                    headers=headers,
-                )
-                response.raise_for_status()
-            except (httpx.HTTPError, MCPOAuthError):
-                pass
-            self._http_session_id = ""
+        session_to_close = self._http_session_id or self._pending_initialize_session_id
+        if session_to_close:
+            await self._delete_http_session(session_to_close)
+        self._http_session_id = ""
         if self._http is not None and self._owns_http:
             await self._http.aclose()
             self._http = None
@@ -624,21 +942,62 @@ class MCPClient:
         self.server_capabilities = {}
         self.server_info = {}
         self.server_instructions = ""
+        self._pending_initialize_session_id = ""
+
+    async def _delete_http_session(self, session_id: str) -> None:
+        if self._http is None or not session_id:
+            return
+        try:
+            headers = httpx.Headers(self.config.resolved_headers)
+            if self._oauth is not None:
+                headers["Authorization"] = await self._oauth.authorization_header()
+            headers["Mcp-Session-Id"] = session_id
+            if self.protocol_version:
+                headers["MCP-Protocol-Version"] = self.protocol_version
+            response = await self._http.delete(
+                self.config.resolved_url,
+                headers=headers,
+            )
+            if response.status_code != 405:
+                response.raise_for_status()
+        except (httpx.HTTPError, MCPOAuthError):
+            return
+
+
+def _validate_http_session_id(session_id: str) -> None:
+    if len(session_id) > MAX_HTTP_SESSION_ID_BYTES or any(
+        ord(character) < 0x21 or ord(character) > 0x7E for character in session_id
+    ):
+        raise MCPProtocolError(
+            "MCP HTTP session ID must contain at most "
+            f"{MAX_HTTP_SESSION_ID_BYTES} visible ASCII characters"
+        )
 
 
 def _parse_http_messages(response: httpx.Response) -> list[dict[str, Any]]:
-    content_type = response.headers.get("content-type", "").casefold()
-    if "text/event-stream" not in content_type:
+    content_type = (
+        response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
+    )
+    if response.content and content_type not in {
+        "application/json",
+        "text/event-stream",
+    }:
+        raise MCPProtocolError(
+            "MCP HTTP response must use application/json or text/event-stream"
+        )
+    if content_type != "text/event-stream":
         if not response.content:
             return []
-        payload = response.json()
-        if isinstance(payload, dict):
-            return [payload]
-        if isinstance(payload, list) and all(
-            isinstance(item, dict) for item in payload
-        ):
-            return payload
-        raise MCPProtocolError("MCP HTTP response must contain JSON-RPC objects")
+        try:
+            payload = response.json()
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise MCPProtocolError("MCP HTTP response contained invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise MCPProtocolError(
+                "MCP HTTP application/json response must contain one JSON-RPC object"
+            )
+        _validate_jsonrpc_message(payload)
+        return [payload]
 
     messages: list[dict[str, Any]] = []
     data_lines: list[str] = []
@@ -648,15 +1007,44 @@ def _parse_http_messages(response: httpx.Response) -> list[dict[str, Any]]:
             continue
         if line or not data_lines:
             continue
-        try:
-            payload = json.loads("\n".join(data_lines))
-        except json.JSONDecodeError:
+        event_data = "\n".join(data_lines)
+        if not event_data:
             data_lines.clear()
             continue
+        try:
+            payload = json.loads(event_data)
+        except json.JSONDecodeError as exc:
+            raise MCPProtocolError("MCP SSE event contained invalid JSON") from exc
         data_lines.clear()
         if isinstance(payload, dict):
+            _validate_jsonrpc_message(payload)
             messages.append(payload)
+        else:
+            raise MCPProtocolError("MCP SSE data must contain a JSON-RPC object")
     return messages
+
+
+def _validate_jsonrpc_message(message: dict[str, Any]) -> None:
+    if message.get("jsonrpc") != "2.0":
+        raise MCPProtocolError("MCP message must declare JSON-RPC 2.0")
+    has_method = "method" in message
+    has_result = "result" in message
+    has_error = "error" in message
+    if has_method:
+        if not isinstance(message["method"], str) or not message["method"]:
+            raise MCPProtocolError("MCP request method must be a non-empty string")
+        if has_result or has_error:
+            raise MCPProtocolError("MCP request cannot contain result or error")
+    elif has_result == has_error:
+        raise MCPProtocolError(
+            "MCP response must contain exactly one of result or error"
+        )
+    if "id" in message:
+        request_id = message["id"]
+        if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
+            raise MCPProtocolError("MCP message id must be a string or integer")
+    elif not has_method:
+        raise MCPProtocolError("MCP response must contain an id")
 
 
 def _client_version() -> str:

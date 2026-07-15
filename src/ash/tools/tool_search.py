@@ -107,6 +107,16 @@ class SearchToolsTool(BaseTool):
     def reset_activations(self) -> None:
         self.activated_names.clear()
 
+    def set_catalog_provider(
+        self, catalog: Callable[[], dict[str, BaseTool]]
+    ) -> None:
+        """Bind discovery to the owning runtime's live tool inventory."""
+
+        self._catalog = catalog
+
+    def prune_activations(self, available_names: set[str]) -> None:
+        self.activated_names.intersection_update(available_names)
+
 
 def _rank_tools(
     catalog: dict[str, BaseTool],

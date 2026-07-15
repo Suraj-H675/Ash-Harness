@@ -215,11 +215,16 @@ def main() -> None:
                 self.calls = 0
 
             async def call_tool(
-                self, name: str, arguments: dict[str, object]
+                self,
+                name: str,
+                arguments: dict[str, object],
+                *,
+                expected_contract: str | None = None,
             ) -> dict[str, object]:
                 self.calls += 1
                 assert name == "inspect"
                 assert arguments == {"mode": "safe"}
+                assert expected_contract is not None
                 return {
                     "content": [{"type": "text", "text": "value: 2"}],
                     "structuredContent": {"value": 2},

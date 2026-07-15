@@ -391,7 +391,8 @@ WebSockets share the public-host and `allowed_web_domains` policy. The model
 receives bounded ARIA snapshots and stable element references rather than raw
 unbounded DOM content. Password fields are never filled by the browser tool.
 
-Remote MCP servers may use OAuth-protected Streamable HTTP or SSE. Ash
+Remote MCP servers may use OAuth-protected Streamable HTTP (`sse` remains a
+configuration alias for the same request path). Ash
 discovers protected-resource and authorization-server metadata, requires S256
 PKCE, sends the MCP resource indicator, validates callback state, and uses
 dynamic client registration when no client ID is configured and the server
@@ -402,6 +403,14 @@ without coercion in a bounded, secret-free subprocess; remote schema references
 are never fetched. Rich call results preserve validated content blocks,
 structured data, metadata, application errors, and protocol error details;
 side-effecting calls are not replayed after an ambiguous failure.
+Session-expiry 404 responses are unambiguous protocol rejections: Ash performs
+one generation-locked reinitialization, restarts any paginated list, reconciles
+the replacement server catalog, and performs one bounded retry only when the
+called tool contract is unchanged. Declared MCP tool list changes are validated
+and atomically published to the live runtime. Failed refreshes retain the last
+working catalog for discovery but quarantine its calls until a later verified
+refresh. In-flight turns retain the tool snapshot they were offered and verify
+its exact contract again immediately before every HTTP or stdio send.
 
 ```bash
 ash mcp add docs --transport http --url https://mcp.example/rpc --auth oauth

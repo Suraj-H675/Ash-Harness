@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 import json
 import re
@@ -37,6 +38,8 @@ MAX_SCHEMA_DEPTH = 64
 MAX_PATTERN_CHARACTERS = 1024
 MAX_VALIDATION_PAYLOAD_BYTES = 2 * 1024 * 1024
 MAX_WORKER_OUTPUT_BYTES = 64 * 1024
+MAX_CONSECUTIVE_TOOL_REFRESHES = 3
+TOOL_REFRESH_DEBOUNCE_SECONDS = 0.05
 
 
 def _default_schema_dialect(protocol_version: str) -> str:
@@ -392,6 +395,9 @@ class MCPTool(BaseTool):
         super().__init__(safety_guard)
         self.client = client
         self.protocol_version = protocol_version
+        self._contract_fingerprint = (
+            f"{protocol_version}\0{_json_dump(deepcopy(definition))}"
+        )
         remote_name = definition.get("name")
         if not isinstance(remote_name, str) or not remote_name:
             raise ValueError("MCP tool name must be a non-empty string")
@@ -445,6 +451,11 @@ class MCPTool(BaseTool):
 
         return deepcopy(self._input_schema)
 
+    def contract_fingerprint(self) -> str:
+        """Return a canonical fingerprint of the complete server declaration."""
+
+        return self._contract_fingerprint
+
     async def run(self, **kwargs: Any) -> ToolResult:
         try:
             input_validation = await _validate_schema_instance(
@@ -476,7 +487,20 @@ class MCPTool(BaseTool):
             )
 
         try:
-            result = await self.client.call_tool(self.remote_name, dict(kwargs))
+            validator = getattr(self.client, "tool_contract_validator", None)
+            generation = int(getattr(self.client, "session_generation", 0))
+            if callable(validator) and not validator(
+                self.remote_name, self._contract_fingerprint, generation
+            ):
+                raise MCPProtocolError(
+                    f"MCP tool {self.remote_name!r} no longer matches "
+                    "the active verified server contract"
+                )
+            result = await self.client.call_tool(
+                self.remote_name,
+                dict(kwargs),
+                expected_contract=self._contract_fingerprint,
+            )
         except MCPProtocolError as exc:
             error_payload: dict[str, Any] = {
                 "type": "mcp_protocol_error",
@@ -747,44 +771,110 @@ class MCPRuntime:
         self,
         configs: dict[str, MCPServerConfig],
         safety_guard: SafetyGuard,
+        *,
+        tool_change_handler: Callable[
+            [str, dict[str, BaseTool], dict[str, BaseTool]], Awaitable[None]
+        ]
+        | None = None,
+        event_sink: Callable[[dict[str, Any]], None] | None = None,
+        defer_notifications: bool = False,
     ) -> None:
         self.configs = configs
         self.safety_guard = safety_guard
         self.clients: dict[str, MCPClient] = {}
         self.errors: dict[str, str] = {}
+        self._server_tools: dict[str, dict[str, BaseTool]] = {}
+        self._tool_change_handler = tool_change_handler
+        self._event_sink = event_sink
+        self._defer_notifications = defer_notifications
+        self._refresh_locks: dict[str, asyncio.Lock] = {}
+        self._recovery_reconcile_locks: dict[str, asyncio.Lock] = {}
+        self._refresh_owners: dict[str, asyncio.Task[Any]] = {}
+        self._recovery_results: dict[tuple[str, int], bool] = {}
+        self._validated_generations: dict[str, int] = {}
+        self._tool_catalog_epochs: dict[str, int] = {}
+        self._validated_tool_catalog_epochs: dict[str, int] = {}
+        self._refresh_tasks: dict[str, asyncio.Task[None]] = {}
+        self._refresh_requested: set[str] = set()
+        self._startup_notifications: set[str] = set()
+        self._catalog_revisions: dict[str, int] = {}
+        self._started = False
+        self._notifications_active = False
+        self._closed = False
 
     async def start(self) -> dict[str, BaseTool]:
+        if self._started:
+            raise RuntimeError("MCP runtime is already started")
+        self._closed = False
         tools: dict[str, BaseTool] = {}
         for name, config in self.configs.items():
-            client = MCPClient(config, roots=(self.safety_guard.project_root,))
+            client = MCPClient(
+                config,
+                roots=(self.safety_guard.project_root,),
+            )
+            client.notification_handler = (
+                lambda method, params, server=name, source=client: (
+                    self._handle_notification(server, source, method, params)
+                )
+            )
+            client.session_reinitialized_handler = (
+                lambda generation, method, params, server=name, source=client: (
+                    self._handle_session_reinitialized(
+                        server, source, generation, method, params
+                    )
+                )
+            )
+            client.tool_contract_validator = (
+                lambda remote_name, fingerprint, generation, server=name: (
+                    self._validate_tool_contract(
+                        server, remote_name, fingerprint, generation
+                    )
+                )
+            )
+            self.clients[name] = client
+            self._refresh_locks[name] = asyncio.Lock()
+            self._recovery_reconcile_locks[name] = asyncio.Lock()
             try:
                 await client.connect()
-                definitions = (
-                    await client.list_tools()
-                    if client.supports_server_capability("tools")
-                    else []
-                )
+                async with self._refresh_locks[name]:
+                    task = asyncio.current_task()
+                    catalog_epoch = self._tool_catalog_epochs.get(name, 0)
+                    if task is not None:
+                        self._refresh_owners[name] = task
+                    try:
+                        definitions = (
+                            await client.list_tools()
+                            if client.supports_server_capability("tools")
+                            else []
+                        )
+                        server_tools = self._build_server_tools(
+                            name, client, definitions, strict=False
+                        )
+                        collisions = tools.keys() & server_tools.keys()
+                        if collisions:
+                            raise MCPProtocolError(
+                                "MCP tool name collision: "
+                                + ", ".join(sorted(collisions))
+                            )
+                    finally:
+                        if self._refresh_owners.get(name) is task:
+                            self._refresh_owners.pop(name, None)
+            except asyncio.CancelledError:
+                await asyncio.shield(self.close())
+                raise
             except Exception as exc:  # noqa: BLE001
                 self.errors[name] = str(exc)
+                self.clients.pop(name, None)
+                self._refresh_locks.pop(name, None)
+                self._recovery_reconcile_locks.pop(name, None)
                 await client.disconnect()
                 continue
-            self.clients[name] = client
-            for definition in definitions:
-                remote_name = definition.get("name", "<unknown>")
-                try:
-                    tool = MCPTool(
-                        self.safety_guard,
-                        client=client,
-                        server_name=name,
-                        definition=definition,
-                        protocol_version=getattr(
-                            client, "protocol_version", "2025-11-25"
-                        ),
-                    )
-                except Exception as exc:  # noqa: BLE001 - untrusted catalog entry
-                    self.errors[f"{name}:tool:{remote_name}"] = str(exc)
-                    continue
-                tools[tool.name] = tool
+            self._server_tools[name] = server_tools
+            self._validated_generations[name] = int(
+                getattr(client, "session_generation", 0)
+            )
+            self._validated_tool_catalog_epochs[name] = catalog_epoch
+            tools.update(server_tools)
         if self.clients:
             resource_tool = MCPReadResourceTool(self.safety_guard, self)
             prompt_tool = MCPGetPromptTool(self.safety_guard, self)
@@ -796,14 +886,334 @@ class MCPRuntime:
                 MCPListPromptsTool(self.safety_guard, self),
             ]
             tools.update({tool.name: tool for tool in capability_tools})
+        self._started = True
+        if not self._defer_notifications:
+            self.activate_notifications()
         return tools
 
+    def activate_notifications(self) -> None:
+        if not self._started or self._closed:
+            raise RuntimeError("MCP runtime is not active")
+        self._notifications_active = True
+        for name in tuple(self._startup_notifications):
+            self._schedule_tool_refresh(name)
+        self._startup_notifications.clear()
+
+    def server_tools_snapshot(self) -> dict[str, dict[str, BaseTool]]:
+        return {name: dict(tools) for name, tools in self._server_tools.items()}
+
+    def _build_server_tools(
+        self,
+        server_name: str,
+        client: MCPClient,
+        definitions: list[dict[str, Any]],
+        *,
+        strict: bool,
+    ) -> dict[str, BaseTool]:
+        prefix = f"{server_name}:tool:"
+        for key in tuple(self.errors):
+            if key.startswith(prefix):
+                self.errors.pop(key, None)
+        tools: dict[str, BaseTool] = {}
+        failures: list[str] = []
+        remote_names: set[str] = set()
+        for definition in definitions:
+            remote_name = definition.get("name", "<unknown>")
+            label = str(remote_name)
+            try:
+                if not isinstance(remote_name, str) or not remote_name:
+                    raise ValueError("MCP tool name must be a non-empty string")
+                if remote_name in remote_names:
+                    raise ValueError(f"duplicate MCP tool name {remote_name!r}")
+                remote_names.add(remote_name)
+                tool = MCPTool(
+                    self.safety_guard,
+                    client=client,
+                    server_name=server_name,
+                    definition=definition,
+                    protocol_version=getattr(
+                        client, "protocol_version", "2025-11-25"
+                    ),
+                )
+                if tool.name in tools:
+                    raise ValueError(f"duplicate generated MCP tool name {tool.name!r}")
+                tools[tool.name] = tool
+            except Exception as exc:  # noqa: BLE001 - untrusted catalog entry
+                self.errors[f"{prefix}{label}"] = str(exc)
+                failures.append(f"{label}: {exc}")
+        if strict and failures:
+            raise MCPProtocolError(
+                f"MCP server {server_name!r} returned an invalid tool catalog: "
+                + "; ".join(failures)
+            )
+        return tools
+
+    async def _handle_notification(
+        self,
+        server_name: str,
+        client: MCPClient,
+        method: str,
+        params: dict[str, Any],
+    ) -> None:
+        del params
+        if self._closed or self.clients.get(server_name) is not client:
+            return
+        capability_by_notification = {
+            "notifications/tools/list_changed": "tools",
+            "notifications/resources/list_changed": "resources",
+            "notifications/prompts/list_changed": "prompts",
+        }
+        capability = capability_by_notification.get(method)
+        if capability is None:
+            return
+        advertised = client.server_capabilities.get(capability)
+        if not isinstance(advertised, dict) or advertised.get("listChanged") is not True:
+            self.errors[f"{server_name}:notification:{method}"] = (
+                "server sent list_changed without declaring listChanged"
+            )
+            return
+        if capability == "tools":
+            self._tool_catalog_epochs[server_name] = (
+                self._tool_catalog_epochs.get(server_name, 0) + 1
+            )
+            if not self._notifications_active:
+                self._startup_notifications.add(server_name)
+            else:
+                self._schedule_tool_refresh(server_name)
+            return
+        revision = self._catalog_revisions.get(server_name, 0) + 1
+        self._catalog_revisions[server_name] = revision
+        self._emit_event(
+            {
+                "type": "mcp.catalog.changed",
+                "server": server_name,
+                "capability": capability,
+                "revision": revision,
+            }
+        )
+
+    async def _handle_session_reinitialized(
+        self,
+        server_name: str,
+        client: MCPClient,
+        generation: int,
+        method: str,
+        params: dict[str, Any],
+    ) -> bool:
+        del params
+        if self._closed or self.clients.get(server_name) is not client:
+            return False
+        current_task = asyncio.current_task()
+        if self._refresh_owners.get(server_name) is current_task:
+            return True
+        recovery_lock = self._recovery_reconcile_locks.get(server_name)
+        if recovery_lock is None:
+            return False
+        key = (server_name, generation)
+        async with recovery_lock:
+            cached = self._recovery_results.get(key)
+            if cached is not None:
+                return cached if method == "tools/call" else True
+            previous = self._server_tools.get(server_name, {})
+            previous_contract = {
+                name: getattr(tool, "contract_fingerprint")()
+                for name, tool in previous.items()
+            }
+            try:
+                await self._refresh_server_tools(server_name)
+            except Exception as exc:  # noqa: BLE001 - keep last good catalog
+                self.errors[f"{server_name}:tools/recovery"] = str(exc)
+                retry_allowed = False
+            else:
+                replacement = self._server_tools.get(server_name, {})
+                replacement_contract = {
+                    name: getattr(tool, "contract_fingerprint")()
+                    for name, tool in replacement.items()
+                }
+                retry_allowed = previous_contract == replacement_contract
+                self.errors.pop(f"{server_name}:tools/recovery", None)
+            self._recovery_results[key] = retry_allowed
+            if len(self._recovery_results) > 16:
+                oldest = next(iter(self._recovery_results))
+                self._recovery_results.pop(oldest, None)
+            self._emit_event(
+                {
+                    "type": "mcp.session.reinitialized",
+                    "server": server_name,
+                    "generation": generation,
+                    "contract_changed": not retry_allowed,
+                }
+            )
+            return retry_allowed if method == "tools/call" else True
+
+    def _validate_tool_contract(
+        self,
+        server_name: str,
+        remote_name: str,
+        fingerprint: str,
+        generation: int,
+    ) -> bool:
+        client = self.clients.get(server_name)
+        if (
+            self._closed
+            or client is None
+            or int(getattr(client, "session_generation", 0)) != generation
+            or self._validated_generations.get(server_name) != generation
+            or self._validated_tool_catalog_epochs.get(server_name, 0)
+            != self._tool_catalog_epochs.get(server_name, 0)
+        ):
+            return False
+        tool = self._server_tools.get(server_name, {}).get(
+            f"mcp__{server_name}__{remote_name}"
+        )
+        return bool(
+            tool is not None
+            and getattr(tool, "contract_fingerprint")() == fingerprint
+        )
+
+    def _schedule_tool_refresh(self, server_name: str) -> None:
+        if self._closed or server_name not in self.clients:
+            return
+        self._refresh_requested.add(server_name)
+        task = self._refresh_tasks.get(server_name)
+        if task is not None and not task.done():
+            return
+        task = asyncio.create_task(self._run_tool_refreshes(server_name))
+        self._refresh_tasks[server_name] = task
+
+    async def _run_tool_refreshes(self, server_name: str) -> None:
+        consecutive = 0
+        try:
+            while (
+                server_name in self._refresh_requested
+                and not self._closed
+                and consecutive < MAX_CONSECUTIVE_TOOL_REFRESHES
+            ):
+                self._refresh_requested.discard(server_name)
+                try:
+                    await self._refresh_server_tools(server_name)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - preserve last good catalog
+                    self.errors[f"{server_name}:tools/refresh"] = str(exc)
+                consecutive += 1
+                await asyncio.sleep(TOOL_REFRESH_DEBOUNCE_SECONDS)
+            if server_name in self._refresh_requested:
+                self._refresh_requested.discard(server_name)
+                self.errors[f"{server_name}:tools/refresh"] = (
+                    "suppressed a self-sustaining tools/list_changed refresh storm"
+                )
+                self._emit_event(
+                    {
+                        "type": "mcp.catalog.refresh_suppressed",
+                        "server": server_name,
+                        "capability": "tools",
+                    }
+                )
+        finally:
+            current = self._refresh_tasks.get(server_name)
+            if current is asyncio.current_task():
+                self._refresh_tasks.pop(server_name, None)
+
+    async def _refresh_server_tools(self, server_name: str) -> None:
+        client = self.clients.get(server_name)
+        lock = self._refresh_locks.get(server_name)
+        if client is None or lock is None:
+            return
+        async with lock:
+            task = asyncio.current_task()
+            catalog_epoch = self._tool_catalog_epochs.get(server_name, 0)
+            if task is not None:
+                self._refresh_owners[server_name] = task
+            try:
+                if self._closed or self.clients.get(server_name) is not client:
+                    return
+                definitions = (
+                    await client.list_tools()
+                    if client.supports_server_capability("tools")
+                    else []
+                )
+                if self._closed or self.clients.get(server_name) is not client:
+                    return
+                replacement = self._build_server_tools(
+                    server_name, client, definitions, strict=True
+                )
+                previous = self._server_tools.get(server_name, {})
+                if self._tool_change_handler is not None:
+                    await self._tool_change_handler(
+                        server_name, previous, replacement
+                    )
+                if self._closed or self.clients.get(server_name) is not client:
+                    return
+                self._server_tools[server_name] = replacement
+                self._validated_generations[server_name] = int(
+                    getattr(client, "session_generation", 0)
+                )
+                self._validated_tool_catalog_epochs[server_name] = catalog_epoch
+                self.errors.pop(f"{server_name}:tools/refresh", None)
+                revision = self._catalog_revisions.get(server_name, 0) + 1
+                self._catalog_revisions[server_name] = revision
+                previous_names = set(previous)
+                replacement_names = set(replacement)
+                changed = {
+                    name
+                    for name in previous_names & replacement_names
+                    if getattr(previous[name], "contract_fingerprint")()
+                    != getattr(replacement[name], "contract_fingerprint")()
+                }
+                self._emit_event(
+                    {
+                        "type": "mcp.catalog.changed",
+                        "server": server_name,
+                        "capability": "tools",
+                        "revision": revision,
+                        "added": sorted(replacement_names - previous_names),
+                        "removed": sorted(previous_names - replacement_names),
+                        "changed": sorted(changed),
+                    }
+                )
+            finally:
+                if self._refresh_owners.get(server_name) is task:
+                    self._refresh_owners.pop(server_name, None)
+
+    def _emit_event(self, event: dict[str, Any]) -> None:
+        if self._event_sink is not None:
+            self._event_sink(event)
+
+    async def wait_for_refreshes(self) -> None:
+        idle_ticks = 0
+        while idle_ticks < 2:
+            await asyncio.sleep(0)
+            tasks = tuple(self._refresh_tasks.values())
+            if not tasks:
+                idle_ticks += 1
+                continue
+            idle_ticks = 0
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def close(self) -> None:
+        self._closed = True
+        self._refresh_requested.clear()
+        tasks = tuple(self._refresh_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._refresh_tasks.clear()
         await asyncio.gather(
             *(client.disconnect() for client in self.clients.values()),
             return_exceptions=True,
         )
         self.clients.clear()
+        self._server_tools.clear()
+        self._refresh_locks.clear()
+        self._recovery_reconcile_locks.clear()
+        self._refresh_owners.clear()
+        self._recovery_results.clear()
+        self._validated_generations.clear()
+        self._tool_catalog_epochs.clear()
+        self._validated_tool_catalog_epochs.clear()
+        self._started = False
+        self._notifications_active = False
 
     async def list_resources(self) -> list[dict[str, Any]]:
         return await self._list_capability("list_resources")

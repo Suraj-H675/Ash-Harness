@@ -340,6 +340,10 @@ class AshLoop:
         self.project_root = project_root
         self.tools: dict[str, BaseTool] = dict(tools or {})
         self._started_tool_ids: set[int] = set()
+        search_tool = self.tools.get("search_tools")
+        set_catalog_provider = getattr(search_tool, "set_catalog_provider", None)
+        if callable(set_catalog_provider):
+            set_catalog_provider(lambda: self.tools)
         self._plugin_tool_names = {
             name
             for name, tool in self.tools.items()
@@ -442,6 +446,11 @@ class AshLoop:
         self.recovery_summary: Any | None = None
         self._mcp_runtime: Any | None = None
         self._mcp_tool_names: set[str] = set()
+        self._mcp_tools_by_server: dict[str, set[str]] = {}
+        self._mcp_reload_lock = asyncio.Lock()
+        self._retired_mcp_runtimes: set[Any] = set()
+        self._closing = False
+        self._closed = False
         self._mcp_configs = dict(mcp_configs or {})
         self._hook_session_open = False
         if mcp_config_path is not None and mcp_config_path.exists():
@@ -467,17 +476,29 @@ class AshLoop:
     async def aclose(self) -> None:
         """Deterministically release provider and subprocess resources."""
 
-        await self._fire_session_end("shutdown")
-        self._flush_runtime_events()
-        if self._mcp_runtime is not None:
-            await self._mcp_runtime.close()
-            self._mcp_runtime = None
-        self._mcp_tool_names.clear()
-        await asyncio.gather(
-            *(tool.aclose() for tool in self.tools.values()),
-            return_exceptions=True,
-        )
-        await self.provider.aclose()
+        async with self._mcp_reload_lock:
+            if self._closed:
+                return
+            self._closing = True
+            await self._fire_session_end("shutdown")
+            self._flush_runtime_events()
+            if self._mcp_runtime is not None:
+                await self._mcp_runtime.close()
+                self._mcp_runtime = None
+            if self._retired_mcp_runtimes:
+                await asyncio.gather(
+                    *(runtime.close() for runtime in self._retired_mcp_runtimes),
+                    return_exceptions=True,
+                )
+                self._retired_mcp_runtimes.clear()
+            self._mcp_tool_names.clear()
+            self._mcp_tools_by_server.clear()
+            await asyncio.gather(
+                *(tool.aclose() for tool in self.tools.values()),
+                return_exceptions=True,
+            )
+            await self.provider.aclose()
+            self._closed = True
 
     async def _fire_session_end(self, reason: str) -> None:
         hooks = self._active_hooks()
@@ -647,16 +668,25 @@ class AshLoop:
     async def reload_mcp_servers(
         self, configs: dict[str, MCPServerConfig]
     ) -> dict[str, str]:
-        if self._mcp_runtime is not None:
-            await self._mcp_runtime.close()
-            self._mcp_runtime = None
-        for name in self._mcp_tool_names:
-            self.tools.pop(name, None)
-        self._mcp_tool_names.clear()
-        self._mcp_configs = dict(configs)
-        if self.current_session is not None and self._mcp_configs:
-            await self._start_mcp_runtime()
-        return dict(self._mcp_runtime.errors) if self._mcp_runtime is not None else {}
+        async with self._mcp_reload_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("cannot reload MCP servers after loop shutdown")
+            next_configs = dict(configs)
+            if self.current_session is None:
+                old_runtime = self._mcp_runtime
+                self._mcp_runtime = None
+                for name in self._mcp_tool_names:
+                    old_tool = self.tools.pop(name, None)
+                    if old_tool is not None:
+                        self._started_tool_ids.discard(id(old_tool))
+                self._mcp_tool_names.clear()
+                self._mcp_tools_by_server.clear()
+                self._mcp_configs = next_configs
+                if old_runtime is not None:
+                    await old_runtime.close()
+                self._prune_tool_search_activations()
+                return {}
+            return await self._publish_mcp_runtime(next_configs)
 
     async def reload_plugin_runtime_tools(self, tools: Sequence["BaseTool"]) -> None:
         """Atomically replace executable plugin proxies and stop their old hosts."""
@@ -690,24 +720,139 @@ class AshLoop:
         self._plugin_tool_names = set(next_tools)
 
     async def _start_mcp_runtime(self) -> None:
+        async with self._mcp_reload_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("cannot start MCP servers after loop shutdown")
+            await self._publish_mcp_runtime(self._mcp_configs)
+
+    async def _publish_mcp_runtime(
+        self, configs: dict[str, MCPServerConfig]
+    ) -> dict[str, str]:
         from ash.mcp.runtime import MCPRuntime
 
-        self._mcp_runtime = MCPRuntime(self._mcp_configs, self.safety_guard)
-        tools = await self._mcp_runtime.start()
-        duplicates = self.tools.keys() & tools.keys()
+        runtime: MCPRuntime
+
+        async def replace_server_tools(
+            server_name: str,
+            previous: dict[str, BaseTool],
+            replacement: dict[str, BaseTool],
+        ) -> None:
+            if self._mcp_runtime is not runtime:
+                raise RuntimeError("stale MCP runtime attempted a catalog refresh")
+            await self._replace_mcp_server_tools(
+                server_name, previous, replacement
+            )
+
+        runtime = MCPRuntime(
+            configs,
+            self.safety_guard,
+            tool_change_handler=replace_server_tools,
+            event_sink=self._emit_event,
+            defer_notifications=True,
+        )
+        try:
+            tools = await runtime.start()
+        except BaseException:
+            await asyncio.shield(runtime.close())
+            raise
+        if configs and not runtime.clients and self._mcp_runtime is not None:
+            errors = dict(runtime.errors)
+            await runtime.close()
+            return errors
+        occupied = self.tools.keys() - self._mcp_tool_names
+        duplicates = occupied & tools.keys()
         if duplicates:
-            await self._mcp_runtime.close()
-            self._mcp_runtime = None
+            await runtime.close()
             raise ValueError(
                 "MCP tool collides with an existing tool: "
                 + ", ".join(sorted(duplicates))
             )
-        for tool in tools.values():
-            tool.set_event_sink(self._emit_event)
+        try:
+            for tool in tools.values():
+                tool.set_event_sink(self._emit_event)
+                await tool.start()
+                self._started_tool_ids.add(id(tool))
+        except BaseException:
+            await asyncio.shield(runtime.close())
+            raise
+        old_runtime = self._mcp_runtime
+        for name in self._mcp_tool_names:
+            old_tool = self.tools.pop(name, None)
+            if old_tool is not None:
+                self._started_tool_ids.discard(id(old_tool))
         self.tools.update(tools)
+        self._mcp_runtime = runtime
         self._mcp_tool_names = set(tools)
-        for name, error in self._mcp_runtime.errors.items():
+        self._mcp_tools_by_server = {
+            server: set(server_tools)
+            for server, server_tools in runtime.server_tools_snapshot().items()
+        }
+        self._mcp_configs = dict(configs)
+        runtime.activate_notifications()
+        self._prune_tool_search_activations()
+        if old_runtime is not None:
+            if self._turn_running:
+                self._retired_mcp_runtimes.add(old_runtime)
+            else:
+                await old_runtime.close()
+        for name, error in runtime.errors.items():
             _log.warning("MCP server %s unavailable: %s", name, error)
+        return dict(runtime.errors)
+
+    async def _replace_mcp_server_tools(
+        self,
+        server_name: str,
+        previous: dict[str, BaseTool],
+        replacement: dict[str, BaseTool],
+    ) -> None:
+        previous_names = set(previous)
+        owned_names = self._mcp_tools_by_server.get(server_name, previous_names)
+        if owned_names != previous_names:
+            raise RuntimeError(
+                f"MCP catalog ownership changed unexpectedly for {server_name!r}"
+            )
+        occupied = self.tools.keys() - previous_names
+        duplicates = occupied & replacement.keys()
+        if duplicates:
+            raise ValueError(
+                "refreshed MCP tool collides with an existing tool: "
+                + ", ".join(sorted(duplicates))
+            )
+        try:
+            for tool in replacement.values():
+                tool.set_event_sink(self._emit_event)
+                await tool.start()
+        except Exception:
+            await asyncio.gather(
+                *(tool.aclose() for tool in replacement.values()),
+                return_exceptions=True,
+            )
+            raise
+        for name in previous_names:
+            old_tool = self.tools.pop(name, None)
+            if old_tool is not None:
+                self._started_tool_ids.discard(id(old_tool))
+        self.tools.update(replacement)
+        self._mcp_tool_names.difference_update(previous_names)
+        self._mcp_tool_names.update(replacement)
+        self._mcp_tools_by_server[server_name] = set(replacement)
+        self._started_tool_ids.update(id(tool) for tool in replacement.values())
+        self._prune_tool_search_activations()
+
+    def _prune_tool_search_activations(self) -> None:
+        search_tool = self.tools.get("search_tools")
+        prune = getattr(search_tool, "prune_activations", None)
+        if callable(prune):
+            prune(set(self.tools))
+
+    async def _close_retired_mcp_runtimes(self) -> None:
+        if not self._retired_mcp_runtimes:
+            return
+        runtimes = tuple(self._retired_mcp_runtimes)
+        self._retired_mcp_runtimes.clear()
+        await asyncio.gather(
+            *(runtime.close() for runtime in runtimes), return_exceptions=True
+        )
 
     # --- the main turn ----------------------------------------------------
 
@@ -810,6 +955,7 @@ class AshLoop:
         finally:
             self._flush_runtime_events()
             self._turn_running = False
+            await self._close_retired_mcp_runtimes()
 
     async def _run_turn(
         self,
@@ -945,6 +1091,7 @@ class AshLoop:
         while iteration < iteration_budget:
             iteration += 1
             self._drain_steering_messages(session)
+            iteration_tools = dict(self._provider_tools())
             # Optionally search semantic memory and inject relevant context.
             self._pending_memory_context = ""
             if self.enable_semantic_memory and self._vector_pipeline is not None:
@@ -986,11 +1133,13 @@ class AshLoop:
                     "model": self.provider.model_name,
                     "iteration": iteration,
                     "message_count": len(messages),
-                    "tool_count": len(self.tools),
+                    "tool_count": len(iteration_tools),
                 },
             )
             try:
-                model_completion = await self._stream_one_completion(messages)
+                model_completion = await self._stream_one_completion(
+                    messages, provider_tools=iteration_tools
+                )
             except asyncio.CancelledError:
                 await self._fire_hook_lifecycle(
                     "post_model",
@@ -1114,7 +1263,9 @@ class AshLoop:
             # Independent read-only calls may execute concurrently; all other
             # calls retain deterministic sequential side-effect ordering.
             try:
-                results = await self._execute_tool_calls(tool_calls, session)
+                results = await self._execute_tool_calls(
+                    tool_calls, session, tools_snapshot=iteration_tools
+                )
             except CircuitBreakerError:
                 _log.warning("circuit breaker tripped — halting turn")
                 final_text = (
@@ -1399,12 +1550,16 @@ class AshLoop:
     async def _stream_one_completion(
         self,
         messages: list[dict[str, Any]],
+        *,
+        provider_tools: dict[str, BaseTool] | None = None,
     ) -> CompletionOutcome:
         """Stream one completion with normalized token and cache usage."""
 
         canonical_messages = normalize_messages(messages)
         # Build OpenAI-format tools list for providers that support native tool_calls.
-        provider_tools = self._provider_tools()
+        provider_tools = (
+            self._provider_tools() if provider_tools is None else provider_tools
+        )
         openai_tools = (
             self._tools_to_openai_format(provider_tools)
             if provider_tools and _provider_capabilities(self.provider).native_tools
@@ -1735,6 +1890,8 @@ class AshLoop:
         self,
         tool_calls: list[dict[str, Any]],
         session: Session,
+        *,
+        tools_snapshot: dict[str, BaseTool] | None = None,
     ) -> list[dict[str, Any]]:
         """Execute approved tool calls, gating each on the safety guard."""
 
@@ -1742,7 +1899,12 @@ class AshLoop:
             call.get("name") in READ_ONLY_TOOLS for call in tool_calls
         ):
             grouped = await asyncio.gather(
-                *(self._execute_tool_calls([call], session) for call in tool_calls)
+                *(
+                    self._execute_tool_calls(
+                        [call], session, tools_snapshot=tools_snapshot
+                    )
+                    for call in tool_calls
+                )
             )
             return [result for group in grouped for result in group]
 
@@ -1852,7 +2014,8 @@ class AshLoop:
                 record,
                 turn_id=self.turn_context.turn_id if self.turn_context else None,
             )
-            tool = self.tools.get(tool_name)
+            active_tools = self.tools if tools_snapshot is None else tools_snapshot
+            tool = active_tools.get(tool_name)
             if tool is None:
                 record.error = f"Unknown tool: {tool_name}"
                 self.session_store.save_tool_call(

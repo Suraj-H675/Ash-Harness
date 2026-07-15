@@ -216,16 +216,27 @@ def test_mcp_oauth_constructor_rejects_invalid_options_before_save() -> None:
         )
 
 
-@pytest.mark.parametrize("transport", ["stdio", "websocket"])
-def test_mcp_oauth_rejects_unsupported_transports(transport: str) -> None:
+def test_mcp_oauth_rejects_stdio_transport() -> None:
     with pytest.raises(ValueError, match="requires the http or sse transport"):
         MCPServerConfig(
             name="protected",
             command="server",
             args=[],
             env={},
-            transport=transport,
+            transport="stdio",
             auth="oauth",
+        )
+
+
+def test_mcp_config_rejects_unimplemented_websocket_transport() -> None:
+    with pytest.raises(ValueError, match="Unknown MCP transport"):
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="websocket",
+            url="wss://mcp.example.test/rpc",
         )
 
 
@@ -426,7 +437,10 @@ class StubMCPClient:
         self.result = result
         self.calls: list[tuple[str, dict]] = []
 
-    async def call_tool(self, name: str, arguments: dict) -> dict:
+    async def call_tool(
+        self, name: str, arguments: dict, *, expected_contract: str | None = None
+    ) -> dict:
+        del expected_contract
         self.calls.append((name, arguments))
         return self.result
 
@@ -922,7 +936,10 @@ async def test_mcp_tool_preserves_protocol_error_data_without_replay(
         def __init__(self) -> None:
             self.calls = 0
 
-        async def call_tool(self, name: str, arguments: dict) -> dict:
+        async def call_tool(
+            self, name: str, arguments: dict, *, expected_contract: str | None = None
+        ) -> dict:
+            del expected_contract
             self.calls += 1
             raise MCPProtocolError(
                 "tools/call failed (-32602): invalid mode",
@@ -957,7 +974,10 @@ async def test_mcp_tool_preserves_explicit_null_protocol_error_data(
     tmp_path: Path,
 ) -> None:
     class ErrorClient:
-        async def call_tool(self, name: str, arguments: dict) -> dict:
+        async def call_tool(
+            self, name: str, arguments: dict, *, expected_contract: str | None = None
+        ) -> dict:
+            del expected_contract
             raise MCPProtocolError("explicit null", code=-32000, data=None)
 
     tool = MCPTool(
@@ -1235,6 +1255,159 @@ async def test_loop_reloads_mcp_tools_without_restarting_session(
 
 
 @pytest.mark.asyncio
+async def test_loop_applies_live_mcp_tool_refresh(tmp_path: Path) -> None:
+    config = MCPServerConfig(
+        name="dynamic",
+        command=sys.executable,
+        args=["-u", "-c", DYNAMIC_MCP_SERVER],
+        env={},
+    )
+    loop = AshLoop(
+        session_store=SessionStore(tmp_path / "sessions.db"),
+        provider=IdleProvider(),
+        safety_guard=SafetyGuard(tmp_path),
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+        mcp_configs={"dynamic": config},
+    )
+    await loop.start_session()
+    try:
+        await loop._mcp_runtime.wait_for_refreshes()
+        assert "mcp__dynamic__old" not in loop.tools
+        assert "mcp__dynamic__new" in loop.tools
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_keeps_in_flight_mcp_snapshot_alive_until_turn_end(
+    tmp_path: Path,
+) -> None:
+    config = MCPServerConfig(
+        name="fake",
+        command=sys.executable,
+        args=["-u", "-c", FAKE_MCP_SERVER],
+        env={},
+    )
+    loop = AshLoop(
+        session_store=SessionStore(tmp_path / "sessions.db"),
+        provider=IdleProvider(),
+        safety_guard=SafetyGuard(tmp_path),
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+        mcp_configs={"fake": config},
+    )
+    await loop.start_session()
+    old_tool = loop.tools["mcp__fake__echo"]
+    loop._turn_running = True
+    try:
+        assert await loop.reload_mcp_servers({}) == {}
+        assert "mcp__fake__echo" not in loop.tools
+        result = await old_tool.run(text="in flight")
+        assert result.success is True
+        assert result.output == "in flight"
+        assert loop._retired_mcp_runtimes
+    finally:
+        loop._turn_running = False
+        await loop._close_retired_mcp_runtimes()
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_mcp_reload_preserves_working_runtime(tmp_path: Path) -> None:
+    working = MCPServerConfig(
+        name="fake",
+        command=sys.executable,
+        args=["-u", "-c", FAKE_MCP_SERVER],
+        env={},
+    )
+    loop = AshLoop(
+        session_store=SessionStore(tmp_path / "sessions.db"),
+        provider=IdleProvider(),
+        safety_guard=SafetyGuard(tmp_path),
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+        mcp_configs={"fake": working},
+    )
+    await loop.start_session()
+    broken = MCPServerConfig(
+        name="broken",
+        command=str(tmp_path / "missing-server"),
+        args=[],
+        env={},
+    )
+    try:
+        errors = await loop.reload_mcp_servers({"broken": broken})
+        assert "broken" in errors
+        assert "mcp__fake__echo" in loop.tools
+        result = await loop.tools["mcp__fake__echo"].run(text="still works")
+        assert result.success is True
+        assert result.output == "still works"
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_loop_shutdown_serializes_with_in_progress_mcp_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    start_entered = asyncio.Event()
+    release_start = asyncio.Event()
+    instances = []
+
+    class PausedRuntime:
+        def __init__(self, configs, safety_guard, **kwargs) -> None:
+            del safety_guard, kwargs
+            self.configs = configs
+            self.clients = {"paused": object()}
+            self.errors = {}
+            self.close_calls = 0
+            instances.append(self)
+
+        async def start(self) -> dict:
+            start_entered.set()
+            await release_start.wait()
+            return {}
+
+        def server_tools_snapshot(self) -> dict:
+            return {}
+
+        def activate_notifications(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            self.clients.clear()
+
+    monkeypatch.setattr("ash.mcp.runtime.MCPRuntime", PausedRuntime)
+    loop = AshLoop(
+        session_store=SessionStore(tmp_path / "sessions.db"),
+        provider=IdleProvider(),
+        safety_guard=SafetyGuard(tmp_path),
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+    )
+    await loop.start_session()
+    config = MCPServerConfig(name="paused", command="unused", args=[], env={})
+    reload_task = asyncio.create_task(loop.reload_mcp_servers({"paused": config}))
+    await asyncio.wait_for(start_entered.wait(), timeout=1)
+    close_task = asyncio.create_task(loop.aclose())
+    await asyncio.sleep(0)
+    assert close_task.done() is False
+
+    release_start.set()
+    assert await reload_task == {}
+    await asyncio.wait_for(close_task, timeout=1)
+
+    assert len(instances) == 1
+    assert instances[0].close_calls == 1
+    assert loop._mcp_runtime is None
+    assert loop._closed is True
+    with pytest.raises(RuntimeError, match="after loop shutdown"):
+        await loop.reload_mcp_servers({})
+
+
+@pytest.mark.asyncio
 async def test_streamable_http_tracks_session_and_parses_sse() -> None:
     seen_session = []
     seen_protocol = []
@@ -1285,6 +1458,744 @@ async def test_streamable_http_tracks_session_and_parses_sse() -> None:
     assert seen_session == ["session-1"]
     assert seen_protocol == ["2025-06-18"]
     await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_recovers_expired_session_and_retries_once() -> None:
+    trace: list[tuple[str, str | None, int | None]] = []
+    initialize_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialize_count
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        payload = json.loads(request.content)
+        method = payload["method"]
+        session = request.headers.get("Mcp-Session-Id")
+        trace.append((method, session, payload.get("id")))
+        if method == "initialize":
+            initialize_count += 1
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": f"session-{initialize_count}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        if session == "session-1":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            headers={"Mcp-Session-Id": "must-not-replace-session-2"},
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {"content": [{"type": "text", "text": "ok"}]},
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    try:
+        result = await client.call_tool("echo", {})
+        assert result["content"][0]["text"] == "ok"
+        assert client._http_session_id == "session-2"
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+    calls = [item for item in trace if item[0] == "tools/call"]
+    assert [(method, session) for method, session, _ in trace] == [
+        ("initialize", None),
+        ("notifications/initialized", "session-1"),
+        ("tools/call", "session-1"),
+        ("initialize", None),
+        ("notifications/initialized", "session-2"),
+        ("tools/call", "session-2"),
+    ]
+    assert calls[0][2] != calls[1][2]
+
+
+@pytest.mark.asyncio
+async def test_http_concurrent_expiry_uses_one_recovery_handshake() -> None:
+    initialize_count = 0
+    old_calls = 0
+    both_old_calls = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialize_count, old_calls
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        payload = json.loads(request.content)
+        method = payload["method"]
+        session = request.headers.get("Mcp-Session-Id")
+        if method == "initialize":
+            initialize_count += 1
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": f"session-{initialize_count}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        if session == "session-1":
+            old_calls += 1
+            if old_calls == 2:
+                both_old_calls.set()
+            await asyncio.wait_for(both_old_calls.wait(), timeout=1)
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": {}},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    try:
+        await asyncio.gather(
+            client.call_tool("first", {}), client.call_tool("second", {})
+        )
+        assert initialize_count == 2
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_second_session_404_recovers_without_third_tool_attempt() -> None:
+    initialize_count = 0
+    tool_attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialize_count, tool_attempts
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        payload = json.loads(request.content)
+        if payload["method"] == "initialize":
+            initialize_count += 1
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": f"session-{initialize_count}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if payload["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        tool_attempts += 1
+        return httpx.Response(404)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    try:
+        with pytest.raises(MCPProtocolError, match="after one HTTP session recovery"):
+            await client.call_tool("write", {})
+        assert tool_attempts == 2
+        assert initialize_count == 3
+        assert client._http_session_id == "session-3"
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_rejects_invalid_initialize_session_id() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            headers={"Mcp-Session-Id": b"not-visible-\xff"},
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                },
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    with pytest.raises(MCPProtocolError, match="visible ASCII"):
+        await client.connect()
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_malformed_sse_never_replays_tool_call() -> None:
+    tool_attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tool_attempts
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        payload = json.loads(request.content)
+        if payload["method"] == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if payload["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        tool_attempts += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text="event: message\ndata: {not-json}\n\n",
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    try:
+        with pytest.raises(MCPProtocolError, match="SSE event contained invalid JSON"):
+            await client.call_tool("write", {})
+        assert tool_attempts == 1
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_http_connect_initializes_once() -> None:
+    initialize_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialize_count
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        payload = json.loads(request.content)
+        if payload["method"] == "initialize":
+            initialize_count += 1
+            await asyncio.sleep(0)
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                    },
+                },
+            )
+        return httpx.Response(202)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await asyncio.gather(client.connect(), client.connect())
+    try:
+        assert initialize_count == 1
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_paginated_list_restarts_after_session_recovery() -> None:
+    initialize_count = 0
+    cursors: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialize_count
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        payload = json.loads(request.content)
+        method = payload["method"]
+        session = request.headers.get("Mcp-Session-Id")
+        if method == "initialize":
+            initialize_count += 1
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": f"session-{initialize_count}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        cursor = payload.get("params", {}).get("cursor")
+        cursors.append((session or "", cursor))
+        if session == "session-1" and cursor == "page-2":
+            return httpx.Response(404)
+        prefix = "old" if session == "session-1" else "new"
+        result = (
+            {
+                "tools": [{"name": f"{prefix}-first"}],
+                "nextCursor": "page-2",
+            }
+            if cursor is None
+            else {"tools": [{"name": f"{prefix}-second"}]}
+        )
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    try:
+        tools = await client.list_tools()
+        assert [tool["name"] for tool in tools] == ["new-first", "new-second"]
+        assert cursors == [
+            ("session-1", None),
+            ("session-1", "page-2"),
+            ("session-2", None),
+            ("session-2", "page-2"),
+        ]
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_rejects_non_object_catalog_entries() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload["method"] == "initialize":
+            result = {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {}},
+            }
+        elif payload["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        else:
+            result = {"tools": [{"name": "valid"}, "invalid"]}
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    try:
+        with pytest.raises(MCPProtocolError, match="non-object tools entry"):
+            await client.list_tools()
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_initialize_deletes_pending_server_session() -> None:
+    deleted_sessions: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            deleted_sessions.append(request.headers.get("Mcp-Session-Id"))
+            return httpx.Response(204)
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            headers={"Mcp-Session-Id": "allocated-session"},
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {"protocolVersion": "unsupported", "capabilities": {}},
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    with pytest.raises(MCPProtocolError, match="unsupported protocol version"):
+        await client.connect()
+    assert deleted_sessions == ["allocated-session"]
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capability", [None, False, []])
+async def test_initialize_rejects_non_object_capabilities(capability: object) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"tools": capability},
+                },
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    with pytest.raises(
+        MCPProtocolError, match="capabilities must contain objects: tools"
+    ):
+        await client.connect()
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_replacement_initialize_deletes_allocated_session() -> None:
+    initialize_count = 0
+    deleted_sessions: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialize_count
+        if request.method == "DELETE":
+            deleted_sessions.append(request.headers.get("Mcp-Session-Id"))
+            return httpx.Response(204)
+        payload = json.loads(request.content)
+        method = payload["method"]
+        session = request.headers.get("Mcp-Session-Id")
+        if method == "initialize":
+            initialize_count += 1
+            capabilities = (
+                {"tools": None}
+                if initialize_count == 2
+                else {"tools": {}}
+            )
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": f"session-{initialize_count}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": capabilities,
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        if session == "session-1":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {"content": []},
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    try:
+        with pytest.raises(
+            MCPProtocolError, match="capabilities must contain objects: tools"
+        ):
+            await client.call_tool("echo", {})
+        assert deleted_sessions == ["session-2"]
+
+        assert await client.call_tool("echo", {}) == {"content": []}
+        assert initialize_count == 3
+    finally:
+        await client.disconnect()
+        await http.aclose()
+    assert deleted_sessions == ["session-2", "session-3"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_session_recovery_restores_readiness() -> None:
+    initialize_count = 0
+    replacement_initialize_started = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialize_count
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        payload = json.loads(request.content)
+        method = payload["method"]
+        session = request.headers.get("Mcp-Session-Id")
+        if method == "initialize":
+            initialize_count += 1
+            if initialize_count == 2:
+                replacement_initialize_started.set()
+                await asyncio.Event().wait()
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": f"session-{initialize_count}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        if session == "session-1":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {"content": []},
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    task = asyncio.create_task(client.call_tool("echo", {}))
+    try:
+        await asyncio.wait_for(replacement_initialize_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+        assert client._session_ready.is_set()
+
+        assert await client.call_tool("echo", {}) == {"content": []}
+        assert initialize_count == 3
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_factory", "message"),
+    [
+        (
+            lambda request_id: httpx.Response(
+                200,
+                json=[{"jsonrpc": "2.0", "id": request_id, "result": {}}],
+            ),
+            "must contain one JSON-RPC object",
+        ),
+        (
+            lambda request_id: httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": True, "result": {}},
+            ),
+            "id must be a string or integer",
+        ),
+        (
+            lambda request_id: httpx.Response(
+                200,
+                text='{"jsonrpc":"2.0","id":2,"result":{}}',
+                headers={"content-type": "text/plain"},
+            ),
+            "must use application/json or text/event-stream",
+        ),
+        (
+            lambda request_id: httpx.Response(
+                200,
+                text='{"jsonrpc":"2.0","id":2,"result":{}}',
+                headers={"content-type": "application/jsonp"},
+            ),
+            "must use application/json or text/event-stream",
+        ),
+        (
+            lambda request_id: httpx.Response(
+                200,
+                text='data: {"jsonrpc":"2.0","id":2,"result":{}}\n\n',
+                headers={"content-type": "text/event-stream-evil"},
+            ),
+            "must use application/json or text/event-stream",
+        ),
+    ],
+)
+async def test_http_rejects_invalid_jsonrpc_envelopes(
+    response_factory, message: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload["method"] == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if payload["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        return response_factory(payload["id"])
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    try:
+        with pytest.raises(MCPProtocolError, match=message):
+            await client.call_tool("echo", {})
+    finally:
+        await client.disconnect()
+        await http.aclose()
 
 
 INTERACTIVE_MCP_SERVER = r"""
@@ -1423,6 +2334,7 @@ async def test_request_timeout_sends_cancellation_notification() -> None:
     client.notify.assert_awaited_once_with(
         "notifications/cancelled",
         {"requestId": 1, "reason": "tools/call timed out"},
+        _allow_session_recovery=False,
     )
 
 
@@ -1436,6 +2348,35 @@ async def test_stdio_send_failure_cleans_pending_future() -> None:
         await client._request_stdio(9, {"jsonrpc": "2.0", "id": 9})
 
     assert client._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_stdio_revalidates_tool_contract_inside_write_lock() -> None:
+    client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
+    stdin = Mock()
+    client._process = Mock(stdin=stdin)
+    client._session_generation = 1
+    catalog_valid = True
+    client.tool_contract_validator = (
+        lambda name, fingerprint, generation: catalog_valid
+    )
+    await client._write_lock.acquire()
+    task = asyncio.create_task(
+        client.call_tool("echo", {}, expected_contract="fingerprint")
+    )
+    try:
+        await asyncio.sleep(0)
+        catalog_valid = False
+        client._write_lock.release()
+        with pytest.raises(MCPProtocolError, match="active verified server contract"):
+            await asyncio.wait_for(task, timeout=1)
+        stdin.write.assert_not_called()
+    finally:
+        if client._write_lock.locked():
+            client._write_lock.release()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1457,6 +2398,84 @@ async def test_stdio_reader_fails_pending_request_on_framing_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_stdio_connect_cleans_process_and_reader_tasks() -> None:
+    client = MCPClient(
+        MCPServerConfig(
+            name="blocked",
+            command=sys.executable,
+            args=["-u", "-c", "import time; time.sleep(60)"],
+            env={},
+        )
+    )
+    task = asyncio.create_task(client.connect())
+    for _ in range(100):
+        if client._process is not None and client._reader_task is not None:
+            break
+        await asyncio.sleep(0.01)
+    process = client._process
+    assert process is not None
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2)
+
+    assert client._process is None
+    assert client._reader_task is None
+    assert client._stderr_task is None
+    assert process.returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_runtime_start_cleans_initialized_clients(
+    tmp_path: Path,
+) -> None:
+    blocked_server = r"""
+import json, sys, time
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"tools": {}},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "tools/list":
+        time.sleep(60)
+"""
+    runtime = MCPRuntime(
+        {
+            "blocked": MCPServerConfig(
+                name="blocked",
+                command=sys.executable,
+                args=["-u", "-c", blocked_server],
+                env={},
+            )
+        },
+        SafetyGuard(tmp_path),
+    )
+    task = asyncio.create_task(runtime.start())
+    client = None
+    for _ in range(200):
+        client = runtime.clients.get("blocked")
+        if client is not None and client._initialized and client._pending:
+            break
+        await asyncio.sleep(0.01)
+    assert client is not None and client._process is not None
+    process = client._process
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2)
+
+    assert runtime.clients == {}
+    assert client._process is None
+    assert client._reader_task is None
+    assert client._stderr_task is None
+    assert process.returncode is not None
+
+
+@pytest.mark.asyncio
 async def test_initialize_timeout_does_not_send_cancellation_notification() -> None:
     client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
     client._request_stdio = AsyncMock(side_effect=asyncio.TimeoutError())
@@ -1466,6 +2485,60 @@ async def test_initialize_timeout_does_not_send_cancellation_notification() -> N
         await client.request("initialize")
 
     client.notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sessionless_http_timeout_sends_cancellation_without_reinitialize() -> None:
+    trace: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        method = payload["method"]
+        trace.append(method)
+        if method == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        if method == "notifications/cancelled":
+            assert request.headers.get("Mcp-Session-Id") is None
+            return httpx.Response(202)
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    try:
+        with pytest.raises(httpx.ReadTimeout):
+            await client.call_tool("slow", {})
+        assert trace == [
+            "initialize",
+            "notifications/initialized",
+            "tools/call",
+            "notifications/cancelled",
+        ]
+    finally:
+        await client.disconnect()
+        await http.aclose()
 
 
 @pytest.mark.asyncio
@@ -1502,3 +2575,664 @@ async def test_server_cancellation_stops_incoming_request_without_response() -> 
     await asyncio.sleep(0)
 
     client._send_message.assert_not_awaited()
+
+
+DYNAMIC_MCP_SERVER = r"""
+import json, sys
+state = "old"
+list_count = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"tools": {"listChanged": True}},
+            "serverInfo": {"name": "dynamic", "version": "1"},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "tools/list":
+        list_count += 1
+        schema = {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        }
+        result = {"tools": [{"name": state, "description": state, "inputSchema": schema}]}
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+        if list_count == 1:
+            state = "new"
+            print(json.dumps({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}), flush=True)
+    elif method == "tools/call":
+        name = message["params"]["name"]
+        result = {"content": [{"type": "text", "text": name}]}
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"""
+
+
+@pytest.mark.asyncio
+async def test_runtime_applies_startup_tool_list_change_atomically(tmp_path: Path) -> None:
+    live_tools: dict[str, object] = {}
+    replacements: list[tuple[set[str], set[str]]] = []
+
+    async def replace(server: str, previous: dict, replacement: dict) -> None:
+        assert server == "dynamic"
+        replacements.append((set(previous), set(replacement)))
+        for name in previous:
+            live_tools.pop(name, None)
+        live_tools.update(replacement)
+
+    events: list[dict] = []
+    runtime = MCPRuntime(
+        {
+            "dynamic": MCPServerConfig(
+                name="dynamic",
+                command=sys.executable,
+                args=["-u", "-c", DYNAMIC_MCP_SERVER],
+                env={},
+            )
+        },
+        SafetyGuard(tmp_path),
+        tool_change_handler=replace,
+        event_sink=events.append,
+    )
+    live_tools.update(await runtime.start())
+    try:
+        await runtime.wait_for_refreshes()
+        assert "mcp__dynamic__old" not in live_tools
+        assert "mcp__dynamic__new" in live_tools
+        result = await live_tools["mcp__dynamic__new"].run(text="hello")
+        assert result.success is True
+        assert result.output == "new"
+        assert replacements == [
+            ({"mcp__dynamic__old"}, {"mcp__dynamic__new"})
+        ]
+        assert any(
+            event.get("type") == "mcp.catalog.changed"
+            and event.get("added") == ["mcp__dynamic__new"]
+            and event.get("removed") == ["mcp__dynamic__old"]
+            for event in events
+        )
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_dynamic_catalog_preserves_last_good_tools(
+    tmp_path: Path,
+) -> None:
+    broken_server = DYNAMIC_MCP_SERVER.replace(
+        '"required": ["text"]',
+        '"required": ["text"] if state == "old" else "invalid"',
+    )
+    replacements: list[dict] = []
+
+    async def replace(server: str, previous: dict, replacement: dict) -> None:
+        replacements.append(replacement)
+
+    runtime = MCPRuntime(
+        {
+            "dynamic": MCPServerConfig(
+                name="dynamic",
+                command=sys.executable,
+                args=["-u", "-c", broken_server],
+                env={},
+            )
+        },
+        SafetyGuard(tmp_path),
+        tool_change_handler=replace,
+    )
+    tools = await runtime.start()
+    try:
+        await runtime.wait_for_refreshes()
+        assert "mcp__dynamic__old" in tools
+        assert replacements == []
+        assert "invalid tool catalog" in runtime.errors["dynamic:tools/refresh"]
+        quarantined = await tools["mcp__dynamic__old"].run(text="blocked")
+        assert quarantined.success is False
+        assert "no longer matches the active verified" in quarantined.error
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_list_change_quarantines_calls_until_refresh_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    class PausedRefreshClient:
+        server_capabilities = {"tools": {"listChanged": True}}
+        protocol_version = "2025-11-25"
+        session_generation = 1
+
+        def __init__(self, config, *, roots=()) -> None:
+            self.notification_handler = None
+            self.session_reinitialized_handler = None
+            self.tool_contract_validator = None
+            self.list_calls = 0
+            self.tool_calls = 0
+
+        async def connect(self) -> None:
+            return None
+
+        def supports_server_capability(self, name: str) -> bool:
+            return name == "tools"
+
+        async def list_tools(self) -> list[dict]:
+            self.list_calls += 1
+            if self.list_calls == 2:
+                refresh_started.set()
+                await release_refresh.wait()
+            return [{"name": "echo", "inputSchema": {"type": "object"}}]
+
+        async def call_tool(
+            self,
+            name: str,
+            arguments: dict,
+            *,
+            expected_contract: str | None = None,
+        ) -> dict:
+            del name, arguments, expected_contract
+            self.tool_calls += 1
+            return {"content": []}
+
+        async def disconnect(self) -> None:
+            return None
+
+    monkeypatch.setattr("ash.mcp.runtime.MCPClient", PausedRefreshClient)
+    runtime = MCPRuntime(
+        {
+            "paused": MCPServerConfig(
+                name="paused", command="unused", args=[], env={}
+            )
+        },
+        SafetyGuard(tmp_path),
+    )
+    tools = await runtime.start()
+    client = runtime.clients["paused"]
+    try:
+        await client.notification_handler("notifications/tools/list_changed", {})
+        await asyncio.wait_for(refresh_started.wait(), timeout=1)
+
+        quarantined = await tools["mcp__paused__echo"].run()
+        assert quarantined.success is False
+        assert "no longer matches the active verified" in quarantined.error
+        assert client.tool_calls == 0
+
+        release_refresh.set()
+        await runtime.wait_for_refreshes()
+        restored = await tools["mcp__paused__echo"].run()
+        assert restored.success is True
+        assert client.tool_calls == 1
+    finally:
+        release_refresh.set()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_resource_and_prompt_list_changes_emit_live_revisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class CatalogClient:
+        server_capabilities = {
+            "resources": {"listChanged": True},
+            "prompts": {"listChanged": True},
+        }
+        protocol_version = "2025-11-25"
+
+        def __init__(self, config, *, roots=()) -> None:
+            self.config = config
+            self.notification_handler = None
+
+        async def connect(self) -> None:
+            return None
+
+        def supports_server_capability(self, name: str) -> bool:
+            return name in self.server_capabilities
+
+        async def disconnect(self) -> None:
+            return None
+
+    monkeypatch.setattr("ash.mcp.runtime.MCPClient", CatalogClient)
+    events: list[dict] = []
+    runtime = MCPRuntime(
+        {
+            "catalog": MCPServerConfig(
+                name="catalog", command="unused", args=[], env={}
+            )
+        },
+        SafetyGuard(tmp_path),
+        event_sink=events.append,
+    )
+    await runtime.start()
+    client = runtime.clients["catalog"]
+    assert client.notification_handler is not None
+    try:
+        await client.notification_handler("notifications/resources/list_changed", {})
+        await client.notification_handler("notifications/prompts/list_changed", {})
+        assert [(event["capability"], event["revision"]) for event in events] == [
+            ("resources", 1),
+            ("prompts", 2),
+        ]
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contract_mode", ["unchanged", "renamed", "removed"])
+async def test_runtime_reconciles_catalog_before_http_tool_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contract_mode: str,
+) -> None:
+    initialize_count = 0
+    tool_attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialize_count, tool_attempts
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        payload = json.loads(request.content)
+        method = payload["method"]
+        session = request.headers.get("Mcp-Session-Id")
+        if method == "initialize":
+            initialize_count += 1
+            capabilities = (
+                {}
+                if contract_mode == "removed" and initialize_count == 2
+                else {"tools": {}}
+            )
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": f"session-{initialize_count}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": capabilities,
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        if method == "tools/list":
+            assert not (contract_mode == "removed" and session == "session-2")
+            name = (
+                "replacement"
+                if contract_mode == "renamed" and session == "session-2"
+                else "echo"
+            )
+            result = {
+                "tools": [
+                    {
+                        "name": name,
+                        "description": name,
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                        },
+                    }
+                ]
+            }
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+            )
+        tool_attempts += 1
+        if session == "session-1":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {"content": [{"type": "text", "text": "ok"}]},
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    real_client = MCPClient
+
+    def client_factory(config, **kwargs):
+        return real_client(config, http_client=http, **kwargs)
+
+    monkeypatch.setattr("ash.mcp.runtime.MCPClient", client_factory)
+    live: dict[str, object] = {}
+
+    async def replace(server: str, previous: dict, replacement: dict) -> None:
+        for name in previous:
+            live.pop(name, None)
+        live.update(replacement)
+
+    runtime = MCPRuntime(
+        {
+            "remote": MCPServerConfig(
+                name="remote",
+                command="",
+                args=[],
+                env={},
+                transport="http",
+                url="https://mcp.example.test/rpc",
+            )
+        },
+        SafetyGuard(tmp_path),
+        tool_change_handler=replace,
+    )
+    live.update(await runtime.start())
+    old_tool = live["mcp__remote__echo"]
+    try:
+        result = await old_tool.run(text="hello")
+        if contract_mode != "unchanged":
+            assert result.success is False
+            assert "changed the server contract" in result.error
+            assert tool_attempts == 1
+            assert "mcp__remote__echo" not in live
+            assert ("mcp__remote__replacement" in live) is (
+                contract_mode == "renamed"
+            )
+            stale_result = await old_tool.run(text="again")
+            assert stale_result.success is False
+            assert "no longer matches the active verified" in stale_result.error
+            assert tool_attempts == 1
+        else:
+            assert result.success is True
+            assert result.output == "ok"
+            assert tool_attempts == 2
+            assert "mcp__remote__echo" in live
+        assert initialize_count == 2
+    finally:
+        await runtime.close()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_supports_tools", [True, False])
+async def test_runtime_start_recovers_session_expiry_during_initial_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_supports_tools: bool,
+) -> None:
+    initialize_count = 0
+    list_sessions: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialize_count
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        payload = json.loads(request.content)
+        method = payload["method"]
+        session = request.headers.get("Mcp-Session-Id")
+        if method == "initialize":
+            initialize_count += 1
+            capabilities = (
+                {"tools": {}}
+                if initialize_count == 1 or replacement_supports_tools
+                else {}
+            )
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": f"session-{initialize_count}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": capabilities,
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        assert method == "tools/list"
+        list_sessions.append(session)
+        if session == "session-1":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {
+                    "tools": [{"name": "echo", "inputSchema": {"type": "object"}}]
+                },
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    real_client = MCPClient
+
+    def client_factory(config, **kwargs):
+        return real_client(config, http_client=http, **kwargs)
+
+    monkeypatch.setattr("ash.mcp.runtime.MCPClient", client_factory)
+    runtime = MCPRuntime(
+        {
+            "remote": MCPServerConfig(
+                name="remote",
+                command="",
+                args=[],
+                env={},
+                transport="http",
+                url="https://mcp.example.test/rpc",
+            )
+        },
+        SafetyGuard(tmp_path),
+    )
+    try:
+        tools = await asyncio.wait_for(runtime.start(), timeout=1)
+        assert ("mcp__remote__echo" in tools) is replacement_supports_tools
+        assert initialize_count == 2
+        expected_sessions = (
+            ["session-1", "session-2"]
+            if replacement_supports_tools
+            else ["session-1"]
+        )
+        assert list_sessions == expected_sessions
+        assert runtime.errors == {}
+    finally:
+        await runtime.close()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_blocks_concurrent_stale_call_until_catalog_reconciles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_count = 0
+    tool_attempts = 0
+    replacement_list_started = asyncio.Event()
+    release_replacement_list = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialize_count, tool_attempts
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        payload = json.loads(request.content)
+        method = payload["method"]
+        session = request.headers.get("Mcp-Session-Id")
+        if method == "initialize":
+            initialize_count += 1
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": f"session-{initialize_count}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        if method == "tools/list":
+            if session == "session-2":
+                replacement_list_started.set()
+                await asyncio.wait_for(release_replacement_list.wait(), timeout=1)
+            name = "replacement" if session == "session-2" else "echo"
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "tools": [
+                            {
+                                "name": name,
+                                "inputSchema": {"type": "object"},
+                            }
+                        ]
+                    },
+                },
+            )
+        tool_attempts += 1
+        if session == "session-1":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": {}},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    real_client = MCPClient
+
+    def client_factory(config, **kwargs):
+        return real_client(config, http_client=http, **kwargs)
+
+    monkeypatch.setattr("ash.mcp.runtime.MCPClient", client_factory)
+    runtime = MCPRuntime(
+        {
+            "remote": MCPServerConfig(
+                name="remote",
+                command="",
+                args=[],
+                env={},
+                transport="http",
+                url="https://mcp.example.test/rpc",
+            )
+        },
+        SafetyGuard(tmp_path),
+    )
+    tools = await runtime.start()
+    old_tool = tools["mcp__remote__echo"]
+    first = asyncio.create_task(old_tool.run())
+    try:
+        await asyncio.wait_for(replacement_list_started.wait(), timeout=1)
+        second = asyncio.create_task(old_tool.run())
+        await asyncio.sleep(0.05)
+        assert second.done() is False
+        assert tool_attempts == 1
+
+        release_replacement_list.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        assert first_result.success is False
+        assert "changed the server contract" in first_result.error
+        assert second_result.success is False
+        assert "no longer matches the active verified" in second_result.error
+        assert tool_attempts == 1
+    finally:
+        release_replacement_list.set()
+        if not first.done():
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+        await runtime.close()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_output_schema_only_refresh_is_reported_as_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ChangingClient:
+        server_capabilities = {"tools": {"listChanged": True}}
+        protocol_version = "2025-11-25"
+
+        def __init__(self, config, *, roots=()) -> None:
+            self.notification_handler = None
+            self.session_reinitialized_handler = None
+            self.calls = 0
+
+        async def connect(self) -> None:
+            return None
+
+        def supports_server_capability(self, name: str) -> bool:
+            return name == "tools"
+
+        async def list_tools(self) -> list[dict]:
+            self.calls += 1
+            return [
+                {
+                    "name": "same",
+                    "description": "same",
+                    "inputSchema": {"type": "object"},
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {"version": {"const": self.calls}},
+                    },
+                }
+            ]
+
+        async def disconnect(self) -> None:
+            return None
+
+    monkeypatch.setattr("ash.mcp.runtime.MCPClient", ChangingClient)
+    events: list[dict] = []
+    runtime = MCPRuntime(
+        {
+            "changing": MCPServerConfig(
+                name="changing", command="unused", args=[], env={}
+            )
+        },
+        SafetyGuard(tmp_path),
+        event_sink=events.append,
+    )
+    await runtime.start()
+    client = runtime.clients["changing"]
+    try:
+        await client.notification_handler("notifications/tools/list_changed", {})
+        await runtime.wait_for_refreshes()
+        tool_events = [
+            event
+            for event in events
+            if event.get("type") == "mcp.catalog.changed"
+            and event.get("capability") == "tools"
+        ]
+        assert tool_events[-1]["changed"] == ["mcp__changing__same"]
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_refresh_storm_is_bounded_and_reported(tmp_path: Path) -> None:
+    storm_server = DYNAMIC_MCP_SERVER.replace(
+        "if list_count == 1:", "if True:"
+    )
+    events: list[dict] = []
+    runtime = MCPRuntime(
+        {
+            "storm": MCPServerConfig(
+                name="storm",
+                command=sys.executable,
+                args=["-u", "-c", storm_server],
+                env={},
+            )
+        },
+        SafetyGuard(tmp_path),
+        event_sink=events.append,
+    )
+    await runtime.start()
+    try:
+        await asyncio.wait_for(runtime.wait_for_refreshes(), timeout=2)
+        assert "refresh storm" in runtime.errors["storm:tools/refresh"]
+        assert any(
+            event.get("type") == "mcp.catalog.refresh_suppressed"
+            for event in events
+        )
+    finally:
+        await runtime.close()

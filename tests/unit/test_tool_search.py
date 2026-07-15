@@ -150,3 +150,68 @@ async def test_loop_exposes_search_match_on_next_iteration_and_budgets_visible_t
     await loop.start_session()
     assert set(loop._provider_tools()) == {"search_tools"}
     await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_loop_search_catalog_tracks_runtime_additions_and_removals(
+    tmp_path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    initial_catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: initial_catalog, threshold=1)
+    initial_catalog[search.name] = search
+    loop = AshLoop(
+        SessionStore(tmp_path / "live-search.db"),
+        SearchFlowProvider(),
+        guard,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        tmp_path,
+        tools=initial_catalog,
+    )
+    late = DummyTool(guard, "late_mcp_tool", "Query a live remote catalog.")
+    loop.tools[late.name] = late
+
+    result = await search.run(query="live remote", limit=1)
+    assert json.loads(result.output)["tools"][0]["name"] == late.name
+    assert late.name in search.activated_names
+
+    loop.tools.pop(late.name)
+    search.prune_activations(set(loop.tools))
+    result = await search.run(query="live remote", limit=1)
+    assert json.loads(result.output)["tools"] == []
+    assert late.name not in search.activated_names
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_iteration_tool_snapshot_survives_live_catalog_removal(tmp_path) -> None:
+    guard = SafetyGuard(tmp_path)
+    tool = DummyTool(guard, "dynamic_tool", "A changing remote tool.")
+    loop = AshLoop(
+        SessionStore(tmp_path / "snapshot.db"),
+        SearchFlowProvider(),
+        guard,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        tmp_path,
+        tools={tool.name: tool},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+    snapshot = dict(loop.tools)
+    loop.tools.pop(tool.name)
+
+    results = await loop._execute_tool_calls(
+        [
+            {
+                "call_id": "dynamic-1",
+                "name": tool.name,
+                "arguments": {"text": "still valid"},
+            }
+        ],
+        session,
+        tools_snapshot=snapshot,
+    )
+
+    assert results[0]["success"] is True
+    assert results[0]["output"] == "ran dynamic_tool: still valid"
+    await loop.aclose()

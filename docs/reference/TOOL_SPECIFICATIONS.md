@@ -179,7 +179,7 @@ Ash supports direct interaction with external tool servers conforming to the Mod
 ```
        ┌───────────┐           Model Context Protocol           ┌────────────┐
        │           │ <========================================> │            │
-       │    Ash    │             (stdio or SSE)                 │ MCP Server │
+       │    Ash    │      (stdio or Streamable HTTP)            │ MCP Server │
        │  Harness  │                                            │ (Goose,    │
        │  Client   │ <--- list_tools()                          │  SQLite,   │
        │           │ ---> call_tool(name, args)                 │  Docker,   │
@@ -192,8 +192,24 @@ Ash supports direct interaction with external tool servers conforming to the Mod
    JSON-RPC messages up to 8 MiB over standard streams, fails pending requests
    immediately on framing or process errors, and shuts down the process tree.
 2. **Streamable HTTP** exchanges JSON or SSE responses over HTTP, retains MCP
-   session IDs, and supports explicit OAuth 2.1 authorization. Legacy SSE
-   endpoints remain available for compatibility.
+   session IDs, and supports explicit OAuth 2.1 authorization. The `sse`
+   configuration spelling is currently a compatibility alias for this
+   transport; deprecated HTTP+SSE endpoint discovery is not advertised.
+
+When a session-bound POST is rejected with the specification-defined 404,
+Ash serializes reinitialization, omits the expired session ID, sends
+`notifications/initialized`, and retries the rejected logical request once
+with a fresh JSON-RPC ID. Concurrent rejections share the replacement session.
+A second rejection establishes a usable session for future traffic but does
+not attempt the operation a third time. Timeouts, 5xx responses, malformed
+responses, and other ambiguous failures never replay tool calls.
+The replacement handshake invalidates the server catalog: Ash reconciles and
+atomically publishes the newly negotiated complete tool set before deciding
+whether a rejected tool call can be retried. A removed or changed contract is
+not replayed, and every tool call proves its snapshot fingerprint against the
+active verified session generation immediately before its HTTP POST or stdio
+write. Paginated lists restart from page one after recovery so opaque cursors
+and entries from different sessions are never combined.
 
 ### 3.2 Tool Schema Boundary
 
@@ -201,6 +217,19 @@ After initialization, Ash paginates `tools/list` and namespaces each remote
 tool as `mcp__<server>__<tool>`. The declared `inputSchema` remains the
 authoritative provider-facing schema; Ash does not translate it into a smaller
 Pydantic type model.
+
+Servers that declare `tools.listChanged` can update this catalog without a
+restart. Ash coalesces notification bursts, paginates and validates a complete
+replacement before an atomic per-server swap, and preserves the last good
+catalog on failure. Self-sustaining notification storms are rate-limited and
+suppressed with a runtime diagnostic. A provider iteration retains the exact
+tool snapshot it was offered, while the next iteration and `search_tools` see
+the new catalog. Receipt of a valid notification immediately quarantines calls
+through the prior catalog. A failed refresh keeps that last-good catalog
+visible for discovery and diagnostics but does not make it executable again;
+a later complete refresh must verify it first. Declared resource and prompt
+list changes emit revisioned runtime events; their list operations already
+fetch live data and do not cache stale entries.
 
 * An omitted `$schema` selects JSON Schema 2020-12 for MCP 2025-11-25. Older
   negotiated revisions use draft 7 for ecosystem compatibility; an explicit
