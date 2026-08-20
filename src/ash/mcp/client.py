@@ -460,6 +460,12 @@ class MCPClient:
                     retry_allowed = await self._recover_http_session(
                         exc, method=method, params=params or {}
                     )
+                    if method == "tools/call":
+                        raise MCPProtocolError(
+                            "tools/call was rejected after HTTP session recovery; "
+                            "the operation was not replayed because a server-side "
+                            "effect may have occurred"
+                        ) from exc
                     if recovery_attempted:
                         raise MCPProtocolError(
                             f"{method} was rejected after one HTTP session recovery; "
@@ -626,15 +632,14 @@ class MCPClient:
                 exc,
                 method=str(payload.get("method", "")),
                 params=(
-                    payload["params"]
-                    if isinstance(payload.get("params"), dict)
-                    else {}
+                    payload["params"] if isinstance(payload.get("params"), dict) else {}
                 ),
             )
             method = payload.get("method")
             if (
                 not retry_allowed
                 or not isinstance(method, str)
+                or method == "tools/call"
                 or method == "notifications/cancelled"
             ):
                 return
@@ -708,6 +713,12 @@ class MCPClient:
             headers=headers,
         )
         if response.status_code == 401 and self._oauth is not None:
+            if payload.get("method") == "tools/call":
+                raise MCPAuthorizationRequired(
+                    f"MCP server {self.config.name!r} rejected the tool-call "
+                    "credentials; the operation was not replayed because a "
+                    "server-side effect may have occurred"
+                )
             rejected_access_token = headers["Authorization"].removeprefix("Bearer ")
             headers["Authorization"] = await self._oauth.authorization_header(
                 force_refresh=True,
@@ -760,10 +771,7 @@ class MCPClient:
         params: dict[str, Any] | None = None,
     ) -> bool:
         async with self._session_recovery_lock:
-            if (
-                self._initialized
-                and self._session_generation != expired.generation
-            ):
+            if self._initialized and self._session_generation != expired.generation:
                 generation = self._session_generation
             else:
                 self._initialized = False
@@ -778,8 +786,7 @@ class MCPClient:
                     await self._initialize_protocol()
                 except BaseException:
                     session_to_close = (
-                        self._http_session_id
-                        or self._pending_initialize_session_id
+                        self._http_session_id or self._pending_initialize_session_id
                     )
                     self._http_session_id = ""
                     self._pending_initialize_session_id = ""

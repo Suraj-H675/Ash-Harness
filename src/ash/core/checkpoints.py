@@ -28,12 +28,25 @@ MAX_CHECKPOINT_DIFF_LINES = 400
 
 
 @dataclass(frozen=True)
+class RecoveredToolCall:
+    """One durable terminal decision for an interrupted tool intent."""
+
+    call_id: str
+    tool_name: str
+    turn_id: str
+    error: str
+    dispatched: bool
+    ambiguous: bool
+
+
+@dataclass(frozen=True)
 class RecoverySummary:
     interrupted_turns: int = 0
     compensated_calls: int = 0
     compensated_files: tuple[Path, ...] = ()
     unknown_calls: tuple[str, ...] = ()
     unresolved_files: tuple[Path, ...] = ()
+    recovered_calls: tuple[RecoveredToolCall, ...] = ()
 
     @property
     def needs_attention(self) -> bool:
@@ -46,6 +59,17 @@ class RecoverySummary:
             "compensated_files": [str(path) for path in self.compensated_files],
             "unknown_calls": list(self.unknown_calls),
             "unresolved_files": [str(path) for path in self.unresolved_files],
+            "recovered_calls": [
+                {
+                    "call_id": call.call_id,
+                    "tool": call.tool_name,
+                    "turn_id": call.turn_id,
+                    "error": call.error,
+                    "dispatched": call.dispatched,
+                    "ambiguous": call.ambiguous,
+                }
+                for call in self.recovered_calls
+            ],
             "needs_attention": self.needs_attention,
         }
 
@@ -131,6 +155,7 @@ def recover_interrupted_turns(
     compensated_files: list[Path] = []
     unknown_calls: list[str] = []
     unresolved_files: list[Path] = []
+    recovered_calls: list[RecoveredToolCall] = []
 
     for turn in turns:
         turn_id = str(turn["turn_id"])
@@ -141,10 +166,26 @@ def recover_interrupted_turns(
         turn_compensated: list[str] = []
         turn_unknown: list[dict[str, str]] = []
         turn_unresolved: list[str] = []
+        turn_recovered: list[RecoveredToolCall] = []
 
         for call in pending:
             call_id = str(call["call_id"])
             tool_name = str(call["tool_name"])
+            dispatched = bool(call["dispatched"])
+            if not dispatched:
+                error = "Ash stopped before this tool was dispatched; it was not run."
+                call_errors[call_id] = error
+                turn_recovered.append(
+                    RecoveredToolCall(
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        turn_id=turn_id,
+                        error=error,
+                        dispatched=False,
+                        ambiguous=False,
+                    )
+                )
+                continue
             if tool_name not in EDIT_TOOLS:
                 error = (
                     "Ash stopped while this tool was running; its outcome is unknown. "
@@ -153,6 +194,16 @@ def recover_interrupted_turns(
                 call_errors[call_id] = error
                 unknown_calls.append(f"{tool_name} ({call_id})")
                 turn_unknown.append({"call_id": call_id, "tool": tool_name})
+                turn_recovered.append(
+                    RecoveredToolCall(
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        turn_id=turn_id,
+                        error=error,
+                        dispatched=True,
+                        ambiguous=True,
+                    )
+                )
                 continue
 
             rows = store.file_checkpoints_for_call(session_id, turn_id, call_id)
@@ -164,6 +215,16 @@ def recover_interrupted_turns(
                 call_errors[call_id] = error
                 unknown_calls.append(f"{tool_name} ({call_id})")
                 turn_unknown.append({"call_id": call_id, "tool": tool_name})
+                turn_recovered.append(
+                    RecoveredToolCall(
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        turn_id=turn_id,
+                        error=error,
+                        dispatched=True,
+                        ambiguous=True,
+                    )
+                )
                 continue
             safe_rows: list[tuple[Any, Path]] = []
             conflicts: list[Path] = []
@@ -188,6 +249,16 @@ def recover_interrupted_turns(
                 for path in conflicts:
                     unresolved_files.append(path)
                     turn_unresolved.append(_relative_display(path, guard.project_root))
+                turn_recovered.append(
+                    RecoveredToolCall(
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        turn_id=turn_id,
+                        error=error,
+                        dispatched=True,
+                        ambiguous=True,
+                    )
+                )
                 continue
 
             rows_to_restore = [
@@ -204,6 +275,16 @@ def recover_interrupted_turns(
             compensated_files.extend(path for _, path in rows_to_restore)
             call_errors[call_id] = (
                 "Interrupted file edit was rolled back during startup recovery."
+            )
+            turn_recovered.append(
+                RecoveredToolCall(
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    turn_id=turn_id,
+                    error=call_errors[call_id],
+                    dispatched=True,
+                    ambiguous=False,
+                )
             )
 
         unmatched = store.unmatched_incomplete_checkpoints(
@@ -230,6 +311,17 @@ def recover_interrupted_turns(
             "compensated_calls": turn_compensated,
             "unknown_calls": turn_unknown,
             "unresolved_files": list(dict.fromkeys(turn_unresolved)),
+            "recovered_calls": [
+                {
+                    "call_id": call.call_id,
+                    "tool": call.tool_name,
+                    "turn_id": call.turn_id,
+                    "error": call.error,
+                    "dispatched": call.dispatched,
+                    "ambiguous": call.ambiguous,
+                }
+                for call in turn_recovered
+            ],
         }
         store.finalize_interrupted_recovery(
             session_id,
@@ -237,7 +329,9 @@ def recover_interrupted_turns(
             call_errors=call_errors,
             restored_checkpoint_ids=list(dict.fromkeys(restored_checkpoint_ids)),
             recovery=report,
+            recovered_calls=turn_recovered,
         )
+        recovered_calls.extend(turn_recovered)
 
     return RecoverySummary(
         interrupted_turns=len(turns),
@@ -245,6 +339,7 @@ def recover_interrupted_turns(
         compensated_files=tuple(dict.fromkeys(compensated_files)),
         unknown_calls=tuple(unknown_calls),
         unresolved_files=tuple(dict.fromkeys(unresolved_files)),
+        recovered_calls=tuple(recovered_calls),
     )
 
 

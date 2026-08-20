@@ -22,7 +22,7 @@ AuditAction = Literal[
     "tool_call", "command_run", "file_write", "safety_block", "user_approval"
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 
 
 class SessionStorageError(RuntimeError):
@@ -46,6 +46,7 @@ class ToolCallRecord(BaseModel):
     arguments: dict[str, Any]
     approved: bool
     executed: bool
+    dispatched: bool = False
     result: str | None = None
     error: str | None = None
     timestamp: datetime
@@ -348,6 +349,8 @@ class SessionStore:
                 self._migrate_v8(conn)
             if from_version < 9:
                 self._migrate_v9(conn)
+            if from_version < 10:
+                self._migrate_v10(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -577,6 +580,26 @@ class SessionStore:
             (9, _serialize_datetime(_utc_now())),
         )
 
+    def _migrate_v10(self, conn: sqlite3.Connection) -> None:
+        """Distinguish persisted tool intent from a started tool dispatch."""
+
+        if not _column_exists(conn, "tool_calls", "dispatched"):
+            conn.execute(
+                "ALTER TABLE tool_calls ADD COLUMN dispatched INTEGER NOT NULL "
+                "DEFAULT 0 CHECK(dispatched IN (0, 1))"
+            )
+            # Older records cannot prove whether the call reached its tool.
+            # Preserve safety by treating every approved unfinished legacy call
+            # as potentially dispatched during recovery.
+            conn.execute(
+                "UPDATE tool_calls SET dispatched = 1 "
+                "WHERE approved = 1 AND executed = 0"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (10, _serialize_datetime(_utc_now())),
+        )
+
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
     ) -> Path:
@@ -656,6 +679,7 @@ class SessionStore:
                     arguments_json TEXT NOT NULL,
                     approved INTEGER CHECK(approved IN (0, 1)) DEFAULT 0,
                     executed INTEGER CHECK(executed IN (0, 1)) DEFAULT 0,
+                    dispatched INTEGER CHECK(dispatched IN (0, 1)) DEFAULT 0,
                     result TEXT,
                     error TEXT,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -887,7 +911,8 @@ class SessionStore:
 
             tool_call_rows = conn.execute(
                 """
-                SELECT call_id, tool_name, arguments_json, approved, executed, result, error, timestamp
+                SELECT call_id, tool_name, arguments_json, approved, executed,
+                       dispatched, result, error, timestamp
                 FROM tool_calls
                 WHERE session_id = ?
                 ORDER BY timestamp ASC, call_id ASC
@@ -927,6 +952,7 @@ class SessionStore:
                     arguments=json.loads(row["arguments_json"]),
                     approved=bool(row["approved"]),
                     executed=bool(row["executed"]),
+                    dispatched=bool(row["dispatched"]),
                     result=row["result"],
                     error=row["error"],
                     timestamp=_deserialize_datetime(row["timestamp"]),
@@ -1215,7 +1241,8 @@ class SessionStore:
         with closing(get_db_connection(self.db_path)) as conn:
             return conn.execute(
                 "SELECT * FROM tool_calls WHERE session_id = ? AND turn_id = ? "
-                "AND approved = 1 AND executed = 0 ORDER BY timestamp, call_id",
+                "AND approved = 1 AND executed = 0 AND error IS NULL "
+                "ORDER BY timestamp, call_id",
                 (session_id, turn_id),
             ).fetchall()
 
@@ -1260,15 +1287,56 @@ class SessionStore:
         call_errors: dict[str, str],
         restored_checkpoint_ids: list[int],
         recovery: dict[str, Any],
+        recovered_calls: list[Any],
     ) -> None:
         """Atomically persist one startup recovery decision."""
 
         with closing(get_db_connection(self.db_path)) as conn, conn:
+            recovered_by_id = {str(call.call_id): call for call in recovered_calls}
             for call_id, error in call_errors.items():
+                call = recovered_by_id[call_id]
                 conn.execute(
-                    "UPDATE tool_calls SET executed = 1, error = ? "
+                    "UPDATE tool_calls SET executed = ?, error = ? "
                     "WHERE session_id = ? AND turn_id = ? AND call_id = ?",
-                    (error, session_id, turn_id, call_id),
+                    (
+                        int(bool(call.dispatched)),
+                        error,
+                        session_id,
+                        turn_id,
+                        call_id,
+                    ),
+                )
+            for call in recovered_calls:
+                tool_name = str(call.tool_name)
+                action_type: AuditAction = (
+                    "command_run"
+                    if tool_name == "run_command"
+                    else "file_write"
+                    if tool_name
+                    in {
+                        "write_file",
+                        "whole_edit",
+                        "replace_file_content",
+                        "replace_file_edits",
+                        "apply_patch",
+                    }
+                    else "tool_call"
+                )
+                self._append_audit_log_in_connection(
+                    conn,
+                    session_id,
+                    action_type=action_type,
+                    target_resource=tool_name,
+                    details={
+                        "call_id": str(call.call_id),
+                        "error": str(call.error),
+                        "dispatched": bool(call.dispatched),
+                        "ambiguous": bool(call.ambiguous),
+                        "replayed": False,
+                        "recovered": True,
+                        "replay_policy": "never",
+                    },
+                    result="FAILURE",
                 )
             if restored_checkpoint_ids:
                 placeholders = ",".join("?" for _ in restored_checkpoint_ids)
@@ -1954,18 +2022,20 @@ class SessionStore:
                     arguments_json,
                     approved,
                     executed,
+                    dispatched,
                     result,
                     error,
                     timestamp,
                     turn_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(call_id) DO UPDATE SET
                     session_id = excluded.session_id,
                     tool_name = excluded.tool_name,
                     arguments_json = excluded.arguments_json,
                     approved = excluded.approved,
                     executed = excluded.executed,
+                    dispatched = excluded.dispatched,
                     result = excluded.result,
                     error = excluded.error,
                     timestamp = excluded.timestamp,
@@ -1978,6 +2048,7 @@ class SessionStore:
                     json.dumps(record.arguments),
                     int(record.approved),
                     int(record.executed),
+                    int(record.dispatched),
                     record.result,
                     record.error,
                     _serialize_datetime(record.timestamp),
@@ -1997,68 +2068,85 @@ class SessionStore:
     ) -> AuditLogRecord:
         """Append one tamper-evident audit event for a session."""
 
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            return self._append_audit_log_in_connection(
+                conn,
+                session_id,
+                action_type=action_type,
+                target_resource=target_resource,
+                details=details,
+                result=result,
+                timestamp=timestamp,
+            )
+
+    def _append_audit_log_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        *,
+        action_type: AuditAction,
+        target_resource: str,
+        details: dict[str, Any],
+        result: AuditResult,
+        timestamp: datetime | None = None,
+    ) -> AuditLogRecord:
+        """Append one chained audit entry into an existing transaction."""
+
         event_time = timestamp or _utc_now()
         details_json = _canonical_json(details)
-        with closing(get_db_connection(self.db_path)) as conn, conn:
-            previous_row = conn.execute(
-                """
-                SELECT sha256_hash FROM audit_logs
-                WHERE session_id = ?
-                ORDER BY log_id DESC
-                LIMIT 1
-                """,
-                (session_id,),
-            ).fetchone()
-            previous_hash = (
-                str(previous_row["sha256_hash"])
-                if previous_row is not None and previous_row["sha256_hash"]
-                else ""
+        previous_row = conn.execute(
+            """
+            SELECT sha256_hash FROM audit_logs
+            WHERE session_id = ?
+            ORDER BY log_id DESC
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        previous_hash = (
+            str(previous_row["sha256_hash"])
+            if previous_row is not None and previous_row["sha256_hash"]
+            else ""
+        )
+        event_hash = _audit_hash(
+            session_id=session_id,
+            timestamp=event_time,
+            action_type=action_type,
+            target_resource=target_resource,
+            details_json=details_json,
+            result=result,
+            previous_hash=previous_hash,
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO audit_logs (
+                session_id, timestamp, action_type, target_resource, details_json,
+                result, sha256_hash, previous_hash
             )
-            event_hash = _audit_hash(
-                session_id=session_id,
-                timestamp=event_time,
-                action_type=action_type,
-                target_resource=target_resource,
-                details_json=details_json,
-                result=result,
-                previous_hash=previous_hash,
-            )
-            cursor = conn.execute(
-                """
-                INSERT INTO audit_logs (
-                    session_id,
-                    timestamp,
-                    action_type,
-                    target_resource,
-                    details_json,
-                    result,
-                    sha256_hash,
-                    previous_hash
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    _serialize_datetime(event_time),
-                    action_type,
-                    target_resource,
-                    details_json,
-                    result,
-                    event_hash,
-                    previous_hash,
-                ),
-            )
-            return AuditLogRecord(
-                log_id=int(cursor.lastrowid or 0),
-                session_id=session_id,
-                action_type=action_type,
-                target_resource=target_resource,
-                details=json.loads(details_json),
-                result=result,
-                timestamp=event_time,
-                previous_hash=previous_hash,
-                sha256_hash=event_hash,
-            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                _serialize_datetime(event_time),
+                action_type,
+                target_resource,
+                details_json,
+                result,
+                event_hash,
+                previous_hash,
+            ),
+        )
+        return AuditLogRecord(
+            log_id=int(cursor.lastrowid or 0),
+            session_id=session_id,
+            action_type=action_type,
+            target_resource=target_resource,
+            details=json.loads(details_json),
+            result=result,
+            timestamp=event_time,
+            previous_hash=previous_hash,
+            sha256_hash=event_hash,
+        )
 
     def list_audit_logs(self, session_id: str) -> list[AuditLogRecord]:
         """Return audit log records for a session in append order."""

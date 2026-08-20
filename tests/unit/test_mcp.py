@@ -577,9 +577,7 @@ def test_mcp_tool_rejects_non_object_roots_and_remote_references(
             input_schema={
                 "type": "object",
                 "properties": {
-                    "value": {
-                        "$ref": "http://169.254.169.254/latest/meta-data/"
-                    }
+                    "value": {"$ref": "http://169.254.169.254/latest/meta-data/"}
                 },
             },
         )
@@ -959,6 +957,7 @@ async def test_mcp_tool_preserves_protocol_error_data_without_replay(
 
     assert result.success is False
     assert client.calls == 1
+    assert result.outcome == "unknown"
     assert json.loads(result.output) == {
         "error": {
             "type": "mcp_protocol_error",
@@ -1060,7 +1059,9 @@ async def test_mcp_client_rejects_boolean_error_code_and_distinguishes_data() ->
 
 
 @pytest.mark.asyncio
-async def test_mcp_runtime_isolates_invalid_tool_schema(tmp_path: Path, monkeypatch) -> None:
+async def test_mcp_runtime_isolates_invalid_tool_schema(
+    tmp_path: Path, monkeypatch
+) -> None:
     class CatalogClient:
         server_capabilities = {"tools": {}}
 
@@ -1100,9 +1101,10 @@ async def test_mcp_runtime_isolates_invalid_tool_schema(tmp_path: Path, monkeypa
         assert "mcp__catalog__broken" not in tools
         assert "mcp__catalog__task-only" not in tools
         assert "not valid JSON Schema" in runtime.errors["catalog:tool:broken"]
-        assert "requires experimental task execution" in runtime.errors[
-            "catalog:tool:task-only"
-        ]
+        assert (
+            "requires experimental task execution"
+            in runtime.errors["catalog:tool:task-only"]
+        )
     finally:
         await runtime.close()
 
@@ -1461,7 +1463,7 @@ async def test_streamable_http_tracks_session_and_parses_sse() -> None:
 
 
 @pytest.mark.asyncio
-async def test_http_recovers_expired_session_and_retries_once() -> None:
+async def test_http_recovers_expired_session_without_replaying_tool_call() -> None:
     trace: list[tuple[str, str | None, int | None]] = []
     initialize_count = 0
 
@@ -1515,8 +1517,8 @@ async def test_http_recovers_expired_session_and_retries_once() -> None:
     )
     await client.connect()
     try:
-        result = await client.call_tool("echo", {})
-        assert result["content"][0]["text"] == "ok"
+        with pytest.raises(MCPProtocolError, match="operation was not replayed"):
+            await client.call_tool("echo", {})
         assert client._http_session_id == "session-2"
     finally:
         await client.disconnect()
@@ -1529,9 +1531,8 @@ async def test_http_recovers_expired_session_and_retries_once() -> None:
         ("tools/call", "session-1"),
         ("initialize", None),
         ("notifications/initialized", "session-2"),
-        ("tools/call", "session-2"),
     ]
-    assert calls[0][2] != calls[1][2]
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
@@ -1588,9 +1589,10 @@ async def test_http_concurrent_expiry_uses_one_recovery_handshake() -> None:
     )
     await client.connect()
     try:
-        await asyncio.gather(
-            client.call_tool("first", {}), client.call_tool("second", {})
-        )
+        with pytest.raises(MCPProtocolError, match="operation was not replayed"):
+            await asyncio.gather(
+                client.call_tool("first", {}), client.call_tool("second", {})
+            )
         assert initialize_count == 2
     finally:
         await client.disconnect()
@@ -1598,7 +1600,7 @@ async def test_http_concurrent_expiry_uses_one_recovery_handshake() -> None:
 
 
 @pytest.mark.asyncio
-async def test_http_second_session_404_recovers_without_third_tool_attempt() -> None:
+async def test_http_session_404_recovers_without_replaying_tool_attempt() -> None:
     initialize_count = 0
     tool_attempts = 0
 
@@ -1640,11 +1642,11 @@ async def test_http_second_session_404_recovers_without_third_tool_attempt() -> 
     )
     await client.connect()
     try:
-        with pytest.raises(MCPProtocolError, match="after one HTTP session recovery"):
+        with pytest.raises(MCPProtocolError, match="operation was not replayed"):
             await client.call_tool("write", {})
-        assert tool_attempts == 2
-        assert initialize_count == 3
-        assert client._http_session_id == "session-3"
+        assert tool_attempts == 1
+        assert initialize_count == 2
+        assert client._http_session_id == "session-2"
     finally:
         await client.disconnect()
         await http.aclose()
@@ -1981,11 +1983,7 @@ async def test_failed_replacement_initialize_deletes_allocated_session() -> None
         session = request.headers.get("Mcp-Session-Id")
         if method == "initialize":
             initialize_count += 1
-            capabilities = (
-                {"tools": None}
-                if initialize_count == 2
-                else {"tools": {}}
-            )
+            capabilities = {"tools": None} if initialize_count == 2 else {"tools": {}}
             return httpx.Response(
                 200,
                 headers={"Mcp-Session-Id": f"session-{initialize_count}"},
@@ -2357,9 +2355,7 @@ async def test_stdio_revalidates_tool_contract_inside_write_lock() -> None:
     client._process = Mock(stdin=stdin)
     client._session_generation = 1
     catalog_valid = True
-    client.tool_contract_validator = (
-        lambda name, fingerprint, generation: catalog_valid
-    )
+    client.tool_contract_validator = lambda name, fingerprint, generation: catalog_valid
     await client._write_lock.acquire()
     task = asyncio.create_task(
         client.call_tool("echo", {}, expected_contract="fingerprint")
@@ -2488,7 +2484,9 @@ async def test_initialize_timeout_does_not_send_cancellation_notification() -> N
 
 
 @pytest.mark.asyncio
-async def test_sessionless_http_timeout_sends_cancellation_without_reinitialize() -> None:
+async def test_sessionless_http_timeout_sends_cancellation_without_reinitialize() -> (
+    None
+):
     trace: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2612,7 +2610,9 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
-async def test_runtime_applies_startup_tool_list_change_atomically(tmp_path: Path) -> None:
+async def test_runtime_applies_startup_tool_list_change_atomically(
+    tmp_path: Path,
+) -> None:
     live_tools: dict[str, object] = {}
     replacements: list[tuple[set[str], set[str]]] = []
 
@@ -2645,9 +2645,7 @@ async def test_runtime_applies_startup_tool_list_change_atomically(tmp_path: Pat
         result = await live_tools["mcp__dynamic__new"].run(text="hello")
         assert result.success is True
         assert result.output == "new"
-        assert replacements == [
-            ({"mcp__dynamic__old"}, {"mcp__dynamic__new"})
-        ]
+        assert replacements == [({"mcp__dynamic__old"}, {"mcp__dynamic__new"})]
         assert any(
             event.get("type") == "mcp.catalog.changed"
             and event.get("added") == ["mcp__dynamic__new"]
@@ -2744,11 +2742,7 @@ async def test_tool_list_change_quarantines_calls_until_refresh_finishes(
 
     monkeypatch.setattr("ash.mcp.runtime.MCPClient", PausedRefreshClient)
     runtime = MCPRuntime(
-        {
-            "paused": MCPServerConfig(
-                name="paused", command="unused", args=[], env={}
-            )
-        },
+        {"paused": MCPServerConfig(name="paused", command="unused", args=[], env={})},
         SafetyGuard(tmp_path),
     )
     tools = await runtime.start()
@@ -2799,11 +2793,7 @@ async def test_resource_and_prompt_list_changes_emit_live_revisions(
     monkeypatch.setattr("ash.mcp.runtime.MCPClient", CatalogClient)
     events: list[dict] = []
     runtime = MCPRuntime(
-        {
-            "catalog": MCPServerConfig(
-                name="catalog", command="unused", args=[], env={}
-            )
-        },
+        {"catalog": MCPServerConfig(name="catalog", command="unused", args=[], env={})},
         SafetyGuard(tmp_path),
         event_sink=events.append,
     )
@@ -2823,7 +2813,7 @@ async def test_resource_and_prompt_list_changes_emit_live_revisions(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("contract_mode", ["unchanged", "renamed", "removed"])
-async def test_runtime_reconciles_catalog_before_http_tool_retry(
+async def test_runtime_reconciles_catalog_without_http_tool_replay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     contract_mode: str,
@@ -2927,22 +2917,17 @@ async def test_runtime_reconciles_catalog_before_http_tool_retry(
     old_tool = live["mcp__remote__echo"]
     try:
         result = await old_tool.run(text="hello")
+        assert result.success is False
+        assert "operation was not replayed" in result.error
+        assert tool_attempts == 1
         if contract_mode != "unchanged":
-            assert result.success is False
-            assert "changed the server contract" in result.error
-            assert tool_attempts == 1
             assert "mcp__remote__echo" not in live
-            assert ("mcp__remote__replacement" in live) is (
-                contract_mode == "renamed"
-            )
+            assert ("mcp__remote__replacement" in live) is (contract_mode == "renamed")
             stale_result = await old_tool.run(text="again")
             assert stale_result.success is False
             assert "no longer matches the active verified" in stale_result.error
             assert tool_attempts == 1
         else:
-            assert result.success is True
-            assert result.output == "ok"
-            assert tool_attempts == 2
             assert "mcp__remote__echo" in live
         assert initialize_count == 2
     finally:
@@ -3028,9 +3013,7 @@ async def test_runtime_start_recovers_session_expiry_during_initial_catalog(
         assert ("mcp__remote__echo" in tools) is replacement_supports_tools
         assert initialize_count == 2
         expected_sessions = (
-            ["session-1", "session-2"]
-            if replacement_supports_tools
-            else ["session-1"]
+            ["session-1", "session-2"] if replacement_supports_tools else ["session-1"]
         )
         assert list_sessions == expected_sessions
         assert runtime.errors == {}
@@ -3132,7 +3115,7 @@ async def test_runtime_blocks_concurrent_stale_call_until_catalog_reconciles(
         release_replacement_list.set()
         first_result, second_result = await asyncio.gather(first, second)
         assert first_result.success is False
-        assert "changed the server contract" in first_result.error
+        assert "operation was not replayed" in first_result.error
         assert second_result.success is False
         assert "no longer matches the active verified" in second_result.error
         assert tool_attempts == 1
@@ -3210,9 +3193,7 @@ async def test_output_schema_only_refresh_is_reported_as_changed(
 
 @pytest.mark.asyncio
 async def test_refresh_storm_is_bounded_and_reported(tmp_path: Path) -> None:
-    storm_server = DYNAMIC_MCP_SERVER.replace(
-        "if list_count == 1:", "if True:"
-    )
+    storm_server = DYNAMIC_MCP_SERVER.replace("if list_count == 1:", "if True:")
     events: list[dict] = []
     runtime = MCPRuntime(
         {
@@ -3231,8 +3212,7 @@ async def test_refresh_storm_is_bounded_and_reported(tmp_path: Path) -> None:
         await asyncio.wait_for(runtime.wait_for_refreshes(), timeout=2)
         assert "refresh storm" in runtime.errors["storm:tools/refresh"]
         assert any(
-            event.get("type") == "mcp.catalog.refresh_suppressed"
-            for event in events
+            event.get("type") == "mcp.catalog.refresh_suppressed" for event in events
         )
     finally:
         await runtime.close()

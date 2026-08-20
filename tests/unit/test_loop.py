@@ -1,9 +1,18 @@
 import asyncio
+import platform
+import shlex
+import sys
 
 import pytest
 from datetime import datetime, timezone
 from ash.core.loop import AshLoop
-from ash.tools.base import BaseTool, ToolResult, ToolMiddleware, ToolMiddlewareSkip
+from ash.tools.base import (
+    BaseTool,
+    ToolExecutionOutcome,
+    ToolMiddleware,
+    ToolMiddlewareSkip,
+    ToolResult,
+)
 from ash.config import AshConfig
 from ash.context.turn import TurnContext
 from ash.core.session import Message, SessionStore, ToolCallRecord, get_db_connection
@@ -15,6 +24,7 @@ from ash.safety.grants import PermissionRule, RuleEffect
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionMode
 from ash.ui.terminal import TerminalUI
+from ash.tools.command import RunCommandTool, quote_powershell_literal_path
 from ash.tools.filesystem import ReadFileTool
 from pathlib import Path
 import tempfile
@@ -633,9 +643,7 @@ async def test_metadata_terminal_rate_limit_retries_before_output(tmp_path) -> N
     assert outcome.text == "recovered"
     assert provider.calls == 3
     assert [
-        event["attempt"]
-        for event in ui.events
-        if event["type"] == "provider.retrying"
+        event["attempt"] for event in ui.events if event["type"] == "provider.retrying"
     ] == [2, 3]
 
 
@@ -935,6 +943,7 @@ async def test_resuming_session_recovers_pending_tool_and_emits_details(tmp_path
             arguments={"command_line": "build"},
             approved=True,
             executed=False,
+            dispatched=True,
             timestamp=datetime.now(timezone.utc),
         ),
         turn_id="turn-crashed",
@@ -950,6 +959,13 @@ async def test_resuming_session_recovers_pending_tool_and_emits_details(tmp_path
     event = next(event for event in ui.events if event["type"] == "session.recovery")
     assert event["unknown_calls"] == ["run_command (call-command)"]
     assert event["needs_attention"] is True
+    tool_error = next(event for event in ui.events if event["type"] == "tool.error")
+    assert tool_error["call_id"] == "call-command"
+    assert tool_error["recovered"] is True
+    assert tool_error["ambiguous"] is True
+    audit = store.list_audit_logs(session.session_id)[-1]
+    assert audit.details["call_id"] == "call-command"
+    assert audit.details["replayed"] is False
 
 
 class SteeringProvider(ProviderABC):
@@ -1130,11 +1146,12 @@ async def test_approved_tool_intent_is_durable_before_execution_finishes(tmp_pat
     assert loop.turn_context is not None
     with get_db_connection(store.db_path) as connection:
         pending = connection.execute(
-            "SELECT approved, executed, turn_id FROM tool_calls WHERE call_id = ?",
+            "SELECT approved, executed, dispatched, turn_id FROM tool_calls WHERE call_id = ?",
             ("call-native-1",),
         ).fetchone()
     assert pending["approved"] == 1
     assert pending["executed"] == 0
+    assert pending["dispatched"] == 1
     assert pending["turn_id"] == loop.turn_context.turn_id
 
     turn.cancel()
@@ -1146,6 +1163,14 @@ async def test_approved_tool_intent_is_durable_before_execution_finishes(tmp_pat
     assert "outcome is unknown" in (recovered.error or "")
     assert loop.recovery_summary is not None
     assert loop.recovery_summary.needs_attention is True
+    tool_errors = [event for event in loop.ui.events if event["type"] == "tool.error"]
+    assert len(tool_errors) == 1
+    assert tool_errors[0]["call_id"] == "call-native-1"
+    assert tool_errors[0]["recovered"] is True
+    assert tool_errors[0]["ambiguous"] is True
+    audit = store.list_audit_logs(loop.current_session.session_id)[-1]
+    assert audit.details["call_id"] == "call-native-1"
+    assert audit.details["recovered"] is True
 
 
 @pytest.mark.asyncio
@@ -1758,19 +1783,17 @@ async def test_on_tool_approval_can_auto_deny(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_retry_on_transient_failure(tmp_path):
-    transient_count = 0
+async def test_tool_exception_after_dispatch_is_not_replayed(tmp_path):
+    invocation_count = 0
 
     class FlakyTool(BaseTool):
         name = "flaky"
         args_schema = None
 
         async def run(self, **kwargs):
-            nonlocal transient_count
-            transient_count += 1
-            if transient_count < 3:
-                raise RuntimeError("transient error")
-            return ToolResult(success=True, output="ok")
+            nonlocal invocation_count
+            invocation_count += 1
+            raise RuntimeError("result channel failed")
 
     class FlakyProvider(ProviderABC):
         model_name = "test"
@@ -1787,7 +1810,7 @@ async def test_retry_on_transient_failure(tmp_path):
     with tempfile.TemporaryDirectory() as db_dir:
         store = SessionStore(Path(db_dir) / "test.db")
         guard = SafetyGuard(project_root=tmp_path)
-        ui = TerminalUI(safety_tier="auto_approve")
+        ui = EventUI(safety_tier="auto_approve")
         loop = AshLoop(
             store,
             FlakyProvider(),
@@ -1799,9 +1822,190 @@ async def test_retry_on_transient_failure(tmp_path):
         )
         await loop.start_session()
         await loop.run_turn("test")
-        assert (
-            transient_count == 3
-        )  # 3 total attempts: fail, fail, success (MAX_RETRIES=2 means 2 retries)
+        assert invocation_count == 1
+        assert loop.current_session is not None
+        record = store.load_session(loop.current_session.session_id).tool_calls[-1]
+        assert record.executed is True
+        assert "side effect may have occurred" in (record.error or "")
+        assert "did not retry" in (record.error or "")
+        started = [event for event in ui.events if event["type"] == "tool.started"]
+        failed = [event for event in ui.events if event["type"] == "tool.error"]
+        assert len(started) == 1
+        assert len(failed) == 1
+        assert failed[0]["dispatched"] is True
+        assert failed[0]["ambiguous"] is True
+        assert failed[0]["replayed"] is False
+        assert failed[0]["replay_policy"] == "never"
+
+
+@pytest.mark.asyncio
+async def test_lost_result_after_real_command_effect_is_not_replayed(tmp_path):
+    counter = tmp_path / "command-counter.txt"
+
+    class LostResultCommandTool(RunCommandTool):
+        async def _run_scoped(self, *args, **kwargs):
+            result = await super()._run_scoped(*args, **kwargs)
+            assert result.success is True
+            raise OSError("response lost after command exited")
+
+    script = (
+        "from pathlib import Path\n"
+        'p = Path("command-counter.txt")\n'
+        'p.write_text((p.read_text() if p.exists() else "") + "x")'
+    )
+    command = (
+        f"& {quote_powershell_literal_path(sys.executable)} -c "
+        f"{quote_powershell_literal_path(script)}"
+        if platform.system() == "Windows"
+        else f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    )
+    guard = SafetyGuard(project_root=tmp_path)
+    ui = EventUI(safety_tier="auto_approve")
+    loop = AshLoop(
+        SessionStore(tmp_path / "lost-command-result.db"),
+        MockProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={"run_command": LostResultCommandTool(guard)},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+
+    results = await loop._execute_tool_calls(
+        [
+            {
+                "call_id": "lost-command-result",
+                "name": "run_command",
+                "arguments": {"command_line": command},
+            }
+        ],
+        session,
+    )
+
+    assert counter.read_text(encoding="utf-8") == "x"
+    assert results == [
+        {
+            "success": False,
+            "output": "",
+            "error": (
+                "Tool failed after dispatch; its side effect may have occurred. "
+                "Ash did not retry the operation: response lost after command exited"
+            ),
+        }
+    ]
+    started = [event for event in ui.events if event["type"] == "tool.started"]
+    failed = [event for event in ui.events if event["type"] == "tool.error"]
+    assert len(started) == len(failed) == 1
+    assert failed[0]["ambiguous"] is True
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_outcome_is_a_durable_ambiguous_failure(tmp_path):
+    class TransportLostTool(BaseTool):
+        name = "remote_write"
+        args_schema = None
+
+        async def run(self, **kwargs):
+            return ToolResult(
+                success=False,
+                output="",
+                error="connection closed before response",
+                outcome=ToolExecutionOutcome.UNKNOWN,
+            )
+
+    guard = SafetyGuard(project_root=tmp_path)
+    store = SessionStore(tmp_path / "unknown-outcome.db")
+    ui = EventUI(safety_tier="auto_approve")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={"remote_write": TransportLostTool(guard)},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+
+    result = await loop._execute_tool_calls(
+        [
+            {
+                "call_id": "unknown-outcome",
+                "name": "remote_write",
+                "arguments": {},
+            }
+        ],
+        session,
+    )
+
+    assert result[0]["success"] is False
+    assert "Tool outcome is ambiguous" in result[0]["error"]
+    assert [
+        event["type"] for event in ui.events if event["type"] != "tool.requested"
+    ] == [
+        "tool.started",
+        "tool.error",
+    ]
+    error_event = ui.events[-1]
+    assert error_event["ambiguous"] is True
+    assert error_event["replayed"] is False
+    record = store.load_session(session.session_id).tool_calls[-1]
+    assert record.executed is True
+    assert record.dispatched is True
+    audit = store.list_audit_logs(session.session_id)[-1]
+    assert audit.result == "FAILURE"
+    assert audit.details["ambiguous"] is True
+    assert audit.details["replayed"] is False
+
+
+@pytest.mark.asyncio
+async def test_invalid_execution_contract_is_rejected_before_dispatch(tmp_path):
+    calls = 0
+
+    class InvalidContractTool(BaseTool):
+        name = "invalid_contract"
+        args_schema = None
+        execution_contract = object()
+
+        async def run(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            return ToolResult(success=True, output="unexpected")
+
+    guard = SafetyGuard(project_root=tmp_path)
+    store = SessionStore(tmp_path / "invalid-contract.db")
+    ui = EventUI(safety_tier="auto_approve")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={"invalid_contract": InvalidContractTool(guard)},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+
+    result = await loop._execute_tool_calls(
+        [
+            {
+                "call_id": "invalid-contract",
+                "name": "invalid_contract",
+                "arguments": {},
+            }
+        ],
+        session,
+    )
+
+    assert calls == 0
+    assert "must declare a ToolExecutionContract" in result[0]["error"]
+    assert [
+        event["type"] for event in ui.events if event["type"] != "tool.requested"
+    ] == ["tool.error"]
+    record = store.load_session(session.session_id).tool_calls[-1]
+    assert record.dispatched is False
+    assert record.executed is False
 
 
 @pytest.mark.asyncio

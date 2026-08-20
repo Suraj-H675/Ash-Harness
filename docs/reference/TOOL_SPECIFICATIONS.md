@@ -31,6 +31,30 @@ class BaseTool(ABC):
         ...
 ```
 
+### 1.1 Execution and Replay Contract
+
+`BaseTool.execution_contract` declares the host's automatic replay policy.
+The only currently supported policy is `ToolReplayPolicy.NEVER`, which is the
+fail-closed default for every built-in, plugin, and MCP-backed tool.
+
+Ash persists an approved tool intent before dispatch. It runs policy hooks and
+pre-execution middleware first; a middleware skip never invokes `tool.run()`.
+Immediately before `tool.run()` begins, Ash emits `tool.started`. From that
+point forward the runtime invokes that call exactly once. A returned failed
+`ToolResult` is a terminal tool outcome. `ToolResult.outcome` is `completed` by
+default; transport-backed tools set it to `unknown` whenever they cannot prove
+the remote result. An exception, transport loss, timeout, or process
+interruption after dispatch is recorded as an **ambiguous** failure:
+the side effect may have occurred, and Ash does not automatically replay it.
+
+The tool call record carries whether dispatch began and an ambiguity error; the
+audit entry and `tool.error` event carry explicit `dispatched`, `ambiguous`,
+`replayed`, and replay-policy fields. Recovery may expose the interrupted
+intent for inspection or a newly approved user/model action, but it must not
+silently resume the original operation. Provider-request retries before visible
+model output are separate transport mechanisms and never permit host-level
+replay of a tool invocation.
+
 ---
 
 ## 2. Core Tool Definitions
@@ -198,18 +222,19 @@ Ash supports direct interaction with external tool servers conforming to the Mod
 
 When a session-bound POST is rejected with the specification-defined 404,
 Ash serializes reinitialization, omits the expired session ID, sends
-`notifications/initialized`, and retries the rejected logical request once
-with a fresh JSON-RPC ID. Concurrent rejections share the replacement session.
-A second rejection establishes a usable session for future traffic but does
-not attempt the operation a third time. Timeouts, 5xx responses, malformed
-responses, and other ambiguous failures never replay tool calls.
+`notifications/initialized`, and resumes safe catalog/list traffic on the
+replacement session. Concurrent rejections share that replacement session. A
+rejected `tools/call` is never reposted, even if the replacement contract is
+unchanged; its terminal result is ambiguous because the remote effect cannot be
+proven absent. Timeouts, OAuth authentication rejection, 5xx responses,
+malformed responses, and other ambiguous failures likewise never replay tool
+calls.
 The replacement handshake invalidates the server catalog: Ash reconciles and
-atomically publishes the newly negotiated complete tool set before deciding
-whether a rejected tool call can be retried. A removed or changed contract is
-not replayed, and every tool call proves its snapshot fingerprint against the
-active verified session generation immediately before its HTTP POST or stdio
-write. Paginated lists restart from page one after recovery so opaque cursors
-and entries from different sessions are never combined.
+atomically publishes the newly negotiated complete tool set for subsequent
+calls. Every tool call proves its snapshot fingerprint against the active
+verified session generation immediately before its HTTP POST or stdio write.
+Paginated lists restart from page one after recovery so opaque cursors and
+entries from different sessions are never combined.
 
 ### 3.2 Tool Schema Boundary
 

@@ -26,7 +26,12 @@ from ash.sandbox.process_utils import (
     process_group_options,
     terminate_process_tree,
 )
-from ash.tools.base import BaseTool, ToolResult, count_output_tokens
+from ash.tools.base import (
+    BaseTool,
+    ToolExecutionOutcome,
+    ToolResult,
+    count_output_tokens,
+)
 
 
 CURRENT_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
@@ -90,7 +95,9 @@ def _schema_validator(
                     try:
                         re.compile(child)
                     except re.error as exc:
-                        raise ValueError(f"{label} contains an invalid pattern: {exc}") from exc
+                        raise ValueError(
+                            f"{label} contains an invalid pattern: {exc}"
+                        ) from exc
                 if (
                     key == "patternProperties"
                     and isinstance(child, dict)
@@ -128,7 +135,9 @@ def _schema_validator(
             raise ValueError(f"{label} has an invalid $schema dialect")
         validator_class = validator_for(schema, default=None)
         if validator_class is None:
-            raise ValueError(f"{label} uses unsupported JSON Schema dialect {dialect!r}")
+            raise ValueError(
+                f"{label} uses unsupported JSON Schema dialect {dialect!r}"
+            )
     try:
         validator_class.check_schema(schema)
     except SchemaError as exc:
@@ -194,8 +203,7 @@ def _validate_annotations(value: Any) -> str | None:
     if audience is not None and (
         not isinstance(audience, list)
         or not all(
-            isinstance(item, str) and item in {"user", "assistant"}
-            for item in audience
+            isinstance(item, str) and item in {"user", "assistant"} for item in audience
         )
     ):
         return "annotations.audience must contain only user or assistant"
@@ -427,9 +435,7 @@ class MCPTool(BaseTool):
             protocol_version=protocol_version,
         )
         output_schema = (
-            definition.get("outputSchema")
-            if protocol_version >= "2025-06-18"
-            else None
+            definition.get("outputSchema") if protocol_version >= "2025-06-18" else None
         )
         if output_schema is not None and not isinstance(output_schema, dict):
             raise ValueError("MCP tool outputSchema must be an object")
@@ -516,6 +522,7 @@ class MCPTool(BaseTool):
                 output=output,
                 error=str(exc),
                 token_count=count_output_tokens(output),
+                outcome=ToolExecutionOutcome.UNKNOWN,
             )
         except Exception as exc:  # noqa: BLE001 - prevent unsafe automatic replay
             message = str(exc).strip() or type(exc).__name__
@@ -532,6 +539,7 @@ class MCPTool(BaseTool):
                 output=output,
                 error=message,
                 token_count=count_output_tokens(output),
+                outcome=ToolExecutionOutcome.UNKNOWN,
             )
         if not isinstance(result, dict):
             try:
@@ -931,9 +939,7 @@ class MCPRuntime:
                     client=client,
                     server_name=server_name,
                     definition=definition,
-                    protocol_version=getattr(
-                        client, "protocol_version", "2025-11-25"
-                    ),
+                    protocol_version=getattr(client, "protocol_version", "2025-11-25"),
                 )
                 if tool.name in tools:
                     raise ValueError(f"duplicate generated MCP tool name {tool.name!r}")
@@ -967,7 +973,10 @@ class MCPRuntime:
         if capability is None:
             return
         advertised = client.server_capabilities.get(capability)
-        if not isinstance(advertised, dict) or advertised.get("listChanged") is not True:
+        if (
+            not isinstance(advertised, dict)
+            or advertised.get("listChanged") is not True
+        ):
             self.errors[f"{server_name}:notification:{method}"] = (
                 "server sent list_changed without declaring listChanged"
             )
@@ -1013,7 +1022,7 @@ class MCPRuntime:
         async with recovery_lock:
             cached = self._recovery_results.get(key)
             if cached is not None:
-                return cached if method == "tools/call" else True
+                return False if method == "tools/call" else True
             previous = self._server_tools.get(server_name, {})
             previous_contract = {
                 name: getattr(tool, "contract_fingerprint")()
@@ -1044,7 +1053,9 @@ class MCPRuntime:
                     "contract_changed": not retry_allowed,
                 }
             )
-            return retry_allowed if method == "tools/call" else True
+            # Catalog reconciliation still completes for the next invocation,
+            # but never authorizes replay of the rejected tool call itself.
+            return False if method == "tools/call" else True
 
     def _validate_tool_contract(
         self,
@@ -1067,8 +1078,7 @@ class MCPRuntime:
             f"mcp__{server_name}__{remote_name}"
         )
         return bool(
-            tool is not None
-            and getattr(tool, "contract_fingerprint")() == fingerprint
+            tool is not None and getattr(tool, "contract_fingerprint")() == fingerprint
         )
 
     def _schedule_tool_refresh(self, server_name: str) -> None:
@@ -1140,9 +1150,7 @@ class MCPRuntime:
                 )
                 previous = self._server_tools.get(server_name, {})
                 if self._tool_change_handler is not None:
-                    await self._tool_change_handler(
-                        server_name, previous, replacement
-                    )
+                    await self._tool_change_handler(server_name, previous, replacement)
                 if self._closed or self.clients.get(server_name) is not client:
                     return
                 self._server_tools[server_name] = replacement

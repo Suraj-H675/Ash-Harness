@@ -402,11 +402,10 @@ MCP tool inputs retain their exact draft-aware JSON Schemas and validate
 without coercion in a bounded, secret-free subprocess; remote schema references
 are never fetched. Rich call results preserve validated content blocks,
 structured data, metadata, application errors, and protocol error details;
-side-effecting calls are not replayed after an ambiguous failure.
-Session-expiry 404 responses are unambiguous protocol rejections: Ash performs
-one generation-locked reinitialization, restarts any paginated list, reconciles
-the replacement server catalog, and performs one bounded retry only when the
-called tool contract is unchanged. Declared MCP tool list changes are validated
+side-effecting calls are not replayed after an ambiguous failure. Session-expiry
+404 responses trigger one generation-locked reinitialization, restart any
+paginated list, and reconcile the replacement server catalog, but never repost
+the rejected `tools/call`; its outcome remains ambiguous. Declared MCP tool list changes are validated
 and atomically published to the live runtime. Failed refreshes retain the last
 working catalog for discovery but quarantine its calls until a later verified
 refresh. In-flight turns retain the tool snapshot they were offered and verify
@@ -612,6 +611,12 @@ Exhausted transient requests open a provider circuit after the configured
 threshold. `/status` reports circuit state; cooldown permits a half-open probe,
 and a successful request resets it. Retry reasons are redacted in logs and
 structured events.
+
+Tool execution has a separate, stricter rule: after Ash dispatches a local,
+plugin, or MCP tool call, it never automatically invokes that call again. A
+reported tool failure is final; a timeout, crash, or lost result after dispatch
+is preserved as an ambiguous outcome because the external side effect may
+already have happened.
 
 See [the production parity checklist](docs/architecture/PRODUCTION_HARNESS_PARITY.md) for
 implemented and remaining release requirements.

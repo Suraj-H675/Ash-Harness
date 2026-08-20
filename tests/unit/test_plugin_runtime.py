@@ -6,7 +6,7 @@ import pytest
 
 from ash.runtime import build_tools
 from ash.config import AshConfig
-from ash.core.loop import AshLoop, _execute_with_retry
+from ash.core.loop import AshLoop, _execute_tool_once
 from ash.core.session import SessionStore
 from ash.plugins.manifest import PluginManifest
 from ash.plugins.registry import DiscoveredPlugin
@@ -211,14 +211,14 @@ async def test_crashed_plugin_call_is_not_automatically_replayed(
     tool = _tool(tmp_path)
     counter = tmp_path / "calls.txt"
 
-    result = await _execute_with_retry(
+    result = await _execute_tool_once(
         tool,
-        tool.name,
         {"action": "crash", "counter": str(counter)},
     )
 
     assert result["success"] is False
     assert "host crashed intentionally" in (result["error"] or "")
+    assert result["outcome"] == "unknown"
     assert counter.read_text(encoding="utf-8").splitlines() == ["called"]
     assert tool.client.running is False
 

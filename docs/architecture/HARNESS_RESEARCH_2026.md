@@ -451,8 +451,8 @@ sessions migrate, and provider/tool fakes cover the state machine.
    tool schemas, structured result validation, server request dispatch,
    progress/cancellation/notifications, roots, sampling, elicitation, and OAuth:
    complete through explicit OAuth 2.1 login, private resource-bound
-   credentials, refresh, atomic declared tool-list refresh, and one-retry
-   Streamable HTTP POST session recovery. Incremental resumable SSE,
+   credentials, refresh, atomic declared tool-list refresh, and bounded
+   Streamable HTTP POST session recovery without tool-call replay. Incremental resumable SSE,
    deprecated HTTP+SSE discovery, and experimental tasks remain.
 2. Define plugin API v1 and an out-of-process plugin host: complete for tool
    contributions, including manifest-time Draft 2020-12 schema and namespace
@@ -532,7 +532,9 @@ upgrade or roll back without losing sessions.
 3. Project-controlled executable content requires trust; remote content remains
    untrusted even when its transport is authenticated.
 4. Persist intent before side effects and result after side effects when crash
-   recovery matters.
+   recovery matters. Once a tool dispatch starts, never replay it
+   automatically: a lost result is an ambiguous outcome unless an explicit,
+   future idempotency contract proves a retry is safe.
 5. Never claim a sandbox, protocol feature, provider capability, or install path
    works without an automated or end-to-end verification.
 6. Keep protocol and public SDK schemas versioned and backward-compatible or

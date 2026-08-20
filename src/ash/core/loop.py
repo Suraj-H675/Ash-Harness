@@ -67,7 +67,15 @@ from ash.providers.retry import (
 from ash.repo.repomap import RepoMap
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy, PolicyAction, READ_ONLY_TOOLS
-from ash.tools.base import BaseTool, ToolMiddleware, ToolMiddlewareSkip, ToolResult
+from ash.tools.base import (
+    BaseTool,
+    ToolExecutionContract,
+    ToolExecutionOutcome,
+    ToolMiddleware,
+    ToolMiddlewareSkip,
+    ToolReplayPolicy,
+    ToolResult,
+)
 from ash.tools.git import auto_commit_turn
 from ash.ui.parser import Event, StreamingXMLParser
 from rich.console import Console
@@ -602,6 +610,7 @@ class AshLoop:
             )
             self.recovered_turns = self.recovery_summary.interrupted_turns
             if self.recovered_turns:
+                self._emit_recovered_tool_events(self.recovery_summary)
                 self._emit_event(
                     {
                         "type": "session.recovery",
@@ -739,9 +748,7 @@ class AshLoop:
         ) -> None:
             if self._mcp_runtime is not runtime:
                 raise RuntimeError("stale MCP runtime attempted a catalog refresh")
-            await self._replace_mcp_server_tools(
-                server_name, previous, replacement
-            )
+            await self._replace_mcp_server_tools(server_name, previous, replacement)
 
         runtime = MCPRuntime(
             configs,
@@ -909,6 +916,7 @@ class AshLoop:
                         self.current_session.session_id,
                     )
                     self.recovered_turns = self.recovery_summary.interrupted_turns
+                    self._emit_recovered_tool_events(self.recovery_summary)
                 except Exception as exc:  # noqa: BLE001 - preserve cancellation semantics
                     _log.warning(
                         "cancel recovery failed for {}: {}", current_turn_id, exc
@@ -1082,9 +1090,7 @@ class AshLoop:
         total_estimated_completion_tokens = 0
         turn_budget_exhausted = False
         usage_sources: set[str] = set()
-        turn_token_budget = int(
-            getattr(self._config, "max_turn_total_tokens", 0)
-        )
+        turn_token_budget = int(getattr(self._config, "max_turn_total_tokens", 0))
         iteration = 0
         iteration_budget = self.max_turn_iterations
         maximum_iteration_budget = self.max_turn_iterations + self.max_steering_messages
@@ -2054,45 +2060,83 @@ class AshLoop:
                 )
                 continue
 
-            self._emit_event({"type": "tool.started", **event_base})
-            if self.turn_context is not None:
-                self.turn_context.set("tool_call_id", record.call_id)
+            dispatched = False
+            replay_policy = "invalid"
             try:
-                hooks = self._active_hooks()
-                if hooks is not None:
-                    await hooks.fire_pre_tool(tool_name, arguments)
-                await self._apply_middlewares_before(tool_name, arguments, tool)
-                with tool.event_context(event_base):
-                    result_dict = await _execute_with_retry(tool, tool_name, arguments)
-                tool_result = ToolResult(
-                    success=result_dict["success"],
-                    output=result_dict["output"],
-                    error=result_dict["error"],
-                    truncated=result_dict.get("truncated", False),
-                    token_count=result_dict.get("token_count", 0),
-                )
-                if hooks is not None:
-                    await hooks.fire_post_tool(tool_name, arguments, tool_result)
-                tool_result = await self._apply_middlewares_after(
-                    tool_name, arguments, tool_result
-                )
+                contract = _validated_tool_execution_contract(tool)
+                replay_policy = contract.replay_policy.value
+                try:
+                    hooks = self._active_hooks()
+                    if hooks is not None:
+                        await hooks.fire_pre_tool(tool_name, arguments)
+                    await self._apply_middlewares_before(tool_name, arguments, tool)
+                except ToolMiddlewareSkip:
+                    tool_result = ToolResult(
+                        success=True, output="skipped by middleware", error=None
+                    )
+                else:
+                    # This is the last point at which no external effect can have
+                    # occurred. Persisted intent above makes an interruption after
+                    # this boundary recoverable as an ambiguous, non-replayed call.
+                    record.dispatched = True
+                    self.session_store.save_tool_call(
+                        session.session_id,
+                        record,
+                        turn_id=(
+                            self.turn_context.turn_id if self.turn_context else None
+                        ),
+                    )
+                    self._emit_event({"type": "tool.started", **event_base})
+                    if self.turn_context is not None:
+                        self.turn_context.set("tool_call_id", record.call_id)
+                    with tool.event_context(event_base):
+                        dispatched = True
+                        result_dict = await _execute_tool_once(tool, arguments)
+                    tool_result = ToolResult(
+                        success=result_dict["success"],
+                        output=result_dict["output"],
+                        error=result_dict["error"],
+                        truncated=result_dict.get("truncated", False),
+                        token_count=result_dict.get("token_count", 0),
+                        outcome=result_dict.get(
+                            "outcome", ToolExecutionOutcome.COMPLETED
+                        ),
+                    )
+                    if hooks is not None:
+                        await hooks.fire_post_tool(tool_name, arguments, tool_result)
+                    tool_result = await self._apply_middlewares_after(
+                        tool_name, arguments, tool_result
+                    )
+                    if tool_result.outcome is ToolExecutionOutcome.UNKNOWN:
+                        raw_error = tool_result.error or "the result was lost"
+                        tool_result = tool_result.model_copy(
+                            update={
+                                "success": False,
+                                "error": (
+                                    "Tool outcome is ambiguous; its side effect may "
+                                    "have occurred. Ash did not retry the operation: "
+                                    f"{raw_error}"
+                                ),
+                            }
+                        )
                 if self.turn_context is not None:
                     self.turn_context.data.pop("tool_call_id", None)
             except asyncio.CancelledError:
                 if self.turn_context is not None:
                     self.turn_context.data.pop("tool_call_id", None)
                 raise
-            except ToolMiddlewareSkip:
-                if self.turn_context is not None:
-                    self.turn_context.data.pop("tool_call_id", None)
-                tool_result = ToolResult(
-                    success=True, output="skipped by middleware", error=None
-                )
             except Exception as exc:  # noqa: BLE001 — we want any error captured
                 if self.turn_context is not None:
                     self.turn_context.data.pop("tool_call_id", None)
-                record.executed = True
-                record.error = str(exc)
+                raw_error = str(exc).strip() or type(exc).__name__
+                error = (
+                    "Tool failed after dispatch; its side effect may have occurred. "
+                    f"Ash did not retry the operation: {raw_error}"
+                    if dispatched
+                    else raw_error
+                )
+                record.executed = dispatched
+                record.error = error
                 self.session_store.save_tool_call(
                     session.session_id,
                     record,
@@ -2105,7 +2149,11 @@ class AshLoop:
                     details={
                         "call_id": record.call_id,
                         "arguments": record.arguments,
-                        "error": redact_text(str(exc)),
+                        "error": redact_text(error),
+                        "dispatched": dispatched,
+                        "ambiguous": dispatched,
+                        "replayed": False,
+                        "replay_policy": replay_policy,
                     },
                     result="FAILURE",
                 )
@@ -2114,7 +2162,11 @@ class AshLoop:
                     {
                         "type": "tool.error",
                         **event_base,
-                        "error": redact_text(str(exc)),
+                        "error": redact_text(error),
+                        "dispatched": dispatched,
+                        "ambiguous": dispatched,
+                        "replayed": False,
+                        "replay_policy": replay_policy,
                     }
                 )
                 await self._fire_tool_error_hook(
@@ -2122,20 +2174,21 @@ class AshLoop:
                     call_id=record.call_id,
                     tool_name=tool_name,
                     arguments=arguments,
-                    error=str(exc),
+                    error=error,
                 )
                 results.append(
                     {
                         "success": False,
                         "output": "",
-                        "error": str(exc),
+                        "error": error,
                     }
                 )
                 continue
 
-            record.executed = True
+            record.executed = dispatched
             record.result = tool_result.output
             record.error = tool_result.error
+            ambiguous = tool_result.outcome is ToolExecutionOutcome.UNKNOWN
             self.session_store.save_tool_call(
                 session.session_id,
                 record,
@@ -2152,17 +2205,31 @@ class AshLoop:
                     "output": redact_text(tool_result.output),
                     "error": redact_text(tool_result.error or ""),
                     "truncated": tool_result.truncated,
+                    "dispatched": dispatched,
+                    "ambiguous": ambiguous,
+                    "replayed": False,
+                    "replay_policy": replay_policy,
                 },
                 result="SUCCESS" if tool_result.success else "FAILURE",
             )
             self._emit_event(
                 {
-                    "type": "tool.completed",
+                    "type": (
+                        "tool.skipped"
+                        if not dispatched
+                        else "tool.error"
+                        if ambiguous
+                        else "tool.completed"
+                    ),
                     **event_base,
                     "success": tool_result.success,
                     "output": tool_result.output,
                     "error": tool_result.error,
                     "truncated": tool_result.truncated,
+                    "dispatched": dispatched,
+                    "ambiguous": ambiguous,
+                    "replayed": False,
+                    "replay_policy": replay_policy,
                 }
             )
             if not tool_result.success:
@@ -2183,6 +2250,8 @@ class AshLoop:
                     "token_count": tool_result.token_count,
                 }
             )
+            if not dispatched:
+                continue
             self._record_repo_map_activity(tool_name, arguments, tool_result)
             self._record_turn_file_mutation(tool_name, arguments, tool_result)
             if tool_result.success:
@@ -2293,6 +2362,26 @@ class AshLoop:
             details=redact_value(details),
             result=result,
         )
+
+    def _emit_recovered_tool_events(self, summary: Any) -> None:
+        """Publish the per-call terminal states produced by crash recovery."""
+
+        for call in summary.recovered_calls:
+            self._emit_event(
+                {
+                    "type": "tool.error",
+                    "call_id": call.call_id,
+                    "tool": call.tool_name,
+                    "turn_id": call.turn_id,
+                    "error": redact_text(call.error),
+                    "dispatched": call.dispatched,
+                    "ambiguous": call.ambiguous,
+                    "replayed": False,
+                    "recovered": True,
+                    "replay_policy": "never",
+                }
+            )
+        self._flush_runtime_events()
 
     # --- prompt assembly --------------------------------------------------
 
@@ -2707,34 +2796,35 @@ class AshLoop:
         self._config = new_config
 
 
-MAX_RETRIES = 2
-BASE_DELAY_SECONDS = 1.0
-
-
-async def _execute_with_retry(
+async def _execute_tool_once(
     tool: "BaseTool",
-    tool_name: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
-    last_error: str | None = None
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            tool_result: "ToolResult" = await tool.run(**arguments)
-            return {
-                "success": tool_result.success,
-                "output": tool_result.output,
-                "error": tool_result.error,
-                "truncated": tool_result.truncated,
-                "token_count": tool_result.token_count,
-            }
-        except Exception as exc:
-            last_error = str(exc)
-            if attempt < MAX_RETRIES:
-                delay = BASE_DELAY_SECONDS * (2**attempt)
-                await asyncio.sleep(delay)
-            continue
+    """Dispatch one tool invocation exactly once and preserve its typed result."""
+
+    tool_result: "ToolResult" = await tool.run(**arguments)
     return {
-        "success": False,
-        "output": "",
-        "error": f"Failed after {MAX_RETRIES + 1} attempts: {last_error}",
+        "success": tool_result.success,
+        "output": tool_result.output,
+        "error": tool_result.error,
+        "truncated": tool_result.truncated,
+        "token_count": tool_result.token_count,
+        "outcome": tool_result.outcome,
     }
+
+
+def _validated_tool_execution_contract(tool: "BaseTool") -> ToolExecutionContract:
+    """Reject invalid or future replay policies before a tool is dispatched."""
+
+    contract = getattr(tool, "execution_contract", None)
+    if not isinstance(contract, ToolExecutionContract):
+        raise TypeError(
+            f"tool {tool.name!r} must declare a ToolExecutionContract; "
+            "automatic replay is disabled"
+        )
+    if contract.replay_policy is not ToolReplayPolicy.NEVER:
+        raise ValueError(
+            f"tool {tool.name!r} declares unsupported replay policy "
+            f"{contract.replay_policy!r}"
+        )
+    return contract

@@ -550,11 +550,14 @@ See `ash/agents/shared_state.py` (`send_to_agent`, `broadcast`).
 
 ---
 
-### ✅ M-9: Retry with Exponential Backoff for Transient Tool Failures
+### ⚠️ Historical M-9: Retry with Exponential Backoff for Transient Tool Failures
 
-**Status:** IMPLEMENTED — tests passing (1 passed)
+**Superseded:** This historical experiment was removed. Ash now executes every
+dispatched tool call exactly once by default; retrying a tool after a lost
+result can duplicate an external side effect. Provider pre-output retries are
+separate and remain bounded.
 
-See `ash/core/loop.py` (`MAX_RETRIES=2`, `_execute_with_retry`).
+See `ash/core/loop.py` (`_execute_tool_once`).
 
 ---
 

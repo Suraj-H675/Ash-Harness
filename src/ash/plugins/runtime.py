@@ -23,7 +23,12 @@ from ash.plugins.registry import DiscoveredPlugin
 from ash.safety.guard import SafetyGuard
 from ash.sandbox import SandboxBackendUnavailable, SandboxManager
 from ash.sandbox.process_utils import process_group_options, terminate_process_tree
-from ash.tools.base import BaseTool, ToolResult, count_output_tokens
+from ash.tools.base import (
+    BaseTool,
+    ToolExecutionOutcome,
+    ToolResult,
+    count_output_tokens,
+)
 
 MAX_PLUGIN_MESSAGE_BYTES = 1024 * 1024
 MAX_PLUGIN_STDERR_BYTES = 64 * 1024
@@ -338,7 +343,12 @@ class PluginRuntimeTool(BaseTool):
         try:
             return await self.client.call_tool(self.declaration.name, kwargs)
         except PluginRuntimeError as exc:
-            return ToolResult(success=False, output="", error=str(exc))
+            return ToolResult(
+                success=False,
+                output="",
+                error=str(exc),
+                outcome=ToolExecutionOutcome.UNKNOWN,
+            )
 
     async def aclose(self) -> None:
         await self.client.aclose()

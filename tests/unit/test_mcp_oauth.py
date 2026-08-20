@@ -675,6 +675,73 @@ async def test_mcp_client_retries_one_401_with_refreshed_oauth() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mcp_tool_call_401_is_not_reposted_after_oauth_refresh() -> None:
+    class FakeOAuth:
+        def __init__(self) -> None:
+            self.http_client = None
+            self.token = "fresh"
+            self.calls: list[bool] = []
+
+        async def authorization_header(
+            self,
+            *,
+            force_refresh: bool = False,
+            rejected_access_token: str = "",
+        ) -> str:
+            del rejected_access_token
+            self.calls.append(force_refresh)
+            return f"Bearer {self.token}"
+
+    oauth = FakeOAuth()
+    tool_posts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tool_posts
+        payload = json.loads(request.content)
+        if payload["method"] == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if payload["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        tool_posts += 1
+        return httpx.Response(401)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+            auth="oauth",
+        ),
+        http_client=http,
+        oauth_session=oauth,  # type: ignore[arg-type]
+    )
+    await client.connect()
+    oauth.token = "stale"
+    try:
+        with pytest.raises(MCPAuthorizationRequired, match="not replayed"):
+            await client.call_tool("write", {})
+        assert tool_posts == 1
+        assert oauth.calls == [False, False, False]
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_mcp_client_reports_insufficient_scope_without_interaction() -> None:
     class FakeOAuth:
         http_client = None

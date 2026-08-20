@@ -304,6 +304,7 @@ def _tool_record(
         arguments={},
         approved=True,
         executed=executed,
+        dispatched=not executed,
         result="done" if executed else None,
         timestamp=datetime.now(timezone.utc),
     )
@@ -421,3 +422,41 @@ def test_startup_recovery_flags_non_file_tool_outcome_as_unknown(tmp_path) -> No
     recovered = store.load_session(session.session_id).tool_calls[0]
     assert recovered.executed is True
     assert "outcome is unknown" in (recovered.error or "")
+
+
+def test_recovery_marks_an_unstarted_approved_intent_as_not_run(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "turn-1", "pending approval")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id="call-unstarted",
+            tool_name="run_command",
+            arguments={"command_line": "build"},
+            approved=True,
+            executed=False,
+            dispatched=False,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id="turn-1",
+    )
+
+    summary = recover_interrupted_turns(
+        store, SafetyGuard(tmp_path), session.session_id
+    )
+
+    assert summary.needs_attention is False
+    assert summary.unknown_calls == ()
+    assert summary.recovered_calls[0].dispatched is False
+    assert summary.recovered_calls[0].ambiguous is False
+    recovered = store.load_session(session.session_id).tool_calls[0]
+    assert recovered.executed is False
+    assert recovered.dispatched is False
+    assert "was not run" in (recovered.error or "")
+    assert (
+        recover_interrupted_turns(
+            store, SafetyGuard(tmp_path), session.session_id
+        ).interrupted_turns
+        == 0
+    )

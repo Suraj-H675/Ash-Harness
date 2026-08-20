@@ -472,6 +472,10 @@ DO NOT implement any other item from PRIORITY.md.
 
 ### M-9: Retry with Exponential Backoff for Transient Tool Failures
 
+> Historical and superseded. Do not implement these instructions: Ash now
+> forbids automatic replay after tool dispatch because the prior operation may
+> already have performed an external side effect.
+
 ```
 /goal m9
 

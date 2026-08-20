@@ -4,11 +4,20 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel
 
 from ash.safety.guard import SafetyGuard
+
+
+class ToolExecutionOutcome(StrEnum):
+    """How confidently Ash knows a dispatched tool invocation completed."""
+
+    COMPLETED = "completed"
+    UNKNOWN = "unknown"
 
 
 class ToolResult(BaseModel):
@@ -17,12 +26,27 @@ class ToolResult(BaseModel):
     error: str | None = None
     token_count: int = 0
     truncated: bool = False
+    outcome: ToolExecutionOutcome = ToolExecutionOutcome.COMPLETED
+
+
+class ToolReplayPolicy(StrEnum):
+    """Automatic host replay permitted after a tool invocation starts."""
+
+    NEVER = "never"
+
+
+@dataclass(frozen=True)
+class ToolExecutionContract:
+    """Fail-closed execution semantics shared by built-in and extension tools."""
+
+    replay_policy: ToolReplayPolicy = ToolReplayPolicy.NEVER
 
 
 class BaseTool(ABC):
     name: str
     description: str
     args_schema: type[BaseModel] | None
+    execution_contract = ToolExecutionContract()
 
     def __init__(self, safety_guard: SafetyGuard) -> None:
         self.safety_guard = safety_guard
