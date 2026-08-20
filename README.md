@@ -18,7 +18,7 @@ Then configure and verify the runtime:
 
 ```bash
 ash setup
-ash doctor
+ash doctor --connect
 ash
 ```
 
@@ -511,6 +511,10 @@ The setup wizard discovers models through the provider endpoint before writing
 credentials, supports `b` to return and `c` to cancel, and offers explicit
 retry or save-unverified choices when an endpoint is unavailable. API keys use
 hidden input and related key/base/model settings are committed atomically.
+`ash doctor --connect` resolves the same provider endpoint and authentication
+used for a turn, then confirms that the selected model is advertised there.
+Custom OpenAI-compatible endpoints can explicitly use bearer authentication or
+no authentication; an anonymous endpoint never inherits `OPENAI_API_KEY`.
 Ollama setup discovers installed models and gives `ollama serve`/`ollama pull`
 guidance without starting a download. In scripts, `ash setup
 --non-interactive` validates an existing environment configuration without

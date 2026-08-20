@@ -211,8 +211,8 @@ class TestGroqFlow:
             "ash.commands.setup.getpass.getpass", _FakeGetpass("gsk_groq_test")
         )
         monkeypatch.setattr(
-            "builtins.input", _fake_input(["1"])
-        )  # select model index 1
+            "builtins.input", _fake_input(["", "1"])
+        )  # default endpoint, then select model index 1
 
         from ash.commands.setup import ModelProbe, _flow_groq
 
@@ -333,10 +333,36 @@ class TestOpenaiCompatibleFlow:
                 cp = call_args["custom_providers"]["my-minimax"]
                 assert cp["base_url"] == "https://api.minimax.io/v1"
                 assert cp["key_env"] == "ASH_PROVIDER_MY_MINIMAX_API_KEY"
+                assert cp["auth_mode"] == "bearer"
                 assert "api_key" not in cp
                 env_text = (tmp_path / ".ash" / ".env").read_text()
                 assert "ASH_PROVIDER_MY_MINIMAX_API_KEY=sk-cp-test\n" in env_text
                 assert "ASH_MODEL=my-minimax/MiniMax-M2.7\n" in env_text
+
+    def test_saves_anonymous_custom_provider_without_a_missing_key_requirement(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(["local", "http://127.0.0.1:8000/v1", "local-model"]),
+        )
+        monkeypatch.setattr("ash.commands.setup.getpass.getpass", _FakeGetpass(""))
+
+        from ash.commands.setup import ModelProbe, _flow_openai_compatible
+
+        with (
+            patch(
+                "ash.commands.setup._probe_models_detailed",
+                return_value=ModelProbe(models=("local-model",)),
+            ),
+            patch("ash.commands.setup.save_config") as save_config,
+        ):
+            _flow_openai_compatible()
+
+        custom = save_config.call_args.args[0]["custom_providers"]["local"]
+        assert custom["auth_mode"] == "none"
+        assert "key_env" not in custom
 
 
 class TestProbeModels:

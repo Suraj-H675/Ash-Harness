@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from typing import Any, AsyncGenerator
+import httpx
 import openai  # type: ignore[import-not-found]
 
 from ash.context.tokens import OpenAITokenCounter
@@ -21,6 +22,12 @@ class _PartialToolCall:
         self.id = id
         self.name = name
         self.arguments = ""
+
+
+def _strip_authorization_header(request: httpx.Request) -> None:
+    """Keep explicit anonymous OpenAI-compatible calls free of bearer auth."""
+
+    request.headers.pop("Authorization", None)
 
 
 def prepare_openai_messages(
@@ -83,10 +90,11 @@ class OpenAIProvider(ProviderABC):
         api_key: str | None = None,
         *,
         base_url: str | None = None,
+        allow_anonymous: bool = False,
         token_counter: TokenCounterLike | None = None,
         client: Any | None = None,
     ) -> None:
-        if not api_key:
+        if not api_key and not allow_anonymous:
             raise ValueError(
                 "OpenAI API key is required. "
                 "Set the OPENAI_API_KEY environment variable or pass api_key."
@@ -95,10 +103,19 @@ class OpenAIProvider(ProviderABC):
         self._api_key = api_key
         self._base_url = base_url
         self._token_counter = token_counter or OpenAITokenCounter(model_name)
+        client_options: dict[str, Any] = {
+            # A non-empty placeholder prevents the SDK from inheriting
+            # OPENAI_API_KEY when the configured endpoint is anonymous.
+            "api_key": "ash-anonymous" if allow_anonymous else api_key,
+            "base_url": base_url,
+            "max_retries": 0,
+        }
+        if allow_anonymous:
+            client_options["http_client"] = httpx.AsyncClient(
+                event_hooks={"request": [_strip_authorization_header]}
+            )
         self._client = client or openai.AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            max_retries=0,
+            **client_options,
         )
         self._owns_client = client is None
         self._prompt_cache_enabled = False

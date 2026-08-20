@@ -2962,9 +2962,9 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
         reply = input(
-            "Press Enter to continue to REPL anyway, or type 'setup' to run the setup wizard: "
+            "Press Enter to run setup, or type 'repl' to continue without a provider: "
         ).strip()
-        if reply.lower() in ("setup", "y", "yes"):
+        if reply.lower() not in ("repl", "continue"):
             from ash.commands.setup import cmd_setup
 
             setup_code = cmd_setup(
@@ -2978,6 +2978,12 @@ def main(argv: list[str] | None = None) -> int:
             if loaded_config is None:
                 return config_exit_code
             config = loaded_config
+            if not _has_provider_configured(config):
+                print(
+                    "Ash is still not configured. Run 'ash setup' to complete provider setup.",
+                    file=sys.stderr,
+                )
+                return 2
 
     from ash.safety.grants import PermissionGrantError, load_permission_rules
     from ash.ui.terminal import TerminalUI

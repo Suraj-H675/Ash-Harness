@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-import os
-import re
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Callable
 
 from ash.providers.base import ProviderABC
 from ash.providers.capabilities import (
@@ -14,12 +12,12 @@ from ash.providers.capabilities import (
     CapabilityResolver,
     get_capability_registry,
 )
+from ash.providers.identifiers import PROVIDER_NAME, parse_model_string
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
 
 
-PROVIDER_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 ProviderFactory = Callable[["AshConfig", str], ProviderABC]
 
 
@@ -104,18 +102,6 @@ class ProviderRegistry:
         raise ValueError(f"Unknown provider in model string: {provider_name!r}")
 
 
-def parse_model_string(model: str) -> tuple[str, str]:
-    """Split and validate a canonical ``provider/model`` identifier."""
-
-    provider, separator, model_name = model.strip().partition("/")
-    provider = provider.casefold()
-    if not separator or not PROVIDER_NAME.fullmatch(provider) or not model_name.strip():
-        raise ValueError(
-            f"Model string must be in 'provider/model' format, got: {model!r}"
-        )
-    return provider, model_name.strip()
-
-
 def prompt_cache_key(config: "AshConfig") -> str:
     """Return a stable workspace key without disclosing the workspace path."""
 
@@ -126,16 +112,17 @@ def prompt_cache_key(config: "AshConfig") -> str:
 
 def _build_anthropic(config: "AshConfig", model_name: str) -> ProviderABC:
     from ash.providers.anthropic import AnthropicProvider
+    from ash.providers.readiness import resolve_provider_connection
 
-    base_url = os.environ.get("ANTHROPIC_API_BASE") or None
+    connection = resolve_provider_connection(config)
     provider = AnthropicProvider(
         model_name=model_name,
-        api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
-        base_url=base_url,
+        api_key=connection.api_key,
+        base_url=None if connection.uses_default_base_url else connection.base_url,
     )
     provider.configure_max_tokens(config.max_completion_tokens)
     provider.configure_prompt_cache(
-        enabled=config.prompt_cache_enabled and base_url is None,
+        enabled=config.prompt_cache_enabled and connection.uses_default_base_url,
         retention=config.prompt_cache_retention,
     )
     return provider
@@ -143,16 +130,17 @@ def _build_anthropic(config: "AshConfig", model_name: str) -> ProviderABC:
 
 def _build_openai(config: "AshConfig", model_name: str) -> ProviderABC:
     from ash.providers.openai import OpenAIProvider
+    from ash.providers.readiness import resolve_provider_connection
 
-    base_url = os.environ.get("OPENAI_API_BASE") or None
+    connection = resolve_provider_connection(config)
     provider = OpenAIProvider(
         model_name=model_name,
-        api_key=os.environ.get("OPENAI_API_KEY", ""),
-        base_url=base_url,
+        api_key=connection.api_key,
+        base_url=None if connection.uses_default_base_url else connection.base_url,
     )
     provider.configure_max_tokens(config.max_completion_tokens)
     provider.configure_prompt_cache(
-        enabled=config.prompt_cache_enabled and base_url is None,
+        enabled=config.prompt_cache_enabled and connection.uses_default_base_url,
         cache_key=prompt_cache_key(config),
         retention=config.prompt_cache_retention,
     )
@@ -161,11 +149,13 @@ def _build_openai(config: "AshConfig", model_name: str) -> ProviderABC:
 
 def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderABC:
     from ash.providers.openai import OpenAIProvider
+    from ash.providers.readiness import resolve_provider_connection
 
+    connection = resolve_provider_connection(config)
     provider = OpenAIProvider(
         model_name=model_name,
-        api_key=os.environ.get("OPENAI_API_KEY", ""),
-        base_url=os.environ.get("OPENAI_API_BASE") or None,
+        api_key=connection.api_key,
+        base_url=None if connection.uses_default_base_url else connection.base_url,
     )
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider
@@ -173,10 +163,12 @@ def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderAB
 
 def _build_ollama(config: "AshConfig", model_name: str) -> ProviderABC:
     from ash.providers.ollama import OllamaProvider
+    from ash.providers.readiness import resolve_provider_connection
 
+    connection = resolve_provider_connection(config)
     provider = OllamaProvider(
         model_name=model_name,
-        base_url=os.environ.get("OLLAMA_API_BASE", "http://localhost:11434"),
+        base_url=connection.base_url,
     )
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider
@@ -184,11 +176,13 @@ def _build_ollama(config: "AshConfig", model_name: str) -> ProviderABC:
 
 def _build_deepseek(config: "AshConfig", model_name: str) -> ProviderABC:
     from ash.providers.deepseek import DeepSeekProvider
+    from ash.providers.readiness import resolve_provider_connection
 
+    connection = resolve_provider_connection(config)
     provider = DeepSeekProvider(
         model_name=model_name,
-        api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
-        base_url=os.environ.get("DEEPSEEK_API_BASE") or None,
+        api_key=connection.api_key,
+        base_url=None if connection.uses_default_base_url else connection.base_url,
     )
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider
@@ -196,11 +190,13 @@ def _build_deepseek(config: "AshConfig", model_name: str) -> ProviderABC:
 
 def _build_groq(config: "AshConfig", model_name: str) -> ProviderABC:
     from ash.providers.groq import GroqProvider
+    from ash.providers.readiness import resolve_provider_connection
 
+    connection = resolve_provider_connection(config)
     provider = GroqProvider(
         model_name=model_name,
-        api_key=os.environ.get("GROQ_API_KEY", ""),
-        base_url=os.environ.get("GROQ_API_BASE") or None,
+        api_key=connection.api_key,
+        base_url=None if connection.uses_default_base_url else connection.base_url,
     )
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider
@@ -212,15 +208,14 @@ def _build_custom_openai_provider(
     model_name: str,
 ) -> ProviderABC:
     from ash.providers.openai import OpenAIProvider
+    from ash.providers.readiness import resolve_provider_connection
 
-    custom: dict[str, Any] = config.custom_providers[provider_name]
-    key_env = str(custom.get("key_env", ""))
+    connection = resolve_provider_connection(config)
     provider = OpenAIProvider(
         model_name=model_name,
-        api_key=(
-            os.environ.get(key_env, "") if key_env else str(custom.get("api_key", ""))
-        ),
-        base_url=custom.get("base_url"),
+        api_key=connection.api_key or None,
+        base_url=connection.base_url,
+        allow_anonymous=connection.auth_mode == "none",
     )
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider

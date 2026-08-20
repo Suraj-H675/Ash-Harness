@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, AsyncGenerator
 
+import httpx
 import pytest
 
 from ash.config import AshConfig
@@ -113,3 +114,49 @@ def test_default_registry_exposes_builtins_without_constructing_them() -> None:
         "openai",
         "openai-compatible",
     )
+
+
+@pytest.mark.asyncio
+async def test_custom_anonymous_openai_compatible_provider_builds_without_bearer_auth() -> (
+    None
+):
+    config = AshConfig(
+        model="local/local-model",
+        custom_providers={
+            "local": {
+                "base_url": "http://127.0.0.1:8000/v1",
+                "auth_mode": "none",
+            }
+        },
+    )
+
+    provider = create_default_provider_registry().build(config)
+
+    assert provider.model_name == "local-model"
+    request = httpx.Request("POST", "http://127.0.0.1:8000/v1/chat/completions")
+    request.headers["Authorization"] = "Bearer should-not-be-sent"
+    hooks = provider._client._client.event_hooks["request"]
+    assert len(hooks) == 1
+    hooks[0](request)
+    assert "Authorization" not in request.headers
+    await provider.aclose()
+
+
+def test_custom_bearer_provider_without_its_key_is_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import _has_provider_configured
+
+    monkeypatch.delenv("ASH_PROVIDER_LOCAL_API_KEY", raising=False)
+    config = AshConfig(
+        model="local/local-model",
+        custom_providers={
+            "local": {
+                "base_url": "http://127.0.0.1:8000/v1",
+                "auth_mode": "bearer",
+                "key_env": "ASH_PROVIDER_LOCAL_API_KEY",
+            }
+        },
+    )
+
+    assert _has_provider_configured(config) is False

@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 
+import httpx
 import pytest
 
 from ash.commands.doctor import DoctorCheck, render_doctor, run_doctor
@@ -11,6 +12,7 @@ from ash.commands.doctor import (
     _check_browser,
     _check_lsp,
     _check_storage,
+    _check_connectivity,
     _check_web_search,
 )
 from ash.automation.schedules import build_schedule
@@ -25,6 +27,109 @@ def test_render_doctor_json_has_stable_schema() -> None:
     assert payload["schema_version"] == 1
     assert payload["ok"] is True
     assert payload["checks"][0]["name"] == "config"
+
+
+class _RecordingAsyncClient:
+    def __init__(
+        self, response: object, requests: list[tuple[str, dict[str, str]]], **_: object
+    ) -> None:
+        self._response = response
+        self._requests = requests
+
+    async def __aenter__(self) -> "_RecordingAsyncClient":
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+    async def get(self, url: str, *, headers: dict[str, str]) -> object:
+        self._requests.append((url, headers))
+        return self._response
+
+
+@pytest.mark.asyncio
+async def test_connectivity_uses_runtime_openai_override_and_validates_model(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[tuple[str, dict[str, str]]] = []
+    response = httpx.Response(
+        200,
+        json={"data": [{"id": "gateway-model"}]},
+        request=httpx.Request("GET", "http://gateway.invalid/v1/models"),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret")
+    monkeypatch.setenv("OPENAI_API_BASE", "http://gateway.invalid/v1")
+    monkeypatch.setattr(
+        "ash.commands.doctor.httpx.AsyncClient",
+        lambda **kwargs: _RecordingAsyncClient(response, requests, **kwargs),
+    )
+
+    check = await _check_connectivity(
+        AshConfig(model="openai/gateway-model", workspace_root=tmp_path)
+    )
+
+    assert check.status == "pass"
+    assert requests == [
+        ("http://gateway.invalid/v1/models", {"Authorization": "Bearer gateway-secret"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_connectivity_fails_when_selected_model_is_not_advertised(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[tuple[str, dict[str, str]]] = []
+    response = httpx.Response(
+        200,
+        json={"data": [{"id": "another-model"}]},
+        request=httpx.Request("GET", "https://api.openai.com/v1/models"),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.setattr(
+        "ash.commands.doctor.httpx.AsyncClient",
+        lambda **kwargs: _RecordingAsyncClient(response, requests, **kwargs),
+    )
+
+    check = await _check_connectivity(
+        AshConfig(model="openai/missing-model", workspace_root=tmp_path)
+    )
+
+    assert check.status == "fail"
+    assert "missing-model" in check.message
+
+
+@pytest.mark.asyncio
+async def test_connectivity_checks_anthropic_catalog_with_runtime_headers(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[tuple[str, dict[str, str]]] = []
+    response = httpx.Response(
+        200,
+        json={"data": [{"id": "claude-test"}]},
+        request=httpx.Request("GET", "http://gateway.invalid/v1/models"),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
+    monkeypatch.setenv("ANTHROPIC_API_BASE", "http://gateway.invalid")
+    monkeypatch.setattr(
+        "ash.commands.doctor.httpx.AsyncClient",
+        lambda **kwargs: _RecordingAsyncClient(response, requests, **kwargs),
+    )
+
+    check = await _check_connectivity(
+        AshConfig(model="anthropic/claude-test", workspace_root=tmp_path)
+    )
+
+    assert check.status == "pass"
+    assert requests == [
+        (
+            "http://gateway.invalid/v1/models",
+            {
+                "x-api-key": "anthropic-secret",
+                "anthropic-version": "2023-06-01",
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio

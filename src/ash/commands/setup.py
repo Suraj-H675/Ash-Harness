@@ -416,28 +416,31 @@ def _flow_deepseek(current: str) -> SetupOutcome:
 
 
 def _flow_groq(current: str) -> SetupOutcome:
-    """Groq setup: API key, model selection."""
+    """Groq setup: API key, optional base URL override, model selection."""
     _print_header("Groq Configuration")
 
     api_key = _prompt_api_key("GROQ_API_KEY", "Groq API key")
+    base_url_override = _prompt_optional_url(
+        "GROQ_API_BASE",
+        "https://api.groq.com/openai/v1",
+    )
+    base_url = base_url_override or "https://api.groq.com/openai/v1"
 
     models, verified = _discover_models(
         "Groq",
-        lambda: _probe_models_detailed(
-            "https://api.groq.com/openai/v1",
-            api_key,
-        ),
+        lambda: _probe_models_detailed(base_url, api_key),
         fallback=[current] if current else [],
     )
     model = _prompt_model_list(models, current)
     _confirm_undiscovered_model(model, models, verified)
 
-    save_env_values(
-        {
-            "GROQ_API_KEY": api_key,
-            "ASH_MODEL": f"groq/{model}",
-        }
-    )
+    settings = {
+        "GROQ_API_KEY": api_key,
+        "ASH_MODEL": f"groq/{model}",
+    }
+    if base_url_override:
+        settings["GROQ_API_BASE"] = base_url_override
+    save_env_values(settings)
     _print_verification_status(verified)
     return SetupOutcome.SUCCESS
 
@@ -528,11 +531,14 @@ def _flow_openai_compatible() -> SetupOutcome:
 
     # Save to ash.toml as custom_providers
     custom = load_config().get("custom_providers", {})
-    custom[name] = {
+    custom_provider = {
         "base_url": base_url,
-        "key_env": key_env,
         "models": models,
+        "auth_mode": "bearer" if api_key else "none",
     }
+    if api_key:
+        custom_provider["key_env"] = key_env
+    custom[name] = custom_provider
     save_config({"custom_providers": custom})
 
     settings = {"ASH_MODEL": f"{name}/{model}"}
@@ -718,37 +724,18 @@ def _print_verification_status(verified: bool) -> None:
 
 
 def _has_provider_configured(config) -> bool:
-    """Return True if Ash has a working provider + API key combination.
+    """Return whether the selected model can be assembled by the runtime."""
 
-    A model string with "/" is not enough — we must also have a way to
-    actually call the API (an API key, or ollama which needs no key).
-    """
-    model_str = getattr(config, "model", "") or ""
-    if not model_str or "/" not in model_str:
+    from ash.providers.readiness import (
+        ProviderConfigurationError,
+        resolve_provider_connection,
+    )
+
+    try:
+        resolve_provider_connection(config)
+    except (ProviderConfigurationError, ValueError, AttributeError, TypeError):
         return False
-
-    provider = model_str.split("/", 1)[0]
-
-    # Ollama needs no API key
-    if provider == "ollama":
-        return True
-
-    # Known providers: check for their specific API key
-    key_map = {
-        "anthropic": "ANTHROPIC_API_KEY",
-        "openai": "OPENAI_API_KEY",
-        "deepseek": "DEEPSEEK_API_KEY",
-        "groq": "GROQ_API_KEY",
-    }
-    if provider in key_map:
-        if get_env_value(key_map[provider]):
-            return True
-
-    # Custom provider: must have entry in custom_providers
-    if provider in config.custom_providers:
-        return True
-
-    return False
+    return True
 
 
 def _has_web_search_configured(config) -> bool:

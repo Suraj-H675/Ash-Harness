@@ -10,8 +10,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from importlib.metadata import distribution
 from pathlib import Path
@@ -48,7 +50,7 @@ def run_ash(
         result.stdout,
         result.stderr,
     )
-    assert "Traceback (most recent call last)" not in result.stderr
+    assert "Traceback (most recent call last)" not in result.stderr, result.stderr
     return result
 
 
@@ -94,6 +96,76 @@ def assert_distribution_metadata() -> None:
     assert (installed.read_text("top_level.txt") or "").splitlines() == ["ash"]
     assert not any(path.startswith("project/") for path in packaged)
     assert not any(path.startswith("tests/") for path in packaged)
+
+
+def verify_installed_openai_first_turn(*, workspace: Path, env: dict[str, str]) -> None:
+    """Exercise doctor and one streaming turn through the installed CLI."""
+
+    requests: list[tuple[str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - HTTP handler API
+            requests.append((self.path, self.headers.get("Authorization", "")))
+            if self.path != "/v1/models":
+                self.send_error(404)
+                return
+            body = json.dumps({"data": [{"id": "wheel-model"}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:  # noqa: N802 - HTTP handler API
+            requests.append((self.path, self.headers.get("Authorization", "")))
+            if self.path != "/v1/chat/completions":
+                self.send_error(404)
+                return
+            body = (
+                'data: {"id":"wheel","choices":[{"delta":{"content":"READY"},'
+                '"finish_reason":null}]}\n\n'
+                'data: {"id":"wheel","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        configured_env = dict(env)
+        configured_env.update(
+            {
+                "ASH_MODEL": "openai/wheel-model",
+                "OPENAI_API_KEY": "wheel-secret",
+                "OPENAI_API_BASE": f"http://127.0.0.1:{server.server_port}/v1",
+            }
+        )
+        doctor = json.loads(
+            run_ash(
+                "doctor", "--connect", "--json", cwd=workspace, env=configured_env
+            ).stdout
+        )
+        connectivity = next(
+            check for check in doctor["checks"] if check["name"] == "connectivity"
+        )
+        assert connectivity["status"] == "pass", doctor
+        first_turn = run_ash("-p", "reply READY", cwd=workspace, env=configured_env)
+        assert first_turn.stdout.strip() == "READY"
+        assert requests == [
+            ("/v1/models", "Bearer wheel-secret"),
+            ("/v1/chat/completions", "Bearer wheel-secret"),
+        ]
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
 
 
 def main() -> None:
@@ -173,6 +245,7 @@ def main() -> None:
                 "OLLAMA_API_BASE": "http://127.0.0.1:1",
             }
         )
+        verify_installed_openai_first_turn(workspace=workspace, env=env)
 
         class InstalledNativeProvider(ProviderABC):
             model_name = "installed-native-smoke"

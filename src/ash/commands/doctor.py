@@ -18,6 +18,10 @@ import httpx
 
 from ash.config import AshConfig
 from ash.mcp.server import load_mcp_servers
+from ash.providers.readiness import (
+    ProviderConfigurationError,
+    resolve_provider_connection,
+)
 from ash.sandbox import SandboxManager
 
 
@@ -30,34 +34,21 @@ class DoctorCheck:
 
 
 def _check_credentials(config: AshConfig) -> DoctorCheck:
-    provider = config.provider
-    key_names = {
-        "anthropic": "ANTHROPIC_API_KEY",
-        "openai": "OPENAI_API_KEY",
-        "deepseek": "DEEPSEEK_API_KEY",
-        "groq": "GROQ_API_KEY",
-    }
-    if provider == "ollama":
-        return DoctorCheck("credentials", "pass", "Ollama requires no API key")
-    if provider in config.custom_providers:
-        key_name = str(config.custom_providers[provider].get("key_env", ""))
-        if not key_name and config.custom_providers[provider].get("api_key"):
-            return DoctorCheck(
-                "credentials",
-                "warn",
-                "legacy inline custom-provider key is configured",
-                "Run ash setup to migrate the key into ~/.ash/.env.",
-            )
-    else:
-        key_name = key_names.get(provider, "")
-    if key_name and os.environ.get(key_name):
-        return DoctorCheck("credentials", "pass", f"{key_name} is configured")
-    return DoctorCheck(
-        "credentials",
-        "fail",
-        f"No API key is configured for provider {provider!r}",
-        "Run ash setup.",
-    )
+    try:
+        connection = resolve_provider_connection(config)
+    except (ProviderConfigurationError, ValueError) as exc:
+        return DoctorCheck("credentials", "fail", str(exc), "Run ash setup.")
+    if connection.auth_mode == "none":
+        return DoctorCheck("credentials", "pass", connection.credential_description)
+    custom = config.custom_providers.get(connection.provider, {})
+    if isinstance(custom, dict) and custom.get("api_key") and not custom.get("key_env"):
+        return DoctorCheck(
+            "credentials",
+            "warn",
+            "legacy inline custom-provider key is configured",
+            "Run ash setup to migrate the key into ~/.ash/.env.",
+        )
+    return DoctorCheck("credentials", "pass", connection.credential_description)
 
 
 def _check_web_search(config: AshConfig) -> DoctorCheck:
@@ -384,48 +375,58 @@ def _check_lsp(config: AshConfig) -> DoctorCheck:
 
 
 async def _check_connectivity(config: AshConfig) -> DoctorCheck:
-    provider = config.provider
-    if provider == "ollama":
-        url = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434").rstrip("/")
-        endpoint = f"{url}/api/tags"
-        headers: dict[str, str] = {}
-    else:
-        defaults = {
-            "openai": "https://api.openai.com/v1",
-            "groq": "https://api.groq.com/openai/v1",
-            "deepseek": "https://api.deepseek.com/v1",
-        }
-        if provider == "anthropic":
-            return DoctorCheck(
-                "connectivity",
-                "warn",
-                "Anthropic has no inexpensive model-list health endpoint",
-                "Run a one-shot prompt to verify the selected model.",
-            )
-        custom = config.custom_providers.get(provider, {})
-        base = str(custom.get("base_url") or defaults.get(provider, "")).rstrip("/")
-        endpoint = f"{base}/models"
-        key_env = str(custom.get("key_env", ""))
-        key = (
-            os.environ.get(key_env, "")
-            if key_env
-            else os.environ.get(
-                {
-                    "openai": "OPENAI_API_KEY",
-                    "groq": "GROQ_API_KEY",
-                    "deepseek": "DEEPSEEK_API_KEY",
-                }.get(provider, ""),
-                "",
-            )
-        )
-        headers = {"Authorization": f"Bearer {key}"} if key else {}
+    try:
+        connection = resolve_provider_connection(config)
+    except (ProviderConfigurationError, ValueError) as exc:
+        return DoctorCheck("connectivity", "fail", str(exc), "Run ash setup.")
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(endpoint, headers=headers)
+            response = await client.get(
+                connection.catalog_endpoint,
+                headers=connection.headers,
+            )
         response.raise_for_status()
-    except (httpx.HTTPError, ValueError) as exc:
-        return DoctorCheck("connectivity", "fail", f"{endpoint}: {exc}")
-    return DoctorCheck("connectivity", "pass", endpoint)
+        models = _catalog_models(response.json(), connection.catalog_format)
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
+        return DoctorCheck(
+            "connectivity", "fail", f"{connection.catalog_endpoint}: {exc}"
+        )
+    if not models:
+        return DoctorCheck(
+            "connectivity",
+            "fail",
+            f"{connection.catalog_endpoint}: endpoint returned no model IDs",
+        )
+    if connection.model_name not in models:
+        return DoctorCheck(
+            "connectivity",
+            "fail",
+            f"{connection.catalog_endpoint}: selected model "
+            f"{connection.model_name!r} was not returned by the endpoint",
+            "Run ash setup to select an available model or correct ASH_MODEL.",
+        )
+    return DoctorCheck(
+        "connectivity",
+        "pass",
+        f"{connection.catalog_endpoint}; selected model {connection.model_name!r} is available",
+    )
+
+
+def _catalog_models(payload: object, catalog_format: str) -> set[str]:
+    if not isinstance(payload, dict):
+        return set()
+    collection = "models" if catalog_format == "ollama" else "data"
+    identifier = "name" if catalog_format == "ollama" else "id"
+    values = payload.get(collection)
+    if not isinstance(values, list):
+        return set()
+    return {
+        value
+        for item in values
+        if isinstance(item, dict)
+        and isinstance((value := item.get(identifier)), str)
+        and value
+    }
 
 
 async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
