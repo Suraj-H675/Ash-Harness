@@ -6,6 +6,10 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Restored cross-platform CI correctness for Windows-only type analysis and a
+  Linux-specific Bubblewrap regression test.
+
 ### Added
 - Managed enterprise permission policy from platform administrator files.
   Managed deny and ask rules cannot be overridden by user, project, or session

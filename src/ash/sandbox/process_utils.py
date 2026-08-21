@@ -69,12 +69,17 @@ async def terminate_process_tree(
 
 
 def _signal_posix_processes(root: int, descendants: list[int], signum: int) -> None:
-    own_group = os.getpgrp()
+    getpgrp = getattr(os, "getpgrp", None)
+    getpgid = getattr(os, "getpgid", None)
+    killpg = getattr(os, "killpg", None)
+    if getpgrp is None or getpgid is None or killpg is None:
+        return
+    own_group = getpgrp()
     groups: set[int] = set()
     individual: list[int] = []
     for pid in [root, *descendants]:
         try:
-            group = os.getpgid(pid)
+            group = getpgid(pid)
         except ProcessLookupError:
             continue
         if group == own_group:
@@ -83,7 +88,7 @@ def _signal_posix_processes(root: int, descendants: list[int], signum: int) -> N
             groups.add(group)
     for group in groups:
         try:
-            os.killpg(group, signum)
+            killpg(group, signum)
         except ProcessLookupError:
             pass
     for pid in reversed(individual):

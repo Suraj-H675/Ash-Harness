@@ -645,6 +645,10 @@ def test_run_command_fails_closed_when_sandbox_unavailable(tmp_path: Path) -> No
     assert "Sandbox unavailable; command was not run" in (result.error or "")
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Bubblewrap is a Linux sandbox backend",
+)
 def test_bubblewrap_rejects_cwd_outside_workspace(tmp_path: Path) -> None:
     fake = tmp_path / "bwrap"
     fake.write_text("#!/bin/sh\n")

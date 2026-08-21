@@ -59,14 +59,16 @@ def _validate(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _apply_resource_limits() -> None:
+    if sys.platform == "win32":
+        return
     try:
         import resource
     except ImportError:  # pragma: no cover - Windows
         return
     try:
-        resource.setrlimit(resource.RLIMIT_CPU, (1, 1))
+        resource.setrlimit(resource.RLIMIT_CPU, (1, 1))  # type: ignore[attr-defined]
         memory = 512 * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+        resource.setrlimit(resource.RLIMIT_AS, (memory, memory))  # type: ignore[attr-defined]
     except (OSError, ValueError):
         return
 

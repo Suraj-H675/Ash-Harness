@@ -190,8 +190,9 @@ class MCPOAuthTokenStore:
             suffix=".tmp",
         )
         try:
-            if os.name != "nt":
-                os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+            fchmod = getattr(os, "fchmod", None)
+            if os.name != "nt" and fchmod is not None:
+                fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
                 handle.write("\n")
