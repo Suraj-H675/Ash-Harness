@@ -21,6 +21,7 @@ from ash.safety.trust import canonical_workspace
 
 CURRENT_PERMISSION_RULE_VERSION = 2
 MAX_RULE_FILE_BYTES = 1_000_000
+MAX_MANAGED_RULE_FILES = 16
 MAX_EXACT_VALUE_BYTES = 8192
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
@@ -398,6 +399,52 @@ def load_permission_rules(workspace: Path) -> list[PermissionRule]:
     payload = _read_payload(grants_path())
     workspaces = _normalized_workspaces(payload)
     return list(workspaces.get(canonical_workspace(workspace), ()))
+
+
+def managed_policy_paths() -> tuple[Path, ...]:
+    """Return administrator-owned policy files in increasing authority order."""
+
+    if os.name == "nt":
+        program_data = os.environ.get("ProgramData")
+        return ((Path(program_data) / "Ash" / "policy",) if program_data else ())
+    return (
+        Path("/etc/ash/policy"),
+        Path("/Library/Application Support/Ash/policy"),
+    )
+
+
+def load_managed_permission_rules(workspace: Path) -> list[PermissionRule]:
+    """Load immutable admin policy for one workspace.
+
+    A malformed or unreadable file fails closed. Files are read in sorted order,
+    with later paths taking precedence when rule identifiers conflict.
+    """
+
+    key = canonical_workspace(workspace)
+    by_id: dict[str, PermissionRule] = {}
+    for directory in managed_policy_paths():
+        if not directory.exists():
+            continue
+        try:
+            files = sorted(path for path in directory.iterdir() if path.is_file())
+        except OSError as exc:
+            raise PermissionGrantError(f"cannot read managed policy: {exc}") from exc
+        if len(files) > MAX_MANAGED_RULE_FILES:
+            raise PermissionGrantError(
+                "managed policy contains more than 16 files"
+            )
+        for path in files:
+            try:
+                payload = _read_payload(path)
+                workspaces = _normalized_workspaces(payload)
+                rules = workspaces.get(key, ())
+            except PermissionGrantError as exc:
+                raise PermissionGrantError(
+                    f"invalid managed policy {path}: {exc}"
+                ) from exc
+            for rule in rules:
+                by_id[rule.rule_id] = rule
+    return list(by_id.values())
 
 
 def load_tool_grants(workspace: Path) -> set[str]:

@@ -1147,6 +1147,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         continue
                 loop.permission_policy = PermissionPolicy(
                     mode,
+                    managed_rules=loop.permission_policy.managed_rules,
                     persistent_rules=loop.permission_policy.persistent_rules,
                     session_rules=loop.permission_policy.session_rules,
                 )
@@ -2450,6 +2451,10 @@ def main(argv: list[str] | None = None) -> int:
         workspace = permissions_config.workspace_root
         action = args.permissions_action or "status"
         try:
+            if action == "status":
+                from ash.safety.grants import load_managed_permission_rules
+
+                load_managed_permission_rules(workspace)
             if action in {"allow", "ask", "deny"}:
                 _, rules = add_cli_permission_rule(
                     workspace,
@@ -2985,11 +2990,16 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 2
 
-    from ash.safety.grants import PermissionGrantError, load_permission_rules
+    from ash.safety.grants import (
+        PermissionGrantError,
+        load_managed_permission_rules,
+        load_permission_rules,
+    )
     from ash.ui.terminal import TerminalUI
 
     try:
         permission_rules = load_permission_rules(config.workspace_root)
+        managed_permission_rules = load_managed_permission_rules(config.workspace_root)
     except PermissionGrantError as exc:
         print(f"Error: invalid permission policy: {exc}", file=sys.stderr)
         return 2
@@ -3049,6 +3059,7 @@ def main(argv: list[str] | None = None) -> int:
             ui,
             session_store=session_store,
             permission_rules=permission_rules,
+            managed_rules=managed_permission_rules,
             workspace_trusted=workspace_trusted,
             run_maintenance=False,
         )

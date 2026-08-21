@@ -64,7 +64,8 @@ docs/archive/      historical plans and completed verification reports
 ```
 
 Start with the [documentation index](docs/README.md) for maintained design and
-extension references. Development standards are in
+extension references, including [permissions and managed policy](
+docs/guides/PERMISSIONS.md). Development standards are in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Core Usage
@@ -93,6 +94,7 @@ ash storage restore BACKUP --yes # validated, non-destructive restore
 ash permissions status --json    # inspect effective project rules
 ash permissions deny write_file --exact 'file_path=".env"'
 ash permissions allow run_command --command-prefix pytest
+ash permissions status --json    # managed policy appears separately and cannot be overridden locally
 ash sandbox status --json        # inspect effective command isolation
 ash sandbox build                # explicitly build the optional baseline image
 ash agents branches              # inspect isolated worker branches

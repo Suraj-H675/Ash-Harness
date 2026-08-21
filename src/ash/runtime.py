@@ -23,7 +23,11 @@ from ash.plugins.lifecycle import load_extension_state
 from ash.plugins.registry import DiscoveredPlugin, PluginCatalog
 from ash.providers.base import ProviderABC
 from ash.providers.registry import get_provider_registry
-from ash.safety.grants import PermissionRule, load_permission_rules
+from ash.safety.grants import (
+    PermissionRule,
+    load_managed_permission_rules,
+    load_permission_rules,
+)
 from ash.safety.guard import SafetyGuard
 from ash.safety.trust import is_workspace_trusted
 from ash.sandbox import (
@@ -304,6 +308,7 @@ def build_runtime(
     agent_provider_factory: Callable[[], ProviderABC] | None = None,
     session_store: SessionStore | None = None,
     permission_rules: list[PermissionRule] | None = None,
+    managed_rules: list[PermissionRule] | None = None,
     workspace_trusted: bool | None = None,
     approval_callback: ApprovalCallback | None = None,
     additional_mcp_configs: dict[str, MCPServerConfig] | None = None,
@@ -340,6 +345,12 @@ def build_runtime(
         if permission_rules is None
         else permission_rules
     )
+    managed = (
+        load_managed_permission_rules(config.workspace_root)
+        if managed_rules is None
+        else managed_rules
+    )
+    managed_rules = load_managed_permission_rules(config.workspace_root)
     guard = SafetyGuard(
         config.workspace_root,
         blocklist_commands=config.command_blocklist,
@@ -456,6 +467,8 @@ def build_runtime(
         chroma_persist_dir=config.chroma_persist_dir,
     )
     loop.permission_policy.set_persistent_rules(rules)
+    loop.permission_policy.set_managed_rules(managed)
+    loop.permission_policy.set_managed_rules(managed_rules)
     hooks.set_event_sink(loop._emit_event)
 
     def checkpoint_context() -> tuple[str, str, str] | None:

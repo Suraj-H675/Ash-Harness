@@ -185,7 +185,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Prompt-injection isolation | Partial | Untrusted content provenance and tool-policy enforcement |
 | Secret scanning/redaction | Verified locally | Runtime logs, persisted messages/tool calls, tool output, and exports are redacted; auto-commit blocks high-confidence secrets in staged additions without echoing values |
 | Audit log | Partial | Tool approvals, blocks, and outcomes are persisted with a tamper-evident hash chain plus CLI list/verify/export; broader non-tool decision coverage remains |
-| Enterprise policy layers | Missing | System/admin policy that lower scopes cannot override |
+| Enterprise policy layers | Verified locally | Platform-managed deny/ask files load before user rules, survive mode changes, appear in status, and invalid/unreadable policy fails startup closed |
 
 ## 9. Extensibility
 

@@ -69,11 +69,13 @@ class PermissionPolicy:
         self,
         mode: str | PermissionMode = PermissionMode.INTERACTIVE,
         *,
+        managed_rules: list[PermissionRule] | None = None,
         persistent_tool_grants: set[str] | None = None,
         persistent_rules: list[PermissionRule] | None = None,
         session_rules: list[PermissionRule] | None = None,
     ):
         self.mode = PermissionMode(mode)
+        self.managed_rules = list(managed_rules or ())
         self.persistent_rules = list(persistent_rules or ())
         self.session_rules = list(session_rules or ())
         if persistent_tool_grants:
@@ -110,6 +112,9 @@ class PermissionPolicy:
     def set_persistent_rules(self, rules: list[PermissionRule]) -> None:
         self.persistent_rules = list(rules)
 
+    def set_managed_rules(self, rules: list[PermissionRule]) -> None:
+        self.managed_rules = list(rules)
+
     def add_session_rule(self, rule: PermissionRule) -> None:
         if all(existing.rule_id != rule.rule_id for existing in self.session_rules):
             self.session_rules.append(rule)
@@ -123,7 +128,11 @@ class PermissionPolicy:
         return next(
             (
                 rule
-                for rule in (*self.session_rules, *self.persistent_rules)
+                for rule in (
+                    *self.managed_rules,
+                    *self.session_rules,
+                    *self.persistent_rules,
+                )
                 if rule.effect == effect and rule.matches(tool_name, arguments)
             ),
             None,

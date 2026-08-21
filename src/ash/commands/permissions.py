@@ -13,6 +13,7 @@ from ash.safety.grants import (
     RuleEffect,
     add_permission_rule,
     clear_permission_rules,
+    load_managed_permission_rules,
     load_permission_rules,
     remove_permission_rule,
     remove_permission_rules_for_tool,
@@ -24,12 +25,14 @@ def permission_rules_payload(
     workspace: Path,
     rules: list[PermissionRule],
 ) -> dict[str, Any]:
+    managed_rules = load_managed_permission_rules(workspace)
     return {
         "workspace": canonical_workspace(workspace),
+        "managed_rules": [rule.as_payload() for rule in managed_rules],
         "rules": [rule.as_payload() for rule in rules],
         "persistent_grants": sorted(
             rule.tool_name
-            for rule in rules
+            for rule in (*managed_rules, *rules)
             if rule.effect == RuleEffect.ALLOW and not rule.scoped
         ),
     }
@@ -60,7 +63,22 @@ def render_permission_rules(
     payload = permission_rules_payload(workspace, rules)
     if json_output:
         return json.dumps(payload, sort_keys=True)
-    lines = [f"Workspace: {payload['workspace']}", "Permission rules:"]
+    lines = [f"Workspace: {payload['workspace']}", "Managed policy rules:"]
+    if not payload["managed_rules"]:
+        lines.append("  (none)")
+    for rule in payload["managed_rules"]:
+        scope = ""
+        if rule["matches"]:
+            scope = " " + " AND ".join(
+                _render_matcher(
+                    ArgumentMatcher.from_payload(matcher)
+                )
+                for matcher in rule["matches"]
+            )
+        lines.append(
+            f"  {rule['id']} [MANAGED] {rule['effect'].upper()} {rule['tool']}{scope}"
+        )
+    lines.append("Permission rules:")
     if not rules:
         lines.append("  (none)")
         return "\n".join(lines)

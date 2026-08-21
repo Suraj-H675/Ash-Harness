@@ -1,6 +1,15 @@
+import json
+from pathlib import Path
+
 import pytest
 
-from ash.safety.grants import ArgumentMatcher, MatchOperator, PermissionRule, RuleEffect
+from ash.safety.grants import (
+    ArgumentMatcher,
+    MatchOperator,
+    PermissionRule,
+    RuleEffect,
+    load_managed_permission_rules,
+)
 from ash.safety.policy import PermissionPolicy, PolicyAction
 
 
@@ -91,3 +100,88 @@ def test_plan_mode_cannot_be_overridden_by_allow_rule() -> None:
 
     assert decision.action == PolicyAction.DENY
     assert decision.reason == "plan mode is read-only"
+
+
+def test_managed_deny_and_ask_override_lower_rules() -> None:
+    managed_deny = PermissionRule.create(RuleEffect.DENY, "run_command")
+    managed_ask = PermissionRule.create(RuleEffect.ASK, "read_file")
+    user_deny = PermissionRule.create(
+        RuleEffect.DENY,
+        "run_command",
+        [ArgumentMatcher("command_line", MatchOperator.COMMAND_PREFIX, ["pytest"])],
+    )
+    user_allow = PermissionRule.create(RuleEffect.ALLOW, "read_file")
+    policy = PermissionPolicy(
+        "auto_approve",
+        managed_rules=[managed_deny, managed_ask],
+        persistent_rules=[user_deny, user_allow],
+    )
+
+    assert (
+        policy.evaluate("run_command", {"command_line": "pytest -q"}).action
+        == PolicyAction.DENY
+    )
+    decision = policy.evaluate("read_file", {"file_path": "README.md"})
+    assert decision.action == PolicyAction.ASK
+    assert decision.rule_id == managed_ask.rule_id
+
+
+def test_managed_allow_does_not_bypass_read_only_mode() -> None:
+    managed_allow = PermissionRule.create(RuleEffect.ALLOW, "write_file")
+    decision = PermissionPolicy(
+        "plan",
+        managed_rules=[managed_allow],
+    ).evaluate("write_file", {"file_path": "x"})
+
+    assert decision.action == PolicyAction.DENY
+    assert decision.reason == "plan mode is read-only"
+
+
+def test_load_managed_permission_rules_reads_sorted_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory = tmp_path / "policy"
+    directory.mkdir()
+    deny_payload = {
+        "version": 2,
+        "workspaces": {
+            str(workspace.resolve()): [
+                PermissionRule.create(
+                    RuleEffect.DENY,
+                    "web_fetch",
+                ).as_payload(),
+            ],
+        },
+    }
+    allow_payload = {
+        "version": 2,
+        "workspaces": {
+            str(workspace.resolve()): [
+                PermissionRule.create(RuleEffect.ALLOW, "web_fetch").as_payload(),
+            ],
+        },
+    }
+    (directory / "20-deny.json").write_text(json.dumps(deny_payload))
+    (directory / "10-allow.json").write_text(json.dumps(allow_payload))
+    monkeypatch.setattr("ash.safety.grants.managed_policy_paths", lambda: (directory,))
+
+    rules = load_managed_permission_rules(workspace)
+
+    assert len(rules) == 2
+    assert [rule.effect for rule in rules] == [RuleEffect.ALLOW, RuleEffect.DENY]
+
+
+def test_load_managed_policy_fails_closed_on_invalid_json(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    directory = tmp_path / "policy"
+    directory.mkdir()
+    (directory / "broken.json").write_text("{invalid")
+    monkeypatch.setattr("ash.safety.grants.managed_policy_paths", lambda: (directory,))
+
+    with pytest.raises(ValueError, match="invalid managed policy"):
+        load_managed_permission_rules(tmp_path)

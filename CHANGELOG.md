@@ -6,6 +6,11 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Managed enterprise permission policy from platform administrator files.
+  Managed deny and ask rules cannot be overridden by user, project, or session
+  rules, while invalid policy fails closed at startup.
+
 ### Fixed
 - Unified provider readiness: setup, doctor, and runtime construction resolve
   the same endpoint and authentication path for every provider.
