@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,23 @@ version = "0.1.0"
 description = "Extensible local AI agent harness"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Suraj-H675" }]
+keywords = ["agent", "ai", "coding-agent", "harness", "llm", "mcp", "terminal"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
 dependencies = [
     "anthropic>=0.52",
     "croniter>=6.2.3,<7",
@@ -36,6 +53,12 @@ dependencies = [
     "tree-sitter-typescript>=0.23",
     "tzdata>=2026.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Suraj-H675/Ash-Harness"
+Repository = "https://github.com/Suraj-H675/Ash-Harness"
+Changelog = "https://github.com/Suraj-H675/Ash-Harness/blob/main/CHANGELOG.md"
+Issues = "https://github.com/Suraj-H675/Ash-Harness/issues"
 
 [project.scripts]
 ash = "ash.cli:main"
@@ -87,10 +110,6 @@ dev = [
     "types-pyyaml>=6.0",
     "uvicorn>=0.34",
 ]
-
-[project.urls]
-Repository = "https://github.com/Suraj-H675/Ash-Harness"
-Issues = "https://github.com/Suraj-H675/Ash-Harness/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
