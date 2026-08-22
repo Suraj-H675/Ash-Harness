@@ -11,6 +11,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Durable graph-wide token ceilings for parallel agent DAGs, atomic usage
+  accounting across tasks, terminal failure on overrun, and aggregate budget
+  inspection.
 - Managed enterprise permission policy from platform administrator files.
   Managed deny and ask rules cannot be overridden by user, project, or session
   rules, while invalid policy fails closed at startup.

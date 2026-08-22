@@ -100,6 +100,7 @@ class AgentTaskCreate:
     token_budget: int = 4000
     time_budget_seconds: float = 900.0
     metadata: dict[str, Any] = field(default_factory=dict)
+    graph_token_budget: int | None = None
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,16 @@ class _PreparedTaskCreate:
     token_budget: int
     time_budget_seconds: float
     metadata_json: str
+    graph_token_budget: int | None
+
+
+@dataclass(frozen=True)
+class AgentGraphBudget:
+    graph_id: str
+    token_budget: int
+    used_tokens: int
+    remaining_tokens: int
+    task_count: int
 
 
 class AgentTaskStore:
@@ -166,6 +177,7 @@ class AgentTaskStore:
                     result_json TEXT,
                     error TEXT,
                     metadata_json TEXT NOT NULL DEFAULT '{{}}',
+                    graph_token_budget INTEGER CHECK(graph_token_budget IS NULL OR graph_token_budget > 0),
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -254,6 +266,7 @@ class AgentTaskStore:
             raise ValueError("task graph contains duplicate task ids")
         graph_ids = set(identifiers)
         _validate_task_graph(prepared, graph_ids)
+        _validate_graph_token_budgets(prepared, graph_ids)
         now = time.time()
         with self._transaction():
             self._require_graph_references(prepared, graph_ids)
@@ -264,8 +277,8 @@ class AgentTaskStore:
                         INSERT INTO agent_tasks (
                             task_id, description, role, state, parent_task_id, sprint_id,
                             max_attempts, token_budget, time_budget_seconds,
-                            metadata_json, created_at, updated_at
-                        ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+                            metadata_json, graph_token_budget, created_at, updated_at
+                        ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             definition.task_id,
@@ -281,6 +294,7 @@ class AgentTaskStore:
                             definition.token_budget,
                             definition.time_budget_seconds,
                             definition.metadata_json,
+                            definition.graph_token_budget,
                             now,
                             now,
                         ),
@@ -434,6 +448,22 @@ class AgentTaskStore:
             row = self._owned_row(identifier, token, now)
             used = int(row["used_tokens"]) + token_count
             budget = int(row["token_budget"])
+            graph_id = _json_object(row["metadata_json"]).get("graph_id")
+            graph_budget = row["graph_token_budget"]
+            graph_used = None
+            graph_remaining = None
+            if graph_id is not None and graph_budget is not None:
+                aggregate = self._conn.execute(
+                    """
+                    SELECT COALESCE(SUM(used_tokens), 0) AS used_tokens
+                    FROM agent_tasks
+                    WHERE json_extract(metadata_json, '$.graph_id') = ?
+                    """,
+                    (str(graph_id),),
+                ).fetchone()
+                graph_used = int(aggregate["used_tokens"]) + token_count
+                graph_budget = int(graph_budget)
+                graph_remaining = max(graph_budget - graph_used, 0)
             if used > budget:
                 self._conn.execute(
                     """
@@ -459,6 +489,40 @@ class AgentTaskStore:
                     token_budget=budget,
                 )
                 exceeded_error = f"task {identifier!r} exceeded token budget {budget}"
+            elif (
+                graph_budget is not None
+                and graph_used is not None
+                and graph_used > graph_budget
+            ):
+                self._conn.execute(
+                    """
+                    UPDATE agent_tasks SET state = 'failed', error = ?, used_tokens = ?,
+                        lease_token_hash = NULL, lease_expires_at = NULL, updated_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (
+                        f"graph token budget exceeded: {graph_used} > {graph_budget}",
+                        used,
+                        now,
+                        identifier,
+                    ),
+                )
+                self._record_event_locked(
+                    identifier,
+                    "agent.task.failed",
+                    now,
+                    state="failed",
+                    owner_agent_id=str(row["owner_agent_id"]),
+                    reason="graph_token_budget_exceeded",
+                    graph_id=str(graph_id),
+                    used_tokens=used,
+                    graph_used_tokens=graph_used,
+                    graph_token_budget=graph_budget,
+                )
+                exceeded_error = (
+                    f"task {identifier!r} exceeded graph token budget "
+                    f"{graph_budget}"
+                )
             else:
                 self._conn.execute(
                     "UPDATE agent_tasks SET used_tokens = ?, updated_at = ? WHERE task_id = ?",
@@ -473,10 +537,50 @@ class AgentTaskStore:
                     added_tokens=token_count,
                     used_tokens=used,
                     token_budget=budget,
+                    **(
+                        {
+                            "graph_id": str(graph_id),
+                            "graph_used_tokens": graph_used,
+                            "graph_token_budget": graph_budget,
+                            "graph_remaining_tokens": graph_remaining,
+                        }
+                        if graph_budget is not None
+                        else {}
+                    ),
                 )
         if exceeded_error is not None:
             raise AgentTaskBudgetExceeded(exceeded_error)
         return self._required_task(identifier)
+
+    def get_graph_budget(self, graph_id: str) -> AgentGraphBudget:
+        """Return durable aggregate usage for one explicit task graph."""
+
+        identifier = _identifier(graph_id, "graph id")
+        with self._lock, closing(self._conn.cursor()) as cursor:
+            row = cursor.execute(
+                """
+                SELECT COUNT(*) AS task_count,
+                       COALESCE(SUM(used_tokens), 0) AS used_tokens,
+                       MIN(graph_token_budget) AS token_budget
+                FROM agent_tasks
+                WHERE json_extract(metadata_json, '$.graph_id') = ?
+                  AND graph_token_budget IS NOT NULL
+                """,
+                (identifier,),
+            ).fetchone()
+        assert row is not None
+        task_count = int(row["task_count"])
+        token_budget = row["token_budget"]
+        if task_count == 0 or token_budget is None:
+            raise AgentTaskError(f"unknown task graph: {identifier}")
+        used_tokens = int(row["used_tokens"])
+        return AgentGraphBudget(
+            graph_id=identifier,
+            token_budget=int(token_budget),
+            used_tokens=used_tokens,
+            remaining_tokens=max(int(token_budget) - used_tokens, 0),
+            task_count=task_count,
+        )
 
     def complete_task(
         self,
@@ -1136,6 +1240,9 @@ def _prepare_task_create(definition: AgentTaskCreate) -> _PreparedTaskCreate:
         raise ValueError("max_attempts must be between 1 and 10")
     if definition.token_budget < 1:
         raise ValueError("token_budget must be positive")
+    graph_token_budget = definition.graph_token_budget
+    if graph_token_budget is not None and graph_token_budget < 1:
+        raise ValueError("graph_token_budget must be positive")
     time_budget = float(definition.time_budget_seconds)
     if not 0.1 <= time_budget <= 86_400:
         raise ValueError("time_budget_seconds must be between 0.1 and 86400")
@@ -1150,7 +1257,34 @@ def _prepare_task_create(definition: AgentTaskCreate) -> _PreparedTaskCreate:
         token_budget=definition.token_budget,
         time_budget_seconds=time_budget,
         metadata_json=_bounded_json(definition.metadata, "task metadata"),
+        graph_token_budget=graph_token_budget,
     )
+
+
+def _validate_graph_token_budgets(
+    definitions: Sequence[_PreparedTaskCreate],
+    graph_ids: set[str],
+) -> dict[str, int]:
+    budgets: dict[str, int] = {}
+    for definition in definitions:
+        if definition.graph_token_budget is None:
+            continue
+        graph_id = json.loads(definition.metadata_json).get("graph_id")
+        if not isinstance(graph_id, str):
+            raise ValueError(
+                "graph_token_budget requires metadata.graph_id to identify "
+                "a task in this graph"
+            )
+        if not isinstance(definition.graph_token_budget, int) or (
+            definition.graph_token_budget < 1
+        ):
+            raise ValueError("graph_token_budget must be positive")
+        if graph_id in budgets and budgets[graph_id] != definition.graph_token_budget:
+            raise ValueError(
+                "all tasks in one graph must declare the same graph_token_budget"
+            )
+        budgets[graph_id] = definition.graph_token_budget
+    return budgets
 
 
 def _validate_task_graph(

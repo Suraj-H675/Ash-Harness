@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 from ash.agents.shared_state import SharedState
-from ash.agents.tasks import AgentTaskBudgetExceeded, AgentTaskCreate, AgentTaskError
+from ash.agents.tasks import (
+    AgentGraphBudget,
+    AgentTaskBudgetExceeded,
+    AgentTaskCreate,
+    AgentTaskError,
+)
 
 
 @pytest.fixture
@@ -213,6 +218,93 @@ def test_graph_cancellation_is_atomic_filterable_and_idempotent(
 
     with pytest.raises(AgentTaskError, match="unknown task graph"):
         state.tasks.cancel_graph("missing-graph")
+
+
+def test_graph_token_budget_fails_consuming_task_and_exposes_usage(
+    state: SharedState,
+) -> None:
+    graph_id = "budgeted-graph"
+    tasks = state.tasks.create_tasks(
+        [
+            AgentTaskCreate(
+                "one",
+                task_id="budget-one",
+                metadata={"graph_id": graph_id},
+                    token_budget=15,
+                graph_token_budget=20,
+            ),
+            AgentTaskCreate(
+                "two",
+                task_id="budget-two",
+                dependencies=("budget-one",),
+                metadata={"graph_id": graph_id},
+                token_budget=15,
+                graph_token_budget=20,
+            ),
+        ]
+    )
+    first = state.tasks.claim_task("worker", task_id="budget-one")
+    assert first is not None
+    state.tasks.start_task("budget-one", first.token)
+    state.tasks.record_tokens("budget-one", first.token, 12)
+
+    second = state.tasks.get_task("budget-two")
+    assert second is not None and second.state == "queued"
+    state.tasks.fail_task("budget-one", first.token, "operator stopped")
+
+    budget = state.tasks.get_graph_budget(graph_id)
+    assert budget == (
+        AgentGraphBudget(
+            graph_id=graph_id,
+            token_budget=20,
+            used_tokens=12,
+            remaining_tokens=8,
+            task_count=2,
+        )
+    )
+    assert [task.used_tokens for task in tasks] == [0, 0]
+
+    with pytest.raises(AgentTaskError, match="unknown task graph"):
+        state.tasks.get_graph_budget("missing-graph")
+
+
+def test_graph_token_budget_exceeded_fails_owner_atomically(state: SharedState) -> None:
+    graph_id = "over-budget-graph"
+    state.tasks.create_tasks(
+        [
+            AgentTaskCreate(
+                "one",
+                task_id="over-budget-one",
+                metadata={"graph_id": graph_id},
+                token_budget=100,
+                graph_token_budget=20,
+            ),
+            AgentTaskCreate(
+                "two",
+                task_id="over-budget-two",
+                metadata={"graph_id": graph_id},
+                token_budget=100,
+                graph_token_budget=20,
+            ),
+        ]
+    )
+    lease = state.tasks.claim_task("worker", task_id="over-budget-one")
+    assert lease is not None
+    state.tasks.start_task("over-budget-one", lease.token)
+    state.tasks.record_tokens("over-budget-one", lease.token, 15)
+
+    with pytest.raises(AgentTaskBudgetExceeded, match="graph token budget"):
+        state.tasks.record_tokens("over-budget-one", lease.token, 10)
+
+    failed = state.tasks.get_task("over-budget-one")
+    assert failed is not None
+    assert failed.state == "failed"
+    assert failed.used_tokens == 25
+    assert failed.error == "graph token budget exceeded: 25 > 20"
+    events = state.tasks.list_events(event_type="agent.task.failed")
+    assert len(events) == 1
+    assert events[0].event["reason"] == "graph_token_budget_exceeded"
+    assert events[0].event["graph_used_tokens"] == 25
 
 
 def test_failed_dependency_is_terminally_propagated(state: SharedState) -> None:
