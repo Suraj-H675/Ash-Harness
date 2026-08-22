@@ -20,8 +20,8 @@ SAFE_ENV_KEYS = frozenset(
         "TMP",
         "LANG",
         "PYTHONIOENCODING",
-        "SYSTEMROOT",
-        "WINDIR",
+        "SystemRoot",
+        "windir",
         "COMSPEC",
         "PATHEXT",
     }

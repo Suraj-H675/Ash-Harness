@@ -7,6 +7,9 @@ All notable changes to Ash are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Preserved case-correct Windows system environment variables in scrubbed
+  command environments and bounded CI tests at 120 seconds so platform hangs
+  fail visibly instead of blocking the workflow.
 - Restored cross-platform CI correctness for Windows-only type analysis and a
   Linux-specific Bubblewrap regression test.
 

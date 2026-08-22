@@ -24,7 +24,7 @@ jobs:
       - run: uv sync --group dev --extra server --extra browser --extra acp --extra a2a
       - run: uv run ruff check src tests
       - run: uv run mypy src/ash
-      - run: uv run pytest -q
+      - run: uv run pytest -q --timeout=120
       - run: uv build
       - name: Installed CLI smoke test
         shell: bash
