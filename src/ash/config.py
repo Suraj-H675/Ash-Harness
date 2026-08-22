@@ -331,9 +331,11 @@ class AshConfig(BaseSettings):
     model_pricing_usd_per_million: dict[str, dict[str, float]] = Field(
         default_factory=dict,
         description=(
-            "Optional explicit model pricing: provider/model -> "
-            "{input, output, cache_read, cache_write: USD per million tokens}. "
-            "Cache rates default to the input rate when omitted."
+            "Optional explicit model pricing that overrides built-in defaults: "
+            "provider/model -> {input, output, cache_read, cache_write: USD "
+            "per million tokens}. Cache rates default to the input rate when "
+            "omitted. Built-in defaults cover major Anthropic, OpenAI, "
+            "DeepSeek, and Groq models."
         ),
     )
     fallback_models: list[str] = Field(

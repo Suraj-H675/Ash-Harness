@@ -295,6 +295,57 @@ def _calculate_turn_cost(
     ) / 1_000_000
 
 
+DEFAULT_MODEL_PRICING_USD_PER_MILLION: dict[str, dict[str, float]] = {
+    "anthropic/claude-sonnet-4-6": {
+        "input": 3.0,
+        "output": 15.0,
+        "cache_read": 0.30,
+        "cache_write": 3.75,
+    },
+    "anthropic/claude-opus-4-7": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.50,
+        "cache_write": 6.25,
+    },
+    "anthropic/claude-haiku-4-5": {
+        "input": 1.0,
+        "output": 5.0,
+        "cache_read": 0.10,
+        "cache_write": 1.25,
+    },
+    "openai/gpt-5.2": {
+        "input": 1.75,
+        "output": 14.0,
+        "cache_read": 0.175,
+    },
+    "openai/gpt-5.2-codex": {
+        "input": 1.75,
+        "output": 14.0,
+        "cache_read": 0.175,
+    },
+    "openai/gpt-5-mini": {
+        "input": 0.25,
+        "output": 2.0,
+        "cache_read": 0.025,
+    },
+    "deepseek/deepseek-v4-flash": {
+        "input": 0.28,
+        "output": 0.42,
+        "cache_read": 0.028,
+    },
+    "deepseek/deepseek-v4-pro": {
+        "input": 0.70,
+        "output": 2.10,
+        "cache_read": 0.07,
+    },
+    "groq/llama-3.3-70b-versatile": {
+        "input": 0.59,
+        "output": 0.79,
+    },
+}
+
+
 class AshLoop:
     """V1 minimal agent loop."""
 
@@ -1344,8 +1395,10 @@ class AshLoop:
             usage_source = "mixed"
         pricing: dict[str, float] = {}
         if self._config is not None:
-            pricing = self._config.model_pricing_usd_per_million.get(
-                self._config.model, {}
+            pricing = (
+                self._config.model_pricing_usd_per_million.get(self._config.model)
+                or DEFAULT_MODEL_PRICING_USD_PER_MILLION.get(self._config.model)
+                or {}
             )
         turn_cost_usd = _calculate_turn_cost(
             prompt_tokens=prompt,

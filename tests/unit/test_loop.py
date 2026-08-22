@@ -1471,6 +1471,35 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_default_pricing_applies_without_user_config(tmp_path):
+    """Known model IDs get real costs without manual pricing config."""
+
+    store = SessionStore(tmp_path / "default-pricing.db")
+    config = AshConfig(
+        model="anthropic/claude-sonnet-4-6",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    loop = AshLoop(
+        store,
+        CacheUsageProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=config,
+    )
+
+    await loop.start_session()
+    await loop.run_turn("test default pricing")
+
+    usage = loop.last_turn_usage
+    assert float(usage["cost_usd"]) > 0.0, (
+        "Default pricing should produce a non-zero cost for known models"
+    )
+
+
+@pytest.mark.asyncio
 async def test_missing_provider_usage_is_estimated_marked_and_persisted(tmp_path):
     store = SessionStore(tmp_path / "estimated-usage.db")
     config = AshConfig(

@@ -98,7 +98,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Session export/import | Verified locally | Versioned redacted JSONL/Markdown export and validated JSONL import |
 | Crash recovery | Verified locally | Approved tool intent is persisted before execution; resume and cancellation compensate only hash-proven in-flight direct edits, preserve earlier completed edits, persist idempotent outcomes, and flag non-file or conflicting effects for inspection |
 | Session retention | Verified locally | Configurable automatic cleanup plus explicit project prune and vacuum |
-| Cost/token history | Partial | Model-specific pricing, no hardcoded provider assumptions |
+| Cost/token history | Verified locally | Built-in pricing defaults for current major Anthropic, OpenAI, DeepSeek, and Groq models; explicit user pricing overrides remain authoritative |
 
 ## 5. CLI And TUI Experience
 

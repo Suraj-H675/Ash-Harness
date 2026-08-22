@@ -15,6 +15,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Built-in USD-per-million-token pricing defaults for current major
+  Anthropic, OpenAI, DeepSeek, and Groq models, while preserving explicit
+  user overrides.
 - Durable graph-wide token ceilings for parallel agent DAGs, atomic usage
   accounting across tasks, terminal failure on overrun, and aggregate budget
   inspection.
