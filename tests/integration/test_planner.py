@@ -305,6 +305,74 @@ def test_loop_runs_editable_planning_phase_before_execution(tmp_path: Path) -> N
     assert sprint.items[0].description == "Add login endpoint"
 
 
+def test_loop_injects_live_persisted_plan_state_into_provider(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        scripts=[
+            [
+                "## Goal\nImplement login\n\n## Test Command\npytest\n\n"
+                "## Rollback Plan\nrevert\n\n## Checklist\n\n"
+                "### Implementation\n- [ ] Add login endpoint\n"
+            ],
+            ["<response>continued plan</response>"],
+            ["<response>live plan state</response>"],
+        ]
+    )
+    store = SessionStore(tmp_path / "sessions.db")
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(tmp_path),
+        _make_ui(input_text="y\n"),
+        tmp_path,
+        planner=Planner(provider),
+        enable_sprint_planning=True,
+    )
+
+    session = asyncio.run(loop.start_session())
+    response = asyncio.run(loop.run_turn("Implement user authentication for the API"))
+    assert response == "continued plan"
+
+    sprint_ids = store.list_session_sprints(session.session_id)
+    execution = store.load_sprint(sprint_ids[0])
+    execution.mark_item_in_progress(1)
+    store.save_sprint(session.session_id, execution)
+
+    second_response = asyncio.run(loop.run_turn("Continue implementing login"))
+    assert second_response == "live plan state"
+
+    execution_messages = [
+        messages
+        for messages in provider.received_messages[1:]
+        if "Current Sprint Plan" in messages[0]["content"]
+    ]
+    assert len(execution_messages) == 2
+    assert "progress=0/1" in execution_messages[-1][0]["content"]
+    assert "[>] 1. (Implementation) Add login endpoint" in (
+        execution_messages[-1][0]["content"]
+    )
+
+
+def test_loop_does_not_substitute_input_without_new_plan(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    provider = FakeProvider(scripts=[["<response>normal turn</response>"]])
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(tmp_path),
+        _make_ui(),
+        tmp_path,
+        enable_sprint_planning=True,
+    )
+
+    asyncio.run(loop.start_session())
+    response = asyncio.run(loop.run_turn("Implement user authentication for the API"))
+
+    assert response == "normal turn"
+    assert provider.received_messages[0][-1]["content"] == (
+        "Implement user authentication for the API"
+    )
+
+
 # ---------------------------------------------------------------------------
 # SessionStore persistence
 # ---------------------------------------------------------------------------

@@ -7,6 +7,8 @@ All notable changes to Ash are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Prevented approved-sprint input substitution from applying to turns that
+  did not create a new sprint.
 - Preserved case-correct Windows system environment variables in scrubbed
   command environments and bounded CI tests at 120 seconds with verbose test
   names so platform hangs identify the exact case instead of blocking the
@@ -15,6 +17,8 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Live persisted sprint-plan state in runtime model context, including
+  checklist progress, notes, and bounded budget accounting.
 - Built-in USD-per-million-token pricing defaults for current major
   Anthropic, OpenAI, DeepSeek, and Groq models, while preserving explicit
   user overrides.

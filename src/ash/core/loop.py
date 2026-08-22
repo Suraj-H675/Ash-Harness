@@ -492,6 +492,7 @@ class AshLoop:
         self.enable_semantic_memory = enable_semantic_memory
         self._vector_pipeline: "VectorSearchPipeline | None" = None
         self._pending_memory_context: str = ""
+        self._pending_plan_context: str = ""
         if enable_semantic_memory:
             self._init_vector_pipeline(
                 memory_backend=memory_backend,
@@ -1148,6 +1149,39 @@ class AshLoop:
         while iteration < iteration_budget:
             iteration += 1
             self._drain_steering_messages(session)
+            self._pending_plan_context = ""
+            if self.enable_sprint_planning:
+                active_sprint_ids = [
+                    sprint_id
+                    for sprint_id in self.session_store.list_session_sprints(
+                        session.session_id
+                    )
+                    if not self.session_store.load_sprint(sprint_id).is_terminal
+                ]
+                if active_sprint_ids:
+                    latest_sprint = self.session_store.load_sprint(active_sprint_ids[0])
+                    done_count, total_count = latest_sprint.progress
+                    plan_lines = []
+                    for item in latest_sprint.items:
+                        marker = {
+                            "done": "[x]",
+                            "skipped": "[-]",
+                            "in_progress": "[>]",
+                            "failed": "[!]",
+                            "pending": "[ ]",
+                        }.get(item.status.value, "[ ]")
+                        notes = f" — {item.notes}" if item.notes else ""
+                        plan_lines.append(
+                            f"{marker} {item.idx}. ({item.section}) "
+                            f"{item.description}{notes}"
+                        )
+                    self._pending_plan_context = (
+                        f"Sprint {latest_sprint.contract.contract_id}: "
+                        f"{latest_sprint.contract.goal} "
+                        f"(state={latest_sprint.state.value}, "
+                        f"progress={done_count}/{total_count})\n"
+                        + "\n".join(plan_lines)
+                    )
             iteration_tools = dict(self._provider_tools())
             # Optionally search semantic memory and inject relevant context.
             self._pending_memory_context = ""
@@ -2586,8 +2620,16 @@ class AshLoop:
                 repo_section = f"(repo map unavailable: {exc})"
 
         memory_section = ""
+        if self._pending_plan_context:
+            memory_section = (
+                f"## Current Sprint Plan\n{self._pending_plan_context}\n\n"
+                "Keep this persisted checklist current as work progresses."
+            )
         if self._pending_memory_context:
-            memory_section = f"## Relevant Context\n{self._pending_memory_context}"
+            recalled_context = f"## Relevant Context\n{self._pending_memory_context}"
+            memory_section = (
+                f"{memory_section}\n\n{recalled_context}" if memory_section else recalled_context
+            )
 
         if self._config is not None:
             from ash.context.history import (

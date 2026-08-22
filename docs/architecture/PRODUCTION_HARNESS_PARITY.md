@@ -165,7 +165,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Web fetch/search | Strong partial | Guarded HTTP(S) fetch plus Brave/Tavily live search with credential auto-detection, auto fallback, fixed endpoints, freshness, bounded normalized sources, provider provenance, and shared domain filtering; provider-native search blocks and durable citation objects remain |
 | Browser automation | Strong partial | Optional Playwright pack owns an isolated Chromium context with public-host/domain routing for requests and WebSockets, blocked service workers/downloads/password fills, bounded ARIA snapshots, stable refs, navigation/click/type/scroll/history actions, setup/doctor support, and deterministic cleanup; vision, uploads, persistent profiles, and CDP attachment remain |
 | Ask-user tool | Verified locally | Typed blocking question with bounded options and explicit empty-answer failure |
-| Todo/plan tracking | Partial | Persisted sprint checklists are inspectable and updatable from the top-level CLI; automatic runtime progress injection remains |
+| Todo/plan tracking | Verified locally | Persisted sprint checklists are inspectable and updatable from the top-level CLI; active plan state is injected into every runtime model request with bounded context accounting |
 
 ## 8. Safety, Trust, And Permissions
 
