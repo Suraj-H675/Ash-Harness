@@ -14,7 +14,9 @@ from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
 
 
-CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION = 1
+CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION = 2
+MINIMUM_SUPPORTED_PLUGIN_MANIFEST_SCHEMA_VERSION = 1
+DEPRECATED_PLUGIN_MANIFEST_SCHEMA_VERSIONS: frozenset[int] = frozenset({1})
 MAX_PLUGIN_MANIFEST_BYTES = 128 * 1024
 PLUGIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PLUGIN_TOOL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
@@ -147,6 +149,12 @@ class PluginManifest:
         )
         if not isinstance(raw_schema_version, int):
             raise ValueError("plugin schemaVersion must be an integer")
+        if raw_schema_version < MINIMUM_SUPPORTED_PLUGIN_MANIFEST_SCHEMA_VERSION:
+            raise ValueError(
+                "plugin manifest schemaVersion "
+                f"{raw_schema_version} is older than supported "
+                f"{MINIMUM_SUPPORTED_PLUGIN_MANIFEST_SCHEMA_VERSION}; upgrade the plugin"
+            )
         if raw_schema_version > CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION:
             raise ValueError(
                 "plugin manifest schemaVersion "
@@ -216,6 +224,18 @@ class PluginManifest:
             runtime=runtime,
             tools=tools,
         )
+
+    @property
+    def deprecation_notice(self) -> str | None:
+        """Return the active deprecation warning for this manifest, if any."""
+
+        if self.schema_version in DEPRECATED_PLUGIN_MANIFEST_SCHEMA_VERSIONS:
+            return (
+                f"plugin manifest schemaVersion {self.schema_version} is deprecated "
+                "and will be removed in a future Ash release; migrate to "
+                f"schemaVersion {CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION}"
+            )
+        return None
 
     def check_dependencies(self, installed_plugins: Mapping[str, str]) -> list[str]:
         """Validate all declared plugin dependencies are installed.

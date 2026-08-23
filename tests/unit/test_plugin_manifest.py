@@ -19,7 +19,7 @@ def test_load_minimal_manifest(tmp_path: Path) -> None:
     manifest = PluginManifest.load(manifest_file)
     assert manifest.name == "my-plugin"
     assert manifest.version == "1.0.0"
-    assert manifest.schema_version == 1
+    assert manifest.schema_version == 2
     assert manifest.description == ""
 
 
@@ -91,6 +91,51 @@ def test_future_manifest_schema_version_is_refused(tmp_path: Path) -> None:
         assert "newer than supported" in str(exc)
     else:
         raise AssertionError("future plugin manifest schema version was accepted")
+
+
+def test_deprecated_manifest_schema_version_exposes_notice(tmp_path: Path) -> None:
+    manifest_file = tmp_path / "plugin.json"
+    manifest_file.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "name": "legacy-plugin",
+                "version": "1.0.0",
+            }
+        )
+    )
+    manifest = PluginManifest.load(manifest_file)
+    assert manifest.deprecation_notice is not None
+    assert "schemaVersion 1 is deprecated" in manifest.deprecation_notice
+
+
+def test_current_manifest_schema_version_has_no_notice(tmp_path: Path) -> None:
+    manifest_file = tmp_path / "plugin.json"
+    manifest_file.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 2,
+                "name": "current-plugin",
+                "version": "1.0.0",
+            }
+        )
+    )
+    assert PluginManifest.load(manifest_file).deprecation_notice is None
+
+
+def test_pre_minimum_manifest_schema_version_is_refused(tmp_path: Path) -> None:
+    manifest_file = tmp_path / "plugin.json"
+    manifest_file.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 0,
+                "name": "old-plugin",
+                "version": "1.0.0",
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="older than supported"):
+        PluginManifest.load(manifest_file)
 
 
 def test_check_dependencies_returns_empty_for_installed_plugins(tmp_path: Path) -> None:

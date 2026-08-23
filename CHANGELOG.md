@@ -20,6 +20,8 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Plugin manifest schema v2 with explicit compatibility policy: schema 1 is
+  accepted with a deprecation notice, schema 0 and future schemas fail closed.
 - Searchable session summaries: session lookup now matches redacted context
   summaries and exposes them in summary metadata.
 - Opt-in automatic project-memory indexing with bounded file counts, file

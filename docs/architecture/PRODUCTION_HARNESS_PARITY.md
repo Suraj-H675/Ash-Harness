@@ -248,7 +248,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Packaging CI | Verified locally | Wheel/sdist build, minimal clean install, artifact metadata/content, CLI/config/trust, repo-map import, optional dependency absence, and missing-extra behavior are exercised |
 | Security tests | Partial | Command/path bypass corpus, sandbox escape assumptions, secret leaks |
 | Performance tests | Partial | Lightweight CLI import graph and installed version startup are regression-tested under one second; large-repo indexing, long-session memory, and redraw latency benchmarks remain |
-| Compatibility policy | Partial | Config, session, and plugin manifest schemas are versioned with future-version refusal; plugin deprecation windows remain |
+| Compatibility policy | Verified locally | Config, session, and plugin manifest schemas are versioned with future-version refusal, minimum-version enforcement, and plugin deprecation notices |
 
 ## Delivery Gates
 

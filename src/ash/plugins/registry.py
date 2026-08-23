@@ -15,6 +15,10 @@ class DiscoveredPlugin:
     source: str
     enabled: bool = True
 
+    @property
+    def deprecation_notice(self) -> str | None:
+        return self.manifest.deprecation_notice
+
     def skill_paths(self) -> tuple[Path, ...]:
         if self.manifest.skills:
             return tuple(self.root / relative for relative in self.manifest.skills)
