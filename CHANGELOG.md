@@ -7,6 +7,8 @@ All notable changes to Ash are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Routed interactive REPL command and turn failures through the shared error
+  taxonomy so users receive stable categories and actionable remedies.
 - Recorded subagent token and cost usage in one durable transaction,
   restored explicit pricing precedence over built-in defaults, and exposed
   background graph cost aggregates.

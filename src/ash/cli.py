@@ -77,7 +77,15 @@ def _load_config_or_report(**overrides: Any) -> tuple[AshConfig | None, int]:
     except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
         error = classify_exception(exc)
         print(format_error(error), file=sys.stderr)
-        return None, error.exit_code
+    return None, error.exit_code
+
+
+def _print_classified_error(exc: BaseException) -> None:
+    """Render interactive failures through Ash's shared error taxonomy."""
+
+    from ash.exceptions import classify_exception, format_error
+
+    print(format_error(classify_exception(exc)), file=sys.stderr, flush=True)
 
 
 def _config_overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -506,7 +514,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 print(f"Error: {custom_exc}", file=sys.stderr, flush=True)
                 continue
             if custom is None:
-                print(f"Error: {exc}", file=sys.stderr, flush=True)
+                _print_classified_error(exc)
                 continue
             custom_command, custom_arguments = custom
             user_input = custom_command.expand(custom_arguments)
@@ -664,7 +672,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             continue
                     session = await loop.start_session(selected_session_id)
                 except (KeyError, ValueError) as exc:
-                    print(f"Error: {exc}", file=sys.stderr, flush=True)
+                    _print_classified_error(exc)
                     continue
                 loop.ui.load_session_transcript(session)
                 print(f"Resumed session {session.session_id}", flush=True)
@@ -701,7 +709,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         branch_name=" ".join(name_parts),
                     )
                 except ValueError as exc:
-                    print(f"Error: {exc}", file=sys.stderr, flush=True)
+                    _print_classified_error(exc)
                     continue
                 loop.current_session = session
                 loop.ui.load_session_transcript(session)
@@ -753,7 +761,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             loop.current_session.session_id, count
                         )
                 except (RuntimeError, ValueError) as exc:
-                    print(f"Error: {exc}", file=sys.stderr, flush=True)
+                    _print_classified_error(exc)
                     continue
                 loop.current_session = session
                 loop.ui.load_session_transcript(session)
@@ -801,7 +809,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     )
                     output_path.write_text(content, encoding="utf-8")
                 except (OSError, ValueError) as exc:
-                    print(f"Error: {exc}", file=sys.stderr, flush=True)
+                    _print_classified_error(exc)
                     continue
                 print(f"Exported to {output_path}", flush=True)
                 continue
@@ -818,7 +826,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         project_path=str(loop.project_root),
                     )
                 except (OSError, ValueError) as exc:
-                    print(f"Error: {exc}", file=sys.stderr, flush=True)
+                    _print_classified_error(exc)
                     continue
                 loop.current_session = session
                 loop.ui.load_session_transcript(session)
@@ -1062,7 +1070,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             flush=True,
                         )
                     except RuntimeError as exc:
-                        print(f"Error: {exc}", file=sys.stderr, flush=True)
+                        _print_classified_error(exc)
                     continue
                 result = await loop.tools["git_diff"].run(
                     staged=staged, path=paths[0] if paths else ""
@@ -1080,7 +1088,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         loop.project_root, arguments
                     )
                 except ValueError as exc:
-                    print(f"Error: {exc}", file=sys.stderr, flush=True)
+                    _print_classified_error(exc)
                     continue
                 if not changes.strip():
                     print(f"No changes found for {label}.", flush=True)
@@ -1312,7 +1320,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 config.model = model_str
                 print(f"Switched to {model_str}", flush=True)
             except Exception as exc:
-                print(f"Error: {exc}", file=sys.stderr, flush=True)
+                _print_classified_error(exc)
             continue
 
         # /models → list
@@ -1344,7 +1352,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             print()
             return 0
         except Exception as exc:  # noqa: BLE001
-            print(f"Error: {exc}", file=sys.stderr, flush=True)
+            _print_classified_error(exc)
             continue
         if not prompt_input.uses_viewport:
             print(response, flush=True)

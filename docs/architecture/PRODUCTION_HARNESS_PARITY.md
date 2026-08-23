@@ -239,7 +239,7 @@ Research is clean-room: proprietary or leaked source is not used.
 |---|---|---|
 | Structured logging | Verified locally | Rotation, redaction, correlation IDs, and bounded redacted structured debug bundles |
 | Telemetry | Verified locally | No outbound telemetry; `ash metrics` exposes aggregate local-only token, cache, session, and cost metrics |
-| Error taxonomy | Partial | Shared config/provider/tool/policy/sandbox/context/storage classifier is wired into headless/CI errors; broader interactive command adoption remains |
+| Error taxonomy | Verified locally | Shared config/provider/tool/policy/sandbox/context/storage classifier is wired into headless/CI errors, interactive slash commands, imports, model switches, and normal turn failures |
 | Graceful shutdown | Verified locally | Providers, MCP clients, command trees, background agents, SDK, and servers close deterministically |
 | Database migrations | Verified locally | Schema version table, transactional ordered migration, future-version refusal, and backups |
 | Corruption recovery | Verified locally | Read-only integrity diagnostics plus validated backup and pre-restore preservation |
