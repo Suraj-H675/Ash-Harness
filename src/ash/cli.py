@@ -1174,6 +1174,21 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 config.safety_tier = mode.value
                 if hasattr(loop.ui, "safety_tier"):
                     loop.ui.safety_tier = mode.value
+                if loop.current_session is not None:
+                    loop.session_store.append_audit_log(
+                        loop.current_session.session_id,
+                        action_type="permission_mode",
+                        target_resource=mode.value,
+                        details={
+                            "previous_mode": (
+                                config.safety_tier
+                                if config.safety_tier != mode.value
+                                else mode.value
+                            ),
+                            "mode": mode.value,
+                        },
+                        result="SUCCESS",
+                    )
                 print(f"Permission mode: {mode.value}")
                 continue
             if command.name == "sandbox":

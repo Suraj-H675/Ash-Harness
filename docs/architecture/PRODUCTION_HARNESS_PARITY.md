@@ -184,7 +184,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Environment scrubbing | Verified locally | Foreground/background commands and Git hooks receive only a scrubbed operational env plus an explicit user-owned variable-name allowlist; MCP stdio servers receive only explicit server env; project config cannot grant command variables, isolated backends preserve the policy, and Docker arguments never contain values |
 | Prompt-injection isolation | Partial | Untrusted content provenance and tool-policy enforcement |
 | Secret scanning/redaction | Verified locally | Runtime logs, persisted messages/tool calls, tool output, and exports are redacted; auto-commit blocks high-confidence secrets in staged additions without echoing values |
-| Audit log | Partial | Tool approvals, blocks, and outcomes are persisted with a tamper-evident hash chain plus CLI list/verify/export; broader non-tool decision coverage remains |
+| Audit log | Verified locally | Tool approvals, blocks, outcomes, and interactive permission-mode decisions are persisted with a tamper-evident hash chain plus CLI list/verify/export |
 | Enterprise policy layers | Verified locally | Platform-managed deny/ask files load before user rules, survive mode changes, appear in status, and invalid/unreadable policy fails startup closed |
 
 ## 9. Extensibility

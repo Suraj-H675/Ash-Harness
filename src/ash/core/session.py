@@ -19,10 +19,15 @@ from pydantic import BaseModel, Field
 
 Role = Literal["system", "user", "assistant", "tool"]
 AuditAction = Literal[
-    "tool_call", "command_run", "file_write", "safety_block", "user_approval"
+    "tool_call",
+    "command_run",
+    "file_write",
+    "safety_block",
+    "user_approval",
+    "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 11
 
 
 class SessionStorageError(RuntimeError):
@@ -351,6 +356,8 @@ class SessionStore:
                 self._migrate_v9(conn)
             if from_version < 10:
                 self._migrate_v10(conn)
+            if from_version < 11:
+                self._migrate_v11(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -600,6 +607,49 @@ class SessionStore:
             (10, _serialize_datetime(_utc_now())),
         )
 
+    def _migrate_v11(self, conn: sqlite3.Connection) -> None:
+        """Allow non-tool permission decisions in the audit hash chain."""
+
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS audit_logs_v11 (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                action_type TEXT CHECK(action_type IN (
+                    'tool_call', 'command_run', 'file_write',
+                    'safety_block', 'user_approval', 'permission_mode'
+                )),
+                target_resource TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                result TEXT CHECK(result IN (
+                    'APPROVED', 'DENIED', 'BLOCKED_BY_GUARD', 'SUCCESS', 'FAILURE'
+                )),
+                sha256_hash TEXT,
+                previous_hash TEXT DEFAULT ''
+            );
+
+            INSERT INTO audit_logs_v11 (
+                session_id, timestamp, action_type, target_resource,
+                details_json, result, sha256_hash, previous_hash
+            )
+            SELECT session_id, timestamp, action_type, target_resource,
+                   details_json, result, sha256_hash, previous_hash
+            FROM audit_logs ORDER BY log_id;
+
+            DROP TABLE audit_logs;
+            ALTER TABLE audit_logs_v11 RENAME TO audit_logs;
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_logs(session_id)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (11, _serialize_datetime(_utc_now())),
+        )
+
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
     ) -> Path:
@@ -699,7 +749,8 @@ class SessionStore:
                         'command_run',
                         'file_write',
                         'safety_block',
-                        'user_approval'
+                        'user_approval',
+                        'permission_mode'
                     )),
                     target_resource TEXT NOT NULL,
                     details_json TEXT NOT NULL,

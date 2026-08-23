@@ -201,3 +201,57 @@ def test_interactive_runtime_reports_invalid_permission_policy(
     error = capsys.readouterr().err
     assert "invalid permission policy" in error
     assert "cannot read permission rule file" in error
+
+
+def test_runtime_permission_mode_changes_are_audit_chained(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from ash.core.session import SessionStore
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    db_dir = home / ".ash" / "db"
+    db_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
+    async def fake_repl(loop, config, sandbox_manager, *, session_id):
+        await loop.start_session()
+        loop.permission_policy = PermissionPolicy(
+            "plan",
+            managed_rules=loop.permission_policy.managed_rules,
+            persistent_rules=loop.permission_policy.persistent_rules,
+            session_rules=loop.permission_policy.session_rules,
+        )
+        config.safety_tier = "plan"
+        if loop.current_session is not None:
+            loop.session_store.append_audit_log(
+                loop.current_session.session_id,
+                action_type="permission_mode",
+                target_resource="plan",
+                details={"previous_mode": "interactive", "mode": "plan"},
+                result="SUCCESS",
+            )
+        return 0
+
+    monkeypatch.setattr(
+        "ash.cli._bootstrap_and_repl",
+        fake_repl,
+    )
+
+    assert main([]) == 0
+    store = SessionStore(db_dir / "sessions.db")
+    try:
+        session = store.list_sessions(project_path=str(workspace))[0]
+        audit = store.list_audit_logs(session.session_id)
+        mode_events = [item for item in audit if item.action_type == "permission_mode"]
+        assert len(mode_events) == 1
+        assert mode_events[0].target_resource == "plan"
+        assert mode_events[0].result == "SUCCESS"
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        pass
