@@ -554,6 +554,11 @@ Interactive sessions use the responsive transcript viewport by default. Use
 output. Set `ASH_TUI_MODE=inline` when native terminal scrollback is preferred
 or a terminal does not support full-screen applications reliably.
 
+Approval previews use a bounded unified diff by default. Run
+`ash diff-mode side-by-side` to persist a side-by-side layout for write and edit
+approvals, or `ash diff-mode unified` to switch back. Both layouts preserve the
+same 200-line safety bound.
+
 Set `ASH_SCREEN_READER_MODE=true` for linear, non-rewriting terminal output.
 This mode forces inline rendering, no color, reduced motion, and no token bar;
 it also disables dynamic completion, autosuggestions, and the bottom toolbar

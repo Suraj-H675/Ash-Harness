@@ -84,6 +84,7 @@ PROJECT_CONFIG_FIELDS = frozenset(
         "context_compaction_threshold",
         "context_recent_messages",
         "context_budget_weights",
+        "approval_diff_mode",
         "no_color",
         "reduced_motion",
         "screen_reader_mode",
@@ -405,6 +406,10 @@ class AshConfig(BaseSettings):
         "interactive",
         description="Permission mode: interactive, auto_edit, plan, auto_approve, or dry_run.",
     )
+    approval_diff_mode: str = Field(
+        "unified",
+        description="Approval preview layout: unified or side-by-side.",
+    )
     no_color: bool = Field(
         False,
         description="Disable ANSI colors in the interactive terminal UI.",
@@ -700,6 +705,16 @@ class AshConfig(BaseSettings):
         except ValueError as exc:
             allowed = ", ".join(mode.value for mode in PermissionMode)
             raise ValueError(f"safety_tier must be one of: {allowed}") from exc
+
+    @field_validator("approval_diff_mode")
+    @classmethod
+    def validate_approval_diff_mode(cls, value: str) -> str:
+        normalized = value.strip().casefold().replace("_", "-")
+        if normalized not in {"unified", "side-by-side"}:
+            raise ValueError(
+                "approval_diff_mode must be unified or side-by-side"
+            )
+        return normalized
 
     @field_validator("sandbox_backend")
     @classmethod

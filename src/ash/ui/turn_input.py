@@ -44,6 +44,9 @@ class InteractiveTurnController:
         self.write_status = write_status
         self.notifier = notifier
         self.notification_include_preview = notification_include_preview
+        self.diff_mode = getattr(loop, "_config", None) and getattr(
+            loop._config, "approval_diff_mode", "unified"
+        ) or "unified"
         self._steering_read: asyncio.Task[str] | None = None
         self._approval_active = False
         self._approval_complete = asyncio.Event()
@@ -124,7 +127,6 @@ class InteractiveTurnController:
         if decision.action == PolicyAction.ALLOW:
             return True
         if self.ui.is_tool_approved_for_session(tool_name):
-            self.ui.show_tool_approval(tool_name, arguments, auto=True)
             return True
 
         self._approval_active = True
@@ -134,7 +136,12 @@ class InteractiveTurnController:
             NotificationEvent.APPROVAL_REQUIRED,
             f"Ash needs approval: {tool_name}",
         )
-        self.ui.show_tool_approval(tool_name, arguments, auto=False)
+        self.ui.show_tool_approval(
+            tool_name,
+            arguments,
+            auto=False,
+            diff_mode=self.diff_mode,
+        )
         try:
             choices = (
                 "Approve [y] once, [s] scope/session, [a] tool/session, "

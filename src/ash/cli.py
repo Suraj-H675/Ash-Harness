@@ -90,12 +90,17 @@ def _print_classified_error(exc: BaseException) -> None:
 
 def _config_overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
-    if getattr(args, "mode", None) is not None:
+    if (
+        getattr(args, "mode", None) is not None
+        and getattr(args, "command", "") != "diff-mode"
+    ):
         overrides["safety_tier"] = args.mode
     if getattr(args, "ci", False):
         overrides.update({"no_color": True, "reduced_motion": True})
     if getattr(args, "db_directory", None) is not None:
         overrides["db_directory"] = args.db_directory
+    if getattr(args, "command", "") == "diff-mode" and getattr(args, "mode", None):
+        overrides["approval_diff_mode"] = args.mode
     return overrides
 
 
@@ -1417,6 +1422,11 @@ def main(argv: list[str] | None = None) -> int:
         "explain", help="Show effective config values and their sources"
     )
     config_explain.add_argument("--json", action="store_true")
+    diff_mode_parser = subparsers.add_parser(
+        "diff-mode",
+        help="Select approval diff preview layout",
+    )
+    diff_mode_parser.add_argument("mode", choices=["unified", "side-by-side"])
     trust_parser = subparsers.add_parser(
         "trust", help="Inspect or change project extension trust"
     )
@@ -2009,6 +2019,27 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+
+    if args.command == "diff-mode":
+        from ash.commands.config import load_config, save_config
+
+        try:
+            config = AshConfig.load(
+                _override_source="cli",
+                _override_detail="command-line option",
+                **_config_overrides_from_args(args),
+            )
+            user_config = load_config(strict=True)
+            if not isinstance(user_config, dict):
+                raise ValueError("user configuration must contain a TOML table")
+            user_config["approval_diff_mode"] = config.approval_diff_mode
+            save_config(user_config)
+            print(f"Approval diff mode saved: {config.approval_diff_mode}")
+            return 0
+        except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
+            error = classify_exception(exc)
+            print(format_error(error), file=sys.stderr)
+            return error.exit_code
 
     if args.command == "trust":
         from ash.safety.trust import (

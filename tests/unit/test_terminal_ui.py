@@ -1,6 +1,7 @@
 # tests/unit/test_terminal_ui.py
 from ash.ui.terminal import TerminalUI
 from io import StringIO
+import pytest
 from rich.console import Console
 from types import SimpleNamespace
 
@@ -160,6 +161,50 @@ def test_terminal_ui_builds_workspace_edit_preview(tmp_path):
     )
     assert "-old" in preview
     assert "+new" in preview
+
+
+def test_side_by_side_approval_preview_is_bounded_and_labeled(tmp_path):
+    target = tmp_path / "example.txt"
+    target.write_text("\n".join(f"old {index}" for index in range(250)) + "\n")
+    ui = TerminalUI(workspace_root=tmp_path)
+
+    preview = ui._edit_preview(
+        "whole_edit",
+        {
+            "file_path": "example.txt",
+            "content": "\n".join(
+                f"new {index}" if index % 2 == 0 else f"old {index}"
+                for index in range(250)
+            )
+            + "\n",
+        },
+        side_by_side=True,
+    )
+    lines = preview.splitlines()
+
+    assert lines[0].startswith("--- a/example.txt")
+    assert lines[1].startswith("+++ b/example.txt")
+    assert " | " in preview
+    assert len(lines) <= 201
+    assert lines[-1] == "[diff preview truncated]"
+
+    ui.show_tool_approval(
+        "whole_edit",
+        {"file_path": "example.txt", "content": "new"},
+        auto=False,
+        diff_mode="side-by-side",
+    )
+    approval = ui.transcript.snapshot()[-1]
+    assert approval.kind == "approval"
+    assert "Diff preview (side-by-side):" in approval.content
+    assert "old 0" in approval.content
+    assert " | " in approval.content
+
+
+def test_show_tool_approval_rejects_unknown_diff_mode():
+    ui = TerminalUI(safety_tier="dry_run")
+    with pytest.raises(ValueError, match="diff_mode"):
+        ui.show_tool_approval("whole_edit", {}, auto=False, diff_mode="split")
 
 
 def test_terminal_ui_renders_tool_lifecycle_without_arguments() -> None:

@@ -262,6 +262,13 @@ def test_terminal_preferences_are_validated() -> None:
     assert config.keybindings["newline"] == ["c-o"]
 
 
+def test_approval_diff_mode_is_validated() -> None:
+    config = AshConfig(approval_diff_mode="SIDE_BY_SIDE")
+    assert config.approval_diff_mode == "side-by-side"
+    with pytest.raises(ValueError, match="approval_diff_mode"):
+        AshConfig(approval_diff_mode="split")
+
+
 def test_screen_reader_mode_forces_linear_terminal_preferences() -> None:
     config = AshConfig(
         screen_reader_mode=True,

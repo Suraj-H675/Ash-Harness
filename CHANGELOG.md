@@ -22,6 +22,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Selectable approval diff layouts with persisted `unified`/`side-by-side`
+  configuration, bounded side-by-side rendering, interactive controller wiring,
+  and CLI switching through `ash diff-mode`.
 - Selectable dark/light terminal themes with validated configuration,
   project-layer selection, Rich panel styling, prompt-toolkit viewport styling,
   and explicit screen-reader fallback behavior.

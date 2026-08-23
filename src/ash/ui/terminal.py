@@ -393,12 +393,16 @@ class TerminalUI:
         arguments: dict[str, Any] | dict[str, object],
         *,
         auto: bool,
+        diff_mode: str = "unified",
     ) -> None:
+        if diff_mode not in {"unified", "side-by-side"}:
+            raise ValueError("diff_mode must be unified or side-by-side")
         self._render_approval_notice(
             tool_name,
             dict(arguments),
             auto=auto,
             scope_options=not auto,
+            side_by_side=diff_mode == "side-by-side",
         )
 
     def _render_approval_notice(
@@ -408,6 +412,7 @@ class TerminalUI:
         *,
         auto: bool,
         scope_options: bool = False,
+        side_by_side: bool = False,
     ) -> None:
         # Suspend the live render while we print the approval panel.
         live = getattr(self, "_active_live", None)
@@ -422,9 +427,16 @@ class TerminalUI:
             body.append(f"  {key} = ", style="dim")
             body.append(repr(value))
             body.append("\n")
-        preview = self._edit_preview(tool_name, arguments)
+        preview = self._edit_preview(
+            tool_name,
+            arguments,
+            side_by_side=side_by_side,
+        )
         if preview:
-            body.append("\nDiff preview:\n", style="bold")
+            body.append(
+                "\nDiff preview (side-by-side):\n" if side_by_side else "\nDiff preview:\n",
+                style="bold",
+            )
             body.append(preview, style="dim")
         if auto:
             body.append("\n[auto-approved]", style=self.theme.success)
@@ -493,7 +505,13 @@ class TerminalUI:
                     metadata=dict(message.metadata),
                 )
 
-    def _edit_preview(self, tool_name: str, arguments: dict[str, Any]) -> str:
+    def _edit_preview(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        side_by_side: bool = False,
+    ) -> str:
         if tool_name == "apply_patch":
             patch = arguments.get("patch")
             if isinstance(patch, str):
@@ -506,14 +524,12 @@ class TerminalUI:
             before = arguments.get("target_content")
             after = arguments.get("replacement_content")
             if isinstance(before, str) and isinstance(after, str):
-                return "\n".join(
-                    difflib.unified_diff(
-                        before.splitlines(),
-                        after.splitlines(),
-                        fromfile="target",
-                        tofile="replacement",
-                        lineterm="",
-                    )
+                return self._render_diff(
+                    "target",
+                    "replacement",
+                    before.splitlines(),
+                    after.splitlines(),
+                    side_by_side=side_by_side,
                 )
         if tool_name == "replace_file_edits":
             edits = arguments.get("edits")
@@ -526,14 +542,12 @@ class TerminalUI:
                     after = edit.get("replacement_content")
                     if not isinstance(before, str) or not isinstance(after, str):
                         continue
-                    diff = "\n".join(
-                        difflib.unified_diff(
-                            before.splitlines(),
-                            after.splitlines(),
-                            fromfile=f"edit-{index}-target",
-                            tofile=f"edit-{index}-replacement",
-                            lineterm="",
-                        )
+                    diff = self._render_diff(
+                        f"edit-{index}-target",
+                        f"edit-{index}-replacement",
+                        before.splitlines(),
+                        after.splitlines(),
+                        side_by_side=side_by_side,
                     )
                     if diff:
                         previews.append(diff)
@@ -561,18 +575,72 @@ class TerminalUI:
             before = path.read_text(encoding="utf-8") if path.is_file() else ""
         except (OSError, UnicodeError):
             return "[preview unavailable: existing file is not readable text]"
-        lines = list(
-            difflib.unified_diff(
-                before.splitlines(),
-                content.splitlines(),
-                fromfile=f"a/{relative.as_posix()}",
-                tofile=f"b/{relative.as_posix()}",
-                lineterm="",
-            )
+        preview = self._render_diff(
+            f"a/{relative.as_posix()}",
+            f"b/{relative.as_posix()}",
+            before.splitlines(),
+            content.splitlines(),
+            side_by_side=side_by_side,
         )
+        if not preview:
+            return preview
+        lines = preview.splitlines()
         if len(lines) > 200:
             lines = lines[:200] + ["[diff preview truncated]"]
         return "\n".join(lines)
+
+    @staticmethod
+    def _render_diff(
+        old_name: str,
+        new_name: str,
+        old_lines: list[str],
+        new_lines: list[str],
+        *,
+        side_by_side: bool = False,
+    ) -> str:
+        if not side_by_side:
+            return "\n".join(
+                difflib.unified_diff(
+                    old_lines,
+                    new_lines,
+                    fromfile=old_name,
+                    tofile=new_name,
+                    lineterm="",
+                )
+            )
+        matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+        left_width, right_width = 38, 38
+        rows: list[tuple[str, str]] = []
+        for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+            old_slice = old_lines[old_start:old_end]
+            new_slice = new_lines[new_start:new_end]
+            if tag == "equal":
+                rows.extend((line, line) for line in old_slice)
+            elif tag == "delete":
+                rows.extend((line, "") for line in old_slice)
+            elif tag == "insert":
+                rows.extend(("", line) for line in new_slice)
+            else:
+                for index in range(max(len(old_slice), len(new_slice))):
+                    rows.append(
+                        (
+                            old_slice[index] if index < len(old_slice) else "",
+                            new_slice[index] if index < len(new_slice) else "",
+                        )
+                    )
+        output: list[str] = [
+            "--- " + old_name.ljust(left_width)[:left_width],
+            "+++ " + new_name.ljust(right_width)[:right_width],
+        ]
+        for old_line, new_line in rows[:198]:
+            output.append(
+                old_line.ljust(left_width)[:left_width]
+                + " | "
+                + new_line[:right_width]
+            )
+        if len(rows) > 198:
+            output.append("[diff preview truncated]")
+        return "\n".join(output)
 
     # --- sprint planning surface (Sprint 12 / V5) -----------------------
 
