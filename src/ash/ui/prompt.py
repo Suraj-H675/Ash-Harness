@@ -104,6 +104,7 @@ class PromptInput:
         workspace_root: Path | None = None,
         transcript: Transcript | None = None,
         tui_mode: str = "inline",
+        theme: str = "dark",
         screen_reader_mode: bool = False,
     ) -> None:
         if input_mode not in {"emacs", "vi"}:
@@ -138,6 +139,7 @@ class PromptInput:
                     status_provider=status_provider,
                     input_mode=input_mode,
                     keybindings=keybindings,
+                    theme=theme,
                 )
             else:
                 self._session = PromptSession(

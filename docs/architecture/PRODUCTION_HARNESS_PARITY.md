@@ -111,7 +111,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Diff preview | Partial | Bounded unified previews for writes/replacements/patches; side-by-side view remains |
 | Approval dialog | Partial | Allow once, exact session, broad session, exact project, persisted exact deny, and verified command-prefix project scopes are wired; deny-with-feedback and a full-screen scope editor remain |
 | Status line | Verified locally | Cached model, mode, branch, context budget, prompt-cache totals, cost, sandbox, session, and cwd state |
-| Themes | Partial | ANSI-safe no-color mode is wired; selectable light/dark themes remain |
+| Themes | Verified locally | Validated dark/light palettes are wired through config precedence, streamed Rich panels, approvals/status output, inline prompts, and the responsive viewport; screen-reader/no-color fallback remains ANSI-safe |
 | Configurable keybindings | Verified locally | Cross-platform newline/editor actions with collision validation |
 | Vim input mode | Verified locally | Optional Emacs or Vim prompt-toolkit editing mode |
 | External editor | Verified locally | Prompt-toolkit external-editor integration |

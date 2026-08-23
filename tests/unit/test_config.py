@@ -266,6 +266,7 @@ def test_screen_reader_mode_forces_linear_terminal_preferences() -> None:
     config = AshConfig(
         screen_reader_mode=True,
         tui_mode="viewport",
+        theme="light",
         no_color=False,
         reduced_motion=False,
         show_token_meter=True,
@@ -273,9 +274,40 @@ def test_screen_reader_mode_forces_linear_terminal_preferences() -> None:
 
     assert config.screen_reader_mode is True
     assert config.tui_mode == "inline"
+    assert config.theme == "dark"
     assert config.no_color is True
     assert config.reduced_motion is True
     assert config.show_token_meter is False
+
+
+def test_terminal_theme_is_validated_and_project_configurable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = AshConfig(theme="LIGHT")
+
+    assert config.theme == "light"
+    with pytest.raises(ValueError, match="theme"):
+        AshConfig(theme="solarized")
+
+    from ash.safety.trust import set_workspace_trusted
+
+    root = tmp_path / "theme-repo"
+    _make_git_root(root)
+    (root / ".ash").mkdir()
+    (root / ".ash" / "config.toml").write_text(
+        'theme = "light"\n',
+        encoding="utf-8",
+    )
+
+    _use_temporary_trust_store(tmp_path, monkeypatch)
+    monkeypatch.chdir(root)
+    set_workspace_trusted(root, True)
+
+    assert AshConfig.load().theme == "light"
+    assert AshConfig.load().config_source("theme") == (
+        "project",
+        str(root / ".ash" / "config.toml"),
+    )
 
 
 def test_terminal_notification_preferences_are_validated() -> None:

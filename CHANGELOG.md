@@ -22,6 +22,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Selectable dark/light terminal themes with validated configuration,
+  project-layer selection, Rich panel styling, prompt-toolkit viewport styling,
+  and explicit screen-reader fallback behavior.
 - Local-only aggregate model usage metrics through `ash metrics`, with no
   network telemetry.
 - Plugin manifest schema v2 with explicit compatibility policy: schema 1 is

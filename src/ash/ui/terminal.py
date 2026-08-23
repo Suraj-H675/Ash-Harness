@@ -30,6 +30,7 @@ from rich.progress import BarColumn, Progress, TaskID, TextColumn
 from rich.text import Text
 
 from ash.ui.transcript import Transcript
+from ash.ui.theme import get_theme
 
 
 ApprovalCallback = Callable[[str, dict[str, Any]], bool]
@@ -75,6 +76,7 @@ class TerminalUI:
         show_token_meter: bool = False,
         no_color: bool = False,
         reduced_motion: bool = False,
+        theme: str = "dark",
         screen_reader_mode: bool = False,
         workspace_root: Path | None = None,
         transcript: Transcript | None = None,
@@ -94,7 +96,9 @@ class TerminalUI:
             no_color = True
             reduced_motion = True
             show_token_meter = False
+            theme = "dark"
         self.console = console or Console(no_color=no_color)
+        self.theme = get_theme(theme)
         self._input_stream = input_stream or sys.stdin
         self._active_buffers: _LiveBuffers | None = None
         self._active_live: Live | None = None
@@ -185,13 +189,13 @@ class TerminalUI:
                     self._render_token_meter(
                         self._current_tokens, self._maximum_tokens
                     ),
-                    style="dim",
+                    style="dim italic" if self.theme.name == "light" else "dim",
                 )
             )
         return Panel(
             Group(*parts),
             title="ash",
-            border_style="cyan",
+            border_style=self.theme.border_primary,
             padding=(0, 1),
         )
 
@@ -322,13 +326,13 @@ class TerminalUI:
         if output_entry is not None:
             self.transcript.finalize(output_entry)
         labels = {
-            "tool.started": ("started", "cyan"),
+            "tool.started": ("started", self.theme.prompt),
             "tool.completed": (
                 "completed" if payload.get("success") else "failed",
-                "green" if payload.get("success") else "red",
+                self.theme.success if payload.get("success") else self.theme.error,
             ),
-            "tool.denied": ("denied", "yellow"),
-            "tool.error": ("error", "red"),
+            "tool.denied": ("denied", self.theme.border_approval),
+            "tool.error": ("error", self.theme.error),
         }
         label, style = labels[event_type]
         self.transcript.append(
@@ -341,7 +345,9 @@ class TerminalUI:
                 if key in payload
             },
         )
-        line = Text("tool ", style="dim")
+        line = Text(
+            "tool ", style="dim italic" if self.theme.name == "light" else "dim"
+        )
         line.append(tool, style="bold")
         line.append(f" [{label}]", style=style)
         if not self.viewport_mode:
@@ -410,7 +416,7 @@ class TerminalUI:
 
         body = Text()
         body.append("Tool: ", style="bold")
-        body.append(tool_name, style="cyan")
+        body.append(tool_name, style=self.theme.prompt)
         body.append("\nArgs:\n")
         for key, value in arguments.items():
             body.append(f"  {key} = ", style="dim")
@@ -421,7 +427,7 @@ class TerminalUI:
             body.append("\nDiff preview:\n", style="bold")
             body.append(preview, style="dim")
         if auto:
-            body.append("\n[auto-approved]", style="green")
+            body.append("\n[auto-approved]", style=self.theme.success)
         elif scope_options:
             command_choice = (
                 ", command prefix for project [c]" if tool_name == "run_command" else ""
@@ -430,12 +436,12 @@ class TerminalUI:
                 "\nApprove once [y], scoped for session [s], tool for session [a], "
                 "scoped for project [p], deny scope for project [x]"
                 f"{command_choice}, or deny [N]? ",
-                style="bold yellow",
+                style=self.theme.approval_prompt,
             )
         else:
             body.append(
                 "\nApprove once [y], for this session [a], or deny [N]? ",
-                style="bold yellow",
+                style=self.theme.approval_prompt,
             )
         self.transcript.append(
             "approval",
@@ -448,7 +454,13 @@ class TerminalUI:
                 self.console.print("Approval:", markup=False, highlight=False)
                 self.console.print(body.plain, markup=False, highlight=False)
             else:
-                self.console.print(Panel(body, border_style="yellow", title="approval"))
+                self.console.print(
+                    Panel(
+                        body,
+                        border_style=self.theme.border_approval,
+                        title="approval",
+                    )
+                )
 
         if live is not None:
             live.start()
@@ -590,7 +602,10 @@ class TerminalUI:
                 try:
                     self._edit_plan(execution)
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                    self.console.print(f"Plan edit failed: {exc}", style="red")
+                    self.console.print(
+                        f"Plan edit failed: {exc}",
+                        style=self.theme.error,
+                    )
                     return False
         finally:
             if live is not None:
@@ -631,7 +646,10 @@ class TerminalUI:
                 body.append(f"  {mark} [{item.section}] {item.description}\n")
         else:
             body.append("  (empty)\n")
-        body.append("\nApprove [y], edit [e], or deny [N]?", style="bold yellow")
+        body.append(
+            "\nApprove [y], edit [e], or deny [N]?",
+            style=self.theme.approval_prompt,
+        )
         self.transcript.append(
             "approval",
             body.plain,
@@ -650,7 +668,7 @@ class TerminalUI:
                 self.console.print(
                     Panel(
                         body,
-                        border_style="cyan",
+                        border_style=self.theme.border_primary,
                         title=f"sprint {execution.contract.contract_id[:8]}",
                     )
                 )
@@ -661,7 +679,10 @@ class TerminalUI:
         else:
             self.transcript.append("status", text, title="status")
         if not self.viewport_mode:
-            self.console.print(text, style="red" if error else None)
+            self.console.print(
+                text,
+                style=self.theme.error if error else None,
+            )
 
     def _edit_plan(self, execution: Any) -> None:
         from ash.core.planner import apply_sprint_markdown_edit, render_sprint_markdown

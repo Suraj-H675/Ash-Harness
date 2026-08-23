@@ -87,6 +87,7 @@ PROJECT_CONFIG_FIELDS = frozenset(
         "no_color",
         "reduced_motion",
         "screen_reader_mode",
+        "theme",
         "show_token_meter",
         "input_mode",
         "tui_mode",
@@ -415,6 +416,10 @@ class AshConfig(BaseSettings):
     screen_reader_mode: bool = Field(
         False,
         description="Use linear, non-rewriting interactive terminal output.",
+    )
+    theme: str = Field(
+        "dark",
+        description="Interactive terminal palette: dark or light.",
     )
     show_token_meter: bool = Field(
         False,
@@ -832,6 +837,13 @@ class AshConfig(BaseSettings):
             raise ValueError("tui_mode must be viewport or inline")
         return normalized
 
+    @field_validator("theme")
+    @classmethod
+    def validate_theme(cls, value: str) -> str:
+        from ash.ui.theme import normalize_theme_name
+
+        return normalize_theme_name(value)
+
     @field_validator("notification_method")
     @classmethod
     def validate_notification_method(cls, value: str) -> str:
@@ -884,6 +896,7 @@ class AshConfig(BaseSettings):
         if not self.screen_reader_mode:
             return self
         self.no_color = True
+        self.theme = "dark"
         self.reduced_motion = True
         self.show_token_meter = False
         self.tui_mode = "inline"
@@ -1087,7 +1100,7 @@ class AshConfig(BaseSettings):
     def _record_derived_sources(self) -> None:
         if not self.screen_reader_mode:
             return
-        for field in ("no_color", "reduced_motion", "show_token_meter", "tui_mode"):
+        for field in ("no_color", "reduced_motion", "show_token_meter", "tui_mode", "theme"):
             self._config_sources[field] = ("derived", "screen_reader_mode")
 
     def model_post_init(self, *args: Any, **kwargs: Any) -> None:

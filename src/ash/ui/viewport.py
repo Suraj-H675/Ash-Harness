@@ -35,6 +35,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 from ash.ui.transcript import Transcript, TranscriptEntry, TranscriptEvent
+from ash.ui.theme import Theme, get_theme, viewport_styles
 
 
 _ENTRY_STYLE = {
@@ -130,6 +131,7 @@ class TranscriptViewport:
         status_provider: Callable[[], str] | None = None,
         input_mode: str = "emacs",
         keybindings: dict[str, list[str]] | None = None,
+        theme: str = "dark",
         input: Input | None = None,
         output: Output | None = None,
     ) -> None:
@@ -146,6 +148,7 @@ class TranscriptViewport:
             "newline": ["escape enter", "c-j"],
             "open_editor": ["c-x c-e"],
         }
+        selected_theme: Theme = get_theme(theme)
 
         self.input_buffer = Buffer(
             history=FileHistory(str(history_path)),
@@ -193,23 +196,7 @@ class TranscriptViewport:
             full_screen=True,
             erase_when_done=False,
             editing_mode=EditingMode.VI if input_mode == "vi" else EditingMode.EMACS,
-            style=Style.from_dict(
-                {
-                    "user-prefix": "bold #5fd7ff",
-                    "assistant-prefix": "bold #5fff87",
-                    "reasoning-prefix": "italic #808080",
-                    "reasoning": "italic #a8a8a8",
-                    "tool-prefix": "bold #ffd75f",
-                    "approval-prefix": "bold #ffaf5f",
-                    "status-prefix": "bold #808080",
-                    "error-prefix": "bold #ff5f5f",
-                    "streaming": "italic #808080",
-                    "prompt": "bold #5fd7ff",
-                    "composer": "bg:#1c1c1c",
-                    "separator": "#444444",
-                    "status": "bg:#262626 #bcbcbc",
-                }
-            ),
+            style=Style.from_dict(viewport_styles(selected_theme)),
             input=input,
             output=output,
             min_redraw_interval=0.03,

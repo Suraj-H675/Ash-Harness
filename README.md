@@ -545,9 +545,9 @@ an exact-content migration record prevents repeated prompts while retaining
 recovery evidence.
 
 Terminal behavior is configurable with `ASH_INPUT_MODE=vi`,
-`ASH_NO_COLOR=true`, `ASH_REDUCED_MOTION=true`, and
-`ASH_SHOW_TOKEN_METER=true`. Structured keybindings and sprint planning can be
-set in `~/.ash/ash.toml`.
+`ASH_NO_COLOR=true`, `ASH_REDUCED_MOTION=true`, `ASH_THEME=light`, and
+`ASH_SHOW_TOKEN_METER=true`. Structured keybindings, sprint planning, and
+terminal appearance can be set in `~/.ash/ash.toml`.
 
 Interactive sessions use the responsive transcript viewport by default. Use
 `PageUp`/`PageDown` to inspect history and `End` to resume following live
@@ -558,6 +558,14 @@ Set `ASH_SCREEN_READER_MODE=true` for linear, non-rewriting terminal output.
 This mode forces inline rendering, no color, reduced motion, and no token bar;
 it also disables dynamic completion, autosuggestions, and the bottom toolbar
 while retaining cancellable cross-platform prompt input and command history.
+
+Terminal colors use the high-contrast dark theme by default. Set
+`theme = "light"` in configuration (or `ASH_THEME=light`) for a palette tuned
+for light terminals. The setting applies to streamed panels, approval dialogs,
+status surfaces, inline prompts, and the full-screen transcript viewport. It is
+a presentation preference that trusted project configuration may select;
+screen-reader mode intentionally forces the dark palette while disabling color
+output.
 
 Desktop notifications are disabled by default. Enable terminal-aware desktop
 notifications with `ASH_NOTIFICATION_METHOD=auto`, or choose `osc9` or `bel`

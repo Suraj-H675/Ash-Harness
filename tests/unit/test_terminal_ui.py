@@ -20,6 +20,15 @@ def test_terminal_ui_supports_no_color_and_reduced_motion():
     assert ui.show_token_meter is True
 
 
+def test_terminal_ui_selects_theme_palette() -> None:
+    dark = TerminalUI(theme="dark")
+    light = TerminalUI(theme="light")
+
+    assert dark.theme.name == "dark"
+    assert light.theme.name == "light"
+    assert light.theme.border_primary == "#005faf"
+
+
 def test_screen_reader_mode_emits_linear_non_rewriting_output() -> None:
     output = StringIO()
     ui = TerminalUI(
