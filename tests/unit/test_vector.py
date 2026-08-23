@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 from pathlib import Path
 
@@ -378,3 +379,46 @@ def test_pipeline_index_empty_chunks_is_noop() -> None:
         return await pipeline.index_chunks([], file_path="a.py")
 
     assert asyncio.run(runner()) == 0
+
+
+def test_pipeline_export_is_bounded_and_redacted(tmp_path: Path) -> None:
+    secret = "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz"
+    pipeline = VectorSearchPipeline(
+        adapter=DeterministicEmbedding(),
+        vector_index=InMemoryVectorIndex(),
+        lexical_index=FTS5FallbackIndex(FTS5Index(tmp_path / "export.db")),
+    )
+    asyncio.run(
+        pipeline.index_chunks(
+            [
+                Chunk(
+                    file_path="secret.py",
+                    start_line=1,
+                    end_line=1,
+                    content=f"token {secret}",
+                )
+            ],
+            file_path="secret.py",
+        )
+    )
+    asyncio.run(
+        pipeline.index_chunks(
+            [
+                Chunk(
+                    file_path="lexical.py",
+                    start_line=1,
+                    end_line=1,
+                    content=f"lexical token {secret}",
+                )
+            ],
+            file_path="lexical.py",
+        )
+    )
+
+    exported = pipeline.export(limit=1)
+
+    assert exported["redacted"] is True
+    assert exported["count"] == 1
+    assert len(exported["records"]) == 1
+    assert secret not in json.dumps(exported)
+    assert "[REDACTED" in json.dumps(exported)

@@ -22,11 +22,13 @@ import math
 import sqlite3
 import struct
 from abc import ABC, abstractmethod
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from ash.context.compaction import Chunk
+from ash.core.redaction import redact_text
 from ash.memory.fts5 import FTS5Index, query_lexical_fallback
 
 
@@ -687,6 +689,79 @@ class VectorSearchPipeline:
         self._vector_index.clear()
         if self._lexical_index is not None:
             self._lexical_index.clear()
+
+    def export(
+        self,
+        *,
+        limit: int = 1000,
+    ) -> dict[str, Any]:
+        """Return bounded, redacted indexed content for privacy inspection."""
+
+        if limit < 1 or limit > 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        exported = self._export_records(limit)
+        return {
+            "count": len(exported),
+            "limit": limit,
+            "redacted": True,
+            "records": exported,
+        }
+
+    def _export_records(self, limit: int) -> list[dict[str, Any]]:
+        vector_records: list[dict[str, Any]] = []
+        if isinstance(self._vector_index, InMemoryVectorIndex):
+            vector_records = [
+                {
+                    "source": "vector",
+                    "chunk_key": str(
+                        record.get("metadata", {}).get("chunk_key", record["id"])
+                    ),
+                    "file_path": redact_text(
+                        str(record.get("metadata", {}).get("file_path", ""))
+                    ),
+                    "content": redact_text(str(record["document"])[:4_000]),
+                    "metadata": {
+                        key: value
+                        for key, value in record.get("metadata", {}).items()
+                        if isinstance(value, (str, int, float, bool))
+                    },
+                }
+                for record in self._vector_index._records[:limit]
+            ]
+            if len(vector_records) >= limit:
+                return vector_records[:limit]
+        lexical = self._lexical_index
+        if isinstance(lexical, FTS5FallbackIndex):
+            with closing(sqlite3.connect(str(lexical._index.db_path))) as connection:
+                connection.row_factory = sqlite3.Row
+                rows = connection.execute(
+                    """
+                    SELECT file_path, content, symbol_tags
+                    FROM fts_index
+                    ORDER BY rowid
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+                vector_records.extend(
+                    {
+                        "source": "lexical",
+                        "chunk_key": f"{row['file_path']}:{index + 1}",
+                        "file_path": redact_text(row["file_path"]),
+                        "content": redact_text(row["content"][:4_000]),
+                        "symbol_tags": redact_text(row["symbol_tags"]),
+                    }
+                    for index, row in enumerate(rows)
+                )
+        seen: set[tuple[str, str]] = set()
+        unique: list[dict[str, Any]] = []
+        for record in vector_records:
+            identity = (record["source"], record["content"])
+            if identity in seen:
+                continue
+            seen.add(identity)
+            unique.append(record)
+        return unique
 
 
 # ---------------------------------------------------------------------------

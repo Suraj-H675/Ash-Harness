@@ -1258,6 +1258,12 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     for hit in hits:
                         print(f"{hit.score:.3f} {hit.file_path}: {hit.content[:300]}")
                     continue
+                if action == "export" and len(arguments) == 1:
+                    if loop._vector_pipeline is None:
+                        print("Memory is disabled.")
+                    else:
+                        print(json.dumps(loop._vector_pipeline.export(), sort_keys=True))
+                    continue
                 if action == "clear" and len(arguments) == 1:
                     if loop._vector_pipeline is None:
                         print("Memory is disabled.")

@@ -82,7 +82,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Session memory | Partial | Searchable summaries rather than raw transcript concatenation |
 | Project memory | Partial | Explicit project-scoped index/search/clear controls; automatic policy remains |
 | Semantic memory | Partial | In-memory, Chroma, and FTS5 backend selection with index/search/delete lifecycle |
-| Memory privacy | Partial | Project scope and explicit delete; retention/redacted export remain |
+| Memory privacy | Verified locally | Project scope, explicit delete, bounded redacted semantic-memory export across in-memory and FTS-backed indexes |
 
 ## 4. Sessions And Recovery
 

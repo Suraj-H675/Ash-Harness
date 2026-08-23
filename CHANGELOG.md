@@ -20,6 +20,8 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Bounded, redacted semantic-memory export for in-memory and FTS-backed
+  indexes through `/memory export`.
 - Full interactive `/agents --full` status view with durable task identity,
   token budgets, and USD cost usage alongside live worker state.
 - Durable graph-consolidation artifacts for delegated agent results, with
