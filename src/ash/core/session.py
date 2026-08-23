@@ -100,6 +100,7 @@ class SessionSummary(BaseModel):
     fork_message_count: int | None = None
     branch_name: str = ""
     depth: int = 0
+    context_summary: str = ""
 
 
 class SessionLineage(BaseModel):
@@ -1066,9 +1067,11 @@ class SessionStore:
             clauses.append("s.project_key = ?")
             params.append(normalize_project_path(project_path))
         if query:
-            clauses.append("(s.title LIKE ? OR s.session_id LIKE ?)")
+            clauses.append(
+                "(s.title LIKE ? OR s.session_id LIKE ? OR s.context_summary LIKE ?)"
+            )
             pattern = f"%{query}%"
-            params.extend((pattern, pattern))
+            params.extend((pattern, pattern, pattern))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         with closing(get_db_connection(self.db_path)) as conn:
@@ -1079,6 +1082,7 @@ class SessionStore:
                        COUNT(m.message_id) AS message_count, s.model,
                        s.parent_session_id, s.root_session_id,
                        s.fork_message_count, s.branch_name, s.depth
+                       , s.context_summary
                 FROM sessions s
                 LEFT JOIN messages m ON m.session_id = s.session_id
                 {where}
@@ -1102,6 +1106,7 @@ class SessionStore:
                 fork_message_count=row["fork_message_count"],
                 branch_name=row["branch_name"] or "",
                 depth=int(row["depth"] or 0),
+                context_summary=row["context_summary"] or "",
             )
             for row in rows
         ]

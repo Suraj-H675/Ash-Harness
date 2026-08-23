@@ -79,7 +79,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Repository map | Verified locally | Incremental Tree-sitter symbols/imports for Python, JS/JSX, TS/TSX, Go, Rust, Java, C/C++, and C#; configured/Git ignores, active-file ranking, and CLI/SDK injection |
 | Project instructions | Verified locally | Trusted hierarchical `ASH.md` discovery, bounded `@import` expansion, diagnostics, and conservative conflict lint across user/project/imported instructions |
 | User instructions | Verified locally | Global `~/.ash/ASH.md` is loaded with a bounded size |
-| Session memory | Partial | Searchable summaries rather than raw transcript concatenation |
+| Session memory | Verified locally | Redacted summaries are searchable across title, ID, and persisted summary metadata without raw transcript concatenation |
 | Project memory | Verified locally | Explicit project-scoped index/search/clear controls plus opt-in trusted-workspace auto-indexing bounded by file count, file size, and configured exclusions |
 | Semantic memory | Verified locally | In-memory, Chroma, and FTS5 backend selection with index/search/delete lifecycle and bounded automatic project indexing |
 | Memory privacy | Verified locally | Project scope, explicit delete, bounded redacted semantic-memory export across in-memory and FTS-backed indexes |

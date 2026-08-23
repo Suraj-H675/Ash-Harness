@@ -20,6 +20,8 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Searchable session summaries: session lookup now matches redacted context
+  summaries and exposes them in summary metadata.
 - Opt-in automatic project-memory indexing with bounded file counts, file
   sizes, trusted-project gating, deterministic shutdown, and exclusion-aware
   selection.

@@ -659,6 +659,21 @@ def test_list_and_rename_sessions(tmp_path: Path) -> None:
     }
 
 
+def test_session_summary_search_matches_redacted_context_summary(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.save_context_summary(session.session_id, "Reviewed authentication flow")
+
+    matching = store.list_sessions(project_path=str(tmp_path), query="authentication")
+    non_matching = store.list_sessions(project_path=str(tmp_path), query="payments")
+
+    assert [item.session_id for item in matching] == [session.session_id]
+    assert matching[0].context_summary == "Reviewed authentication flow"
+    assert non_matching == []
+
+
 def test_rename_unknown_session_fails(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     with pytest.raises(KeyError, match="Session not found"):
