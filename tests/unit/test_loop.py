@@ -2038,6 +2038,103 @@ async def test_invalid_execution_contract_is_rejected_before_dispatch(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_read_only_tool_calls_run_concurrently_with_stable_order(tmp_path):
+    active = 0
+    max_active = 0
+
+    class SlowReadTool(BaseTool):
+        name = "test_slow_read"
+        args_schema = None
+
+        async def run(self, **kwargs):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0.03)
+                return ToolResult(success=True, output=f"result-{kwargs['index']}")
+            finally:
+                active -= 1
+
+    guard = SafetyGuard(project_root=tmp_path)
+    store = SessionStore(tmp_path / "parallel-reads.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"test_slow_read": SlowReadTool(guard)},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+
+    results = await loop._execute_tool_calls(
+        [
+            {
+                "call_id": f"call-{index}",
+                "name": "test_slow_read",
+                "arguments": {"index": index},
+            }
+            for index in range(3)
+        ],
+        session,
+    )
+
+    assert max_active == 3
+    assert [item["output"] for item in results] == [
+        "result-0",
+        "result-1",
+        "result-2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_read_only_calls_preserve_results_on_cancellation(tmp_path):
+    class CancellableReadTool(BaseTool):
+        name = "test_cancellable_read"
+        args_schema = None
+
+        async def run(self, **kwargs):
+            if kwargs["index"] == 1:
+                await asyncio.Event().wait()
+            return ToolResult(success=True, output=f"result-{kwargs['index']}")
+
+    guard = SafetyGuard(project_root=tmp_path)
+    store = SessionStore(tmp_path / "parallel-cancel.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"test_cancellable_read": CancellableReadTool(guard)},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+    batch = asyncio.create_task(
+        loop._execute_tool_calls(
+            [
+                {
+                    "call_id": f"call-{index}",
+                    "name": "test_cancellable_read",
+                    "arguments": {"index": index},
+                }
+                for index in range(3)
+            ],
+            session,
+        )
+    )
+    await asyncio.sleep(0.01)
+    batch.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await batch
+
+    records = store.load_session(session.session_id).tool_calls
+    assert any(record.dispatched is True for record in records)
+
+
+@pytest.mark.asyncio
 async def test_provider_retries_transient_failure_before_output(tmp_path):
     class APIConnectionError(RuntimeError):
         pass

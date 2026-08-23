@@ -56,7 +56,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Native tool calling | Partial | Capability-selected native schemas/calls are isolated from text parsing and malformed, truncated, or cross-protocol calls are refused; richer provider reasoning/citation blocks remain |
 | XML fallback tool protocol | Verified locally | Enabled only for explicitly non-native providers, with incremental text/reasoning, literal-markup finalization, incomplete-control rejection, and no native-call crossover |
 | Tool execution boundary | Verified locally | Approved intents persist before dispatch; pre-hooks and middleware can stop an unstarted call; every dispatched local, plugin, and MCP tool call runs exactly once by default. Returned failures are terminal, and exceptions or lost results after dispatch are durably marked ambiguous rather than replayed. |
-| Parallel tool calls | Partial | Independent read-only calls run concurrently with deterministic result order |
+| Parallel tool calls | Verified locally | Independent read-only calls run concurrently with deterministic result order; cancellation preserves already persisted dispatch intent |
 | Turn steering | Verified locally | Bounded durable guidance queue applies at safe iteration boundaries through interactive CLI, SDK, and HTTP |
 | Interrupt/cancel | Verified locally | `/cancel` preempts live interactive turns, propagates cancellation, clears pending steering, and finalizes the turn journal |
 | Retry policy | Verified locally | One harness-owned policy retries only classified pre-output transient failures, honors bounded Retry-After, adds jittered exponential backoff, preserves cancellation, emits redacted events, and disables nested SDK retries |

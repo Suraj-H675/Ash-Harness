@@ -20,6 +20,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Regression coverage proving independent read-only tool calls execute
+  concurrently, preserve deterministic result order, and preserve durable
+  dispatch intent under cancellation.
 - Evidence-linked result consolidation for foreground agent DAGs, including
   successful/failed task summaries, path-scoped evidence, and conflict
   detection.

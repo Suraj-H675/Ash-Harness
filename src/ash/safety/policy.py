@@ -42,6 +42,8 @@ READ_ONLY_TOOLS = frozenset(
         "list_automations",
         "browser_snapshot",
         "ask_user",
+        "test_slow_read",
+        "test_cancellable_read",
     }
 )
 EDIT_TOOLS = frozenset(
