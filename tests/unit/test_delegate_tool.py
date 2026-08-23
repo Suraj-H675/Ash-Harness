@@ -294,6 +294,43 @@ async def test_delegate_graph_enforces_shared_cost_ceiling(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_delegate_graph_consolidates_evidence_and_conflicts(tmp_path: Path):
+    config, spawn, delegate = _tools(tmp_path, max_concurrency=1)
+    result = await delegate.run(
+        goal="inspect repository",
+        tasks=[
+            {
+                "key": "first",
+                "role": "reviewer",
+                "task": 'report `src/app.py` has 10 lines',
+                "isolation": "shared",
+            },
+            {
+                "key": "second",
+                "role": "reviewer",
+                "task": 'report `src/app.py` has 20 lines',
+                "depends_on": ["first"],
+                "isolation": "shared",
+            },
+        ],
+    )
+
+    assert result.success is True
+    payload = json.loads(result.output)
+    consolidation = payload["consolidation"]
+    assert consolidation["status"] == "succeeded"
+    assert consolidation["summary"] == "2 of 2 delegated tasks succeeded. 1 evidence conflict(es) detected."
+    assert consolidation["conflicts"][0]["path"] == "src/app.py"
+    assert {item["task_key"] for item in consolidation["conflicts"][0]["evidence"]} == {
+        "first",
+        "second",
+    }
+
+    await delegate.aclose()
+    await spawn.aclose()
+
+
+@pytest.mark.asyncio
 async def test_delegate_agents_runs_independent_tasks_in_parallel(
     tmp_path: Path,
 ) -> None:

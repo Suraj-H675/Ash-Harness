@@ -20,6 +20,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Evidence-linked result consolidation for foreground agent DAGs, including
+  successful/failed task summaries, path-scoped evidence, and conflict
+  detection.
 - Durable graph-wide USD cost ceilings for parallel agent DAGs, atomic
   exceedance handling, aggregate cost inspection, and provider-backed
   subagent cost reporting.

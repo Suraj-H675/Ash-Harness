@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ash.agents.shared_state import SharedState
-from ash.agents.tasks import AgentTaskCreate, AgentTaskError
+from ash.agents.tasks import AgentTask, AgentTaskCreate, AgentTaskError
 from ash.config import AshConfig
 from ash.core.redaction import redact_text
 from ash.safety.guard import SafetyGuard
@@ -179,6 +180,17 @@ class DelegateAgentsTool(BaseTool):
                     "task_ids": [task.task_id for task in terminal],
                 }
             )
+        consolidation = (
+            _consolidate_results(
+                goal=args.goal,
+                specs=args.tasks,
+                terminal_by_id={
+                    task.task_id[len(f"{graph_id}-") :]: task for task in terminal
+                },
+            )
+            if terminal
+            else None
+        )
         output = json.dumps(
             {
                 "graph_id": graph_id,
@@ -191,6 +203,7 @@ class DelegateAgentsTool(BaseTool):
                     if graph_budget is not None
                     else {}
                 ),
+                **({"consolidation": consolidation} if consolidation else {}),
                 "tasks": [
                     {
                         "key": spec.key,
@@ -231,3 +244,80 @@ class DelegateAgentsTool(BaseTool):
 
 def _error(message: str) -> ToolResult:
     return ToolResult(success=False, output="", error=message)
+
+
+def _consolidate_results(
+    *,
+    goal: str,
+    specs: list[DelegatedTaskSpec],
+    terminal_by_id: dict[str, AgentTask],
+) -> dict[str, Any]:
+    succeeded: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    evidence_by_path: dict[str, list[dict[str, str]]] = {}
+
+    for spec in specs:
+        task = terminal_by_id.get(spec.key)
+        if task is None:
+            continue
+        record = {
+            "key": spec.key,
+            "task_id": task.task_id,
+            "role": spec.role,
+            "state": task.state,
+        }
+        if task.state == "succeeded":
+            result = task.result or {}
+            summary = result.get("summary", "")
+            record["summary"] = redact_text(str(summary)[:4_000])
+            succeeded.append(record)
+
+            claim_match = re.search(
+                r"`?([\w./+-]+\.[A-Za-z0-9]{1,8})`?\s+(?:has|is|contains|reports?)\s+(.+)",
+                str(summary),
+                re.IGNORECASE,
+            )
+            if claim_match:
+                evidence_by_path.setdefault(str(Path(claim_match.group(1))), []).append(
+                    {
+                        "task_key": spec.key,
+                        "quote": redact_text(str(summary)[:500]),
+                    }
+                )
+
+            for raw_path in re.findall(
+                r"(?:^|\s)`?([\w./+-]+\.[A-Za-z0-9]{1,8})\b", str(summary)
+            ):
+                normalized = str(Path(raw_path))
+                if normalized.startswith("/") or ".." in Path(normalized).parts:
+                    continue
+                evidence_by_path.setdefault(normalized, []).append(
+                    {"task_key": spec.key, "quote": redact_text(raw_path)}
+                )
+        else:
+            record["error"] = redact_text(task.error or task.state)
+            failed.append(record)
+
+    for path, evidence in sorted(evidence_by_path.items()):
+        if len(evidence) < 2:
+            continue
+        claims = [item["quote"] for item in evidence]
+        if len(set(claims)) < 2:
+            continue
+        conflicts.append({"path": path, "evidence": evidence})
+
+    return {
+        "goal": redact_text(goal),
+        "status": "succeeded" if not failed else "failed",
+        "summary": (
+            f"{len(succeeded)} of {len(specs)} delegated tasks succeeded."
+            + (f" {len(conflicts)} evidence conflict(es) detected." if conflicts else "")
+        ),
+        "successful_tasks": succeeded,
+        "failed_tasks": failed,
+        "conflicts": conflicts,
+        "evidence_by_path": {
+            path: items for path, items in sorted(evidence_by_path.items()) if items
+        },
+    }
