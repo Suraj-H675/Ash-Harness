@@ -122,7 +122,7 @@ class InteractiveTurnController:
 
     async def _request_approval(
         self, tool_name: str, arguments: dict[str, object]
-    ) -> bool:
+    ) -> bool | str:
         decision = self.loop.permission_policy.evaluate(tool_name, dict(arguments))
         if decision.action == PolicyAction.ALLOW:
             return True
@@ -145,7 +145,7 @@ class InteractiveTurnController:
         try:
             choices = (
                 "Approve [y] once, [s] scope/session, [a] tool/session, "
-                "[p] scope/project, [x] deny scope/project"
+                "[p] scope/project, [x] deny scope/project, [f] deny with feedback"
             )
             if tool_name == "run_command":
                 choices += ", [c] command prefix/project"
@@ -178,6 +178,11 @@ class InteractiveTurnController:
                 rule = self._exact_scope_rule(RuleEffect.DENY, tool_name, arguments)
                 self._persist_rule(rule)
                 return False
+            if answer in {"f", "feedback"}:
+                feedback = (await self.prompt_input.read("Denial feedback> ")).strip()
+                if not feedback:
+                    return False
+                return feedback[:500]
             if answer in {"c", "command"} and tool_name == "run_command":
                 command_line = arguments.get("command_line")
                 if not isinstance(command_line, str):

@@ -33,7 +33,7 @@ from ash.ui.transcript import Transcript
 from ash.ui.theme import get_theme
 
 
-ApprovalCallback = Callable[[str, dict[str, Any]], bool]
+ApprovalCallback = Callable[[str, dict[str, Any]], bool | str]
 
 
 @dataclass
@@ -355,11 +355,15 @@ class TerminalUI:
 
     # --- approval surface -------------------------------------------------
 
-    def request_tool_approval(self, tool_name: str, arguments: dict[str, Any]) -> bool:
+    def request_tool_approval(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> bool | str:
         """Decide whether the loop may execute a tool call."""
 
         if self._approval_callback is not None:
-            return bool(self._approval_callback(tool_name, arguments))
+            return self._approval_callback(tool_name, arguments)
         if tool_name in self._session_approvals:
             self._render_approval_notice(tool_name, arguments, auto=True)
             return True

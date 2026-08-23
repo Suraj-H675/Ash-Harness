@@ -559,6 +559,11 @@ Approval previews use a bounded unified diff by default. Run
 approvals, or `ash diff-mode unified` to switch back. Both layouts preserve the
 same 200-line safety bound.
 
+When a tool needs approval, choose `f` to deny it with bounded feedback. Ash
+records the denial durably and returns the feedback to the model so the next
+attempt can respect the user's instruction; blank feedback falls back to a
+normal denial.
+
 Set `ASH_SCREEN_READER_MODE=true` for linear, non-rewriting terminal output.
 This mode forces inline rendering, no color, reduced motion, and no token bar;
 it also disables dynamic completion, autosuggestions, and the bottom toolbar

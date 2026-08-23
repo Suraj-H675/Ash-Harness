@@ -105,7 +105,7 @@ if TYPE_CHECKING:
 
 ToolApprovalCallback = Callable[
     [str, dict[str, Any]],  # tool_name, arguments
-    Awaitable[bool],  # True = approve, False = deny
+    Awaitable[bool | str | tuple[bool, str]],  # approve, deny+feedback
 ]
 PlanApprovalCallback = Callable[["SprintExecution"], Awaitable[bool]]
 
@@ -2059,17 +2059,33 @@ class AshLoop:
             self._emit_event({"type": "tool.requested", **event_base})
 
             decision = self.permission_policy.evaluate(tool_name, arguments)
+            denial_feedback = ""
             if decision.action == PolicyAction.DENY:
                 approved = False
             elif self.on_tool_approval is not None:
-                approved = await self.on_tool_approval(tool_name, arguments)
+                decision_result = await self.on_tool_approval(
+                    tool_name, arguments
+                )
+                if isinstance(decision_result, str):
+                    approved = False
+                    denial_feedback = decision_result.strip()
+                elif isinstance(decision_result, tuple):
+                    approved = bool(decision_result[0])
+                    denial_feedback = (
+                        str(decision_result[1]).strip() if len(decision_result) > 1 else ""
+                    )
+                else:
+                    approved = bool(decision_result)
             elif self.ui.has_approval_callback:
                 approved = self.ui.request_tool_approval(tool_name, arguments)
+                if isinstance(approved, str):
+                    denial_feedback = approved.strip()
+                    approved = False
             elif decision.action == PolicyAction.ALLOW:
                 approved = True
             else:
                 approved = self.ui.request_tool_approval(tool_name, arguments)
-            record.approved = approved
+            record.approved = bool(approved)
             if approved:
                 self._append_tool_audit(
                     session,
@@ -2086,11 +2102,14 @@ class AshLoop:
                 )
             if not approved:
                 record.executed = False
-                record.error = (
-                    decision.reason
-                    if decision.action == PolicyAction.DENY
-                    else "Denied by user"
-                )
+                if denial_feedback:
+                    record.error = f"Denied by user: {denial_feedback}"
+                else:
+                    record.error = (
+                        decision.reason
+                        if decision.action == PolicyAction.DENY
+                        else "Denied by user"
+                    )
                 self.session_store.save_tool_call(
                     session.session_id,
                     record,

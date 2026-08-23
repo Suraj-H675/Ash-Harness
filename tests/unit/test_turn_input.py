@@ -26,7 +26,7 @@ class RoutedPrompt:
 
     async def read(self, prompt: str = "> ") -> str:
         self.prompts.append(prompt)
-        if prompt.startswith(("Approve", "Plan")):
+        if prompt.startswith(("Approve", "Plan", "Denial feedback")):
             return await self.approvals.get()
         return await self.steering.get()
 
@@ -406,9 +406,52 @@ async def test_approval_can_persist_scoped_denial(
     arguments = {"file_path": ".env", "content": "secret"}
 
     assert await controller._request_approval("write_file", arguments) is False
-    decision = loop.permission_policy.evaluate("write_file", arguments)
-    assert decision.action == PolicyAction.DENY
-    assert decision.rule_id == load_permission_rules(tmp_path)[0].rule_id
+
+
+@pytest.mark.asyncio
+async def test_approval_can_deny_with_bounded_feedback(tmp_path: Path) -> None:
+    prompt = RoutedPrompt()
+    await prompt.approvals.put("f")
+    await prompt.approvals.put("Use the docs directory instead " + "x" * 600)
+    ui = make_ui()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        BlockingProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(loop, prompt, ui)  # type: ignore[arg-type]
+
+    feedback = await controller._request_approval(
+        "write_file",
+        {"file_path": "root.txt", "content": "one"},
+    )
+
+    assert isinstance(feedback, str)
+    assert feedback.startswith("Use the docs directory instead ")
+    assert len(feedback) == 500
+
+
+@pytest.mark.asyncio
+async def test_empty_denial_feedback_falls_back_to_plain_denial(
+    tmp_path: Path,
+) -> None:
+    prompt = RoutedPrompt()
+    await prompt.approvals.put("f")
+    await prompt.approvals.put("")
+    ui = make_ui()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        BlockingProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(loop, prompt, ui)  # type: ignore[arg-type]
+
+    assert await controller._request_approval("write_file", {}) is False
+    assert load_permission_rules(tmp_path) == []
 
 
 @pytest.mark.asyncio

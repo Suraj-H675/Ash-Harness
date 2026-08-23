@@ -373,6 +373,48 @@ def test_denial_does_not_execute_tool(
     assert record.error == "Denied by user"
 
 
+def test_user_denial_feedback_is_returned_to_model(
+    tmp_workspace: Path,
+    safety_guard: SafetyGuard,
+    session_store: SessionStore,
+) -> None:
+    provider = FakeProvider(
+        scripts=[
+            [
+                '<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'
+            ],
+            ["<response>adjusted after feedback</response>"],
+        ]
+    )
+    read_tool = CountingReadTool(safety_guard)
+
+    def deny_with_feedback(_name: str, _args: dict[str, Any]) -> str:
+        return "Read only the public docs directory"
+
+    ui = TerminalUI(
+        approval_callback=deny_with_feedback,
+        console=_silent_console(),
+    )
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=ui,
+        project_root=tmp_workspace,
+        tools={read_tool.name: read_tool},
+    )
+
+    response = asyncio.run(loop.run_turn("read"))
+
+    assert read_tool.calls == 0
+    assert "adjusted after feedback" in response
+    record = session_store.load_session(loop.current_session.session_id).tool_calls[0]
+    assert record.approved is False
+    assert record.error == (
+        "Denied by user: Read only the public docs directory"
+    )
+
+
 def test_max_iterations_terminates_infinite_tool_loop(
     tmp_workspace: Path,
     safety_guard: SafetyGuard,
