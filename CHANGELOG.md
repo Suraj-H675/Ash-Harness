@@ -20,6 +20,8 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Full interactive `/agents --full` status view with durable task identity,
+  token budgets, and USD cost usage alongside live worker state.
 - Durable graph-consolidation artifacts for delegated agent results, with
   inspectable path evidence and conflict records.
 - Regression coverage proving independent read-only tool calls execute

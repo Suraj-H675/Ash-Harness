@@ -209,7 +209,7 @@ Research is clean-room: proprietary or leaked source is not used.
 |---|---|---|
 | Spawn subagent tool | Verified locally | Real bounded provider-backed Ash loop, persisted reports, role-scoped tool manifests, background execution, cancellation, and no recursive spawning |
 | Parallel agents | Verified locally | Atomic DAG submission, dependency-ready parallel dispatch, cross-process capacity, bounded retries, foreground/background operation, restart recovery, and durable graph-wide token and USD ceilings with atomic overrun accounting |
-| Agent status/output | Partial | Live slash status plus top-level persisted status/report/message inspection; full TUI view remains |
+| Agent status/output | Verified locally | Live basic and full slash status with durable task identity, token budgets, and USD cost usage; top-level persisted status/report/message inspection |
 | Agent messaging | Verified locally | Typed SQLite IPC is persisted and inspectable; running workers consume steer/stop messages, acknowledge delivery, and enforce pending-message backpressure |
 | Role tool policies | Verified locally | Read/search baseline, coder-only scoped edits, sandbox-required tester commands, and no recursive spawn tool |
 | Worktree isolation | Verified locally | Clean-lead precondition, locked `ash-agent/*` branches, exact branch/commit verification, conflict-safe dependent merges, bounded commits, deterministic cleanup, and explicit full-branch squash/discard |

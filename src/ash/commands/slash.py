@@ -58,8 +58,8 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("commands", "List custom Markdown commands", "/commands"),
     SlashCommand(
         "agents",
-        "Show, stop, or resume subagents",
-        "/agents [stop|resume AGENT_ID]",
+        "Show basic or full subagent status; stop or resume",
+        "/agents [--full] [stop|resume AGENT_ID]",
     ),
     SlashCommand(
         "diff",

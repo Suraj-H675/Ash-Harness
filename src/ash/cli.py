@@ -939,7 +939,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             if command.name == "reload-plugins":
                 if arguments:
                     print(f"Usage: {command.usage}", file=sys.stderr)
-                    continue
+                continue
                 try:
                     print(await reload_plugin_components(), flush=True)
                 except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -995,20 +995,39 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     print(resumed.output or resumed.error or "Resume failed.")
                     continue
                 if arguments:
-                    print(f"Usage: {command.usage}", file=sys.stderr)
-                    continue
+                    if arguments != ["--full"]:
+                        print(f"Usage: {command.usage}", file=sys.stderr)
+                        continue
                 statuses = (
-                    agent_tool.statuses()
+                    agent_tool.detailed_statuses()
+                    if arguments == ["--full"]
+                    and isinstance(agent_tool, SpawnAgentTool)
+                    else agent_tool.statuses()
                     if isinstance(agent_tool, SpawnAgentTool)
                     else []
                 )
                 if not statuses:
                     print("No subagents have run in this process.")
                 for status in statuses:
-                    print(
-                        f"{status['agent_id']} [{status['role']}] "
-                        f"{status['status']}: {status['task']}"
-                    )
+                    if arguments == ["--full"]:
+                        task_id = (
+                            status.get("active_task_id")
+                            or status.get("latest_task_id")
+                            or "-"
+                        )
+                        print(
+                            f"{status['agent_id']} [{status['role']}] "
+                            f"{status['status']} task={task_id} "
+                            f"tokens={status['used_tokens']}/"
+                            f"{status['token_budget']} "
+                            f"cost=${status['used_cost_usd']:.6f}: "
+                            f"{status['task']}"
+                        )
+                    else:
+                        print(
+                            f"{status['agent_id']} [{status['role']}] "
+                            f"{status['status']}: {status['task']}"
+                        )
                 continue
             if command.name == "diff":
                 staged = "--staged" in arguments

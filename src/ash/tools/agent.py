@@ -1023,6 +1023,45 @@ class SpawnAgentTool(BaseTool):
             for status in self._shared_state.list_agents()
         ]
 
+    def detailed_statuses(self) -> list[dict[str, Any]]:
+        status_by_agent = {
+            status.agent_id: status for status in self._shared_state.list_agents()
+        }
+        tasks = self._shared_state.tasks.list_tasks(limit=1000)
+        task_by_owner: dict[str, list[AgentTask]] = {}
+        for task in tasks:
+            if task.owner_agent_id is not None:
+                task_by_owner.setdefault(task.owner_agent_id, []).append(task)
+
+        rows: list[dict[str, Any]] = []
+        for agent_id, status in status_by_agent.items():
+            owned = task_by_owner.get(agent_id, [])
+            active_task = next(
+                (task for task in owned if task.state in {"queued", "leased", "running"}),
+                None,
+            )
+            latest_task = owned[0] if owned else None
+            rows.append(
+                {
+                    "agent_id": agent_id,
+                    "role": status.role,
+                    "status": status.status,
+                    "task": status.current_task,
+                    "active_task_id": active_task.task_id if active_task else None,
+                    "latest_task_id": (
+                        latest_task.task_id if latest_task else None
+                    ),
+                    "used_tokens": latest_task.used_tokens if latest_task else 0,
+                    "token_budget": (
+                        latest_task.token_budget if latest_task else 0
+                    ),
+                    "used_cost_usd": (
+                        latest_task.used_cost_usd if latest_task else 0.0
+                    ),
+                }
+            )
+        return rows
+
     def _emit_task_lifecycle(
         self,
         event_type: str,
