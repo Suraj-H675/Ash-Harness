@@ -22,6 +22,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Structured bounded diagnostics for compiler, lint, and pytest-style failures
+  returned by `run_command`, with model-visible path, line, symbol, code, and
+  message fields.
 - Model catalog improvements: configured custom-provider models appear in
   `/models`, and `/model` displays known capabilities plus context/output
   budgets before switching.

@@ -231,10 +231,11 @@ def _render_tool_response(call_id: str, tool_name: str, result: dict[str, Any]) 
     payload = {
         "success": result.get("success", False),
         "output": result.get("output", ""),
-        "error": result.get("error"),
-        "truncated": result.get("truncated", False),
-        "token_count": result.get("token_count", 0),
-    }
+                    "error": result.get("error"),
+                    "truncated": result.get("truncated", False),
+                    "token_count": result.get("token_count", 0),
+                    **({"diagnostics": result["diagnostics"]} if result.get("diagnostics") else {}),
+                }
     return (
         f'<tool_response name="{tool_name}" call_id="{call_id}">\n'
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
@@ -2386,6 +2387,7 @@ class AshLoop:
                     "output": tool_result.output,
                     "error": tool_result.error,
                     "truncated": tool_result.truncated,
+                    **({"diagnostics": tool_result.diagnostics} if tool_result.diagnostics else {}),
                     "token_count": tool_result.token_count,
                 }
             )

@@ -22,6 +22,7 @@ from ash.sandbox.process_utils import process_group_options, terminate_process_t
 
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_COMMAND_OUTPUT_CHARS = 100_000
+MAX_DIAGNOSTIC_ITEMS = 50
 POWERSHELL_FILE_CMDLETS = (
     "get-content",
     "set-content",
@@ -44,6 +45,68 @@ class RunCommandArgs(BaseModel):
         ge=1,
         description="Hard timeout for subprocess execution.",
     )
+
+
+def _diagnostic_from_line(line: str, *, severity: str) -> dict[str, Any] | None:
+    """Extract one bounded diagnostic from common compiler/test/lint formats."""
+
+    stripped = line.strip()
+    if not stripped or len(stripped) > 1000:
+        return None
+    patterns = (
+        re.compile(
+            r"^(?P<path>[^:\n]+):(?P<line>\d+):(?P<column>\d+):"
+            r"\s+(?P<severity>error|warning|note):\s*(?P<message>.+)$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(?P<path>[^:\n]+):(?P<line>\d+):\s+(?P<severity>error|warning|note):\s*(?P<message>.+)$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(?P<path>[^:\n]+\.py):(?P<line>\d+):\s+\[(?P<code>[A-Z0-9]+)\]\s+(?P<message>.+)$"
+        ),
+        re.compile(
+            r"^FAILED\s+(?P<path>tests/[^\s:]+)::(?P<symbol>[^\s]+)"
+            r"(?:\s+-\s+(?P<message>.+))?$"
+        ),
+    )
+    for pattern in patterns:
+        match = pattern.match(stripped)
+        if match is None:
+            continue
+        values = match.groupdict()
+        return {
+            "path": values.get("path", ""),
+            "line": int(values["line"]) if values.get("line") else None,
+            "column": int(values["column"]) if values.get("column") else None,
+            "symbol": values.get("symbol"),
+            "code": values.get("code"),
+            "message": values.get("message") or "",
+            "severity": severity,
+            "source_text": stripped[:500],
+        }
+    return None
+
+
+def extract_diagnostics(output: str, error: str) -> list[dict[str, Any]]:
+    """Bound structured diagnostics to the most actionable stream lines."""
+
+    diagnostics: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source, severity in ((error, "error"), (output, "warning")):
+        for line in source.splitlines():
+            diagnostic = _diagnostic_from_line(line, severity=severity)
+            if diagnostic is None:
+                continue
+            key = diagnostic["source_text"]
+            if key in seen:
+                continue
+            seen.add(key)
+            diagnostics.append(diagnostic)
+            if len(diagnostics) >= MAX_DIAGNOSTIC_ITEMS:
+                return diagnostics
+    return diagnostics
 
 
 class RunCommandTool(BaseTool):
@@ -162,6 +225,7 @@ class RunCommandTool(BaseTool):
             error=error or None,
             token_count=count_output_tokens(output),
             truncated=truncated,
+            diagnostics=extract_diagnostics(result.stdout, result.stderr),
         )
 
     async def _run_scoped(
@@ -229,6 +293,7 @@ class RunCommandTool(BaseTool):
             error=error or None,
             token_count=count_output_tokens(output),
             truncated=truncated,
+            diagnostics=extract_diagnostics(stdout, stderr),
         )
 
     def _validate_powershell_literal_paths(self, command_line: str) -> None:

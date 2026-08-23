@@ -100,6 +100,48 @@ async def test_read_file_truncation_reports_follow_up_range(
 
 
 @pytest.mark.asyncio
+async def test_run_command_extracts_bounded_structured_diagnostics(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    command = (
+        "printf '%s\\n' "
+        "'src/app.py:12:5: error: expected expression' "
+        "'src/app.py:20: [E501] line too long' "
+        "'FAILED tests/unit/test_app.py::test_app - AssertionError'"
+    )
+
+    result = await RunCommandTool(guard).run(command_line=command)
+
+    paths = [diagnostic["path"] for diagnostic in result.diagnostics]
+    assert result.success is True
+    assert len(result.diagnostics) == 3
+    assert "src/app.py" in paths
+    assert any(diagnostic["code"] == "E501" for diagnostic in result.diagnostics)
+    assert any(
+        diagnostic["symbol"] == "test_app"
+        and diagnostic["path"] == "tests/unit/test_app.py"
+        for diagnostic in result.diagnostics
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_command_bounds_diagnostic_count(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    lines = [
+        f"src/file-{index}.py:{index}: error: bad {index}" for index in range(60)
+    ]
+    quoted_lines = " ".join(f"'{line}'" for line in lines)
+    command = f"printf '%s\\n' {quoted_lines}"
+
+    result = await RunCommandTool(guard).run(command_line=command)
+
+    assert len(result.diagnostics) == 50
+
+
+@pytest.mark.asyncio
 async def test_read_file_truncation_metadata_respects_start_line(
     project_root: Path,
     guard: SafetyGuard,
