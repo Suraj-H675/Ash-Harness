@@ -238,7 +238,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | Structured logging | Verified locally | Rotation, redaction, correlation IDs, and bounded redacted structured debug bundles |
-| Telemetry | Missing | Off by default or explicit opt-in; local metrics still available |
+| Telemetry | Verified locally | No outbound telemetry; `ash metrics` exposes aggregate local-only token, cache, session, and cost metrics |
 | Error taxonomy | Partial | Shared config/provider/tool/policy/sandbox/context/storage classifier is wired into headless/CI errors; broader interactive command adoption remains |
 | Graceful shutdown | Verified locally | Providers, MCP clients, command trees, background agents, SDK, and servers close deterministically |
 | Database migrations | Verified locally | Schema version table, transactional ordered migration, future-version refusal, and backups |

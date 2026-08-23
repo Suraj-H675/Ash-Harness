@@ -109,6 +109,37 @@ def test_debug_bundle_is_bounded_json_and_restricted(
     assert oct(created.stat().st_mode & 0o777) in {"0o600", "0o644"}
 
 
+def test_metrics_cli_reports_local_only_aggregate(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.save_session_token_stats(
+        session.session_id,
+        10,
+        5,
+        0.01,
+        cache_read_tokens=2,
+        cache_write_tokens=1,
+        estimated_prompt_tokens=3,
+        estimated_completion_tokens=2,
+        estimated_cost_usd=0.002,
+    )
+
+    assert main(["--db-directory", str(tmp_path), "metrics"]) == 0
+    output = capsys.readouterr().out
+    assert "15 tokens" in output
+    assert "$0.010000" in output
+
+    assert main(["--db-directory", str(tmp_path), "metrics", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["telemetry"] == "local_only"
+    assert payload["metrics"]["session_count"] == 1
+    assert payload["metrics"]["total_tokens"] == 15
+    assert payload["metrics"]["cost_usd"] == pytest.approx(0.01)
+
+
 def test_storage_check_reports_newer_schema_as_unsupported(tmp_path: Path) -> None:
     path = tmp_path / "future.db"
     with sqlite3.connect(path) as connection:

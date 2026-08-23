@@ -1442,6 +1442,10 @@ def main(argv: list[str] | None = None) -> int:
         "debug-bundle", help="Create a bounded, redacted diagnostics bundle"
     )
     storage_debug.add_argument("destination", nargs="?", type=Path)
+    metrics_parser = subparsers.add_parser(
+        "metrics", help="Show aggregate local-only model usage metrics"
+    )
+    metrics_parser.add_argument("--json", action="store_true")
     audit_parser = subparsers.add_parser(
         "audit", help="Inspect or export tamper-evident session audit logs"
     )
@@ -2057,6 +2061,18 @@ def main(argv: list[str] | None = None) -> int:
         print(render_update_status(update_status, json_output=args.json))
         return 0
 
+    if args.command == "metrics":
+        from ash.commands.storage import render_local_metrics
+        from ash.core.session import SessionStore
+
+        metrics_config = AshConfig.load(
+            **({"db_directory": args.db_directory} if args.db_directory else {})
+        )
+        store = SessionStore(metrics_config.db_directory / "sessions.db")
+        summary = store.local_metrics_summary()
+        print(render_local_metrics(summary, json_output=args.json))
+        return 0
+
     if args.command == "storage":
         from ash.commands.storage import (
             backup_database,
@@ -2406,16 +2422,16 @@ def main(argv: list[str] | None = None) -> int:
         store = SessionStore(sessions_config.db_directory / "sessions.db")
         if args.sessions_action == "tree":
             try:
-                summary = (
+                selected_summary = (
                     store.resolve_session(
                         args.session, str(sessions_config.workspace_root)
                     )
                     if args.session
                     else store.latest_session(str(sessions_config.workspace_root))
                 )
-                if summary is None:
+                if selected_summary is None:
                     raise ValueError("no sessions found in this project")
-                tree = store.session_tree(summary.session_id)
+                tree = store.session_tree(selected_summary.session_id)
             except (KeyError, ValueError) as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 return 2

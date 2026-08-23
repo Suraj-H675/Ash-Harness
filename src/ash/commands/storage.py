@@ -199,6 +199,25 @@ def create_debug_bundle(config, destination: str | Path | None = None) -> Path:
     return destination_path
 
 
+def render_local_metrics(summary: dict, *, json_output: bool = False) -> str:
+    """Render aggregate local-only model usage metrics."""
+
+    if json_output:
+        return json.dumps(
+            {"telemetry": "local_only", "metrics": summary},
+            sort_keys=True,
+        )
+    return (
+        f"Local model usage ({summary['session_count']} sessions): "
+        f"{int(summary['total_tokens'])} tokens "
+        f"({int(summary['prompt_tokens'])} prompt / "
+        f"{int(summary['completion_tokens'])} completion), "
+        f"cache {int(summary['cache_read_tokens'])}/"
+        f"{int(summary['cache_write_tokens'])}, "
+        f"cost ${float(summary['cost_usd']):.6f}"
+    )
+
+
 def _restrict(path: Path) -> None:
     if os.name != "nt":
         path.chmod(0o600)

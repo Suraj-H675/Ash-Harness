@@ -1206,6 +1206,30 @@ class SessionStore:
             raise KeyError(f"Session not found: {session_id}")
         return SessionUsage(**dict(row))
 
+    def local_metrics_summary(self) -> dict[str, Any]:
+        """Return aggregate local-only model usage metrics."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS session_count,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                       COALESCE(SUM(total_prompt_tokens), 0) AS prompt_tokens,
+                       COALESCE(SUM(total_completion_tokens), 0) AS completion_tokens,
+                       COALESCE(SUM(total_cache_read_tokens), 0) AS cache_read_tokens,
+                       COALESCE(SUM(total_cache_write_tokens), 0) AS cache_write_tokens,
+                       COALESCE(SUM(total_cost_usd), 0) AS cost_usd,
+                       COALESCE(SUM(estimated_prompt_tokens), 0)
+                           AS estimated_prompt_tokens,
+                       COALESCE(SUM(estimated_completion_tokens), 0)
+                           AS estimated_completion_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                FROM sessions
+                """
+            ).fetchone()
+        assert row is not None
+        return dict(row)
+
     def cleanup_sessions(
         self, retention_days: int, *, project_path: str | None = None
     ) -> int:
