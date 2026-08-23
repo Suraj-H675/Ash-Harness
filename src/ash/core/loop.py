@@ -1427,13 +1427,25 @@ class AshLoop:
             usage_source = next(iter(usage_sources))
         else:
             usage_source = "mixed"
-        pricing: dict[str, float] = {}
-        if self._config is not None:
-            pricing = (
-                self._config.model_pricing_usd_per_million.get(self._config.model)
-                or DEFAULT_MODEL_PRICING_USD_PER_MILLION.get(self._config.model)
-                or {}
-            )
+        config_pricing = (
+            self._config.model_pricing_usd_per_million if self._config else {}
+        )
+        provider_model = (
+            f"{getattr(self.provider, 'provider_family', 'custom')}/"
+            f"{self.provider.model_name}"
+        )
+        configured_model = (
+            self._config.model
+            if self._config is not None
+            else f"custom/{self.provider.model_name}"
+        )
+        for key in (provider_model, self.provider.model_name, configured_model):
+            pricing = config_pricing.get(key) or DEFAULT_MODEL_PRICING_USD_PER_MILLION.get(key)
+            if pricing is not None:
+                break
+        else:
+            pricing = {}
+        assert pricing is not None
         turn_cost_usd = _calculate_turn_cost(
             prompt_tokens=prompt,
             completion_tokens=completion,
@@ -1758,7 +1770,11 @@ class AshLoop:
                                         chunk.cache_write_tokens,
                                     )
                                 )
-                                if first_terminal or authoritative_usage:
+                                if (
+                                    first_terminal
+                                    or authoritative_usage
+                                    or chunk.usage_source != "unavailable"
+                                ):
                                     prompt_tokens = chunk.prompt_tokens
                                     completion_tokens = chunk.completion_tokens
                                     cache_read_tokens = chunk.cache_read_tokens

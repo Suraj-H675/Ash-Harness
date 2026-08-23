@@ -17,6 +17,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Durable graph-wide USD cost ceilings for parallel agent DAGs, atomic
+  exceedance handling, aggregate cost inspection, and provider-backed
+  subagent cost reporting.
 - Live persisted sprint-plan state in runtime model context, including
   checklist progress, notes, and bounded budget accounting.
 - Built-in USD-per-million-token pricing defaults for current major

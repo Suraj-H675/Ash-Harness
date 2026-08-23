@@ -259,6 +259,9 @@ def test_graph_token_budget_fails_consuming_task_and_exposes_usage(
             token_budget=20,
             used_tokens=12,
             remaining_tokens=8,
+            cost_budget_usd=None,
+            used_cost_usd=0.0,
+            remaining_cost_usd=None,
             task_count=2,
         )
     )
@@ -305,6 +308,61 @@ def test_graph_token_budget_exceeded_fails_owner_atomically(state: SharedState) 
     assert len(events) == 1
     assert events[0].event["reason"] == "graph_token_budget_exceeded"
     assert events[0].event["graph_used_tokens"] == 25
+
+
+def test_graph_cost_budget_exceedance_is_atomic_and_reported(
+    state: SharedState,
+) -> None:
+    graph_id = "cost-graph"
+    state.tasks.create_tasks(
+        [
+            AgentTaskCreate(
+                "one",
+                task_id="cost-one",
+                metadata={"graph_id": graph_id},
+                token_budget=100,
+                graph_cost_budget_usd=0.10,
+            ),
+            AgentTaskCreate(
+                "two",
+                task_id="cost-two",
+                dependencies=("cost-one",),
+                metadata={"graph_id": graph_id},
+                token_budget=100,
+                graph_cost_budget_usd=0.10,
+            ),
+        ]
+    )
+    lease = state.tasks.claim_task("worker", task_id="cost-one")
+    assert lease is not None
+    state.tasks.start_task("cost-one", lease.token)
+    state.tasks.record_cost("cost-one", lease.token, 0.06)
+
+    with pytest.raises(AgentTaskBudgetExceeded, match="graph cost budget"):
+        state.tasks.record_cost("cost-one", lease.token, 0.05)
+
+    task = state.tasks.get_task("cost-one")
+    dependent = state.tasks.get_task("cost-two")
+    assert task is not None and task.state == "failed"
+    assert task.used_tokens == 0
+    assert task.used_cost_usd == pytest.approx(0.11)
+    assert task.error == "graph cost budget exceeded: 0.110000 > 0.100000"
+    assert dependent is not None and dependent.state == "queued"
+
+    budget = state.tasks.get_graph_budget(graph_id)
+    assert budget.cost_budget_usd == pytest.approx(0.10)
+    assert budget.used_cost_usd == pytest.approx(0.11)
+    assert budget.remaining_cost_usd == 0.0
+
+    events = state.tasks.list_events(event_type="agent.task.failed")
+    assert len(events) == 1
+    event = events[0].event
+    assert event["reason"] == "graph_cost_budget_exceeded"
+    assert event["used_cost_usd"] == pytest.approx(0.11)
+    assert event["graph_used_cost_usd"] == pytest.approx(0.11)
+
+    with pytest.raises(ValueError, match="non-negative"):
+        state.tasks.record_cost("cost-one", lease.token, -0.01)
 
 
 def test_failed_dependency_is_terminally_propagated(state: SharedState) -> None:

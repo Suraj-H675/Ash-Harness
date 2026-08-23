@@ -38,6 +38,16 @@ class RecordingProvider(ProviderABC):
         return len(text.split())
 
 
+class CostlyProvider(ProviderABC):
+    model_name = "cost-provider"
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        yield StreamChunk(content="completed expensive task", is_done=True)
+
+    def count_tokens(self, text: str) -> int:
+        return len(text.split())
+
+
 class FailFirstTaskProvider(ProviderABC):
     model_name = "retry-provider"
     calls = 0
@@ -152,6 +162,9 @@ def reset_provider() -> None:
 
 def _tools(tmp_path: Path, *, max_concurrency: int = 2):
     config = AshConfig(
+        model_pricing_usd_per_million={
+            "cost-provider": {"input": 1.0, "output": 2.0},
+        },
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
         max_concurrent_agents=max_concurrency,
@@ -217,6 +230,63 @@ async def test_delegate_agents_runs_dependency_dag_and_aggregates_results(
         tasks = {task.metadata["task_key"]: task for task in state.tasks.list_tasks()}
         assert tasks["review"].dependencies == (tasks["implement"].task_id,)
         assert tasks["review"].result["summary"] == "completed: review implementation"
+    finally:
+        state.close()
+        await delegate.aclose()
+        await spawn.aclose()
+
+
+@pytest.mark.asyncio
+async def test_delegate_graph_enforces_shared_cost_ceiling(tmp_path: Path):
+    config = AshConfig(
+        model_pricing_usd_per_million={
+            "cost-provider": {"input": 1.0, "output": 2.0},
+        },
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        max_concurrent_agents=1,
+        agent_token_budget=100,
+        agent_time_budget_seconds=10,
+        memory_backend="off",
+    )
+    db_path = config.db_directory / "agents.db"
+    provider = CostlyProvider()
+    spawn = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        lambda: provider,
+        config=config,
+    )
+    delegate = DelegateAgentsTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        spawn,
+        config,
+    )
+
+    result = await delegate.run(
+        goal="ship change",
+        graph_cost_budget_usd=0.0001,
+        tasks=[
+            {
+                "key": "implement",
+                "role": "reviewer",
+                "task": "implement change",
+                "isolation": "shared",
+            }
+        ],
+    )
+
+    assert result.success is False
+    payload = json.loads(result.output)
+    assert payload["graph_cost_budget_usd"] == pytest.approx(0.0001)
+    state = SharedState(db_path)
+    try:
+        task = state.tasks.get_task(payload["tasks"][0]["task_id"])
+        budget = state.tasks.get_graph_budget(payload["graph_id"])
+        assert task is not None and task.state == "failed"
+        assert task.error is not None and task.error.startswith("graph cost budget")
+        assert budget.used_cost_usd == pytest.approx(0.000135)
     finally:
         state.close()
         await delegate.aclose()

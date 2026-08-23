@@ -50,6 +50,14 @@ class DelegateAgentsArgs(BaseModel):
     goal: str = Field(..., min_length=1, max_length=20_000)
     tasks: list[DelegatedTaskSpec] = Field(..., min_length=1, max_length=32)
     background: bool = False
+    graph_cost_budget_usd: float | None = Field(
+        None,
+        gt=0.0,
+        description=(
+            "Durable USD ceiling shared across the entire foreground or "
+            "background task graph."
+        ),
+    )
 
 
 class DelegateAgentsTool(BaseTool):
@@ -129,6 +137,7 @@ class DelegateAgentsTool(BaseTool):
                     "task_key": spec.key,
                     "workspace": workspace,
                 },
+                graph_cost_budget_usd=args.graph_cost_budget_usd,
             )
             for spec in args.tasks
         ]
@@ -152,6 +161,11 @@ class DelegateAgentsTool(BaseTool):
             else []
         )
         terminal_by_id = {task.task_id: task for task in terminal}
+        graph_budget = (
+            self._shared_state.tasks.get_graph_budget(graph_id)
+            if args.graph_cost_budget_usd is not None and not args.background
+            else None
+        )
         if terminal:
             self.emit_event(
                 {
@@ -168,6 +182,15 @@ class DelegateAgentsTool(BaseTool):
         output = json.dumps(
             {
                 "graph_id": graph_id,
+                **(
+                    {
+                        "graph_cost_budget_usd": args.graph_cost_budget_usd,
+                        "graph_used_cost_usd": graph_budget.used_cost_usd,
+                        "graph_remaining_cost_usd": graph_budget.remaining_cost_usd,
+                    }
+                    if graph_budget is not None
+                    else {}
+                ),
                 "tasks": [
                     {
                         "key": spec.key,
