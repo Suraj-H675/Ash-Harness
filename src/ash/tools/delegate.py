@@ -191,6 +191,21 @@ class DelegateAgentsTool(BaseTool):
             if terminal
             else None
         )
+        if consolidation is not None:
+            artifact_uri = f"consolidation://{graph_id}"
+            self._shared_state.tasks.add_artifact(
+                created[0].task_id,
+                kind="graph-consolidation",
+                uri=artifact_uri,
+                metadata={
+                    "goal": redact_text(args.goal),
+                    "status": consolidation["status"],
+                    "summary": consolidation["summary"],
+                    "conflict_count": len(consolidation["conflicts"]),
+                    "evidence": consolidation["evidence_by_path"],
+                    "conflicts": consolidation["conflicts"],
+                },
+            )
         output = json.dumps(
             {
                 "graph_id": graph_id,

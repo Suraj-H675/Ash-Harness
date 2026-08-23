@@ -213,7 +213,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Agent messaging | Verified locally | Typed SQLite IPC is persisted and inspectable; running workers consume steer/stop messages, acknowledge delivery, and enforce pending-message backpressure |
 | Role tool policies | Verified locally | Read/search baseline, coder-only scoped edits, sandbox-required tester commands, and no recursive spawn tool |
 | Worktree isolation | Verified locally | Clean-lead precondition, locked `ash-agent/*` branches, exact branch/commit verification, conflict-safe dependent merges, bounded commits, deterministic cleanup, and explicit full-branch squash/discard |
-| Result consolidation | Verified locally | Foreground DAG calls return typed terminal results and errors plus evidence-linked synthesis, bounded summaries, workspace-relative path evidence, and cross-agent claim-conflict detection |
+| Result consolidation | Verified locally | Foreground DAG calls return typed terminal results and errors plus evidence-linked synthesis, bounded summaries, workspace-relative path evidence, cross-agent claim-conflict detection, and durable graph-consolidation artifacts |
 | Agent steering/stop | Verified locally | In-process stop, persisted stop, atomic graph cancellation with active-turn revocation, live steering at safe iteration boundaries, delivery state, and report-based resume; isolated changes must be applied before continuation |
 
 ## 11. Automation And Integration

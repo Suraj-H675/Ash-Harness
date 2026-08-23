@@ -325,6 +325,16 @@ async def test_delegate_graph_consolidates_evidence_and_conflicts(tmp_path: Path
         "first",
         "second",
     }
+    state = SharedState(config.db_directory / "agents.db")
+    try:
+        artifacts = state.tasks.list_artifacts(payload["tasks"][0]["task_id"])
+        assert len(artifacts) == 1
+        assert artifacts[0].kind == "graph-consolidation"
+        assert artifacts[0].uri == f"consolidation://{payload['graph_id']}"
+        assert artifacts[0].metadata["conflict_count"] == 1
+        assert artifacts[0].metadata["conflicts"] == consolidation["conflicts"]
+    finally:
+        state.close()
 
     await delegate.aclose()
     await spawn.aclose()
