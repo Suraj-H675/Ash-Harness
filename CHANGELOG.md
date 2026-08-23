@@ -22,6 +22,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Model catalog improvements: configured custom-provider models appear in
+  `/models`, and `/model` displays known capabilities plus context/output
+  budgets before switching.
 - Deny-with-feedback approval flow that records bounded user feedback in the
   durable tool-call ledger and returns it to the model for corrective retry.
 - Selectable approval diff layouts with persisted `unified`/`side-by-side`

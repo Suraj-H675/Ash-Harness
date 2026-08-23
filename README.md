@@ -564,6 +564,11 @@ records the denial durably and returns the feedback to the model so the next
 attempt can respect the user's instruction; blank feedback falls back to a
 normal denial.
 
+`/models` lists built-in models plus models declared by configured custom
+providers, including capability labels. `/model provider/model` shows the known
+tool/vision/reasoning/local capabilities and context/output limits before
+switching.
+
 Set `ASH_SCREEN_READER_MODE=true` for linear, non-rewriting terminal output.
 This mode forces inline rendering, no color, reduced motion, and no token bar;
 it also disables dynamic completion, autosuggestions, and the bottom toolbar

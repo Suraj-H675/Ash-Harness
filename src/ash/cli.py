@@ -162,7 +162,31 @@ def _print_model_list(config: AshConfig) -> None:
     print(_render_model_list(config))
 
 
-def _render_model_list(config: AshConfig, *, numbered: bool = False) -> str:
+def _configured_model_catalog(config: AshConfig) -> list[str]:
+    """Return configured custom and local models after built-in defaults."""
+
+    catalog = [model for model in AVAILABLE_MODELS if "<your-model>" not in model]
+    custom_providers = config.custom_providers
+    if isinstance(custom_providers, dict):
+        for provider_name in sorted(custom_providers, key=str.casefold):
+            provider_config = custom_providers.get(provider_name)
+            if not isinstance(provider_config, dict):
+                continue
+            models = provider_config.get("models", [])
+            if not isinstance(models, list):
+                continue
+            for raw_model in models:
+                if not isinstance(raw_model, str) or not raw_model.strip():
+                    continue
+                catalog.append(f"{provider_name}/{raw_model.strip()}")
+    return list(dict.fromkeys(catalog))
+
+
+def _render_model_list(
+    config: AshConfig,
+    *,
+    numbered: bool = False,
+) -> str:
     """Render known models for interactive or machine-independent display."""
     from ash.providers.capabilities import infer_capabilities
 
@@ -174,7 +198,7 @@ def _render_model_list(config: AshConfig, *, numbered: bool = False) -> str:
 
     # Group by provider
     grouped: dict[str, list[str]] = {}
-    for m in AVAILABLE_MODELS:
+    for m in _configured_model_catalog(config):
         prov, mod = _parse_model_string(m)
         grouped.setdefault(prov, []).append(mod)
 
@@ -222,6 +246,32 @@ def _render_context_budget(report: Any | None) -> str:
     return "\n".join(lines)
 
 
+def _render_model_capabilities(model_string: str) -> str:
+    """Render one model's capability and budget metadata without network I/O."""
+
+    from ash.providers.capabilities import infer_capabilities
+
+    provider, model_name = _parse_model_string(model_string)
+    capabilities = infer_capabilities(provider, model_name)
+    labels = [
+        label
+        for label, enabled in (
+            ("tools", capabilities.native_tools),
+            ("vision", capabilities.vision),
+            ("reasoning", capabilities.reasoning),
+            ("local", capabilities.local),
+        )
+        if enabled
+    ]
+    budgets: list[str] = []
+    if capabilities.context_window is not None:
+        budgets.append(f"context {capabilities.context_window:,}")
+    if capabilities.max_output_tokens is not None:
+        budgets.append(f"output {capabilities.max_output_tokens:,}")
+    suffix = f"; {'; '.join(budgets)}" if budgets else ""
+    return f"{model_string}: [{', '.join(labels) or 'unknown'}]{suffix}"
+
+
 async def _interactive_model_picker(
     config: AshConfig,
     loop: AshLoop,
@@ -235,7 +285,8 @@ async def _interactive_model_picker(
         return
     try:
         idx = int(choice) - 1
-        model_str = AVAILABLE_MODELS[idx]
+        catalog = _configured_model_catalog(config)
+        model_str = catalog[idx]
     except (ValueError, IndexError):
         write_output("Invalid selection.", file=sys.stderr)
         return
@@ -1321,6 +1372,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     file=sys.stderr,
                 )
                 continue
+            print(_render_model_capabilities(model_str))
             try:
                 loop.switch_model(model_str)
                 config.model = model_str
@@ -1331,7 +1383,15 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
         # /models → list
         if parsed_command is not None and parsed_command[0].name == "models":
-            print(_render_model_list(config))
+            lines = ["Available models:", _render_model_list(config)]
+            custom_models = [
+                model
+                for model in _configured_model_catalog(config)
+                if model.split("/", 1)[0] not in {"anthropic", "openai", "deepseek", "groq", "ollama"}
+            ]
+            for model in custom_models:
+                lines.append(_render_model_capabilities(model))
+            print("\n".join(lines))
             continue
 
         # Normal turn

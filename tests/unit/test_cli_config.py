@@ -529,6 +529,43 @@ def test_model_catalog_rendering_and_shared_input_picker() -> None:
     assert output[-1] == f"Switched to {AVAILABLE_MODELS[1]}"
 
 
+def test_model_catalog_includes_configured_custom_models() -> None:
+    from ash.cli import _configured_model_catalog, _render_model_list
+    from ash.config import AshConfig
+
+    config = AshConfig(
+        model="my-minimax/MiniMax-M2.7",
+        custom_providers={
+            "my-minimax": {
+                "base_url": "https://api.example.test/v1",
+                "models": ["MiniMax-M2.7", "MiniMax-Text"],
+            }
+        },
+    )
+
+    catalog = _configured_model_catalog(config)
+    rendered = _render_model_list(config)
+
+    assert "my-minimax/MiniMax-M2.7" in catalog
+    assert "my-minimax/MiniMax-Text" in catalog
+    assert "(current)" in rendered
+    assert rendered.count("MiniMax-M2.7") >= 1
+
+
+def test_model_capability_display_covers_budgets_and_custom_models() -> None:
+    from ash.cli import _render_model_capabilities, _render_model_list
+    from ash.config import AshConfig
+
+    config = AshConfig(model="anthropic/claude-sonnet-4-6")
+    rendered = _render_model_capabilities("anthropic/claude-sonnet-4-6")
+    list_rendered = _render_model_list(config)
+
+    assert "tools" in rendered and "vision" in rendered and "reasoning" in rendered
+    assert "context 1,000,000" in rendered
+    assert "output 64,000" in rendered
+    assert "claude-opus-4-7 [tools, vision, reasoning]" in list_rendered
+
+
 def test_explain_config_reports_sources_and_masks_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
