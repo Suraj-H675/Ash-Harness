@@ -99,6 +99,9 @@ PROJECT_CONFIG_FIELDS = frozenset(
         "repo_map_enabled",
         "repo_map_max_files",
         "memory_backend",
+        "memory_auto_index",
+        "memory_auto_index_max_files",
+        "memory_auto_index_max_bytes_per_file",
     }
 )
 
@@ -616,6 +619,25 @@ class AshConfig(BaseSettings):
     memory_backend: str = Field(
         "auto",
         description="Memory backend: auto, chroma, fts5, or off.",
+    )
+    memory_auto_index: bool = Field(
+        False,
+        description=(
+            "Automatically index bounded workspace source files into semantic "
+            "memory for trusted projects."
+        ),
+    )
+    memory_auto_index_max_files: int = Field(
+        100,
+        ge=1,
+        le=1_000,
+        description="Maximum files considered by automatic project-memory indexing.",
+    )
+    memory_auto_index_max_bytes_per_file: int = Field(
+        128_000,
+        ge=1,
+        le=1_048_576,
+        description="Maximum size of each file indexed automatically.",
     )
     chroma_persist_dir: Path = Field(
         Path(".ash/chroma"),

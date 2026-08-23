@@ -1,5 +1,11 @@
 import pytest
 
+from ash.config import AshConfig
+from ash.core.loop import AshLoop
+from ash.core.session import SessionStore
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.safety.guard import SafetyGuard
+
 from ash.context.compaction import Chunk
 from ash.memory import (
     DeterministicEmbedding,
@@ -7,6 +13,16 @@ from ash.memory import (
     InMemoryVectorIndex,
     VectorSearchPipeline,
 )
+
+
+class MemoryTestProvider(ProviderABC):
+    model_name = "memory-test"
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        yield StreamChunk(content="done", is_done=True)
+
+    def count_tokens(self, text: str) -> int:
+        return len(text.split())
 
 
 @pytest.mark.asyncio
@@ -25,3 +41,45 @@ async def test_fts5_only_pipeline_indexes_and_searches_lexically(tmp_path) -> No
     pipeline.clear()
     hits, _ = await pipeline.search("uniquephrase")
     assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_project_memory_auto_index_is_bounded_and_respects_excludes(
+    tmp_path,
+) -> None:
+    (tmp_path / ".env").write_text("SECRET=1", encoding="utf-8")
+    (tmp_path / "included.py").write_text("alpha\n" * 10, encoding="utf-8")
+    (tmp_path / "excluded.py").write_text("beta\n", encoding="utf-8")
+    (tmp_path / "large.py").write_text("gamma\n" * 100_000, encoding="utf-8")
+
+    config = AshConfig(
+        model="openai/memory-test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="fts5",
+        chroma_persist_dir=tmp_path / "memory",
+        repo_map_exclude_patterns=["excluded.py"],
+    )
+    loop = AshLoop(
+        SessionStore(config.db_directory / "sessions.db"),
+        MemoryTestProvider(),
+        SafetyGuard(project_root=tmp_path),
+        None,
+        tmp_path,
+        config=config,
+        enable_semantic_memory=True,
+        memory_backend="fts5",
+        chroma_persist_dir=tmp_path / "memory",
+    )
+    try:
+        indexed = await loop.index_project_memory(
+            max_files=2,
+            max_bytes_per_file=1_000,
+        )
+        assert indexed == 1
+        hits = await loop.semantic_search("beta")
+        assert all(hit.file_path != "excluded.py" for hit in hits)
+        hits = await loop.semantic_search("alpha")
+        assert any(hit.file_path.endswith("included.py") for hit in hits)
+    finally:
+        await loop.aclose()

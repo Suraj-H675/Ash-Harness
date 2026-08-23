@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -470,6 +471,17 @@ def build_runtime(
     loop.permission_policy.set_managed_rules(managed)
     loop.permission_policy.set_managed_rules(managed_rules)
     hooks.set_event_sink(loop._emit_event)
+    if (
+        trusted
+        and config.memory_auto_index
+        and loop._vector_pipeline is not None
+    ):
+        loop._memory_auto_index_task = asyncio.create_task(
+            loop.index_project_memory(
+                max_files=config.memory_auto_index_max_files,
+                max_bytes_per_file=config.memory_auto_index_max_bytes_per_file,
+            )
+        )
 
     def checkpoint_context() -> tuple[str, str, str] | None:
         if loop.current_session is None or loop.turn_context is None:

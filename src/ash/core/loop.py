@@ -18,6 +18,7 @@ emits new tool calls. A :class:`CircuitBreaker` halts the loop after
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 from collections import deque
 from datetime import datetime, timezone
@@ -491,6 +492,7 @@ class AshLoop:
         self.permission_policy = PermissionPolicy(safety_tier)
         self.enable_semantic_memory = enable_semantic_memory
         self._vector_pipeline: "VectorSearchPipeline | None" = None
+        self._memory_auto_index_task: asyncio.Task[int] | None = None
         self._pending_memory_context: str = ""
         self._pending_plan_context: str = ""
         if enable_semantic_memory:
@@ -536,6 +538,16 @@ class AshLoop:
     async def aclose(self) -> None:
         """Deterministically release provider and subprocess resources."""
 
+        if self._memory_auto_index_task is not None and not (
+            self._memory_auto_index_task.done()
+        ):
+            self._memory_auto_index_task.cancel()
+        if self._memory_auto_index_task is not None:
+            await asyncio.gather(
+                self._memory_auto_index_task,
+                return_exceptions=True,
+            )
+            self._memory_auto_index_task = None
         async with self._mcp_reload_lock:
             if self._closed:
                 return
@@ -2581,6 +2593,52 @@ class AshLoop:
             return []
         hits, _ = await self._vector_pipeline.search(query, top_k=top_k)
         return hits
+
+    async def index_project_memory(
+        self,
+        *,
+        max_files: int = 100,
+        max_bytes_per_file: int = 128_000,
+    ) -> int:
+        """Automatically index bounded, workspace-relative source files."""
+
+        if self._vector_pipeline is None:
+            return 0
+        if max_files < 1 or max_bytes_per_file < 1:
+            raise ValueError("memory indexing limits must be positive")
+        patterns = list(
+            getattr(self._config, "repo_map_exclude_patterns", ())
+            if self._config is not None
+            else ()
+        )
+        candidates: list[Path] = []
+        for path in self.project_root.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(self.project_root)
+            text = relative.as_posix()
+            if (
+                any(part.startswith(".") for part in relative.parts)
+                or "__pycache__" in relative.parts
+            ):
+                continue
+            if any(fnmatch.fnmatch(text, pattern) for pattern in patterns):
+                continue
+            try:
+                if path.stat().st_size > max_bytes_per_file:
+                    continue
+            except OSError:
+                continue
+            candidates.append(path)
+            if len(candidates) >= max_files:
+                break
+
+        indexed = 0
+        for path in sorted(candidates):
+            chunks = self._chunk_file(path)
+            await self._vector_pipeline.index_chunks(chunks, path.as_posix())
+            indexed += 1
+        return indexed
 
     def _chunk_file(self, file_path: Path) -> list["Chunk"]:
         """Split a file into memory-indexable chunks."""

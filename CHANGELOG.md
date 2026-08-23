@@ -20,6 +20,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Opt-in automatic project-memory indexing with bounded file counts, file
+  sizes, trusted-project gating, deterministic shutdown, and exclusion-aware
+  selection.
 - `ash storage debug-bundle` produces a bounded, redacted structured JSON
   diagnostics file covering runtime, configuration, and database health.
 - Tamper-evident permission-mode decision auditing, including schema v11
