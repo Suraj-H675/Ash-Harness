@@ -1440,11 +1440,16 @@ class AshLoop:
             else f"custom/{self.provider.model_name}"
         )
         for key in (provider_model, self.provider.model_name, configured_model):
-            pricing = config_pricing.get(key) or DEFAULT_MODEL_PRICING_USD_PER_MILLION.get(key)
+            pricing = config_pricing.get(key)
             if pricing is not None:
                 break
         else:
-            pricing = {}
+            for key in (configured_model, provider_model, self.provider.model_name):
+                pricing = DEFAULT_MODEL_PRICING_USD_PER_MILLION.get(key)
+                if pricing is not None:
+                    break
+            else:
+                pricing = {}
         assert pricing is not None
         turn_cost_usd = _calculate_turn_cost(
             prompt_tokens=prompt,

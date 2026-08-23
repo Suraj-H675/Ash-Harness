@@ -497,15 +497,11 @@ class SpawnAgentTool(BaseTool):
                 artifacts["completion_tokens"] = completion_tokens
                 artifacts["cost_usd"] = task_cost_usd
                 try:
-                    self._shared_state.tasks.record_tokens(
+                    self._shared_state.tasks.record_usage(
                         durable_task.task_id,
                         durable_lease.token,
-                        completion_tokens,
-                    )
-                    self._shared_state.tasks.record_cost(
-                        durable_task.task_id,
-                        durable_lease.token,
-                        task_cost_usd,
+                        token_count=completion_tokens,
+                        cost_usd=task_cost_usd,
                     )
                 except AgentTaskBudgetExceeded as exc:
                     summary = f"{summary}\n{exc}"
@@ -840,10 +836,7 @@ class SpawnAgentTool(BaseTool):
                 completion_tokens = int(usage["completion_tokens"])
                 if completion_tokens == 0:
                     completion_tokens = int(usage["estimated_completion_tokens"])
-                cost_usd = max(
-                    float(usage["cost_usd"]),
-                    float(usage["estimated_cost_usd"]),
-                )
+                cost_usd = float(usage["cost_usd"])
                 return response[: self._max_return_chars], completion_tokens, cost_usd
             except asyncio.TimeoutError as exc:
                 turn.cancel()

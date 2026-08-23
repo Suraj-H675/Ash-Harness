@@ -7,6 +7,9 @@ All notable changes to Ash are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Recorded subagent token and cost usage in one durable transaction,
+  restored explicit pricing precedence over built-in defaults, and exposed
+  background graph cost aggregates.
 - Prevented approved-sprint input substitution from applying to turns that
   did not create a new sprint.
 - Preserved case-correct Windows system environment variables in scrubbed

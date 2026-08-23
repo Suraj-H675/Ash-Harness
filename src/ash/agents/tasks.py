@@ -489,7 +489,26 @@ class AgentTaskStore:
     ) -> AgentTask:
         if cost_usd < 0:
             raise ValueError("cost_usd must be non-negative")
-        return self._record_usage(task_id, token, cost_usd=cost_usd)
+        return self._record_usage(task_id, token, token_count=0, cost_usd=cost_usd)
+
+    def record_usage(
+        self,
+        task_id: str,
+        token: str,
+        *,
+        token_count: int = 0,
+        cost_usd: float = 0.0,
+    ) -> AgentTask:
+        if token_count < 0:
+            raise ValueError("token_count must be non-negative")
+        if cost_usd < 0:
+            raise ValueError("cost_usd must be non-negative")
+        return self._record_usage(
+            task_id,
+            token,
+            token_count=token_count,
+            cost_usd=cost_usd,
+        )
 
     def _record_usage(
         self,

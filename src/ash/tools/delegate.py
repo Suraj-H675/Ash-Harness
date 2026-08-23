@@ -163,7 +163,7 @@ class DelegateAgentsTool(BaseTool):
         terminal_by_id = {task.task_id: task for task in terminal}
         graph_budget = (
             self._shared_state.tasks.get_graph_budget(graph_id)
-            if args.graph_cost_budget_usd is not None and not args.background
+            if args.graph_cost_budget_usd is not None
             else None
         )
         if terminal:
