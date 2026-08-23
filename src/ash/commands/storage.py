@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
+import subprocess
 import sqlite3
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -12,6 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from ash.core.session import CURRENT_SCHEMA_VERSION, SessionStorageError, SessionStore
+from ash.core.redaction import redact_text
 
 
 @dataclass(frozen=True)
@@ -140,6 +143,60 @@ def render_storage_check(check: StorageCheck, *, json_output: bool = False) -> s
     return f"Storage check {state}: {check.path} (schema {version})\n" + "\n".join(
         check.messages
     )
+
+
+def create_debug_bundle(config, destination: str | Path | None = None) -> Path:
+    """Create a bounded, redacted JSON diagnostics bundle."""
+
+    database = config.db_directory / "sessions.db"
+    check = check_database(database)
+    try:
+        git_revision = redact_text(
+            subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=config.workspace_root,
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        git_revision = ""
+
+    payload = {
+        "schema_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "ash": {
+            "config_schema_version": config.config_schema_version,
+            "model": config.model,
+            "safety_tier": config.safety_tier,
+            "memory_backend": config.memory_backend,
+            "session_retention_days": config.session_retention_days,
+        },
+        "runtime": {
+            "platform": platform.system(),
+            "platform_release": platform.release(),
+            "python_version": platform.python_version(),
+            "workspace": str(Path(config.workspace_root).resolve()),
+            "git_revision": git_revision,
+        },
+        "storage": {
+            **check.as_dict(),
+            "path": str(database),
+        },
+    }
+    serialized = json.dumps(payload, indent=2, sort_keys=True)
+    destination_path = (
+        Path(destination).expanduser().resolve()
+        if destination is not None
+        else config.db_directory
+        / f"debug-bundle-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.json"
+    )
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    destination_path.write_text(serialized + "\n", encoding="utf-8")
+    _restrict(destination_path)
+    return destination_path
 
 
 def _restrict(path: Path) -> None:

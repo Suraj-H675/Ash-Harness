@@ -80,6 +80,35 @@ def test_restore_refuses_unconfirmed_or_invalid_backup(tmp_path: Path) -> None:
         restore_database(path, backup, confirmed=True)
 
 
+def test_debug_bundle_is_bounded_json_and_restricted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.storage import create_debug_bundle
+    from ash.config import AshConfig
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    db_dir = tmp_path / "db"
+    config = AshConfig(
+        model="anthropic/claude-sonnet-4-6",
+        workspace_root=workspace,
+        db_directory=db_dir,
+        memory_backend="off",
+    )
+    monkeypatch.chdir(workspace)
+    destination = tmp_path / "bundle.json"
+
+    created = create_debug_bundle(config, destination)
+
+    payload = json.loads(created.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["ash"]["model"] == "anthropic/claude-sonnet-4-6"
+    assert payload["storage"]["path"] == str(db_dir / "sessions.db")
+    assert payload["runtime"]["workspace"] == str(workspace.resolve())
+    assert oct(created.stat().st_mode & 0o777) in {"0o600", "0o644"}
+
+
 def test_storage_check_reports_newer_schema_as_unsupported(tmp_path: Path) -> None:
     path = tmp_path / "future.db"
     with sqlite3.connect(path) as connection:

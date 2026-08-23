@@ -237,7 +237,7 @@ Research is clean-room: proprietary or leaked source is not used.
 
 | Capability | Ash status | Required production behavior |
 |---|---|---|
-| Structured logging | Partial | Rotation, redaction, correlation IDs, debug bundle |
+| Structured logging | Verified locally | Rotation, redaction, correlation IDs, and bounded redacted structured debug bundles |
 | Telemetry | Missing | Off by default or explicit opt-in; local metrics still available |
 | Error taxonomy | Partial | Shared config/provider/tool/policy/sandbox/context/storage classifier is wired into headless/CI errors; broader interactive command adoption remains |
 | Graceful shutdown | Verified locally | Providers, MCP clients, command trees, background agents, SDK, and servers close deterministically |

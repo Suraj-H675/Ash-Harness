@@ -20,6 +20,8 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- `ash storage debug-bundle` produces a bounded, redacted structured JSON
+  diagnostics file covering runtime, configuration, and database health.
 - Tamper-evident permission-mode decision auditing, including schema v11
   migration and regression coverage for chained non-tool decisions.
 - Bounded, redacted semantic-memory export for in-memory and FTS-backed

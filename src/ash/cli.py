@@ -1438,6 +1438,10 @@ def main(argv: list[str] | None = None) -> int:
     storage_restore = storage_subparsers.add_parser("restore")
     storage_restore.add_argument("backup", type=Path)
     storage_restore.add_argument("--yes", action="store_true")
+    storage_debug = storage_subparsers.add_parser(
+        "debug-bundle", help="Create a bounded, redacted diagnostics bundle"
+    )
+    storage_debug.add_argument("destination", nargs="?", type=Path)
     audit_parser = subparsers.add_parser(
         "audit", help="Inspect or export tamper-evident session audit logs"
     )
@@ -2057,6 +2061,7 @@ def main(argv: list[str] | None = None) -> int:
         from ash.commands.storage import (
             backup_database,
             check_database,
+            create_debug_bundle,
             render_storage_check,
             restore_database,
         )
@@ -2069,6 +2074,14 @@ def main(argv: list[str] | None = None) -> int:
             check = check_database(database)
             print(render_storage_check(check, json_output=args.json))
             return 0 if check.ok else 1
+        if args.storage_action == "debug-bundle":
+            try:
+                bundle_path = create_debug_bundle(storage_config, args.destination)
+            except (OSError, RuntimeError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            print(f"Debug bundle created: {bundle_path}")
+            return 0
         if args.storage_action == "backup":
             try:
                 backup_path = backup_database(database, args.destination)
