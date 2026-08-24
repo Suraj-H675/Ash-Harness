@@ -1368,6 +1368,12 @@ async def test_context_budget_report_enforces_sections(tmp_path):
     assert budget.slices["repo_map"].truncated is True
     assert budget.slices["memory"].truncated is True
     assert "context section truncated" in messages[0]["content"]
+    fragment = next(
+        item for item in budget.fragments if item.kind.value == "history"
+    )
+    assert dict(fragment.metadata)["untrusted_content_policy"] == (
+        "data_not_instructions"
+    )
 
 
 def test_tool_response_marks_untrusted_content_and_policy_boundary() -> None:

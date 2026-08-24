@@ -593,6 +593,42 @@ def test_live_catalog_refresh_reports_failure_without_losing_static_catalog() ->
     assert "claude-sonnet-4-6" in rendered
 
 
+def test_context_provenance_renders_fragment_metadata() -> None:
+    from ash.cli import _render_context_provenance
+    from ash.context.history import (
+        ContextBudgetSlice,
+        ContextFragment,
+        ContextFragmentKind,
+        ContextTrust,
+        ContextBudgetReport,
+    )
+
+    report = ContextBudgetReport(
+        maximum=1000,
+        completion_reserve=100,
+        input_limit=900,
+        slices={"system": ContextBudgetSlice("system", 100, 10)},
+        fragments=(
+            ContextFragment(
+                kind=ContextFragmentKind.REPO_MAP,
+                source="workspace_repository_map",
+                trust=ContextTrust.PROJECT,
+                tokens=20,
+                limit=100,
+                truncated=False,
+                content_sha256="a" * 64,
+                metadata=(("untrusted_content_policy", "data_not_instructions"),),
+            ),
+        ),
+    )
+
+    rendered = _render_context_provenance(report)
+
+    assert "repo_map source=workspace_repository_map" in rendered
+    assert "trust=project" in rendered
+    assert "untrusted_content_policy=data_not_instructions" in rendered
+
+
 def test_explain_config_reports_sources_and_masks_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

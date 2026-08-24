@@ -22,6 +22,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Structured provider-input provenance reporting through `/context
+  --provenance`, including source, trust class, token/truncation accounting,
+  content digest, and untrusted-content policy metadata.
 - Live dynamic model discovery through `/models --refresh`, rendering endpoint
   catalogs alongside static/configured models with explicit failure handling.
 - Dynamic Ollama tool-capability detection from model metadata, cached per

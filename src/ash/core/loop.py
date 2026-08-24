@@ -2890,11 +2890,17 @@ class AshLoop:
                 context_fragment(
                     kind=ContextFragmentKind.SYSTEM,
                     source="assembled_system_prompt",
-                    trust=ContextTrust.MIXED,
+                    trust=ContextTrust.BUILT_IN,
                     content=system_fit.text,
                     tokens=budget_usage["system"],
                     limit=budget_limits["system"],
                     truncated="system" in truncated,
+                    metadata={
+                        "injection_boundary": "true",
+                        "contains_project_context": str(
+                            bool(repo_fragment_content or memory_fragment_content)
+                        ).lower(),
+                    },
                 ),
                 context_fragment(
                     kind=ContextFragmentKind.TOOL_SCHEMA,
@@ -2904,7 +2910,10 @@ class AshLoop:
                     tokens=budget_usage["tools"],
                     limit=budget_limits["tools"],
                     truncated="tools" in truncated,
-                    metadata={"tool_count": str(len(self.tools))},
+                    metadata={
+                        "tool_count": str(len(self.tools)),
+                        "trust_boundary": "schemas_only",
+                    },
                 ),
                 context_fragment(
                     kind=ContextFragmentKind.HISTORY,
@@ -2917,6 +2926,13 @@ class AshLoop:
                     metadata={
                         "message_count": str(max(0, len(result.messages) - 1)),
                         "compacted": str(result.compacted).lower(),
+                        "tool_output_present": str(
+                            any(
+                                message.get("role") == "tool"
+                                for message in result.messages
+                            )
+                        ).lower(),
+                        "untrusted_content_policy": "data_not_instructions",
                     },
                 ),
                 context_fragment(
@@ -2927,6 +2943,7 @@ class AshLoop:
                     tokens=budget_usage["repo_map"],
                     limit=budget_limits["repo_map"],
                     truncated="repo_map" in truncated,
+                    metadata={"untrusted_content_policy": "data_not_instructions"},
                 ),
                 context_fragment(
                     kind=ContextFragmentKind.MEMORY,
@@ -2936,6 +2953,7 @@ class AshLoop:
                     tokens=budget_usage["memory"],
                     limit=budget_limits["memory"],
                     truncated="memory" in truncated,
+                    metadata={"untrusted_content_policy": "data_not_instructions"},
                 ),
             )
             self._last_context_budget = allocator.report(

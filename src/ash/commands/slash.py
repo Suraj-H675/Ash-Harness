@@ -46,7 +46,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "export", "Export a redacted transcript", "/export [jsonl|markdown] [path]"
     ),
     SlashCommand("import", "Import an Ash JSONL transcript", "/import <path>"),
-    SlashCommand("context", "Show current context usage", "/context"),
+    SlashCommand(
+        "context",
+        "Show context usage or --provenance details",
+        "/context [--provenance]",
+    ),
     SlashCommand("compact", "Compact older conversation history", "/compact"),
     SlashCommand("plan", "Toggle editable sprint planning", "/plan [on|off]"),
     SlashCommand("skills", "List available instruction skills", "/skills [query]"),

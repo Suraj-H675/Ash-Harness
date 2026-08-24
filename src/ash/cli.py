@@ -246,6 +246,24 @@ def _render_context_budget(report: Any | None) -> str:
     return "\n".join(lines)
 
 
+def _render_context_provenance(report: Any | None) -> str:
+    """Render bounded per-fragment provider-input provenance."""
+
+    if report is None:
+        return "Provenance unavailable; run a turn first."
+    lines = ["Provider-input provenance:"]
+    for fragment in report.fragments:
+        metadata = ", ".join(f"{key}={value}" for key, value in fragment.metadata)
+        suffix = f"; {metadata}" if metadata else ""
+        lines.append(
+            f"  {fragment.kind} source={fragment.source} trust={fragment.trust.value} "
+            f"tokens={fragment.tokens}/{fragment.limit} "
+            f"truncated={str(fragment.truncated).lower()} "
+            f"sha256={fragment.content_sha256[:12]}{suffix}"
+        )
+    return "\n".join(lines)
+
+
 def _render_model_capabilities(model_string: str) -> str:
     """Render one model's capability and budget metadata without network I/O."""
 
@@ -957,6 +975,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 has_summary = bool(
                     loop.current_session and loop.current_session.context_summary
                 )
+                if arguments and arguments[0] == "--provenance":
+                    print(_render_context_provenance(loop._last_context_budget), flush=True)
+                    continue
                 budget = _render_context_budget(loop._last_context_budget)
                 budget_suffix = f"\n{budget}" if budget else ""
                 last_usage = loop.last_turn_usage

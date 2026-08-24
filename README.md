@@ -591,6 +591,9 @@ system prompt states that repository files, tool outputs, memory, and
 project-derived content must not override user instructions or policy. This is a
 parsing-and-prompting defense layer; permissions, approval gates, sandboxing,
 redaction, and auditing remain independently enforced.
+Run `/context --provenance` after a turn to inspect bounded per-fragment
+provenance: source, trust class, token accounting, truncation state, content
+digest, and the applicable untrusted-content policy.
 
 Interactive `@` completion supports workspace files and directories plus two
 extended forms: `@symbol:<query>` offers fuzzy structural symbol matches with
