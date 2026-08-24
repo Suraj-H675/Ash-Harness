@@ -1499,6 +1499,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Select approval diff preview layout",
     )
     diff_mode_parser.add_argument("mode", choices=["unified", "side-by-side"])
+    ollama_parser = subparsers.add_parser(
+        "ollama",
+        help="Manage local Ollama models",
+    )
+    ollama_subparsers = ollama_parser.add_subparsers(dest="ollama_action", required=True)
+    ollama_pull = ollama_subparsers.add_parser("pull")
+    ollama_pull.add_argument("model")
+    ollama_pull.add_argument(
+        "--timeout",
+        type=int,
+        default=1800,
+        help="Pull timeout in seconds",
+    )
     trust_parser = subparsers.add_parser(
         "trust", help="Inspect or change project extension trust"
     )
@@ -2012,6 +2025,23 @@ def main(argv: list[str] | None = None) -> int:
         checks = asyncio.run(run_doctor(connect=args.connect))
         print(render_doctor(checks, json_output=args.json_output))
         return 1 if any(check.status == "fail" for check in checks) else 0
+
+    if args.command == "ollama":
+        from ash.commands.ollama import pull_model, validate_ollama_model
+
+        if args.ollama_action != "pull":
+            parser.error("unsupported ollama action")
+        if args.timeout <= 0:
+            print("Error: timeout must be positive", file=sys.stderr)
+            return 2
+        try:
+            validate_ollama_model(args.model)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        return asyncio.run(
+            pull_model(args.model, timeout_seconds=args.timeout)
+        )
 
     if args.command == "lsp":
         from ash.commands.lsp import inspect_lsp, render_lsp

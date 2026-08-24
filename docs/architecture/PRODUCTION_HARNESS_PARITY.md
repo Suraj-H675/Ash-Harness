@@ -40,7 +40,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Dependency separation | Verified locally | Lean default runtime/provider install, standardized dev group, published vector/server extras, actionable missing-extra errors, and lockfile/artifact checks |
 | First-run wizard | Verified locally | No-key detection, deterministic cancel/back, endpoint retry/save-unverified choices, non-billable model discovery, secret input, atomic related settings, non-TTY guidance, and fresh-process API/local checks |
 | API-key providers | Partial | Anthropic, OpenAI, Groq, DeepSeek and custom endpoints tested from fresh process |
-| Local models | Partial | Ollama URL validation, installed-model discovery, health failure detail, start/pull guidance, and fresh-process configuration checks are wired; pull execution and dynamic tool-capability detection remain |
+| Local models | Partial | Ollama URL validation, installed-model discovery, health failure detail, fresh-process configuration checks, and safe bounded pull execution through `ash ollama pull` are wired; dynamic tool-capability detection remains |
 | Custom endpoints | Verified locally | Per-provider credentials are stored in mode-0600 env storage, not TOML |
 | Config precedence | Verified locally | CLI > process env > trusted hierarchical project TOML > user TOML > user dotenv > defaults, with exact masked provenance and project security restrictions |
 | Config migration | Verified locally | Complete legacy mapping, conflict preservation, strict destination parsing, verified private source/destination backups, exact-content migration records, and future-version refusal |

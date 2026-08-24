@@ -515,6 +515,10 @@ retry or save-unverified choices when an endpoint is unavailable. API keys use
 hidden input and related key/base/model settings are committed atomically.
 `ash doctor --connect` resolves the same provider endpoint and authentication
 used for a turn, then confirms that the selected model is advertised there.
+For local models, run `ash ollama pull <model>` to execute a validated pull
+through the installed Ollama CLI. The command uses a scrubbed environment,
+bounded output, timeout/process cleanup, and never interprets the model name as
+a shell command.
 Custom OpenAI-compatible endpoints can explicitly use bearer authentication or
 no authentication; an anonymous endpoint never inherits `OPENAI_API_KEY`.
 Ollama setup discovers installed models and gives `ollama serve`/`ollama pull`

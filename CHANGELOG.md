@@ -22,6 +22,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- `ash ollama pull` executes local model downloads through strict validation, a
+  scrubbed environment, bounded output, timeout cleanup, and process-tree
+  termination.
 - Extended lifecycle hooks for context compaction, runtime configuration
   changes, and permission rule/mode changes with redacted bounded payloads and
   event-loop-safe dispatch.
