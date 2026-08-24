@@ -566,6 +566,33 @@ def test_model_capability_display_covers_budgets_and_custom_models() -> None:
     assert "claude-opus-4-7 [tools, vision, reasoning]" in list_rendered
 
 
+def test_live_catalog_refresh_renders_discovered_and_static_models() -> None:
+    from ash.cli import render_model_catalog_refresh
+    from ash.config import AshConfig
+
+    config = AshConfig(model="openai/discovered-a")
+    rendered = render_model_catalog_refresh(
+        config,
+        ["openai/discovered-b", "openai/discovered-a"],
+    )
+
+    assert "Live:" in rendered
+    assert "openai/discovered-a (current)" in rendered
+    assert "openai/discovered-b" in rendered
+    assert "Available models:" in rendered
+
+
+def test_live_catalog_refresh_reports_failure_without_losing_static_catalog() -> None:
+    from ash.cli import render_model_catalog_refresh
+    from ash.config import AshConfig
+
+    config = AshConfig(model="anthropic/claude-sonnet-4-6")
+    rendered = render_model_catalog_refresh(config, [], error="offline")
+
+    assert "Live discovery unavailable: offline" in rendered
+    assert "claude-sonnet-4-6" in rendered
+
+
 def test_explain_config_reports_sources_and_masks_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -21,7 +21,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand(
         "model", "Choose or switch the active model", "/model [provider/model]"
     ),
-    SlashCommand("models", "List known models", "/models"),
+    SlashCommand(
+        "models",
+        "List known models; --refresh probes the live endpoint",
+        "/models [--refresh]",
+    ),
     SlashCommand("new", "Start a new session", "/new", aliases=("clear",)),
     SlashCommand("sessions", "List or search recent sessions", "/sessions [query]"),
     SlashCommand("resume", "Resume a session by ID or name", "/resume [session]"),

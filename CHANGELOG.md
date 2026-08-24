@@ -22,6 +22,8 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Live dynamic model discovery through `/models --refresh`, rendering endpoint
+  catalogs alongside static/configured models with explicit failure handling.
 - Dynamic Ollama tool-capability detection from model metadata, cached per
   provider instance, with context-length reporting and fail-closed local fallback.
 - `ash ollama pull` executes local model downloads through strict validation, a

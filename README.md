@@ -575,6 +575,10 @@ normal denial.
 providers, including capability labels. `/model provider/model` shows the known
 tool/vision/reasoning/local capabilities and context/output limits before
 switching.
+Run `/models --refresh` to probe the currently configured provider endpoint and
+display its live catalog alongside the static/configured list. Discovery is
+bounded by provider credentials and endpoint policy; failures preserve the local
+catalog with an explicit warning.
 
 `run_command` returns a bounded set of structured diagnostics parsed from common
 compiler, linter, and test-failure output. These diagnostics accompany the raw

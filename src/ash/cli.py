@@ -272,6 +272,67 @@ def _render_model_capabilities(model_string: str) -> str:
     return f"{model_string}: [{', '.join(labels) or 'unknown'}]{suffix}"
 
 
+async def _discover_live_model_catalog(config: AshConfig) -> list[str]:
+    """Probe the selected provider's live catalog with a short timeout."""
+
+    from ash.commands.setup import (
+        _probe_anthropic_models_detailed,
+        _probe_models_detailed,
+        _probe_ollama_models_detailed,
+    )
+    from ash.providers.readiness import resolve_provider_connection
+
+    provider, model_name = _parse_model_string(config.model)
+    connection = resolve_provider_connection(
+        config.model_copy(update={"model": f"{provider}/{model_name}"})
+    )
+    if connection.provider == "anthropic":
+        models = await asyncio.to_thread(
+            lambda: _probe_anthropic_models_detailed(
+                api_key=connection.api_key,
+                base_url=connection.base_url,
+            )
+        )
+    elif connection.provider == "ollama":
+        models = await asyncio.to_thread(
+            lambda: _probe_ollama_models_detailed(connection.base_url)
+        )
+    else:
+        models = await asyncio.to_thread(
+            lambda: _probe_models_detailed(
+                connection.base_url,
+                connection.api_key or None,
+            )
+        )
+    prefix = connection.provider
+    return [
+        f"{prefix}/{model}"
+        for model in models.models
+        if isinstance(model, str) and model
+    ]
+
+
+def render_model_catalog_refresh(
+    config: AshConfig,
+    discovered: list[str],
+    *,
+    error: str | None = None,
+) -> str:
+    """Render static plus newly discovered catalogs with explicit provenance."""
+
+    lines = ["Available models:"]
+    if error:
+        lines.append(f"Live discovery unavailable: {error}")
+    if discovered:
+        lines.append("\nLive:")
+        current = config.model
+        for model in sorted(set(discovered)):
+            marker = " (current)" if model == current else ""
+            lines.append(f"  {model}{marker}")
+    lines.extend(["", _render_model_list(config)])
+    return "\n".join(lines)
+
+
 async def _interactive_model_picker(
     config: AshConfig,
     loop: AshLoop,
@@ -1393,6 +1454,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
         # /models → list
         if parsed_command is not None and parsed_command[0].name == "models":
+            refresh = bool(arguments) and arguments[0] == "--refresh"
             lines = ["Available models:", _render_model_list(config)]
             custom_models = [
                 model
@@ -1401,7 +1463,21 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             ]
             for model in custom_models:
                 lines.append(_render_model_capabilities(model))
-            print("\n".join(lines))
+            if refresh:
+                try:
+                    live_models = await _discover_live_model_catalog(config)
+                    print(render_model_catalog_refresh(config, live_models))
+                except Exception as exc:
+                    print(
+                        render_model_catalog_refresh(
+                            config,
+                            [],
+                            error=str(exc),
+                        ),
+                        flush=True,
+                    )
+            else:
+                print("\n".join(lines))
             continue
 
         # Normal turn

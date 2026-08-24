@@ -127,7 +127,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Central slash-command registry | Verified locally | Metadata, aliases, parsing, completion, and stable help |
 | `/help` | Verified locally | Filterable text fallback plus full-screen searchable overlay with navigation, details, aliases, and screen-reader/non-TTY fallback |
 | `/status` | Verified locally | Runtime model/mode/workspace/session plus persisted token, cache, and cost diagnostics |
-| `/model` and `/models` | Partial | Configured custom models, capability labels, and local/built-in catalogs are displayed with context/output budgets; live dynamic discovery remains |
+| `/model` and `/models` | Verified locally | Configured custom/local/built-in catalogs, capability labels, context/output budgets, and opt-in live endpoint discovery through `/models --refresh` are wired |
 | `/new`, `/resume`, `/sessions` | Verified locally | Durable session lifecycle and missing-ID errors |
 | `/rename`, `/fork`, `/tree` | Verified locally | Atomic complete-turn transcript forks, durable parent/root lineage, redacted branch metadata, stable parent-first navigation, and tree-aware retention across CLI/SDK/HTTP/JSON-RPC |
 | `/compact`, `/context` | Verified locally | Context compaction, budget inspection, and last-turn cache hit metrics |
