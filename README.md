@@ -595,6 +595,10 @@ Run `/context --provenance` after a turn to inspect bounded per-fragment
 provenance: source, trust class, token accounting, truncation state, content
 digest, and the applicable untrusted-content policy.
 
+Permission rules now support tool-specific matchers in addition to exact and
+prefix values: `--path-prefix file_path=docs` scopes workspace paths safely, and
+`--domain url=*.example.com` scopes web URLs or domain arguments by hostname.
+
 Interactive `@` completion supports workspace files and directories plus two
 extended forms: `@symbol:<query>` offers fuzzy structural symbol matches with
 file and line metadata, and `@mcp:<query>` searches live connected MCP resource

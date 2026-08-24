@@ -50,6 +50,12 @@ class MatchOperator(StrEnum):
     EXACT = "exact"
     PREFIX = "prefix"
     COMMAND_PREFIX = "command_prefix"
+    PATH_PREFIX = "path_prefix"
+    DOMAIN = "domain"
+
+
+_PATH_ARGUMENTS = frozenset({"file_path", "path", "cwd", "directory_path"})
+_DOMAIN_ARGUMENTS = frozenset({"url", "domain"})
 
 
 def _validate_identifier(value: str, *, label: str) -> str:
@@ -115,6 +121,29 @@ def _safe_command_tokens(command_line: str) -> tuple[str, ...] | None:
     return tuple(normalized) if normalized else None
 
 
+def _hostname_from_candidate(candidate: str) -> str | None:
+    """Extract a lowercase hostname from a URL or bare hostname safely."""
+
+    from urllib.parse import urlsplit
+
+    value = candidate.strip()
+    if not value:
+        return None
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname or ""
+        if parsed.scheme and not hostname:
+            return None
+        if not parsed.scheme:
+            candidate_host = value.split("/", 1)[0]
+            if "@" in candidate_host or ":" in candidate_host or not candidate_host:
+                return None
+            hostname = candidate_host
+        return hostname.casefold().rstrip(".")
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True)
 class ArgumentMatcher:
     """One argument condition in a permission rule."""
@@ -156,6 +185,55 @@ class ArgumentMatcher:
                     "command_prefix requires 1 to 16 non-empty argv tokens"
                 )
             object.__setattr__(self, "value", tuple(self.value))
+        if self.operator == MatchOperator.PATH_PREFIX:
+            if self.argument not in _PATH_ARGUMENTS:
+                allowed = ", ".join(sorted(_PATH_ARGUMENTS))
+                raise PermissionGrantError(
+                    f"path_prefix can only match workspace path arguments: {allowed}"
+                )
+            value = self._validated_text("path_prefix")
+            if "\\" in value or "\x00" in value:
+                raise PermissionGrantError(
+                    "path_prefix must use POSIX-style workspace paths"
+                )
+            normalized = value.strip("/")
+            if not normalized or ".." in normalized.split("/"):
+                raise PermissionGrantError(
+                    "path_prefix must be a relative workspace path without traversal"
+                )
+            object.__setattr__(self, "value", normalized + "/")
+        if self.operator == MatchOperator.DOMAIN:
+            if self.argument not in _DOMAIN_ARGUMENTS:
+                allowed = ", ".join(sorted(_DOMAIN_ARGUMENTS))
+                raise PermissionGrantError(
+                    f"domain can only match URL or domain arguments: {allowed}"
+                )
+            domain = self._validated_text("domain").strip(".").casefold()
+            if (
+                "/" in domain
+                or ":" in domain
+                or "@" in domain
+                or "*" in domain.replace("*.", "")
+                or not domain
+            ):
+                raise PermissionGrantError(
+                    "domain must be a hostname, optionally starting with '*.'"
+                )
+            labels = domain.split(".")
+            if len(labels) < 2 or any(not label for label in labels):
+                raise PermissionGrantError("domain must include at least two labels")
+            object.__setattr__(self, "value", domain)
+
+    def _validated_text(self, operator: str) -> str:
+        if (
+            not isinstance(self.value, str)
+            or not self.value.strip()
+            or len(self.value) > 2048
+        ):
+            raise PermissionGrantError(
+                f"{operator} requires a non-empty string up to 2048 characters"
+            )
+        return self.value.strip()
 
     def matches(self, arguments: Mapping[str, Any]) -> bool:
         if self.argument not in arguments:
@@ -167,10 +245,34 @@ class ArgumentMatcher:
             return isinstance(candidate, str) and candidate.startswith(self.value)
         if not isinstance(candidate, str):
             return False
+        if self.operator == MatchOperator.PATH_PREFIX:
+            normalized = candidate.replace("\\", "/").strip("/")
+            return normalized.startswith(str(self.value))
+        if self.operator == MatchOperator.DOMAIN:
+            hostname = _hostname_from_candidate(candidate)
+            expected_domain = str(self.value)
+            if hostname is None:
+                return False
+            if expected_domain.startswith("*."):
+                base_domain = expected_domain[2:]
+                matches_domain = (
+                    hostname == base_domain
+                    or hostname.endswith(f".{base_domain}")
+                )
+            else:
+                matches_domain = (
+                    hostname == expected_domain
+                    or hostname.endswith(f".{expected_domain}")
+                )
+            return matches_domain
+        if not isinstance(candidate, str):
+            return False
         tokens = _safe_command_tokens(candidate)
         if tokens is None or len(tokens) < len(self.value):
             return False
-        expected = tuple(self.value)
+        expected = tuple(self.value) if isinstance(self.value, (list, tuple)) else ()
+        if not all(isinstance(token, str) for token in expected):
+            return False
         if os.name == "nt":
             return tuple(
                 token.casefold() for token in tokens[: len(expected)]

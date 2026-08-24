@@ -1808,6 +1808,18 @@ def main(argv: list[str] | None = None) -> int:
             metavar="ARGUMENT=TEXT",
         )
         permissions_rule.add_argument(
+            "--path-prefix",
+            action="append",
+            default=[],
+            metavar="PATH_ARGUMENT=RELATIVE_PATH",
+        )
+        permissions_rule.add_argument(
+            "--domain",
+            action="append",
+            default=[],
+            metavar="URL_OR_DOMAIN_ARGUMENT=HOSTNAME",
+        )
+        permissions_rule.add_argument(
             "--command-prefix",
             nargs="+",
             default=[],
@@ -2770,6 +2782,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.tool_name,
                     exact=args.exact,
                     prefix=args.prefix,
+                    path_prefix=args.path_prefix,
+                    domain=args.domain,
                     command_prefix=args.command_prefix,
                 )
             elif action == "revoke":

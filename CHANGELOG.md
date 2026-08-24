@@ -22,6 +22,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Tool-specific permission grammar with safe `path_prefix` workspace matching
+  and hostname-based `domain` matching for URLs/domain arguments, exposed via
+  `ash permissions`.
 - Structured provider-input provenance reporting through `/context
   --provenance`, including source, trust class, token/truncation accounting,
   content digest, and untrusted-content policy metadata.

@@ -120,6 +120,8 @@ def build_argument_matchers(
     *,
     exact: list[str] | None = None,
     prefix: list[str] | None = None,
+    path_prefix: list[str] | None = None,
+    domain: list[str] | None = None,
     command_prefix: list[str] | None = None,
 ) -> list[ArgumentMatcher]:
     matchers: list[ArgumentMatcher] = []
@@ -136,6 +138,14 @@ def build_argument_matchers(
     for raw in prefix or ():
         argument, value = _split_assignment(raw, option="--prefix")
         matchers.append(ArgumentMatcher(argument, MatchOperator.PREFIX, value))
+    for raw in path_prefix or ():
+        argument, value = _split_assignment(raw, option="--path-prefix")
+        matchers.append(
+            ArgumentMatcher(argument, MatchOperator.PATH_PREFIX, value)
+        )
+    for raw in domain or ():
+        argument, value = _split_assignment(raw, option="--domain")
+        matchers.append(ArgumentMatcher(argument, MatchOperator.DOMAIN, value))
     if command_prefix:
         matchers.append(
             ArgumentMatcher(
@@ -154,6 +164,8 @@ def add_cli_permission_rule(
     *,
     exact: list[str] | None = None,
     prefix: list[str] | None = None,
+    path_prefix: list[str] | None = None,
+    domain: list[str] | None = None,
     command_prefix: list[str] | None = None,
 ) -> tuple[PermissionRule, list[PermissionRule]]:
     if command_prefix and tool_name != "run_command":
@@ -164,6 +176,8 @@ def add_cli_permission_rule(
         build_argument_matchers(
             exact=exact,
             prefix=prefix,
+            path_prefix=path_prefix,
+            domain=domain,
             command_prefix=command_prefix,
         ),
     )

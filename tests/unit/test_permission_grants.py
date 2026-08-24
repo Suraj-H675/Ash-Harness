@@ -90,6 +90,35 @@ def test_command_prefix_matcher_rejects_ambiguous_shell_programs() -> None:
     assert matcher.matches({"command_line": 'pytest "$(touch marker)"'}) is False
 
 
+def test_path_prefix_matcher_is_workspace_scoped_and_safe() -> None:
+    matcher = ArgumentMatcher("file_path", MatchOperator.PATH_PREFIX, "docs")
+
+    assert matcher.value == "docs/"
+    assert matcher.matches({"file_path": "docs/readme.md"}) is True
+    assert matcher.matches({"file_path": "/docs/readme.md"}) is True
+    assert matcher.matches({"file_path": "docs/../secret"}) is True
+    assert matcher.matches({"file_path": "documentation/x"}) is False
+    with pytest.raises(PermissionGrantError, match="relative workspace path"):
+        ArgumentMatcher("file_path", MatchOperator.PATH_PREFIX, "../outside")
+    with pytest.raises(PermissionGrantError, match="path arguments"):
+        ArgumentMatcher("command_line", MatchOperator.PATH_PREFIX, "docs")
+
+
+def test_domain_matcher_accepts_urls_and_hostnames_only() -> None:
+    url_matcher = ArgumentMatcher("url", MatchOperator.DOMAIN, "*.Example.COM")
+    domain_matcher = ArgumentMatcher("domain", MatchOperator.DOMAIN, "docs.example.com")
+
+    assert url_matcher.matches({"url": "https://api.example.com/path"}) is True
+    assert url_matcher.matches({"url": "https://example.com/path"}) is True
+    assert url_matcher.matches({"url": "https://badexample.com/path"}) is False
+    assert domain_matcher.matches({"domain": "DOCS.EXAMPLE.COM"}) is True
+    assert domain_matcher.matches({"url": "https://user@example.com"}) is False
+
+    for invalid in ("https://example.com", "*", "example"):
+        with pytest.raises(PermissionGrantError, match="domain"):
+            ArgumentMatcher("url", MatchOperator.DOMAIN, invalid)
+
+
 def test_permission_rule_file_refuses_corruption_and_future_versions(
     tmp_path, monkeypatch
 ) -> None:
