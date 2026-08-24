@@ -30,6 +30,8 @@ class ToolResult(BaseModel):
     diagnostics: list[dict[str, Any]] = []
     diagnostic_summary: dict[str, int] = {}
     citations: list[dict[str, Any]] = []
+    images: list[dict[str, str]] = []
+    image_blocks: list[dict[str, str]] = []
 
 
 class ToolReplayPolicy(StrEnum):

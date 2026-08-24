@@ -2440,6 +2440,11 @@ class AshLoop:
                         if tool_result.citations
                         else {}
                     ),
+                    **(
+                        {"images": tool_result.images}
+                        if tool_result.images
+                        else {}
+                    ),
                     "token_count": tool_result.token_count,
                 }
             )

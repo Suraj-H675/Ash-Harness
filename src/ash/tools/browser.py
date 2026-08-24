@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import re
 from typing import Any, Literal
 from urllib.parse import urlparse, urlunparse
@@ -39,6 +41,15 @@ INTERACTIVE_SELECTOR = ",".join(
 
 class BrowserUnavailableError(RuntimeError):
     """The optional runtime or its pinned browser binary is unavailable."""
+
+
+class BrowserScreenshot:
+    """A bounded canonical screenshot payload."""
+
+    def __init__(self, *, media_type: str, data: str, sha256: str) -> None:
+        self.media_type = media_type
+        self.data = data
+        self.sha256 = sha256
 
 
 class BrowserSession:
@@ -194,6 +205,21 @@ class BrowserSession:
             lines.append("(none)")
         lines.extend(("", "ARIA snapshot:", aria))
         return _truncate_snapshot("\n".join(lines))
+
+    async def screenshot(self, *, max_bytes: int) -> "BrowserScreenshot":
+        page = await self.ensure_started()
+        self._page = self._latest_page()
+        payload = await page.screenshot(type="png", full_page=False)
+        if len(payload) > max_bytes:
+            raise ValueError(
+                f"browser screenshot exceeds {max_bytes} bytes; try scrolling or "
+                "capturing a smaller page"
+            )
+        return BrowserScreenshot(
+            media_type="image/png",
+            data=base64.b64encode(payload).decode("ascii"),
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
 
     async def click(self, ref: str) -> str:
         page = await self.ensure_started()
@@ -353,6 +379,15 @@ class EmptyArgs(BaseModel):
     pass
 
 
+class ScreenshotArgs(BaseModel):
+    max_bytes: int = Field(
+        2_000_000,
+        ge=10_000,
+        le=5_000_000,
+        description="Maximum PNG payload accepted from the browser.",
+    )
+
+
 class _BrowserTool(BaseTool):
     def __init__(self, safety_guard: SafetyGuard, session: BrowserSession) -> None:
         super().__init__(safety_guard)
@@ -449,6 +484,51 @@ class BrowserBackTool(_BrowserTool):
         return await self._result(self.session.back())
 
 
+class BrowserScreenshotTool(_BrowserTool):
+    name = "browser_screenshot"
+    description = (
+        "Capture a bounded PNG screenshot of the current browser page for "
+        "vision-capable models."
+    )
+    args_schema = ScreenshotArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = ScreenshotArgs(**kwargs)
+        try:
+            image = await self.session.screenshot(max_bytes=args.max_bytes)
+            output = (
+                f'<attachment kind="image" path="browser-screenshot" '
+                f'media_type="{image.media_type}" sha256="{image.sha256}" />'
+            )
+        except (BrowserUnavailableError, ValueError) as exc:
+            return ToolResult(success=False, output="", error=redact_text(str(exc)))
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error="browser screenshot failed: " + redact_text(str(exc))[:500],
+            )
+        return ToolResult(
+            success=True,
+            output=output,
+            token_count=count_output_tokens(output),
+            images=[
+                {
+                    "path": "browser-screenshot",
+                    "media_type": image.media_type,
+                    "sha256": image.sha256,
+                }
+            ],
+            image_blocks=[
+                {
+                    "type": "image",
+                    "media_type": image.media_type,
+                    "data": image.data,
+                }
+            ],
+        )
+
+
 def build_browser_tools(
     safety_guard: SafetyGuard,
     *,
@@ -468,4 +548,5 @@ def build_browser_tools(
         BrowserTypeTool(safety_guard, session),
         BrowserScrollTool(safety_guard, session),
         BrowserBackTool(safety_guard, session),
+        BrowserScreenshotTool(safety_guard, session),
     ]

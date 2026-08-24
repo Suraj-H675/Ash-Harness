@@ -8,6 +8,7 @@ from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy, PolicyAction
 from ash.tools.browser import (
     BrowserBackTool,
+    BrowserScreenshotTool,
     BrowserClickTool,
     BrowserNavigateTool,
     BrowserScrollTool,
@@ -54,6 +55,16 @@ class FakeBrowserSession:
         self.calls.append(("back", None))
         return "back snapshot"
 
+    async def screenshot(self, *, max_bytes: int):
+        self.calls.append(("screenshot", max_bytes))
+
+        class Screenshot:
+            media_type = "image/png"
+            data = "cG5nLWRhdGE="
+            sha256 = "a" * 64
+
+        return Screenshot()
+
     async def close(self) -> None:
         self.closed += 1
 
@@ -69,6 +80,7 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
         BrowserTypeTool(guard, session),  # type: ignore[arg-type]
         BrowserScrollTool(guard, session),  # type: ignore[arg-type]
         BrowserBackTool(guard, session),  # type: ignore[arg-type]
+        BrowserScreenshotTool(guard, session),  # type: ignore[arg-type]
     ]
 
     results = [
@@ -78,6 +90,7 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
         await tools[3].run(ref="e3", text="hello", submit=True, clear=False),
         await tools[4].run(direction="up", amount=250),
         await tools[5].run(),
+        await tools[6].run(max_bytes=1_000_000),
     ]
     await tools[0].aclose()
 
@@ -89,8 +102,11 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
         ("type", ("e3", "hello", True, False)),
         ("scroll", ("up", 250)),
         ("back", None),
+        ("screenshot", 1_000_000),
     ]
     assert session.closed == 1
+    assert results[6].images[0]["sha256"] == "a" * 64
+    assert results[6].image_blocks[0]["data"] == "cG5nLWRhdGE="
 
 
 def test_browser_url_policy_blocks_private_non_http_and_disallowed_hosts(

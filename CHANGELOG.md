@@ -22,6 +22,8 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Browser `browser_screenshot` tool that returns bounded PNG evidence as a
+  canonical image block with digest metadata and fail-closed size handling.
 - `/mcp refresh` reloads trusted project/plugin MCP configuration atomically and
   reports connected/failed server state without restarting Ash.
 - Durable web citations for successful search and fetch tool results, including
