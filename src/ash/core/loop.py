@@ -1736,6 +1736,7 @@ class AshLoop:
         cache_write_tokens = 0
         usage_source: Literal["provider", "estimated", "unavailable"] = "unavailable"
         native_tool_calls_from_api: list[CanonicalToolCall] = []
+        reasoning_blocks: list[dict[str, Any]] = []
         saw_terminal = False
         terminal_stop_reason: str | None = None
         maximum_attempts = int(getattr(self._config, "provider_max_attempts", 3))
@@ -1754,6 +1755,8 @@ class AshLoop:
                         async for chunk in self.provider.stream_chat(
                             canonical_messages, tools=openai_tools
                         ):
+                            if chunk.reasoning:
+                                reasoning_blocks.extend(chunk.reasoning)
                             chunk_has_output = bool(
                                 chunk.content
                                 or chunk.tool_call_delta
@@ -1918,6 +1921,7 @@ class AshLoop:
                         cache_read_tokens = 0
                         cache_write_tokens = 0
                         usage_source = "unavailable"
+                        reasoning_blocks.clear()
                         attempt += 1
                 if not saw_terminal:
                     raise ProviderCompletionError(
@@ -1981,6 +1985,7 @@ class AshLoop:
             cache_write_tokens=cache_write_tokens,
             usage_source=usage_source,
             stop_reason=terminal_stop_reason,
+            reasoning_blocks=reasoning_blocks,
         )
 
     def _handle_event(

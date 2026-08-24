@@ -823,7 +823,20 @@ async def test_anthropic_prompt_cache_normalizes_usage() -> None:
             output_tokens=20,
         ),
         stop_reason="end_turn",
-        content=[],
+        content=[
+            SimpleNamespace(
+                type="thinking",
+                thinking="Consider cache behavior first.",
+            ),
+            SimpleNamespace(type="redacted_thinking", data="opaque"),
+            SimpleNamespace(
+                type="web_search_tool_result",
+                content=[{"url": "https://example.com/source"}],
+            ),
+            SimpleNamespace(
+                type="tool_use", id="call_1", name="read_file", input={}
+            ),
+        ],
     )
     messages = _FakeAnthropicMessages(final_message)
     client = SimpleNamespace(messages=messages)
@@ -846,6 +859,18 @@ async def test_anthropic_prompt_cache_normalizes_usage() -> None:
     assert chunks[-1].cache_read_tokens == 1000
     assert chunks[-1].usage_source == "provider"
     assert chunks[-1].cache_write_tokens == 500
+    assert chunks[-1].reasoning is not None
+    assert chunks[-1].reasoning[0] == {
+        "type": "thinking",
+        "thinking": "Consider cache behavior first.",
+    }
+    assert {"type": "redacted_thinking", "data": "opaque"} in chunks[
+        -1
+    ].reasoning
+    assert any(
+        block["type"] == "web_search_tool_result"
+        for block in chunks[-1].reasoning
+    )
 
 
 def test_prompt_cache_retention_validation() -> None:

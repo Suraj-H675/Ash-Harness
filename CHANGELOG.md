@@ -24,6 +24,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Native Anthropic reasoning and citation evidence extraction for thinking,
+  redacted-thinking, and web-search result blocks, carried through provider
+  chunks into provider-neutral completion outcomes.
 - Full-screen exact-scope approval editor for selecting which arguments are
   persisted in a project permission rule, with all/none/cancel shortcuts.
 - Browser `browser_upload` tool that safely attaches one bounded workspace file

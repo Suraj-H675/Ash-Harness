@@ -33,11 +33,13 @@ class StreamChunk(BaseModel):
     cache_write_tokens: int = 0
     usage_source: Literal["provider", "estimated", "unavailable"] = "unavailable"
     stop_reason: str | None = None
+    reasoning_blocks: list[dict[str, Any]] = Field(default_factory=list)
     model: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     # Fully-formed tool calls from providers that support native
     # OpenAI tool_calls streaming (includes real id for tool_call_id).
     native_tool_calls: list[CanonicalToolCall] | None = None
+    reasoning: list[dict[str, Any]] | None = None
 
 
 class CompletionStopCategory(StrEnum):
@@ -64,6 +66,7 @@ class CompletionOutcome(BaseModel):
     cache_write_tokens: int = Field(0, ge=0)
     usage_source: Literal["provider", "estimated", "unavailable"] = "unavailable"
     stop_reason: str | None = None
+    reasoning_blocks: list[dict[str, Any]] = Field(default_factory=list)
 
 
 _COMPLETE_STOP_REASONS = frozenset(

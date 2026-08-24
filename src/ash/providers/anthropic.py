@@ -216,6 +216,7 @@ class AnthropicProvider(ProviderABC):
             cache_write_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
             stop_reason = getattr(final_message, "stop_reason", None)
             native_tool_calls: list[CanonicalToolCall] = []
+            reasoning_blocks: list[dict[str, Any]] = []
             for block in getattr(final_message, "content", []) or []:
                 if getattr(block, "type", None) == "tool_use":
                     native_tool_calls.append(
@@ -224,6 +225,31 @@ class AnthropicProvider(ProviderABC):
                             name=block.name,
                             arguments=block.input,
                         )
+                    )
+                elif getattr(block, "type", None) in {
+                    "thinking",
+                    "redacted_thinking",
+                    "web_search_tool_result",
+                }:
+                    reasoning_blocks.append(
+                        {
+                            "type": block.type,
+                            **(
+                                {"thinking": str(block.thinking)[:20_000]}
+                                if getattr(block, "thinking", None)
+                                else {}
+                            ),
+                            **(
+                                {"data": getattr(block, "data", "")[:20_000]}
+                                if getattr(block, "type", None) == "redacted_thinking"
+                                else {}
+                            ),
+                            **(
+                                {"content": getattr(block, "content", [])}
+                                if block.type == "web_search_tool_result"
+                                else {}
+                            ),
+                        }
                     )
             yield StreamChunk(
                 content="",
@@ -238,6 +264,7 @@ class AnthropicProvider(ProviderABC):
                 stop_reason=stop_reason,
                 model=self._model_name,
                 native_tool_calls=native_tool_calls or None,
+                reasoning=reasoning_blocks or None,
             )
 
     def configure_max_tokens(self, max_tokens: int) -> None:
