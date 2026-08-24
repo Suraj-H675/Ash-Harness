@@ -22,6 +22,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Submission-time expansion for `@symbol` and `@mcp` mentions through the
+  bounded attachment pipeline, including fail-closed resolution, provenance
+  marking, and token-budget enforcement.
 - Extended interactive `@` completion for fuzzy workspace symbols and live
   connected MCP resources.
 - Explicit prompt-injection isolation: every provider request includes an

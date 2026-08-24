@@ -1398,14 +1398,16 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
         # Normal turn
         try:
-            from ash.commands.attachments import prepare_file_mentions
-
             user_metadata: dict[str, Any] | None = None
             if expand_mentions:
-                prepared = prepare_file_mentions(
+                from ash.commands.attachments import prepare_extended_mentions
+
+                prepared = await prepare_extended_mentions(
                     user_input,
                     loop.safety_guard,
                     allow_images=loop.provider.capabilities.vision,
+                    repo_map=loop.repo_map,
+                    mcp_runtime=loop._mcp_runtime,
                     token_budget=config.attachment_token_budget,
                     count_tokens=loop.provider.count_tokens,
                 )

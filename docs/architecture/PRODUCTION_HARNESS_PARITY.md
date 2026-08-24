@@ -143,7 +143,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/agents` | Verified locally | Slash status/stop/resume, persisted status/report/message inspection, live steering/stop acknowledgement, isolated branch lifecycle, durable task filtering, and cursor-based replay of redacted v1 task events |
 | `/doctor` | Verified locally | Runs the local health report in-session |
 | Shell escape (`!`) | Verified locally | Commands use the normal policy, sandbox, persistence, and audit path |
-| File mention/completion (`@`) | Partial | Workspace file/directory completion plus bounded text, directory, vision image expansion, fuzzy symbol completion, and live MCP resource completion remain wired; attachment expansion for the new extended forms remains |
+| File mention/completion (`@`) | Verified locally | Workspace file/directory/text/vision expansion plus fuzzy symbol and live MCP-resource mention expansion are wired through bounded, provenance-marked attachments with fail-closed lookup and budget enforcement |
 | Custom commands | Verified locally | User/trusted-project Markdown commands, arguments, namespacing, listing, completion |
 
 ## 7. Built-In Coding Tools

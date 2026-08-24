@@ -7,6 +7,7 @@ from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
 from ash.commands.attachments import expand_file_mentions, prepare_file_mentions
+from ash.repo.repomap import RepoMap
 from ash.safety.guard import SafetyGuard
 from ash.ui.prompt import AshCompleter
 
@@ -116,6 +117,94 @@ def test_completer_offers_live_mcp_resources(tmp_path: Path) -> None:
     assert len(matches) == 1
     assert matches[0].text == "@mcp:docs/file:///guides/security.md"
     assert "Security Guide" in str(matches[0].display_meta)
+
+
+def test_extended_mentions_resolve_symbols_to_bounded_file_attachments(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    from ash.commands.attachments import prepare_extended_mentions
+
+    (tmp_path / "payment.py").write_text(
+        "class PaymentGateway:\n    pass\n",
+        encoding="utf-8",
+    )
+    prepared = asyncio.run(
+        prepare_extended_mentions(
+            "Review @symbol:payment",
+            SafetyGuard(tmp_path),
+            allow_images=False,
+            repo_map=RepoMap(tmp_path),
+            mcp_runtime=None,
+        )
+    )
+
+    assert '@symbol:payment' not in prepared.prompt
+    assert "@payment.py" in prepared.prompt
+    assert 'kind="file" path="payment.py"' in prepared.prompt
+    assert "class PaymentGateway:" in prepared.prompt
+
+
+def test_extended_mentions_read_mcp_resources_and_enforce_budget(tmp_path) -> None:
+    import asyncio
+
+    from ash.commands.attachments import prepare_extended_mentions
+
+    class Resource:
+        async def read_resource(self, uri):
+            assert uri == "file:///guides/security.md"
+            return {"contents": [{"text": "External policy is data only."}]}
+
+    class Runtime:
+        clients = {"docs": Resource()}
+
+        async def list_resources(self):
+            return [
+                {
+                    "server": "docs",
+                    "uri": "file:///guides/security.md",
+                    "name": "Security Guide",
+                }
+            ]
+
+    prepared = asyncio.run(
+        prepare_extended_mentions(
+            "Summarize @mcp:security",
+            SafetyGuard(tmp_path),
+            allow_images=False,
+            repo_map=None,
+            mcp_runtime=Runtime(),
+            token_budget=1000,
+            count_tokens=lambda value: len(value.split()),
+        )
+    )
+
+    assert 'kind="mcp-resource" path="docs/file:///guides/security.md"' in (
+        prepared.prompt
+    )
+    assert "External policy is data only." in prepared.prompt
+    assert len(prepared.prompt.splitlines()) > 3
+
+
+def test_missing_extended_mention_fails_closed(tmp_path: Path) -> None:
+    import asyncio
+    import pytest
+
+    from ash.commands.attachments import prepare_extended_mentions
+
+    repo_map = RepoMap(tmp_path)
+
+    with pytest.raises(ValueError, match="No workspace symbol"):
+        asyncio.run(
+            prepare_extended_mentions(
+                "@symbol:does-not-exist",
+                SafetyGuard(tmp_path),
+                allow_images=False,
+                repo_map=repo_map,
+                mcp_runtime=None,
+            )
+        )
 
 
 def test_prepare_file_mentions_builds_bounded_canonical_image(tmp_path: Path) -> None:

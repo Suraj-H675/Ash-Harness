@@ -585,6 +585,10 @@ Interactive `@` completion supports workspace files and directories plus two
 extended forms: `@symbol:<query>` offers fuzzy structural symbol matches with
 file and line metadata, and `@mcp:<query>` searches live connected MCP resource
 URIs by server and URI.
+On submission, these forms resolve into the same bounded attachment pipeline:
+symbols attach up to five matching workspace source files, MCP resources attach
+a JSON representation of the selected live resource, missing matches fail
+closed, and all content is explicitly marked untrusted.
 
 Set `ASH_SCREEN_READER_MODE=true` for linear, non-rewriting terminal output.
 This mode forces inline rendering, no color, reduced motion, and no token bar;
