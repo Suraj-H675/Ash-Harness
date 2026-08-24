@@ -468,6 +468,10 @@ def build_runtime(
         chroma_persist_dir=config.chroma_persist_dir,
     )
     loop.permission_policy.set_persistent_rules(rules)
+    loop.notify_permission_rules_changed(
+        source="runtime_startup",
+        rule_count=len(rules),
+    )
     loop.permission_policy.set_managed_rules(managed)
     loop.permission_policy.set_managed_rules(managed_rules)
     hooks.set_event_sink(loop._emit_event)

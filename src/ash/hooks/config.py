@@ -40,6 +40,9 @@ LIFECYCLE_EVENTS: tuple[HookEvent, ...] = (
     "turn_error",
     "pre_model",
     "post_model",
+    "context_compacted",
+    "config_changed",
+    "permission_changed",
     "tool_error",
 )
 

@@ -2970,8 +2970,21 @@ class AshLoop:
         if self.current_session is None:
             raise RuntimeError("No active session")
         before = self.current_session.context_summary
+        before_tokens = self._last_context_tokens
         self._build_messages(self.current_session, force_compaction=True)
-        return self._last_context_tokens, self.current_session.context_summary != before
+        changed = self.current_session.context_summary != before
+        asyncio.create_task(
+            self._fire_hook_lifecycle(
+                "context_compacted",
+                {
+                    "session_id": self.current_session.session_id,
+                    "changed": changed,
+                    "previous_tokens": before_tokens,
+                    "current_tokens": self._last_context_tokens,
+                },
+            )
+        )
+        return self._last_context_tokens, changed
 
     # --- provider switching -------------------------------------------------
 
@@ -2986,6 +2999,7 @@ class AshLoop:
         new_config = self._config.model_copy(update={"model": model_str})
         self.provider = _build_provider(new_config)
         self._config = new_config
+        self._fire_config_changed("switch_provider", {"model": model_str})
         # Re-configure skills runtime with new provider.
         if self.tools_registry is not None:
             from ash.tools.skills import configure_runtime
@@ -3015,6 +3029,58 @@ class AshLoop:
             )
         self.provider = _build_provider(new_config)
         self._config = new_config
+        self._fire_config_changed("switch_model", {"model": self._config.model})
+
+    def _fire_config_changed(self, reason: str, changes: dict[str, Any]) -> None:
+        if not changes:
+            return
+        self._schedule_hook_lifecycle(
+            "config_changed",
+            {
+                "reason": reason,
+                "changes": redact_value(changes),
+                **(
+                    {"session_id": self.current_session.session_id}
+                    if self.current_session is not None
+                    else {}
+                ),
+            },
+        )
+
+    def _schedule_hook_lifecycle(
+        self,
+        event: "HookEvent",
+        payload: dict[str, Any],
+    ) -> None:
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        running_loop.create_task(self._fire_hook_lifecycle(event, payload))
+
+    def notify_permission_rules_changed(
+        self,
+        *,
+        source: str,
+        rule_count: int,
+    ) -> None:
+        """Fire the durable permission-change observer after rules are applied."""
+
+        if rule_count < 0:
+            raise ValueError("rule_count cannot be negative")
+        self._schedule_hook_lifecycle(
+            "permission_changed",
+            {
+                "source": source,
+                "persistent_rule_count": rule_count,
+                "mode": self.permission_policy.mode.value,
+                **(
+                    {"session_id": self.current_session.session_id}
+                    if self.current_session is not None
+                    else {}
+                ),
+            },
+        )
 
 
 async def _execute_tool_once(

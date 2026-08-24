@@ -199,7 +199,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Skills | Verified locally | Bounded standard `SKILL.md` discovery and progressive activation with trust; legacy in-process executable skills are explicit unsafe compatibility only and cannot fabricate tools |
 | Plugins/extensions | Verified locally | Transactional local lifecycle, dependencies, inventory, project trust, namespacing, declarative components, and Plugin API v1 tools through strict bounded JSON-RPC subprocesses with read-only/no-network isolation, ordinary policy/audit/events, no side-effect replay, live replacement, and deterministic cleanup |
 | Plugin marketplace | Missing | Signed or trust-reviewed sources; no hardcoded nonexistent registry |
-| Hooks | Strong partial | Versioned session/turn/model/tool/error lifecycle, structured pre-tool denial and session context, critical-versus-observer failure semantics, redacted diagnostics/events, plugin cwd, scrubbed env, timeout, bounded I/O, and process-tree cleanup; context-compaction/config/permission-change hooks remain |
+| Hooks | Verified locally | Versioned session/turn/model/tool/error lifecycle plus context-compaction/config/permission-change observers; structured pre-tool denial and session context, critical-versus-observer failure semantics, redacted diagnostics/events, plugin cwd, scrubbed env, timeout, bounded I/O, and process-tree cleanup are wired |
 | Custom agents | Verified locally | User/project/plugin Markdown roles, namespacing, instructions, base-role isolation, and non-escalating tool restrictions |
 | Hot reload | Verified locally | Commands/completion, skills, agents, hooks, and MCP runtimes validate before live replacement |
 

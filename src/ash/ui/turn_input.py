@@ -239,6 +239,10 @@ class InteractiveTurnController:
     def _persist_rule(self, rule: PermissionRule) -> None:
         rules = add_permission_rule(self.loop.project_root, rule)
         self.loop.permission_policy.set_persistent_rules(rules)
+        self.loop.notify_permission_rules_changed(
+            source="approval",
+            rule_count=len(rules),
+        )
         self.write_status(
             f"Saved {rule.effect.value} rule {rule.rule_id} for {rule.tool_name}."
         )

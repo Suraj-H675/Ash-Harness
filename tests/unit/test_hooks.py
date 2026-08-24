@@ -13,6 +13,14 @@ from ash.hooks.registry import (
 
 
 @pytest.mark.asyncio
+async def test_extended_lifecycle_events_dispatch_payloads():
+    from ash.hooks.config import LIFECYCLE_EVENTS as CONFIG_EVENTS
+
+    for event in ("context_compacted", "config_changed", "permission_changed"):
+        assert event in CONFIG_EVENTS
+
+
+@pytest.mark.asyncio
 async def test_pre_tool_hook_fires_on_matcher():
     registry = HookRegistry()
     called = []

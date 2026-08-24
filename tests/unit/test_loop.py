@@ -1402,6 +1402,50 @@ def test_build_messages_injects_untrusted_content_boundary(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_extended_lifecycle_observers_fire_at_runtime_boundaries(tmp_path):
+    observed = []
+    hooks = HookRegistry()
+
+    async def capture(payload):
+        observed.append(payload)
+
+    for event in ("context_compacted", "config_changed", "permission_changed"):
+        hooks.register_lifecycle(LifecycleHook(event, capture))
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "extended-hooks.db"),
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        hooks=hooks,
+        config=AshConfig(
+            model="ollama/test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+        ),
+    )
+    session = await loop.start_session()
+
+    loop.compact_current_context()
+    await asyncio.sleep(0)
+    loop.switch_model("test")
+    loop.notify_permission_rules_changed(source="test", rule_count=2)
+    await asyncio.sleep(0.01)
+
+    assert [item["event"] for item in observed] == [
+        "context_compacted",
+        "config_changed",
+        "permission_changed",
+    ]
+    assert len(observed) == 3
+    assert observed[0]["session_id"] == session.session_id
+    assert observed[1]["changes"]["model"] == "ollama/test"
+    assert observed[2]["persistent_rule_count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
     store = SessionStore(tmp_path / "cache-usage.db")
     ui = EventUI()

@@ -22,6 +22,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Extended lifecycle hooks for context compaction, runtime configuration
+  changes, and permission rule/mode changes with redacted bounded payloads and
+  event-loop-safe dispatch.
 - Submission-time expansion for `@symbol` and `@mcp` mentions through the
   bounded attachment pipeline, including fail-closed resolution, provenance
   marking, and token-budget enforcement.

@@ -1207,6 +1207,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         loop.permission_policy.set_persistent_rules(
                             load_permission_rules(loop.project_root)
                         )
+                        loop.notify_permission_rules_changed(
+                            source="slash_permissions",
+                            rule_count=len(loop.permission_policy.persistent_rules),
+                        )
                     except ValueError as exc:
                         print(f"Error: {exc}", file=sys.stderr)
                         continue
@@ -1236,6 +1240,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     managed_rules=loop.permission_policy.managed_rules,
                     persistent_rules=loop.permission_policy.persistent_rules,
                     session_rules=loop.permission_policy.session_rules,
+                )
+                loop.notify_permission_rules_changed(
+                    source="permission_mode",
+                    rule_count=len(loop.permission_policy.persistent_rules),
                 )
                 loop.safety_tier = mode.value
                 config.safety_tier = mode.value
