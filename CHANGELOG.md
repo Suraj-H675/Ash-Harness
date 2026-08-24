@@ -24,6 +24,8 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Full-screen exact-scope approval editor for selecting which arguments are
+  persisted in a project permission rule, with all/none/cancel shortcuts.
 - Browser `browser_upload` tool that safely attaches one bounded workspace file
   to a referenced file input using scoped reads, sensitive-file rejection, and
   bounded payload checks.

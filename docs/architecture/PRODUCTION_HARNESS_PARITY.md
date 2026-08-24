@@ -109,7 +109,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Streaming transcript | Verified locally | Immutable semantic user/assistant/reasoning/tool/approval/status/error entries, bounded mutable live cells, rich cached Markdown, command output routing, and durable-session hydration |
 | Markdown/code rendering | Verified locally | Streamed Rich Markdown with fenced-code highlighting and bounded repaint frequency |
 | Diff preview | Verified locally | Bounded unified and selectable persisted side-by-side previews for writes/replacements/patches are wired into the interactive approval flow |
-| Approval dialog | Partial | Allow once, exact session, broad session, exact project, persisted exact deny, verified command-prefix project scopes, and bounded deny-with-feedback are wired; a full-screen scope editor remains |
+| Approval dialog | Verified locally | Allow once, exact/broad session, exact/edited project scopes, persisted exact deny, verified command-prefix project scopes, bounded deny-with-feedback, and the full-screen scope editor are wired |
 | Status line | Verified locally | Cached model, mode, branch, context budget, prompt-cache totals, cost, sandbox, session, and cwd state |
 | Themes | Verified locally | Validated dark/light palettes are wired through config precedence, streamed Rich panels, approvals/status output, inline prompts, and the responsive viewport; screen-reader/no-color fallback remains ANSI-safe |
 | Configurable keybindings | Verified locally | Cross-platform newline/editor actions with collision validation |

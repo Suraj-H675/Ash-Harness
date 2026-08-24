@@ -145,7 +145,8 @@ class InteractiveTurnController:
         try:
             choices = (
                 "Approve [y] once, [s] scope/session, [a] tool/session, "
-                "[p] scope/project, [x] deny scope/project, [f] deny with feedback"
+                "[p] scope/project, [e] edit exact scope/project, "
+                "[x] deny scope/project, [f] deny with feedback"
             )
             if tool_name == "run_command":
                 choices += ", [c] command prefix/project"
@@ -173,6 +174,21 @@ class InteractiveTurnController:
             if answer in {"p", "persist", "project"}:
                 rule = self._exact_scope_rule(RuleEffect.ALLOW, tool_name, arguments)
                 self._persist_rule(rule)
+                return True
+            if answer in {"e", "edit"}:
+                scoped_arguments = await self._edit_exact_scope(arguments)
+                if scoped_arguments is None:
+                    return False
+                rule = self._exact_scope_rule(
+                    RuleEffect.ALLOW,
+                    tool_name,
+                    scoped_arguments,
+                )
+                self._persist_rule(rule)
+                self.write_status(
+                    f"Approved edited project scope ({rule.rule_id}): "
+                    + ", ".join(scoped_arguments)
+                )
                 return True
             if answer in {"x", "never", "block"}:
                 rule = self._exact_scope_rule(RuleEffect.DENY, tool_name, arguments)
@@ -235,6 +251,50 @@ class InteractiveTurnController:
             tool_name,
             build_exact_scope_matchers(arguments),
         )
+
+    async def _edit_exact_scope(
+        self,
+        arguments: dict[str, object],
+    ) -> dict[str, object] | None:
+        """Full-screen editor flow for selecting exact argument scopes."""
+
+        keys = sorted(arguments)
+        if not keys:
+            self.write_status("No exact arguments are available to scope.")
+            return None
+        selected: set[str] = set()
+        for key in keys:
+            preview = str(arguments[key]).replace("\n", " ")[:200]
+            while True:
+                answer = (
+                    (
+                        await self.prompt_input.read(
+                            f"Scope {key}={preview!r} exactly? "
+                            "[y/N/all/none/cancel]> "
+                        )
+                    )
+                    .strip()
+                    .casefold()
+                )
+                if answer in {"all"}:
+                    selected.update(keys)
+                    break
+                if answer in {"none"}:
+                    selected.clear()
+                    break
+                if answer in {"cancel", "c", "q", "quit"}:
+                    self.write_status("Exact-scope editing cancelled.")
+                    return None
+                if answer in {"y", "yes"}:
+                    selected.add(key)
+                    break
+                if answer in {"n", "no", ""}:
+                    break
+                self.write_status("Answer y, n, all, none, or cancel.")
+        if not selected:
+            self.write_status("Edited scope has no arguments; denied.")
+            return None
+        return {key: arguments[key] for key in sorted(selected)}
 
     def _persist_rule(self, rule: PermissionRule) -> None:
         rules = add_permission_rule(self.loop.project_root, rule)
