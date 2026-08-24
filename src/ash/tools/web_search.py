@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 from abc import ABC, abstractmethod
@@ -371,6 +372,18 @@ class WebSearchTool(BaseTool):
                 ensure_ascii=False,
                 sort_keys=True,
             )
+            citations = [
+                {
+                    "title": redact_text(hit.title)[:300],
+                    "url": hit.url,
+                    "snippet_sha256": hashlib.sha256(
+                        redact_text(hit.snippet).encode("utf-8")
+                    ).hexdigest(),
+                    "published_at": hit.published_at[:64],
+                    "provider": provider.name,
+                }
+                for hit in hits
+            ]
             self.emit_event(
                 {
                     "type": "web.search.completed",
@@ -383,6 +396,7 @@ class WebSearchTool(BaseTool):
                 success=True,
                 output=output,
                 token_count=count_output_tokens(output),
+                citations=citations,
             )
         return ToolResult(
             success=False,

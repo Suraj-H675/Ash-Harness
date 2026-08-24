@@ -29,6 +29,7 @@ class ToolResult(BaseModel):
     outcome: ToolExecutionOutcome = ToolExecutionOutcome.COMPLETED
     diagnostics: list[dict[str, Any]] = []
     diagnostic_summary: dict[str, int] = {}
+    citations: list[dict[str, Any]] = []
 
 
 class ToolReplayPolicy(StrEnum):

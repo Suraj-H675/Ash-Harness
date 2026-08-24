@@ -87,6 +87,17 @@ async def test_brave_search_is_bounded_filtered_and_emits_provenance(
             "result_count": 1,
         }
     ]
+    assert result.citations == [
+        {
+            "title": "MCP",
+            "url": "https://docs.example/mcp",
+            "snippet_sha256": __import__("hashlib").sha256(
+                b"Protocol docs"
+            ).hexdigest(),
+            "published_at": "2 days ago",
+            "provider": "brave",
+        }
+    ]
 
 
 @pytest.mark.asyncio

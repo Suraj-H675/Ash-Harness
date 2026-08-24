@@ -34,6 +34,14 @@ async def test_web_fetch_returns_bounded_html_text(monkeypatch, guard) -> None:
     assert "Hello" in result.output
     assert "bad" not in result.output
     assert result.truncated is True
+    assert result.citations == [
+        {
+            "title": "",
+            "url": "https://example.com/page",
+            "status_code": 200,
+            "content_type": "text/html",
+        }
+    ]
 
 
 @pytest.mark.asyncio

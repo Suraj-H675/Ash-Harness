@@ -83,6 +83,14 @@ class WebFetchTool(BaseTool):
             output=output,
             token_count=count_output_tokens(output),
             truncated=truncated,
+            citations=[
+                {
+                    "title": "",
+                    "url": final_url,
+                    "status_code": status_code,
+                    "content_type": content_type or "unknown",
+                }
+            ],
         )
 
 

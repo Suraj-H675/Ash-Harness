@@ -22,6 +22,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Durable web citations for successful search and fetch tool results, including
+  bounded source metadata, snippet digests, provider/status provenance, and
+  model-visible citation payloads.
 - Bounded framework diagnostic summaries for pytest, MyPy, and Ruff results,
   exposed to both durable tool results and model-visible tool responses.
 - Tool-specific permission grammar with safe `path_prefix` workspace matching

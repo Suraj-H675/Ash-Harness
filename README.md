@@ -383,6 +383,10 @@ and falls back between configured providers only in `auto` mode. Set
 `web_search_provider` to pin one provider. `allowed_web_domains` filters both
 fetch targets and returned search sources. Run `ash setup web` to enter either
 search credential through the hidden-input setup flow.
+Successful search and fetch results carry durable citations. Search citations
+include title, URL, redacted-snippet digest, publication date when available,
+and provider; fetch citations include final URL, status, and content type.
+Citations are also exposed to the model with each tool response.
 
 Browser automation is an optional capability pack. Install with
 `pipx install --force 'ash-ai[browser] @ git+https://github.com/Suraj-H675/Ash-Harness.git'`,
