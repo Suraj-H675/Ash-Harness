@@ -22,6 +22,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Explicit prompt-injection isolation: every provider request includes an
+  untrusted-content boundary, and tool responses are labeled as data with an
+  embedded-instruction warning.
 - Structured bounded diagnostics for compiler, lint, and pytest-style failures
   returned by `run_command`, with model-visible path, line, symbol, code, and
   message fields.

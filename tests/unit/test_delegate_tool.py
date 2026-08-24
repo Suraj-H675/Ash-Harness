@@ -39,6 +39,7 @@ class RecordingProvider(ProviderABC):
 
 
 class CostlyProvider(ProviderABC):
+    provider_family = "cost-provider"
     model_name = "cost-provider"
 
     async def stream_chat(self, messages, temperature=0.0, tools=None):
@@ -286,7 +287,7 @@ async def test_delegate_graph_enforces_shared_cost_ceiling(tmp_path: Path):
         budget = state.tasks.get_graph_budget(payload["graph_id"])
         assert task is not None and task.state == "failed"
         assert task.error is not None and task.error.startswith("graph cost budget")
-        assert budget.used_cost_usd == pytest.approx(0.000135)
+        assert budget.used_cost_usd == pytest.approx(0.000181)
     finally:
         state.close()
         await delegate.aclose()

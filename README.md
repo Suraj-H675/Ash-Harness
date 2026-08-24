@@ -574,6 +574,13 @@ compiler, linter, and test-failure output. These diagnostics accompany the raw
 output so the model can act on exact paths, lines, symbols, and failure messages
 without re-parsing large logs.
 
+Every provider request carries an explicit untrusted-content boundary. Tool
+responses are labeled as untrusted data with a policy note, while the runtime
+system prompt states that repository files, tool outputs, memory, and
+project-derived content must not override user instructions or policy. This is a
+parsing-and-prompting defense layer; permissions, approval gates, sandboxing,
+redaction, and auditing remain independently enforced.
+
 Set `ASH_SCREEN_READER_MODE=true` for linear, non-rewriting terminal output.
 This mode forces inline rendering, no color, reduced motion, and no token bar;
 it also disables dynamic completion, autosuggestions, and the bottom toolbar
