@@ -1376,6 +1376,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 action = arguments[0] if arguments else "status"
                 if len(arguments) > 1 or action not in {
                     "status",
+                    "refresh",
                     "tools",
                     "resources",
                     "prompts",
@@ -1392,6 +1393,23 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         print(f"{name}: {state}")
                     for name, error in runtime.errors.items():
                         print(f"{name}: {error}", file=sys.stderr)
+                    continue
+                if action == "refresh":
+                    await reload_plugin_components()
+                    refreshed_runtime = loop._mcp_runtime
+                    print("MCP configuration reloaded.")
+                    if refreshed_runtime is None:
+                        continue
+                    for name in loop._mcp_configs:
+                        state = (
+                            "connected"
+                            if name in refreshed_runtime.clients
+                            else "failed"
+                        )
+                        print(f"{name}: {state}")
+                    for name, error in sorted(refreshed_runtime.errors.items()):
+                        print(f"{name}: {error}", file=sys.stderr)
+                    continue
                 elif action == "tools":
                     for name in sorted(
                         key for key in loop.tools if key.startswith("mcp__")

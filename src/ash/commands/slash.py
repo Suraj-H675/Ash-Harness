@@ -88,8 +88,8 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("doctor", "Run local diagnostics", "/doctor"),
     SlashCommand(
         "mcp",
-        "Inspect live MCP servers and capabilities",
-        "/mcp [status|tools|resources|prompts]",
+        "Inspect or reload live MCP servers and capabilities",
+        "/mcp [status|refresh|tools|resources|prompts]",
     ),
     SlashCommand(
         "memory",

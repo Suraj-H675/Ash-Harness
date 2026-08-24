@@ -424,6 +424,10 @@ ash mcp status
 ash mcp logout docs
 ```
 
+Inside a session, run `/mcp refresh` to reload trusted project/plugin MCP
+configuration through the same atomic lifecycle and print the resulting
+connected/failed state.
+
 Authorization is always an explicit `ash mcp login`; normal agent runs never
 open a browser or wait for terminal input. Use `--no-browser` to print the URL
 for another browser and paste its final localhost redirect. Access and refresh
