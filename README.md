@@ -394,6 +394,8 @@ then run `ash setup browser` once to download
 Playwright's pinned Chromium build. Browser pages use an isolated context with
 `browser_screenshot` captures a bounded PNG for vision-capable models, returning
 the canonical image block plus digest metadata; oversized captures fail safely.
+`browser_upload` uploads one bounded workspace file through a referenced file
+input using scoped reads and sensitive-file rejection.
 downloads and service workers disabled; navigation, subresources, and
 WebSockets share the public-host and `allowed_web_domains` policy. The model
 receives bounded ARIA snapshots and stable element references rather than raw

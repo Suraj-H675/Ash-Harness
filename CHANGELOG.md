@@ -7,6 +7,8 @@ All notable changes to Ash are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Deferred Windows CI until Windows parity work resumes so Linux/macOS checks
+  are not marked failed by the known platform backlog.
 - Routed interactive REPL command and turn failures through the shared error
   taxonomy so users receive stable categories and actionable remedies.
 - Recorded subagent token and cost usage in one durable transaction,
@@ -22,6 +24,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Browser `browser_upload` tool that safely attaches one bounded workspace file
+  to a referenced file input using scoped reads, sensitive-file rejection, and
+  bounded payload checks.
 - Browser `browser_screenshot` tool that returns bounded PNG evidence as a
   canonical image block with digest metadata and fail-closed size handling.
 - `/mcp refresh` reloads trusted project/plugin MCP configuration atomically and

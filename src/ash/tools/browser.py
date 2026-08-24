@@ -221,6 +221,45 @@ class BrowserSession:
             sha256=hashlib.sha256(payload).hexdigest(),
         )
 
+    async def upload_file(
+        self,
+        ref: str,
+        file_path: str,
+        *,
+        safety_guard: SafetyGuard,
+        max_bytes: int,
+    ) -> str:
+        from ash.commands.attachments import _reject_sensitive
+        from ash.safety.scoped_io import read_scoped_bytes
+
+        locator = await self._locator(ref)
+        input_type = (await locator.get_attribute("type") or "").casefold()
+        if input_type != "file":
+            raise ValueError("browser_upload target must be a file input")
+        page = await self.ensure_started()
+        self._page = self._latest_page()
+        validated_path, payload = await asyncio.to_thread(
+            read_scoped_bytes,
+            file_path,
+            safety_guard,
+        )
+        if len(payload) > max_bytes:
+            raise ValueError(
+                f"upload exceeds {max_bytes} bytes; choose a smaller file"
+            )
+        await asyncio.to_thread(
+            _reject_sensitive,
+            validated_path,
+            safety_guard.project_root,
+        )
+        async with page.expect_file_chooser(
+            timeout=self.timeout_ms,
+        ) as chooser_info:
+            await locator.click(timeout=self.timeout_ms)
+        await chooser_info.value.set_files(str(validated_path))
+        await self._settle(page)
+        return await self.snapshot()
+
     async def click(self, ref: str) -> str:
         page = await self.ensure_started()
         locator = await self._locator(ref)
@@ -388,6 +427,16 @@ class ScreenshotArgs(BaseModel):
     )
 
 
+class UploadArgs(ElementArgs):
+    file_path: str = Field(..., min_length=1, max_length=2048)
+    max_bytes: int = Field(
+        5_000_000,
+        ge=1,
+        le=20_000_000,
+        description="Maximum upload payload accepted from the workspace.",
+    )
+
+
 class _BrowserTool(BaseTool):
     def __init__(self, safety_guard: SafetyGuard, session: BrowserSession) -> None:
         super().__init__(safety_guard)
@@ -529,6 +578,26 @@ class BrowserScreenshotTool(_BrowserTool):
         )
 
 
+class BrowserUploadTool(_BrowserTool):
+    name = "browser_upload"
+    description = (
+        "Upload one bounded workspace file through a referenced file input and "
+        "return the updated snapshot."
+    )
+    args_schema = UploadArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = UploadArgs(**kwargs)
+        return await self._result(
+            self.session.upload_file(
+                args.ref,
+                args.file_path,
+                safety_guard=self.safety_guard,
+                max_bytes=args.max_bytes,
+            )
+        )
+
+
 def build_browser_tools(
     safety_guard: SafetyGuard,
     *,
@@ -549,4 +618,5 @@ def build_browser_tools(
         BrowserScrollTool(safety_guard, session),
         BrowserBackTool(safety_guard, session),
         BrowserScreenshotTool(safety_guard, session),
+        BrowserUploadTool(safety_guard, session),
     ]
