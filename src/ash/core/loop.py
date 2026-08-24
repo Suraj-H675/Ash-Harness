@@ -244,6 +244,11 @@ def _render_tool_response(call_id: str, tool_name: str, result: dict[str, Any]) 
             if result.get("diagnostics")
             else {}
         ),
+        **(
+            {"diagnostic_summary": result["diagnostic_summary"]}
+            if result.get("diagnostic_summary")
+            else {}
+        ),
     }
     return (
         f'<tool_response name="{tool_name}" call_id="{call_id}">\n'
@@ -2413,7 +2418,18 @@ class AshLoop:
                     "output": tool_result.output,
                     "error": tool_result.error,
                     "truncated": tool_result.truncated,
-                    **({"diagnostics": tool_result.diagnostics} if tool_result.diagnostics else {}),
+                    **(
+                        {"diagnostics": tool_result.diagnostics}
+                        if tool_result.diagnostics
+                        else {}
+                    ),
+                    **(
+                        {
+                            "diagnostic_summary": tool_result.diagnostic_summary
+                        }
+                        if tool_result.diagnostic_summary
+                        else {}
+                    ),
                     "token_count": tool_result.token_count,
                 }
             )

@@ -584,6 +584,9 @@ catalog with an explicit warning.
 compiler, linter, and test-failure output. These diagnostics accompany the raw
 output so the model can act on exact paths, lines, symbols, and failure messages
 without re-parsing large logs.
+It also extracts concise framework summaries, such as pytest pass/fail/error
+counts, MyPy totals, and Ruff fixable counts, so the model gets aggregate status
+without scanning the full transcript.
 
 Every provider request carries an explicit untrusted-content boundary. Tool
 responses are labeled as untrusted data with a policy note, while the runtime

@@ -142,6 +142,34 @@ async def test_run_command_bounds_diagnostic_count(
 
 
 @pytest.mark.asyncio
+async def test_run_command_aggregates_framework_summaries(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    output = "\n".join(
+        [
+            "FAILED tests/unit/test_a.py::test_one - AssertionError",
+            "FAILED tests/unit/test_b.py::test_two",
+            "=========== 2 failed, 7 passed, 1 error in 0.12s ===========",
+            "Found 3 errors in 2 files (checked 10 source files)",
+            "1 fixable with the --fix option.",
+        ]
+    )
+    command = f"cat <<'ASH_DIAGNOSTICS'\n{output}\nASH_DIAGNOSTICS"
+
+    result = await RunCommandTool(guard).run(command_line=command)
+
+    assert result.success is True
+    assert result.diagnostic_summary == {
+        "pytest_failed": 2,
+        "pytest_passed": 7,
+        "pytest_errors": 3,
+        "mypy_error_count": 3,
+        "ruff_fixable": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_read_file_truncation_metadata_respects_start_line(
     project_root: Path,
     guard: SafetyGuard,

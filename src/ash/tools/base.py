@@ -28,6 +28,7 @@ class ToolResult(BaseModel):
     truncated: bool = False
     outcome: ToolExecutionOutcome = ToolExecutionOutcome.COMPLETED
     diagnostics: list[dict[str, Any]] = []
+    diagnostic_summary: dict[str, int] = {}
 
 
 class ToolReplayPolicy(StrEnum):

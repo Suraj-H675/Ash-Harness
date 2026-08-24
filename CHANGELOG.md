@@ -22,6 +22,8 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Bounded framework diagnostic summaries for pytest, MyPy, and Ruff results,
+  exposed to both durable tool results and model-visible tool responses.
 - Tool-specific permission grammar with safe `path_prefix` workspace matching
   and hostname-based `domain` matching for URLs/domain arguments, exposed via
   `ash permissions`.

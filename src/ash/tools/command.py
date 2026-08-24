@@ -23,6 +23,7 @@ from ash.sandbox.process_utils import process_group_options, terminate_process_t
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_COMMAND_OUTPUT_CHARS = 100_000
 MAX_DIAGNOSTIC_ITEMS = 50
+MAX_SUMMARY_ITEMS = 8
 POWERSHELL_FILE_CMDLETS = (
     "get-content",
     "set-content",
@@ -107,6 +108,44 @@ def extract_diagnostics(output: str, error: str) -> list[dict[str, Any]]:
             if len(diagnostics) >= MAX_DIAGNOSTIC_ITEMS:
                 return diagnostics
     return diagnostics
+
+
+def extract_diagnostic_summary(output: str, error: str) -> dict[str, int]:
+    """Aggregate common framework result counts from concise summary lines."""
+
+    combined = "\n".join((error, output))
+    counts: dict[str, int] = {}
+    patterns: tuple[tuple[str, re.Pattern[str]], ...] = (
+        (
+            "pytest_failed",
+            re.compile(r"^=+\s+(?:FAILED|\d+ failed)", re.IGNORECASE),
+        ),
+        ("pytest_passed", re.compile(r"(\d+)\s+passed")),
+        ("pytest_errors", re.compile(r"(\d+)\s+errors?")),
+        ("ruff_fixable", re.compile(r"(\d+)\s+fixable")),
+        (
+            "mypy_error_count",
+            re.compile(r"Found\s+(\d+)\s+error", re.IGNORECASE),
+        ),
+    )
+    for line in combined.splitlines()[:2000]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "failed" in stripped.casefold():
+            failed_matches = re.findall(r"(\d+)\s+failed", stripped, re.IGNORECASE)
+            if failed_matches:
+                counts["pytest_failed"] = sum(int(value) for value in failed_matches)
+            elif re.search(r"^=+\s+FAILED\b|^\s*FAILED\b", stripped, re.IGNORECASE):
+                counts["pytest_failed"] = max(counts.get("pytest_failed", 0), 1)
+        for name, pattern in patterns[1:]:
+            match = pattern.search(stripped)
+            if match:
+                value = int(match.group(1))
+                counts[name] = max(counts.get(name, 0), value)
+        if len(counts) >= MAX_SUMMARY_ITEMS:
+            break
+    return {name: value for name, value in sorted(counts.items())}
 
 
 class RunCommandTool(BaseTool):
@@ -226,6 +265,10 @@ class RunCommandTool(BaseTool):
             token_count=count_output_tokens(output),
             truncated=truncated,
             diagnostics=extract_diagnostics(result.stdout, result.stderr),
+            diagnostic_summary=extract_diagnostic_summary(
+                result.stdout,
+                result.stderr,
+            ),
         )
 
     async def _run_scoped(
@@ -294,6 +337,7 @@ class RunCommandTool(BaseTool):
             token_count=count_output_tokens(output),
             truncated=truncated,
             diagnostics=extract_diagnostics(stdout, stderr),
+            diagnostic_summary=extract_diagnostic_summary(stdout, stderr),
         )
 
     def _validate_powershell_literal_paths(self, command_line: str) -> None:
