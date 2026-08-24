@@ -92,7 +92,7 @@ class ProviderRegistry:
             provider = factory(config, model_name)
             if provider.provider_family == "custom":
                 provider.provider_family = provider_name
-            if provider_name in self._owned_capability_families:
+            if provider_name in self._owned_capability_families and provider_name != "ollama":
                 provider._ash_declared_capabilities = self._capabilities.resolve(
                     provider_name, model_name
                 )

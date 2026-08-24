@@ -7,6 +7,7 @@ from typing import Any, AsyncGenerator
 import httpx
 
 from ash.context.tokens import AnthropicTokenCounter
+from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import MessageInput, normalize_messages
 from ash.providers.retry import ProviderHTTPError
@@ -14,6 +15,7 @@ from ash.providers.retry import ProviderHTTPError
 
 class OllamaProvider(ProviderABC):
     provider_family = "ollama"
+    _dynamic_capabilities: ProviderCapabilities | None = None
 
     def __init__(
         self,
@@ -26,6 +28,45 @@ class OllamaProvider(ProviderABC):
         self._base_url = base_url.rstrip("/")
         self._token_counter = token_counter or AnthropicTokenCounter()
         self._client = httpx.AsyncClient(timeout=60.0)
+
+    async def detect_capabilities(self) -> ProviderCapabilities:
+        """Probe model metadata once and map supported tool capabilities."""
+
+        if self._dynamic_capabilities is not None:
+            return self._dynamic_capabilities
+        try:
+            response = await self._client.post(
+                f"{self._base_url}/api/show",
+                json={"model": self._model_name},
+                timeout=5.0,
+            )
+            if response.status_code == 200:
+                payload = response.json()
+                families = payload.get("details", {}).get("families", [])
+                template = str(payload.get("template", "")).casefold()
+                supports_tools = any(
+                    family in {"tools", "function-calling"} for family in families
+                ) or any(
+                    marker in template
+                    for marker in ("tool_call", "tools", "function_call")
+                )
+                context_window = payload.get("model_info", {}).get(
+                    "general.context_length"
+                )
+                self._dynamic_capabilities = ProviderCapabilities(
+                    native_tools=bool(supports_tools),
+                    local=True,
+                    context_window=(
+                        int(context_window)
+                        if isinstance(context_window, int) and context_window > 0
+                        else None
+                    ),
+                )
+        except Exception:  # noqa: BLE001 - capability probing is best-effort
+            pass
+        if self._dynamic_capabilities is None:
+            self._dynamic_capabilities = ProviderCapabilities(local=True)
+        return self._dynamic_capabilities
 
     @property
     def model_name(self) -> str:

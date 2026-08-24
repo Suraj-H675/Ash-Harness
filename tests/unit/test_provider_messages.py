@@ -175,3 +175,46 @@ async def test_ollama_validates_messages_before_network_io() -> None:
     with pytest.raises(ValueError, match="tool messages require tool_call_id"):
         async for _ in provider.stream_chat([{"role": "tool", "content": "orphaned"}]):
             pass
+
+
+@pytest.mark.asyncio
+async def test_ollama_detects_tools_and_context_from_model_metadata():
+    provider = OllamaProvider(model_name="tool-model")
+    provider._client = _StaticAsyncClient()  # type: ignore[assignment]
+
+    capabilities = await provider.detect_capabilities()
+    again = await provider.detect_capabilities()
+
+    assert capabilities.native_tools is True
+    assert capabilities.local is True
+    assert capabilities.context_window == 32768
+    assert again is capabilities
+
+
+class _StaticAsyncClient:
+    async def post(self, *args, **kwargs):
+        import httpx
+
+        return httpx.Response(
+            200,
+            json={
+                "details": {"families": ["tools"]},
+                "template": "Use {{ .ToolCall }}",
+                "model_info": {"general.context_length": 32768},
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_ollama_capability_probe_fails_closed_to_local_only():
+    class BrokenClient:
+        async def post(self, *args, **kwargs):
+            raise RuntimeError("offline")
+
+    provider = OllamaProvider(model_name="local-only")
+    provider._client = BrokenClient()  # type: ignore[assignment]
+
+    capabilities = await provider.detect_capabilities()
+
+    assert capabilities.native_tools is False
+    assert capabilities.local is True

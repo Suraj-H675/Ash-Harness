@@ -519,6 +519,9 @@ For local models, run `ash ollama pull <model>` to execute a validated pull
 through the installed Ollama CLI. The command uses a scrubbed environment,
 bounded output, timeout/process cleanup, and never interprets the model name as
 a shell command.
+Ollama providers probe model metadata once per provider instance to detect
+native tool support and advertised context length. If probing is unavailable,
+Ash fails closed to local-only capabilities.
 Custom OpenAI-compatible endpoints can explicitly use bearer authentication or
 no authentication; an anonymous endpoint never inherits `OPENAI_API_KEY`.
 Ollama setup discovers installed models and gives `ollama serve`/`ollama pull`
