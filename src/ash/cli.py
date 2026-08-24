@@ -346,6 +346,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         transcript=loop.ui.transcript if isinstance(loop.ui, TerminalUI) else None,
         tui_mode=config.tui_mode,
         theme=config.theme,
+        repo_map=getattr(loop, "repo_map", None),
+        mcp_runtime=getattr(loop, "_mcp_runtime", None),
         screen_reader_mode=config.screen_reader_mode,
     )
     if not isinstance(loop.ui, TerminalUI):

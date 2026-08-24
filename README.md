@@ -581,6 +581,11 @@ project-derived content must not override user instructions or policy. This is a
 parsing-and-prompting defense layer; permissions, approval gates, sandboxing,
 redaction, and auditing remain independently enforced.
 
+Interactive `@` completion supports workspace files and directories plus two
+extended forms: `@symbol:<query>` offers fuzzy structural symbol matches with
+file and line metadata, and `@mcp:<query>` searches live connected MCP resource
+URIs by server and URI.
+
 Set `ASH_SCREEN_READER_MODE=true` for linear, non-rewriting terminal output.
 This mode forces inline rendering, no color, reduced motion, and no token bar;
 it also disables dynamic completion, autosuggestions, and the bottom toolbar

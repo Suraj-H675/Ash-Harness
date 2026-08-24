@@ -22,6 +22,8 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Extended interactive `@` completion for fuzzy workspace symbols and live
+  connected MCP resources.
 - Explicit prompt-injection isolation: every provider request includes an
   untrusted-content boundary, and tool responses are labeled as data with an
   embedded-instruction warning.

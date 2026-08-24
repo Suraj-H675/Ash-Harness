@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
-from typing import Callable, TextIO
+from typing import Any, Callable, TextIO
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -21,14 +22,34 @@ from ash.ui.viewport import TranscriptViewport
 
 
 class AshCompleter(Completer):
-    """Complete slash commands and workspace-relative ``@`` paths."""
+    """Complete slash commands, ``@`` paths, symbols, and MCP resources."""
 
-    def __init__(self, commands: list[str], workspace_root: Path) -> None:
+    def __init__(
+        self,
+        commands: list[str],
+        workspace_root: Path,
+        *,
+        repo_map: Any | None = None,
+        mcp_runtime: Any | None = None,
+    ) -> None:
         self._commands = WordCompleter(commands, sentence=True)
         self._root = workspace_root.resolve()
+        self._repo_map = repo_map
+        self._mcp_runtime = mcp_runtime
 
     def set_commands(self, commands: list[str]) -> None:
         self._commands = WordCompleter(commands, sentence=True)
+
+    def set_providers(
+        self,
+        *,
+        repo_map: Any | None = None,
+        mcp_runtime: Any | None = None,
+    ) -> None:
+        if repo_map is not None:
+            self._repo_map = repo_map
+        if mcp_runtime is not None:
+            self._mcp_runtime = mcp_runtime
 
     def get_completions(self, document: Document, complete_event):
         word = document.get_word_before_cursor(WORD=True)
@@ -36,6 +57,9 @@ class AshCompleter(Completer):
             yield from self._commands.get_completions(document, complete_event)
             return
         typed = word[1:].strip("\"'")
+        if typed.startswith("symbol:") or typed.startswith("mcp:"):
+            yield from self._extended_completions(typed, word)
+            return
         relative = Path(typed)
         parent = (self._root / relative.parent).resolve()
         try:
@@ -66,6 +90,87 @@ class AshCompleter(Completer):
                 display=replacement,
                 display_meta="directory" if child.is_dir() else "file",
             )
+
+    def _symbol_completions(self, prefix: str, word: str):
+        if self._repo_map is None or not prefix:
+            return
+        try:
+            matches = self._repo_map.find_definitions(prefix, case_sensitive=True)
+            if not matches:
+                matches = self._repo_map.find_definitions(
+                    prefix,
+                    case_sensitive=False,
+                )
+            if not matches:
+                matches = [
+                    symbol
+                    for file_node in self._repo_map.files
+                    for symbol in file_node.symbols
+                    if prefix.casefold() in symbol.name.casefold()
+                ]
+        except Exception:
+            return
+        try:
+            matches = matches[:50]
+        except Exception:
+            return
+        for symbol in sorted(matches, key=lambda item: item.name.casefold()):
+            path = Path(symbol.file_path)
+            try:
+                relative = path.resolve().relative_to(self._root).as_posix()
+            except ValueError:
+                relative = path.as_posix()
+            replacement = f"@symbol:{symbol.name}"
+            display_meta = f"{symbol.kind} {relative}:{symbol.start_line}"
+            yield Completion(
+                replacement,
+                start_position=-len(word),
+                display=replacement,
+                display_meta=display_meta[:120],
+            )
+
+    def _mcp_completions(self, prefix: str, word: str):
+        if self._mcp_runtime is None:
+            return
+        runtime = self._mcp_runtime
+        async def collect() -> list[dict[str, Any]]:
+            return await runtime.list_resources()
+
+        try:
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is not None:
+                future = asyncio.run_coroutine_threadsafe(collect(), running_loop)
+                resources = future.result(timeout=0.25)
+            else:
+                resources = asyncio.run(collect())
+        except Exception:
+            return
+        candidates: list[tuple[str, str]] = []
+        for resource in resources:
+            server = str(resource.get("server", ""))
+            uri = str(resource.get("uri", ""))
+            name = str(resource.get("name") or uri)
+            if uri and (not prefix or prefix.casefold() in uri.casefold()):
+                candidates.append((f"@mcp:{server}/{uri}", f"MCP {server} {name}"))
+        for replacement, meta in sorted(candidates, key=lambda item: item[0])[:50]:
+            yield Completion(
+                replacement,
+                start_position=-len(word),
+                display=replacement,
+                display_meta=meta[:120],
+            )
+
+    def _extended_completions(self, typed: str, word: str):
+        scheme, separator, prefix = typed.partition(":")
+        if separator != ":":
+            return
+        if scheme == "symbol":
+            yield from self._symbol_completions(prefix, word)
+        elif scheme == "mcp":
+            yield from self._mcp_completions(prefix, word)
 
 
 def _key_bindings(bindings_by_action: dict[str, list[str]]) -> KeyBindings:
@@ -105,6 +210,8 @@ class PromptInput:
         transcript: Transcript | None = None,
         tui_mode: str = "inline",
         theme: str = "dark",
+        repo_map: Any | None = None,
+        mcp_runtime: Any | None = None,
         screen_reader_mode: bool = False,
     ) -> None:
         if input_mode not in {"emacs", "vi"}:
@@ -129,7 +236,12 @@ class PromptInput:
             )
             words.extend(f"/{name}" for name in (extra_commands or []))
             words = sorted(set(words))
-            completer = AshCompleter(words, workspace_root or Path.cwd())
+            completer = AshCompleter(
+                words,
+                workspace_root or Path.cwd(),
+                repo_map=repo_map,
+                mcp_runtime=mcp_runtime,
+            )
             self._completer = completer
             if tui_mode == "viewport" and not screen_reader_mode:
                 self._viewport = TranscriptViewport(

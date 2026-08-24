@@ -78,6 +78,46 @@ def test_workspace_path_completer_handles_files_spaces_and_directories(
     assert '@"some file.py"' in inserted
 
 
+def test_completer_offers_fuzzy_workspace_symbols(tmp_path: Path) -> None:
+    from ash.repo.repomap import RepoMap
+
+    (tmp_path / "example.py").write_text(
+        "class PaymentGateway:\n    def charge(self) -> None:\n        pass\n",
+        encoding="utf-8",
+    )
+    repo_map = RepoMap(tmp_path)
+    completer = AshCompleter(["/help"], tmp_path, repo_map=repo_map)
+
+    matches = list(
+        completer.get_completions(Document("@symbol:payment", 15), CompleteEvent())
+    )
+
+    assert "@symbol:PaymentGateway" in {item.text for item in matches}
+    assert "class example.py:1" in str(matches[0].display_meta)
+
+
+def test_completer_offers_live_mcp_resources(tmp_path: Path) -> None:
+    class Runtime:
+        async def list_resources(self):
+            return [
+                {
+                    "server": "docs",
+                    "uri": "file:///guides/security.md",
+                    "name": "Security Guide",
+                }
+            ]
+
+    completer = AshCompleter(["/help"], tmp_path, mcp_runtime=Runtime())
+
+    matches = list(
+        completer.get_completions(Document("@mcp:secur", 10), CompleteEvent())
+    )
+
+    assert len(matches) == 1
+    assert matches[0].text == "@mcp:docs/file:///guides/security.md"
+    assert "Security Guide" in str(matches[0].display_meta)
+
+
 def test_prepare_file_mentions_builds_bounded_canonical_image(tmp_path: Path) -> None:
     image = tmp_path / "image.png"
     image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"image-data")
