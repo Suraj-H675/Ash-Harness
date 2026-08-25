@@ -1145,6 +1145,150 @@ async def test_mcp_task_terminal_failure_is_not_fetched(status: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_mcp_task_status_notification_wakes_without_polling() -> None:
+    client, request = _task_client(
+        [
+            {
+                "task": {
+                    "taskId": "fast",
+                    "status": "working",
+                    "ttl": None,
+                    "pollInterval": 100000,
+                }
+            },
+            {"content": [{"type": "text", "text": "notified"}]},
+        ]
+    )
+
+    call = asyncio.create_task(client.call_tool("long", {}, as_task=True))
+    await asyncio.sleep(0.01)
+    await client._handle_incoming(
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/tasks/status",
+            "params": {
+                "taskId": "fast",
+                "status": "completed",
+                "createdAt": "2025-11-25T10:30:00Z",
+                "lastUpdatedAt": "2025-11-25T10:31:00Z",
+                "ttl": None,
+            },
+        }
+    )
+
+    result = await asyncio.wait_for(call, 1)
+
+    assert result["content"][0]["text"] == "notified"
+    assert [sent.args[0] for sent in request.await_args_list] == [
+        "tools/call",
+        "tasks/result",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mcp_task_invalid_notifications_are_ignored_and_fallback_polls() -> None:
+    client, request = _task_client(
+        [
+            {
+                "task": {
+                    "taskId": "safe",
+                    "status": "working",
+                    "ttl": None,
+                    "pollInterval": 10,
+                }
+            },
+            {
+                "task": {
+                    "taskId": "safe",
+                    "status": "completed",
+                    "ttl": None,
+                }
+            },
+            {"content": [{"type": "text", "text": "polled"}]},
+        ]
+    )
+
+    call = asyncio.create_task(client.call_tool("long", {}, as_task=True))
+    await asyncio.sleep(0.01)
+    await client._handle_incoming(
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/tasks/status",
+            "params": {"taskId": "other", "status": "completed", "ttl": None},
+        }
+    )
+    await client._handle_incoming(
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/tasks/status",
+            "params": {"taskId": "safe", "status": "exploded", "ttl": None},
+        }
+    )
+
+    result = await asyncio.wait_for(call, 1)
+
+    assert result["content"][0]["text"] == "polled"
+    assert [sent.args[0] for sent in request.await_args_list] == [
+        "tools/call",
+        "tasks/get",
+        "tasks/result",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mcp_task_status_notification_can_update_before_terminal() -> None:
+    client, request = _task_client(
+        [
+            {
+                "task": {
+                    "taskId": "ordered",
+                    "status": "input_required",
+                    "ttl": None,
+                    "pollInterval": 100000,
+                    "statusMessage": "need input",
+                }
+            },
+            {
+                "task": {
+                    "taskId": "ordered",
+                    "status": "completed",
+                    "ttl": None,
+                }
+            },
+            {"content": [{"type": "text", "text": "resumed"}]},
+        ]
+    )
+
+    call = asyncio.create_task(client.call_tool("long", {}, as_task=True))
+    await asyncio.sleep(0.01)
+    await client._handle_incoming(
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/tasks/status",
+            "params": {
+                "taskId": "ordered",
+                "status": "working",
+                "createdAt": "2025-11-25T10:30:00Z",
+                "lastUpdatedAt": "2025-11-25T10:31:00Z",
+                "ttl": None,
+                "pollInterval": 10,
+            },
+        }
+    )
+
+    result = await asyncio.wait_for(call, 1)
+
+    assert result["content"][0]["text"] == "resumed"
+    assert [sent.args[0] for sent in request.await_args_list] == [
+        "tools/call",
+        "tasks/get",
+        "tasks/result",
+    ]
+
+    assert request.await_args_list[1].args[1] == {"taskId": "ordered"}
+
+
+@pytest.mark.asyncio
 async def test_mcp_task_timeout_cancels_remote_task() -> None:
     client, request = _task_client([], timeout=0.01)
     responses = iter(

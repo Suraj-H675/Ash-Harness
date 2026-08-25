@@ -33,6 +33,7 @@ MAX_STDIO_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_HTTP_SESSION_ID_BYTES = 1024
 MIN_TASK_POLL_INTERVAL_SECONDS = 0.01
 MAX_TASK_POLL_INTERVAL_SECONDS = 30.0
+TASK_STATUS_NOTIFICATION = "notifications/tasks/status"
 TASK_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 TASK_STATUSES = TASK_TERMINAL_STATUSES | {"working", "input_required"}
 
@@ -120,6 +121,7 @@ class MCPClient:
         self._stderr_task: asyncio.Task[None] | None = None
         self._server_tasks: set[asyncio.Task[None]] = set()
         self._incoming_requests: dict[str | int, asyncio.Task[None]] = {}
+        self._task_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_id = 1
         self._write_lock = asyncio.Lock()
@@ -296,6 +298,10 @@ class MCPClient:
             if not future.done():
                 future.set_exception(error)
         self._pending.clear()
+        for waiter in self._task_waiters.values():
+            if not waiter.done():
+                waiter.set_exception(error)
+        self._task_waiters.clear()
 
     def _dispatch_incoming(self, message: dict[str, Any]) -> None:
         request_id = message.get("id")
@@ -350,6 +356,8 @@ class MCPClient:
                     pending = self._incoming_requests.get(cancelled_id)
                     if pending is not None:
                         pending.cancel()
+            if method == TASK_STATUS_NOTIFICATION:
+                self._resolve_task_status_notification(params)
             if self.notification_handler is not None:
                 try:
                     notification_result = self.notification_handler(method, params)
@@ -881,15 +889,32 @@ class MCPClient:
         )
         task = created["task"]
         task_id = task["taskId"]
+        loop = asyncio.get_running_loop()
+        waiter = loop.create_future()
+        self._task_waiters[task_id] = waiter
         try:
-            deadline = asyncio.get_running_loop().time() + wait_timeout
+            deadline = loop.time() + wait_timeout
             status = task["status"]
             while status == "working" or status == "input_required":
                 delay = self._task_poll_delay(task)
-                remaining = deadline - asyncio.get_running_loop().time()
+                remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise asyncio.TimeoutError
-                await asyncio.sleep(min(delay, remaining))
+
+                notified: dict[str, Any] | None = None
+                try:
+                    notified = await asyncio.wait_for(
+                        asyncio.shield(waiter), min(delay, remaining)
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                if notified is not None:
+                    status = notified["status"]
+                    task = notified
+                    waiter = loop.create_future()
+                    self._task_waiters[task_id] = waiter
+                    continue
+
                 state = self._validate_task_result(
                     await self.request(
                         "tasks/get",
@@ -928,6 +953,9 @@ class MCPClient:
         except asyncio.CancelledError:
             await asyncio.shield(self._cancel_mcp_task(task_id))
             raise
+        finally:
+            if self._task_waiters.get(task_id) is waiter:
+                self._task_waiters.pop(task_id, None)
 
     async def _cancel_mcp_task(self, task_id: str) -> None:
         try:
@@ -936,6 +964,23 @@ class MCPClient:
             )
         except (MCPProtocolError, httpx.HTTPError, OSError):
             return
+
+    def _resolve_task_status_notification(self, params: Any) -> None:
+        task_id = params.get("taskId") if isinstance(params, dict) else None
+        if not isinstance(task_id, str):
+            return
+        waiter = self._task_waiters.get(task_id)
+        if waiter is None or waiter.done():
+            return
+        try:
+            task = self._validate_task_state(
+                params, method="notifications/tasks/status"
+            )
+        except MCPProtocolError:
+            return
+        if task["taskId"] != task_id:
+            return
+        waiter.set_result(task)
 
     @staticmethod
     def _validate_task_result(

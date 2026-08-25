@@ -6,6 +6,12 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- MCP required-task waiting now consumes optional `notifications/tasks/status`
+  updates to wake immediately and adopt the full task state, while preserving
+  bounded polling for missed notifications and existing timeout, cancellation,
+  terminal-failure, and result semantics.
+
 ### Fixed
 - Closed a `path_prefix` permission-rule escape by lexically resolving
   traversal segments before workspace-prefix matching, so approved directory
