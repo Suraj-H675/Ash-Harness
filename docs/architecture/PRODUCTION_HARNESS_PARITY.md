@@ -63,7 +63,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Circuit breaker | Verified locally | Exhausted transient requests open provider-keyed state, fail fast during cooldown, expose `/status` and events, allow a half-open probe, and reset on success |
 | Long-running process control | Verified locally | Managed start/list/poll/stdin/stop with process-tree cleanup |
 | Structured output mode | Verified locally | One-shot JSON Schema injection, parsing, validation, and machine output |
-| Model capability negotiation | Partial | Tools, vision, reasoning, local status, and known context/output limits; dynamic manifests remain |
+| Model capability negotiation | Verified locally | Tools, vision, reasoning, local status, and known context/output limits; active sessions expose the negotiated manifest through `/capabilities`, with dynamic Ollama evidence distinguished from static/default registry metadata |
 | Provider failover | Verified locally | Ordered fallback before first emitted chunk with visible configured models/failures |
 
 ## 3. Context And Memory
@@ -128,6 +128,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/help` | Verified locally | Filterable text fallback plus full-screen searchable overlay with navigation, details, aliases, and screen-reader/non-TTY fallback |
 | `/status` | Verified locally | Runtime model/mode/workspace/session plus persisted token, cache, and cost diagnostics |
 | `/model` and `/models` | Verified locally | Configured custom/local/built-in catalogs, capability labels, context/output budgets, and opt-in live endpoint discovery through `/models --refresh` are wired |
+| Runtime `/capabilities` | Verified locally | Active-loop manifest reports negotiated tools/vision/reasoning/local status, context/output budgets, and whether evidence is dynamic or from the default registry |
 | `/new`, `/resume`, `/sessions` | Verified locally | Durable session lifecycle and missing-ID errors |
 | `/rename`, `/fork`, `/tree` | Verified locally | Atomic complete-turn transcript forks, durable parent/root lineage, redacted branch metadata, stable parent-first navigation, and tree-aware retention across CLI/SDK/HTTP/JSON-RPC |
 | `/compact`, `/context` | Verified locally | Context compaction, budget inspection, and last-turn cache hit metrics |

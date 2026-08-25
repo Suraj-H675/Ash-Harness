@@ -24,6 +24,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- `/capabilities` displays the active model's runtime manifest, including
+  tools/vision/reasoning/local status, context/output limits, and whether the
+  evidence came from a dynamic manifest or the static/default registry.
 - Native Anthropic reasoning and citation evidence extraction for thinking,
   redacted-thinking, and web-search result blocks, carried through provider
   chunks into provider-neutral completion outcomes.

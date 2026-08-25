@@ -52,6 +52,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "/context [--provenance]",
     ),
     SlashCommand("compact", "Compact older conversation history", "/compact"),
+    SlashCommand(
+        "capabilities",
+        "Show the active model's negotiated capabilities",
+        "/capabilities",
+    ),
     SlashCommand("plan", "Toggle editable sprint planning", "/plan [on|off]"),
     SlashCommand("skills", "List available instruction skills", "/skills [query]"),
     SlashCommand(

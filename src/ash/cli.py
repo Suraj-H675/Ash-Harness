@@ -290,6 +290,31 @@ def _render_model_capabilities(model_string: str) -> str:
     return f"{model_string}: [{', '.join(labels) or 'unknown'}]{suffix}"
 
 
+def _render_runtime_capabilities(loop: AshLoop, config: AshConfig) -> str:
+    """Render the active provider/model's negotiated capability manifest."""
+
+    provider = loop.provider
+    capabilities = provider.capabilities
+    model = f"{getattr(provider, 'provider_family', config.provider)}/{provider.model_name}"
+    lines = [
+        f"Runtime capabilities for {model}:",
+        "  source: dynamic manifest" if getattr(
+            provider,
+            "_dynamic_capabilities",
+            None,
+        ) is not None else "  source: static/default registry",
+        f"  tools={str(capabilities.native_tools).lower()}",
+        f"  vision={str(capabilities.vision).lower()}",
+        f"  reasoning={str(capabilities.reasoning).lower()}",
+        f"  local={str(capabilities.local).lower()}",
+    ]
+    if capabilities.context_window is not None:
+        lines.append(f"  context_window={capabilities.context_window:,}")
+    if capabilities.max_output_tokens is not None:
+        lines.append(f"  max_output_tokens={capabilities.max_output_tokens:,}")
+    return "\n".join(lines)
+
+
 async def _discover_live_model_catalog(config: AshConfig) -> list[str]:
     """Probe the selected provider's live catalog with a short timeout."""
 
@@ -999,6 +1024,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     f"Context summary {state}; estimated input {tokens} tokens.",
                     flush=True,
                 )
+                continue
+            if command.name == "capabilities":
+                print(_render_runtime_capabilities(loop, config), flush=True)
                 continue
             if command.name == "plan":
                 if len(arguments) > 1 or arguments[:1] not in ([], ["on"], ["off"]):

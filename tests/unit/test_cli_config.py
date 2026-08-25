@@ -629,6 +629,41 @@ def test_context_provenance_renders_fragment_metadata() -> None:
     assert "untrusted_content_policy=data_not_instructions" in rendered
 
 
+def test_runtime_capabilities_render_dynamic_and_static_sources() -> None:
+    from types import SimpleNamespace
+
+    from ash.cli import _render_runtime_capabilities
+    from ash.config import AshConfig
+    from ash.providers.capabilities import ProviderCapabilities
+
+    config = AshConfig(model="ollama/tool-model")
+    dynamic = SimpleNamespace(
+        provider=SimpleNamespace(
+            provider_family="ollama",
+            model_name="tool-model",
+            capabilities=ProviderCapabilities(True, local=True, context_window=32768),
+            _dynamic_capabilities=ProviderCapabilities(True, local=True),
+        ),
+    )
+    static = SimpleNamespace(
+        provider=SimpleNamespace(
+            provider_family="openai",
+            model_name="gpt-test",
+            capabilities=ProviderCapabilities(True, vision=True),
+            _dynamic_capabilities=None,
+        ),
+    )
+
+    dynamic_rendered = _render_runtime_capabilities(dynamic, config)  # type: ignore[arg-type]
+    static_rendered = _render_runtime_capabilities(static, config)  # type: ignore[arg-type]
+
+    assert "Runtime capabilities for ollama/tool-model:" in dynamic_rendered
+    assert "source: dynamic manifest" in dynamic_rendered
+    assert "context_window=32,768" in dynamic_rendered
+    assert "Runtime capabilities for openai/gpt-test:" in static_rendered
+    assert "source: static/default registry" in static_rendered
+
+
 def test_explain_config_reports_sources_and_masks_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

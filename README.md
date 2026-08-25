@@ -592,6 +592,11 @@ display its live catalog alongside the static/configured list. Discovery is
 bounded by provider credentials and endpoint policy; failures preserve the local
 catalog with an explicit warning.
 
+Inside a session, run `/capabilities` to show the active runtime's negotiated
+manifest: tool, vision, reasoning, and local support plus known context/output
+budgets. Ash also reports whether the values came from a dynamic provider
+manifest or the static/default capability registry.
+
 `run_command` returns a bounded set of structured diagnostics parsed from common
 compiler, linter, and test-failure output. These diagnostics accompany the raw
 output so the model can act on exact paths, lines, symbols, and failure messages
