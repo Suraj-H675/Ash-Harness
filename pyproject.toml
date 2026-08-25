@@ -52,6 +52,7 @@ dependencies = [
     "tree-sitter-rust>=0.23",
     "tree-sitter-typescript>=0.23",
     "tzdata>=2026.2",
+    "cryptography>=44",
 ]
 
 [project.urls]

@@ -15,6 +15,11 @@ from ash.hooks.config import (
     HookConfigSource,
     load_command_hooks,
 )
+from ash.plugins.catalog import (
+    default_catalog_path,
+    parse_and_verify_catalog,
+    trusted_catalog_keys_path,
+)
 from ash.plugins.manifest import PluginManifest, namespaced_plugin_tool_name
 from ash.plugins.lifecycle import (
     PluginLifecycleError,
@@ -335,6 +340,7 @@ def manage_local_plugin(
     replace: bool = False,
     confirmed: bool = False,
     git_ref: str | None = None,
+    catalog_path: Path | None = None,
 ) -> dict[str, Any]:
     if action == "install":
         state = load_extension_state()
@@ -344,11 +350,20 @@ def manage_local_plugin(
             _validate_plugin_contents(root, manifest)
 
         if target.startswith(("https://", "http://")):
+            expected = None
+            catalog_file = catalog_path or default_catalog_path()
+            if catalog_file is not None:
+                verified_catalog = parse_and_verify_catalog(
+                    catalog_file,
+                    trusted_keys_path=trusted_catalog_keys_path(),
+                )
+                expected = verified_catalog.entries.get(target)
             installed = install_git_plugin(
                 target,
                 ref=git_ref or "",
                 replace=replace,
                 validator=validate_install,
+                expected=expected,
             )
         else:
             installed = install_local_plugin(

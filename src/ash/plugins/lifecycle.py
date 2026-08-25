@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ash.plugins.manifest import PLUGIN_NAME, PluginManifest
+from ash.plugins.catalog import CatalogEntry, PluginCatalogError
 from ash.plugins.registry import _validate_manifest
 
 MAX_PLUGIN_FILES = 10_000
@@ -230,9 +231,10 @@ def install_git_plugin(
     destination_root: Path | None = None,
     replace: bool = False,
     validator: Callable[[Path, PluginManifest], None] | None = None,
+    expected: CatalogEntry | None = None,
 ) -> InstalledPlugin:
     parsed = urllib.parse.urlsplit(source)
-    if parsed.scheme.lower() != "https" or not parsed.hostname:
+    if expected is None and (parsed.scheme.lower() != "https" or not parsed.hostname):
         raise PluginLifecycleError("plugin Git source must use an HTTPS URL")
     if not ref:
         raise PluginLifecycleError("plugin Git source requires an explicit --ref")
@@ -261,6 +263,8 @@ def install_git_plugin(
         if completed.returncode:
             detail = completed.stderr.decode("utf-8", errors="replace").strip()
             raise PluginLifecycleError(f"could not clone plugin source: {detail}")
+        if expected is not None:
+            _verify_catalog_checkout(checkout, source, ref, expected)
         shutil.rmtree(checkout / ".git")
         return install_local_plugin(
             checkout,
@@ -270,6 +274,42 @@ def install_git_plugin(
         )
     finally:
         shutil.rmtree(temporary_root, ignore_errors=True)
+
+
+def _verify_catalog_checkout(
+    checkout: Path,
+    source: str,
+    ref: str,
+    expected: CatalogEntry,
+) -> None:
+    if expected.source != source or expected.ref != ref:
+        raise PluginCatalogError("catalog entry does not match requested plugin source")
+
+    def git(arguments: list[str]) -> str:
+        completed = subprocess.run(
+            ["git", "-C", checkout, *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            text=True,
+        )
+        if completed.returncode:
+            raise PluginCatalogError("could not verify catalog plugin revision")
+        return completed.stdout.strip()
+
+    if git(["rev-parse", "HEAD"]) != expected.digest:
+        raise PluginCatalogError("catalog plugin digest does not match cloned revision")
+    try:
+        staged_manifest = PluginManifest.load(checkout / "plugin.json")
+        _validate_manifest(staged_manifest, checkout)
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+        raise PluginCatalogError(f"invalid catalog plugin checkout: {exc}") from exc
+    if staged_manifest.name != expected.name:
+        raise PluginCatalogError("catalog plugin name does not match checkout manifest")
+    if staged_manifest.version != expected.version:
+        raise PluginCatalogError(
+            "catalog plugin version does not match checkout manifest"
+        )
 
 
 def _is_link(path: Path) -> bool:

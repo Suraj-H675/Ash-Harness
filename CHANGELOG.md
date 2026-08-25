@@ -11,6 +11,11 @@ All notable changes to Ash are documented here. The format follows
   updates to wake immediately and adopt the full task state, while preserving
   bounded polling for missed notifications and existing timeout, cancellation,
   terminal-failure, and result semantics.
+- Added signed plugin catalogs with pinned Ed25519 publisher keys, strict JSON
+  parsing, bounded catalog sizes, canonical signature verification, sequence
+  metadata, exact Git revision digests, and manifest identity checks for
+  catalog-driven installs. Set `ASH_PLUGIN_CATALOG` to enable verification;
+  installs without a signed catalog retain existing HTTPS Git behavior.
 
 ### Fixed
 - Closed a `path_prefix` permission-rule escape by lexically resolving
