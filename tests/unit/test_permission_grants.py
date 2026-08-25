@@ -96,7 +96,10 @@ def test_path_prefix_matcher_is_workspace_scoped_and_safe() -> None:
     assert matcher.value == "docs/"
     assert matcher.matches({"file_path": "docs/readme.md"}) is True
     assert matcher.matches({"file_path": "/docs/readme.md"}) is True
-    assert matcher.matches({"file_path": "docs/../secret"}) is True
+    assert matcher.matches({"file_path": "./docs/readme.md"}) is True
+    assert matcher.matches({"file_path": "docs/../secret"}) is False
+    assert matcher.matches({"file_path": "/../docs/secret"}) is False
+    assert matcher.matches({"file_path": "docs/../../secret"}) is False
     assert matcher.matches({"file_path": "documentation/x"}) is False
     with pytest.raises(PermissionGrantError, match="relative workspace path"):
         ArgumentMatcher("file_path", MatchOperator.PATH_PREFIX, "../outside")

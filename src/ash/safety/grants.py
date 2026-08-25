@@ -144,6 +144,26 @@ def _hostname_from_candidate(candidate: str) -> str | None:
         return None
 
 
+def _lexical_path_prefix_matches(candidate: str, expected_prefix: str) -> bool:
+    """Match a workspace-relative path without following links or allowing traversal."""
+
+    normalized = candidate.replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+    parts: list[str] = []
+    for part in normalized.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                return False
+            parts.pop()
+            continue
+        parts.append(part)
+    workspace_path = "/".join(parts) + "/"
+    return workspace_path.startswith(expected_prefix)
+
+
 @dataclass(frozen=True)
 class ArgumentMatcher:
     """One argument condition in a permission rule."""
@@ -246,8 +266,7 @@ class ArgumentMatcher:
         if not isinstance(candidate, str):
             return False
         if self.operator == MatchOperator.PATH_PREFIX:
-            normalized = candidate.replace("\\", "/").strip("/")
-            return normalized.startswith(str(self.value))
+            return _lexical_path_prefix_matches(candidate, str(self.value))
         if self.operator == MatchOperator.DOMAIN:
             hostname = _hostname_from_candidate(candidate)
             expected_domain = str(self.value)
@@ -255,14 +274,12 @@ class ArgumentMatcher:
                 return False
             if expected_domain.startswith("*."):
                 base_domain = expected_domain[2:]
-                matches_domain = (
-                    hostname == base_domain
-                    or hostname.endswith(f".{base_domain}")
+                matches_domain = hostname == base_domain or hostname.endswith(
+                    f".{base_domain}"
                 )
             else:
-                matches_domain = (
-                    hostname == expected_domain
-                    or hostname.endswith(f".{expected_domain}")
+                matches_domain = hostname == expected_domain or hostname.endswith(
+                    f".{expected_domain}"
                 )
             return matches_domain
         if not isinstance(candidate, str):
@@ -508,7 +525,7 @@ def managed_policy_paths() -> tuple[Path, ...]:
 
     if os.name == "nt":
         program_data = os.environ.get("ProgramData")
-        return ((Path(program_data) / "Ash" / "policy",) if program_data else ())
+        return (Path(program_data) / "Ash" / "policy",) if program_data else ()
     return (
         Path("/etc/ash/policy"),
         Path("/Library/Application Support/Ash/policy"),
@@ -532,9 +549,7 @@ def load_managed_permission_rules(workspace: Path) -> list[PermissionRule]:
         except OSError as exc:
             raise PermissionGrantError(f"cannot read managed policy: {exc}") from exc
         if len(files) > MAX_MANAGED_RULE_FILES:
-            raise PermissionGrantError(
-                "managed policy contains more than 16 files"
-            )
+            raise PermissionGrantError("managed policy contains more than 16 files")
         for path in files:
             try:
                 payload = _read_payload(path)

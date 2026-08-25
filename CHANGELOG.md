@@ -7,6 +7,9 @@ All notable changes to Ash are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Closed a `path_prefix` permission-rule escape by lexically resolving
+  traversal segments before workspace-prefix matching, so approved directory
+  scopes cannot match sibling or outside paths through `..`.
 - Deferred Windows CI until Windows parity work resumes so Linux/macOS checks
   are not marked failed by the known platform backlog.
 - Routed interactive REPL command and turn failures through the shared error

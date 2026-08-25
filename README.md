@@ -622,6 +622,8 @@ digest, and the applicable untrusted-content policy.
 Permission rules now support tool-specific matchers in addition to exact and
 prefix values: `--path-prefix file_path=docs` scopes workspace paths safely, and
 `--domain url=*.example.com` scopes web URLs or domain arguments by hostname.
+Path prefixes are resolved lexically before matching, so traversal cannot move
+an approved call outside its persisted workspace scope.
 
 Interactive `@` completion supports workspace files and directories plus two
 extended forms: `@symbol:<query>` offers fuzzy structural symbol matches with
