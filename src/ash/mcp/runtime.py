@@ -1230,6 +1230,17 @@ class MCPRuntime:
     async def list_resource_templates(self) -> list[dict[str, Any]]:
         return await self._list_capability("list_resource_templates")
 
+    async def list_tasks(self) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        for server_name, client in self.clients.items():
+            try:
+                tasks = await client.list_mcp_tasks()
+            except Exception as exc:  # noqa: BLE001
+                self.errors[f"{server_name}:list_mcp_tasks"] = str(exc)
+                continue
+            output.extend({"server": server_name, **task} for task in tasks)
+        return output
+
     async def _list_capability(self, method: str) -> list[dict[str, Any]]:
         return await self.list_capability(method)
 

@@ -1426,6 +1426,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     "tools",
                     "resources",
                     "prompts",
+                    "tasks",
                 }:
                     print(f"Usage: {command.usage}", file=sys.stderr)
                     continue
@@ -1461,6 +1462,17 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         key for key in loop.tools if key.startswith("mcp__")
                     ):
                         print(name)
+                elif action == "tasks":
+                    tasks = await runtime.list_tasks()
+                    if not tasks:
+                        print("No MCP tasks.")
+                    for task in tasks:
+                        message = task.get("statusMessage")
+                        suffix = f": {message}" if message else ""
+                        print(
+                            f"{task['server']}: {task['taskId']} "
+                            f"{task['status']}{suffix}"
+                        )
                 else:
                     items = (
                         await runtime.list_resources()

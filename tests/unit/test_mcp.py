@@ -1476,6 +1476,45 @@ async def test_async_client_initializes_lists_and_calls_tools() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_list_tasks_aggregates_and_records_errors(
+    tmp_path: Path,
+) -> None:
+    class RuntimeClient:
+        def __init__(self, *, fail: bool = False) -> None:
+            self.fail = fail
+
+        async def list_mcp_tasks(self) -> list[dict[str, str]]:
+            if self.fail:
+                raise RuntimeError("unavailable")
+            return [
+                {
+                    "taskId": "one",
+                    "status": "working",
+                    "statusMessage": "running",
+                },
+                {"taskId": "two", "status": "completed"},
+            ]
+
+    config = MCPServerConfig(name="unused", command="unused", args=[], env={})
+    runtime = MCPRuntime(
+        {"healthy": config, "broken": config},
+        SafetyGuard(tmp_path),
+    )
+    runtime.clients = {
+        "healthy": RuntimeClient(),
+        "broken": RuntimeClient(fail=True),
+    }
+
+    tasks = await runtime.list_tasks()
+
+    assert [(task["server"], task["taskId"]) for task in tasks] == [
+        ("healthy", "one"),
+        ("healthy", "two"),
+    ]
+    assert runtime.errors["broken:list_mcp_tasks"] == "unavailable"
+
+
+@pytest.mark.asyncio
 async def test_stdio_client_accepts_bounded_rich_results_above_64_kib() -> None:
     config = MCPServerConfig(
         name="fake",
