@@ -413,6 +413,7 @@ class MCPTool(BaseTool):
         self.name = f"mcp__{server_name}__{self.remote_name}"
         description = definition.get("description", "MCP tool")
         self.description = description if isinstance(description, str) else "MCP tool"
+        task_support = "forbidden"
         if protocol_version >= "2025-11-25" and "execution" in definition:
             execution = definition["execution"]
             if not isinstance(execution, dict):
@@ -420,11 +421,7 @@ class MCPTool(BaseTool):
             task_support = execution.get("taskSupport", "forbidden")
             if task_support not in {"forbidden", "optional", "required"}:
                 raise ValueError("MCP tool taskSupport is invalid")
-            if task_support == "required":
-                raise ValueError(
-                    "MCP tool requires experimental task execution, which Ash "
-                    "does not support"
-                )
+        self._task_support = task_support
         input_schema = definition.get("inputSchema")
         if not isinstance(input_schema, dict):
             raise ValueError("MCP tool inputSchema must be an object")
@@ -506,6 +503,7 @@ class MCPTool(BaseTool):
                 self.remote_name,
                 dict(kwargs),
                 expected_contract=self._contract_fingerprint,
+                as_task=getattr(self, "_task_support", "forbidden") == "required",
             )
         except MCPProtocolError as exc:
             error_payload: dict[str, Any] = {

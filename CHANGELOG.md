@@ -24,6 +24,10 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- Experimental MCP task execution for tools that declare `execution.taskSupport:
+  "required"`, with capability validation, bounded polling and timeout,
+  `tasks/result` retrieval, terminal-status handling, and cancellation through
+  `tasks/cancel`.
 - `/capabilities` displays the active model's runtime manifest, including
   tools/vision/reasoning/local status, context/output limits, and whether the
   evidence came from a dynamic manifest or the static/default registry.

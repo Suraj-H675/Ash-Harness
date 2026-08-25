@@ -31,6 +31,10 @@ MAX_PAGINATION_PAGES = 100
 MAX_PAGINATION_SESSION_RESTARTS = 1
 MAX_STDIO_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_HTTP_SESSION_ID_BYTES = 1024
+MIN_TASK_POLL_INTERVAL_SECONDS = 0.01
+MAX_TASK_POLL_INTERVAL_SECONDS = 30.0
+TASK_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+TASK_STATUSES = TASK_TERMINAL_STATUSES | {"working", "input_required"}
 
 RequestHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 NotificationHandler = Callable[[str, dict[str, Any]], Awaitable[None] | None]
@@ -65,6 +69,10 @@ class MCPSessionExpired(MCPProtocolError):
         super().__init__("MCP Streamable HTTP session expired with 404 Not Found")
         self.session_id = session_id
         self.generation = generation
+
+
+class MCPTaskTimeout(MCPProtocolError):
+    """A task-augmented operation exceeded the configured task wait limit."""
 
 
 class MCPClient:
@@ -820,13 +828,157 @@ class MCPClient:
         arguments: dict[str, Any],
         *,
         expected_contract: str | None = None,
+        as_task: bool = False,
+        task_ttl_ms: int | None = None,
+        task_timeout: float | None = None,
     ) -> dict[str, Any]:
-        return await self.request(
-            "tools/call",
-            {"name": name, "arguments": arguments},
-            _expected_tool_contract=(name, expected_contract)
-            if expected_contract is not None
-            else None,
+        params: dict[str, Any] = {"name": name, "arguments": arguments}
+        if not as_task:
+            return await self.request(
+                "tools/call",
+                params,
+                _expected_tool_contract=(name, expected_contract)
+                if expected_contract is not None
+                else None,
+            )
+        if task_ttl_ms is not None and (
+            isinstance(task_ttl_ms, bool) or task_ttl_ms <= 0
+        ):
+            raise ValueError("MCP task TTL must be a positive number of milliseconds")
+        wait_timeout = task_timeout if task_timeout is not None else self.timeout
+        if isinstance(wait_timeout, bool) or wait_timeout <= 0:
+            raise ValueError("MCP task timeout must be positive")
+        tasks_capability = self.server_capabilities.get("tasks")
+        task_requests = (
+            tasks_capability.get("requests")
+            if isinstance(tasks_capability, dict)
+            else None
+        )
+        tools_task_requests = (
+            task_requests.get("tools") if isinstance(task_requests, dict) else None
+        )
+        if (
+            not isinstance(tools_task_requests, dict)
+            or "call" not in tools_task_requests
+        ):
+            raise MCPProtocolError(
+                f"MCP server does not advertise support for task-augmented "
+                f"tool calls required by {name!r}"
+            )
+        metadata: dict[str, Any] = {}
+        if task_ttl_ms is not None:
+            metadata["ttl"] = task_ttl_ms
+        params["task"] = metadata
+        expected = (name, expected_contract) if expected_contract is not None else None
+        created = self._validate_task_result(
+            await self.request(
+                "tools/call",
+                params,
+                _expected_tool_contract=expected,
+                _allow_session_recovery=False,
+            ),
+            method="tools/call",
+        )
+        task = created["task"]
+        task_id = task["taskId"]
+        try:
+            deadline = asyncio.get_running_loop().time() + wait_timeout
+            status = task["status"]
+            while status == "working" or status == "input_required":
+                delay = self._task_poll_delay(task)
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await asyncio.sleep(min(delay, remaining))
+                state = self._validate_task_result(
+                    await self.request(
+                        "tasks/get",
+                        {"taskId": task_id},
+                        _allow_session_recovery=False,
+                    ),
+                    method="tasks/get",
+                )
+                state = state["task"]
+                if state["taskId"] != task_id:
+                    raise MCPProtocolError("MCP tasks/get returned another taskId")
+                status = state["status"]
+                task = state
+            if status == "completed":
+                result = self._validate_task_result(
+                    await self.request(
+                        "tasks/result",
+                        {"taskId": task_id},
+                        _allow_session_recovery=False,
+                    ),
+                    method="tasks/result",
+                    require_task=False,
+                )
+                if "content" in result or "error" in result or "_meta" in result:
+                    return result
+                raise MCPProtocolError(
+                    "MCP tasks/result returned an invalid tool result without content"
+                )
+            detail = f": {task['statusMessage']}" if task.get("statusMessage") else ""
+            raise MCPProtocolError(f"MCP tool task {status}{detail}")
+        except asyncio.TimeoutError as exc:
+            await self._cancel_mcp_task(task_id)
+            raise MCPTaskTimeout(
+                f"MCP tool task timed out after {wait_timeout} seconds"
+            ) from exc
+        except asyncio.CancelledError:
+            await asyncio.shield(self._cancel_mcp_task(task_id))
+            raise
+
+    async def _cancel_mcp_task(self, task_id: str) -> None:
+        try:
+            await self.request(
+                "tasks/cancel", {"taskId": task_id}, _allow_session_recovery=False
+            )
+        except (MCPProtocolError, httpx.HTTPError, OSError):
+            return
+
+    @staticmethod
+    def _validate_task_result(
+        result: dict[str, Any],
+        *,
+        method: str,
+        require_task: bool = True,
+    ) -> dict[str, Any]:
+        task = result.get("task")
+        if not isinstance(task, dict):
+            if require_task:
+                raise MCPProtocolError(f"{method} returned no valid task")
+            return result
+        validated = MCPClient._validate_task_state(task, method=method)
+        return {**result, "task": validated}
+
+    @staticmethod
+    def _validate_task_state(task: Any, *, method: str) -> dict[str, Any]:
+        if not isinstance(task, dict):
+            raise MCPProtocolError(f"{method} returned an invalid task")
+        task_id = task.get("taskId")
+        status = task.get("status")
+        if not isinstance(task_id, str) or not task_id:
+            raise MCPProtocolError(f"{method} returned an invalid taskId")
+        if status not in TASK_STATUSES:
+            raise MCPProtocolError(f"{method} returned invalid task status {status!r}")
+        poll_interval = task.get("pollInterval")
+        if poll_interval is not None and (
+            isinstance(poll_interval, bool)
+            or not isinstance(poll_interval, int)
+            or poll_interval < 0
+        ):
+            raise MCPProtocolError(f"{method} returned an invalid pollInterval")
+        return task
+
+    @staticmethod
+    def _task_poll_delay(task: dict[str, Any]) -> float:
+        interval = task.get("pollInterval")
+        if interval is None:
+            return 1.0
+        return min(
+            max(interval / 1000.0, MIN_TASK_POLL_INTERVAL_SECONDS),
+            MAX_TASK_POLL_INTERVAL_SECONDS,
         )
 
     async def list_resources(self) -> list[dict[str, Any]]:

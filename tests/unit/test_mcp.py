@@ -11,7 +11,11 @@ from ash.core.loop import AshLoop
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.guard import SafetyGuard
-from ash.mcp.client import MCPClient, MCPProtocolError
+from ash.mcp.client import (
+    MCPClient,
+    MCPProtocolError,
+    MCPTaskTimeout,
+)
 from ash.mcp.runtime import MCPRuntime, MCPTool
 from ash.mcp.server import (
     MCPServerConfig,
@@ -438,9 +442,14 @@ class StubMCPClient:
         self.calls: list[tuple[str, dict]] = []
 
     async def call_tool(
-        self, name: str, arguments: dict, *, expected_contract: str | None = None
+        self,
+        name: str,
+        arguments: dict,
+        *,
+        expected_contract: str | None = None,
+        as_task: bool = False,
     ) -> dict:
-        del expected_contract
+        del expected_contract, as_task
         self.calls.append((name, arguments))
         return self.result
 
@@ -589,22 +598,21 @@ def test_mcp_tool_rejects_non_object_roots_and_remote_references(
         )
 
 
-def test_mcp_tool_rejects_required_task_execution_until_supported(
-    tmp_path: Path,
-) -> None:
+def test_mcp_tool_preserves_task_execution_support(tmp_path: Path) -> None:
     client = StubMCPClient({"content": []})
-    with pytest.raises(ValueError, match="requires experimental task execution"):
-        MCPTool(
-            SafetyGuard(tmp_path),
-            client=client,  # type: ignore[arg-type]
-            server_name="test",
-            definition={
-                "name": "task-only",
-                "inputSchema": {"type": "object"},
-                "execution": {"taskSupport": "required"},
-            },
-        )
+    required = MCPTool(
+        SafetyGuard(tmp_path),
+        client=client,  # type: ignore[arg-type]
+        server_name="test",
+        definition={
+            "name": "task-required",
+            "inputSchema": {"type": "object"},
+            "execution": {"taskSupport": "required"},
+        },
+    )
 
+    assert required.name == "mcp__test__task-required"
+    assert required._task_support == "required"
     optional = MCPTool(
         SafetyGuard(tmp_path),
         client=client,  # type: ignore[arg-type]
@@ -935,9 +943,15 @@ async def test_mcp_tool_preserves_protocol_error_data_without_replay(
             self.calls = 0
 
         async def call_tool(
-            self, name: str, arguments: dict, *, expected_contract: str | None = None
+            self,
+            name: str,
+            arguments: dict,
+            *,
+            expected_contract: str | None = None,
+            as_task: bool = False,
         ) -> dict:
             del expected_contract
+            del as_task
             self.calls += 1
             raise MCPProtocolError(
                 "tools/call failed (-32602): invalid mode",
@@ -974,9 +988,15 @@ async def test_mcp_tool_preserves_explicit_null_protocol_error_data(
 ) -> None:
     class ErrorClient:
         async def call_tool(
-            self, name: str, arguments: dict, *, expected_contract: str | None = None
+            self,
+            name: str,
+            arguments: dict,
+            *,
+            expected_contract: str | None = None,
+            as_task: bool = False,
         ) -> dict:
             del expected_contract
+            del as_task
             raise MCPProtocolError("explicit null", code=-32000, data=None)
 
     tool = MCPTool(
@@ -1058,6 +1078,141 @@ async def test_mcp_client_rejects_boolean_error_code_and_distinguishes_data() ->
     assert caught.value.data is None
 
 
+def _task_client(
+    responses: list[dict | Exception],
+    *,
+    timeout: float = 30.0,
+) -> tuple[MCPClient, AsyncMock]:
+    client = MCPClient(
+        MCPServerConfig(name="fake", command="fake", args=[], env={}),
+        timeout=timeout,
+    )
+    client.protocol_version = "2025-11-25"
+    client.server_capabilities = {"tasks": {"requests": {"tools": {"call": {}}}}}
+    request = AsyncMock(side_effect=responses)
+    client.request = request  # type: ignore[method-assign]
+    return client, request
+
+
+@pytest.mark.asyncio
+async def test_mcp_required_task_tool_polls_and_fetches_result() -> None:
+    client, request = _task_client(
+        [
+            {
+                "task": {
+                    "taskId": "one",
+                    "status": "working",
+                    "ttl": None,
+                    "pollInterval": 0,
+                }
+            },
+            {"task": {"taskId": "one", "status": "completed", "ttl": None}},
+            {"content": [{"type": "text", "text": "done"}]},
+        ]
+    )
+    result = await client.call_tool("long", {}, as_task=True)
+
+    assert result["content"][0]["text"] == "done"
+    assert [call.args[0] for call in request.await_args_list] == [
+        "tools/call",
+        "tasks/get",
+        "tasks/result",
+    ]
+    assert request.await_args_list[0].args[1]["task"] == {}
+    assert request.await_args_list[1].args[1] == {"taskId": "one"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+async def test_mcp_task_terminal_failure_is_not_fetched(status: str) -> None:
+    client, request = _task_client(
+        [
+            {
+                "task": {
+                    "taskId": "bad",
+                    "status": status,
+                    "ttl": None,
+                    "statusMessage": "no",
+                }
+            },
+        ]
+    )
+
+    with pytest.raises(MCPProtocolError, match=f"MCP tool task {status}: no"):
+        await client.call_tool("long", {}, as_task=True)
+
+    assert request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_task_timeout_cancels_remote_task() -> None:
+    client, request = _task_client([], timeout=0.01)
+    responses = iter(
+        [
+            {
+                "task": {
+                    "taskId": "slow",
+                    "status": "working",
+                    "ttl": None,
+                    "pollInterval": 0,
+                }
+            },
+        ]
+    )
+
+    async def request_side_effect(method, params, **_):
+        del params
+        if method == "tools/call":
+            return next(responses)
+        return {"task": {"taskId": "slow", "status": "working", "ttl": None}}
+
+    request.side_effect = request_side_effect
+    client._task_poll_delay = lambda task: 1.0  # type: ignore[method-assign]
+
+    with pytest.raises(MCPTaskTimeout):
+        await client.call_tool("slow", {}, as_task=True)
+
+    assert request.await_args_list[-1].args[:2] == ("tasks/cancel", {"taskId": "slow"})
+
+
+@pytest.mark.asyncio
+async def test_mcp_task_cancellation_sends_tasks_cancel() -> None:
+    client, request = _task_client(
+        [
+            {
+                "task": {
+                    "taskId": "stop",
+                    "status": "working",
+                    "ttl": None,
+                    "pollInterval": 100000,
+                }
+            },
+        ]
+    )
+
+    async def cancel_side_effect(method, params, **_):
+        if method != "tools/call":
+            return {"task": {"taskId": "stop", "status": "cancelled", "ttl": None}}
+        return {
+            "task": {
+                "taskId": "stop",
+                "status": "working",
+                "ttl": None,
+                "pollInterval": 100000,
+            }
+        }
+
+    request.side_effect = cancel_side_effect
+    call = asyncio.create_task(client.call_tool("stop", {}, as_task=True))
+    await asyncio.sleep(0)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+    await asyncio.sleep(0)
+    assert request.await_args_list[-1].args[:2] == ("tasks/cancel", {"taskId": "stop"})
+
+
 @pytest.mark.asyncio
 async def test_mcp_runtime_isolates_invalid_tool_schema(
     tmp_path: Path, monkeypatch
@@ -1099,12 +1254,9 @@ async def test_mcp_runtime_isolates_invalid_tool_schema(
     try:
         assert "mcp__catalog__healthy" in tools
         assert "mcp__catalog__broken" not in tools
-        assert "mcp__catalog__task-only" not in tools
+        assert "mcp__catalog__task-only" in tools
         assert "not valid JSON Schema" in runtime.errors["catalog:tool:broken"]
-        assert (
-            "requires experimental task execution"
-            in runtime.errors["catalog:tool:task-only"]
-        )
+        assert "catalog:tool:task-only" not in runtime.errors
     finally:
         await runtime.close()
 
@@ -2732,8 +2884,10 @@ async def test_tool_list_change_quarantines_calls_until_refresh_finishes(
             arguments: dict,
             *,
             expected_contract: str | None = None,
+            as_task: bool = False,
         ) -> dict:
             del name, arguments, expected_contract
+            del as_task
             self.tool_calls += 1
             return {"content": []}
 
