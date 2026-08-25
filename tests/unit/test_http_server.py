@@ -111,6 +111,96 @@ async def test_http_server_requires_auth_and_runs_turn() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_jsonrpc_runs_requests_and_returns_notification_ack() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    result_usage = (await FakeClient().prompt("hello")).usage  # type: ignore[arg-type]
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        request = await http.post(
+            "/rpc",
+            json={
+                "jsonrpc": "2.0",
+                "id": "rpc-1",
+                "method": "turn/run",
+                "params": {"input": "hello"},
+            },
+            headers=headers,
+        )
+        notification = await http.post(
+            "/rpc",
+            json={"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 1}},
+            headers=headers,
+        )
+
+    assert request.status_code == 200
+    assert request.json() == {
+        "jsonrpc": "2.0",
+        "id": "rpc-1",
+        "result": {
+            "response": "HELLO",
+            "session_id": "session-1",
+            "model": "fake/model",
+            "context_tokens": 2,
+            "usage": result_usage,
+        },
+    }
+    assert notification.status_code == 204
+    assert notification.content == b""
+
+
+@pytest.mark.asyncio
+async def test_http_jsonrpc_batch_and_protocol_errors() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        batch = await http.post(
+            "/rpc",
+            json=[
+                {"jsonrpc": "2.0", "id": 1, "method": "status"},
+                {"jsonrpc": "2.0", "method": "status"},
+                {"jsonrpc": "1.0", "id": 2, "method": "status"},
+            ],
+            headers=headers,
+        )
+        parse_error = await http.post(
+            "/rpc",
+            content=b"{bad",
+            headers={**headers, "Content-Type": "application/json"},
+        )
+        duplicate_keys = await http.post(
+            "/rpc",
+            content=b'{"jsonrpc":"2.0","id":1,"id":2,"method":"status"}',
+            headers={**headers, "Content-Type": "application/json"},
+        )
+        oversized = await http.post(
+            "/rpc",
+            content=b"0" * 1048577,
+            headers={**headers, "Content-Type": "application/json"},
+        )
+
+    assert batch.status_code == 200
+    responses = batch.json()
+    assert len(responses) == 2
+    assert responses[0]["id"] == 1
+    assert responses[1]["error"]["code"] == -32600
+    assert parse_error.status_code == 400
+    assert duplicate_keys.status_code == 400
+    assert oversized.status_code == 413
+
+
+@pytest.mark.asyncio
 async def test_http_server_rate_limits_authenticated_requests() -> None:
     app = create_app(
         FakeClient(),  # type: ignore[arg-type]

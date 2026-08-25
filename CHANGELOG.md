@@ -7,6 +7,10 @@ All notable changes to Ash are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Added authenticated remote JSON-RPC 2.0 at `/rpc` on the existing HTTP
+  server, reusing the validated SDK methods with bearer auth, rate limiting,
+  strict JSON parsing, bounded payloads, bounded concurrent batches, standard
+  parse/protocol responses, and `204 No Content` for notifications.
 - MCP required-task waiting now consumes optional `notifications/tasks/status`
   updates to wake immediately and adopt the full task state, while preserving
   bounded polling for missed notifications and existing timeout, cancellation,

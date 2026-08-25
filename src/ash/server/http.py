@@ -8,14 +8,15 @@ import json
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ash.sdk import AshClient
 from ash.core.events import EVENT_SCHEMA_VERSION
+from ash.server.jsonrpc import JSONRPCServer
 
 
 class TurnRequest(BaseModel):
@@ -53,7 +54,11 @@ class SlidingWindowLimiter:
             if len(entries) >= self.limit:
                 return False
             entries.append(now)
-            return True
+        return True
+
+
+MAX_JSONRPC_BODY_BYTES = 1_048_576
+MAX_JSONRPC_BATCH_REQUESTS = 32
 
 
 def create_app(
@@ -66,6 +71,7 @@ def create_app(
     if len(bearer_token) < 16:
         raise ValueError("HTTP bearer token must contain at least 16 characters")
     limiter = SlidingWindowLimiter(requests_per_minute)
+    rpc = JSONRPCServer(client)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -104,6 +110,67 @@ def create_app(
             "service": "ash",
             "event_schema_version": EVENT_SCHEMA_VERSION,
         }
+
+    @app.post("/rpc", dependencies=[Depends(authorize)])
+    async def json_rpc(request: Request) -> Response:
+        content_type = request.headers.get("content-type", "").partition(";")[0]
+        if content_type.casefold() != "application/json":
+            return JSONResponse(
+                status_code=415,
+                content={
+                    "error": {"code": -32700, "message": "Unsupported media type"}
+                },
+            )
+        body = await request.body()
+        if not 1 <= len(body) <= MAX_JSONRPC_BODY_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                },
+            )
+        try:
+            payload = json.loads(
+                body,
+                object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_json_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": "Parse error"},
+                },
+            )
+
+        if isinstance(payload, list):
+            if not payload or len(payload) > MAX_JSONRPC_BATCH_REQUESTS:
+                response: dict[str, Any] | list[dict[str, Any]] = {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                }
+            else:
+                responses = [
+                    handled
+                    for handled in await asyncio.gather(
+                        *(rpc.handle_request(item) for item in payload)
+                    )
+                    if handled is not None
+                ]
+                response = responses
+                if not responses:
+                    return Response(status_code=204)
+            return JSONResponse(content=response)
+
+        handled = await rpc.handle_request(payload)
+        if handled is None:
+            return Response(status_code=204)
+        return JSONResponse(content=handled)
 
     @app.post("/v1/turn", dependencies=[Depends(authorize)])
     async def run_turn(payload: TurnRequest) -> dict:
@@ -210,3 +277,16 @@ def create_app(
 
 def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(raw: str) -> None:
+    raise ValueError(f"invalid JSON constant: {raw}")
