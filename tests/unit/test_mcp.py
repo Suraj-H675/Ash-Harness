@@ -1088,7 +1088,9 @@ def _task_client(
         timeout=timeout,
     )
     client.protocol_version = "2025-11-25"
-    client.server_capabilities = {"tasks": {"requests": {"tools": {"call": {}}}}}
+    client.server_capabilities = {
+        "tasks": {"list": {}, "requests": {"tools": {"call": {}}}}
+    }
     request = AsyncMock(side_effect=responses)
     client.request = request  # type: ignore[method-assign]
     return client, request
@@ -1317,6 +1319,52 @@ async def test_mcp_task_timeout_cancels_remote_task() -> None:
         await client.call_tool("slow", {}, as_task=True)
 
     assert request.await_args_list[-1].args[:2] == ("tasks/cancel", {"taskId": "slow"})
+
+
+@pytest.mark.asyncio
+async def test_mcp_list_tasks_paginates_and_validates_states() -> None:
+    client, request = _task_client([])
+    responses = [
+        {
+            "tasks": [
+                {
+                    "taskId": "working",
+                    "status": "working",
+                    "createdAt": "2025-11-25T10:00:00Z",
+                    "lastUpdatedAt": "2025-11-25T10:01:00Z",
+                    "ttl": None,
+                }
+            ],
+            "nextCursor": "page-two",
+        },
+        {"tasks": []},
+    ]
+
+    async def request_side_effect(method, params, **_):
+        del params
+        return responses.pop(0)
+
+    request.side_effect = request_side_effect
+    tasks = await client.list_mcp_tasks()
+
+    assert [task["taskId"] for task in tasks] == ["working"]
+    assert [sent.args[0] for sent in request.await_args_list] == [
+        "tasks/list",
+        "tasks/list",
+    ]
+    assert request.await_args_list[1].args[1] == {"cursor": "page-two"}
+
+
+@pytest.mark.asyncio
+async def test_mcp_list_tasks_requires_capability_and_fails_closed() -> None:
+    client, request = _task_client([])
+    request.side_effect = AssertionError("must not call unadvertised method")
+    del client.server_capabilities["tasks"]["list"]
+
+    with pytest.raises(MCPProtocolError, match="tasks/list"):
+        await client.list_mcp_tasks()
+
+    request.assert_not_awaited()
 
 
 @pytest.mark.asyncio

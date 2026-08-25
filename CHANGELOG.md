@@ -7,6 +7,9 @@ All notable changes to Ash are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Added MCP `tasks/list` support with capability fail-closed checks, opaque
+  cursor pagination, cursor-loop protection, bounded page traversal, and strict
+  task-state validation for remote task observability.
 - Added authenticated remote JSON-RPC 2.0 at `/rpc` on the existing HTTP
   server, reusing the validated SDK methods with bearer auth, rate limiting,
   strict JSON parsing, bounded payloads, bounded concurrent batches, standard

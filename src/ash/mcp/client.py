@@ -155,6 +155,7 @@ class MCPClient:
             capabilities["sampling"] = sampling
         if self.elicitation_handler is not None and self.elicitation_modes:
             capabilities["elicitation"] = {mode: {} for mode in self.elicitation_modes}
+        capabilities["tasks"] = {"list": {}}
         return capabilities
 
     def supports_server_capability(self, name: str) -> bool:
@@ -964,6 +965,46 @@ class MCPClient:
             )
         except (MCPProtocolError, httpx.HTTPError, OSError):
             return
+
+    async def list_mcp_tasks(self) -> list[dict[str, Any]]:
+        if not self._supports_tasks_list():
+            raise MCPProtocolError(
+                "MCP server does not advertise support for tasks/list"
+            )
+        output: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen: set[str] = set()
+        for _ in range(MAX_PAGINATION_PAGES):
+            result = await self.request(
+                "tasks/list",
+                {"cursor": cursor} if cursor is not None else {},
+                _allow_session_recovery=False,
+            )
+            if not isinstance(result, dict) or "tasks" not in result:
+                raise MCPProtocolError("MCP tasks/list returned no valid task list")
+            tasks = result["tasks"]
+            if not isinstance(tasks, list) or not all(
+                isinstance(task, dict) for task in tasks
+            ):
+                raise MCPProtocolError("MCP tasks/list returned an invalid task entry")
+            output.extend(
+                self._validate_task_result({"task": task}, method="tasks/list")["task"]
+                for task in tasks
+            )
+            next_cursor = result.get("nextCursor")
+            if next_cursor is None:
+                return output
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise MCPProtocolError("MCP tasks/list returned an invalid nextCursor")
+            if next_cursor in seen:
+                raise MCPProtocolError("MCP tasks/list repeated pagination cursor")
+            seen.add(next_cursor)
+            cursor = next_cursor
+        raise MCPProtocolError(f"MCP tasks/list exceeded {MAX_PAGINATION_PAGES} pages")
+
+    def _supports_tasks_list(self) -> bool:
+        capability = self.server_capabilities.get("tasks")
+        return isinstance(capability, dict) and isinstance(capability.get("list"), dict)
 
     def _resolve_task_status_notification(self, params: Any) -> None:
         task_id = params.get("taskId") if isinstance(params, dict) else None
