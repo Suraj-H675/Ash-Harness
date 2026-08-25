@@ -24,6 +24,9 @@ All notable changes to Ash are documented here. The format follows
   Linux-specific Bubblewrap regression test.
 
 ### Added
+- HTTPS Git plugin installation with explicit refs, shallow temporary
+  checkouts, removal of Git metadata, and full reuse of local plugin manifest,
+  dependency, component, replacement, and enablement validation.
 - Experimental MCP task execution for tools that declare `execution.taskSupport:
   "required"`, with capability validation, bounded polling and timeout,
   `tasks/result` retrieval, terminal-status handling, and cancellation through

@@ -356,6 +356,10 @@ Dependencies are other installed plugins with optional PEP 440 version
 constraints. Installation rejects links, path traversal, malformed or
 oversized components, missing enabled dependencies, and invalid replacement
 content before changing the active version. `/plugins` manages local plugins
+and trusted HTTPS Git repositories (`ash extensions install URL --ref REF`).
+Git installs use an explicit branch or tag, shallow temporary checkout, and the
+same manifest and component validation as local directories; repository
+metadata is removed before activation.
 inside a session and `/reload-plugins` atomically refreshes commands,
 completion, skills, agents, hooks, executable tools, and MCP servers without
 restarting Ash. Executable plugins use the isolated, versioned JSON-RPC stdio

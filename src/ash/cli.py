@@ -295,14 +295,19 @@ def _render_runtime_capabilities(loop: AshLoop, config: AshConfig) -> str:
 
     provider = loop.provider
     capabilities = provider.capabilities
-    model = f"{getattr(provider, 'provider_family', config.provider)}/{provider.model_name}"
+    model = (
+        f"{getattr(provider, 'provider_family', config.provider)}/{provider.model_name}"
+    )
     lines = [
         f"Runtime capabilities for {model}:",
-        "  source: dynamic manifest" if getattr(
+        "  source: dynamic manifest"
+        if getattr(
             provider,
             "_dynamic_capabilities",
             None,
-        ) is not None else "  source: static/default registry",
+        )
+        is not None
+        else "  source: static/default registry",
         f"  tools={str(capabilities.native_tools).lower()}",
         f"  vision={str(capabilities.vision).lower()}",
         f"  reasoning={str(capabilities.reasoning).lower()}",
@@ -1001,7 +1006,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     loop.current_session and loop.current_session.context_summary
                 )
                 if arguments and arguments[0] == "--provenance":
-                    print(_render_context_provenance(loop._last_context_budget), flush=True)
+                    print(
+                        _render_context_provenance(loop._last_context_budget),
+                        flush=True,
+                    )
                     continue
                 budget = _render_context_budget(loop._last_context_budget)
                 budget_suffix = f"\n{budget}" if budget else ""
@@ -1068,8 +1076,14 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         item for item in arguments[1:] if not item.startswith("--")
                     ]
                     flags = {item for item in arguments[1:] if item.startswith("--")}
+                    ref = (
+                        arguments[index + 1]
+                        if "--ref" in arguments
+                        and (index := arguments.index("--ref")) + 1 < len(arguments)
+                        else None
+                    )
                     allowed_flags = (
-                        {"--replace"}
+                        {"--replace", "--ref"}
                         if action == "install"
                         else {"--yes"}
                         if action == "uninstall"
@@ -1084,6 +1098,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             positional[0],
                             replace="--replace" in flags,
                             confirmed="--yes" in flags,
+                            git_ref=ref,
                         )
                         reload_summary = await reload_plugin_components()
                     except (OSError, PluginLifecycleError, ValueError) as exc:
@@ -1480,7 +1495,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     if loop._vector_pipeline is None:
                         print("Memory is disabled.")
                     else:
-                        print(json.dumps(loop._vector_pipeline.export(), sort_keys=True))
+                        print(
+                            json.dumps(loop._vector_pipeline.export(), sort_keys=True)
+                        )
                     continue
                 if action == "clear" and len(arguments) == 1:
                     if loop._vector_pipeline is None:
@@ -1526,7 +1543,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             custom_models = [
                 model
                 for model in _configured_model_catalog(config)
-                if model.split("/", 1)[0] not in {"anthropic", "openai", "deepseek", "groq", "ollama"}
+                if model.split("/", 1)[0]
+                not in {"anthropic", "openai", "deepseek", "groq", "ollama"}
             ]
             for model in custom_models:
                 lines.append(_render_model_capabilities(model))
@@ -1646,7 +1664,9 @@ def main(argv: list[str] | None = None) -> int:
         "ollama",
         help="Manage local Ollama models",
     )
-    ollama_subparsers = ollama_parser.add_subparsers(dest="ollama_action", required=True)
+    ollama_subparsers = ollama_parser.add_subparsers(
+        dest="ollama_action", required=True
+    )
     ollama_pull = ollama_subparsers.add_parser("pull")
     ollama_pull.add_argument("model")
     ollama_pull.add_argument(
@@ -1901,6 +1921,7 @@ def main(argv: list[str] | None = None) -> int:
         default="all",
     )
     extensions_parser.add_argument("extensions_target", nargs="?")
+    extensions_parser.add_argument("--ref")
     extensions_parser.add_argument("--replace", action="store_true")
     extensions_parser.add_argument("--yes", action="store_true")
     extensions_parser.add_argument("--json", action="store_true")
@@ -2194,9 +2215,7 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
-        return asyncio.run(
-            pull_model(args.model, timeout_seconds=args.timeout)
-        )
+        return asyncio.run(pull_model(args.model, timeout_seconds=args.timeout))
 
     if args.command == "lsp":
         from ash.commands.lsp import inspect_lsp, render_lsp
@@ -2493,6 +2512,7 @@ def main(argv: list[str] | None = None) -> int:
                         "Automation worker active for "
                         f"{config.workspace_root.resolve()}; press Ctrl+C to stop."
                     )
+
                 def report_finished(run: Any) -> None:
                     if args.once:
                         return
@@ -2581,10 +2601,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(render_job(shown_job, json_output=json_output))
                     return 0
                 if args.cron_action in {"pause", "resume"}:
-                    if (
-                        args.cron_action == "resume"
-                        and not config.automation_enabled
-                    ):
+                    if args.cron_action == "resume" and not config.automation_enabled:
                         raise AutomationError(
                             "automation is disabled by user configuration"
                         )
@@ -3045,6 +3062,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.replace and action != "install":
                 print("Error: --replace is only valid with install", file=sys.stderr)
                 return 2
+            if args.ref and action != "install":
+                print("Error: --ref is only valid with install", file=sys.stderr)
+                return 2
             if args.yes and action != "uninstall":
                 print("Error: --yes is only valid with uninstall", file=sys.stderr)
                 return 2
@@ -3054,6 +3074,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.extensions_target,
                     replace=args.replace,
                     confirmed=args.yes,
+                    git_ref=args.ref,
                 )
             except (OSError, PluginLifecycleError) as exc:
                 print(f"Error: {exc}", file=sys.stderr)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,7 @@ def test_extension_inventory_discovers_user_extensions(
     monkeypatch,
 ) -> None:
     home = tmp_path / "home"
+    home.mkdir()
     workspace = tmp_path / "repo"
     workspace.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -209,6 +211,7 @@ def test_extensions_cli_installs_disables_enables_and_uninstalls_local_plugin(
     home = tmp_path / "home"
     workspace = tmp_path / "repo"
     workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
     source = tmp_path / "source"
     _write_plugin(tmp_path, "source")
     monkeypatch.setenv("HOME", str(home))
@@ -240,6 +243,94 @@ def test_extensions_cli_installs_disables_enables_and_uninstalls_local_plugin(
 def test_extensions_cli_requires_management_target(capsys) -> None:
     assert main(["extensions", "install"]) == 2
     assert "requires a target" in capsys.readouterr().err
+
+
+def test_extensions_cli_installs_https_git_plugin(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    source = tmp_path / "source"
+    _write_plugin(tmp_path, "source")
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(source)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "-c",
+            "user.name=Ash",
+            "-c",
+            "user.email=ash@example.test",
+            "commit",
+            "-m",
+            "plugin",
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+
+    original_run = subprocess.run
+    monkeypatch.setattr(
+        "ash.plugins.lifecycle.subprocess.run",
+        lambda args, **kwargs: original_run(
+            [
+                *args[:-2],
+                str(source),
+                args[-1],
+            ]
+            if args[:2] == ["git", "clone"]
+            else args,
+            **kwargs,
+        ),
+    )
+
+    assert (
+        main(
+            [
+                "extensions",
+                "install",
+                "https://plugins.example/source.git",
+                "--ref",
+                "main",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    installed = json.loads(capsys.readouterr().out)
+    assert installed["name"] == "source"
+    assert installed["enabled"] is True
+    assert Path(installed["root"]).is_relative_to(home / ".ash" / "plugins")
+    assert not (Path(installed["root"]) / ".git").exists()
+
+
+def test_extensions_cli_rejects_non_https_and_missing_git_ref(capsys) -> None:
+    assert (
+        main(
+            [
+                "extensions",
+                "install",
+                "http://plugins.example/plugin.git",
+                "--ref",
+                "main",
+            ]
+        )
+        == 2
+    )
+    assert "HTTPS URL" in capsys.readouterr().err
+    assert main(["extensions", "install", "https://plugins.example/plugin.git"]) == 2
+    assert "requires an explicit --ref" in capsys.readouterr().err
 
 
 def test_extensions_install_validates_components_before_replacing(

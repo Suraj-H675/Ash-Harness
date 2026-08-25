@@ -18,6 +18,7 @@ from ash.hooks.config import (
 from ash.plugins.manifest import PluginManifest, namespaced_plugin_tool_name
 from ash.plugins.lifecycle import (
     PluginLifecycleError,
+    install_git_plugin,
     install_local_plugin,
     load_extension_state,
     set_plugin_enabled,
@@ -333,6 +334,7 @@ def manage_local_plugin(
     *,
     replace: bool = False,
     confirmed: bool = False,
+    git_ref: str | None = None,
 ) -> dict[str, Any]:
     if action == "install":
         state = load_extension_state()
@@ -341,9 +343,17 @@ def manage_local_plugin(
             _require_enabled_dependencies(manifest, state.disabled_plugins)
             _validate_plugin_contents(root, manifest)
 
-        installed = install_local_plugin(
-            Path(target), replace=replace, validator=validate_install
-        )
+        if target.startswith(("https://", "http://")):
+            installed = install_git_plugin(
+                target,
+                ref=git_ref or "",
+                replace=replace,
+                validator=validate_install,
+            )
+        else:
+            installed = install_local_plugin(
+                Path(target), replace=replace, validator=validate_install
+            )
         set_plugin_enabled(installed.name, enabled=True)
         return {
             "action": action,

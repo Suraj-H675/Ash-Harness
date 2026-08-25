@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import uuid
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +19,7 @@ from ash.plugins.registry import _validate_manifest
 MAX_PLUGIN_FILES = 10_000
 MAX_PLUGIN_BYTES = 256 * 1024 * 1024
 STATE_VERSION = 1
+MAX_GIT_CLONE_BYTES = MAX_PLUGIN_BYTES
 
 
 class PluginLifecycleError(ValueError):
@@ -218,6 +221,55 @@ def _validate_tree(root: Path) -> None:
                 )
             if total_bytes > MAX_PLUGIN_BYTES:
                 raise PluginLifecycleError("plugin exceeds 256 MiB")
+
+
+def install_git_plugin(
+    source: str,
+    *,
+    ref: str,
+    destination_root: Path | None = None,
+    replace: bool = False,
+    validator: Callable[[Path, PluginManifest], None] | None = None,
+) -> InstalledPlugin:
+    parsed = urllib.parse.urlsplit(source)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise PluginLifecycleError("plugin Git source must use an HTTPS URL")
+    if not ref:
+        raise PluginLifecycleError("plugin Git source requires an explicit --ref")
+    if "\x00" in ref or "\n" in ref or "\r" in ref:
+        raise PluginLifecycleError("plugin Git reference is invalid")
+
+    temporary_root = Path(tempfile.mkdtemp(prefix="ash-plugin-git-"))
+    checkout = temporary_root / "plugin"
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                ref,
+                "--single-branch",
+                source,
+                str(checkout),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise PluginLifecycleError(f"could not clone plugin source: {detail}")
+        shutil.rmtree(checkout / ".git")
+        return install_local_plugin(
+            checkout,
+            destination_root=destination_root,
+            replace=replace,
+            validator=validator,
+        )
+    finally:
+        shutil.rmtree(temporary_root, ignore_errors=True)
 
 
 def _is_link(path: Path) -> bool:
