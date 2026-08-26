@@ -45,3 +45,10 @@ def test_help_filters_by_command_alias_and_description() -> None:
     assert render_help("definitely-not-a-command") == (
         "No slash commands match 'definitely-not-a-command'."
     )
+
+
+def test_help_lists_mcp_authorization_actions() -> None:
+    rendered = render_help("mcp")
+
+    assert "/mcp [status|refresh|login SERVER|logout SERVER|" in rendered
+    assert "Inspect, authorize, or reload live MCP servers" in rendered

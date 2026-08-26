@@ -1432,6 +1432,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         "prompts",
                         "tasks",
                         "cancel",
+                        "login",
+                        "logout",
                     }
                 ):
                     print(f"Usage: {command.usage}", file=sys.stderr)
@@ -1439,6 +1441,45 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 runtime = loop._mcp_runtime
                 if runtime is None:
                     print("No live MCP servers.")
+                    continue
+                assert runtime is not None
+                if action in {"login", "logout"}:
+                    if len(arguments) != 2 or arguments[1] not in loop._mcp_configs:
+                        print(f"Usage: {command.usage}", file=sys.stderr)
+                        continue
+                    server_name = arguments[1]
+                    mcp_config = loop._mcp_configs[server_name]
+                    if mcp_config.auth != "oauth":
+                        print(
+                            f"Error: MCP server {server_name!r} does not use OAuth.",
+                            file=sys.stderr,
+                        )
+                        continue
+                    from ash.mcp.oauth import MCPOAuthTokenStore, authorize_mcp_server
+
+                    oauth_store = MCPOAuthTokenStore(server_name)
+                    if action == "logout":
+                        credentials_removed = oauth_store.remove()
+                        print(
+                            f"Removed OAuth credentials for MCP server {server_name}."
+                            if credentials_removed
+                            else f"No OAuth credentials stored for {server_name}."
+                        )
+                    else:
+                        try:
+                            await authorize_mcp_server(
+                                server_name,
+                                mcp_config.resolved_url,
+                                oauth_config=mcp_config.resolved_oauth,
+                                store=oauth_store,
+                                timeout_seconds=300.0,
+                                manual_paste=True,
+                            )
+                        except (OSError, ValueError) as exc:
+                            print(f"Error: {exc}", file=sys.stderr)
+                            continue
+                        print(f"Authorized MCP server {server_name}.")
+                    await reload_plugin_components()
                     continue
                 if action == "status":
                     for name in loop._mcp_configs:

@@ -139,7 +139,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `/plan` mode | Verified locally | Explicit toggle, editable sprint contract, approval gate, and execution transition |
 | `/permissions` | Verified locally | Inspect/change mode plus versioned project allow/ask/deny rules with stable IDs, exact/string-prefix/argv-prefix matchers, JSON output, precise removal, and legacy migration ([Claude Code rule model](https://code.claude.com/docs/en/permissions)) |
 | `/sandbox` | Verified locally | Active backend, tier, capabilities, and network policy |
-| `/mcp` | Partial | Top-level add/remove/list/status config supports JSON and env/header metadata plus safe OAuth credential health (`missing`, `usable`, `expired`, or `invalid`) without exposing secrets; REPL status/tools/resources/prompts use live clients; interactive login and richer lifecycle remain |
+| `/mcp` | Partial | Top-level add/remove/list/status config supports JSON and env/header metadata plus safe OAuth credential health (`missing`, `usable`, `expired`, or `invalid`) without exposing secrets; REPL status/tools/resources/prompts use live clients, and explicit login/logout atomically reloads affected tooling; richer lifecycle remains |
 | `/skills`, `/plugins`, `/hooks` | Verified locally | Namespaced components and executable tool protocols are inspectable; local install/enable/disable/confirmed-uninstall and live reload close and replace plugin hosts |
 | `/agents` | Verified locally | Slash status/stop/resume, persisted status/report/message inspection, live steering/stop acknowledgement, isolated branch lifecycle, durable task filtering, and cursor-based replay of redacted v1 task events |
 | `/doctor` | Verified locally | Runs the local health report in-session |
