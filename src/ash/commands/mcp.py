@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from ash.mcp.server import MCPServerConfig
+from ash.mcp.oauth import MCPOAuthTokenStore
 
 
 def parse_key_value_options(values: list[str] | None, *, label: str) -> dict[str, str]:
@@ -39,6 +40,16 @@ def mcp_servers_payload(servers: dict[str, MCPServerConfig]) -> dict:
     }
 
 
+def _oauth_credential_state(config: MCPServerConfig) -> str | None:
+    if config.auth != "oauth":
+        return None
+    try:
+        store = MCPOAuthTokenStore(config.name)
+        return store.credential_state(config.resolved_url)
+    except ValueError as exc:
+        return f"invalid configuration: {exc}"
+
+
 def render_mcp_servers(
     servers: dict[str, MCPServerConfig],
     *,
@@ -49,6 +60,10 @@ def render_mcp_servers(
         return json.dumps(payload, sort_keys=True)
     if not servers:
         return "No MCP servers configured."
+    oauth_states = {
+        name: _oauth_credential_state(config)
+        for name, config in sorted(servers.items())
+    }
     lines: list[str] = []
     for item in payload["servers"]:
         target = (
@@ -61,7 +76,10 @@ def render_mcp_servers(
             extras.append("env=" + ",".join(item["env_keys"]))
         if item["header_keys"]:
             extras.append("headers=" + ",".join(item["header_keys"]))
-        suffix = f" ({'; '.join(extras)})" if extras else ""
+        state = oauth_states.get(item["name"])
+        if item["auth"] == "oauth" and state is not None:
+            extras.append(f"credentials={state}")
         auth = " oauth" if item["auth"] == "oauth" else ""
+        suffix = f" ({'; '.join(extras)})" if extras else ""
         lines.append(f"{item['name']} [{item['transport']}{auth}]: {target}{suffix}")
     return "\n".join(lines)

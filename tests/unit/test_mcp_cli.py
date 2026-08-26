@@ -5,7 +5,29 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 from ash.cli import main
+from ash.mcp.oauth import (
+    MCPOAuthTokenStore,
+    OAuthBundle,
+    OAuthClient,
+    OAuthDiscovery,
+    OAuthTokens,
+)
 from ash.mcp.server import load_mcp_servers
+
+
+def _oauth_bundle(resource: str) -> OAuthBundle:
+    return OAuthBundle(
+        resource,
+        OAuthDiscovery(
+            resource,
+            ("files:read",),
+            "https://auth.example.test",
+            "https://auth.example.test/authorize",
+            "https://auth.example.test/token",
+        ),
+        OAuthClient("client-id"),
+        OAuthTokens("access-token", "refresh-token"),
+    )
 
 
 def test_mcp_cli_add_persists_env_headers_and_json_hides_values(
@@ -218,3 +240,41 @@ def test_mcp_cli_login_is_explicit_and_logout_removes_credentials(
     assert main(["mcp", "logout", "protected"]) == 0
     assert "Removed OAuth credentials" in capsys.readouterr().out
     assert not store.path.exists()
+
+
+def test_mcp_cli_status_reports_safe_oauth_credential_state(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert (
+        main(
+            [
+                "mcp",
+                "add",
+                "protected",
+                "--transport",
+                "http",
+                "--url",
+                "https://mcp.example.test/rpc",
+                "--auth",
+                "oauth",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert main(["mcp", "status"]) == 0
+    output = capsys.readouterr().out
+    assert "credentials=missing" in output
+    assert "access-token" not in output
+
+    store = MCPOAuthTokenStore("protected")
+    store.save(_oauth_bundle("https://mcp.example.test/rpc"))
+    assert main(["mcp", "status"]) == 0
+    output = capsys.readouterr().out
+    assert "credentials=usable" in output
+    assert "access-token" not in output

@@ -215,6 +215,19 @@ class MCPOAuthTokenStore:
             return False
         return True
 
+    def credential_state(self, resource: str) -> str:
+        """Report bounded, non-secret credential health for diagnostics."""
+
+        if not self.path.exists():
+            return "missing"
+        try:
+            bundle = self.load(canonical_resource_uri(resource))
+        except MCPOAuthError:
+            return "invalid"
+        if bundle is None:
+            return "missing"
+        return "usable" if bundle.tokens.usable() else "expired"
+
     def _read_record(self) -> str:
         if self.path.is_symlink():
             raise MCPOAuthError("refusing to read a symlinked MCP OAuth token record")

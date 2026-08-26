@@ -99,6 +99,24 @@ def test_oauth_store_rejects_oversized_records_and_symlinked_directory(
         linked.save(_bundle(resource))
 
 
+def test_oauth_credential_state_reports_health_without_secrets(tmp_path: Path) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+
+    assert store.credential_state(resource) == "missing"
+
+    store.save(_bundle(resource, expired=True))
+    assert store.credential_state(resource) == "expired"
+
+    store.save(_bundle(resource))
+    assert store.credential_state(resource) == "usable"
+
+    record = json.loads(store.path.read_text(encoding="utf-8"))
+    record["tokens"]["access_token"] = 123
+    store.path.write_text(json.dumps(record), encoding="utf-8")
+    assert store.credential_state(resource) == "invalid"
+
+
 def test_oauth_store_rejects_coerced_credential_types(tmp_path: Path) -> None:
     resource = "https://mcp.example.test/rpc"
     store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
