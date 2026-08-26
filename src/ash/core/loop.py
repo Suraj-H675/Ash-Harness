@@ -239,21 +239,13 @@ def _render_tool_response(call_id: str, tool_name: str, result: dict[str, Any]) 
         "error": result.get("error"),
         "truncated": result.get("truncated", False),
         "token_count": result.get("token_count", 0),
-        **(
-            {"diagnostics": result["diagnostics"]}
-            if result.get("diagnostics")
-            else {}
-        ),
+        **({"diagnostics": result["diagnostics"]} if result.get("diagnostics") else {}),
         **(
             {"diagnostic_summary": result["diagnostic_summary"]}
             if result.get("diagnostic_summary")
             else {}
         ),
-        **(
-            {"citations": result["citations"]}
-            if result.get("citations")
-            else {}
-        ),
+        **({"citations": result["citations"]} if result.get("citations") else {}),
     }
     return (
         f'<tool_response name="{tool_name}" call_id="{call_id}">\n'
@@ -2105,16 +2097,16 @@ class AshLoop:
             if decision.action == PolicyAction.DENY:
                 approved = False
             elif self.on_tool_approval is not None:
-                decision_result = await self.on_tool_approval(
-                    tool_name, arguments
-                )
+                decision_result = await self.on_tool_approval(tool_name, arguments)
                 if isinstance(decision_result, str):
                     approved = False
                     denial_feedback = decision_result.strip()
                 elif isinstance(decision_result, tuple):
                     approved = bool(decision_result[0])
                     denial_feedback = (
-                        str(decision_result[1]).strip() if len(decision_result) > 1 else ""
+                        str(decision_result[1]).strip()
+                        if len(decision_result) > 1
+                        else ""
                     )
                 else:
                     approved = bool(decision_result)
@@ -2434,9 +2426,7 @@ class AshLoop:
                         else {}
                     ),
                     **(
-                        {
-                            "diagnostic_summary": tool_result.diagnostic_summary
-                        }
+                        {"diagnostic_summary": tool_result.diagnostic_summary}
                         if tool_result.diagnostic_summary
                         else {}
                     ),
@@ -2445,11 +2435,7 @@ class AshLoop:
                         if tool_result.citations
                         else {}
                     ),
-                    **(
-                        {"images": tool_result.images}
-                        if tool_result.images
-                        else {}
-                    ),
+                    **({"images": tool_result.images} if tool_result.images else {}),
                     "token_count": tool_result.token_count,
                 }
             )
@@ -2698,6 +2684,24 @@ class AshLoop:
         for path in self.project_root.rglob("*"):
             if not path.is_file():
                 continue
+            if path.suffix.lower() not in {
+                ".c",
+                ".cpp",
+                ".cs",
+                ".go",
+                ".h",
+                ".hpp",
+                ".java",
+                ".js",
+                ".jsx",
+                ".md",
+                ".py",
+                ".rs",
+                ".ts",
+                ".tsx",
+                ".txt",
+            }:
+                continue
             relative = path.relative_to(self.project_root)
             text = relative.as_posix()
             if (
@@ -2718,8 +2722,9 @@ class AshLoop:
 
         indexed = 0
         for path in sorted(candidates):
+            relative_path = path.relative_to(self.project_root).as_posix()
             chunks = self._chunk_file(path)
-            await self._vector_pipeline.index_chunks(chunks, path.as_posix())
+            await self._vector_pipeline.index_chunks(chunks, relative_path)
             indexed += 1
         return indexed
 
@@ -2790,7 +2795,9 @@ class AshLoop:
         if self._pending_memory_context:
             recalled_context = f"## Relevant Context\n{self._pending_memory_context}"
             memory_section = (
-                f"{memory_section}\n\n{recalled_context}" if memory_section else recalled_context
+                f"{memory_section}\n\n{recalled_context}"
+                if memory_section
+                else recalled_context
             )
 
         if self._config is not None:

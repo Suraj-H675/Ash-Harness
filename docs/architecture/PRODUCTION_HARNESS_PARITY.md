@@ -251,7 +251,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Cross-platform CI | Partial | Linux/macOS CI workflow and platform-neutral installed-wheel smoke gate exist; Windows workflow is intentionally deferred until parity work resumes |
 | Packaging CI | Verified locally | Wheel/sdist build, minimal clean install, artifact metadata/content, CLI/config/trust, repo-map import, optional dependency absence, and missing-extra behavior are exercised |
 | Security tests | Partial | Command/path bypass corpus, sandbox escape assumptions, secret leaks |
-| Performance tests | Partial | Lightweight CLI import graph and installed version startup are regression-tested under one second; bounded large-repository memory indexing is covered by a 170-file offline benchmark; long-session memory and redraw latency benchmarks remain |
+| Performance tests | Partial | Lightweight CLI import graph and installed version startup are regression-tested under one second; bounded large-repository memory indexing is covered by a 170-file offline benchmark; long-session memory proves 1,000-file indexing plus 20 exact-recall rounds with bounded indexing and sub-50 ms recall; redraw latency benchmarks remain |
 | Compatibility policy | Verified locally | Config, session, and plugin manifest schemas are versioned with future-version refusal, minimum-version enforcement, and plugin deprecation notices |
 
 ## Delivery Gates
