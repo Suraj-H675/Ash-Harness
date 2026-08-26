@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+
+import httpx
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -43,6 +46,80 @@ def trusted_catalog_keys_path() -> Path:
 def default_catalog_path() -> Path | None:
     configured = os.environ.get("ASH_PLUGIN_CATALOG")
     return Path(configured).expanduser() if configured else None
+
+
+def catalog_cache_path(url: str) -> Path:
+    """Return a stable private cache location for one HTTPS catalog URL."""
+
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(url)
+    if parsed.scheme.casefold() != "https" or not parsed.hostname:
+        raise PluginCatalogError("catalog URL must use HTTPS")
+    identity = f"{parsed.hostname.lower()}{parsed.path or '/'}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", parsed.hostname.lower())[:80]
+    return Path.home() / ".ash" / "cache" / "catalogs" / f"{safe_name}-{digest}.json"
+
+
+def fetch_catalog(
+    url: str,
+    *,
+    timeout_seconds: float = 10.0,
+    transport: httpx.BaseTransport | None = None,
+) -> Path:
+    """Fetch a bounded HTTPS signed catalog into its stable cache path."""
+
+    if not 1.0 <= timeout_seconds <= 60.0:
+        raise PluginCatalogError("catalog fetch timeout must be 1 to 60 seconds")
+    destination = catalog_cache_path(url)
+    try:
+        if transport is not None:
+            with httpx.Client(
+                transport=transport,
+                timeout=timeout_seconds,
+                follow_redirects=False,
+            ) as client:
+                response = client.get(url, headers={"Accept": "application/json"})
+        else:
+            response = httpx.get(
+                url,
+                timeout=timeout_seconds,
+                follow_redirects=False,
+                headers={"Accept": "application/json"},
+            )
+    except httpx.HTTPError as exc:
+        raise PluginCatalogError(f"could not fetch plugin catalog: {exc}") from exc
+    if response.status_code != 200:
+        raise PluginCatalogError(
+            f"plugin catalog endpoint returned HTTP {response.status_code}"
+        )
+    raw = response.content
+    if len(raw) > MAX_CATALOG_BYTES:
+        raise PluginCatalogError("plugin catalog exceeds 256 KiB")
+    try:
+        envelope = _parse_strict_json(raw.decode("utf-8"))
+        if not isinstance(envelope, dict) or "keyId" not in envelope:
+            raise ValueError("missing catalog key id")
+    except (UnicodeError, ValueError, KeyError, TypeError):
+        # Do not cache malformed or unsigned payloads.
+        raise PluginCatalogError("invalid signed plugin catalog response") from None
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        destination.parent.chmod(0o700)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(raw)
+        if os.name != "nt":
+            temporary.chmod(0o600)
+        os.replace(temporary, destination)
+    except OSError as exc:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise PluginCatalogError(f"could not save plugin catalog: {exc}") from exc
+    return destination
 
 
 @dataclass(frozen=True)

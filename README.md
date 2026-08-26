@@ -103,6 +103,7 @@ ash agents apply ash-agent/ID    # cherry-pick a worker after review
 ash agents discard ash-agent/ID --yes
 ash extensions install ./my-plugin # local directory only; validates before install
 ash extensions search review --catalog /path/catalog.json
+ash extensions search review --catalog https://publisher.example/ash-catalog.json
 ash extensions install review --catalog /path/catalog.json # pinned by signed entry
 ash extensions plugins --json      # inspect enabled and disabled plugins
 ash extensions disable my-plugin
@@ -367,6 +368,9 @@ A signed catalog can also be browsed with `extensions search` and installed by
 name using `--catalog`; name installs use the publisher-pinned source, ref,
 and commit digest. Set `ASH_PLUGIN_CATALOG` to enable a default catalog and
 `ASH_CATALOG_KEYS` to override `~/.ash/catalog-keys.json`.
+HTTPS catalog values are fetched with redirects disabled into a private cache
+under `~/.ash/cache/catalogs`, bounded to 256 KiB, then verified with pinned
+trusted keys before discovery or install.
 inside a session and `/reload-plugins` atomically refreshes commands,
 completion, skills, agents, hooks, executable tools, and MCP servers without
 restarting Ash. Executable plugins use the isolated, versioned JSON-RPC stdio

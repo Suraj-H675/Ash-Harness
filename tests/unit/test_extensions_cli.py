@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import httpx
 import base64
 import os
 from pathlib import Path
@@ -489,6 +490,77 @@ def _write_signed_catalog(
         )
     )
     return catalog_path
+
+
+@pytest.mark.asyncio
+async def test_https_catalog_is_cached_and_verified_for_search(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from ash.commands.extensions import search_catalog_plugins
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(tmp_path / "keys.json"))
+    private_key = Ed25519PrivateKey.generate()
+    encoded_private = (
+        base64.urlsafe_b64encode(private_key.private_bytes_raw()).rstrip(b"=").decode()
+    )
+    public_key = private_key.public_key().public_bytes_raw()
+    catalog_payload = {
+        "version": 1,
+        "sequence": 4,
+        "entries": [
+            {
+                "name": "remote",
+                "version": "2.0.0",
+                "source": "https://plugins.example/remote.git",
+                "ref": "v2.0.0",
+                "digest": "a" * 64,
+            }
+        ],
+    }
+    body = json.dumps(
+        {
+            "catalog": catalog_payload,
+            "keyId": "test-key",
+            "algorithm": "ed25519",
+            "signature": sign_catalog(catalog_payload, encoded_private),
+        }
+    ).encode()
+    (tmp_path / "keys.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "keys": [
+                    {
+                        "keyId": "test-key",
+                        "algorithm": "ed25519",
+                        "publicKey": base64.urlsafe_b64encode(public_key)
+                        .rstrip(b"=")
+                        .decode(),
+                    }
+                ],
+            }
+        )
+    )
+    url = "https://catalog.example/ash/plugins.json"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "catalog.example"
+        assert request.url.path == "/ash/plugins.json"
+        return httpx.Response(200, content=body)
+
+    transport = httpx.MockTransport(handler)
+    sequence, entries = search_catalog_plugins(
+        "remote",
+        catalog=url,
+        transport=transport,
+    )
+
+    assert sequence == 4
+    assert entries[0].name == "remote"
+    assert (home / ".ash" / "cache" / "catalogs").is_dir()
 
 
 def test_extensions_catalog_search_and_name_install_are_pinned(

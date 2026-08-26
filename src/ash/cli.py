@@ -1118,7 +1118,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         and (index := arguments.index("--ref")) + 1 < len(arguments)
                         else None
                     )
-                    catalog_path = default_catalog_path()
+                    catalog = default_catalog_path()
                     allowed_flags = (
                         {"--replace", "--ref"}
                         if action == "install"
@@ -1136,7 +1136,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             replace="--replace" in flags,
                             confirmed="--yes" in flags,
                             git_ref=ref,
-                            catalog_path=catalog_path,
+                            catalog=catalog,
                         )
                         reload_summary = await reload_plugin_components()
                     except (OSError, PluginLifecycleError, ValueError) as exc:
@@ -1149,11 +1149,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 roots = [(Path.home() / ".ash" / "plugins", "user")]
                 if is_workspace_trusted(loop.project_root):
                     roots.append((loop.project_root / ".ash" / "plugins", "project"))
-                catalog = PluginCatalog(
+                plugin_catalog = PluginCatalog(
                     tuple(roots),
                     disabled_plugins=load_extension_state().disabled_plugins,
                 )
-                discovered = catalog.discover(include_disabled=True)
+                discovered = plugin_catalog.discover(include_disabled=True)
                 if not discovered:
                     print("No plugins discovered.")
                 for plugin in discovered:
@@ -1163,7 +1163,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         f"{'enabled' if plugin.enabled else 'disabled'}] - "
                         f"{plugin.manifest.description}"
                     )
-                for path, error in catalog.errors.items():
+                for path, error in plugin_catalog.errors.items():
                     print(f"Invalid plugin {path}: {error}", file=sys.stderr)
                 continue
             if command.name == "reload-plugins":
@@ -3245,7 +3245,7 @@ def main(argv: list[str] | None = None) -> int:
                 if action == "search":
                     sequence, entries = search_catalog_plugins(
                         args.extensions_target or "",
-                        catalog_path=args.catalog,
+                        catalog=args.catalog,
                     )
                     print(
                         render_catalog_search(
@@ -3261,7 +3261,7 @@ def main(argv: list[str] | None = None) -> int:
                         replace=args.replace,
                         confirmed=args.yes,
                         git_ref=args.ref,
-                        catalog_path=args.catalog,
+                        catalog=args.catalog,
                     )
                     print(render_plugin_action(result, json_output=args.json))
             except (OSError, PluginLifecycleError) as exc:

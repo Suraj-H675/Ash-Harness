@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -17,6 +18,7 @@ from ash.hooks.config import (
 )
 from ash.plugins.catalog import (
     CatalogEntry,
+    fetch_catalog,
     default_catalog_path,
     parse_and_verify_catalog,
     trusted_catalog_keys_path,
@@ -346,12 +348,38 @@ def render_extension_inventory(
     return "\n".join(lines)
 
 
-def _verified_catalog(catalog_path: Path | None = None):
-    catalog_file = catalog_path or default_catalog_path()
+def _verified_catalog(
+    catalog: Path | str | None = None,
+    *,
+    transport: Any | None = None,
+):
+    catalog_file: Path | None
+    if isinstance(catalog, str):
+        try:
+            catalog_file = (
+                fetch_catalog(catalog, transport=transport)
+                if "://" in catalog
+                else Path(catalog).expanduser()
+            )
+        except ValueError as exc:
+            raise PluginLifecycleError(str(exc)) from exc
+    else:
+        catalog_file = catalog
     if catalog_file is None:
-        raise PluginLifecycleError(
-            "plugin catalog is not configured; pass --catalog or set ASH_PLUGIN_CATALOG"
-        )
+        configured = os.environ.get("ASH_PLUGIN_CATALOG")
+        if not configured:
+            raise PluginLifecycleError(
+                "plugin catalog is not configured; pass --catalog or set "
+                "ASH_PLUGIN_CATALOG"
+            )
+        try:
+            catalog_file = (
+                fetch_catalog(configured)
+                if "://" in configured
+                else Path(configured).expanduser()
+            )
+        except ValueError as exc:
+            raise PluginLifecycleError(str(exc)) from exc
     try:
         return parse_and_verify_catalog(
             catalog_file,
@@ -364,9 +392,10 @@ def _verified_catalog(catalog_path: Path | None = None):
 def search_catalog_plugins(
     query: str = "",
     *,
-    catalog_path: Path | None = None,
+    catalog: Path | str | None = None,
+    transport: Any | None = None,
 ) -> tuple[int, tuple[CatalogEntry, ...]]:
-    verified = _verified_catalog(catalog_path)
+    verified = _verified_catalog(catalog, transport=transport)
     normalized = query.strip().casefold()
     entries = sorted(verified.entries.values(), key=lambda entry: entry.name.casefold())
     if normalized:
@@ -420,9 +449,9 @@ def render_catalog_search(
 def catalog_entry_for_name(
     name: str,
     *,
-    catalog_path: Path | None = None,
+    catalog: Path | str | None = None,
 ) -> CatalogEntry:
-    _, entries = search_catalog_plugins(name, catalog_path=catalog_path)
+    _, entries = search_catalog_plugins(name, catalog=catalog)
     matches = [entry for entry in entries if entry.name.casefold() == name.casefold()]
     if len(matches) != 1:
         raise PluginLifecycleError(f"unknown catalog plugin: {name}")
@@ -440,7 +469,7 @@ def manage_local_plugin(
     replace: bool = False,
     confirmed: bool = False,
     git_ref: str | None = None,
-    catalog_path: Path | None = None,
+    catalog: Path | str | None = None,
 ) -> dict[str, Any]:
     if action == "install":
         state = load_extension_state()
@@ -451,8 +480,8 @@ def manage_local_plugin(
 
         if target.startswith(("https://", "http://")):
             expected = None
-            if catalog_path is not None or default_catalog_path() is not None:
-                verified_catalog = _verified_catalog(catalog_path)
+            if catalog is not None or default_catalog_path() is not None:
+                verified_catalog = _verified_catalog(catalog)
                 expected = verified_catalog.entries.get(target)
             installed = install_git_plugin(
                 target,
@@ -468,7 +497,7 @@ def manage_local_plugin(
                 Path(target).expanduser(), replace=replace, validator=validate_install
             )
         else:
-            expected = catalog_entry_for_name(target, catalog_path=catalog_path)
+            expected = catalog_entry_for_name(target, catalog=catalog)
             installed = install_git_plugin(
                 expected.source,
                 ref=expected.ref,
