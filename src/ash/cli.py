@@ -1420,14 +1420,20 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 continue
             if command.name == "mcp":
                 action = arguments[0] if arguments else "status"
-                if len(arguments) > 1 or action not in {
-                    "status",
-                    "refresh",
-                    "tools",
-                    "resources",
-                    "prompts",
-                    "tasks",
-                }:
+                if (
+                    (action == "cancel" and len(arguments) != 3)
+                    or (action != "cancel" and len(arguments) > 1)
+                    or action
+                    not in {
+                        "status",
+                        "refresh",
+                        "tools",
+                        "resources",
+                        "prompts",
+                        "tasks",
+                        "cancel",
+                    }
+                ):
                     print(f"Usage: {command.usage}", file=sys.stderr)
                     continue
                 runtime = loop._mcp_runtime
@@ -1473,6 +1479,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             f"{task['server']}: {task['taskId']} "
                             f"{task['status']}{suffix}"
                         )
+                elif action == "cancel":
+                    task = await runtime.cancel_task(arguments[1], arguments[2])
+                    message = task.get("statusMessage")
+                    suffix = f": {message}" if message else ""
+                    print(
+                        f"{task['server']}: {task['taskId']} {task['status']}{suffix}"
+                    )
                 else:
                     items = (
                         await runtime.list_resources()

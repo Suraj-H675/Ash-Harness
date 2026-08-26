@@ -1241,6 +1241,16 @@ class MCPRuntime:
             output.extend({"server": server_name, **task} for task in tasks)
         return output
 
+    async def cancel_task(self, server: str, task_id: str) -> dict[str, Any]:
+        if server not in self.clients:
+            raise ValueError(f"unknown MCP server: {server}")
+        try:
+            task = await self.clients[server].cancel_mcp_task(task_id)
+        except Exception as exc:  # noqa: BLE001
+            self.errors[f"{server}:cancel_mcp_task"] = str(exc)
+            raise
+        return {"server": server, **task}
+
     async def _list_capability(self, method: str) -> list[dict[str, Any]]:
         return await self.list_capability(method)
 

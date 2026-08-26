@@ -155,7 +155,7 @@ class MCPClient:
             capabilities["sampling"] = sampling
         if self.elicitation_handler is not None and self.elicitation_modes:
             capabilities["elicitation"] = {mode: {} for mode in self.elicitation_modes}
-        capabilities["tasks"] = {"list": {}}
+        capabilities["tasks"] = {"cancel": {}, "list": {}}
         return capabilities
 
     def supports_server_capability(self, name: str) -> bool:
@@ -966,6 +966,26 @@ class MCPClient:
         except (MCPProtocolError, httpx.HTTPError, OSError):
             return
 
+    async def cancel_mcp_task(self, task_id: str) -> dict[str, Any]:
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("MCP taskId is required")
+        if not self._supports_tasks_cancel():
+            raise MCPProtocolError(
+                "MCP server does not advertise support for tasks/cancel"
+            )
+        result = self._validate_task_result(
+            await self.request(
+                "tasks/cancel",
+                {"taskId": task_id},
+                _allow_session_recovery=False,
+            ),
+            method="tasks/cancel",
+        )
+        cancelled = result["task"]
+        if cancelled["taskId"] != task_id:
+            raise MCPProtocolError("MCP tasks/cancel returned another taskId")
+        return cancelled
+
     async def list_mcp_tasks(self) -> list[dict[str, Any]]:
         if not self._supports_tasks_list():
             raise MCPProtocolError(
@@ -1005,6 +1025,12 @@ class MCPClient:
     def _supports_tasks_list(self) -> bool:
         capability = self.server_capabilities.get("tasks")
         return isinstance(capability, dict) and isinstance(capability.get("list"), dict)
+
+    def _supports_tasks_cancel(self) -> bool:
+        capability = self.server_capabilities.get("tasks")
+        return isinstance(capability, dict) and isinstance(
+            capability.get("cancel"), dict
+        )
 
     def _resolve_task_status_notification(self, params: Any) -> None:
         task_id = params.get("taskId") if isinstance(params, dict) else None

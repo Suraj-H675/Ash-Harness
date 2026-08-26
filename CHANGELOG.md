@@ -13,6 +13,9 @@ All notable changes to Ash are documented here. The format follows
 - Exposed `/mcp tasks` to aggregate live task state across connected servers,
   showing IDs, status, optional status messages, and per-server lookup errors
   without interrupting healthy servers.
+- Added `/mcp cancel SERVER TASK_ID`, backed by capability-gated MCP
+  `tasks/cancel`, strict task validation, server identity binding, and explicit
+  cancelled-state reporting.
 - Added authenticated remote JSON-RPC 2.0 at `/rpc` on the existing HTTP
   server, reusing the validated SDK methods with bearer auth, rate limiting,
   strict JSON parsing, bounded payloads, bounded concurrent batches, standard

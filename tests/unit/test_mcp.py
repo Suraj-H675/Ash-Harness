@@ -1089,7 +1089,11 @@ def _task_client(
     )
     client.protocol_version = "2025-11-25"
     client.server_capabilities = {
-        "tasks": {"list": {}, "requests": {"tools": {"call": {}}}}
+        "tasks": {
+            "cancel": {},
+            "list": {},
+            "requests": {"tools": {"call": {}}},
+        }
     }
     request = AsyncMock(side_effect=responses)
     client.request = request  # type: ignore[method-assign]
@@ -1365,6 +1369,68 @@ async def test_mcp_list_tasks_requires_capability_and_fails_closed() -> None:
         await client.list_mcp_tasks()
 
     request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mcp_cancel_task_validates_response_and_capability() -> None:
+    client, request = _task_client(
+        [
+            {"task": {}},
+            {"task": {}},
+        ]
+    )
+    cancelled = {
+        "taskId": "stop",
+        "status": "cancelled",
+        "createdAt": "2025-11-25T10:00:00Z",
+        "lastUpdatedAt": "2025-11-25T10:01:00Z",
+        "ttl": None,
+        "statusMessage": "stopped by user",
+    }
+    request.side_effect = [
+        {"task": cancelled},
+        {"task": {**cancelled, "taskId": "different"}},
+    ]
+    task = await client.cancel_mcp_task("stop")
+
+    assert task == cancelled
+    assert request.await_args.args == ("tasks/cancel", {"taskId": "stop"})
+
+    with pytest.raises(MCPProtocolError, match="another taskId"):
+        await client.cancel_mcp_task("stop")
+
+    del client.server_capabilities["tasks"]["cancel"]
+    request.reset_mock()
+    with pytest.raises(MCPProtocolError, match="tasks/cancel"):
+        await client.cancel_mcp_task("stop")
+    request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runtime_cancel_task_binds_server_and_records_errors(
+    tmp_path: Path,
+) -> None:
+    class RuntimeClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def cancel_mcp_task(self, task_id):
+            self.calls.append(task_id)
+            return {"taskId": task_id, "status": "cancelled"}
+
+    config = MCPServerConfig(name="unused", command="unused", args=[], env={})
+    runtime = MCPRuntime({"fake": config}, SafetyGuard(tmp_path))
+    client = RuntimeClient()
+    runtime.clients["fake"] = client
+
+    task = await runtime.cancel_task("fake", "stop")
+
+    assert task == {"server": "fake", "taskId": "stop", "status": "cancelled"}
+    assert client.calls == ["stop"]
+    assert not runtime.errors
+
+    with pytest.raises(ValueError, match="unknown MCP server"):
+        await runtime.cancel_task("missing", "stop")
 
 
 @pytest.mark.asyncio
