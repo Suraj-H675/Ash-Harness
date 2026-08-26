@@ -2040,6 +2040,7 @@ def main(argv: list[str] | None = None) -> int:
             "agents",
             "plugins",
             "hooks",
+            "search",
             "install",
             "enable",
             "disable",
@@ -2049,6 +2050,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     extensions_parser.add_argument("extensions_target", nargs="?")
     extensions_parser.add_argument("--ref")
+    extensions_parser.add_argument("--catalog", type=Path)
     extensions_parser.add_argument("--replace", action="store_true")
     extensions_parser.add_argument("--yes", action="store_true")
     extensions_parser.add_argument("--json", action="store_true")
@@ -3172,6 +3174,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "extensions":
         from ash.commands.extensions import (
+            render_catalog_search,
+            search_catalog_plugins,
             discover_extensions,
             manage_local_plugin,
             render_extension_inventory,
@@ -3180,8 +3184,8 @@ def main(argv: list[str] | None = None) -> int:
         from ash.plugins.lifecycle import PluginLifecycleError
 
         action = args.extensions_action
-        if action in {"install", "enable", "disable", "uninstall"}:
-            if not args.extensions_target:
+        if action in {"search", "install", "enable", "disable", "uninstall"}:
+            if not args.extensions_target and action != "search":
                 print(
                     f"Error: `ash extensions {action}` requires a target",
                     file=sys.stderr,
@@ -3190,28 +3194,51 @@ def main(argv: list[str] | None = None) -> int:
             if args.replace and action != "install":
                 print("Error: --replace is only valid with install", file=sys.stderr)
                 return 2
-            if args.ref and action != "install":
-                print("Error: --ref is only valid with install", file=sys.stderr)
+            if args.catalog and action not in {"search", "install"}:
+                print(
+                    "Error: --catalog is only valid with search or install",
+                    file=sys.stderr,
+                )
                 return 2
             if args.yes and action != "uninstall":
                 print("Error: --yes is only valid with uninstall", file=sys.stderr)
                 return 2
             try:
-                result = manage_local_plugin(
-                    action,
-                    args.extensions_target,
-                    replace=args.replace,
-                    confirmed=args.yes,
-                    git_ref=args.ref,
-                )
+                if action == "search":
+                    sequence, entries = search_catalog_plugins(
+                        args.extensions_target or "",
+                        catalog_path=args.catalog,
+                    )
+                    print(
+                        render_catalog_search(
+                            sequence,
+                            entries,
+                            json_output=args.json,
+                        )
+                    )
+                else:
+                    result = manage_local_plugin(
+                        action,
+                        args.extensions_target,
+                        replace=args.replace,
+                        confirmed=args.yes,
+                        git_ref=args.ref,
+                        catalog_path=args.catalog,
+                    )
+                    print(render_plugin_action(result, json_output=args.json))
             except (OSError, PluginLifecycleError) as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 return 2
-            print(render_plugin_action(result, json_output=args.json))
         else:
-            if args.extensions_target or args.replace or args.yes:
+            if (
+                args.extensions_target
+                or args.replace
+                or args.yes
+                or args.ref
+                or args.catalog
+            ):
                 print(
-                    "Error: inventory actions do not accept a target, --replace, or --yes",
+                    "Error: inventory actions do not accept lifecycle arguments",
                     file=sys.stderr,
                 )
                 return 2

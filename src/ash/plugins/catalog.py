@@ -23,8 +23,8 @@ MAX_CATALOG_ENTRIES = 1_000
 SIGNATURE_ALGORITHM = "ed25519"
 _KEY_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 _PLUGIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-_SOURCE = re.compile(r"^(https|file)://[^\s/$.?#].[^\s]*$")
-_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE = re.compile(r"^(https|file)://\S+$")
+_DIGEST = re.compile(r"^[0-9a-f]{40,64}$")
 
 
 class PluginCatalogError(ValueError):
@@ -32,7 +32,12 @@ class PluginCatalogError(ValueError):
 
 
 def trusted_catalog_keys_path() -> Path:
-    return Path.home() / ".ash" / "catalog-keys.json"
+    configured = os.environ.get("ASH_CATALOG_KEYS")
+    return (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".ash" / "catalog-keys.json"
+    )
 
 
 def default_catalog_path() -> Path | None:

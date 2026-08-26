@@ -234,7 +234,9 @@ def install_git_plugin(
     expected: CatalogEntry | None = None,
 ) -> InstalledPlugin:
     parsed = urllib.parse.urlsplit(source)
-    if expected is None and (parsed.scheme.lower() != "https" or not parsed.hostname):
+    if expected is None and (
+        parsed.scheme.lower() not in {"https", "file"} or not parsed.hostname
+    ):
         raise PluginLifecycleError("plugin Git source must use an HTTPS URL")
     if not ref:
         raise PluginLifecycleError("plugin Git source requires an explicit --ref")

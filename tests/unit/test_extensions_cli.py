@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import subprocess
+import base64
+import os
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ash.cli import main
 from ash.commands.extensions import discover_extensions, render_extension_inventory
+from ash.plugins.catalog import sign_catalog
 from ash.safety.trust import set_workspace_trusted
 
 
@@ -431,6 +435,136 @@ def test_extensions_enforces_enabled_plugin_dependencies(
 def test_extensions_cli_rejects_irrelevant_arguments(arguments, capsys) -> None:
     assert main(arguments) == 2
     assert "Error:" in capsys.readouterr().err
+
+
+def _write_signed_catalog(
+    root: Path,
+    *,
+    source: str,
+    digest: str,
+) -> Path:
+    private_key = Ed25519PrivateKey.generate()
+    encoded_private = (
+        base64.urlsafe_b64encode(private_key.private_bytes_raw()).rstrip(b"=").decode()
+    )
+    public_key = private_key.public_key().public_bytes_raw()
+    (root / "keys.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "keys": [
+                    {
+                        "keyId": "test-key",
+                        "algorithm": "ed25519",
+                        "publicKey": base64.urlsafe_b64encode(public_key)
+                        .rstrip(b"=")
+                        .decode(),
+                    }
+                ],
+            }
+        )
+    )
+    catalog_payload = {
+        "version": 1,
+        "sequence": 1,
+        "entries": [
+            {
+                "name": "demo",
+                "version": "1.2.3",
+                "source": source,
+                "ref": "v1.2.3",
+                "digest": digest,
+            }
+        ],
+    }
+    catalog_path = root / "catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "catalog": catalog_payload,
+                "keyId": "test-key",
+                "algorithm": "ed25519",
+                "signature": sign_catalog(catalog_payload, encoded_private),
+            }
+        )
+    )
+    return catalog_path
+
+
+def test_extensions_catalog_search_and_name_install_are_pinned(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    repository = tmp_path / "repository"
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    (plugin_root / "plugin.json").write_text(
+        json.dumps({"name": "demo", "version": "1.2.3", "description": "Demo"})
+    )
+    git_env = {
+        "GIT_AUTHOR_NAME": "Ash",
+        "GIT_AUTHOR_EMAIL": "ash@example.invalid",
+        "HOME": os.environ["HOME"],
+        "GIT_COMMITTER_NAME": "Ash",
+        "GIT_COMMITTER_EMAIL": "ash@example.invalid",
+        "PATH": os.environ["PATH"],
+    }
+    for arguments in (("init", "-q"), ("add", "."), ("commit", "-m", "demo")):
+        subprocess.run(
+            ["git", "-C", str(plugin_root), *arguments], check=True, env=git_env
+        )
+    digest = subprocess.run(
+        ["git", "-C", str(plugin_root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "-C", str(plugin_root), "tag", "v1.2.3"], check=True)
+    subprocess.run(
+        ["git", "clone", "-q", str(plugin_root), str(repository)], check=True
+    )
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    catalog_path = _write_signed_catalog(
+        tmp_path, source=repository.as_uri(), digest=digest
+    )
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(tmp_path / "keys.json"))
+
+    assert (
+        main(["extensions", "search", "", "--catalog", str(catalog_path), "--json"])
+        == 0
+    )
+    search = json.loads(capsys.readouterr().out)
+    assert search["sequence"] == 1
+    assert search["plugins"][0]["name"] == "demo"
+
+    assert (
+        main(
+            [
+                "extensions",
+                "install",
+                "demo",
+                "--catalog",
+                str(catalog_path),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    installed = json.loads(capsys.readouterr().out)
+    assert installed["name"] == "demo"
+    assert installed["enabled"] is True
+    assert Path(installed["root"]).is_relative_to(home / ".ash" / "plugins")
+
+
+def test_extensions_catalog_requires_configuration(capsys) -> None:
+    assert main(["extensions", "search"]) == 2
+    assert "plugin catalog is not configured" in capsys.readouterr().err
 
 
 def test_extensions_inventory_validates_enabled_plugin_hooks(

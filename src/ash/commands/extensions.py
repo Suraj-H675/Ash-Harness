@@ -16,6 +16,7 @@ from ash.hooks.config import (
     load_command_hooks,
 )
 from ash.plugins.catalog import (
+    CatalogEntry,
     default_catalog_path,
     parse_and_verify_catalog,
     trusted_catalog_keys_path,
@@ -37,6 +38,18 @@ from ash.safety.trust import canonical_workspace, is_workspace_trusted
 
 ExtensionKind = Literal["all", "skills", "agents", "plugins", "hooks"]
 PluginAction = Literal["install", "enable", "disable", "uninstall"]
+ExtensionAction = Literal[
+    "all",
+    "skills",
+    "agents",
+    "plugins",
+    "hooks",
+    "search",
+    "install",
+    "enable",
+    "disable",
+    "uninstall",
+]
 
 
 @dataclass(frozen=True)
@@ -333,6 +346,93 @@ def render_extension_inventory(
     return "\n".join(lines)
 
 
+def _verified_catalog(catalog_path: Path | None = None):
+    catalog_file = catalog_path or default_catalog_path()
+    if catalog_file is None:
+        raise PluginLifecycleError(
+            "plugin catalog is not configured; pass --catalog or set ASH_PLUGIN_CATALOG"
+        )
+    try:
+        return parse_and_verify_catalog(
+            catalog_file,
+            trusted_keys_path=trusted_catalog_keys_path(),
+        )
+    except ValueError as exc:
+        raise PluginLifecycleError(str(exc)) from exc
+
+
+def search_catalog_plugins(
+    query: str = "",
+    *,
+    catalog_path: Path | None = None,
+) -> tuple[int, tuple[CatalogEntry, ...]]:
+    verified = _verified_catalog(catalog_path)
+    normalized = query.strip().casefold()
+    entries = sorted(verified.entries.values(), key=lambda entry: entry.name.casefold())
+    if normalized:
+        entries = [
+            entry
+            for entry in entries
+            if normalized
+            in " ".join(
+                (
+                    entry.name,
+                    entry.version,
+                    entry.source,
+                    entry.ref,
+                )
+            ).casefold()
+        ]
+    return verified.sequence, tuple(entries)
+
+
+def render_catalog_search(
+    sequence: int,
+    entries: tuple[CatalogEntry, ...],
+    *,
+    json_output: bool = False,
+) -> str:
+    payload = {
+        "sequence": sequence,
+        "plugins": [
+            {
+                "name": entry.name,
+                "version": entry.version,
+                "source": entry.source,
+                "ref": entry.ref,
+                "digest": entry.digest,
+            }
+            for entry in entries
+        ],
+    }
+    if json_output:
+        return json.dumps(payload, sort_keys=True)
+    lines = [f"Catalog sequence: {sequence}", "Plugins:"]
+    lines.extend(
+        f"  {entry.name} {entry.version} [{entry.source}@{entry.ref}]"
+        for entry in entries
+    )
+    if not entries:
+        lines.append("  (none)")
+    return "\n".join(lines)
+
+
+def catalog_entry_for_name(
+    name: str,
+    *,
+    catalog_path: Path | None = None,
+) -> CatalogEntry:
+    _, entries = search_catalog_plugins(name, catalog_path=catalog_path)
+    matches = [entry for entry in entries if entry.name.casefold() == name.casefold()]
+    if len(matches) != 1:
+        raise PluginLifecycleError(f"unknown catalog plugin: {name}")
+    if not matches[0].source.lower().startswith(("https://", "file://")):
+        raise PluginLifecycleError(
+            f"catalog plugin {name!r} does not use an HTTPS Git source"
+        )
+    return matches[0]
+
+
 def manage_local_plugin(
     action: PluginAction,
     target: str,
@@ -351,12 +451,8 @@ def manage_local_plugin(
 
         if target.startswith(("https://", "http://")):
             expected = None
-            catalog_file = catalog_path or default_catalog_path()
-            if catalog_file is not None:
-                verified_catalog = parse_and_verify_catalog(
-                    catalog_file,
-                    trusted_keys_path=trusted_catalog_keys_path(),
-                )
+            if catalog_path is not None or default_catalog_path() is not None:
+                verified_catalog = _verified_catalog(catalog_path)
                 expected = verified_catalog.entries.get(target)
             installed = install_git_plugin(
                 target,
@@ -365,9 +461,20 @@ def manage_local_plugin(
                 validator=validate_install,
                 expected=expected,
             )
-        else:
+        elif git_ref is not None:
+            raise PluginLifecycleError("--ref cannot override a catalog-pinned ref")
+        elif Path(target).is_dir() or target.startswith((".", "/", "~")):
             installed = install_local_plugin(
-                Path(target), replace=replace, validator=validate_install
+                Path(target).expanduser(), replace=replace, validator=validate_install
+            )
+        else:
+            expected = catalog_entry_for_name(target, catalog_path=catalog_path)
+            installed = install_git_plugin(
+                expected.source,
+                ref=expected.ref,
+                replace=replace,
+                validator=validate_install,
+                expected=expected,
             )
         set_plugin_enabled(installed.name, enabled=True)
         return {
