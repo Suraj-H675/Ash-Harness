@@ -122,6 +122,27 @@ def test_domain_matcher_accepts_urls_and_hostnames_only() -> None:
             ArgumentMatcher("url", MatchOperator.DOMAIN, invalid)
 
 
+def test_suffix_matcher_is_safe_case_insensitive_extension_matching() -> None:
+    matcher = ArgumentMatcher("file_path", MatchOperator.SUFFIX, ".MD")
+
+    assert matcher.value == ".md"
+    assert matcher.matches({"file_path": "docs/readme.md"}) is True
+    assert matcher.matches({"file_path": "/tmp/notes.MD"}) is True
+    assert matcher.matches({"file_path": "./archive/report.Markdown"}) is False
+    assert matcher.matches({"file_path": "archive.md/secret"}) is False
+    assert matcher.matches({"file_path": "plain"}) is False
+    assert matcher.matches({"command_line": "cat notes.md"}) is False
+
+    with pytest.raises(PermissionGrantError, match="one POSIX filename extension"):
+        ArgumentMatcher("file_path", MatchOperator.SUFFIX, "md")
+    with pytest.raises(PermissionGrantError, match="one POSIX filename extension"):
+        ArgumentMatcher("file_path", MatchOperator.SUFFIX, ".tar.gz")
+    with pytest.raises(PermissionGrantError, match="one POSIX filename extension"):
+        ArgumentMatcher("file_path", MatchOperator.SUFFIX, "../md")
+    with pytest.raises(PermissionGrantError, match="path-like string arguments"):
+        ArgumentMatcher("content", MatchOperator.SUFFIX, ".md")
+
+
 def test_permission_rule_file_refuses_corruption_and_future_versions(
     tmp_path, monkeypatch
 ) -> None:

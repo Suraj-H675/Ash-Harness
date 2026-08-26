@@ -51,10 +51,21 @@ class MatchOperator(StrEnum):
     PREFIX = "prefix"
     COMMAND_PREFIX = "command_prefix"
     PATH_PREFIX = "path_prefix"
+    SUFFIX = "suffix"
     DOMAIN = "domain"
 
 
 _PATH_ARGUMENTS = frozenset({"file_path", "path", "cwd", "directory_path"})
+_SUFFIX_ARGUMENTS = frozenset(
+    {
+        "file_path",
+        "path",
+        "directory_path",
+        "target_path",
+        "source_path",
+        "destination_path",
+    }
+)
 _DOMAIN_ARGUMENTS = frozenset({"url", "domain"})
 
 
@@ -222,6 +233,24 @@ class ArgumentMatcher:
                     "path_prefix must be a relative workspace path without traversal"
                 )
             object.__setattr__(self, "value", normalized + "/")
+        if self.operator == MatchOperator.SUFFIX:
+            if self.argument not in _SUFFIX_ARGUMENTS:
+                raise PermissionGrantError(
+                    "suffix can only match path-like string arguments"
+                )
+            suffix = self._validated_text("suffix")
+            if (
+                "\\" in suffix
+                or "\x00" in suffix
+                or "/" in suffix
+                or not suffix.startswith(".")
+                or "." in suffix[1:]
+                or not suffix[1:]
+            ):
+                raise PermissionGrantError(
+                    "suffix must be one POSIX filename extension, such as '.md'"
+                )
+            object.__setattr__(self, "value", suffix.casefold())
         if self.operator == MatchOperator.DOMAIN:
             if self.argument not in _DOMAIN_ARGUMENTS:
                 allowed = ", ".join(sorted(_DOMAIN_ARGUMENTS))
@@ -267,6 +296,9 @@ class ArgumentMatcher:
             return False
         if self.operator == MatchOperator.PATH_PREFIX:
             return _lexical_path_prefix_matches(candidate, str(self.value))
+        if self.operator == MatchOperator.SUFFIX:
+            basename = candidate.replace("\\", "/").rstrip("/").split("/")[-1]
+            return bool(basename) and basename.casefold().endswith(str(self.value))
         if self.operator == MatchOperator.DOMAIN:
             hostname = _hostname_from_candidate(candidate)
             expected_domain = str(self.value)
