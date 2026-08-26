@@ -4,6 +4,7 @@ import shlex
 import sys
 
 import pytest
+from unittest.mock import patch
 from datetime import datetime, timezone
 from ash.core.loop import AshLoop
 from ash.tools.base import (
@@ -1368,9 +1369,7 @@ async def test_context_budget_report_enforces_sections(tmp_path):
     assert budget.slices["repo_map"].truncated is True
     assert budget.slices["memory"].truncated is True
     assert "context section truncated" in messages[0]["content"]
-    fragment = next(
-        item for item in budget.fragments if item.kind.value == "history"
-    )
+    fragment = next(item for item in budget.fragments if item.kind.value == "history")
     assert dict(fragment.metadata)["untrusted_content_policy"] == (
         "data_not_instructions"
     )
@@ -1449,6 +1448,41 @@ async def test_extended_lifecycle_observers_fire_at_runtime_boundaries(tmp_path)
     assert observed[0]["session_id"] == session.session_id
     assert observed[1]["changes"]["model"] == "ollama/test"
     assert observed[2]["persistent_rule_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_switch_model_closes_previous_provider(tmp_path):
+    closed = []
+
+    class ClosableProvider(MockProvider):
+        async def aclose(self):
+            closed.append(True)
+            await super().aclose()
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "model-switch.db"),
+        ClosableProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="ollama/test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+        ),
+    )
+    await loop.start_session()
+    old_provider = loop.provider
+
+    with patch("ash.cli._build_provider") as build_provider:
+        build_provider.return_value = MockProvider()
+        loop.switch_model("next")
+
+    assert loop.provider is not old_provider
+    await asyncio.sleep(0)
+    assert closed == [True]
+    await loop.aclose()
 
 
 @pytest.mark.asyncio

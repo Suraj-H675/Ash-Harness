@@ -3154,6 +3154,9 @@ class AshLoop:
         Otherwise, prepend the current provider."""
         from ash.cli import _build_provider  # lazy import to avoid circular
 
+        async def _close_old_provider(provider: ProviderABC) -> None:
+            await provider.aclose()
+
         if self._config is None:
             raise RuntimeError("AshLoop was not constructed with a config object")
 
@@ -3166,9 +3169,12 @@ class AshLoop:
             new_config = self._config.model_copy(
                 update={"model": f"{current_provider}/{model}"}
             )
+        old_provider = self.provider
         self.provider = _build_provider(new_config)
         self._config = new_config
         self._fire_config_changed("switch_model", {"model": self._config.model})
+        if isinstance(old_provider, ProviderABC):
+            asyncio.create_task(_close_old_provider(old_provider))
 
     def _fire_config_changed(self, reason: str, changes: dict[str, Any]) -> None:
         if not changes:
