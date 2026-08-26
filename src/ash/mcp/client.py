@@ -916,6 +916,28 @@ class MCPClient:
                     self._task_waiters[task_id] = waiter
                     continue
 
+                if status == "input_required":
+                    await self.request(
+                        "tasks/result",
+                        {"taskId": task_id},
+                        _allow_session_recovery=False,
+                    )
+                    state = self._validate_task_result(
+                        await self.request(
+                            "tasks/get",
+                            {"taskId": task_id},
+                            _allow_session_recovery=False,
+                        ),
+                        method="tasks/get",
+                    )
+                    task = state["task"]
+                    if task["taskId"] != task_id:
+                        raise MCPProtocolError(
+                            "MCP tasks/get returned another taskId"
+                        )
+                    status = task["status"]
+                    continue
+
                 state = self._validate_task_result(
                     await self.request(
                         "tasks/get",

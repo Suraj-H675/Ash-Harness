@@ -1295,6 +1295,53 @@ async def test_mcp_task_status_notification_can_update_before_terminal() -> None
 
 
 @pytest.mark.asyncio
+async def test_mcp_input_required_opens_result_then_resumes_polling() -> None:
+    client, request = _task_client([])
+    states = iter(["working", "input_required", "working", "completed"])
+    result_calls = 0
+
+    def task_state():
+        status = next(states)
+        return {
+            "taskId": "input",
+            "status": status,
+            "createdAt": "2025-11-25T10:00:00Z",
+            "lastUpdatedAt": "2025-11-25T10:01:00Z",
+            "ttl": None,
+            "pollInterval": 0,
+        }
+
+    async def respond(method, params, **_):
+        nonlocal result_calls
+        del params
+        if method == "tools/call":
+            return {"task": task_state()}
+        if method == "tasks/get":
+            return {"task": task_state()}
+        if method == "tasks/result":
+            result_calls += 1
+            if result_calls < 2:
+                return {"value": {}}
+            return {"content": [{"type": "text", "text": "answered"}]}
+        raise AssertionError(f"unexpected MCP method {method}")
+
+    request.side_effect = respond
+
+    result = await client.call_tool("long", {}, as_task=True)
+
+    assert result["content"][0]["text"] == "answered"
+    assert [sent.args[0] for sent in request.await_args_list] == [
+        "tools/call",
+        "tasks/get",
+        "tasks/result",
+        "tasks/get",
+        "tasks/get",
+        "tasks/result",
+    ]
+    assert request.await_args_list[3].args[1] == {"taskId": "input"}
+
+
+@pytest.mark.asyncio
 async def test_mcp_task_timeout_cancels_remote_task() -> None:
     client, request = _task_client([], timeout=0.01)
     responses = iter(

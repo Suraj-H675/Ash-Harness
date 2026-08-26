@@ -16,6 +16,9 @@ All notable changes to Ash are documented here. The format follows
 - Added `/mcp cancel SERVER TASK_ID`, backed by capability-gated MCP
   `tasks/cancel`, strict task validation, server identity binding, and explicit
   cancelled-state reporting.
+- MCP required-task waiting now proactively opens `tasks/result` when a task is
+  `input_required`, then resumes validated polling so server-initiated input
+  flows can proceed while preserving timeout, cancellation, and fallback rules.
 - Added authenticated remote JSON-RPC 2.0 at `/rpc` on the existing HTTP
   server, reusing the validated SDK methods with bearer auth, rate limiting,
   strict JSON parsing, bounded payloads, bounded concurrent batches, standard
