@@ -5,6 +5,7 @@ from ash.core.loop import AshLoop
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.guard import SafetyGuard
+from ash.ui.headless import HeadlessUI
 
 from ash.context.compaction import Chunk
 from ash.memory import (
@@ -81,5 +82,51 @@ async def test_project_memory_auto_index_is_bounded_and_respects_excludes(
         assert all(hit.file_path != "excluded.py" for hit in hits)
         hits = await loop.semantic_search("alpha")
         assert any(hit.file_path.endswith("included.py") for hit in hits)
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_large_repository_memory_indexing_is_bounded(tmp_path) -> None:
+    file_count = 120
+    for index in range(file_count + 50):
+        directory = tmp_path / "packages" / f"pkg-{index % 25}"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"module-{index}.py").write_text(
+            f"def function_{index}():\n    return {index}\n" * 20,
+            encoding="utf-8",
+        )
+
+    config = AshConfig(
+        model="openai/memory-test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="fts5",
+        chroma_persist_dir=tmp_path / "memory",
+    )
+    loop = AshLoop(
+        session_store=SessionStore(config.db_directory / "sessions.db"),
+        provider=MemoryTestProvider(),
+        ui=HeadlessUI(output_format="text"),
+        safety_guard=SafetyGuard(project_root=tmp_path),
+        project_root=tmp_path,
+        config=config,
+        enable_semantic_memory=True,
+        memory_backend="fts5",
+        chroma_persist_dir=tmp_path / "memory",
+    )
+    try:
+        indexed = await loop.index_project_memory(
+            max_files=100,
+            max_bytes_per_file=4_096,
+        )
+        assert indexed == 100
+
+        hits = await loop.semantic_search("function_99")
+        assert hits
+        assert all(hit.file_path.endswith("module-99.py") for hit in hits)
+
+        hits = await loop.semantic_search("function_299")
+        assert not any(hit.file_path.endswith("module-299.py") for hit in hits)
     finally:
         await loop.aclose()
