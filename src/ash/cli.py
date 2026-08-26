@@ -1451,7 +1451,12 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 action = arguments[0] if arguments else "status"
                 if (
                     (action == "cancel" and len(arguments) != 3)
-                    or (action != "cancel" and len(arguments) > 1)
+                    or (
+                        action != "cancel"
+                        and action != "refresh"
+                        and len(arguments) > 1
+                    )
+                    or (action == "refresh" and len(arguments) > 2)
                     or action
                     not in {
                         "status",
@@ -1518,19 +1523,39 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         print(f"{name}: {error}", file=sys.stderr)
                     continue
                 if action == "refresh":
-                    await reload_plugin_components()
-                    refreshed_runtime = loop._mcp_runtime
-                    print("MCP configuration reloaded.")
-                    if refreshed_runtime is None:
+                    errors: dict[str, str] = {}
+                    refresh_target: str | None = (
+                        arguments[1] if len(arguments) == 2 else None
+                    )
+                    try:
+                        if (
+                            refresh_target is not None
+                            and refresh_target not in loop._mcp_configs
+                        ):
+                            raise ValueError(f"unknown MCP server {refresh_target!r}")
+                        if refresh_target is not None:
+                            before = set(runtime.clients)
+                            errors = await loop.reconnect_mcp_server(refresh_target)
+                            refreshed_runtime = loop._mcp_runtime
+                            assert refreshed_runtime is not None
+                            state = (
+                                "connected"
+                                if refresh_target in refreshed_runtime.clients
+                                else "failed"
+                            )
+                            transition = (
+                                "recovered"
+                                if target not in before and state == "connected"
+                                else state
+                            )
+                            print(f"{refresh_target}: {transition}")
+                        else:
+                            await reload_plugin_components()
+                            print("MCP configuration reloaded.")
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        print(f"Error: {exc}", file=sys.stderr)
                         continue
-                    for name in loop._mcp_configs:
-                        state = (
-                            "connected"
-                            if name in refreshed_runtime.clients
-                            else "failed"
-                        )
-                        print(f"{name}: {state}")
-                    for name, error in sorted(refreshed_runtime.errors.items()):
+                    for name, error in sorted(errors.items()):
                         print(f"{name}: {error}", file=sys.stderr)
                     continue
                 elif action == "tools":

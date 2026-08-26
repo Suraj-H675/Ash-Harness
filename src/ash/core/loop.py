@@ -762,6 +762,78 @@ class AshLoop:
     async def reload_mcp_servers(
         self, configs: dict[str, MCPServerConfig]
     ) -> dict[str, str]:
+        return await self._reload_mcp_servers(configs)
+
+    async def reconnect_mcp_server(self, server_name: str) -> dict[str, str]:
+        """Reconnect one configured MCP server without touching others."""
+
+        if server_name not in self._mcp_configs:
+            raise ValueError(f"unknown MCP server: {server_name}")
+        async with self._mcp_reload_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("cannot reload MCP servers after loop shutdown")
+            runtime = self._mcp_runtime
+            if runtime is None:
+                return await self._publish_mcp_runtime(
+                    {server_name: self._mcp_configs[server_name]}
+                )
+
+            old_client = runtime.clients.pop(server_name, None)
+            old_tools: set[str] = self._mcp_tools_by_server.get(server_name, set())
+            for name in old_tools:
+                old_tool = self.tools.pop(name, None)
+                if old_tool is not None:
+                    self._started_tool_ids.discard(id(old_tool))
+            self._mcp_tool_names.difference_update(old_tools)
+            self._mcp_tools_by_server.pop(server_name, None)
+            runtime._server_tools.pop(server_name, None)
+            for key in tuple(runtime.errors):
+                if key == server_name or key.startswith(f"{server_name}:"):
+                    runtime.errors.pop(key, None)
+            try:
+                from ash.mcp.runtime import MCPRuntime
+
+                replacement = MCPRuntime(
+                    {server_name: self._mcp_configs[server_name]},
+                    self.safety_guard,
+                    event_sink=self._emit_event,
+                )
+                server_tools = await replacement.start()
+            except BaseException as exc:
+                runtime.errors[server_name] = str(exc)
+                raise
+            occupied = self.tools.keys() - self._mcp_tool_names
+            duplicates = occupied & server_tools.keys()
+            if duplicates:
+                await asyncio.shield(replacement.close())
+                raise ValueError(
+                    "MCP tool collides with an existing tool: "
+                    + ", ".join(sorted(duplicates))
+                )
+            try:
+                for tool in server_tools.values():
+                    tool.set_event_sink(self._emit_event)
+                    await tool.start()
+                    self._started_tool_ids.add(id(tool))
+            except BaseException:
+                await asyncio.shield(replacement.close())
+                raise
+            self.tools.update(server_tools)
+            self._mcp_tool_names.update(server_tools)
+            self._mcp_tools_by_server[server_name] = set(server_tools)
+            runtime.clients[server_name] = replacement.clients[server_name]
+            runtime._server_tools[server_name] = dict(
+                replacement.server_tools_snapshot()[server_name]
+            )
+            await replacement.close()
+            if old_client is not None:
+                await old_client.disconnect()
+            return {}
+
+    async def _reload_mcp_servers(
+        self,
+        configs: dict[str, MCPServerConfig],
+    ) -> dict[str, str]:
         async with self._mcp_reload_lock:
             if self._closing or self._closed:
                 raise RuntimeError("cannot reload MCP servers after loop shutdown")
@@ -847,7 +919,12 @@ class AshLoop:
         except BaseException:
             await asyncio.shield(runtime.close())
             raise
-        if configs and not runtime.clients and self._mcp_runtime is not None:
+        if (
+            configs
+            and not runtime.clients
+            and self._mcp_runtime is not None
+            and set(self._mcp_runtime.clients)
+        ):
             errors = dict(runtime.errors)
             await runtime.close()
             return errors
@@ -879,7 +956,8 @@ class AshLoop:
             server: set(server_tools)
             for server, server_tools in runtime.server_tools_snapshot().items()
         }
-        self._mcp_configs = dict(configs)
+        for name, config in configs.items():
+            self._mcp_configs[name] = config
         runtime.activate_notifications()
         self._prune_tool_search_activations()
         if old_runtime is not None:
