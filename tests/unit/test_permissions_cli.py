@@ -129,6 +129,91 @@ def test_permissions_cli_manages_scoped_rules_by_stable_id(
         == PolicyAction.ASK
     )
 
+
+def test_permissions_cli_persists_safe_suffix_rule_and_enforces_it(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert (
+        main(
+            [
+                "permissions",
+                "allow",
+                "read_file",
+                "--suffix",
+                "file_path=.MD",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    rules = load_permission_rules(workspace)
+    policy = PermissionPolicy("interactive", persistent_rules=rules)
+    assert (
+        policy.evaluate("read_file", {"file_path": "docs/README.md"}).action
+        == PolicyAction.ALLOW
+    )
+    assert (
+        policy.evaluate("read_file", {"file_path": "docs/secrets.env"}).action
+        == PolicyAction.ALLOW
+    )
+    assert (
+        rules[0].matches(
+            "read_file",
+            {"file_path": "docs/README.md"},
+        )
+        is True
+    )
+
+
+def test_permissions_cli_suffix_rule_is_rejected_for_non_path_argument(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert main(["permissions", "allow", "read_file", "--suffix", "content=.md"]) == 2
+
+
+def test_permissions_cli_deny_exact_rule_remains_managed(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert (
+        main(
+            [
+                "permissions",
+                "allow",
+                "run_command",
+                "--command-prefix",
+                "pytest",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    allow_rule = payload["rules"][0]
+
     assert (
         main(
             [
@@ -152,12 +237,7 @@ def test_permissions_cli_manages_scoped_rules_by_stable_id(
         policy.evaluate("write_file", {"file_path": ".env"}).action == PolicyAction.DENY
     )
 
-    assert (
-        main(
-            ["permissions", "remove", deny_rule["id"], "--json"],
-        )
-        == 0
-    )
+    assert main(["permissions", "remove", deny_rule["id"], "--json"]) == 0
     remaining = json.loads(capsys.readouterr().out)
     assert [rule["id"] for rule in remaining["rules"]] == [allow_rule["id"]]
 
@@ -219,6 +299,7 @@ def test_runtime_permission_mode_changes_are_audit_chained(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(workspace))
     monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
+
     async def fake_repl(loop, config, sandbox_manager, *, session_id):
         await loop.start_session()
         loop.permission_policy = PermissionPolicy(

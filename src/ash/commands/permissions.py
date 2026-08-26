@@ -121,6 +121,7 @@ def build_argument_matchers(
     exact: list[str] | None = None,
     prefix: list[str] | None = None,
     path_prefix: list[str] | None = None,
+    suffix: list[str] | None = None,
     domain: list[str] | None = None,
     command_prefix: list[str] | None = None,
 ) -> list[ArgumentMatcher]:
@@ -143,6 +144,9 @@ def build_argument_matchers(
         matchers.append(
             ArgumentMatcher(argument, MatchOperator.PATH_PREFIX, value)
         )
+    for raw in suffix or ():
+        argument, value = _split_assignment(raw, option="--suffix")
+        matchers.append(ArgumentMatcher(argument, MatchOperator.SUFFIX, value))
     for raw in domain or ():
         argument, value = _split_assignment(raw, option="--domain")
         matchers.append(ArgumentMatcher(argument, MatchOperator.DOMAIN, value))
@@ -165,6 +169,7 @@ def add_cli_permission_rule(
     exact: list[str] | None = None,
     prefix: list[str] | None = None,
     path_prefix: list[str] | None = None,
+    suffix: list[str] | None = None,
     domain: list[str] | None = None,
     command_prefix: list[str] | None = None,
 ) -> tuple[PermissionRule, list[PermissionRule]]:
@@ -177,6 +182,7 @@ def add_cli_permission_rule(
             exact=exact,
             prefix=prefix,
             path_prefix=path_prefix,
+            suffix=suffix,
             domain=domain,
             command_prefix=command_prefix,
         ),
