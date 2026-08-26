@@ -70,9 +70,7 @@ def render_permission_rules(
         scope = ""
         if rule["matches"]:
             scope = " " + " AND ".join(
-                _render_matcher(
-                    ArgumentMatcher.from_payload(matcher)
-                )
+                _render_matcher(ArgumentMatcher.from_payload(matcher))
                 for matcher in rule["matches"]
             )
         lines.append(
@@ -119,6 +117,7 @@ def _split_assignment(raw: str, *, option: str) -> tuple[str, str]:
 def build_argument_matchers(
     *,
     exact: list[str] | None = None,
+    contains: list[str] | None = None,
     prefix: list[str] | None = None,
     path_prefix: list[str] | None = None,
     suffix: list[str] | None = None,
@@ -136,14 +135,15 @@ def build_argument_matchers(
                 'quote string values, for example file_path="README.md"'
             ) from exc
         matchers.append(ArgumentMatcher(argument, MatchOperator.EXACT, parsed))
+    for raw in contains or ():
+        argument, value = _split_assignment(raw, option="--contains")
+        matchers.append(ArgumentMatcher(argument, MatchOperator.CONTAINS, value))
     for raw in prefix or ():
         argument, value = _split_assignment(raw, option="--prefix")
         matchers.append(ArgumentMatcher(argument, MatchOperator.PREFIX, value))
     for raw in path_prefix or ():
         argument, value = _split_assignment(raw, option="--path-prefix")
-        matchers.append(
-            ArgumentMatcher(argument, MatchOperator.PATH_PREFIX, value)
-        )
+        matchers.append(ArgumentMatcher(argument, MatchOperator.PATH_PREFIX, value))
     for raw in suffix or ():
         argument, value = _split_assignment(raw, option="--suffix")
         matchers.append(ArgumentMatcher(argument, MatchOperator.SUFFIX, value))
@@ -167,6 +167,7 @@ def add_cli_permission_rule(
     tool_name: str,
     *,
     exact: list[str] | None = None,
+    contains: list[str] | None = None,
     prefix: list[str] | None = None,
     path_prefix: list[str] | None = None,
     suffix: list[str] | None = None,
@@ -180,6 +181,7 @@ def add_cli_permission_rule(
         tool_name,
         build_argument_matchers(
             exact=exact,
+            contains=contains,
             prefix=prefix,
             path_prefix=path_prefix,
             suffix=suffix,

@@ -48,6 +48,7 @@ class RuleEffect(StrEnum):
 
 class MatchOperator(StrEnum):
     EXACT = "exact"
+    CONTAINS = "contains"
     PREFIX = "prefix"
     COMMAND_PREFIX = "command_prefix"
     PATH_PREFIX = "path_prefix"
@@ -189,6 +190,9 @@ class ArgumentMatcher:
             if _json_size(self.value) > MAX_EXACT_VALUE_BYTES:
                 raise PermissionGrantError("exact matcher value exceeds 8 KiB")
             return
+        if self.operator == MatchOperator.CONTAINS:
+            self._validated_text("contains")
+            return
         if self.operator == MatchOperator.PREFIX:
             if (
                 not isinstance(self.value, str)
@@ -290,6 +294,8 @@ class ArgumentMatcher:
         candidate = arguments[self.argument]
         if self.operator == MatchOperator.EXACT:
             return candidate == self.value
+        if self.operator == MatchOperator.CONTAINS:
+            return isinstance(candidate, str) and str(self.value) in candidate
         if self.operator == MatchOperator.PREFIX:
             return isinstance(candidate, str) and candidate.startswith(self.value)
         if not isinstance(candidate, str):

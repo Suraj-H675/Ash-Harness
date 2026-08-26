@@ -93,6 +93,7 @@ ash storage backup               # consistent timestamped backup
 ash storage restore BACKUP --yes # validated, non-destructive restore
 ash permissions status --json    # inspect effective project rules
 ash permissions deny write_file --exact 'file_path=".env"'
+ash permissions deny lsp --contains 'operation=workspace'
 ash permissions allow run_command --command-prefix pytest
 ash permissions status --json    # managed policy appears separately and cannot be overridden locally
 ash sandbox status --json        # inspect effective command isolation

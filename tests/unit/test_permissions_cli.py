@@ -187,6 +187,62 @@ def test_permissions_cli_suffix_rule_is_rejected_for_non_path_argument(
     assert main(["permissions", "allow", "read_file", "--suffix", "content=.md"]) == 2
 
 
+def test_permissions_cli_contains_rule_scopes_text_arguments(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert (
+        main(
+            [
+                "permissions",
+                "deny",
+                "lsp",
+                "--contains",
+                "operation=workspace",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    policy = PermissionPolicy(
+        "interactive",
+        persistent_rules=load_permission_rules(workspace),
+    )
+    assert (
+        policy.evaluate("lsp", {"operation": "workspaceSymbol"}).action
+        == PolicyAction.DENY
+    )
+    assert (
+        policy.evaluate("lsp", {"operation": "definition"}).action == PolicyAction.ALLOW
+    )
+
+
+def test_permissions_cli_contains_rejects_blank_and_oversized_values(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(workspace)
+
+    assert main(["permissions", "deny", "lsp", "--contains", "operation="]) == 2
+    assert "--contains requires ARGUMENT=VALUE" in capsys.readouterr().err
+
+    assert (
+        main(["permissions", "deny", "lsp", "--contains", "operation= ", "--json"]) == 2
+    )
+    assert "requires a non-empty string" in capsys.readouterr().err
+
+
 def test_permissions_cli_deny_exact_rule_remains_managed(
     tmp_path: Path,
     monkeypatch,
