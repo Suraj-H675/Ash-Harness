@@ -29,11 +29,14 @@ class OllamaProvider(ProviderABC):
         self._token_counter = token_counter or AnthropicTokenCounter()
         self._client = httpx.AsyncClient(timeout=60.0)
 
-    async def detect_capabilities(self) -> ProviderCapabilities:
+    async def detect_capabilities(
+        self, *, refresh: bool = False
+    ) -> ProviderCapabilities:
         """Probe model metadata once and map supported tool capabilities."""
 
-        if self._dynamic_capabilities is not None:
+        if self._dynamic_capabilities is not None and not refresh:
             return self._dynamic_capabilities
+        self._dynamic_capabilities = None
         try:
             response = await self._client.post(
                 f"{self._base_url}/api/show",

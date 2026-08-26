@@ -218,3 +218,36 @@ async def test_ollama_capability_probe_fails_closed_to_local_only():
 
     assert capabilities.native_tools is False
     assert capabilities.local is True
+
+
+@pytest.mark.asyncio
+async def test_ollama_capability_refresh_forces_new_probe():
+    class ChangingClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, *args, **kwargs):
+            self.calls += 1
+            import httpx
+
+            return httpx.Response(
+                200,
+                json={
+                    "details": {"families": ["tools"] if self.calls > 1 else []},
+                    "model_info": {"general.context_length": 8192},
+                },
+            )
+
+    provider = OllamaProvider(model_name="changing")
+    client = ChangingClient()
+    provider._client = client  # type: ignore[assignment]
+
+    initial = await provider.detect_capabilities()
+    cached = await provider.detect_capabilities()
+    refreshed = await provider.detect_capabilities(refresh=True)
+
+    assert client.calls == 2
+    assert initial.native_tools is False
+    assert cached is initial
+    assert refreshed.native_tools is True
+    assert refreshed.context_window == 8192

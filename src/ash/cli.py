@@ -331,7 +331,13 @@ async def _refresh_runtime_capabilities(loop: AshLoop, config: AshConfig) -> str
             + "\n  refresh=unsupported for this provider"
         )
     try:
-        await detect()
+        try:
+            await detect(refresh=True)
+        except TypeError as exc:
+            if "refresh" not in str(exc):
+                raise
+            setattr(provider, "_dynamic_capabilities", None)
+            await detect()
     except Exception as exc:  # noqa: BLE001 - refresh must not break the REPL
         return (
             _render_runtime_capabilities(loop, config)
