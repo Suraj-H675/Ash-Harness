@@ -2759,7 +2759,7 @@ class AshLoop:
             else ()
         )
         candidates: list[Path] = []
-        for path in self.project_root.rglob("*"):
+        for path in sorted(self.project_root.rglob("*")):
             if not path.is_file():
                 continue
             if path.suffix.lower() not in {

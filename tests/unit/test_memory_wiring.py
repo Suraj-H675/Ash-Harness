@@ -122,11 +122,11 @@ async def test_large_repository_memory_indexing_is_bounded(tmp_path) -> None:
         )
         assert indexed == 100
 
-        hits = await loop.semantic_search("function_99")
+        hits = await loop.semantic_search("function_100")
         assert hits
-        assert all(hit.file_path.endswith("module-99.py") for hit in hits)
+        assert all(hit.file_path.endswith("module-100.py") for hit in hits)
 
-        hits = await loop.semantic_search("function_299")
-        assert not any(hit.file_path.endswith("module-299.py") for hit in hits)
+        hits = await loop.semantic_search("function_99")
+        assert not any(hit.file_path.endswith("module-99.py") for hit in hits)
     finally:
         await loop.aclose()
