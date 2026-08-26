@@ -40,6 +40,7 @@ SCHEMA_VALIDATION_TIMEOUT_SECONDS = 1.5
 MAX_SCHEMA_BYTES = 256 * 1024
 MAX_SCHEMA_NODES = 4096
 MAX_SCHEMA_DEPTH = 64
+MAX_MCP_HEADER_ANNOTATIONS = 64
 MAX_PATTERN_CHARACTERS = 1024
 MAX_VALIDATION_PAYLOAD_BYTES = 2 * 1024 * 1024
 MAX_WORKER_OUTPUT_BYTES = 64 * 1024
@@ -226,6 +227,59 @@ def _valid_base64(value: str) -> bool:
     except (ValueError, TypeError):
         return False
     return True
+
+
+def _http_header_name(name: str) -> bool:
+    tchar = set(
+        "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    )
+    return bool(name) and all(character in tchar for character in name)
+
+
+def _extract_mcp_header_annotations(
+    schema: dict[str, Any],
+    *,
+    label: str,
+) -> list[tuple[tuple[str, ...], str]]:
+    annotations: list[tuple[tuple[str, ...], str]] = []
+    seen_headers: set[str] = set()
+
+    def walk(node: Any, path: tuple[str, ...]) -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                location = (*path, str(key))
+                if key == "x-mcp-header":
+                    if (
+                        len(path) < 2
+                        or len(path) % 2
+                        or any(
+                            path[index] != "properties"
+                            for index in range(0, len(path), 2)
+                        )
+                    ):
+                        raise ValueError(
+                            f"{label} has an x-mcp-header in an invalid location"
+                        )
+                    if not isinstance(child, str) or not _http_header_name(child):
+                        raise ValueError(f"{label} contains an invalid x-mcp-header")
+                    folded = child.casefold()
+                    if folded in seen_headers:
+                        raise ValueError(f"{label} repeats an x-mcp-header name")
+                    seen_headers.add(folded)
+                    if len(annotations) >= MAX_MCP_HEADER_ANNOTATIONS:
+                        raise ValueError(f"{label} exceeds MCP header annotation limit")
+                    arguments_path = tuple(
+                        path[index] for index in range(1, len(path), 2)
+                    )
+                    annotations.append((arguments_path, child))
+                    continue
+                walk(child, location)
+        elif isinstance(node, list):
+            for index, child in enumerate(node):
+                walk(child, (*path, str(index)))
+
+    walk(schema, ())
+    return annotations
 
 
 def _validate_content_block(item: dict[str, Any], protocol_version: str) -> str | None:
@@ -426,6 +480,14 @@ class MCPTool(BaseTool):
         if not isinstance(input_schema, dict):
             raise ValueError("MCP tool inputSchema must be an object")
         self._input_schema = deepcopy(input_schema)
+        self._header_annotations = (
+            _extract_mcp_header_annotations(
+                self._input_schema,
+                label=f"MCP tool {self.remote_name!r} inputSchema",
+            )
+            if protocol_version >= "2026-07-28"
+            else []
+        )
         self._input_dialect = _schema_validator(
             self._input_schema,
             label=f"MCP tool {self.remote_name!r} inputSchema",
@@ -504,6 +566,7 @@ class MCPTool(BaseTool):
                 dict(kwargs),
                 expected_contract=self._contract_fingerprint,
                 as_task=getattr(self, "_task_support", "forbidden") == "required",
+                header_annotations=self._header_annotations,
             )
         except MCPProtocolError as exc:
             error_payload: dict[str, Any] = {

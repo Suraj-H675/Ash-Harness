@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import base64
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -33,6 +34,7 @@ MAX_PAGINATION_SESSION_RESTARTS = 1
 MAX_STDIO_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_LEGACY_SSE_EVENT_BYTES = 8 * 1024 * 1024
 MAX_BUFFERED_LEGACY_SSE_RESPONSES = 1000
+SAFE_INTEGER_BOUND = 2**53 - 1
 MAX_HTTP_SESSION_ID_BYTES = 1024
 MIN_TASK_POLL_INTERVAL_SECONDS = 0.01
 MAX_TASK_POLL_INTERVAL_SECONDS = 30.0
@@ -456,6 +458,7 @@ class MCPClient:
         *,
         _allow_session_recovery: bool = True,
         _expected_tool_contract: tuple[str, str] | None = None,
+        _header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
     ) -> dict[str, Any]:
         if self.config.transport != "stdio" and _allow_session_recovery:
             async with self._session_recovery_lock:
@@ -500,6 +503,7 @@ class MCPClient:
                             request_id,
                             payload,
                             expected_tool_contract=_expected_tool_contract,
+                            header_annotations=_header_annotations,
                             bypass_session_readiness=not _allow_session_recovery,
                         )
                     break
@@ -589,13 +593,19 @@ class MCPClient:
         payload: dict[str, Any],
         *,
         expected_tool_contract: tuple[str, str] | None = None,
+        header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
         bypass_session_readiness: bool = False,
     ) -> dict[str, Any]:
         if self.config.transport == "sse":
-            return await self._request_legacy_sse(request_id, payload)
+            return await self._request_legacy_sse(
+                request_id,
+                payload,
+                header_annotations=header_annotations or [],
+            )
         response_http = await self._post_http(
             payload,
             expected_tool_contract=expected_tool_contract,
+            header_annotations=header_annotations or [],
             bypass_session_readiness=bypass_session_readiness,
         )
         matching: dict[str, Any] | None = None
@@ -616,6 +626,8 @@ class MCPClient:
         self,
         request_id: int,
         payload: dict[str, Any],
+        *,
+        header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
     ) -> dict[str, Any]:
         endpoint = self._legacy_sse_endpoint
         if not endpoint:
@@ -633,6 +645,10 @@ class MCPClient:
         )
         self._pending[request_id] = future
         try:
+            if header_annotations:
+                raise MCPProtocolError(
+                    "MCP HTTP parameter headers require the http transport"
+                )
             await self._post_legacy_sse(endpoint, payload)
             return await asyncio.wait_for(future, timeout=self.timeout)
         finally:
@@ -645,6 +661,8 @@ class MCPClient:
         self,
         endpoint: str,
         payload: dict[str, Any],
+        *,
+        header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
     ) -> None:
         if self._http is None:
             raise MCPProtocolError("MCP HTTP client is not connected")
@@ -653,12 +671,75 @@ class MCPClient:
         headers["Content-Type"] = "application/json"
         if self._oauth is not None:
             headers["Authorization"] = await self._oauth.authorization_header()
+        if header_annotations:
+            raise MCPProtocolError(
+                "MCP HTTP parameter headers require the http transport"
+            )
         response = await self._http.post(
             endpoint,
             json=payload,
             headers=headers,
         )
         response.raise_for_status()
+
+    @staticmethod
+    def _safe_header_value(value: str) -> str:
+        if (
+            value
+            and all(
+                0x20 <= ord(character) <= 0x7E or ord(character) == 0x09
+                for character in value
+            )
+            and value == value.strip()
+        ):
+            return value
+        encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        return f"=?base64?{encoded}?="
+
+    def _tool_request_headers(
+        self,
+        payload: dict[str, Any],
+        annotations: list[tuple[tuple[str, ...], str]],
+    ) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        method = payload.get("method")
+        if isinstance(method, str) and method:
+            headers["Mcp-Method"] = self._safe_header_value(method)
+        params = payload.get("params", {})
+        if isinstance(params, dict):
+            name = params.get("name")
+            uri = params.get("uri")
+            if isinstance(name, str):
+                headers["Mcp-Name"] = self._safe_header_value(name)
+            elif isinstance(uri, str):
+                headers["Mcp-Name"] = self._safe_header_value(uri)
+            arguments = params.get("arguments")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            for path, annotation in annotations:
+                value: Any = arguments
+                valid = True
+                for part in path:
+                    if part == "properties":
+                        continue
+                    if not isinstance(value, dict) or part not in value:
+                        valid = False
+                        break
+                    value = value[part]
+                if not valid or value is None:
+                    continue
+                if isinstance(value, bool):
+                    rendered = "true" if value else "false"
+                elif isinstance(value, int) and abs(value) <= SAFE_INTEGER_BOUND:
+                    rendered = str(value)
+                elif isinstance(value, str):
+                    rendered = value
+                else:
+                    raise MCPProtocolError(
+                        f"MCP header parameter {path[-1]!r} must be a primitive value"
+                    )
+                headers[f"Mcp-Param-{annotation}"] = self._safe_header_value(rendered)
+        return headers
 
     async def _cancel_request(self, request_id: int, reason: str) -> None:
         if self.config.transport != "stdio" and not self._initialized:
@@ -690,6 +771,7 @@ class MCPClient:
         *,
         _allow_session_recovery: bool = True,
         _expected_tool_contract: tuple[str, str] | None = None,
+        _header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
     ) -> None:
         if self.config.transport == "stdio":
             if self._process is None or self._process.stdin is None:
@@ -721,7 +803,11 @@ class MCPClient:
                 await asyncio.shield(self._legacy_sse_discovery)
                 endpoint = self._legacy_sse_endpoint
             if endpoint:
-                await self._post_legacy_sse(endpoint, payload)
+                await self._post_legacy_sse(
+                    endpoint,
+                    payload,
+                    header_annotations=_header_annotations or [],
+                )
             return
         if _allow_session_recovery:
             async with self._session_recovery_lock:
@@ -732,6 +818,7 @@ class MCPClient:
         try:
             response = await self._post_http(
                 payload,
+                header_annotations=_header_annotations or [],
                 bypass_session_readiness=not _allow_session_recovery,
             )
         except MCPSessionExpired as exc:
@@ -777,6 +864,7 @@ class MCPClient:
         payload: dict[str, Any],
         *,
         expected_tool_contract: tuple[str, str] | None = None,
+        header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
         bypass_session_readiness: bool = False,
     ) -> httpx.Response:
         if self._http is None:
@@ -816,6 +904,13 @@ class MCPClient:
             headers.pop("MCP-Protocol-Version", None)
         if self._oauth is not None:
             headers["Authorization"] = await self._oauth.authorization_header()
+        if header_annotations:
+            headers.update(
+                self._tool_request_headers(
+                    payload,
+                    header_annotations,
+                )
+            )
         response = await self._http.post(
             self.config.resolved_url,
             json=payload,
@@ -940,6 +1035,7 @@ class MCPClient:
         as_task: bool = False,
         task_ttl_ms: int | None = None,
         task_timeout: float | None = None,
+        header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"name": name, "arguments": arguments}
         if not as_task:
@@ -949,6 +1045,7 @@ class MCPClient:
                 _expected_tool_contract=(name, expected_contract)
                 if expected_contract is not None
                 else None,
+                _header_annotations=header_annotations or [],
             )
         if task_ttl_ms is not None and (
             isinstance(task_ttl_ms, bool) or task_ttl_ms <= 0
@@ -985,6 +1082,7 @@ class MCPClient:
                 params,
                 _expected_tool_contract=expected,
                 _allow_session_recovery=False,
+                _header_annotations=header_annotations or [],
             ),
             method="tools/call",
         )

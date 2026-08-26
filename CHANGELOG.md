@@ -7,6 +7,11 @@ All notable changes to Ash are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Added MCP `2026-07-28` Streamable HTTP request metadata support for
+  compliant clients: tools now validate statically reachable `x-mcp-header`
+  annotations, reject invalid names, locations, duplicates, and limits, and
+  mirror method, resource/tool identity, and primitive parameter values into
+  required HTTP headers using the specification's Base64 sentinel encoding.
 - Added compatibility for the deprecated MCP HTTP+SSE transport: the client
   opens one persistent event stream, discovers the POST endpoint before
   initialization, resolves and enforces its origin, routes requests and

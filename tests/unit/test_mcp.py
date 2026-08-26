@@ -16,7 +16,7 @@ from ash.mcp.client import (
     MCPProtocolError,
     MCPTaskTimeout,
 )
-from ash.mcp.runtime import MCPRuntime, MCPTool
+from ash.mcp.runtime import MCPRuntime, MCPTool, _extract_mcp_header_annotations
 from ash.mcp.server import (
     MCPServerConfig,
     MCPServerInstance,
@@ -448,8 +448,9 @@ class StubMCPClient:
         *,
         expected_contract: str | None = None,
         as_task: bool = False,
+        header_annotations: list | None = None,
     ) -> dict:
-        del expected_contract, as_task
+        del expected_contract, as_task, header_annotations
         self.calls.append((name, arguments))
         return self.result
 
@@ -949,6 +950,7 @@ async def test_mcp_tool_preserves_protocol_error_data_without_replay(
             *,
             expected_contract: str | None = None,
             as_task: bool = False,
+            header_annotations: list | None = None,
         ) -> dict:
             del expected_contract
             del as_task
@@ -994,6 +996,7 @@ async def test_mcp_tool_preserves_explicit_null_protocol_error_data(
             *,
             expected_contract: str | None = None,
             as_task: bool = False,
+            header_annotations: list | None = None,
         ) -> dict:
             del expected_contract
             del as_task
@@ -1982,6 +1985,8 @@ async def test_http_get_stream_dispatches_events_and_honors_405() -> None:
         if request.method == "DELETE":
             return httpx.Response(204)
         payload = json.loads(request.content)
+        if "id" not in payload:
+            return httpx.Response(202)
         if payload["method"] == "initialize":
             return httpx.Response(
                 200,
@@ -3310,9 +3315,9 @@ async def test_tool_list_change_quarantines_calls_until_refresh_finishes(
             *,
             expected_contract: str | None = None,
             as_task: bool = False,
+            header_annotations: list | None = None,
         ) -> dict:
-            del name, arguments, expected_contract
-            del as_task
+            del name, arguments, expected_contract, as_task, header_annotations
             self.tool_calls += 1
             return {"content": []}
 
@@ -3910,3 +3915,250 @@ async def test_legacy_sse_rejects_invalid_discovery(
     with pytest.raises(MCPProtocolError, match=message):
         await client.connect()
     await http.aclose()
+
+
+def test_mcp_header_annotations_reject_invalid_locations_and_names() -> None:
+    with pytest.raises(ValueError, match="invalid x-mcp-header"):
+        _extract_mcp_header_annotations(
+            {
+                "type": "object",
+                "properties": {"value": {"type": "string", "x-mcp-header": "bad name"}},
+            },
+            label="test schema",
+        )
+    with pytest.raises(ValueError, match="x-mcp-header"):
+        _extract_mcp_header_annotations(
+            {
+                "type": "object",
+                "properties": {
+                    "items": {"type": "array", "items": {"x-mcp-header": "Value"}}
+                },
+            },
+            label="test schema",
+        )
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_tool_call_sends_validated_parameter_headers() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "DELETE" or not request.content:
+            return httpx.Response(204)
+        if request.method == "GET":
+            return httpx.Response(405)
+        payload = json.loads(request.content)
+        if "id" not in payload:
+            return httpx.Response(202)
+        if payload["method"] == "initialize":
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": "session-1"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {"protocolVersion": "2025-11-25", "capabilities": {}},
+                },
+            )
+        return httpx.Response(
+            200,
+            headers={"Mcp-Session-Id": "session-1"},
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {"content": [{"type": "text", "text": "ok"}]},
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+        timeout=1,
+    )
+    await client.connect()
+    await client.call_tool(
+        "execute_sql",
+        {
+            "region": "us-west1",
+            "greeting": "Hello, 世界",
+            "count": 7,
+            "enabled": True,
+        },
+        header_annotations=[
+            (
+                (
+                    "properties",
+                    "region",
+                ),
+                "Region",
+            ),
+            (
+                (
+                    "properties",
+                    "greeting",
+                ),
+                "Greeting",
+            ),
+            (
+                (
+                    "properties",
+                    "count",
+                ),
+                "Count",
+            ),
+            (
+                (
+                    "properties",
+                    "enabled",
+                ),
+                "Enabled",
+            ),
+        ],
+    )
+    await client.disconnect()
+    await http.aclose()
+    call = next(
+        request
+        for request in requests
+        if request.url.path == "/rpc" and b'"tools/call"' in request.content
+    )
+    assert call.headers["Mcp-Method"] == "tools/call"
+    assert call.headers["Mcp-Name"] == "execute_sql"
+    assert call.headers["Mcp-Param-Region"] == "us-west1"
+    assert call.headers["Mcp-Param-Greeting"].startswith("=?base64?")
+    assert call.headers["Mcp-Param-Count"] == "7"
+    assert call.headers["Mcp-Param-Enabled"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_legacy_sse_tool_calls_reject_http_parameter_headers() -> None:
+    class StreamingSSETransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            if request.url.path != "/sse":
+                return httpx.Response(202)
+
+            class SSEStream(httpx.AsyncByteStream):
+                async def __aiter__(self):
+                    yield b"event: endpoint\ndata: /messages\n\n"
+                    yield (
+                        'event: message\ndata: {"jsonrpc":"2.0","id":1,'
+                        '"result":{"protocolVersion":"2024-11-05","capabilities":{}}}\n\n'
+                    ).encode()
+                    await asyncio.Event().wait()
+
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=SSEStream(),
+            )
+
+    http = httpx.AsyncClient(transport=StreamingSSETransport())
+    client = MCPClient(
+        MCPServerConfig(
+            name="legacy",
+            command="",
+            args=[],
+            env={},
+            transport="sse",
+            url="https://legacy.example.test/sse",
+        ),
+        http_client=http,
+        timeout=0.2,
+    )
+    await client.connect()
+    with pytest.raises(MCPProtocolError, match="require the http transport"):
+        await client.call_tool(
+            "tool",
+            {},
+            header_annotations=[(("properties", "region"), "Region")],
+        )
+    await client.disconnect()
+    await http.aclose()
+
+
+def test_runtime_mcp_tool_extracts_nested_header_annotations(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class HeaderClient:
+        protocol_version = "2026-07-28"
+        session_generation = 1
+
+        async def connect(self) -> None:
+            return None
+
+        async def list_tools(self) -> list[dict]:
+            return [
+                {
+                    "name": "sql",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "options": {
+                                "type": "object",
+                                "properties": {
+                                    "region": {
+                                        "type": "string",
+                                        "x-mcp-header": "Region",
+                                    }
+                                },
+                            }
+                        },
+                    },
+                }
+            ]
+
+        async def call_tool(
+            self,
+            name: str,
+            arguments: dict,
+            *,
+            expected_contract: str | None = None,
+            as_task: bool = False,
+            header_annotations: list | None = None,
+        ) -> dict:
+            del name, expected_contract, as_task
+            captured["arguments"] = arguments
+            captured["annotations"] = header_annotations
+            return {"content": [{"type": "text", "text": "ok"}]}
+
+        async def disconnect(self) -> None:
+            return None
+
+    runtime = MCPRuntime(
+        {"remote": MCPServerConfig(name="remote", command="unused", args=[], env={})},
+        SafetyGuard(tmp_path),
+    )
+    tool = MCPTool(
+        runtime.safety_guard,
+        client=HeaderClient(),  # type: ignore[arg-type]
+        server_name="remote",
+        definition={
+            "name": "sql",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "options": {
+                        "type": "object",
+                        "properties": {
+                            "region": {"type": "string", "x-mcp-header": "Region"}
+                        },
+                    }
+                },
+            },
+        },
+        protocol_version="2026-07-28",
+    )
+    result = asyncio.run(tool.run(options={"region": "us-east1"}))
+    assert result.success is True
+    assert captured["annotations"] == [(("options", "region"), "Region")]
