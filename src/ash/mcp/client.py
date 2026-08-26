@@ -30,6 +30,8 @@ MODERN_PROTOCOL_VERSION = "2026-07-28"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset(
     {LATEST_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"}
 )
+MODERN_HEADER_MISMATCH_ERROR = -32020
+MODERN_MISSING_CAPABILITY_ERROR = -32021
 MODERN_UNSUPPORTED_VERSION_ERROR = -32022
 MAX_PAGINATION_PAGES = 100
 MAX_PAGINATION_SESSION_RESTARTS = 1
@@ -137,6 +139,7 @@ class MCPClient:
         self._task_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_id = 1
+        self._probe_id = 0
         self._write_lock = asyncio.Lock()
         self._http: httpx.AsyncClient | None = http_client
         self._owns_http = http_client is None
@@ -216,6 +219,8 @@ class MCPClient:
             try:
                 if self.config.transport == "stdio":
                     await self._probe_modern_stdio()
+                elif self.config.transport == "http":
+                    await self._probe_modern_http()
                 await self._initialize_protocol()
             except BaseException:
                 await asyncio.shield(self.disconnect())
@@ -324,6 +329,61 @@ class MCPClient:
                 f"{LATEST_PROTOCOL_VERSION}: {sorted(versions)}"
             )
         raise MCPProtocolError("MCP stdio discovery returned a legacy-era result")
+
+    async def _probe_modern_http(self) -> None:
+        try:
+            await self._post_http(
+                {
+                    "jsonrpc": "2.0",
+                    "id": self._probe_id,
+                    "method": "ping",
+                    "params": {"_meta": self._modern_request_meta()},
+                },
+                is_initialize=True,
+                bypass_session_readiness=True,
+                allow_oauth_refresh=False,
+            )
+            return
+        except MCPAuthorizationRequired:
+            return
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 400:
+                raise
+            try:
+                body = exc.response.json()
+            except ValueError:
+                return
+            if not isinstance(body, dict):
+                return
+            error = body.get("error")
+            if not isinstance(error, dict):
+                return
+            code = error.get("code")
+            raw_data = error.get("data")
+            data = raw_data if isinstance(raw_data, dict) else {}
+            if code == MODERN_UNSUPPORTED_VERSION_ERROR and isinstance(
+                data.get("supported"), list
+            ):
+                supported = [
+                    str(version)
+                    for version in data["supported"]
+                    if isinstance(version, str)
+                ]
+                raise MCPProtocolError(
+                    f"MCP server supports modern protocol versions {supported}, "
+                    f"but Ash currently negotiates through {LATEST_PROTOCOL_VERSION}"
+                ) from exc
+            if code in {
+                MODERN_HEADER_MISMATCH_ERROR,
+                MODERN_MISSING_CAPABILITY_ERROR,
+            }:
+                raise MCPProtocolError(
+                    "MCP server rejected the modern HTTP probe: "
+                    + str(error.get("message", ""))
+                ) from exc
+            return
+        except (asyncio.TimeoutError, httpx.TimeoutException, httpx.HTTPError):
+            return
 
     async def _connect_stdio(self) -> None:
         env = build_scrubbed_environment(overrides=self.config.resolved_env)
@@ -915,16 +975,19 @@ class MCPClient:
         self,
         payload: dict[str, Any],
         *,
+        is_initialize: bool = False,
         expected_tool_contract: tuple[str, str] | None = None,
         header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
         bypass_session_readiness: bool = False,
+        allow_oauth_refresh: bool = True,
     ) -> httpx.Response:
         if self._http is None:
             raise MCPProtocolError("MCP HTTP client is not connected")
         headers = httpx.Headers(self.config.resolved_headers)
         headers["Accept"] = "application/json, text/event-stream"
         headers["Content-Type"] = "application/json"
-        is_initialize = payload.get("method") == "initialize"
+        if not is_initialize:
+            is_initialize = payload.get("method") == "initialize"
         while True:
             ready = self._session_ready.is_set()
             sent_session_id = "" if is_initialize else self._http_session_id
@@ -968,6 +1031,15 @@ class MCPClient:
             json=payload,
             headers=headers,
         )
+        if (
+            response.status_code == 401
+            and self._oauth is not None
+            and not allow_oauth_refresh
+        ):
+            raise MCPAuthorizationRequired(
+                f"MCP server {self.config.name!r} rejected the compatibility "
+                "probe credentials; falling back to legacy initialization"
+            )
         if response.status_code == 401 and self._oauth is not None:
             if payload.get("method") == "tools/call":
                 raise MCPAuthorizationRequired(

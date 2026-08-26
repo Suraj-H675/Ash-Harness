@@ -670,8 +670,9 @@ async def test_mcp_client_retries_one_401_with_refreshed_oauth() -> None:
     await client.disconnect()
     await http.aclose()
 
-    assert seen[:2] == ["Bearer stale", "Bearer fresh"]
-    assert oauth.calls[:2] == [False, True]
+    assert seen.count("Bearer stale") == 2
+    assert "Bearer fresh" in seen
+    assert oauth.calls == [False, False, True, False]
 
 
 @pytest.mark.asyncio
@@ -698,6 +699,8 @@ async def test_mcp_tool_call_401_is_not_reposted_after_oauth_refresh() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal tool_posts
         payload = json.loads(request.content)
+        if payload["method"] == "ping":
+            return httpx.Response(401)
         if payload["method"] == "initialize":
             return httpx.Response(
                 200,
@@ -735,7 +738,7 @@ async def test_mcp_tool_call_401_is_not_reposted_after_oauth_refresh() -> None:
         with pytest.raises(MCPAuthorizationRequired, match="not replayed"):
             await client.call_tool("write", {})
         assert tool_posts == 1
-        assert oauth.calls == [False, False, False]
+        assert oauth.calls == [False, False, False, False]
     finally:
         await client.disconnect()
         await http.aclose()

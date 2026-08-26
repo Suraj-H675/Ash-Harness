@@ -3,6 +3,8 @@ import asyncio
 import json
 import io
 import sys
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -16,6 +18,7 @@ from ash.mcp.client import (
     MCPProtocolError,
     MCPTaskTimeout,
 )
+from ash.mcp.oauth import MCPOAuthSession
 from ash.mcp.runtime import MCPRuntime, MCPTool, _extract_mcp_header_annotations
 from ash.mcp.server import (
     MCPServerConfig,
@@ -1921,6 +1924,11 @@ async def test_streamable_http_tracks_session_and_parses_sse() -> None:
             seen_session.append(request.headers.get("Mcp-Session-Id"))
             seen_protocol.append(request.headers.get("MCP-Protocol-Version"))
             return httpx.Response(204)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         if "id" not in payload:
             return httpx.Response(202)
@@ -2056,6 +2064,11 @@ async def test_http_recovers_expired_session_without_replaying_tool_call() -> No
         nonlocal initialize_count
         if request.method == "DELETE":
             return httpx.Response(405)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         method = payload["method"]
         session = request.headers.get("Mcp-Session-Id")
@@ -2193,6 +2206,11 @@ async def test_http_session_404_recovers_without_replaying_tool_attempt() -> Non
         nonlocal initialize_count, tool_attempts
         if request.method == "DELETE":
             return httpx.Response(405)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         if payload["method"] == "initialize":
             initialize_count += 1
@@ -2240,6 +2258,13 @@ async def test_http_session_404_recovers_without_replaying_tool_attempt() -> Non
 @pytest.mark.asyncio
 async def test_http_rejects_invalid_initialize_session_id() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if not request.content:
+            return httpx.Response(204)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         return httpx.Response(
             200,
@@ -2279,6 +2304,11 @@ async def test_http_malformed_sse_never_replays_tool_call() -> None:
         nonlocal tool_attempts
         if request.method == "DELETE":
             return httpx.Response(405)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         if payload["method"] == "initialize":
             return httpx.Response(
@@ -2331,6 +2361,11 @@ async def test_concurrent_http_connect_initializes_once() -> None:
         nonlocal initialize_count
         if request.method == "DELETE":
             return httpx.Response(405)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         if payload["method"] == "initialize":
             initialize_count += 1
@@ -2377,6 +2412,11 @@ async def test_paginated_list_restarts_after_session_recovery() -> None:
         nonlocal initialize_count
         if request.method == "DELETE":
             return httpx.Response(405)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         method = payload["method"]
         session = request.headers.get("Mcp-Session-Id")
@@ -2444,6 +2484,13 @@ async def test_paginated_list_restarts_after_session_recovery() -> None:
 @pytest.mark.asyncio
 async def test_list_rejects_non_object_catalog_entries() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if not request.content:
+            return httpx.Response(204)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         if payload["method"] == "initialize":
             result = {
@@ -2488,6 +2535,8 @@ async def test_failed_initialize_deletes_pending_server_session() -> None:
         if request.method == "DELETE":
             deleted_sessions.append(request.headers.get("Mcp-Session-Id"))
             return httpx.Response(204)
+        if not request.content:
+            return httpx.Response(204)
         payload = json.loads(request.content)
         return httpx.Response(
             200,
@@ -2521,6 +2570,8 @@ async def test_failed_initialize_deletes_pending_server_session() -> None:
 @pytest.mark.parametrize("capability", [None, False, []])
 async def test_initialize_rejects_non_object_capabilities(capability: object) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method != "POST":
+            return httpx.Response(204)
         payload = json.loads(request.content)
         return httpx.Response(
             200,
@@ -2563,6 +2614,11 @@ async def test_failed_replacement_initialize_deletes_allocated_session() -> None
         if request.method == "DELETE":
             deleted_sessions.append(request.headers.get("Mcp-Session-Id"))
             return httpx.Response(204)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         method = payload["method"]
         session = request.headers.get("Mcp-Session-Id")
@@ -2743,6 +2799,11 @@ async def test_http_rejects_invalid_jsonrpc_envelopes(
     response_factory, message: str
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         if payload["method"] == "initialize":
             return httpx.Response(
@@ -2904,7 +2965,7 @@ async def test_http_tool_listing_follows_pagination() -> None:
         await http.aclose()
 
     assert [tool["name"] for tool in tools] == ["first", "second"]
-    assert cursors == [None, "page-2"]
+    assert cursors == [None, None, "page-2"]
 
 
 @pytest.mark.asyncio
@@ -3080,6 +3141,8 @@ async def test_sessionless_http_timeout_sends_cancellation_without_reinitialize(
     trace: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if not request.content:
+            return httpx.Response(204)
         payload = json.loads(request.content)
         method = payload["method"]
         trace.append(method)
@@ -3118,12 +3181,13 @@ async def test_sessionless_http_timeout_sends_cancellation_without_reinitialize(
     try:
         with pytest.raises(httpx.ReadTimeout):
             await client.call_tool("slow", {})
-        assert trace == [
-            "initialize",
-            "notifications/initialized",
-            "tools/call",
-            "notifications/cancelled",
-        ]
+            assert trace == [
+                "ping",
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+                "notifications/cancelled",
+            ]
     finally:
         await client.disconnect()
         await http.aclose()
@@ -3420,6 +3484,11 @@ async def test_runtime_reconciles_catalog_without_http_tool_replay(
         nonlocal initialize_count, tool_attempts
         if request.method == "DELETE":
             return httpx.Response(405)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         method = payload["method"]
         session = request.headers.get("Mcp-Session-Id")
@@ -3544,6 +3613,11 @@ async def test_runtime_start_recovers_session_expiry_during_initial_catalog(
         nonlocal initialize_count
         if request.method == "DELETE":
             return httpx.Response(405)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         method = payload["method"]
         session = request.headers.get("Mcp-Session-Id")
@@ -3630,6 +3704,11 @@ async def test_runtime_blocks_concurrent_stale_call_until_catalog_reconciles(
         nonlocal initialize_count, tool_attempts
         if request.method == "DELETE":
             return httpx.Response(405)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": 0, "result": {}},
+            )
         payload = json.loads(request.content)
         method = payload["method"]
         session = request.headers.get("Mcp-Session-Id")
@@ -4246,3 +4325,240 @@ for line in sys.stdin:
         MCPProtocolError, match="Ash currently negotiates through 2025-11-25"
     ):
         await asyncio.wait_for(client.connect(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_http_modern_probe_recognizes_supported_headers_and_oauth() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method != "POST":
+            return httpx.Response(204)
+        payload = json.loads(request.content)
+        if payload["method"] == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {"protocolVersion": "2025-11-25", "capabilities": {}},
+                },
+            )
+        if payload["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        assert request.headers["Authorization"] == "Bearer probe-token"
+        assert request.headers["x-required"] == "probe"
+        meta = payload["params"]["_meta"]
+        assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": {}},
+        )
+
+    oauth = SimpleNamespace(
+        http_client=None,
+        authorization_header=AsyncMock(return_value="Bearer probe-token"),
+    )
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+            headers={"x-required": "probe"},
+        ),
+        http_client=http,
+        oauth_session=cast(MCPOAuthSession, oauth),
+    )
+    await client.connect()
+
+    assert len([request for request in requests if request.method == "POST"]) == 3
+    await client.disconnect()
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_unrecognized_400_falls_back_to_legacy_initialize() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method != "POST":
+            return httpx.Response(204)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(400, text="legacy gateway rejection")
+        payload = json.loads(request.content)
+        if payload["method"] == "initialize":
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": "session-1"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                    },
+                },
+            )
+        if payload["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": {"tools": []}},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    protocol_version = client.protocol_version
+    await client.disconnect()
+
+    assert [
+        json.loads(request.content)["method"]
+        for request in requests
+        if request.method == "POST"
+    ] == [
+        "ping",
+        "initialize",
+        "notifications/initialized",
+    ]
+    assert protocol_version == "2025-06-18"
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_modern_unsupported_version_fails_without_fallback() -> None:
+    methods = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        methods.append(payload["method"])
+        return httpx.Response(
+            400,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "error": {
+                    "code": -32022,
+                    "message": "unsupported version",
+                    "data": {"requested": "2026-07-28", "supported": ["2026-07-28"]},
+                },
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    with pytest.raises(
+        MCPProtocolError, match="Ash currently negotiates through 2025-11-25"
+    ):
+        await asyncio.wait_for(client.connect(), timeout=1)
+
+    assert methods == ["ping"]
+    await http.aclose()
+
+
+@pytest.mark.parametrize("code", [-32020, -32021])
+@pytest.mark.asyncio
+async def test_http_recognized_modern_error_fails_without_fallback(
+    code: int,
+) -> None:
+    methods = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        methods.append(payload["method"])
+        return httpx.Response(
+            400,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "error": {"code": code, "message": "modern rejection"},
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    with pytest.raises(MCPProtocolError, match="modern HTTP probe"):
+        await asyncio.wait_for(client.connect(), timeout=1)
+
+    assert methods == ["ping"]
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_probe_network_failure_falls_back_to_initialize() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if request.method != "POST":
+            return httpx.Response(204)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            raise httpx.ConnectError("network unavailable", request=request)
+        payload = json.loads(request.content)
+        if "id" not in payload:
+            return httpx.Response(202)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {"protocolVersion": "2025-06-18", "capabilities": {}},
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    protocol_version = client.protocol_version
+    await client.disconnect()
+
+    assert calls >= 2
+    assert protocol_version == "2025-06-18"
+    await http.aclose()
