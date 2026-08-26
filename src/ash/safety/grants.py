@@ -50,6 +50,7 @@ class MatchOperator(StrEnum):
     EXACT = "exact"
     CONTAINS = "contains"
     MAX = "max"
+    IN_SET = "in"
     PREFIX = "prefix"
     COMMAND_PREFIX = "command_prefix"
     PATH_PREFIX = "path_prefix"
@@ -204,6 +205,23 @@ class ArgumentMatcher:
             if self.value < 1:
                 raise PermissionGrantError("max requires a positive integer")
             return
+        if self.operator == MatchOperator.IN_SET:
+            if (
+                not isinstance(self.value, (list, tuple))
+                or not 1 <= len(self.value) <= 32
+                or any(
+                    not isinstance(choice, str)
+                    or not choice.strip()
+                    or len(choice) > 512
+                    for choice in self.value
+                )
+            ):
+                raise PermissionGrantError(
+                    "in requires 1 to 32 non-empty string choices"
+                )
+            object.__setattr__(
+                self, "value", tuple(choice.strip() for choice in self.value)
+            )
         if self.operator == MatchOperator.PREFIX:
             if (
                 not isinstance(self.value, str)
@@ -313,6 +331,8 @@ class ArgumentMatcher:
                 and not isinstance(candidate, bool)
                 and candidate <= int(self.value)
             )
+        if self.operator == MatchOperator.IN_SET:
+            return candidate in self.value if isinstance(candidate, str) else False
         if self.operator == MatchOperator.PREFIX:
             return isinstance(candidate, str) and candidate.startswith(self.value)
         if not isinstance(candidate, str):

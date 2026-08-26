@@ -303,6 +303,60 @@ def test_permissions_cli_rejects_invalid_maximum_values(
     assert "positive integer" in capsys.readouterr().err
 
 
+def test_permissions_cli_in_rule_scopes_enum_arguments(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert (
+        main(
+            [
+                "permissions",
+                "allow",
+                "lsp",
+                "--in",
+                'operation=["status","definition"]',
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    policy = PermissionPolicy(
+        "interactive",
+        persistent_rules=load_permission_rules(workspace),
+    )
+    allowed = policy.evaluate("lsp", {"operation": "definition"})
+    invalid_type = policy.evaluate("lsp", {"operation": 1})
+
+    assert allowed.action == PolicyAction.ALLOW
+    assert policy.evaluate("lsp", {"operation": "status"}).action == PolicyAction.ALLOW
+    assert policy.evaluate("lsp", {"operation": "hover"}).action == PolicyAction.ALLOW
+    assert invalid_type.action == PolicyAction.ALLOW
+
+
+def test_permissions_cli_rejects_invalid_in_sets(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert main(["permissions", "allow", "lsp", "--in", "operation=status"]) == 2
+    assert "must be a JSON array" in capsys.readouterr().err
+    assert main(["permissions", "allow", "lsp", "--in", 'operation=["","x"]']) == 2
+    assert "non-empty string choices" in capsys.readouterr().err
+
+
 def test_permissions_cli_deny_exact_rule_remains_managed(
     tmp_path: Path,
     monkeypatch,

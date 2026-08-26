@@ -2032,6 +2032,13 @@ def main(argv: list[str] | None = None) -> int:
             metavar="ARGUMENT=INTEGER",
         )
         permissions_rule.add_argument(
+            "--in",
+            dest="in",
+            action="append",
+            default=[],
+            metavar="ARGUMENT=[VALUE,...]",
+        )
+        permissions_rule.add_argument(
             "--prefix",
             action="append",
             default=[],
@@ -3018,6 +3025,7 @@ def main(argv: list[str] | None = None) -> int:
                     exact=args.exact,
                     contains=args.contains,
                     maximum=args.maximum,
+                    in_set=getattr(args, "in"),
                     prefix=args.prefix,
                     path_prefix=args.path_prefix,
                     suffix=args.suffix,
