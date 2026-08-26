@@ -293,11 +293,15 @@ def main() -> None:
                 arguments: dict[str, object],
                 *,
                 expected_contract: str | None = None,
+                as_task: bool = False,
+                header_annotations: list[dict[str, object]] | None = None,
             ) -> dict[str, object]:
                 self.calls += 1
                 assert name == "inspect"
                 assert arguments == {"mode": "safe"}
                 assert expected_contract is not None
+                assert as_task is False
+                assert header_annotations == []
                 return {
                     "content": [{"type": "text", "text": "value: 2"}],
                     "structuredContent": {"value": 2},
