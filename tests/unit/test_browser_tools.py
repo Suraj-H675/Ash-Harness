@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy, PolicyAction
 from ash.tools.browser import (
+    BrowserSession,
     BrowserBackTool,
     BrowserUploadTool,
     BrowserScreenshotTool,
@@ -179,3 +183,84 @@ async def test_browser_tool_reports_stale_refs_without_raising(tmp_path) -> None
 
     assert result.success is False
     assert "stale or missing" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_browser_profile_is_ephemeral_by_default() -> None:
+    session = BrowserSession()
+
+    class FakeContext:
+        def set_default_timeout(self, value):
+            pass
+
+        def set_default_navigation_timeout(self, value):
+            pass
+
+        async def route(self, *args):
+            return None
+
+        async def route_web_socket(self, *args):
+            return None
+
+        async def new_page(self):
+            return object()
+
+    with patch("playwright.async_api.async_playwright") as playwright_factory:
+        playwright = MagicMock()
+        launch_result = MagicMock()
+        launch_result.new_context = AsyncMock(return_value=FakeContext())
+        playwright.chromium.launch = AsyncMock(return_value=launch_result)
+        playwright.chromium.launch_persistent_context = AsyncMock(
+            return_value=FakeContext()
+        )
+        playwright.stop = AsyncMock()
+        playwright_factory.return_value.start = AsyncMock(return_value=playwright)
+
+        await session.ensure_started()
+
+    playwright.chromium.launch_persistent_context.assert_not_called()
+    kwargs = playwright.chromium.launch.return_value.new_context.await_args.kwargs
+    assert "user_data_dir" not in kwargs
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_optin_profile_creates_private_directory(tmp_path: Path) -> None:
+    profile = tmp_path / "state" / "browser-profile"
+    session = BrowserSession(profile_path=profile)
+
+    class FakeContext:
+        def set_default_timeout(self, value):
+            pass
+
+        def set_default_navigation_timeout(self, value):
+            pass
+
+        async def route(self, *args):
+            return None
+
+        async def route_web_socket(self, *args):
+            return None
+
+        async def new_page(self):
+            return object()
+
+    with patch("playwright.async_api.async_playwright") as playwright_factory:
+        playwright = MagicMock()
+        launch_result = MagicMock()
+        launch_result.new_context = AsyncMock(return_value=FakeContext())
+        playwright.chromium.launch = AsyncMock(return_value=launch_result)
+        playwright.chromium.launch_persistent_context = AsyncMock(
+            return_value=FakeContext()
+        )
+        playwright.stop = AsyncMock()
+        playwright_factory.return_value.start = AsyncMock(return_value=playwright)
+
+        await session.ensure_started()
+
+    assert profile.is_dir()
+    if os.name != "nt":
+        assert profile.stat().st_mode & 0o077 == 0
+    kwargs = playwright.chromium.launch_persistent_context.await_args.kwargs
+    assert kwargs["user_data_dir"] == str(profile)
+    await session.close()

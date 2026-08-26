@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import os
 import re
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse, urlunparse
 
@@ -61,12 +63,16 @@ class BrowserSession:
         headless: bool = True,
         timeout_seconds: float = 30.0,
         allowed_domains: list[str] | tuple[str, ...] | None = None,
+        profile_path: Path | None = None,
     ) -> None:
         if not 1.0 <= timeout_seconds <= 120.0:
             raise ValueError("browser timeout must be between 1 and 120 seconds")
         self.headless = headless
         self.timeout_ms = int(timeout_seconds * 1000)
         self.allowed_domains = _normalize_allowed_domains(allowed_domains or ())
+        self.profile_path = (
+            profile_path.expanduser().resolve() if profile_path is not None else None
+        )
         self._lock = asyncio.Lock()
         self._playwright: Any | None = None
         self._browser: Any | None = None
@@ -88,6 +94,10 @@ class BrowserSession:
                 ) from exc
             try:
                 self._playwright = await async_playwright().start()
+                if self.profile_path is not None:
+                    self.profile_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    if os.name != "nt":
+                        self.profile_path.chmod(0o700)
                 browser_environment_names = {
                     "PLAYWRIGHT_BROWSERS_PATH",
                     "PLAYWRIGHT_NODEJS_PATH",
@@ -104,15 +114,27 @@ class BrowserSession:
                 browser_environment: dict[str, str | float | bool] = dict(
                     build_scrubbed_environment(browser_environment_names)
                 )
-                self._browser = await self._playwright.chromium.launch(
-                    headless=self.headless,
-                    env=browser_environment,
-                )
-                self._context = await self._browser.new_context(
-                    accept_downloads=False,
-                    service_workers="block",
-                    viewport={"width": 1280, "height": 800},
-                )
+                if self.profile_path is not None:
+                    self._context = await (
+                        self._playwright.chromium.launch_persistent_context(
+                            user_data_dir=str(self.profile_path),
+                            headless=self.headless,
+                            env=browser_environment,
+                            accept_downloads=False,
+                            service_workers="block",
+                            viewport={"width": 1280, "height": 800},
+                        )
+                    )
+                else:
+                    self._browser = await self._playwright.chromium.launch(
+                        headless=self.headless,
+                        env=browser_environment,
+                    )
+                    self._context = await self._browser.new_context(
+                        accept_downloads=False,
+                        service_workers="block",
+                        viewport={"width": 1280, "height": 800},
+                    )
                 self._context.set_default_timeout(self.timeout_ms)
                 self._context.set_default_navigation_timeout(self.timeout_ms)
                 await self._context.route("**/*", self._route_request)
@@ -244,9 +266,7 @@ class BrowserSession:
             safety_guard,
         )
         if len(payload) > max_bytes:
-            raise ValueError(
-                f"upload exceeds {max_bytes} bytes; choose a smaller file"
-            )
+            raise ValueError(f"upload exceeds {max_bytes} bytes; choose a smaller file")
         await asyncio.to_thread(
             _reject_sensitive,
             validated_path,
@@ -604,11 +624,13 @@ def build_browser_tools(
     headless: bool = True,
     timeout_seconds: float = 30.0,
     allowed_domains: list[str] | tuple[str, ...] | None = None,
+    profile_path: Path | None = None,
 ) -> list[BaseTool]:
     session = BrowserSession(
         headless=headless,
         timeout_seconds=timeout_seconds,
         allowed_domains=allowed_domains,
+        profile_path=profile_path,
     )
     return [
         BrowserNavigateTool(safety_guard, session),

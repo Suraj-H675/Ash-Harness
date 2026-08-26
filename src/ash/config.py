@@ -54,6 +54,7 @@ def _publish_dotenv_runtime_values(
             os.environ[key] = value
             _DOTENV_RUNTIME_VALUES[key] = value
 
+
 PROJECT_CONFIG_DIRECTORY = ".ash"
 PROJECT_CONFIG_FILENAME = "config.toml"
 PROJECT_MODEL_PROVIDERS = frozenset(
@@ -549,6 +550,13 @@ class AshConfig(BaseSettings):
         le=120.0,
         description="Timeout for one browser navigation or interaction.",
     )
+    browser_persistent_profile: bool = Field(
+        False,
+        description=(
+            "Opt in to a private Ash-owned Chromium profile under the local state "
+            "directory. Disabled always starts a clean ephemeral profile."
+        ),
+    )
 
     db_directory: Path = Field(
         default=Path.home() / ".ash" / "db",
@@ -711,9 +719,7 @@ class AshConfig(BaseSettings):
     def validate_approval_diff_mode(cls, value: str) -> str:
         normalized = value.strip().casefold().replace("_", "-")
         if normalized not in {"unified", "side-by-side"}:
-            raise ValueError(
-                "approval_diff_mode must be unified or side-by-side"
-            )
+            raise ValueError("approval_diff_mode must be unified or side-by-side")
         return normalized
 
     @field_validator("sandbox_backend")
@@ -1115,7 +1121,13 @@ class AshConfig(BaseSettings):
     def _record_derived_sources(self) -> None:
         if not self.screen_reader_mode:
             return
-        for field in ("no_color", "reduced_motion", "show_token_meter", "tui_mode", "theme"):
+        for field in (
+            "no_color",
+            "reduced_motion",
+            "show_token_meter",
+            "tui_mode",
+            "theme",
+        ):
             self._config_sources[field] = ("derived", "screen_reader_mode")
 
     def model_post_init(self, *args: Any, **kwargs: Any) -> None:

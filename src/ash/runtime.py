@@ -208,6 +208,12 @@ def build_tools(
                 runtime_config.browser_timeout_seconds if runtime_config else 30.0
             ),
             allowed_domains=allowed_web_domains,
+            profile_path=(
+                runtime_config.db_directory / "browser-profile"
+                if runtime_config is not None
+                and runtime_config.browser_persistent_profile
+                else None
+            ),
         )
     )
     from ash.agents.a2a_remote import (
@@ -475,11 +481,7 @@ def build_runtime(
     loop.permission_policy.set_managed_rules(managed)
     loop.permission_policy.set_managed_rules(managed_rules)
     hooks.set_event_sink(loop._emit_event)
-    if (
-        trusted
-        and config.memory_auto_index
-        and loop._vector_pipeline is not None
-    ):
+    if trusted and config.memory_auto_index and loop._vector_pipeline is not None:
         loop._memory_auto_index_task = asyncio.create_task(
             loop.index_project_memory(
                 max_files=config.memory_auto_index_max_files,
