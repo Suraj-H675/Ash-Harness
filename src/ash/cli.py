@@ -1582,6 +1582,29 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     await loop.index_file_for_memory(memory_path)
                     print(f"Indexed {memory_path}")
                     continue
+                if action == "index-workspace":
+                    if len(arguments) > 2:
+                        print(f"Usage: {command.usage}", file=sys.stderr)
+                        continue
+                    limit = (
+                        loop._config.memory_auto_index_max_files
+                        if loop._config is not None
+                        else 100
+                    )
+                    if len(arguments) == 2:
+                        try:
+                            limit = int(arguments[1])
+                        except ValueError as exc:
+                            raise ValueError(
+                                "memory index-workspace limit must be an integer"
+                            ) from exc
+                    if limit < 1 or limit > 10_000:
+                        raise ValueError(
+                            "memory index-workspace limit must be between 1 and 10000"
+                        )
+                    indexed = await loop.index_project_memory(max_files=limit)
+                    print(f"Indexed {indexed} workspace file(s).")
+                    continue
                 if action == "search" and len(arguments) >= 2:
                     hits = await loop.semantic_search(" ".join(arguments[1:]))
                     if not hits:

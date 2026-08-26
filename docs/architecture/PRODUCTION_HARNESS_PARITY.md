@@ -131,7 +131,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Runtime `/capabilities` | Verified locally | Active-loop manifest reports negotiated tools/vision/reasoning/local status, context/output budgets, and whether evidence is dynamic or from the default registry |
 | `/new`, `/resume`, `/sessions` | Verified locally | Durable session lifecycle and missing-ID errors |
 | `/rename`, `/fork`, `/tree` | Verified locally | Atomic complete-turn transcript forks, durable parent/root lineage, redacted branch metadata, stable parent-first navigation, and tree-aware retention across CLI/SDK/HTTP/JSON-RPC |
-| `/compact`, `/context` | Verified locally | Context compaction, budget inspection, and last-turn cache hit metrics |
+| `/compact`, `/context` | Verified locally | Context compaction, budget inspection, and last-turn cache hit metrics; explicit bounded workspace memory indexing is available from the REPL |
 | `/cancel` | Verified locally | Cancel the active provider/tool turn while retaining already completed work |
 | `/clear`, `/rewind`, `/undo` | Verified locally | New-session clear, complete-turn transcript rewind with optional `--files`, and conflict-aware latest file undo |
 | `/diff` | Verified locally | Current, staged, path-scoped Git diff plus latest per-turn checkpoint diff with conflict refusal |
