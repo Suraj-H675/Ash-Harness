@@ -55,7 +55,7 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand(
         "capabilities",
         "Show the active model's negotiated capabilities",
-        "/capabilities",
+        "/capabilities [--refresh]",
     ),
     SlashCommand("plan", "Toggle editable sprint planning", "/plan [on|off]"),
     SlashCommand("skills", "List available instruction skills", "/skills [query]"),

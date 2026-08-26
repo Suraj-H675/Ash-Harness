@@ -320,6 +320,27 @@ def _render_runtime_capabilities(loop: AshLoop, config: AshConfig) -> str:
     return "\n".join(lines)
 
 
+async def _refresh_runtime_capabilities(loop: AshLoop, config: AshConfig) -> str:
+    """Re-probe dynamic local-model capabilities and render the new manifest."""
+
+    provider = loop.provider
+    detect = getattr(provider, "detect_capabilities", None)
+    if not callable(detect):
+        return (
+            _render_runtime_capabilities(loop, config)
+            + "\n  refresh=unsupported for this provider"
+        )
+    try:
+        await detect()
+    except Exception as exc:  # noqa: BLE001 - refresh must not break the REPL
+        return (
+            _render_runtime_capabilities(loop, config)
+            + f"\n  refresh failed: {type(exc).__name__}: {exc}"
+        )
+    refreshed = _render_runtime_capabilities(loop, config)
+    return refreshed + "\n  source refreshed"
+
+
 async def _discover_live_model_catalog(config: AshConfig) -> list[str]:
     """Probe the selected provider's live catalog with a short timeout."""
 
@@ -1034,7 +1055,15 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 )
                 continue
             if command.name == "capabilities":
-                print(_render_runtime_capabilities(loop, config), flush=True)
+                if arguments not in ([], ["--refresh"]):
+                    print(f"Usage: {command.usage}", file=sys.stderr)
+                    continue
+                output = (
+                    await _refresh_runtime_capabilities(loop, config)
+                    if arguments == ["--refresh"]
+                    else _render_runtime_capabilities(loop, config)
+                )
+                print(output, flush=True)
                 continue
             if command.name == "plan":
                 if len(arguments) > 1 or arguments[:1] not in ([], ["on"], ["off"]):

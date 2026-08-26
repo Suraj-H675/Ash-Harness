@@ -35,6 +35,7 @@ def test_help_lists_core_session_commands() -> None:
     assert "/reload-plugins" in rendered
     assert "/help [query]" in rendered
     assert "aliases: /clear" in rendered
+    assert "/capabilities [--refresh]" in rendered
 
 
 def test_help_filters_by_command_alias_and_description() -> None:
