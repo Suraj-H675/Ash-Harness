@@ -243,6 +243,66 @@ def test_permissions_cli_contains_rejects_blank_and_oversized_values(
     assert "requires a non-empty string" in capsys.readouterr().err
 
 
+def test_permissions_cli_maximum_rule_scopes_numeric_arguments(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert (
+        main(
+            [
+                "permissions",
+                "allow",
+                "web_fetch",
+                "--maximum",
+                "max_chars=1000",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    policy = PermissionPolicy(
+        "interactive",
+        persistent_rules=load_permission_rules(workspace),
+    )
+    bounded = policy.evaluate(
+        "web_fetch", {"url": "https://example.com", "max_chars": 1000}
+    )
+    unbounded = policy.evaluate(
+        "web_fetch", {"url": "https://example.com", "max_chars": 1001}
+    )
+    invalid = policy.evaluate(
+        "web_fetch", {"url": "https://example.com", "max_chars": True}
+    )
+
+    assert bounded.action == PolicyAction.ALLOW
+    assert unbounded.action == PolicyAction.ASK
+    assert invalid.action == PolicyAction.ASK
+
+
+def test_permissions_cli_rejects_invalid_maximum_values(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert main(["permissions", "allow", "lsp", "--maximum", "line=abc"]) == 2
+    assert "must be an integer" in capsys.readouterr().err
+    assert main(["permissions", "allow", "lsp", "--maximum", "line=0"]) == 2
+    assert "positive integer" in capsys.readouterr().err
+
+
 def test_permissions_cli_deny_exact_rule_remains_managed(
     tmp_path: Path,
     monkeypatch,

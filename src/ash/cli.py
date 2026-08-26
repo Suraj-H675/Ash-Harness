@@ -2026,6 +2026,12 @@ def main(argv: list[str] | None = None) -> int:
             metavar="ARGUMENT=TEXT",
         )
         permissions_rule.add_argument(
+            "--maximum",
+            action="append",
+            default=[],
+            metavar="ARGUMENT=INTEGER",
+        )
+        permissions_rule.add_argument(
             "--prefix",
             action="append",
             default=[],
@@ -3011,6 +3017,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.tool_name,
                     exact=args.exact,
                     contains=args.contains,
+                    maximum=args.maximum,
                     prefix=args.prefix,
                     path_prefix=args.path_prefix,
                     suffix=args.suffix,

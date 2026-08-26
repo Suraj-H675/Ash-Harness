@@ -174,7 +174,7 @@ Research is clean-room: proprietary or leaked source is not used.
 |---|---|---|
 | Workspace path boundary | Verified locally | Canonical scope checks plus symlink/junction rejection; POSIX reads, directory listings, creates, no-clobber writes, edits, and patches use descriptor-anchored no-follow operations, with identity/content revalidation fallback on Windows |
 | Trusted-folder prompt | Verified locally | Project instructions, skills, hooks, plugins, and MCP are trust-gated |
-| Fine-grained policy engine | Partial | Deny-first then ask/allow precedence, mode circuit breakers, stable scoped rules, conservative command-prefix parsing, managed policy layers, tool-specific path/domain/suffix grammar with safe case-insensitive filename extensions plus bounded text containment matching are enforced; richer argument grammars remain |
+| Fine-grained policy engine | Partial | Deny-first then ask/allow precedence, mode circuit breakers, stable scoped rules, conservative command-prefix parsing, managed policy layers, tool-specific path/domain/suffix grammar with safe case-insensitive filename extensions, bounded text containment matching, and strict positive-integer maximum matching are enforced; richer argument grammars remain |
 | Approval persistence | Verified locally | Atomic mode-0600 versioned rules, version-1 migration, stable IDs, exact session/project scopes, command-prefix project scopes, scoped denial, slash/top-level inspection, removal, and clear |
 | Read-only plan mode | Verified locally | Non-read tools are denied by the central policy |
 | Auto-edit mode | Verified locally | Reads/edits allowed while commands and external tools remain gated |

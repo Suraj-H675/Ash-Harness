@@ -49,6 +49,7 @@ class RuleEffect(StrEnum):
 class MatchOperator(StrEnum):
     EXACT = "exact"
     CONTAINS = "contains"
+    MAX = "max"
     PREFIX = "prefix"
     COMMAND_PREFIX = "command_prefix"
     PATH_PREFIX = "path_prefix"
@@ -193,6 +194,16 @@ class ArgumentMatcher:
         if self.operator == MatchOperator.CONTAINS:
             self._validated_text("contains")
             return
+        if self.operator == MatchOperator.MAX:
+            if (
+                not isinstance(self.value, (int, float))
+                or isinstance(self.value, bool)
+                or not isinstance(self.value, int)
+            ):
+                raise PermissionGrantError("max requires an integer threshold")
+            if self.value < 1:
+                raise PermissionGrantError("max requires a positive integer")
+            return
         if self.operator == MatchOperator.PREFIX:
             if (
                 not isinstance(self.value, str)
@@ -296,6 +307,12 @@ class ArgumentMatcher:
             return candidate == self.value
         if self.operator == MatchOperator.CONTAINS:
             return isinstance(candidate, str) and str(self.value) in candidate
+        if self.operator == MatchOperator.MAX:
+            return (
+                isinstance(candidate, int)
+                and not isinstance(candidate, bool)
+                and candidate <= int(self.value)
+            )
         if self.operator == MatchOperator.PREFIX:
             return isinstance(candidate, str) and candidate.startswith(self.value)
         if not isinstance(candidate, str):

@@ -118,6 +118,7 @@ def build_argument_matchers(
     *,
     exact: list[str] | None = None,
     contains: list[str] | None = None,
+    maximum: list[str] | None = None,
     prefix: list[str] | None = None,
     path_prefix: list[str] | None = None,
     suffix: list[str] | None = None,
@@ -138,6 +139,15 @@ def build_argument_matchers(
     for raw in contains or ():
         argument, value = _split_assignment(raw, option="--contains")
         matchers.append(ArgumentMatcher(argument, MatchOperator.CONTAINS, value))
+    for raw in maximum or ():
+        argument, value = _split_assignment(raw, option="--maximum")
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"--maximum value for {argument!r} must be an integer"
+            ) from exc
+        matchers.append(ArgumentMatcher(argument, MatchOperator.MAX, parsed))
     for raw in prefix or ():
         argument, value = _split_assignment(raw, option="--prefix")
         matchers.append(ArgumentMatcher(argument, MatchOperator.PREFIX, value))
@@ -168,6 +178,7 @@ def add_cli_permission_rule(
     *,
     exact: list[str] | None = None,
     contains: list[str] | None = None,
+    maximum: list[str] | None = None,
     prefix: list[str] | None = None,
     path_prefix: list[str] | None = None,
     suffix: list[str] | None = None,
@@ -182,6 +193,7 @@ def add_cli_permission_rule(
         build_argument_matchers(
             exact=exact,
             contains=contains,
+            maximum=maximum,
             prefix=prefix,
             path_prefix=path_prefix,
             suffix=suffix,
