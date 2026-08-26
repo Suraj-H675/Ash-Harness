@@ -7,6 +7,12 @@ All notable changes to Ash are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Added MCP `2026-07-28` stdio dual-era detection: connections now probe
+  `server/discover` with modern request metadata, strictly validate discovery
+  results, fail deterministically for modern-only servers or advertised newer
+  versions, reject recognized unsupported-version errors without legacy
+  fallback, and fall back to the proven legacy `initialize` handshake only on
+  unrecognized errors or timeout.
 - Added MCP `2026-07-28` Streamable HTTP request metadata support for
   compliant clients: tools now validate statically reachable `x-mcp-header`
   annotations, reject invalid names, locations, duplicates, and limits, and

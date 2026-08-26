@@ -348,6 +348,9 @@ for line in sys.stdin:
     if "id" not in message:
         continue
     method = message["method"]
+    if method == "server/discover":
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "legacy"}}), flush=True)
+        continue
     if method == "initialize":
         result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}, "resources": {}, "prompts": {}}, "serverInfo": {"name": "fake", "version": "1"}}
     elif method == "tools/list":
@@ -2784,7 +2787,9 @@ pending_tools_id = None
 root_uri = ""
 for line in sys.stdin:
     message = json.loads(line)
-    if message.get("method") == "initialize":
+    if message.get("method") == "server/discover":
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "legacy"}}), flush=True)
+    elif message.get("method") == "initialize":
         result = {
             "protocolVersion": "2025-11-25",
             "capabilities": {"tools": {"listChanged": True}, "logging": {}},
@@ -3012,6 +3017,9 @@ import json, sys, time
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
+    if method == "server/discover":
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "legacy"}}), flush=True)
+        continue
     if method == "initialize":
         result = {
             "protocolVersion": "2025-11-25",
@@ -3164,6 +3172,9 @@ list_count = 0
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
+    if method == "server/discover":
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "legacy"}}), flush=True)
+        continue
     if method == "initialize":
         result = {
             "protocolVersion": "2025-11-25",
@@ -4162,3 +4173,76 @@ def test_runtime_mcp_tool_extracts_nested_header_annotations(
     result = asyncio.run(tool.run(options={"region": "us-east1"}))
     assert result.success is True
     assert captured["annotations"] == [(("options", "region"), "Region")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probe_response", "expected"),
+    [
+        (
+            {
+                "resultType": "complete",
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {}},
+                "_meta": {
+                    "io.modelcontextprotocol/serverInfo": {
+                        "name": "modern",
+                        "version": "1",
+                    }
+                },
+            },
+            "MCP server is modern-only",
+        ),
+        (
+            {
+                "resultType": "complete",
+                "supportedVersions": ["2026-08-01"],
+                "capabilities": {},
+            },
+            "MCP server is modern-only",
+        ),
+    ],
+)
+async def test_stdio_discover_rejects_modern_server_without_fallback(
+    probe_response: dict,
+    expected: str,
+) -> None:
+    server = f"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "server/discover":
+        print(json.dumps({{"jsonrpc": "2.0", "id": message["id"], "result": {json.dumps(probe_response)}}}), flush=True)
+"""
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern", command=sys.executable, args=["-u", "-c", server], env={}
+        )
+    )
+    with pytest.raises(MCPProtocolError, match=expected):
+        await asyncio.wait_for(client.connect(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_stdio_unsupported_modern_version_fails_deterministically() -> None:
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "server/discover":
+        error = {
+            "code": -32022,
+            "message": "unsupported version",
+            "data": {"supported": ["2026-07-28"]},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "error": error}), flush=True)
+"""
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern", command=sys.executable, args=["-u", "-c", server], env={}
+        )
+    )
+    with pytest.raises(
+        MCPProtocolError, match="Ash currently negotiates through 2025-11-25"
+    ):
+        await asyncio.wait_for(client.connect(), timeout=1)

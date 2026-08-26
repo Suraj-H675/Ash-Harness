@@ -26,9 +26,11 @@ from ash.sandbox.process_utils import process_group_options, terminate_process_t
 
 
 LATEST_PROTOCOL_VERSION = "2025-11-25"
+MODERN_PROTOCOL_VERSION = "2026-07-28"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset(
     {LATEST_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"}
 )
+MODERN_UNSUPPORTED_VERSION_ERROR = -32022
 MAX_PAGINATION_PAGES = 100
 MAX_PAGINATION_SESSION_RESTARTS = 1
 MAX_STDIO_MESSAGE_BYTES = 8 * 1024 * 1024
@@ -212,6 +214,8 @@ class MCPClient:
                     f"Unsupported MCP transport: {self.config.transport}"
                 )
             try:
+                if self.config.transport == "stdio":
+                    await self._probe_modern_stdio()
                 await self._initialize_protocol()
             except BaseException:
                 await asyncio.shield(self.disconnect())
@@ -272,6 +276,54 @@ class MCPClient:
             and (self._sse_task is None or self._sse_task.done())
         ):
             self._sse_task = asyncio.create_task(self._read_http_events())
+
+    def _modern_request_meta(self) -> dict[str, Any]:
+        return {
+            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "ash",
+                "version": _client_version(),
+            },
+            "io.modelcontextprotocol/clientCapabilities": self.client_capabilities,
+        }
+
+    async def _probe_modern_stdio(self) -> None:
+        try:
+            result = await self.request(
+                "server/discover",
+                {"_meta": self._modern_request_meta()},
+                _allow_session_recovery=False,
+            )
+        except MCPProtocolError as exc:
+            data = exc.data if isinstance(exc.data, dict) else {}
+            supported = data.get("supported")
+            if exc.code == MODERN_UNSUPPORTED_VERSION_ERROR and isinstance(
+                supported, list
+            ):
+                raise MCPProtocolError(
+                    f"MCP server supports modern protocol versions {supported}, "
+                    f"but Ash currently negotiates through {LATEST_PROTOCOL_VERSION}"
+                ) from exc
+            return
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            return
+        versions = result.get("supportedVersions")
+        capabilities = result.get("capabilities")
+        if not (
+            result.get("resultType") == "complete"
+            and isinstance(versions, list)
+            and all(isinstance(version, str) for version in versions)
+            and isinstance(capabilities, dict)
+        ):
+            raise MCPProtocolError("MCP server discovery returned an invalid result")
+        if MODERN_PROTOCOL_VERSION in versions or any(
+            version > LATEST_PROTOCOL_VERSION for version in versions
+        ):
+            raise MCPProtocolError(
+                f"MCP server is modern-only; Ash currently negotiates through "
+                f"{LATEST_PROTOCOL_VERSION}: {sorted(versions)}"
+            )
+        raise MCPProtocolError("MCP stdio discovery returned a legacy-era result")
 
     async def _connect_stdio(self) -> None:
         env = build_scrubbed_environment(overrides=self.config.resolved_env)
