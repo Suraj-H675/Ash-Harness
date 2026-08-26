@@ -19,6 +19,11 @@ All notable changes to Ash are documented here. The format follows
 - MCP required-task waiting now proactively opens `tasks/result` when a task is
   `input_required`, then resumes validated polling so server-initiated input
   flows can proceed while preserving timeout, cancellation, and fallback rules.
+- Added protocol-version-aware Streamable HTTP GET/SSE support for negotiated
+  pre-2026 sessions: standalone server-to-client events are dispatched through
+  the existing request/notification handlers, `405` disables the channel,
+  reconnects honor SSE retry timing and `Last-Event-ID`, and the stream stops on
+  session replacement or disconnect.
 - Added authenticated remote JSON-RPC 2.0 at `/rpc` on the existing HTTP
   server, reusing the validated SDK methods with bearer auth, rate limiting,
   strict JSON parsing, bounded payloads, bounded concurrent batches, standard

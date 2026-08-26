@@ -128,6 +128,11 @@ class MCPClient:
         self._http: httpx.AsyncClient | None = http_client
         self._owns_http = http_client is None
         self._http_session_id = ""
+        self._sse_task: asyncio.Task[None] | None = None
+        self._sse_generation = 0
+        self._sse_last_event_id = ""
+        self._sse_retry_ms = 1000
+        self._sse_supported = True
         self._pending_initialize_session_id = ""
         self._session_generation = 0
         self._session_recovery_lock = asyncio.Lock()
@@ -238,6 +243,13 @@ class MCPClient:
             "notifications/initialized", {}, _allow_session_recovery=False
         )
         self._initialized = True
+        if (
+            self.config.transport in {"http", "sse"}
+            and selected != LATEST_PROTOCOL_VERSION
+            and self._sse_supported
+            and (self._sse_task is None or self._sse_task.done())
+        ):
+            self._sse_task = asyncio.create_task(self._read_http_events())
 
     async def _connect_stdio(self) -> None:
         env = build_scrubbed_environment(overrides=self.config.resolved_env)
@@ -799,6 +811,7 @@ class MCPClient:
                 self.server_capabilities = {}
                 self.server_info = {}
                 self.server_instructions = ""
+                self._stop_http_events()
                 try:
                     await self._initialize_protocol()
                 except BaseException:
@@ -815,6 +828,13 @@ class MCPClient:
                     finally:
                         self._session_ready.set()
                     raise
+                if (
+                    self.config.transport in {"http", "sse"}
+                    and self.protocol_version != LATEST_PROTOCOL_VERSION
+                    and self._sse_supported
+                ):
+                    self._sse_generation += 1
+                    self._sse_task = asyncio.create_task(self._read_http_events())
                 generation = self._session_generation
         try:
             if self.session_reinitialized_handler is None:
@@ -932,9 +952,7 @@ class MCPClient:
                     )
                     task = state["task"]
                     if task["taskId"] != task_id:
-                        raise MCPProtocolError(
-                            "MCP tasks/get returned another taskId"
-                        )
+                        raise MCPProtocolError("MCP tasks/get returned another taskId")
                     status = task["status"]
                     continue
 
@@ -1203,6 +1221,7 @@ class MCPClient:
 
     async def disconnect(self) -> None:
         self._initialized = False
+        self._stop_http_events()
         self._fail_pending(
             MCPProtocolError(f"MCP server {self.config.name!r} disconnected")
         )
@@ -1255,6 +1274,82 @@ class MCPClient:
                 response.raise_for_status()
         except (httpx.HTTPError, MCPOAuthError):
             return
+
+    async def _read_http_events(self) -> None:
+        generation = self._sse_generation
+        while self._initialized and generation == self._sse_generation:
+            if not self._sse_supported or self._http is None:
+                return
+            headers = httpx.Headers(self.config.resolved_headers)
+            headers["Accept"] = "text/event-stream"
+            if self._http_session_id:
+                headers["Mcp-Session-Id"] = self._http_session_id
+            if self.protocol_version:
+                headers["MCP-Protocol-Version"] = self.protocol_version
+            if self._sse_last_event_id:
+                headers["Last-Event-ID"] = self._sse_last_event_id
+            if self._oauth is not None:
+                headers["Authorization"] = await self._oauth.authorization_header()
+            try:
+                async with self._http.stream(
+                    "GET", self.config.resolved_url, headers=headers
+                ) as response:
+                    if response.status_code == 405:
+                        self._sse_supported = False
+                        return
+                    response.raise_for_status()
+                    content_type = (
+                        response.headers.get("content-type", "")
+                        .split(";", 1)[0]
+                        .strip()
+                        .casefold()
+                    )
+                    if content_type != "text/event-stream":
+                        raise MCPProtocolError(
+                            "MCP HTTP GET stream must use text/event-stream"
+                        )
+                    retry_ms: int | None = None
+                    data_lines: list[str] = []
+                    event_id = ""
+                    async for raw_line in response.aiter_lines():
+                        line = raw_line.rstrip("\r")
+                        if line.startswith("retry:"):
+                            try:
+                                retry_ms = max(0, int(line[6:].strip()))
+                            except ValueError as exc:
+                                raise MCPProtocolError(
+                                    "MCP SSE stream contained an invalid retry field"
+                                ) from exc
+                            continue
+                        if line.startswith("id:"):
+                            event_id = line[3:].strip()
+                            continue
+                        if line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip())
+                            continue
+                        if line:
+                            continue
+                        if event_id:
+                            self._sse_last_event_id = event_id
+                        if retry_ms is not None:
+                            self._sse_retry_ms = retry_ms
+                            retry_ms = None
+                        if data_lines and any(data_lines):
+                            payload = json.loads("\n".join(data_lines))
+                            if isinstance(payload, dict):
+                                self._dispatch_incoming(payload)
+                        data_lines.clear()
+                        event_id = ""
+            except (httpx.HTTPError, MCPProtocolError):
+                pass
+            await asyncio.sleep(self._sse_retry_ms / 1000)
+
+    def _stop_http_events(self) -> None:
+        self._sse_generation += 1
+        task = self._sse_task
+        self._sse_task = None
+        if task is not None:
+            task.cancel()
 
 
 def _validate_http_session_id(session_id: str) -> None:

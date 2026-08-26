@@ -1959,6 +1959,87 @@ async def test_streamable_http_tracks_session_and_parses_sse() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_get_stream_dispatches_events_and_honors_405() -> None:
+    requests: list[httpx.Request] = []
+    mode = {"get": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            requests.append(request)
+            if not mode["get"]:
+                return httpx.Response(405)
+            body = (
+                "retry: 5\n"
+                'id: event-1\ndata: {"jsonrpc":"2.0","method":"notifications/message",'
+                '"params":{"level":"info","data":"ready"}}\n'
+                "\n"
+            )
+            return httpx.Response(
+                200,
+                text=body,
+                headers={"content-type": "text/event-stream"},
+            )
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        payload = json.loads(request.content)
+        if payload["method"] == "initialize":
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": "stream-session"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                    },
+                },
+            )
+        if payload["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": []},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    notifications = []
+    client.notification_handler = lambda method, params: notifications.append(method)
+    await client.connect()
+    await asyncio.sleep(0.01)
+    assert notifications.count("notifications/message") >= 1
+    assert requests[0].headers["Accept"] == "text/event-stream"
+    assert requests[0].headers["Mcp-Session-Id"] == "stream-session"
+    assert requests[0].headers["MCP-Protocol-Version"] == "2025-06-18"
+    assert "Last-Event-ID" not in requests[0].headers
+
+    mode["get"] = False
+    client._sse_supported = True
+    client._sse_generation += 1
+    client._sse_task = asyncio.create_task(client._read_http_events())
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if client._sse_supported is False:
+            break
+    assert requests[-1].headers.get("Last-Event-ID") == "event-1"
+    assert client._sse_supported is False
+
+    await client.disconnect()
+    await http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_http_recovers_expired_session_without_replaying_tool_call() -> None:
     trace: list[tuple[str, str | None, int | None]] = []
     initialize_count = 0
