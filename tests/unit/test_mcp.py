@@ -1575,7 +1575,7 @@ async def test_async_client_initializes_lists_and_calls_tools() -> None:
         env={},
     )
     client = MCPClient(config)
-    await client.connect()
+    await asyncio.wait_for(client.connect(), timeout=1)
     try:
         assert client.protocol_version == "2025-06-18"
         assert client.server_info == {"name": "fake", "version": "1"}
@@ -1636,7 +1636,7 @@ async def test_stdio_client_accepts_bounded_rich_results_above_64_kib() -> None:
         env={},
     )
     client = MCPClient(config)
-    await client.connect()
+    await asyncio.wait_for(client.connect(), timeout=1)
     try:
         text = "x" * 70_000
         result = await client.call_tool("echo", {"text": text})
@@ -3795,3 +3795,118 @@ async def test_refresh_storm_is_bounded_and_reported(tmp_path: Path) -> None:
         )
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_sse_discovers_endpoint_and_receives_async_response() -> None:
+    requests: list[tuple[str, str]] = []
+    initialized = asyncio.Event()
+
+    class StreamingSSETransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            requests.append((request.method, str(request.url)))
+            if request.url.path != "/sse":
+                return httpx.Response(202)
+
+            class SSEStream(httpx.AsyncByteStream):
+                async def __aiter__(self):
+                    yield b"event: endpoint\ndata: /messages?session=legacy-1\n\n"
+                    yield (
+                        'event: message\ndata: {"jsonrpc":"2.0","id":1,'
+                        '"result":{"protocolVersion":"2025-06-18","capabilities":{}}}\n\n'
+                    ).encode()
+                    yield (
+                        'event: message\ndata: {"jsonrpc":"2.0","id":2,'
+                        '"result":{"tools":[]}}\n\n'
+                    ).encode()
+                    yield (
+                        'event: message\ndata: {"jsonrpc":"2.0",'
+                        '"method":"notifications/message","params":{"level":"info",'
+                        '"data":"ready"}}\n\n'
+                    ).encode()
+                    await initialized.wait()
+
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=SSEStream(),
+            )
+
+    http = httpx.AsyncClient(transport=StreamingSSETransport())
+    client = MCPClient(
+        MCPServerConfig(
+            name="legacy",
+            command="",
+            args=[],
+            env={},
+            transport="sse",
+            url="https://legacy.example.test/sse",
+        ),
+        http_client=http,
+    )
+    notifications: list[str] = []
+    client.notification_handler = lambda method, params: notifications.append(method)
+    await asyncio.wait_for(client.connect(), timeout=1)
+    tools = await asyncio.wait_for(client.list_tools(), timeout=1)
+    initialized.set()
+    await asyncio.wait_for(
+        client.notify(
+            "notifications/initialized",
+            {},
+            _allow_session_recovery=False,
+        ),
+        timeout=1,
+    )
+    assert tools == []
+    assert client._pending == {}
+    assert client._legacy_sse_endpoint == (
+        "https://legacy.example.test/messages?session=legacy-1"
+    )
+    assert "notifications/message" in notifications
+    await client.disconnect()
+    await http.aclose()
+    assert all(method != "DELETE" for method, _ in requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_body", "message"),
+    [
+        ("", "requires an endpoint event"),
+        (
+            "event: wrong\ndata: https://other.test/messages\n\n",
+            "requires an endpoint event",
+        ),
+        (
+            "event: endpoint\ndata: https://attacker.test/messages\n\n",
+            "origin does not match",
+        ),
+    ],
+)
+async def test_legacy_sse_rejects_invalid_discovery(
+    event_body: str,
+    message: str,
+) -> None:
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                text=event_body,
+                headers={"content-type": "text/event-stream"},
+            )
+        )
+    )
+    client = MCPClient(
+        MCPServerConfig(
+            name="legacy",
+            command="",
+            args=[],
+            env={},
+            transport="sse",
+            url="https://legacy.example.test/sse",
+        ),
+        http_client=http,
+    )
+    with pytest.raises(MCPProtocolError, match=message):
+        await client.connect()
+    await http.aclose()

@@ -7,6 +7,12 @@ All notable changes to Ash are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Added compatibility for the deprecated MCP HTTP+SSE transport: the client
+  opens one persistent event stream, discovers the POST endpoint before
+  initialization, resolves and enforces its origin, routes requests and
+  notifications to the discovered endpoint, matches early asynchronous replies,
+  dispatches server messages, bounds event sizes and buffered replies, and
+  fails closed when discovery is missing or invalid.
 - Added MCP `tasks/list` support with capability fail-closed checks, opaque
   cursor pagination, cursor-loop protection, bounded page traversal, and strict
   task-state validation for remote task observability.

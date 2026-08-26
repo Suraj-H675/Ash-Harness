@@ -7,6 +7,7 @@ import inspect
 import json
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 from typing import Any, Awaitable, Callable
 
 import httpx
@@ -30,6 +31,8 @@ SUPPORTED_PROTOCOL_VERSIONS = frozenset(
 MAX_PAGINATION_PAGES = 100
 MAX_PAGINATION_SESSION_RESTARTS = 1
 MAX_STDIO_MESSAGE_BYTES = 8 * 1024 * 1024
+MAX_LEGACY_SSE_EVENT_BYTES = 8 * 1024 * 1024
+MAX_BUFFERED_LEGACY_SSE_RESPONSES = 1000
 MAX_HTTP_SESSION_ID_BYTES = 1024
 MIN_TASK_POLL_INTERVAL_SECONDS = 0.01
 MAX_TASK_POLL_INTERVAL_SECONDS = 30.0
@@ -70,6 +73,12 @@ class MCPSessionExpired(MCPProtocolError):
         super().__init__("MCP Streamable HTTP session expired with 404 Not Found")
         self.session_id = session_id
         self.generation = generation
+
+
+class _EndpointDiscovered(Exception):
+    def __init__(self, endpoint: str) -> None:
+        super().__init__("legacy MCP SSE endpoint discovered")
+        self.endpoint = endpoint
 
 
 class MCPTaskTimeout(MCPProtocolError):
@@ -128,6 +137,9 @@ class MCPClient:
         self._http: httpx.AsyncClient | None = http_client
         self._owns_http = http_client is None
         self._http_session_id = ""
+        self._legacy_sse_endpoint = ""
+        self._legacy_sse_discovery: asyncio.Future[None] | None = None
+        self._legacy_sse_responses: dict[int, dict[str, Any]] = {}
         self._sse_task: asyncio.Task[None] | None = None
         self._sse_generation = 0
         self._sse_last_event_id = ""
@@ -185,6 +197,14 @@ class MCPClient:
                     self._http = httpx.AsyncClient(timeout=self.timeout)
                 if self._oauth is not None and self._oauth.http_client is None:
                     self._oauth.http_client = self._http
+                if self.config.transport == "sse":
+                    self._legacy_sse_discovery = (
+                        asyncio.get_running_loop().create_future()
+                    )
+                    self._sse_task = asyncio.create_task(
+                        self._read_legacy_sse_events(self._sse_generation + 1)
+                    )
+                    await asyncio.shield(self._legacy_sse_discovery)
             else:
                 raise MCPProtocolError(
                     f"Unsupported MCP transport: {self.config.transport}"
@@ -571,6 +591,8 @@ class MCPClient:
         expected_tool_contract: tuple[str, str] | None = None,
         bypass_session_readiness: bool = False,
     ) -> dict[str, Any]:
+        if self.config.transport == "sse":
+            return await self._request_legacy_sse(request_id, payload)
         response_http = await self._post_http(
             payload,
             expected_tool_contract=expected_tool_contract,
@@ -589,6 +611,54 @@ class MCPClient:
         if matching is None:
             raise MCPProtocolError(f"MCP HTTP response omitted request id {request_id}")
         return matching
+
+    async def _request_legacy_sse(
+        self,
+        request_id: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        endpoint = self._legacy_sse_endpoint
+        if not endpoint:
+            if self._legacy_sse_discovery is None:
+                raise MCPProtocolError("MCP SSE client is not connected")
+            await asyncio.shield(self._legacy_sse_discovery)
+            endpoint = self._legacy_sse_endpoint
+        if not endpoint:
+            raise MCPProtocolError("MCP SSE server did not advertise a POST endpoint")
+        buffered = self._legacy_sse_responses.pop(request_id, None)
+        if buffered is not None:
+            return buffered
+        future: asyncio.Future[dict[str, Any]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._pending[request_id] = future
+        try:
+            await self._post_legacy_sse(endpoint, payload)
+            return await asyncio.wait_for(future, timeout=self.timeout)
+        finally:
+            if self._pending.get(request_id) is future:
+                self._pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+
+    async def _post_legacy_sse(
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if self._http is None:
+            raise MCPProtocolError("MCP HTTP client is not connected")
+        headers = httpx.Headers(self.config.resolved_headers)
+        headers["Accept"] = "application/json"
+        headers["Content-Type"] = "application/json"
+        if self._oauth is not None:
+            headers["Authorization"] = await self._oauth.authorization_header()
+        response = await self._http.post(
+            endpoint,
+            json=payload,
+            headers=headers,
+        )
+        response.raise_for_status()
 
     async def _cancel_request(self, request_id: int, reason: str) -> None:
         if self.config.transport != "stdio" and not self._initialized:
@@ -642,6 +712,16 @@ class MCPClient:
                     (json.dumps(payload, separators=(",", ":")) + "\n").encode()
                 )
                 await self._process.stdin.drain()
+            return
+        if self.config.transport == "sse":
+            endpoint = self._legacy_sse_endpoint
+            if not endpoint:
+                if self._legacy_sse_discovery is None:
+                    raise MCPProtocolError("MCP SSE client is not connected")
+                await asyncio.shield(self._legacy_sse_discovery)
+                endpoint = self._legacy_sse_endpoint
+            if endpoint:
+                await self._post_legacy_sse(endpoint, payload)
             return
         if _allow_session_recovery:
             async with self._session_recovery_lock:
@@ -1222,11 +1302,17 @@ class MCPClient:
     async def disconnect(self) -> None:
         self._initialized = False
         self._stop_http_events()
+        if self._legacy_sse_discovery and not self._legacy_sse_discovery.done():
+            self._legacy_sse_discovery.set_exception(
+                MCPProtocolError(f"MCP server {self.config.name!r} disconnected")
+            )
+        self._legacy_sse_discovery = None
+        self._legacy_sse_endpoint = ""
         self._fail_pending(
             MCPProtocolError(f"MCP server {self.config.name!r} disconnected")
         )
         session_to_close = self._http_session_id or self._pending_initialize_session_id
-        if session_to_close:
+        if session_to_close and self.config.transport != "sse":
             await self._delete_http_session(session_to_close)
         self._http_session_id = ""
         if self._http is not None and self._owns_http:
@@ -1275,8 +1361,171 @@ class MCPClient:
         except (httpx.HTTPError, MCPOAuthError):
             return
 
+    async def _read_legacy_sse_events(self, generation: int) -> None:
+        if self._http is None:
+            raise MCPProtocolError("MCP HTTP client is not connected")
+        headers = httpx.Headers(self.config.resolved_headers)
+        headers["Accept"] = "text/event-stream"
+        if self._oauth is not None:
+            headers["Authorization"] = await self._oauth.authorization_header()
+
+        try:
+            async with self._http.stream(
+                "GET", self.config.resolved_url, headers=headers
+            ) as response:
+                response.raise_for_status()
+                content_type = (
+                    response.headers.get("content-type", "")
+                    .split(";", 1)[0]
+                    .strip()
+                    .casefold()
+                )
+                if content_type != "text/event-stream":
+                    raise MCPProtocolError(
+                        "MCP SSE discovery must use text/event-stream"
+                    )
+                event_name = ""
+                data_lines: list[str] = []
+                event_bytes = 0
+                endpoint_discovered = False
+
+                def finish_event() -> None:
+                    nonlocal event_name, data_lines, event_bytes
+                    nonlocal endpoint_discovered
+                    event_data = "\n".join(data_lines)
+                    data_lines = []
+                    name = event_name
+                    event_name = ""
+                    event_bytes = 0
+                    if name == "endpoint" and event_data:
+                        try:
+                            resolved_endpoint = urljoin(
+                                self.config.resolved_url, event_data
+                            )
+                            source = urlparse(self.config.resolved_url)
+                            target = urlparse(resolved_endpoint)
+                        except ValueError as exc:
+                            raise MCPProtocolError(
+                                "MCP SSE server advertised an invalid URL"
+                            ) from exc
+                        if (
+                            (source.scheme, source.netloc)
+                            != (target.scheme, target.netloc)
+                            or target.scheme not in {"http", "https"}
+                            or not target.netloc
+                        ):
+                            raise MCPProtocolError(
+                                "MCP SSE POST endpoint origin does not match "
+                                "the connection origin: "
+                                f"{event_data}"
+                            )
+                        self._legacy_sse_endpoint = resolved_endpoint
+                        if (
+                            self._legacy_sse_discovery
+                            and not self._legacy_sse_discovery.done()
+                        ):
+                            self._legacy_sse_discovery.set_result(None)
+                        endpoint_discovered = True
+                        return
+                    if name != "message" or not event_data:
+                        return
+                    try:
+                        payload = json.loads(event_data)
+                    except json.JSONDecodeError as exc:
+                        raise MCPProtocolError(
+                            "MCP SSE event contained invalid JSON"
+                        ) from exc
+                    if not isinstance(payload, dict):
+                        raise MCPProtocolError(
+                            "MCP SSE data must contain a JSON-RPC object"
+                        )
+                    _validate_jsonrpc_message(payload)
+                    if (
+                        "method" not in payload
+                        and isinstance(payload.get("id"), int)
+                        and not isinstance(payload.get("id"), bool)
+                    ):
+                        response_id = payload["id"]
+                        pending = self._pending.get(response_id)
+                        if pending is None:
+                            if len(self._legacy_sse_responses) >= (
+                                MAX_BUFFERED_LEGACY_SSE_RESPONSES
+                            ):
+                                raise MCPProtocolError(
+                                    "MCP SSE response buffer exceeded "
+                                    f"{MAX_BUFFERED_LEGACY_SSE_RESPONSES} entries"
+                                )
+                            self._legacy_sse_responses[response_id] = payload
+                        else:
+                            self._pending.pop(response_id, None)
+                            if pending.done():
+                                return
+                            pending.set_result(payload)
+                    else:
+                        self._dispatch_incoming(payload)
+
+                while not endpoint_discovered:
+                    async for raw_line in response.aiter_lines():
+                        line = raw_line.rstrip("\r")
+                        event_bytes += len(line.encode()) + 1
+                        if event_bytes > MAX_LEGACY_SSE_EVENT_BYTES:
+                            raise MCPProtocolError(
+                                f"MCP SSE event exceeded "
+                                f"{MAX_LEGACY_SSE_EVENT_BYTES} bytes"
+                            )
+                        if line.startswith("retry:"):
+                            try:
+                                self._sse_retry_ms = max(0, int(line[6:].strip()))
+                            except ValueError as exc:
+                                raise MCPProtocolError(
+                                    "MCP SSE stream contained an invalid retry field"
+                                ) from exc
+                        elif line.startswith("event:"):
+                            event_name = line[6:].strip()
+                        elif line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip())
+                        elif not line:
+                            finish_event()
+                    break
+                if not endpoint_discovered:
+                    raise MCPProtocolError(
+                        "MCP SSE discovery requires an endpoint event before "
+                        "the first message"
+                    )
+                async for raw_line in response.aiter_lines():
+                    line = raw_line.rstrip("\r")
+                    event_bytes += len(line.encode()) + 1
+                    if event_bytes > MAX_LEGACY_SSE_EVENT_BYTES:
+                        raise MCPProtocolError(
+                            f"MCP SSE event exceeded {MAX_LEGACY_SSE_EVENT_BYTES} bytes"
+                        )
+                    if line.startswith("retry:"):
+                        try:
+                            self._sse_retry_ms = max(0, int(line[6:].strip()))
+                        except ValueError as exc:
+                            raise MCPProtocolError(
+                                "MCP SSE stream contained an invalid retry field"
+                            ) from exc
+                    elif line.startswith("event:"):
+                        event_name = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                    elif not line:
+                        finish_event()
+        except (httpx.HTTPError, MCPProtocolError) as exc:
+            error = (
+                exc
+                if isinstance(exc, MCPProtocolError)
+                else MCPProtocolError(f"Could not connect to MCP SSE endpoint: {exc}")
+            )
+            if self._legacy_sse_discovery and not self._legacy_sse_discovery.done():
+                self._legacy_sse_discovery.set_exception(error)
+            return
+
     async def _read_http_events(self) -> None:
         generation = self._sse_generation
+        if self.config.transport == "sse":
+            return await self._read_legacy_sse_events(generation)
         while self._initialized and generation == self._sse_generation:
             if not self._sse_supported or self._http is None:
                 return
@@ -1308,14 +1557,13 @@ class MCPClient:
                         raise MCPProtocolError(
                             "MCP HTTP GET stream must use text/event-stream"
                         )
-                    retry_ms: int | None = None
                     data_lines: list[str] = []
                     event_id = ""
                     async for raw_line in response.aiter_lines():
                         line = raw_line.rstrip("\r")
                         if line.startswith("retry:"):
                             try:
-                                retry_ms = max(0, int(line[6:].strip()))
+                                self._sse_retry_ms = max(0, int(line[6:].strip()))
                             except ValueError as exc:
                                 raise MCPProtocolError(
                                     "MCP SSE stream contained an invalid retry field"
@@ -1331,9 +1579,6 @@ class MCPClient:
                             continue
                         if event_id:
                             self._sse_last_event_id = event_id
-                        if retry_ms is not None:
-                            self._sse_retry_ms = retry_ms
-                            retry_ms = None
                         if data_lines and any(data_lines):
                             payload = json.loads("\n".join(data_lines))
                             if isinstance(payload, dict):
