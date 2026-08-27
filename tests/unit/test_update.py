@@ -3,10 +3,11 @@ from __future__ import annotations
 import io
 import json
 import urllib.error
+from types import SimpleNamespace
 
 import pytest
 
-from ash.commands.update import check_for_update, render_update_status
+from ash.commands.update import apply_update, check_for_update, render_update_status
 
 
 class Response(io.BytesIO):
@@ -72,3 +73,30 @@ def test_update_check_handles_missing_and_invalid_releases() -> None:
                 {"tag_name": "latest", "html_url": "https://example.test/release"}
             ),
         )
+
+
+def test_apply_update_uses_uv_clear_and_preserves_install_boundary(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr("ash.commands.update.shutil.which", lambda name: "/usr/bin/pipx")
+
+    def runner(command, *, env, check):
+        calls.append((command, env, check))
+        return SimpleNamespace(returncode=0)
+
+    assert apply_update(runner=runner) == 0
+    command, env, check = calls[0]
+    assert command == [
+        "/usr/bin/pipx",
+        "install",
+        "--force",
+        "ash-ai @ git+https://github.com/Suraj-H675/Ash-Harness.git",
+    ]
+    assert env["UV_VENV_CLEAR"] == "1"
+    assert check is False
+
+
+def test_apply_update_explains_missing_pipx(monkeypatch) -> None:
+    monkeypatch.setattr("ash.commands.update.shutil.which", lambda name: None)
+
+    with pytest.raises(ValueError, match="pipx is not installed"):
+        apply_update(runner=lambda *args, **kwargs: None)

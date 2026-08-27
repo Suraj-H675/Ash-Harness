@@ -12,8 +12,13 @@ one command. Paste the install command as one physical line; a line break
 inside the quotes makes `pipx` reject the package spec.
 
 ```bash
-pipx install --force 'git+https://github.com/Suraj-H675/Ash-Harness.git'
+UV_VENV_CLEAR=1 pipx install --force 'ash-ai @ git+https://github.com/Suraj-H675/Ash-Harness.git'
 ```
+
+The `UV_VENV_CLEAR=1` prefix makes upgrades work when pipx is using its uv
+backend and the `ash-ai` environment already exists. It is safe for a fresh
+install. In PowerShell, use
+`$env:UV_VENV_CLEAR='1'; pipx install --force 'ash-ai @ git+https://github.com/Suraj-H675/Ash-Harness.git'`.
 
 If `ash` is not found after installation, run `pipx ensurepath`, restart your
 terminal, and then continue below.
@@ -36,10 +41,10 @@ The default install includes the terminal harness, coding tools, repository
 map, and supported API/local providers. Install optional features explicitly:
 
 ```bash
-pipx install --force 'ash-ai[server] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
-pipx install --force 'ash-ai[vector] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
-pipx install --force 'ash-ai[acp] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
-pipx install --force 'ash-ai[a2a] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+UV_VENV_CLEAR=1 pipx install --force 'ash-ai[server] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+UV_VENV_CLEAR=1 pipx install --force 'ash-ai[vector] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+UV_VENV_CLEAR=1 pipx install --force 'ash-ai[acp] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+UV_VENV_CLEAR=1 pipx install --force 'ash-ai[a2a] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
 ```
 
 Choose the extras needed by one installation, for example
@@ -91,6 +96,7 @@ ash mcp add remote --transport http --url https://mcp.example/rpc --auth oauth
 ash mcp login remote            # explicit browser authorization
 ash trust add .                  # allow project instructions, extensions, MCP, LSP
 ash update                       # explicitly check GitHub releases
+ash update --apply               # self-repair/reinstall the current pipx checkout
 ASH_SERVER_TOKEN=change-me-long-token ash serve # requires ash-ai[server]
 ash storage check --json         # read-only session DB integrity check
 ash storage backup               # consistent timestamped backup
@@ -136,7 +142,7 @@ retention behavior.
 Install the capability pack, configure a provider once, and verify the agent:
 
 ```bash
-pipx install --force 'ash-ai[acp] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+UV_VENV_CLEAR=1 pipx install --force 'ash-ai[acp] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
 ash setup
 ash acp --check
 ```
@@ -158,7 +164,7 @@ Install and verify the optional capability pack, then expose the current
 project on loopback with an operator-owned token:
 
 ```bash
-pipx install --force 'ash-ai[a2a] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+UV_VENV_CLEAR=1 pipx install --force 'ash-ai[a2a] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
 ash a2a check
 export ASH_A2A_TOKEN='replace-with-at-least-16-characters'
 ash a2a serve
@@ -410,7 +416,7 @@ and provider; fetch citations include final URL, status, and content type.
 Citations are also exposed to the model with each tool response.
 
 Browser automation is an optional capability pack. Install with
-`pipx install --force 'ash-ai[browser] @ git+https://github.com/Suraj-H675/Ash-Harness.git'`,
+`UV_VENV_CLEAR=1 pipx install --force 'ash-ai[browser] @ git+https://github.com/Suraj-H675/Ash-Harness.git'`,
 then run `ash setup browser` once to download
 Playwright's pinned Chromium build. Browser pages use an isolated context with
 `browser_screenshot` captures a bounded PNG for vision-capable models, returning

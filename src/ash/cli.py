@@ -1859,6 +1859,11 @@ def main(argv: list[str] | None = None) -> int:
         "update", help="Check GitHub for a newer Ash release"
     )
     update_parser.add_argument("--json", action="store_true")
+    update_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Reinstall the current Ash checkout through pipx",
+    )
     storage_parser = subparsers.add_parser(
         "storage", help="Check, back up, or restore the session database"
     )
@@ -2558,9 +2563,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "update":
-        from ash.commands.update import check_for_update, render_update_status
+        from ash.commands.update import apply_update, check_for_update, render_update_status
 
         try:
+            if args.apply:
+                return apply_update()
             update_status = check_for_update(current_version=version)
         except ValueError as exc:
             if args.json:
