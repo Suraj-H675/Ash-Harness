@@ -52,5 +52,5 @@ def test_help_filters_by_command_alias_and_description() -> None:
 def test_help_lists_mcp_authorization_actions() -> None:
     rendered = render_help("mcp")
 
-    assert "/mcp [status|refresh [SERVER]|login SERVER|logout SERVER|" in rendered
+    assert "/mcp [status [--json]|refresh [SERVER]|login SERVER|logout SERVER|" in rendered
     assert "Inspect, authorize, or reload live MCP servers" in rendered

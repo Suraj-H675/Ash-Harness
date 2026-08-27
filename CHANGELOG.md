@@ -7,6 +7,8 @@ All notable changes to Ash are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Added live interactive `/mcp status` reporting with text and JSON output,
+  transport/auth state, discovered-tool counts, and bounded redacted errors.
 - Added MCP `2026-07-28` stdio dual-era detection: connections now probe
   `server/discover` with modern request metadata, strictly validate discovery
   results, fail deterministically for modern-only servers or advertised newer
@@ -56,6 +58,11 @@ All notable changes to Ash are documented here. The format follows
   installs without a signed catalog retain existing HTTPS Git behavior.
 
 ### Fixed
+- Restored interactive `/reload-plugins`, which now performs its atomic
+  component refresh instead of returning before the reload call.
+- Fixed interactive MCP status/refresh dispatch so the handler is reachable,
+  `--json` is parsed before validation, and targeted recovery reports the
+  requested server correctly.
 - Closed a `path_prefix` permission-rule escape by lexically resolving
   traversal segments before workspace-prefix matching, so approved directory
   scopes cannot match sibling or outside paths through `..`.

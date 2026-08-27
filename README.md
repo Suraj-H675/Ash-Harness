@@ -11,7 +11,7 @@ Python 3.11 or newer is required. Install the latest repository version with
 one command:
 
 ```bash
-pipx install 'git+https://github.com/Suraj-H675/Ash-Harness.git'
+pipx install --force 'ash-ai @ git+https://github.com/Suraj-H675/Ash-Harness.git'
 ```
 
 Then configure and verify the runtime:

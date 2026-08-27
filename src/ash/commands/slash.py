@@ -94,7 +94,7 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand(
         "mcp",
         "Inspect, authorize, or reload live MCP servers and capabilities",
-        "/mcp [status|refresh [SERVER]|login SERVER|logout SERVER|tools|resources|prompts|tasks|cancel SERVER TASK_ID]",
+        "/mcp [status [--json]|refresh [SERVER]|login SERVER|logout SERVER|tools|resources|prompts|tasks|cancel SERVER TASK_ID]",
     ),
     SlashCommand(
         "memory",

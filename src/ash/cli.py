@@ -1169,7 +1169,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             if command.name == "reload-plugins":
                 if arguments:
                     print(f"Usage: {command.usage}", file=sys.stderr)
-                continue
+                    continue
                 try:
                     print(await reload_plugin_components(), flush=True)
                 except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -1454,6 +1454,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 print(render_doctor(await run_doctor()), flush=True)
                 continue
             if command.name == "mcp":
+                json_output = "--json" in arguments
+                if json_output:
+                    arguments = [item for item in arguments if item != "--json"]
                 action = arguments[0] if arguments else "status"
                 if (
                     (action == "cancel" and len(arguments) != 3)
@@ -1463,6 +1466,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         and len(arguments) > 1
                     )
                     or (action == "refresh" and len(arguments) > 2)
+                    or (json_output and action != "status")
                     or action
                     not in {
                         "status",
@@ -1522,11 +1526,22 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     await reload_plugin_components()
                     continue
                 if action == "status":
-                    for name in loop._mcp_configs:
-                        state = "connected" if name in runtime.clients else "failed"
-                        print(f"{name}: {state}")
-                    for name, error in runtime.errors.items():
-                        print(f"{name}: {error}", file=sys.stderr)
+                    statuses = runtime.status_snapshot()
+                    if json_output:
+                        print(json.dumps({"servers": statuses}, sort_keys=True))
+                    else:
+                        if not statuses:
+                            print("No MCP servers configured.")
+                        for status in statuses:
+                            suffix = (
+                                f"; tools={status['tools']}" if status["tools"] else ""
+                            )
+                            print(
+                                f"{status['name']}: {status['state']} "
+                                f"[{status['transport']}/{status['auth']}]{suffix}"
+                            )
+                            for error in status["errors"]:
+                                print(f"  error: {error}", file=sys.stderr)
                     continue
                 if action == "refresh":
                     errors: dict[str, str] = {}
@@ -1551,7 +1566,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             )
                             transition = (
                                 "recovered"
-                                if target not in before and state == "connected"
+                                if refresh_target not in before and state == "connected"
                                 else state
                             )
                             print(f"{refresh_target}: {transition}")

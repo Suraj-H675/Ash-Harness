@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from ash.mcp.client import MCPClient, MCPProtocolError
 from ash.mcp.server import MCPServerConfig
+from ash.core.redaction import redact_text
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
 from ash.sandbox.process_utils import (
@@ -970,6 +971,43 @@ class MCPRuntime:
 
     def server_tools_snapshot(self) -> dict[str, dict[str, BaseTool]]:
         return {name: dict(tools) for name, tools in self._server_tools.items()}
+
+    def status_snapshot(self) -> list[dict[str, Any]]:
+        """Return safe, bounded live status for every configured server."""
+
+        max_error_chars = 512
+        max_errors = 16
+        output: list[dict[str, Any]] = []
+        for name in self.configs:
+            config = self.configs[name]
+            connected = name in self.clients
+            server_errors = {
+                key.removeprefix(f"{name}:"): str(value)
+                for key, value in self.errors.items()
+                if key == name or key.startswith(f"{name}:")
+            }
+            errors = []
+            error_keys = sorted(server_errors)
+            for key in error_keys[:max_errors]:
+                error = redact_text(server_errors[key]).strip()
+                if len(error) > max_error_chars:
+                    error = error[: max_error_chars - 3] + "..."
+                errors.append(error)
+            if len(error_keys) > max_errors:
+                errors.append(
+                    f"... {len(error_keys) - max_errors} additional errors omitted"
+                )
+            output.append(
+                {
+                    "name": name,
+                    "transport": config.transport,
+                    "auth": config.auth,
+                    "state": "connected" if connected else "failed",
+                    "tools": len(self._server_tools.get(name, {})),
+                    "errors": errors,
+                }
+            )
+        return output
 
     def _build_server_tools(
         self,

@@ -1,7 +1,7 @@
 # Ash Harness Research and Target Architecture
 
 Status: active architecture record  
-Research date: 2026-07-10  
+Research date: 2026-08-27
 Scope: local coding harness plus extensible general-purpose agent platform
 
 This document supersedes earlier project plans as a source of architectural
@@ -10,8 +10,8 @@ Decisions here come from the running Ash implementation, current protocol
 specifications, and the reference repositories pinned below.
 
 No source code from a reference repository was copied during this audit. Ash
-does not yet declare a license, so source adaptation is blocked until the
-project owner selects one and attribution requirements can be satisfied.
+is distributed under the MIT license; reference behavior is used for design
+comparison only, with source adaptation still subject to attribution review.
 
 ## Executive Conclusion
 
@@ -25,26 +25,25 @@ tool calling with an XML fallback, filesystem and command tools, granular
 permissions, OS/container sandbox selection, durable SQLite sessions,
 checkpoints and rewind, provider retries/failover, MCP tools/resources/prompts,
 skills, declarative plugins, subagents with worktree isolation, a TUI, SDK, and
-authenticated HTTP/JSON-RPC adapters. The initial full suite contained 925
-passing tests before this audit.
+authenticated HTTP/JSON-RPC adapters. The current full suite contains 1,497
+passing tests, with 4 environment-dependent skips on this host.
 
 Ash is not yet the universal harness described by the project goal. The largest
-missing domains are:
+remaining domains are:
 
-1. A stable canonical event and provider contract independent of any one model
-   API or the legacy XML protocol.
-2. Current MCP client capabilities and authentication.
+1. Richer provider-neutral content blocks and model-assisted compaction beyond
+   the deterministic, provenance-preserving fallback.
+2. Full multi-vendor MCP OAuth conformance and the remaining edge behavior of
+   experimental tasks and resumable transports.
 3. Broader executable plugin capabilities for providers, storage, interfaces,
-   channels, and services. Plugin API v1 now covers isolated tool contributions
-   without importing Ash internals.
-4. Durable session trees and resumable operations rather than only linear
-   transcripts and session-level forks.
-5. Remote agent interoperability through A2A and editor/client interoperability
-   through Agent Client Protocol.
-6. Browser/computer control, web search, multimodal generation/understanding,
-   scheduling, background events, and messaging channels.
-7. OpenTelemetry-compatible traces, metrics, evaluation fixtures, and
-   performance/regression budgets.
+   channels, and services. Plugin API v1 currently covers isolated tool
+   contributions without importing Ash internals.
+4. Non-Git artifact materialization and richer A2A modalities/auth, plus
+   per-turn configuration snapshots and richer branch summaries.
+5. Browser downloads/CDP attachment and additional media, gateway routing, and
+   messaging channels.
+6. OpenTelemetry-compatible traces, evaluation fixtures, Windows CI, signed
+   release provenance, and public PyPI publication.
 
 The target should therefore be a narrow core with capability packs. Sending
 every tool and integration to every model call would increase prompt cost,
@@ -336,7 +335,7 @@ not remove them.
 
 ## Current Ash Capability Matrix
 
-| Domain | State on 2026-07-14 | Key gap |
+| Domain | State on 2026-08-27 | Key gap |
 |---|---|---|
 | Agent loop and streaming | Strong | Public event schema v1, validated provider-portable messages, typed terminal outcomes, and capability-selected native/XML paths span the runtime and adapters. EOF, truncation, filtering, post-terminal output, and cross-protocol calls fail closed; richer provider content blocks and a smaller loop remain. |
 | Provider layer | Strong partial | Built-ins, embedders, declared model capabilities, and custom OpenAI-compatible endpoints resolve through thread-safe linked registries; auth/discovery and non-text modalities remain limited. |
@@ -346,13 +345,13 @@ not remove them.
 | Memory | Partial | FTS/vector/Markdown exist; lifecycle, provenance, expiry, poisoning controls, and user workflow are incomplete. |
 | Subagents | Strong local/remote | Provider-backed local roles, shared state, steering, atomic DAG dispatch, bounded retries, restart recovery, redacted result context, and branch-verified Git artifact handoff exist. Official A2A 1.0 adds authenticated independent-agent discovery/delegation, durable tasks and context continuation, streaming, cancellation, CLI client/server, and policy-gated configured tools; non-Git artifact materialization and richer A2A modalities/auth remain. |
 | Agent Skills | Strong after `5dcbf51` | Standard parsing and progressive disclosure now exist; controlled script execution and compatibility diagnostics remain. |
-| Plugins | Partial | Declarative skills/commands/agents/hooks/MCP only; no versioned executable SDK or providers/channels/services. |
+| Plugins | Strong partial | Versioned, isolated executable tool plugins plus declarative skills/commands/agents/hooks/MCP are live; provider/storage/interface/channel/service contribution kinds remain future capabilities. |
 | Hooks | Strong partial | Hook contract v1 covers bounded/redacted session, turn, model, tool, and error lifecycle with fail-closed pre-tool denial and isolated observers. Context-compaction/config/permission-change events and explicit ordering remain. |
-| MCP | Strong partial | 2025-11-25 negotiation, strict JSON-RPC envelopes, bounded large stdio messages, exact version-aware input/output schemas, process-isolated non-coercing validation with no remote-reference retrieval, version-specific content checks, complete structured result envelopes, protocol error data, bidirectional cancellation, tools/resources/templates/prompts, roots, sampling, elicitation, progress, logging, restart-safe pagination, server requests, bounded atomic declared list-change refresh with stale-call quarantine, generation-locked Streamable HTTP POST session recovery with catalog reconciliation, and explicit OAuth 2.1 authorization/refresh/scope step-up exist. Required-task tools fail closed until the experimental lifecycle is implemented; resumable incremental SSE, deprecated HTTP+SSE discovery, experimental tasks, and live multi-vendor OAuth conformance remain. |
+| MCP | Strong partial | 2025-11-25 negotiation, strict JSON-RPC envelopes, bounded large stdio messages, exact version-aware input/output schemas, process-isolated non-coercing validation with no remote-reference retrieval, version-specific content checks, complete structured result envelopes, protocol error data, bidirectional cancellation, tools/resources/templates/prompts, roots, sampling, elicitation, progress, logging, restart-safe pagination, server requests, bounded atomic declared list-change refresh with stale-call quarantine, generation-locked Streamable HTTP POST session recovery with catalog reconciliation, experimental task listing/cancellation/execution, pre-2026 GET/SSE, legacy HTTP+SSE discovery, and explicit OAuth 2.1 authorization/refresh/scope step-up exist. Live multi-vendor OAuth conformance remains. |
 | Safety/sandbox | Strong | Needs remote/plugin identity capabilities, network proxy policy, stronger resource limits, and platform CI. |
 | CLI/TUI/SDK/API | Strong local/remote | CLI, SDK, HTTP server, ACP v1, and A2A 1.0 adapters share the trusted runtime and versioned events. ACP provides bounded editor sessions and an official wire test. A2A provides authenticated/durable JSON-RPC and HTTP+JSON tasks, streaming/cancel/continuation, origin-pinned clients, and trusted delegation tools. WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, and channel adapters remain. |
 | LSP | Verified locally | Bounded LSP 3.18 stdio clients start lazily per root, honor negotiated full/incremental sync and UTF position units, support push/pull diagnostics and semantic queries, filter external URIs, require workspace trust, use scrubbed environments, bound caches/results, and shut down process trees deterministically. Rename, code actions, broader server coverage, and multi-vendor conformance remain. |
-| Browser/media | Partial | Optional Playwright/Chromium navigation, ARIA snapshots, stable refs, form/click/scroll/history actions, network policy, and deterministic cleanup are live. Screenshots/vision, downloads/uploads, profiles, and other media remain. |
+| Browser/media | Partial | Optional Playwright/Chromium navigation, ARIA snapshots, stable refs, form/click/scroll/history actions, network policy, screenshots/vision, bounded uploads, private profiles, and deterministic cleanup are live. Downloads, CDP attachment, and other media remain. |
 | Automation/channels | Partial | Durable one-shot/interval/cron prompts, atomic multi-worker claims, renewable leases, cancellation, coalescing, misfire records, CLI/SDK/model tools, liveness diagnostics, and restart recovery are verified. Webhooks, event triggers, gateway routing, pairing, and channel delivery remain. |
 | Observability/evals | Absent | Logging and audit exist, but no OTel traces/metrics or task evaluation harness. |
 | Packaging | Improved | Distribution renamed to available `ash-ai`; public PyPI release/signing still required. |
@@ -419,7 +418,7 @@ scheduled task.
 - Establish public distribution metadata, Python 3.11 support, complete dev
   dependencies, Agent Skills validation/progressive loading, and scoped skill
   resources: complete in `5dcbf51`.
-- Current verification: 1140 passed, 9 environment-dependent skips on Python
+- Current verification: 1497 passed, 4 environment-dependent skips on Python
   3.12; Ruff and mypy are clean. The managed PID-namespace subprocess waiter
   race is covered by Ash's portable process completion helper.
 
