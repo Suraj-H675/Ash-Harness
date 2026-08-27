@@ -8,11 +8,15 @@ scope; protected remote MCP servers support the MCP OAuth 2.1 flow.
 ## Install
 
 Python 3.11 or newer is required. Install the latest repository version with
-one command:
+one command. Paste the install command as one physical line; a line break
+inside the quotes makes `pipx` reject the package spec.
 
 ```bash
-pipx install --force 'ash-ai @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+pipx install --force 'git+https://github.com/Suraj-H675/Ash-Harness.git'
 ```
+
+If `ash` is not found after installation, run `pipx ensurepath`, restart your
+terminal, and then continue below.
 
 Then configure and verify the runtime:
 
