@@ -7,21 +7,28 @@ scope; protected remote MCP servers support the MCP OAuth 2.1 flow.
 
 ## Install
 
-Python 3.11 or newer is required. Install the latest repository version with
-one command. Paste the install command as one physical line; a line break
-inside the quotes makes `pipx` reject the package spec.
+Python 3.11 or newer is required. The public installer detects pipx or uv,
+repairs an existing environment, preserves selected capability extras, and
+verifies the resulting `ash` executable:
 
 ```bash
-UV_VENV_CLEAR=1 pipx install --force 'ash-ai @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 -
 ```
 
-The `UV_VENV_CLEAR=1` prefix makes upgrades work when pipx is using its uv
-backend and the `ash-ai` environment already exists. It is safe for a fresh
-install. In PowerShell, use
-`$env:UV_VENV_CLEAR='1'; pipx install --force 'ash-ai @ git+https://github.com/Suraj-H675/Ash-Harness.git'`.
+PowerShell:
 
-If `ash` is not found after installation, run `pipx ensurepath`, restart your
-terminal, and then continue below.
+```powershell
+irm https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | py -
+```
+
+The installer never modifies `~/.ash`. If pipx uses uv internally, the
+existing-venv repair flag is applied inside the installer rather than exposed
+as part of the public command. Run the downloaded installer with `--help` to
+see capability-pack and Git-ref options.
+
+If the executable directory is not already on `PATH`, the installer requests
+the appropriate pipx/uv shell update and tells you to restart the terminal. It
+also prints the verified executable path as a fallback.
 
 Then configure and verify the runtime:
 
@@ -41,16 +48,15 @@ The default install includes the terminal harness, coding tools, repository
 map, and supported API/local providers. Install optional features explicitly:
 
 ```bash
-UV_VENV_CLEAR=1 pipx install --force 'ash-ai[server] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
-UV_VENV_CLEAR=1 pipx install --force 'ash-ai[vector] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
-UV_VENV_CLEAR=1 pipx install --force 'ash-ai[acp] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
-UV_VENV_CLEAR=1 pipx install --force 'ash-ai[a2a] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra server
+curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra vector
+curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra acp
+curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra a2a
 ```
 
-Choose the extras needed by one installation, for example
-`ash-ai[server,vector]`. The direct Git reference is required until an
-`ash-ai` release is published to PyPI; `--force` also upgrades an existing
-base `pipx` installation into the selected capability pack.
+Repeat `--extra` to choose multiple capability packs, for example
+`--extra server --extra vector`. When no extras are supplied, an existing
+pipx installation keeps the extras recorded in its package metadata.
 
 For development:
 
@@ -142,7 +148,7 @@ retention behavior.
 Install the capability pack, configure a provider once, and verify the agent:
 
 ```bash
-UV_VENV_CLEAR=1 pipx install --force 'ash-ai[acp] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra acp
 ash setup
 ash acp --check
 ```
@@ -164,7 +170,7 @@ Install and verify the optional capability pack, then expose the current
 project on loopback with an operator-owned token:
 
 ```bash
-UV_VENV_CLEAR=1 pipx install --force 'ash-ai[a2a] @ git+https://github.com/Suraj-H675/Ash-Harness.git'
+curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra a2a
 ash a2a check
 export ASH_A2A_TOKEN='replace-with-at-least-16-characters'
 ash a2a serve
@@ -416,7 +422,7 @@ and provider; fetch citations include final URL, status, and content type.
 Citations are also exposed to the model with each tool response.
 
 Browser automation is an optional capability pack. Install with
-`UV_VENV_CLEAR=1 pipx install --force 'ash-ai[browser] @ git+https://github.com/Suraj-H675/Ash-Harness.git'`,
+`curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra browser`,
 then run `ash setup browser` once to download
 Playwright's pinned Chromium build. Browser pages use an isolated context with
 `browser_screenshot` captures a bounded PNG for vision-capable models, returning

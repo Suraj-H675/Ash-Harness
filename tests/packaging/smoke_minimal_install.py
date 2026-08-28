@@ -521,7 +521,8 @@ def main() -> None:
         server_env = dict(env)
         server_env["ASH_SERVER_TOKEN"] = "0123456789abcdef"
         server = run_ash("serve", cwd=workspace, env=server_env, expected=2)
-        assert "ash-ai[server]" in server.stderr
+        assert "installer.py | python3 - --extra server" in server.stderr
+        assert "pipx install" not in server.stderr
 
     print("minimal installed-wheel smoke passed")
 

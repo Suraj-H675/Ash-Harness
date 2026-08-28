@@ -559,7 +559,9 @@ class TestBrowserSetup:
         )
 
         assert setup_browser() == SetupOutcome.ERROR
-        assert "ash-ai[browser]" in capsys.readouterr().err
+        error = capsys.readouterr().err
+        assert "installer.py | python3 - --extra browser" in error
+        assert "pipx install" not in error
 
     def test_existing_browser_never_runs_installer(
         self,

@@ -1,4 +1,4 @@
-"""Canonical installation commands used by runtime remediation messages."""
+"""Canonical public installation commands used by remediation messages."""
 
 from __future__ import annotations
 
@@ -7,23 +7,31 @@ import shlex
 
 
 REPOSITORY_URL = "https://github.com/Suraj-H675/Ash-Harness.git"
+INSTALLER_URL = (
+    "https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py"
+)
 
 
-def pipx_install_command(*extras: str, ref: str | None = None) -> str:
-    """Return a self-healing pipx install command.
+def install_command(*extras: str, ref: str | None = None) -> str:
+    """Return the Ash-owned cross-platform bootstrap command.
 
-    Newer pipx releases may use uv as their virtual-environment backend.  In
-    that mode ``pipx install --force`` can fail when the target environment
-    already exists unless uv is told to clear it.  The setting is harmless for
-    fresh installs and pip-backed environments, so keep it in every generated
-    remediation command.
+    Package-manager selection and repair details live in the downloaded
+    installer, keeping generated user guidance stable as pipx and uv evolve.
     """
 
     normalized = sorted({extra.strip() for extra in extras if extra.strip()})
-    suffix = f"[{','.join(normalized)}]" if normalized else ""
-    revision = f"@{ref}" if ref else ""
-    package_spec = f"ash-ai{suffix} @ git+{REPOSITORY_URL}{revision}"
-    quoted_spec = shlex.quote(package_spec)
+    arguments = [part for extra in normalized for part in ("--extra", extra)]
+    if ref:
+        arguments.extend(("--ref", ref))
+    suffix = (
+        " " + " ".join(shlex.quote(value) for value in arguments) if arguments else ""
+    )
     if os.name == "nt":
-        return f"$env:UV_VENV_CLEAR='1'; pipx install --force {quoted_spec}"
-    return f"UV_VENV_CLEAR=1 pipx install --force {quoted_spec}"
+        return f"irm {INSTALLER_URL} | py -{suffix}"
+    return f"curl -fsSL {INSTALLER_URL} | python3 -{suffix}"
+
+
+def pipx_install_command(*extras: str, ref: str | None = None) -> str:
+    """Compatibility alias for callers that previously exposed raw pipx."""
+
+    return install_command(*extras, ref=ref)

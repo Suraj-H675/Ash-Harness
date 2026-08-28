@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
-import os
-import shutil
-import subprocess
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -14,14 +11,14 @@ from typing import Any, Callable
 
 from packaging.version import InvalidVersion, Version
 
-from ash.install import REPOSITORY_URL, pipx_install_command
+from ash.install import pipx_install_command
+from ash.installer import InstallError, InstallResult, install as install_ash
 
 
 LATEST_RELEASE_API = (
     "https://api.github.com/repos/Suraj-H675/Ash-Harness/releases/latest"
 )
 MAX_RESPONSE_BYTES = 1_000_000
-PACKAGE_SPEC = f"ash-ai @ git+{REPOSITORY_URL}"
 
 
 @dataclass(frozen=True)
@@ -86,35 +83,17 @@ def check_for_update(
     )
 
 
-def apply_update(*, runner: Callable[..., Any] = subprocess.run) -> int:
-    """Update an installed Ash checkout through pipx without shell parsing.
+def apply_update(*, installer: Callable[[], InstallResult] = install_ash) -> int:
+    """Update or repair Ash through the same verified first-run installer."""
 
-    This path is useful when Ash is already installed but its pipx environment
-    needs to be rebuilt.  It intentionally installs the repository default
-    branch rather than depending on a published release existing yet.
-    """
-
-    pipx = shutil.which("pipx")
-    if pipx is None:
-        raise ValueError(
-            "pipx is not installed. Install pipx first, then run `ash update --apply`."
-        )
-
-    environment = os.environ.copy()
-    environment["UV_VENV_CLEAR"] = "1"
-    command = [pipx, "install", "--force", PACKAGE_SPEC]
     try:
-        result = runner(command, env=environment, check=False)
-    except OSError as exc:
-        raise ValueError(f"Could not start pipx: {exc}") from exc
-
-    return_code = int(getattr(result, "returncode", 1))
-    if return_code != 0:
-        raise ValueError(
-            "Ash update failed. Retry with: "
-            f"`{pipx_install_command()}`"
-        )
-    print("Ash updated successfully. Run `ash doctor --connect` to verify it.")
+        result = installer()
+    except InstallError as exc:
+        raise ValueError(str(exc)) from exc
+    print(
+        f"Ash updated successfully ({result.version}) via {result.manager}. "
+        "Run `ash doctor --connect` to verify provider connectivity."
+    )
     return 0
 
 
@@ -126,8 +105,7 @@ def render_update_status(status: UpdateStatus, *, json_output: bool = False) -> 
             (
                 f"Ash {status.latest_version} is available (installed: {status.current_version}).",
                 f"Release: {status.release_url}",
-                "Upgrade: "
-                + pipx_install_command(ref=status.release_tag),
+                "Upgrade: " + pipx_install_command(ref=status.release_tag),
             )
         )
     return f"Ash {status.current_version} is up to date."

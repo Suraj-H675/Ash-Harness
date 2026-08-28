@@ -3,11 +3,11 @@ from __future__ import annotations
 import io
 import json
 import urllib.error
-from types import SimpleNamespace
 
 import pytest
 
 from ash.commands.update import apply_update, check_for_update, render_update_status
+from ash.installer import InstallError, InstallResult
 
 
 class Response(io.BytesIO):
@@ -40,7 +40,9 @@ def test_update_check_normalizes_release_tag_and_reports_upgrade() -> None:
     )
     assert status.update_available is True
     assert status.latest_version == "0.2.0"
-    assert "Ash-Harness.git@ash-v0.2.0" in render_update_status(status)
+    rendered = render_update_status(status)
+    assert "installer.py | python3 - --ref ash-v0.2.0" in rendered
+    assert "pipx install" not in rendered
     assert (
         json.loads(render_update_status(status, json_output=True))["update_available"]
         is True
@@ -75,28 +77,21 @@ def test_update_check_handles_missing_and_invalid_releases() -> None:
         )
 
 
-def test_apply_update_uses_uv_clear_and_preserves_install_boundary(monkeypatch) -> None:
+def test_apply_update_uses_the_same_verified_installer_as_first_run(capsys) -> None:
     calls = []
-    monkeypatch.setattr("ash.commands.update.shutil.which", lambda name: "/usr/bin/pipx")
 
-    def runner(command, *, env, check):
-        calls.append((command, env, check))
-        return SimpleNamespace(returncode=0)
+    def installer():
+        calls.append(True)
+        return InstallResult("pipx", "/isolated/bin/ash", "ash 0.2.0")
 
-    assert apply_update(runner=runner) == 0
-    command, env, check = calls[0]
-    assert command == [
-        "/usr/bin/pipx",
-        "install",
-        "--force",
-        "ash-ai @ git+https://github.com/Suraj-H675/Ash-Harness.git",
-    ]
-    assert env["UV_VENV_CLEAR"] == "1"
-    assert check is False
+    assert apply_update(installer=installer) == 0
+    assert calls == [True]
+    assert "ash 0.2.0" in capsys.readouterr().out
 
 
-def test_apply_update_explains_missing_pipx(monkeypatch) -> None:
-    monkeypatch.setattr("ash.commands.update.shutil.which", lambda name: None)
+def test_apply_update_explains_installer_failure() -> None:
+    def installer():
+        raise InstallError("Neither pipx nor uv is installed.")
 
-    with pytest.raises(ValueError, match="pipx is not installed"):
-        apply_update(runner=lambda *args, **kwargs: None)
+    with pytest.raises(ValueError, match="Neither pipx nor uv"):
+        apply_update(installer=installer)
