@@ -158,11 +158,14 @@ def run_setup_wizard(args) -> SetupOutcome:
     # Check for old ash.toml and offer migration
     _migrate_old_ash_toml()
 
-    if section in ("model", "all"):
+    if section in ("model", "providers", "all"):
         result = setup_model_provider(config, quick=quick)
         if result != SetupOutcome.SUCCESS:
             print("Setup cancelled.", file=sys.stderr)
             return result
+
+    if section == "all" and quick:
+        _print_info("QuickStart skipped optional web search and browser setup.")
 
     if section == "web" or (section == "all" and not quick):
         result = setup_web_search()
@@ -179,6 +182,11 @@ def run_setup_wizard(args) -> SetupOutcome:
 
 def setup_model_provider(config, *, quick: bool = False) -> SetupOutcome:
     """Provider + model selection — shared entry point from wizard and REPL."""
+    if quick and _has_provider_configured(config):
+        model = str(getattr(config, "model", "") or "current model")
+        _print_info(f"QuickStart reused {model}.")
+        print("Run 'ash doctor --connect' to verify endpoint connectivity.")
+        return SetupOutcome.SUCCESS
     return select_provider_and_model(config)
 
 

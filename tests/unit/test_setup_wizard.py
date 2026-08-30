@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -602,6 +603,174 @@ class TestBrowserSetup:
 
 
 class TestSetupNavigation:
+    def test_providers_section_dispatches_provider_setup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, run_setup_wizard
+
+        config = MagicMock(model="openai/test-model")
+        args = SimpleNamespace(section="providers", quick=False, non_interactive=False)
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: True)
+
+        with (
+            patch("ash.config.AshConfig.load", return_value=config),
+            patch("ash.commands.setup._migrate_old_ash_toml"),
+            patch(
+                "ash.commands.setup.setup_model_provider",
+                return_value=SetupOutcome.SUCCESS,
+            ) as setup_model,
+            patch("ash.commands.setup._print_header"),
+            patch("ash.commands.setup._print_info"),
+        ):
+            result = run_setup_wizard(args)
+
+        assert result == SetupOutcome.SUCCESS
+        setup_model.assert_called_once_with(config, quick=False)
+
+    @pytest.mark.parametrize("section", ["model", "providers"])
+    def test_noninteractive_configured_route_accepts_provider_sections(
+        self,
+        section: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys,
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, cmd_setup
+
+        args = SimpleNamespace(section=section, quick=False, non_interactive=True)
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: False)
+        config = SimpleNamespace(model="openai/test-model")
+
+        with (
+            patch("ash.config.AshConfig.load", return_value=config),
+            patch("ash.commands.setup._has_provider_configured", return_value=True),
+        ):
+            assert cmd_setup(args) == int(SetupOutcome.SUCCESS)
+
+        output = capsys.readouterr().out
+        assert "Ash is configured for openai/test-model." in output
+        assert "doctor --connect" in output
+
+    @pytest.mark.parametrize("section", ["model", "providers"])
+    def test_noninteractive_missing_route_rejects_provider_sections(
+        self,
+        section: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys,
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, cmd_setup
+
+        args = SimpleNamespace(section=section, quick=False, non_interactive=True)
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: False)
+        config = SimpleNamespace(model="")
+
+        with (
+            patch("ash.config.AshConfig.load", return_value=config),
+            patch("ash.commands.setup._has_provider_configured", return_value=False),
+        ):
+            assert cmd_setup(args) == int(SetupOutcome.ERROR)
+
+        output = capsys.readouterr()
+        assert "Setup complete!" not in output.out
+        assert "requires an interactive terminal" in output.err
+
+    def test_quick_reuses_existing_route_without_provider_prompt(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, setup_model_provider
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-quick-test")
+        config = SimpleNamespace(model="openai/test-model", custom_providers={})
+
+        with patch(
+            "ash.commands.setup.select_provider_and_model",
+            side_effect=AssertionError("QuickStart should reuse the existing route"),
+        ):
+            result = setup_model_provider(config, quick=True)
+
+        assert result == SetupOutcome.SUCCESS
+        output = capsys.readouterr().out
+        assert "reused" in output.lower()
+        assert "doctor --connect" in output
+        assert "sk-quick-test" not in output
+
+    def test_quick_partial_route_enters_provider_flow_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, setup_model_provider
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = SimpleNamespace(model="openai/test-model", custom_providers={})
+        with patch(
+            "ash.commands.setup.select_provider_and_model",
+            return_value=SetupOutcome.SUCCESS,
+        ) as select:
+            result = setup_model_provider(config, quick=True)
+
+        assert result == SetupOutcome.SUCCESS
+        select.assert_called_once_with(config)
+
+    def test_quick_all_skips_optional_sections_explicitly(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, run_setup_wizard
+
+        config = SimpleNamespace(model="openai/test-model", custom_providers={})
+        args = SimpleNamespace(section="all", quick=True, non_interactive=False)
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: True)
+
+        with (
+            patch("ash.config.AshConfig.load", return_value=config),
+            patch("ash.commands.setup._migrate_old_ash_toml"),
+            patch(
+                "ash.commands.setup.setup_model_provider",
+                return_value=SetupOutcome.SUCCESS,
+            ),
+            patch("ash.commands.setup.setup_web_search") as web_setup,
+            patch("ash.commands.setup._print_header"),
+        ):
+            result = run_setup_wizard(args)
+
+        assert result == SetupOutcome.SUCCESS
+        web_setup.assert_not_called()
+        output = capsys.readouterr().out
+        assert "QuickStart skipped optional web search and browser setup." in output
+
+    def test_cancelled_quick_setup_does_not_print_complete(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, run_setup_wizard
+
+        config = SimpleNamespace(model="")
+        args = SimpleNamespace(section="all", quick=True, non_interactive=False)
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: True)
+
+        with (
+            patch("ash.config.AshConfig.load", return_value=config),
+            patch("ash.commands.setup._migrate_old_ash_toml"),
+            patch(
+                "ash.commands.setup.setup_model_provider",
+                return_value=SetupOutcome.CANCELLED,
+            ),
+            patch("ash.commands.setup._print_header"),
+        ):
+            result = run_setup_wizard(args)
+
+        assert result == SetupOutcome.CANCELLED
+        assert "Setup complete!" not in capsys.readouterr().out
+
+    def test_invalid_provider_choice_retries_without_dispatch(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, select_provider_and_model
+
+        monkeypatch.setattr("builtins.input", _fake_input(["invalid", "c"]))
+        with patch("ash.commands.setup._flow_openai") as flow:
+            result = select_provider_and_model(SimpleNamespace(model=""))
+
+        assert result == SetupOutcome.CANCELLED
+        flow.assert_not_called()
+        assert "Invalid choice." in capsys.readouterr().out
+
     def test_provider_selection_can_cancel(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
