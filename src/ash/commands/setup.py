@@ -18,8 +18,6 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
-import httpx
-
 from ash.commands.config import (
     backup_config_file,
     get_env_value,
@@ -564,13 +562,6 @@ def _flow_openai_compatible() -> SetupOutcome:
 # ---------------------------------------------------------------------------
 
 
-def _response_error(response: httpx.Response, *, secret: str | None = None) -> str:
-    detail = " ".join(response.text.split())[:200]
-    if secret:
-        detail = detail.replace(secret, "[REDACTED]")
-    return f"HTTP {response.status_code}" + (f": {detail}" if detail else "")
-
-
 def _models_from_payload(payload: object, *, collection: str) -> tuple[str, ...]:
     if not isinstance(payload, dict):
         return ()
@@ -591,30 +582,25 @@ def _probe_anthropic_models_detailed(
     api_key: str,
     base_url: str = "https://api.anthropic.com",
 ) -> ModelProbe:
-    normalized_base = base_url.rstrip("/")
-    endpoint = (
-        f"{normalized_base}/models"
-        if normalized_base.endswith("/v1")
-        else f"{normalized_base}/v1/models"
+    from ash.providers.readiness import (
+        ProviderVerificationError,
+        probe_model_catalog,
     )
+
+    endpoint = f"{base_url.rstrip('/')}/models"
     try:
-        response = httpx.get(
+        models = probe_model_catalog(
             endpoint,
             headers={
                 "x-api-key": api_key,
                 "anthropic-version": "2023-06-01",
             },
+            catalog_format="anthropic",
             timeout=10,
         )
-        if response.status_code != 200:
-            return ModelProbe(error=_response_error(response, secret=api_key))
-        models = _models_from_payload(response.json(), collection="data")
-        return ModelProbe(
-            models=models,
-            error=None if models else "the endpoint returned no model IDs",
-        )
-    except Exception as exc:  # noqa: BLE001 - setup must surface probe failures
-        return ModelProbe(error=f"{type(exc).__name__}: {exc}")
+    except ProviderVerificationError as exc:
+        return ModelProbe(error=str(exc))
+    return ModelProbe(models=models)
 
 
 def _probe_anthropic_models(api_key: str) -> list[str]:
@@ -623,22 +609,23 @@ def _probe_anthropic_models(api_key: str) -> list[str]:
 
 
 def _probe_models_detailed(base_url: str, api_key: Optional[str]) -> ModelProbe:
+    from ash.providers.readiness import (
+        ProviderVerificationError,
+        probe_model_catalog,
+    )
+
+    endpoint = f"{base_url.rstrip('/')}/models"
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
-        response = httpx.get(
-            f"{base_url.rstrip('/')}/models",
+        models = probe_model_catalog(
+            endpoint,
             headers=headers,
+            catalog_format="openai",
             timeout=10,
         )
-        if response.status_code != 200:
-            return ModelProbe(error=_response_error(response, secret=api_key))
-        models = _models_from_payload(response.json(), collection="data")
-        return ModelProbe(
-            models=models,
-            error=None if models else "the endpoint returned no model IDs",
-        )
-    except Exception as exc:  # noqa: BLE001 - setup must surface probe failures
-        return ModelProbe(error=f"{type(exc).__name__}: {exc}")
+    except ProviderVerificationError as exc:
+        return ModelProbe(error=str(exc))
+    return ModelProbe(models=models)
 
 
 def _probe_models(base_url: str, api_key: Optional[str]) -> list[str]:
@@ -647,17 +634,22 @@ def _probe_models(base_url: str, api_key: Optional[str]) -> list[str]:
 
 
 def _probe_ollama_models_detailed(base_url: str) -> ModelProbe:
+    from ash.providers.readiness import (
+        ProviderVerificationError,
+        probe_model_catalog,
+    )
+
+    endpoint = f"{base_url.rstrip('/')}/api/tags"
     try:
-        response = httpx.get(f"{base_url.rstrip('/')}/api/tags", timeout=10)
-        if response.status_code != 200:
-            return ModelProbe(error=_response_error(response))
-        models = _models_from_payload(response.json(), collection="models")
-        return ModelProbe(
-            models=models,
-            error=None if models else "Ollama is running but has no installed models",
+        models = probe_model_catalog(
+            endpoint,
+            headers={},
+            catalog_format="ollama",
+            timeout=10,
         )
-    except Exception as exc:  # noqa: BLE001 - setup must surface probe failures
-        return ModelProbe(error=f"{type(exc).__name__}: {exc}")
+    except ProviderVerificationError as exc:
+        return ModelProbe(error=str(exc))
+    return ModelProbe(models=models)
 
 
 def _probe_ollama_models(base_url: str) -> list[str]:

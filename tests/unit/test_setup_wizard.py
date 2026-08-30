@@ -382,17 +382,81 @@ class TestProbeModels:
             },
         )
         monkeypatch.setenv("HOME", "/tmp")
-        with patch("ash.commands.setup.httpx.get", return_value=mock_response):
+        with patch("ash.providers.readiness.httpx.get", return_value=mock_response):
             from ash.commands.setup import _probe_models
 
             result = _probe_models("https://api.openai.com/v1", "sk-test")
             assert result == ["gpt-4o", "gpt-4o-mini"]
 
+    def test_openai_probe_uses_shared_catalog_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands.setup import _probe_models_detailed
+
+        response = MagicMock(
+            raise_for_status=lambda: None,
+            json=lambda: {"data": [{"id": "model-a"}, {"id": "model-b"}]},
+        )
+
+        def shared_get(
+            url: str, *, headers: dict[str, str], timeout: float
+        ) -> MagicMock:
+            assert url == "https://gateway.example/v1/models"
+            assert headers == {"Authorization": "Bearer sk-test"}
+            assert timeout == 10.0
+            return response
+
+        monkeypatch.setattr("ash.providers.readiness.httpx.get", shared_get)
+
+        result = _probe_models_detailed("https://gateway.example/v1", "sk-test")
+
+        assert result.models == ("model-a", "model-b")
+        assert result.error is None
+
+    def test_anthropic_probe_uses_shared_catalog_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands.setup import _probe_anthropic_models_detailed
+
+        calls: list[tuple[str, dict[str, str], str, int]] = []
+
+        def shared_probe(
+            endpoint: str,
+            *,
+            headers: dict[str, str],
+            catalog_format: str,
+            timeout: int,
+        ) -> tuple[str, ...]:
+            calls.append((endpoint, headers, catalog_format, timeout))
+            return ("claude-a", "claude-b")
+
+        monkeypatch.setattr(
+            "ash.providers.readiness.probe_model_catalog", shared_probe
+        )
+
+        result = _probe_anthropic_models_detailed(
+            "anthropic-secret", "https://gateway.example/v1"
+        )
+
+        assert result.models == ("claude-a", "claude-b")
+        assert result.error is None
+        assert calls == [
+            (
+                "https://gateway.example/v1/models",
+                {
+                    "x-api-key": "anthropic-secret",
+                    "anthropic-version": "2023-06-01",
+                },
+                "anthropic",
+                10,
+            )
+        ]
+
     def test_probe_models_http_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_probe_models returns [] on HTTP error."""
         monkeypatch.setenv("HOME", "/tmp")
         with patch(
-            "ash.commands.setup.httpx.get", side_effect=Exception("network error")
+            "ash.providers.readiness.httpx.get", side_effect=Exception("network error")
         ):
             from ash.commands.setup import _probe_models
 
@@ -406,7 +470,7 @@ class TestProbeModels:
             status_code=401,
             text="invalid key sk-secret-value",
         )
-        with patch("ash.commands.setup.httpx.get", return_value=response):
+        with patch("ash.providers.readiness.httpx.get", return_value=response):
             result = _probe_models_detailed(
                 "https://api.example.test/v1",
                 "sk-secret-value",
@@ -428,11 +492,45 @@ class TestProbeModels:
             },
         )
         monkeypatch.setenv("HOME", "/tmp")
-        with patch("ash.commands.setup.httpx.get", return_value=mock_response):
+        with patch("ash.providers.readiness.httpx.get", return_value=mock_response):
             from ash.commands.setup import _probe_ollama_models
 
             result = _probe_ollama_models("http://localhost:11434")
             assert result == ["llama3", "qwen2.5-coder:7b"]
+
+    def test_ollama_probe_uses_shared_catalog_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands.setup import _probe_ollama_models_detailed
+
+        calls: list[tuple[str, dict[str, str], str, int]] = []
+
+        def shared_probe(
+            endpoint: str,
+            *,
+            headers: dict[str, str],
+            catalog_format: str,
+            timeout: int,
+        ) -> tuple[str, ...]:
+            calls.append((endpoint, headers, catalog_format, timeout))
+            return ("llama3.2:latest", "qwen3:latest")
+
+        monkeypatch.setattr(
+            "ash.providers.readiness.probe_model_catalog", shared_probe
+        )
+
+        result = _probe_ollama_models_detailed("http://localhost:11434")
+
+        assert result.models == ("llama3.2:latest", "qwen3:latest")
+        assert result.error is None
+        assert calls == [
+            (
+                "http://localhost:11434/api/tags",
+                {},
+                "ollama",
+                10,
+            )
+        ]
 
 
 class TestSetupValidation:

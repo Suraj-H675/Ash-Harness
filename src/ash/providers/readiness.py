@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Mapping
 from urllib.parse import urlsplit
+
+import httpx
 
 from ash.providers.identifiers import parse_model_string
 
@@ -56,6 +58,17 @@ class ProviderConnection:
         if self.auth_mode == "none":
             return "no API key is required"
         return "API key is configured"
+
+
+class ProviderVerificationError(RuntimeError):
+    """Raised when a provider catalog cannot be verified safely."""
+
+
+@dataclass(frozen=True)
+class ProviderVerification:
+    connection: ProviderConnection
+    models: tuple[str, ...]
+    selected_model_available: bool
 
 
 _BUILTIN_CONNECTIONS: dict[str, tuple[str, str, CatalogFormat, AuthMode]] = {
@@ -212,4 +225,94 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
         catalog_format="openai",
         auth_mode=custom_auth_mode,
         api_key=api_key,
+    )
+
+
+def _redact_catalog_error(message: str, headers: Mapping[str, str]) -> str:
+    redacted = message
+    for name, value in headers.items():
+        if not value:
+            continue
+        normalized = name.casefold()
+        if normalized == "authorization":
+            redacted = redacted.replace(value, "[REDACTED]")
+            if value.casefold().startswith("bearer "):
+                token = value.split(None, 1)[1]
+                redacted = redacted.replace(token, "[REDACTED]")
+        elif normalized == "x-api-key":
+            redacted = redacted.replace(value, "[REDACTED]")
+    return redacted
+
+
+def probe_model_catalog(
+    endpoint: str,
+    *,
+    headers: Mapping[str, str],
+    catalog_format: CatalogFormat,
+    timeout: float = 10.0,
+) -> tuple[str, ...]:
+    """Fetch and validate a provider model catalog without exposing secrets."""
+
+    try:
+        response = httpx.get(endpoint, headers=dict(headers), timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 - normalize external request failures
+        raise ProviderVerificationError(
+            f"provider catalog request failed ({type(exc).__name__})"
+        ) from exc
+
+    try:
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int) and status_code >= 400:
+            detail = _redact_catalog_error(
+                str(getattr(response, "text", "") or "").strip(),
+                headers,
+            )
+            suffix = f": {detail}" if detail else ""
+            raise ProviderVerificationError(
+                f"provider catalog returned HTTP {status_code}{suffix}"
+            )
+        response.raise_for_status()
+        payload = response.json()
+    except ProviderVerificationError:
+        raise
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        raise ProviderVerificationError(
+            f"provider catalog verification failed ({type(exc).__name__})"
+        ) from exc
+
+    collection = "models" if catalog_format == "ollama" else "data"
+    identifier = "name" if catalog_format == "ollama" else "id"
+    if not isinstance(payload, dict) or not isinstance(payload.get(collection), list):
+        raise ProviderVerificationError("provider returned an invalid model catalog")
+
+    models: list[str] = []
+    for item in payload[collection]:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get(identifier)
+        if isinstance(model_id, str) and model_id and model_id not in models:
+            models.append(model_id)
+    if not models:
+        raise ProviderVerificationError("provider returned no model IDs")
+    return tuple(models)
+
+
+def verify_provider_connection(
+    config: "AshConfig",
+    *,
+    timeout: float = 10.0,
+) -> ProviderVerification:
+    """Resolve and verify the configured provider route and model catalog."""
+
+    connection = resolve_provider_connection(config)
+    models = probe_model_catalog(
+        connection.catalog_endpoint,
+        headers=connection.headers,
+        catalog_format=connection.catalog_format,
+        timeout=timeout,
+    )
+    return ProviderVerification(
+        connection=connection,
+        models=models,
+        selected_model_available=connection.model_name in models,
     )

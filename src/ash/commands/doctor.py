@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import json
 import os
 import platform
@@ -14,13 +15,13 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
-import httpx
-
 from ash.config import AshConfig
 from ash.mcp.server import load_mcp_servers
 from ash.providers.readiness import (
     ProviderConfigurationError,
+    ProviderVerificationError,
     resolve_provider_connection,
+    verify_provider_connection,
 )
 from ash.sandbox import SandboxManager
 
@@ -376,28 +377,18 @@ def _check_lsp(config: AshConfig) -> DoctorCheck:
 
 async def _check_connectivity(config: AshConfig) -> DoctorCheck:
     try:
-        connection = resolve_provider_connection(config)
+        verification = await asyncio.to_thread(
+            verify_provider_connection,
+            config,
+        )
     except (ProviderConfigurationError, ValueError) as exc:
         return DoctorCheck("connectivity", "fail", str(exc), "Run ash setup.")
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                connection.catalog_endpoint,
-                headers=connection.headers,
-            )
-        response.raise_for_status()
-        models = _catalog_models(response.json(), connection.catalog_format)
-    except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
-        return DoctorCheck(
-            "connectivity", "fail", f"{connection.catalog_endpoint}: {exc}"
-        )
-    if not models:
-        return DoctorCheck(
-            "connectivity",
-            "fail",
-            f"{connection.catalog_endpoint}: endpoint returned no model IDs",
-        )
-    if connection.model_name not in models:
+    except ProviderVerificationError as exc:
+        return DoctorCheck("connectivity", "fail", str(exc))
+
+    connection = verification.connection
+
+    if not verification.selected_model_available:
         return DoctorCheck(
             "connectivity",
             "fail",
@@ -410,23 +401,6 @@ async def _check_connectivity(config: AshConfig) -> DoctorCheck:
         "pass",
         f"{connection.catalog_endpoint}; selected model {connection.model_name!r} is available",
     )
-
-
-def _catalog_models(payload: object, catalog_format: str) -> set[str]:
-    if not isinstance(payload, dict):
-        return set()
-    collection = "models" if catalog_format == "ollama" else "data"
-    identifier = "name" if catalog_format == "ollama" else "id"
-    values = payload.get(collection)
-    if not isinstance(values, list):
-        return set()
-    return {
-        value
-        for item in values
-        if isinstance(item, dict)
-        and isinstance((value := item.get(identifier)), str)
-        and value
-    }
 
 
 async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:

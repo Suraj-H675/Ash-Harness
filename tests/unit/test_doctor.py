@@ -29,22 +29,40 @@ def test_render_doctor_json_has_stable_schema() -> None:
     assert payload["checks"][0]["name"] == "config"
 
 
-class _RecordingAsyncClient:
-    def __init__(
-        self, response: object, requests: list[tuple[str, dict[str, str]]], **_: object
-    ) -> None:
-        self._response = response
-        self._requests = requests
+@pytest.mark.asyncio
+async def test_run_doctor_connect_uses_shared_provider_verification(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[tuple[str, dict[str, str], float]] = []
+    response = httpx.Response(
+        200,
+        json={"data": [{"id": "gateway-model"}]},
+        request=httpx.Request("GET", "http://gateway.invalid/v1/models"),
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("ASH_MODEL", "openai/gateway-model")
+    monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret")
+    monkeypatch.setenv("OPENAI_API_BASE", "http://gateway.invalid/v1")
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(tmp_path / "db"))
 
-    async def __aenter__(self) -> "_RecordingAsyncClient":
-        return self
+    def fake_get(endpoint: str, *, headers: dict[str, str], timeout: float) -> object:
+        requests.append((endpoint, headers, timeout))
+        return response
 
-    async def __aexit__(self, *_: object) -> None:
-        return None
+    monkeypatch.setattr("ash.providers.readiness.httpx.get", fake_get)
 
-    async def get(self, url: str, *, headers: dict[str, str]) -> object:
-        self._requests.append((url, headers))
-        return self._response
+    checks = await run_doctor(connect=True)
+
+    by_name = {check.name: check for check in checks}
+    assert by_name["connectivity"].status == "pass"
+    assert requests == [
+        (
+            "http://gateway.invalid/v1/models",
+            {"Authorization": "Bearer gateway-secret"},
+            10.0,
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -59,10 +77,11 @@ async def test_connectivity_uses_runtime_openai_override_and_validates_model(
     )
     monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret")
     monkeypatch.setenv("OPENAI_API_BASE", "http://gateway.invalid/v1")
-    monkeypatch.setattr(
-        "ash.commands.doctor.httpx.AsyncClient",
-        lambda **kwargs: _RecordingAsyncClient(response, requests, **kwargs),
-    )
+    def fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+        requests.append((url, headers))
+        return response
+
+    monkeypatch.setattr("ash.providers.readiness.httpx.get", fake_get)
 
     check = await _check_connectivity(
         AshConfig(model="openai/gateway-model", workspace_root=tmp_path)
@@ -86,10 +105,11 @@ async def test_connectivity_fails_when_selected_model_is_not_advertised(
     )
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.delenv("OPENAI_API_BASE", raising=False)
-    monkeypatch.setattr(
-        "ash.commands.doctor.httpx.AsyncClient",
-        lambda **kwargs: _RecordingAsyncClient(response, requests, **kwargs),
-    )
+    def fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+        requests.append((url, headers))
+        return response
+
+    monkeypatch.setattr("ash.providers.readiness.httpx.get", fake_get)
 
     check = await _check_connectivity(
         AshConfig(model="openai/missing-model", workspace_root=tmp_path)
@@ -111,10 +131,11 @@ async def test_connectivity_checks_anthropic_catalog_with_runtime_headers(
     )
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
     monkeypatch.setenv("ANTHROPIC_API_BASE", "http://gateway.invalid")
-    monkeypatch.setattr(
-        "ash.commands.doctor.httpx.AsyncClient",
-        lambda **kwargs: _RecordingAsyncClient(response, requests, **kwargs),
-    )
+    def fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+        requests.append((url, headers))
+        return response
+
+    monkeypatch.setattr("ash.providers.readiness.httpx.get", fake_get)
 
     check = await _check_connectivity(
         AshConfig(model="anthropic/claude-test", workspace_root=tmp_path)
