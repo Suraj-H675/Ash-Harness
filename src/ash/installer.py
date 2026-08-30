@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -21,7 +22,11 @@ from typing import Any, Callable, Mapping, Sequence
 
 REPOSITORY_URL = "https://github.com/Suraj-H675/Ash-Harness.git"
 SUPPORTED_EXTRAS = ("a2a", "acp", "browser", "server", "vector")
-_EXTRAS_PATTERN = re.compile(r"^\s*ash-ai(?:\[([^]]+)\])?\s*@", re.IGNORECASE)
+_PACKAGE_NAME = "ash-ai"
+_EXTRAS_PATTERN = re.compile(
+    rf"^\s*{re.escape(_PACKAGE_NAME)}(?:\[([^]]+)\])?\s*@",
+    re.IGNORECASE,
+)
 _UV_EXTRAS_PATTERN = re.compile(r"\[extras:\s*([^]]+)\]", re.IGNORECASE)
 _UV_ASH_PATH_PATTERN = re.compile(r"^-\s+ash\s+\(([^)]+)\)\s*$", re.MULTILINE)
 
@@ -43,6 +48,16 @@ class _PipxState:
     installed: bool = False
     extras: tuple[str, ...] = ()
     executable: str | None = None
+
+
+@dataclass(frozen=True)
+class _PipxInspection:
+    state: _PipxState | None
+    error: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.state is not None
 
 
 @dataclass(frozen=True)
@@ -79,7 +94,11 @@ def install(
         )
 
     try:
-        previous = _read_pipx_state(pipx, runner=runner, environment=environment)
+        inspection = _read_pipx_state(
+            pipx,
+            runner=runner,
+            environment=environment,
+        )
     except OSError as exc:
         if uv is None:
             raise InstallError(f"pipx was found but could not start ({exc}).") from exc
@@ -92,7 +111,37 @@ def install(
             environment=environment,
             previous=previous_uv,
         )
-    if not previous.installed and uv is not None:
+    quarantine_path: Path | None = None
+    repairing_corrupt_metadata = False
+    if inspection.succeeded:
+        previous = inspection.state
+        assert previous is not None
+    else:
+        pipx_home = _pipx_home_directory(
+            pipx,
+            runner=runner,
+            environment=environment,
+        )
+        metadata_path = _corrupt_ash_metadata_path(pipx_home)
+        if metadata_path is None:
+            detail = inspection.error or "unknown pipx inspection failure"
+            raise InstallError(
+                f"Could not inspect the existing pipx installation: {detail}"
+            )
+        quarantine_path = _quarantine_pipx_metadata(metadata_path)
+        repairing_corrupt_metadata = True
+        previous = _PipxState()
+        if not extras:
+            print(
+                "Warning: Ash's corrupt pipx metadata did not preserve optional "
+                "extras; repairing the base installation.",
+                file=sys.stderr,
+            )
+    if (
+        not previous.installed
+        and uv is not None
+        and not repairing_corrupt_metadata
+    ):
         previous_uv = _read_uv_state(uv, runner=runner, environment=environment)
         if previous_uv.installed:
             return _install_with_uv(
@@ -107,33 +156,75 @@ def install(
     package_spec = _package_spec(selected_extras, ref=ref)
     install_environment = dict(environment)
     install_environment["UV_VENV_CLEAR"] = "1"
-    completed = runner(
-        [pipx, "install", "--force", package_spec],
-        env=install_environment,
-        check=False,
-    )
-    if int(getattr(completed, "returncode", 1)) != 0:
-        raise InstallError("pipx could not install Ash.")
-
-    current = _read_pipx_state(pipx, runner=runner, environment=environment)
-    executable = (
-        current.executable
-        or previous.executable
-        or which("ash")
-        or _pipx_executable(pipx, runner=runner, environment=environment)
-    )
-    if not executable:
-        raise InstallError(
-            "Ash was installed, but its executable could not be located."
+    try:
+        completed = runner(
+            [pipx, "install", "--force", package_spec],
+            env=install_environment,
+            check=False,
         )
-    version = _verify_executable(executable, runner=runner, environment=environment)
-    restart_required = _ensure_shell_path(
-        pipx,
-        manager="pipx",
-        executable=executable,
-        runner=runner,
-        environment=environment,
-    )
+        if int(getattr(completed, "returncode", 1)) != 0:
+            detail = _completed_output_detail(completed)
+            raise InstallError(
+                "pipx could not install Ash."
+                + (f" {detail}" if detail else "")
+            )
+
+        current_inspection = _read_pipx_state(
+            pipx,
+            runner=runner,
+            environment=environment,
+        )
+        if current_inspection.error is not None:
+            detail = current_inspection.error or "unknown pipx inspection failure"
+            raise InstallError(
+                "pipx installed Ash but its resulting state could not be read: "
+                f"{detail}"
+            )
+        current = current_inspection.state
+        if current is None or not current.installed:
+            raise InstallError(
+                "pipx reported a successful install, but Ash is absent from the "
+                "resulting pipx state."
+            )
+        launcher_directory = _pipx_bin_directory(
+            pipx,
+            runner=runner,
+            environment=environment,
+        )
+        executable = (
+            current.executable
+            or previous.executable
+            or _executable_in_directory(launcher_directory)
+            or which("ash")
+        )
+        if not executable:
+            raise InstallError(
+                "Ash was installed, but its executable could not be located."
+            )
+        version = _verify_executable(
+            executable,
+            runner=runner,
+            environment=environment,
+        )
+        restart_required = _ensure_shell_path(
+            pipx,
+            manager="pipx",
+            launcher_directory=launcher_directory,
+            runner=runner,
+            environment=environment,
+        )
+        if quarantine_path is not None:
+            quarantine_path.unlink()
+    except Exception as exc:
+        if not repairing_corrupt_metadata or quarantine_path is None:
+            raise
+        detail = str(exc).strip() or type(exc).__name__
+        raise InstallError(
+            "Corrupt pipx metadata for Ash was detected, but automatic repair "
+            "failed. "
+            f"The original metadata was preserved at {quarantine_path}. "
+            f"{detail}"
+        ) from exc
     return InstallResult(
         manager="pipx",
         executable=executable,
@@ -142,7 +233,7 @@ def install(
     )
 
 
-def _pipx_executable(
+def _pipx_bin_directory(
     pipx: str,
     *,
     runner: Callable[..., Any],
@@ -164,8 +255,74 @@ def _pipx_executable(
         directory = str(getattr(completed, "stdout", "")).strip()
     if not directory:
         return None
+    return directory
+
+
+def _executable_in_directory(directory: str | None) -> str | None:
+    if not directory:
+        return None
     executable_name = "ash.exe" if os.name == "nt" else "ash"
     return str(Path(directory) / executable_name)
+
+
+def _pipx_home_directory(
+    pipx: str,
+    *,
+    runner: Callable[..., Any],
+    environment: Mapping[str, str],
+) -> str | None:
+    configured = environment.get("PIPX_HOME")
+    if configured:
+        return os.path.expanduser(configured)
+    completed = runner(
+        [pipx, "environment", "--value", "PIPX_HOME"],
+        env=dict(environment),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if int(getattr(completed, "returncode", 1)) != 0:
+        return None
+    directory = str(getattr(completed, "stdout", "")).strip()
+    if not directory:
+        return None
+    return os.path.expanduser(directory)
+
+
+def _corrupt_ash_metadata_path(pipx_home: str | None) -> Path | None:
+    if not pipx_home:
+        return None
+    metadata_path = Path(pipx_home) / "venvs" / _PACKAGE_NAME / "pipx_metadata.json"
+    if not metadata_path.exists():
+        return None
+    try:
+        contents = metadata_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        json.loads(contents)
+    except json.JSONDecodeError:
+        return metadata_path
+    return None
+
+
+def _quarantine_pipx_metadata(metadata_path: Path) -> Path:
+    while True:
+        quarantine_path = metadata_path.with_name(
+            f"{metadata_path.name}.corrupt-{uuid.uuid4().hex}"
+        )
+        if not quarantine_path.exists():
+            break
+    metadata_path.rename(quarantine_path)
+    return quarantine_path
+
+
+def _completed_output_detail(completed: Any) -> str:
+    for attribute in ("stderr", "stdout"):
+        value = str(getattr(completed, attribute, "")).strip()
+        if value:
+            return " ".join(value.split())[:240]
+    return ""
 
 
 def _install_with_uv(
@@ -206,7 +363,7 @@ def _install_with_uv(
     restart_required = _ensure_shell_path(
         uv,
         manager="uv",
-        executable=executable,
+        launcher_directory=str(Path(executable).parent),
         runner=runner,
         environment=environment,
     )
@@ -222,20 +379,19 @@ def _ensure_shell_path(
     manager_executable: str,
     *,
     manager: str,
-    executable: str,
+    launcher_directory: str | None,
     runner: Callable[..., Any],
     environment: Mapping[str, str],
 ) -> bool:
-    executable_directory = os.path.normcase(
-        os.path.abspath(str(Path(executable).parent))
-    )
-    path_directories = {
-        os.path.normcase(os.path.abspath(value))
-        for value in environment.get("PATH", "").split(os.pathsep)
-        if value
-    }
-    if executable_directory in path_directories:
-        return False
+    if launcher_directory:
+        normalized_launcher_directory = _normalize_path(launcher_directory)
+        path_directories = {
+            _normalize_path(value)
+            for value in environment.get("PATH", "").split(os.pathsep)
+            if value
+        }
+        if normalized_launcher_directory in path_directories:
+            return False
     command = (
         [manager_executable, "ensurepath"]
         if manager == "pipx"
@@ -249,6 +405,12 @@ def _ensure_shell_path(
         text=True,
     )
     return True
+
+
+def _normalize_path(value: str) -> str:
+    return os.path.normcase(
+        os.path.realpath(os.path.abspath(os.path.expanduser(value)))
+    )
 
 
 def _verify_executable(
@@ -277,7 +439,7 @@ def _read_pipx_state(
     *,
     runner: Callable[..., Any],
     environment: Mapping[str, str],
-) -> _PipxState:
+) -> _PipxInspection:
     completed = runner(
         [pipx, "list", "--json"],
         env=dict(environment),
@@ -286,12 +448,30 @@ def _read_pipx_state(
         text=True,
     )
     if int(getattr(completed, "returncode", 1)) != 0:
-        return _PipxState()
+        detail = _completed_output_detail(completed)
+        if not detail:
+            detail = (
+                "pipx list --json exited with status "
+                f"{int(getattr(completed, 'returncode', 1))}"
+            )
+        return _PipxInspection(None, detail)
     try:
         payload = json.loads(str(getattr(completed, "stdout", "")))
-        main = payload["venvs"]["ash-ai"]["metadata"]["main_package"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return _PipxState()
+    except json.JSONDecodeError as exc:
+        return _PipxInspection(None, f"pipx returned invalid JSON ({exc.msg})")
+    if not isinstance(payload, dict) or not isinstance(payload.get("venvs"), dict):
+        return _PipxInspection(None, "pipx returned an unexpected JSON shape")
+    ash_venv = payload["venvs"].get(_PACKAGE_NAME)
+    if ash_venv is None:
+        return _PipxInspection(_PipxState())
+    if not isinstance(ash_venv, dict):
+        return _PipxInspection(None, "pipx returned an unexpected JSON shape")
+    metadata = ash_venv.get("metadata")
+    if not isinstance(metadata, dict):
+        return _PipxInspection(None, "pipx returned an unexpected JSON shape")
+    main = metadata.get("main_package")
+    if not isinstance(main, dict):
+        return _PipxInspection(None, "pipx returned an unexpected JSON shape")
     package_spec = str(main.get("package_or_url", ""))
     match = _EXTRAS_PATTERN.match(package_spec)
     extras = _normalize_extras(
@@ -304,7 +484,9 @@ def _read_pipx_state(
             if isinstance(entry, dict) and entry.get("__Path__"):
                 executable = str(entry["__Path__"])
                 break
-    return _PipxState(installed=True, extras=extras, executable=executable)
+    return _PipxInspection(
+        _PipxState(installed=True, extras=extras, executable=executable)
+    )
 
 
 def _read_uv_state(
@@ -330,7 +512,11 @@ def _read_uv_state(
     if int(getattr(completed, "returncode", 1)) != 0:
         return _UvState()
     output = str(getattr(completed, "stdout", ""))
-    if not re.search(r"^ash-ai\s", output, re.MULTILINE | re.IGNORECASE):
+    if not re.search(
+        rf"^{re.escape(_PACKAGE_NAME)}\s",
+        output,
+        re.MULTILINE | re.IGNORECASE,
+    ):
         return _UvState()
     extras_match = _UV_EXTRAS_PATTERN.search(output)
     extras = _normalize_extras(extras_match.group(1).split(",") if extras_match else ())
@@ -348,7 +534,7 @@ def _normalize_extras(values: Sequence[str]) -> tuple[str, ...]:
 def _package_spec(extras: Sequence[str], *, ref: str | None) -> str:
     suffix = f"[{','.join(extras)}]" if extras else ""
     revision = f"@{ref}" if ref else ""
-    return f"ash-ai{suffix} @ git+{REPOSITORY_URL}{revision}"
+    return f"{_PACKAGE_NAME}{suffix} @ git+{REPOSITORY_URL}{revision}"
 
 
 def main(
