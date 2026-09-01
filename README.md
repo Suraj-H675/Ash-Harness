@@ -1,769 +1,419 @@
 # Ash
 
-Ash is a terminal-native coding agent harness for Linux, macOS, and Windows.
-It supports API-key providers, custom OpenAI-compatible endpoints, and local
-Ollama, LM Studio, and vLLM runtimes. Subscription-based model-provider login
-is intentionally out of scope; protected remote MCP servers support the MCP
-OAuth 2.1 flow.
+> A terminal-native coding-agent harness for serious, long-running work.
 
-## Install
+Ash turns a language model into a durable engineering workspace. It combines a
+streaming agent loop, real coding tools, persistent sessions, provider
+failover, safe execution, extensibility, subagents, automation, and editor or
+remote-agent protocols in one Python application.
 
-Python 3.11 or newer is required. The public installer detects pipx or uv,
-repairs an existing environment, preserves selected capability extras, and
-verifies the resulting `ash` executable:
+Ash is designed for the space occupied by [Hermes Agent](https://github.com/NousResearch/hermes-agent),
+[OpenClaw](https://github.com/openclaw/openclaw), and
+[OpenCode](https://github.com/anomalyco/opencode): a harness around models,
+tools, state, policy, and integrations rather than a thin chat client.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 -
-```
+## What Ash is
 
-PowerShell:
+Ash is a local-first, provider-neutral coding environment that can:
 
-```powershell
-irm https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | py -
-```
+- work interactively in a rich terminal UI or run bounded one-shot turns;
+- inspect, modify, test, review, and version-control a real workspace;
+- keep conversations, plans, usage, tool activity, and recovery state in
+  durable project-scoped storage;
+- use hosted APIs, local model servers, or custom OpenAI-compatible routes;
+- delegate work to isolated subagents or communicate with remote agents;
+- connect external capabilities through MCP, plugins, skills, LSP, ACP, A2A,
+  HTTP, JSON-RPC, and the Python SDK; and
+- keep every model action inside explicit approval, trust, path, network,
+  sandbox, redaction, and audit boundaries.
 
-The installer never modifies `~/.ash`. If pipx uses uv internally, the
-existing-venv repair flag is applied inside the installer rather than exposed
-as part of the public command. Run the downloaded installer with `--help` to
-see capability-pack and Git-ref options.
+## Capability overview
 
-If the executable directory is not already on `PATH`, the installer requests
-the appropriate pipx/uv shell update and tells you to restart the terminal. It
-also prints the verified executable path as a fallback.
+### Provider and model layer
 
-Then configure and verify the runtime:
+Ash has a descriptor-driven provider catalog and a provider-neutral runtime.
+Supported built-in routes include:
 
-```bash
-ash setup
-ash setup status
-ash setup status --json
-ash providers list
-ash providers test
-ash profile list
-ash doctor --connect
-ash
-```
+| Route | Models and behavior |
+| --- | --- |
+| Anthropic | Claude models through the Anthropic Messages API |
+| OpenAI | GPT models through the OpenAI API |
+| OpenRouter | Multi-provider gateway routing |
+| DeepSeek | Chat and reasoning models |
+| Groq | Fast hosted open models |
+| Mistral | Mistral models through an OpenAI-compatible endpoint |
+| xAI | Grok models through an OpenAI-compatible endpoint |
+| Together AI | Hosted open models |
+| Fireworks AI | Hosted inference |
+| Cerebras | Fast hosted models |
+| Ollama | Local models with no API key requirement |
+| LM Studio | Local OpenAI-compatible model server |
+| vLLM | Self-hosted OpenAI-compatible model server |
+| Custom routes | User-defined OpenAI-compatible providers with explicit auth mode |
 
-`ash setup` can configure Anthropic, OpenAI, OpenRouter, DeepSeek, Groq,
-Mistral, xAI, Together AI, Fireworks, Cerebras, Ollama, LM Studio, vLLM, or a
-custom OpenAI-compatible endpoint. It discovers models when the endpoint is
-available, keeps an existing route unless you choose to change it, and lets
-you continue with an unverified model when a service is offline. Rerunning the
-installer is safe: it repairs the managed environment and preserves recorded
-optional capability packs.
+The provider layer also provides:
 
-Lightweight commands such as `ash --version` and `ash --help` lazy-load the
-runtime stack; provider SDKs, the agent loop, repository parser, and TUI are
-loaded only when a command needs them. Installed-wheel startup is covered by a
-sub-second regression test. Public Python APIs use the canonical `ash.*`
-namespace.
+- model strings in `provider/model` form;
+- live model discovery and endpoint readiness checks;
+- provider and model capability metadata for native tools, vision,
+  reasoning, locality, context, and output budgets;
+- isolated named profiles for separate model, provider, credential, and local
+  state contexts;
+- ordered model failover before the first streamed response chunk;
+- one harness-owned retry policy for classified pre-output transient failures;
+- `Retry-After` handling, jittered exponential backoff, and provider-keyed
+  circuit breakers with half-open recovery;
+- local Ollama health, model metadata, native-tool, and context probing;
+- safe, bounded local-model pull execution;
+- Anthropic and OpenAI prompt caching with normalized cache usage and cost
+  reporting; and
+- provider usage normalization with explicit provider, estimated, or mixed
+  accounting when a service does not return token usage.
 
-The default install includes the terminal harness, coding tools, repository
-map, and supported API/local providers. Install optional features explicitly:
+Subscription-based model-provider login is not currently part of the provider
+surface. MCP OAuth is supported separately for protected MCP servers.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra server
-curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra vector
-curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra acp
-curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra a2a
-```
+### Agent runtime
 
-Repeat `--extra` to choose multiple capability packs, for example
-`--extra server --extra vector`. When no extras are supplied, an existing
-installation keeps the extras recorded in its package metadata; supplied
-extras are additive on upgrades and repairs.
+The core loop supports:
 
-For development:
+- streaming provider-neutral text, reasoning, tool, usage, status, error, and
+  completion events;
+- native tool calling for capable providers;
+- an incremental XML tool protocol for explicitly non-native providers;
+- strict parsing and validation of tool calls and provider responses;
+- durable approved-intent recording before dispatch;
+- exactly-once local, plugin, and MCP dispatch by default;
+- explicit ambiguous-outcome handling when a dispatched side effect times out,
+  crashes, or loses its result;
+- concurrent independent read-only tool calls with deterministic result order;
+- bounded turn iteration and steering-message queues;
+- cancellation that propagates through provider and tool work;
+- structured JSON and JSON-Schema output for machine consumers;
+- capability-aware tool and vision negotiation; and
+- bounded long-running process management with process-tree cleanup.
 
-```bash
-pipx install .
-uv sync --group dev
-uv run ash --help
-uv run pytest -q
-```
+The model receives an explicit untrusted-content boundary. Workspace files,
+tool output, memory, citations, and project-derived instructions are treated
+as evidence and cannot override user instructions or runtime policy.
 
-## Repository Layout
+### Coding workspace tools
 
-```text
-src/ash/           installable harness and public Python package
-tests/             unit, integration, end-to-end, and wheel smoke tests
-docs/architecture/ current architecture and parity analysis
-docs/guides/       operational and workflow guides
-docs/reference/    versioned protocol and extension contracts
-docs/archive/      historical plans and completed verification reports
-```
+Ash includes a complete coding-tool surface:
 
-Start with the [documentation index](docs/README.md) for maintained design and
-extension references, including [permissions and managed policy](
-docs/guides/PERMISSIONS.md). Development standards are in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+| Area | Capabilities |
+| --- | --- |
+| Files | Ranged reads, file creation, atomic writes, exact replacement, multi-edit operations, whole-file edits, and patch application |
+| Text and structure | Directory listing, bounded globbing, ripgrep-backed text/regex search, Python search fallback, symbol lookup, and reference lookup |
+| Code intelligence | Incremental Tree-sitter repository maps for Python, JavaScript/JSX, TypeScript/TSX, Go, Rust, Java, C, C++, and C# |
+| Git | Status, bounded diffs, log inspection, explicit-scope commits, secret scanning, Git-hook error reporting, and worktree-aware review |
+| Processes | Foreground commands, managed background jobs, live bounded stdout/stderr, stdin, polling, stopping, and cleanup |
+| Interaction | Typed ask-user questions, persisted plans, and model-visible compiler, linter, test, MyPy, and Ruff diagnostics |
 
-## Core Usage
+File operations are workspace-scoped and protect against symlinks, junctions,
+path traversal, stale reads, encoding loss, binary misclassification, and
+concurrent no-overwrite races. UTF-8 and BOM-tagged UTF-8/16/32 text can be
+read and preserved during edits.
 
-```bash
-ash                              # interactive terminal session
-ash -p "inspect and test this repo"  # one-shot prompt
-ash --ci -p "inspect only"          # no prompts; stream-json by default
-ash -p "summarize" --output-format json
-ash -c                          # continue this project's latest session
-ash -r                          # choose from searchable project sessions
-ash -r SESSION_ID_OR_NAME       # resume an exact durable session
-ash -c --fork-session           # branch latest history under a new ID
-ash providers list              # show built-in provider routes
-ash providers test              # verify ASH_MODEL and discover its models
-ash providers test ollama/coder # verify a route without changing config
-ash profile add work             # create isolated user config/credential state
-ash profile use work             # make that profile active for future commands
-ash --profile work setup         # use a profile for one invocation
-ash profile show work --json     # inspect profile paths/status without secrets
-ash sessions tree               # inspect the latest conversation tree
-ash sessions tree --session NAME --json
-ash --session SESSION_ID        # legacy explicit-ID compatibility
-ash mcp add local -- python server.py
-ash mcp add remote --transport http --url https://mcp.example/rpc --auth oauth
-ash mcp login remote            # explicit browser authorization
-ash trust add .                  # allow project instructions, extensions, MCP, LSP
-ash update                       # explicitly check GitHub releases
-ash update --apply               # self-repair/reinstall the current pipx checkout
-ASH_SERVER_TOKEN=change-me-long-token ash serve # requires ash-ai[server]
-ash storage check --json         # read-only session DB integrity check
-ash storage backup               # consistent timestamped backup
-ash storage restore BACKUP --yes # validated, non-destructive restore
-ash permissions status --json    # inspect effective project rules
-ash permissions deny write_file --exact 'file_path=".env"'
-ash permissions deny lsp --contains 'operation=workspace'
-ash permissions allow web_fetch --maximum 'max_chars=1000'
-ash permissions allow lsp --in 'operation=["status","definition"]'
-ash permissions allow run_command --command-prefix pytest
-ash permissions status --json    # managed policy appears separately and cannot be overridden locally
-ash sandbox status --json        # inspect effective command isolation
-ash sandbox build                # explicitly build the optional baseline image
-ash agents branches              # inspect isolated worker branches
-ash agents apply ash-agent/ID    # cherry-pick a worker after review
-ash agents discard ash-agent/ID --yes
-ash extensions install ./my-plugin # local directory only; validates before install
-ash extensions search review --catalog /path/catalog.json
-ash extensions search review --catalog https://publisher.example/ash-catalog.json
-ash extensions install review --catalog /path/catalog.json # pinned by signed entry
-ash extensions plugins --json      # inspect enabled and disabled plugins
-ash extensions disable my-plugin
-ash extensions enable my-plugin
-ash extensions uninstall my-plugin --yes
-ash lsp status --json              # inspect servers without starting them
-ash lsp diagnostics src/app.py
-ash lsp query definition src/app.py --line 12 --character 8
-ash lsp query workspaceSymbol --query App
-ash cron add nightly --prompt 'Review open risks' --cron '0 2 * * mon-fri' --timezone UTC
-ash cron status                  # includes worker liveness
-ash cron worker                  # execute due schedules for this workspace
-```
+### Context, memory, and instructions
 
-The authenticated server exposes synchronous turns at `/v1/turn`, live SSE
-turn events at `/v1/turn/stream`, and durable branching at
-`/v1/sessions/{session_id}/fork` and `/v1/sessions/{session_id}/tree`;
-non-loopback binding requires `--allow-remote`. See
-[durable session branching](docs/guides/SESSION_BRANCHING.md) for integrity and
-retention behavior.
+Ash manages context as a first-class runtime resource:
 
-### Editor integration (ACP v1)
+- configurable system, tool, history, repository-map, and memory budgets;
+- provider-aware token counting, cost tracking, and cache accounting;
+- automatic and manually requested compaction;
+- extractive summaries that retain recent tool-call/result pairs;
+- bounded pruning of stale large tool results;
+- persistent global and trusted hierarchical `ASH.md` instructions with
+  bounded imports, diagnostics, and conflict linting;
+- project-root-aware repository maps with active-file ranking;
+- searchable redacted session memory;
+- explicit project memory indexing, search, clear, and privacy export;
+- deterministic in-memory semantic search;
+- optional Chroma vector search;
+- SQLite FTS5 lexical fallback; and
+- bounded batch indexing for large projects without one database transaction
+  per file.
 
-Install the capability pack, configure a provider once, and verify the agent:
+Attachments and context expansion support workspace files, directories,
+images, fuzzy repository symbols, and live MCP resources. Text and directory
+content is bounded by model context; PNG, JPEG, GIF, and WebP images are
+bounded, require advertised vision support, and are persisted as metadata and
+digests rather than base64 payloads.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra acp
-ash setup
-ash acp --check
-```
+### Durable sessions and recovery
 
-Point an ACP-compatible editor's custom-agent command at `ash` with argument
-`acp` (for example, Zed accepts that command/argument pair). Ash uses the
-editor's workspace as the session boundary and supports new, load, list,
-prompt, cancel, close, text/resource-link content, tool progress, usage, and
-HTTP/SSE/stdio MCP servers. Durable loads replay messages and redacted tool
-activity. Each editor connection is limited to 16 live sessions and one active
-turn per session. Image, audio, embedded-resource, extra-directory, ACP-MCP,
-mode, fork, and resume capabilities are not advertised until their full
-protocol behavior is implemented. Standard output is reserved for ACP JSONL;
-diagnostics go to standard error.
+Every project can have durable, inspectable conversation state backed by
+versioned SQLite storage. Ash supports:
 
-### Remote agents (A2A 1.0)
+- new, continue, resume, list, search, rename, and project-scoped session
+  picking;
+- exact session IDs and human-readable session names;
+- parent/root lineage, forks, conversation trees, and branch summaries;
+- complete-turn transcript rewind;
+- optional conflict-aware restoration of checkpointed file edits;
+- per-turn file checkpoints, hashes, and undo protection;
+- redacted JSONL and Markdown session export and validated JSONL import;
+- configurable retention, pruning, vacuum, backups, restore, and integrity
+  checks;
+- crash recovery based on persisted tool intent and hash-proven file state;
+- recovery reports for in-flight, incomplete, conflicting, or ambiguous work;
+  and
+- persisted token, cache, usage, and cost history with estimated portions
+  clearly labeled.
 
-Install and verify the optional capability pack, then expose the current
-project on loopback with an operator-owned token:
+Recovery is conservative: completed work is retained, direct file edits are
+compensated only when hashes prove what happened, and non-file side effects
+are never guessed or silently replayed.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra a2a
-ash a2a check
-export ASH_A2A_TOKEN='replace-with-at-least-16-characters'
-ash a2a serve
-```
+### Terminal experience
 
-The public Agent Card is at `/.well-known/agent-card.json`; JSON-RPC is at
-`/a2a`, and the official HTTP+JSON routes are also mounted under `/a2a`.
-Operational routes require the bearer token and are rate-limited. A remote
-binding additionally requires `--allow-remote` and an explicit HTTPS
-`--public-url`; terminate TLS in a production reverse proxy.
+The interactive interface is built for sustained terminal work:
 
-Discover or call another A2A agent with the same out-of-band token convention:
+- responsive full-screen transcript viewport with page navigation and live
+  tailing;
+- inline rendering fallback for terminals that do not support a viewport;
+- Rich Markdown and fenced-code rendering with bounded repaint frequency;
+- streaming user, assistant, reasoning, tool, approval, status, error, and
+  recovery entries;
+- searchable full-screen help with a linear fallback for redirected input and
+  screen readers;
+- multiline editing, persistent prompt history, reverse history search, Vim or
+  Emacs input modes, and external-editor support;
+- `/` command registry with aliases, parsing, completion, and stable help;
+- `@` file, directory, image, symbol, and MCP-resource completion;
+- unified or side-by-side bounded approval diffs;
+- status surfaces for model, branch, context, cache, cost, sandbox, session,
+  and working directory;
+- validated dark and light themes;
+- reduced-motion, no-color, inline, and dedicated screen-reader modes;
+- configurable cross-platform keybindings; and
+- opt-in OSC 9, BEL, and terminal-aware desktop notifications with bounded
+  previews and failure isolation.
 
-```bash
-ash a2a inspect https://agent.example.com
-ash a2a send https://agent.example.com 'Review the authentication flow'
-ash a2a send https://agent.example.com 'Continue' --context-id CONTEXT --json
-```
+Structured text, JSON, and stream-JSON surfaces are available for scripts,
+CI systems, editor hosts, and other automation clients.
 
-To let models delegate through `list_remote_agents` and
-`delegate_remote_agent`, configure explicit endpoints in `~/.ash/a2a.json` or,
-for a trusted workspace, `.ash/a2a.json`:
+### Safety, trust, and policy
 
-```json
-{
-  "agents": {
-    "review": {
-      "url": "https://review.example.com",
-      "description": "Independent code reviewer",
-      "token_env": "REVIEW_A2A_TOKEN",
-      "timeout_seconds": 300
-    }
-  }
-}
-```
+Safety is part of the harness contract rather than an optional prompt:
 
-Tokens are read from the named environment variable and never stored in the
-file or exposed as model arguments. Delegation remains subject to Ash's normal
-approval policy. A2A tasks and context-to-Ash session mappings persist in
-separate SQLite databases; text streaming, polling, task get/list,
-cancellation, and context continuation are supported. Push notifications,
-files/data modalities, extended cards, gRPC, and signed-card trust policy are
-not advertised.
+- interactive approvals for tool calls with once, session, project, and
+  scoped decisions;
+- ordered allow, ask, and deny rules with stable IDs;
+- exact, contains, prefix, enum, numeric maximum, path-prefix, suffix, domain,
+  and command-prefix matchers;
+- deny precedence and fail-closed behavior for unattended work;
+- bounded approval previews and deny-with-feedback;
+- separate user-owned policy from repository-controlled configuration;
+- explicit project trust before project instructions, extensions, MCP, or LSP
+  configuration can affect the runtime;
+- workspace path and domain restrictions;
+- secret and private-key detection before auto-commit;
+- incremental redaction of sensitive output;
+- tamper-evident session audit records with verification and export;
+- untrusted-content labels and provenance metadata;
+- no automatic replay of dispatched side effects; and
+- clean error classification with actionable diagnostics.
 
-### Managed language servers (LSP 3.18)
+### Sandboxed execution
 
-Managed LSP support is included in the base install. Ash never downloads or
-installs a language-server binary. It detects installed basedpyright/pyright,
+Shell and executable extension work can use a fail-closed isolation layer:
+
+- Bubblewrap on Linux;
+- `sandbox-exec` on macOS;
+- Docker with the packaged `ash-sandbox` baseline, including Docker Desktop on
+  Windows; or
+- explicitly reported direct execution when no isolation backend is available.
+
+Isolated commands default to disabled network access, a scrubbed environment,
+workspace-scoped filesystem access, bounded output, and process-tree cleanup.
+User-owned sandbox configuration cannot be weakened by project configuration.
+Git hooks, MCP stdio servers, and plugin runtimes use the same conservative
+environment boundary. Unsafe auto-approval is disabled unless an operator
+explicitly opts into the compatibility escape hatch.
+
+### Web and browser automation
+
+The web surface includes:
+
+- guarded HTTP(S) fetching;
+- Brave and Tavily search with provider provenance;
+- automatic search-provider fallback or an explicitly pinned provider;
+- public-host, private-network, loopback, content-type, size, and domain
+  restrictions;
+- durable citations for search and fetch results; and
+- normalized source records exposed to both the model and structured clients.
+
+The optional browser surface owns an isolated Playwright Chromium context and
+provides:
+
+- navigation, click, type, scroll, back, and stable element references;
+- bounded ARIA snapshots rather than unbounded DOM dumps;
+- bounded vision screenshots;
+- safe workspace uploads;
+- bounded atomic workspace downloads with no-overwrite-by-default behavior;
+- public-host and allowed-domain policy for navigation, subresources, and
+  WebSockets;
+- disabled service workers and blocked password-field filling;
+- ephemeral contexts by default;
+- optional Ash-owned persistent browser profiles; and
+- deterministic browser cleanup and health diagnostics.
+
+Attaching to an already-running browser through CDP is not currently exposed.
+
+### MCP integration
+
+Ash connects local and remote Model Context Protocol servers over stdio,
+Streamable HTTP, and the SSE configuration alias. MCP support includes:
+
+- server add, remove, list, status, login, logout, and targeted refresh;
+- live tools, resources, resource templates, prompts, and task operations;
+- OAuth 2.1 discovery, protected-resource metadata, S256 PKCE, resource
+  indicators, callback-state validation, and dynamic client registration;
+- explicit operator authorization rather than surprise browser prompts during
+  agent runs;
+- resource-bound access and refresh tokens with private local storage;
+- automatic token refresh and explicit insufficient-scope step-up handling;
+- exact draft-aware schema validation in a bounded secret-free subprocess;
+- preservation of rich content blocks, structured data, metadata, and protocol
+  errors;
+- no replay of a rejected or ambiguously dispatched side effect;
+- session-expiry recovery without reposting the rejected tool call;
+- paginated capability listing and live catalog reconciliation;
+- atomic publication of validated tool-list changes;
+- catalog quarantine when refresh fails; and
+- in-flight tool-snapshot and contract verification before sending a call.
+
+MCP configuration can be user-owned or enabled for a trusted workspace. MCP
+resource mentions can be selected directly from terminal completion.
+
+### Extensions, skills, and hooks
+
+Ash is extensible without changing the core runtime:
+
+- local plugins with a root `plugin.json` manifest;
+- plugin-provided skills, commands, agents, hooks, MCP servers, and executable
+  tools;
+- namespacing and dependency constraints to prevent collisions;
+- local-directory and trusted HTTPS Git repository sources;
+- publisher-pinned, signed catalogs with bounded redirect-free caching;
+- validation for traversal, links, malformed manifests, oversized components,
+  missing dependencies, and unsafe replacements;
+- enable, disable, uninstall, inventory, search, and atomic live reload;
+- isolated versioned JSON-RPC stdio for executable plugins;
+- lazy plugin startup with no ambient secrets or network access;
+- ordinary approval, audit, hook, sandbox, and dry-run policy around plugins;
+- modern Markdown `SKILL.md` instruction skills that do not execute embedded
+  code;
+- opt-in legacy executable-skill compatibility; and
+- bounded lifecycle hooks for sessions, turns, models, tools, errors, and
+  policy gates.
+
+Critical pre-tool hooks fail closed. Observer-hook failures cannot corrupt a
+completed turn. Custom Markdown commands support arguments, namespaces,
+completion, and trusted user or project sources.
+
+### Subagents and delegation
+
+Ash can run provider-backed workers as bounded, role-specific agents:
+
+- researchers and reviewers with read-only tools;
+- coders with scoped edit tools;
+- testers with shell access only when a full OS sandbox is active;
+- isolated Git worktrees and retained `ash-agent/*` branches;
+- live status, stop, resume, steering, messages, reports, and branch review;
+- durable task IDs, ownership leases, capacity admission, crash recovery,
+  cancellation, time/token/cost budgets, results, and artifacts;
+- dependency graphs with atomic submission and ready-task scheduling;
+- redacted predecessor results treated as untrusted evidence;
+- event replay with type and cursor filtering; and
+- embedded delegation through the Python client.
+
+The remote-agent tools can discover configured A2A peers and delegate to them
+with operator-owned bearer credentials held outside model arguments.
+
+### Protocols and integrations
+
+Ash exposes or consumes the following integration surfaces:
+
+| Surface | Capability |
+| --- | --- |
+| ACP v1 | Stdio editor/agent host integration with session lifecycle, prompts, cancellation, tool progress, usage, text, resource links, and stdio/HTTP/SSE MCP support |
+| A2A 1.0 | Authenticated Agent Card, JSON-RPC, HTTP+JSON routes, task polling, streaming, cancellation, context continuation, inspection, and outbound delegation |
+| HTTP API | Authenticated synchronous turns, live SSE turn events, session fork, and session tree endpoints |
+| JSON-RPC | Structured runtime and session integration for external hosts |
+| LSP 3.18 | Managed lazy language servers for diagnostics, hover, definitions, references, implementations, symbols, and call hierarchy |
+| Python SDK | Async client access to turns, sessions, plans, steering, events, usage, storage, automation, and agent delegation |
+
+Managed LSP detects installed basedpyright/pyright,
 typescript-language-server, gopls, rust-analyzer, clangd, and
-lua-language-server processes. A server starts lazily for the nearest project
-root and stops with its owning Ash runtime.
-
-The `lsp` tool and `ash lsp` commands support diagnostics, hover, definition,
-references, implementation, document/workspace symbols, and call hierarchy.
-Input line and character coordinates are 1-based; returned protocol ranges are
-0-based. Successful write, replace, and patch tools may append advisory
-diagnostics. A language-server failure never changes whether the edit itself
-succeeded. Rename and code actions are not currently exposed.
-
-Add custom servers or override detected ones in `~/.ash/lsp.json`. A trusted
-workspace may also use `.ash/lsp.json`; project entries take precedence over
-user entries. Set `disabled` to remove a detected or inherited server.
-
-```json
-{
-  "servers": {
-    "example": {
-      "command": ["example-language-server", "--stdio"],
-      "extensions": {".example": "example"},
-      "root_markers": ["example.toml", ".git"],
-      "env": {"EXAMPLE_MODE": "strict"},
-      "initialization_options": {},
-      "settings": {"example": {"diagnostics": true}},
-      "disabled": false
-    }
-  }
-}
-```
-
-Server commands execute directly without a shell and receive a scrubbed
-environment plus explicit `env` overrides. They are host processes, not
-network-isolated sandboxes. For that reason, project LSP configuration and
-workspace `node_modules/.bin` discovery are disabled until `ash trust add` is
-run. Ash rejects server-requested workspace edits and discards semantic results
-that reference files outside the workspace. Set `lsp_enabled = false` in the
-user config, or `ASH_LSP_ENABLED=false`, to disable the capability globally;
-trusted project config cannot override that user-owned control.
+lua-language-server processes. It never downloads a server, rejects
+out-of-workspace semantic results, and does not expose rename or code-action
+operations yet.
 
 ### Durable automation
 
-Ash can persist one-shot, interval, and five-field cron prompts in SQLite and
-execute them through the ordinary trusted runtime:
+Ash can persist unattended prompts as:
 
-```bash
-cd /path/to/project
-ash trust add .
-ash cron add dependency-review \
-  --prompt 'Review dependency changes, run focused checks, and report risks' \
-  --cron '30 9 * * mon-fri' --timezone Asia/Kolkata
-ash cron worker
-```
+- one-shot jobs at an explicit future instant;
+- elapsed intervals; or
+- five-field cron schedules in named IANA time zones.
 
-Jobs do not run inside the interactive CLI process. Keep one `ash cron worker`
-under a process supervisor for each workspace, or invoke `ash cron worker
---once` from an external scheduler. `ash cron status` and `ash doctor` warn
-when enabled jobs have no fresh worker heartbeat. Unattended tool calls use the
-normal permission rules: read-only calls proceed, persistent allows proceed,
-and actions that still require a prompt fail closed. Revoking workspace trust
-stops new claims.
+Automation includes validated schedule parsing, misfire grace, whole-turn
+timeouts, token budgets, cancellation, run history, pause/resume, soft delete,
+worker liveness heartbeats, crash recovery, and external-supervisor-friendly
+workers. Unattended calls continue to obey the same permission, trust, and
+fail-closed approval rules as interactive work.
 
-See the [durable automation guide](docs/guides/DURABLE_AUTOMATION.md) for
-schedule, crash-recovery, DST, supervision, SDK, and cancellation contracts.
+### Operations and lifecycle
 
-Inside an interactive terminal, `/help` opens a full-screen searchable command
-reference; redirected input and screen-reader mode keep the linear text output.
-It covers session, context, model, diff, review, permissions, sandbox, skills,
-plugins, export, and diagnostic commands.
-Prefix a command with `!` to run it through the same permission and sandbox
-policy as model tool calls while streaming bounded stdout and stderr live.
-`@path` attachments are capped at 25% of usable model input context by default;
-set `max_attachment_tokens` (or `ASH_MAX_ATTACHMENT_TOKENS`) for an explicit cap.
-File reads and edits support UTF-8 plus BOM-tagged UTF-8/16/32 and preserve the
-detected encoding during atomic overwrites.
-`/resume` opens the project-scoped session picker; type to filter, use arrow
-keys to navigate, `Space` to preview, and `Enter` to resume. `/resume NAME`
-resolves an exact persisted title, while `/rename TITLE` sets that title.
-`/review` supports worktree, staged, commit, and branch-versus-base scopes.
-`/diff --turn` shows the latest Ash checkpoint diff and refuses if files changed
-after Ash's edit; `/diff --staged` and `/diff path` keep showing Git diffs.
-`/rewind COUNT` truncates complete persisted turns at a message boundary.
-Add `--files` to restore all checkpointed direct file edits from the removed
-turns as well. Combined rewind preflights every file hash, handles repeated
-edits newest-first, adjusts persisted token/cost totals, and rolls files back
-to their current state if the database update fails. It refuses split-turn
-boundaries, post-edit conflicts, incomplete checkpoints, and legacy transcript
-records that predate durable turn IDs.
-When a resumed session contains a turn interrupted during tool execution, Ash
-uses the persisted approved-call intent and per-call checkpoint to compensate
-only that in-flight direct file edit. It restores a file only when its hash is
-still the recorded post-edit or pre-edit state. Changed/incomplete files and
-non-file tools such as commands are never guessed: they are marked as needing
-attention, persisted in the recovery report, emitted as `session.recovery`, and
-shown by `/status`. A successful recovery is idempotent across another crash.
-`/plan on` enables editable sprint plans for multi-step requests; type `e` at
-the plan prompt to revise the generated contract in `$VISUAL` or `$EDITOR`,
-then `y` to approve and execute it.
-Tool approvals support once-only (`y`), exact session scope (`s`), broad
-tool/session scope (`a`), persisted project scope (`p`), persisted scoped
-denial (`x`), and an explicit argv-prefix project rule for simple commands
-(`c`). Compound commands, redirection, and command substitution cannot match a
-command-prefix rule and continue to require exact approval. Persisted
-allow/ask/deny rules use stable IDs and can be listed or removed with
-`ash permissions`; deny rules take precedence over ask and allow rules.
-Ash auto-commit scans staged added lines for high-confidence credentials and
-private keys, refuses the commit without echoing values, and leaves changes
-staged for inspection.
-Use `ash plans list`, `ash plans show <sprint-id>`, and
-`ash plans update <sprint-id> <item> <status>` to inspect or update persisted
-checklists outside the REPL.
-`Alt+Enter` or `Ctrl+J` inserts a newline; prompt history is stored under
-`~/.ash`. Type `@path` or `@"path with spaces"` to attach bounded workspace
-text, a directory listing, or PNG/JPEG/GIF/WebP images to a prompt. Images are
-accepted only when the active provider/model advertises vision support, are
-bounded to 5 MB each and 10 MB combined, and travel as native Anthropic/OpenAI
-image blocks. Session storage retains only path/media/hash descriptors, never
-base64 payloads. Secret, unsupported binary, oversized, linked, and
-out-of-workspace paths are rejected.
+The operational surface includes:
 
-Provider-backed subagents run bounded Ash loops with role-specific tools.
-Researchers and reviewers are read-only; coders receive scoped edit tools;
-testers receive shell execution only when a full OS sandbox is active. Coder
-and tester roles default to locked Git worktrees and retain committed changes
-on `ash-agent/*` branches without modifying the lead worktree. The lead must be
-clean when a worktree is created or applied. Use `/agents`, `/agents stop ID`,
-and `/agents resume ID` for live status and lifecycle control; queued steering
-messages are consumed at model-iteration boundaries and marked delivered.
-Every provider-backed worker also runs through the durable task contract in
-[Agent Tasks v1](docs/reference/AGENT_TASKS_V1.md): cross-process capacity admission,
-renewable ownership leases, crash recovery, token/time budgets, dependency
-DAGs, cancellation, results, and artifacts are persisted in SQLite. Inspect
-them with `ash agents tasks [--state STATE] [--owner ID] [--json]`.
-Replay their versioned lifecycle with
-`ash agents events [--task ID] [--type TYPE] [--after SEQUENCE] [--json]`.
-For multi-stage work, the provider-facing `delegate_agents` tool atomically
-submits a dependency graph and automatically runs ready tasks in parallel. The
-same workflow is available to embedded callers as
-`await client.delegate_agents(goal, tasks, background=False)`.
-Dependent workers receive redacted predecessor results as untrusted evidence;
-isolated tasks verify and merge retained predecessor branches inside their own
-worktrees without changing the lead branch.
-Use `ash agents tasks --graph GRAPH_ID` to inspect one graph and
-`ash agents cancel GRAPH_ID --yes` to revoke its queued and active work.
+- local health diagnostics covering credentials, providers, web search,
+  browser, storage, automation, extensions, A2A, MCP, LSP, and workspace
+  trust;
+- secret-free JSON status for setup, providers, capabilities, sandbox, and
+  diagnostics;
+- database integrity checks, consistent backups, validated restore, redacted
+  debug bundles, metrics, and tamper-evident audit export;
+- explicit update/version checks with no background telemetry;
+- selective reset of configuration, sessions, cache, or all local state;
+- idempotent installation and repair behavior that preserves selected optional
+  capability packs; and
+- lazy loading so lightweight version/help/status paths do not initialize the
+  full provider, browser, server, repository, or TUI stack.
 
-Large tool catalogs are deferred automatically above 32 tools. The model uses
-`search_tools` to discover and activate exact schemas for plugin, MCP, and
-built-in capabilities; set `tool_search_threshold = 0` in config to always send
-the full catalog.
+## Project shape
 
-Plugins are self-contained local directories with a root `plugin.json`.
-Manifests may declare path-based `skills`, `commands`, `agents`, `hooks`, and
-`mcpServers`; omitted fields use the conventional `skills/`, `commands/`,
-`agents/`, `hooks/hooks.json`, and `.mcp.json` locations. Plugin skills,
-commands, agents, and MCP servers are namespaced to prevent collisions.
-Dependencies are other installed plugins with optional PEP 440 version
-constraints. Installation rejects links, path traversal, malformed or
-oversized components, missing enabled dependencies, and invalid replacement
-content before changing the active version. `/plugins` manages local plugins
-and trusted HTTPS Git repositories (`ash extensions install URL --ref REF`).
-Git installs use an explicit branch or tag, shallow temporary checkout, and the
-same manifest and component validation as local directories; repository
-metadata is removed before activation.
-A signed catalog can also be browsed with `extensions search` and installed by
-name using `--catalog`; name installs use the publisher-pinned source, ref,
-and commit digest. Set `ASH_PLUGIN_CATALOG` to enable a default catalog and
-`ASH_CATALOG_KEYS` to override `~/.ash/catalog-keys.json`.
-HTTPS catalog values are fetched with redirects disabled into a private cache
-under `~/.ash/cache/catalogs`, bounded to 256 KiB, then verified with pinned
-trusted keys before discovery or install.
-inside a session and `/reload-plugins` atomically refreshes commands,
-completion, skills, agents, hooks, executable tools, and MCP servers without
-restarting Ash. Executable plugins use the isolated, versioned JSON-RPC stdio
-boundary in [Plugin API v1](docs/reference/PLUGIN_API_V1.md); they are lazy-started,
-receive no ambient secrets or network access, and cannot bypass ordinary tool
-approval, audit, hooks, or dry-run policy.
-Project plugins remain disabled until their workspace is trusted.
-Command hooks use the versioned, bounded lifecycle contract documented in
-[Hook Contract v1](docs/reference/HOOKS_V1.md). Critical `pre_tool` gates fail closed;
-session, turn, model, post-tool, and error observers cannot corrupt completed
-runtime work when they fail.
-Modern `SKILL.md` instruction skills never execute embedded code. The legacy
-Python/Markdown executable-skill API is disabled by default; compatibility
-callers must opt in explicitly, and even then may use only tools supplied by
-the policy-wired runtime registry.
+Ash is a typed Python package with a public `ash.*` namespace and a console
+entry point. Optional capability packs keep server, vector, browser, ACP, and
+A2A dependencies separate from the lean core. The repository contains:
 
-Project-controlled config and extensions are disabled until the workspace is trusted.
-API keys are stored in `~/.ash/.env` with restricted permissions. Custom
-provider metadata is stored separately in `~/.ash/ash.toml`.
-Network fetches and live search require normal tool approval. `web_fetch`
-refuses private, loopback, reserved, non-HTTP, oversized, and unsupported
-content. `web_search` auto-detects `BRAVE_SEARCH_API_KEY` or `TAVILY_API_KEY`
-from `~/.ash/.env`, returns normalized source records with provider provenance,
-and falls back between configured providers only in `auto` mode. Set
-`web_search_provider` to pin one provider. `allowed_web_domains` filters both
-fetch targets and returned search sources. Run `ash setup web` to enter either
-search credential through the hidden-input setup flow.
-Successful search and fetch results carry durable citations. Search citations
-include title, URL, redacted-snippet digest, publication date when available,
-and provider; fetch citations include final URL, status, and content type.
-Citations are also exposed to the model with each tool response.
+- the installable harness and runtime under `src/ash/`;
+- unit, integration, packaging, and real-browser coverage under `tests/`;
+- architecture and parity analysis under `docs/architecture/`;
+- operational guides under `docs/guides/`; and
+- versioned protocol and extension contracts under `docs/reference/`.
 
-Browser automation is an optional capability pack. Install with
-`curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash/installer.py | python3 - --extra browser`,
-then run `ash setup browser` once to download
-Playwright's pinned Chromium build. Browser pages use an isolated context with
-`browser_screenshot` captures a bounded PNG for vision-capable models, returning
-the canonical image block plus digest metadata; oversized captures fail safely.
-`browser_upload` uploads one bounded workspace file through a referenced file
-input using scoped reads and sensitive-file rejection.
-`browser_download` saves one bounded download to an explicit workspace path;
-it refuses overwrites unless requested and writes atomically. Service workers
-remain disabled; navigation, subresources, and
-WebSockets share the public-host and `allowed_web_domains` policy. The model
-receives bounded ARIA snapshots and stable element references rather than raw
-unbounded DOM content. Password fields are never filled by the browser tool.
+The [documentation index](docs/README.md) links to the maintained guides,
+including [permissions and managed policy](docs/guides/PERMISSIONS.md),
+[durable session branching](docs/guides/SESSION_BRANCHING.md),
+[durable automation](docs/guides/DURABLE_AUTOMATION.md), and the
+[production parity checklist](docs/architecture/PRODUCTION_HARNESS_PARITY.md).
 
-Remote MCP servers may use OAuth-protected Streamable HTTP (`sse` remains a
-configuration alias for the same request path). Ash
-discovers protected-resource and authorization-server metadata, requires S256
-PKCE, sends the MCP resource indicator, validates callback state, and uses
-dynamic client registration when no client ID is configured and the server
-supports it:
+## Current boundaries
 
-MCP tool inputs retain their exact draft-aware JSON Schemas and validate
-without coercion in a bounded, secret-free subprocess; remote schema references
-are never fetched. Rich call results preserve validated content blocks,
-structured data, metadata, application errors, and protocol error details;
-side-effecting calls are not replayed after an ambiguous failure. Session-expiry
-404 responses trigger one generation-locked reinitialization, restart any
-paginated list, and reconcile the replacement server catalog, but never repost
-the rejected `tools/call`; its outcome remains ambiguous. Declared MCP tool list changes are validated
-and atomically published to the live runtime. Failed refreshes retain the last
-working catalog for discovery but quarantine its calls until a later verified
-refresh. In-flight turns retain the tool snapshot they were offered and verify
-its exact contract again immediately before every HTTP or stdio send.
+Ash deliberately reports unsupported or partial surfaces instead of pretending
+they are complete:
 
-```bash
-ash mcp add docs --transport http --url https://mcp.example/rpc --auth oauth
-ash mcp login docs
-ash mcp status
-ash mcp logout docs
-```
+- subscription-based provider authentication is not included;
+- browser CDP attachment is not exposed;
+- ACP image/audio/embedded-resource and advanced session capabilities are not
+  advertised until their full behavior is implemented;
+- A2A push notifications, file/data modalities, extended cards, gRPC, and
+  signed-card trust policy are not currently advertised;
+- LSP rename and code actions are not exposed; and
+- a broad messaging-channel gateway is not currently part of Ash.
 
-Inside a session, run `/mcp refresh` to reload trusted project/plugin MCP
-configuration through the same atomic lifecycle and print the resulting
-connected/failed state.
-
-Authorization is always an explicit `ash mcp login`; normal agent runs never
-open a browser or wait for terminal input. Use `--no-browser` to print the URL
-for another browser and paste its final localhost redirect. Access and refresh
-tokens are resource-bound and stored under `~/.ash/mcp-oauth` with private
-permissions; expired tokens refresh automatically, and a rejected refresh asks
-for login again.
-
-If an operation returns OAuth `insufficient_scope`, Ash does not interrupt an
-agent run with a browser. It reports the server-required scopes; authorize the
-step-up explicitly and retry the operation:
-
-```bash
-ash mcp login docs --scope 'files:read files:write'
-```
-
-For an authorization server without dynamic client registration, pre-register
-the loopback redirect port and keep the client secret in an environment
-variable:
-
-```bash
-export MCP_DOCS_CLIENT_SECRET='...'
-ash mcp add docs --transport http --url https://mcp.example/rpc --auth oauth \
-  --oauth-client-id CLIENT_ID \
-  --oauth-client-secret-env MCP_DOCS_CLIENT_SECRET \
-  --oauth-redirect-port 43123 \
-  --oauth-scope 'files:read'
-ash mcp login docs
-```
-
-The configured port must exactly match the registered
-`http://127.0.0.1:PORT/callback` URI. `.mcp.json` stores only the environment
-variable reference, never its resolved client-secret value. A user-hosted
-OAuth Client ID Metadata Document is also supported by passing its HTTPS URL
-as `--oauth-client-id`; its `client_id` and fixed loopback redirect URI must
-match the hosted document exactly.
-
-Workspace file reads, attachments, writes, exact edits, and patches reject
-symlink/junction mutation paths. On POSIX, Ash walks from an open workspace
-descriptor with no-follow operations and performs atomic directory-anchored
-writes; the cross-platform fallback revalidates path identity and content
-before replacement. Concurrent no-overwrite creation and stale edits fail
-without clobbering the other process's data.
-
-Shell commands use a fail-closed workspace sandbox when one is available:
-Bubblewrap on Linux, `sandbox-exec` on macOS, or a verified
-`ash-sandbox:latest` Docker image (including Docker Desktop on Windows).
-Network access is disabled inside isolated commands. Without one of those
-backends, Ash clearly reports direct execution and keeps shell actions behind
-the permission policy; `auto_approve` is refused unless
-`ASH_ALLOW_UNSAFE_AUTO_APPROVE=true` is explicitly set. `/sandbox` and
-`ash doctor` report the effective filesystem, network, backend readiness, and
-fail-closed policy.
-
-Sandbox selection is user-owned configuration and cannot be weakened by a
-project `.ash/config.toml`:
-
-```toml
-sandbox_backend = "auto" # auto, native, docker, or direct
-sandbox_network = false
-sandbox_docker_image = "ash-sandbox:latest"
-command_env_allowlist = ["BUILD_CHANNEL", "NPM_CONFIG_REGISTRY"]
-# Emergency compatibility only; never project-controlled.
-allow_unsafe_plugin_runtime = false
-```
-
-`auto` prefers Bubblewrap on Linux or `sandbox-exec` on macOS, then a locally
-available Docker image. Windows uses the Docker fallback. `ash sandbox build`
-builds the packaged Python, Node.js, Go, Rust, Java, and native-build baseline;
-it is an explicit operation and Ash never downloads or builds it at startup.
-Shell commands receive only a small operational environment by default. Add
-variable names to `command_env_allowlist` in user configuration when build or
-development commands need them; values are read from Ash's process environment
-at execution time. Repository configuration cannot alter this allowlist, and
-Docker forwarding uses variable names rather than embedding values in process
-arguments. The same scrubbed base applies to Git hooks and MCP stdio servers;
-MCP variables must be declared in that server's `env` configuration.
-
-## Configuration
-
-The selected model uses `provider/model` form, for example:
-
-```text
-anthropic/claude-sonnet-4-5
-openai/gpt-5
-ollama/qwen3-coder
-```
-
-Run `ash setup` to configure a provider and `ash doctor --connect` to test its
-endpoint. Run `ash doctor --json` for machine-readable diagnostics.
-The setup wizard discovers models through the provider endpoint before writing
-credentials, supports `b` to return and `c` to cancel, and offers explicit
-retry or save-unverified choices when an endpoint is unavailable. API keys use
-hidden input and related key/base/model settings are committed atomically.
-`ash doctor --connect` resolves the same provider endpoint and authentication
-used for a turn, then confirms that the selected model is advertised there.
-For local models, run `ash ollama pull <model>` to execute a validated pull
-through the installed Ollama CLI. The command uses a scrubbed environment,
-bounded output, timeout/process cleanup, and never interprets the model name as
-a shell command.
-Ollama providers probe model metadata once per provider instance to detect
-native tool support and advertised context length. If probing is unavailable,
-Ash fails closed to local-only capabilities.
-Custom OpenAI-compatible endpoints can explicitly use bearer authentication or
-no authentication; an anonymous endpoint never inherits `OPENAI_API_KEY`.
-Ollama setup discovers installed models and gives `ollama serve`/`ollama pull`
-guidance without starting a download. In scripts, `ash setup
---non-interactive` validates an existing environment configuration without
-prompting or making a network request.
-
-Configuration resolves in this order, from highest to lowest priority:
-
-1. Command-line overrides
-2. Process environment (`ASH_*`)
-3. Trusted `.ash/config.toml` files from the repository root to the current directory
-4. User configuration in `~/.ash/ash.toml`
-5. User credentials/settings in `~/.ash/.env`
-6. Built-in defaults
-
-Run `ash config explain` or `ash config explain --json` to inspect the selected
-source for every field. Project configuration may tune model/runtime and TUI
-behavior, but cannot set credentials, custom provider endpoints, workspace or
-database paths, MCP servers, permission weakening, or outbound-domain policy.
-Use `ash trust add <path>` to enable project layers and `ash trust remove
-<path>` to disable them.
-
-When setup finds the original project-root `ash.toml` format, it migrates all
-recognized values without replacing newer user settings. Source and changed
-destination files receive verified mode-0600 backups under `~/.ash/backups`;
-an exact-content migration record prevents repeated prompts while retaining
-recovery evidence.
-
-Terminal behavior is configurable with `ASH_INPUT_MODE=vi`,
-`ASH_NO_COLOR=true`, `ASH_REDUCED_MOTION=true`, `ASH_THEME=light`, and
-`ASH_SHOW_TOKEN_METER=true`. Structured keybindings, sprint planning, and
-terminal appearance can be set in `~/.ash/ash.toml`.
-
-Interactive sessions use the responsive transcript viewport by default. Use
-`PageUp`/`PageDown` to inspect history and `End` to resume following live
-output. Set `ASH_TUI_MODE=inline` when native terminal scrollback is preferred
-or a terminal does not support full-screen applications reliably.
-
-Approval previews use a bounded unified diff by default. Run
-`ash diff-mode side-by-side` to persist a side-by-side layout for write and edit
-approvals, or `ash diff-mode unified` to switch back. Both layouts preserve the
-same 200-line safety bound.
-
-When a tool needs approval, choose `f` to deny it with bounded feedback. Ash
-records the denial durably and returns the feedback to the model so the next
-attempt can respect the user's instruction; blank feedback falls back to a
-normal denial.
-
-`/models` lists built-in models plus models declared by configured custom
-providers, including capability labels. `/model provider/model` shows the known
-tool/vision/reasoning/local capabilities and context/output limits before
-switching.
-Run `/models --refresh` to probe the currently configured provider endpoint and
-display its live catalog alongside the static/configured list. Discovery is
-bounded by provider credentials and endpoint policy; failures preserve the local
-catalog with an explicit warning.
-
-Inside a session, run `/capabilities` to show the active runtime's negotiated
-manifest: tool, vision, reasoning, and local support plus known context/output
-budgets. Ash also reports whether the values came from a dynamic provider
-manifest or the static/default capability registry.
-
-`run_command` returns a bounded set of structured diagnostics parsed from common
-compiler, linter, and test-failure output. These diagnostics accompany the raw
-output so the model can act on exact paths, lines, symbols, and failure messages
-without re-parsing large logs.
-It also extracts concise framework summaries, such as pytest pass/fail/error
-counts, MyPy totals, and Ruff fixable counts, so the model gets aggregate status
-without scanning the full transcript.
-
-Every provider request carries an explicit untrusted-content boundary. Tool
-responses are labeled as untrusted data with a policy note, while the runtime
-system prompt states that repository files, tool outputs, memory, and
-project-derived content must not override user instructions or policy. This is a
-parsing-and-prompting defense layer; permissions, approval gates, sandboxing,
-redaction, and auditing remain independently enforced.
-Run `/context --provenance` after a turn to inspect bounded per-fragment
-provenance: source, trust class, token accounting, truncation state, content
-digest, and the applicable untrusted-content policy.
-
-Permission rules now support tool-specific matchers in addition to exact and
-prefix values: `--path-prefix file_path=docs` scopes workspace paths safely, and
-`--domain url=*.example.com` scopes web URLs or domain arguments by hostname.
-Path prefixes are resolved lexically before matching, so traversal cannot move
-an approved call outside its persisted workspace scope.
-
-Interactive `@` completion supports workspace files and directories plus two
-extended forms: `@symbol:<query>` offers fuzzy structural symbol matches with
-file and line metadata, and `@mcp:<query>` searches live connected MCP resource
-URIs by server and URI.
-On submission, these forms resolve into the same bounded attachment pipeline:
-symbols attach up to five matching workspace source files, MCP resources attach
-a JSON representation of the selected live resource, missing matches fail
-closed, and all content is explicitly marked untrusted.
-
-Set `ASH_SCREEN_READER_MODE=true` for linear, non-rewriting terminal output.
-This mode forces inline rendering, no color, reduced motion, and no token bar;
-it also disables dynamic completion, autosuggestions, and the bottom toolbar
-while retaining cancellable cross-platform prompt input and command history.
-
-Terminal colors use the high-contrast dark theme by default. Set
-`theme = "light"` in configuration (or `ASH_THEME=light`) for a palette tuned
-for light terminals. The setting applies to streamed panels, approval dialogs,
-status surfaces, inline prompts, and the full-screen transcript viewport. It is
-a presentation preference that trusted project configuration may select;
-screen-reader mode intentionally forces the dark palette while disabling color
-output.
-
-Desktop notifications are disabled by default. Enable terminal-aware desktop
-notifications with `ASH_NOTIFICATION_METHOD=auto`, or choose `osc9` or `bel`
-explicitly. The equivalent TOML configuration is:
-
-```toml
-notification_method = "auto" # off, auto, osc9, or bel
-notification_events = ["turn_complete", "approval_required"]
-notification_include_preview = false
-```
-
-`auto` uses OSC 9 for detected Ghostty, iTerm2, Kitty, Warp, and WezTerm
-sessions and falls back to the terminal bell elsewhere. Output is TTY-only,
-control characters are removed, and optional response previews are bounded.
-Inside tmux, enable `allow-passthrough` in tmux for OSC notifications to reach
-the host terminal.
-
-First-party Anthropic and OpenAI prompt caching is enabled by default. It can
-be configured in `~/.ash/ash.toml`:
-
-```toml
-prompt_cache_enabled = true
-prompt_cache_retention = "memory" # memory or extended
-```
-
-`memory` selects Anthropic's default 5-minute cache or OpenAI's in-memory
-cache. `extended` selects Anthropic's 1-hour TTL or OpenAI's 24-hour retention
-where the chosen model supports it. Provider-specific cache controls are not
-sent to custom OpenAI-compatible endpoints or local models. Cache reads,
-writes, hit rate, and configured costs are visible through `/status`,
-`/context`, JSON output, the SDK, HTTP, and JSON-RPC.
-
-Turn usage also reports `usage_source` as `provider`, `estimated`, or `mixed`.
-When a provider omits usage, Ash uses its configured model token counter for
-the actual compacted prompt and streamed response, marks those counts as
-estimated, and records estimated prompt, completion, and configured-cost
-portions separately in session totals. `/status` labels estimated portions,
-the status line prefixes a cost containing estimates with `~`, and structured
-surfaces include `has_estimates` and `cost_is_estimated` rather than presenting
-fallback counts as exact.
-
-Provider requests use one harness-level resilience policy. Only transient
-connection, timeout, 408/409/425/429, and 5xx failures before the first stream
-chunk are retried; authentication, validation, quota-exhaustion, and partial
-stream failures are never replayed. `Retry-After` is honored within the
-configured cap, otherwise Ash uses exponential backoff with jitter:
-
-```toml
-provider_max_attempts = 3
-provider_retry_base_delay = 0.5
-provider_retry_max_delay = 8.0
-provider_circuit_failure_threshold = 5
-provider_circuit_cooldown_seconds = 30.0
-```
-
-Exhausted transient requests open a provider circuit after the configured
-threshold. `/status` reports circuit state; cooldown permits a half-open probe,
-and a successful request resets it. Retry reasons are redacted in logs and
-structured events.
-
-Tool execution has a separate, stricter rule: after Ash dispatches a local,
-plugin, or MCP tool call, it never automatically invokes that call again. A
-reported tool failure is final; a timeout, crash, or lost result after dispatch
-is preserved as an ambiguous outcome because the external side effect may
-already have happened.
-
-See [the production parity checklist](docs/architecture/PRODUCTION_HARNESS_PARITY.md) for
-implemented and remaining release requirements.
+Ash is a work in progress (WIP).
