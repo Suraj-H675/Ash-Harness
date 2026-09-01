@@ -45,7 +45,8 @@ async def test_search_text_rejects_out_of_scope_directory(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_search_text_bounds_oversized_rg_output(tmp_path) -> None:
-    (tmp_path / "large.txt").write_text("needle " + "x" * 3_000_000)
+    lines = ["needle " + "x" * 120 for _ in range(20_000)]
+    (tmp_path / "large.txt").write_text("\n".join(lines))
 
     result = await SearchTextTool(SafetyGuard(tmp_path)).run(
         pattern="needle",
