@@ -8,6 +8,12 @@ MCP OAuth is part of the remote MCP transport boundary.
 This is the authoritative product checklist. Older roadmap files describe
 historical intent and do not prove that a feature works.
 
+This checklist measures Ash against its own required behavior; it is not a
+claim that Ash is feature-equivalent to every public harness. “Verified
+locally” means the Ash implementation and its available tests support the
+listed contract. It does not imply production maturity, ecosystem breadth,
+native client coverage, or interoperability with every comparator.
+
 ## Evidence Rules
 
 - **Verified:** wired into the installed CLI and covered by an end-to-end test.
@@ -212,7 +218,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | Spawn subagent tool | Verified locally | Real bounded provider-backed Ash loop, persisted reports, role-scoped tool manifests, background execution, cancellation, and no recursive spawning |
-| Parallel agents | Verified locally | Atomic DAG submission, dependency-ready parallel dispatch, cross-process capacity, bounded retries, foreground/background operation, restart recovery, and durable graph-wide token and USD ceilings with atomic overrun accounting |
+| Parallel agents | Partial | Atomic DAG submission, dependency-ready dispatch, bounded retries, foreground/background operation, restart recovery, and durable graph-wide token and USD ceilings are wired; the user-facing provider-backed path is in-process and the low-level subprocess driver currently runs a simple serialized driver task, so cross-process provider-backed orchestration is not verified |
 | Agent status/output | Verified locally | Live basic and full slash status with durable task identity, token budgets, and USD cost usage; top-level persisted status/report/message inspection |
 | Agent messaging | Verified locally | Typed SQLite IPC is persisted and inspectable; running workers consume steer/stop messages, acknowledge delivery, and enforce pending-message backpressure |
 | Role tool policies | Verified locally | Read/search baseline, coder-only scoped edits, sandbox-required tester commands, and no recursive spawn tool |
@@ -268,3 +274,33 @@ Research is clean-room: proprietary or leaked source is not used.
 6. **Agents:** provider-backed subagents, worktrees, status/steering/consolidation.
 7. **Release:** cross-platform CI, packaging artifacts, security/performance tests,
    documentation that matches verified behavior.
+
+## Overall parity verdict
+
+Ash is a credible local-first terminal coding harness with unusually broad
+implemented primitives for sessions, safety, tools, MCP, local delegation, and
+automation. It is **not at the same overall level** as Hermes Agent, OpenClaw,
+OpenCode, Claude Code, Codex CLI, Gemini CLI, or Aider as a complete product.
+The differences are product-scope differences, not merely missing polish:
+
+- OpenClaw is a gateway product with many chat channels, multi-agent routing,
+  mobile nodes, media/voice surfaces, a browser Control UI, dozens of providers,
+  and plugin channels. See its [official feature list](https://docs.openclaw.ai/concepts/features).
+- Hermes combines a terminal TUI with remote deployment targets, messaging
+  channels, self-improving memory/skills, web backends, and parallel delegated
+  work. See the [official repository overview](https://github.com/NousResearch/hermes-agent).
+- OpenCode, Claude Code, Codex CLI, Gemini CLI, and Aider each document mature
+  combinations of agent profiles, provider ecosystems, IDE/remote or web
+  surfaces, extensions, review/checkpoint workflows, and/or voice/media that
+  Ash does not provide as a single product. See the [OpenCode agents](https://opencode.ai/docs/agents/),
+  [Claude Code extension model](https://code.claude.com/docs/en/features-overview),
+  [Codex CLI overview](https://developers.openai.com/codex/cli/features),
+  [Gemini CLI feature index](https://geminicli.com/docs/), and
+  [Aider feature overview](https://aider.chat/).
+
+Ash should be described as **strong local coding-core parity, incomplete
+product parity, and a WIP**. The missing gateway/channel/mobile/media/cloud
+surfaces, subscription/OAuth provider breadth, native Windows runtime
+evidence, browser CDP attachment, and richer remote-agent modalities are
+material roadmap items rather than claims that should be hidden behind a
+“verified” label.
