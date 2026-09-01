@@ -6,8 +6,9 @@ import asyncio
 import fnmatch
 import json
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from pydantic import BaseModel, Field
 
@@ -24,6 +25,8 @@ DEFAULT_MAX_RESULTS = 200
 HARD_MAX_RESULTS = 2_000
 MAX_SEARCH_CAPTURE_BYTES = 2_000_000
 SEARCH_TIMEOUT_SECONDS = 30
+MAX_SEARCH_LINE_CHARS = 64 * 1024
+MAX_SEARCH_MATCH_CARRY_CHARS = 4 * 1024
 
 
 class ListDirectoryArgs(BaseModel):
@@ -219,7 +222,48 @@ class SearchTextTool(BaseTool):
             regex = re.compile(expression, flags)
         except re.error as exc:
             return ToolResult(success=False, output="", error=f"Invalid regex: {exc}")
+
+        def bounded_lines(
+            handle: TextIO,
+        ) -> Iterator[tuple[int, str, bool, bool]]:
+            line_number = 0
+            while True:
+                chunks: list[str] = []
+                preview_chars = 0
+                carry = ""
+                matched = False
+                saw_data = False
+                complete = False
+                while True:
+                    chunk = handle.readline(MAX_SEARCH_LINE_CHARS)
+                    if not chunk:
+                        break
+                    saw_data = True
+                    candidate = carry + chunk
+                    if not matched and regex.search(candidate):
+                        matched = True
+                    carry = candidate[-MAX_SEARCH_MATCH_CARRY_CHARS:]
+                    if preview_chars < MAX_SEARCH_LINE_CHARS:
+                        remaining = MAX_SEARCH_LINE_CHARS - preview_chars
+                        chunks.append(chunk[:remaining])
+                        preview_chars += min(len(chunk), remaining)
+                    if chunk.endswith(("\n", "\r")):
+                        complete = True
+                        break
+                if not saw_data:
+                    return
+                line_number += 1
+                preview = "".join(chunks).rstrip("\r\n")
+                if not complete:
+                    preview += "…"
+                yield line_number, preview, matched, not complete
+                if not complete:
+                    return
+
         matches: list[str] = []
+        output_bytes = 0
+        output_limited = False
+        match_limited = False
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
@@ -228,24 +272,42 @@ class SearchTextTool(BaseTool):
                 continue
             try:
                 with path.open(encoding="utf-8") as handle:
-                    for line_number, text in enumerate(handle, 1):
-                        text = text.rstrip("\r\n")
-                        if regex.search(text):
-                            matches.append(f"{relative}:{line_number}:{text}")
-                            if len(matches) >= args.max_results:
-                                output = "\n".join(matches)
-                                output += f"\n[truncated after {args.max_results} matches]"
-                                return ToolResult(
-                                    success=True,
-                                    output=output,
-                                    token_count=count_output_tokens(output),
-                                    truncated=True,
-                                )
+                    for line_number, text, matched, line_truncated in bounded_lines(
+                        handle
+                    ):
+                        if not matched:
+                            continue
+                        if line_truncated:
+                            text += " [line preview truncated]"
+                        rendered = f"{relative}:{line_number}:{text}"
+                        rendered_bytes = len(rendered.encode("utf-8"))
+                        separator_bytes = 1 if matches else 0
+                        if (
+                            output_bytes + separator_bytes + rendered_bytes
+                            > MAX_SEARCH_CAPTURE_BYTES
+                        ):
+                            output_limited = True
+                            break
+                        matches.append(rendered)
+                        output_bytes += separator_bytes + rendered_bytes
+                        if len(matches) >= args.max_results:
+                            match_limited = True
+                            break
             except (OSError, UnicodeError):
                 continue
+            if output_limited or match_limited:
+                break
         output = "\n".join(matches)
+        if output_limited:
+            output += (
+                f"\n[search output capture truncated after "
+                f"{MAX_SEARCH_CAPTURE_BYTES} bytes]"
+            )
+        elif match_limited:
+            output += f"\n[truncated after {args.max_results} matches]"
         return ToolResult(
             success=True,
             output=output,
             token_count=count_output_tokens(output),
+            truncated=output_limited or match_limited,
         )

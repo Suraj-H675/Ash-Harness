@@ -44,7 +44,10 @@ async def test_search_text_rejects_out_of_scope_directory(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_text_bounds_oversized_rg_output(tmp_path, monkeypatch) -> None:
+async def test_search_text_bounds_oversized_fallback_output(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: None)
     monkeypatch.setattr("ash.tools.search.MAX_SEARCH_CAPTURE_BYTES", 8_192)
     lines = ["needle " + "x" * 120 for _ in range(1_000)]
     (tmp_path / "large.txt").write_text("\n".join(lines))
@@ -58,6 +61,23 @@ async def test_search_text_bounds_oversized_rg_output(tmp_path, monkeypatch) -> 
     assert result.success is True
     assert result.truncated is True
     assert "search output capture truncated" in result.output
+
+
+@pytest.mark.asyncio
+async def test_search_text_fallback_bounds_long_line(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: None)
+    monkeypatch.setattr("ash.tools.search.MAX_SEARCH_CAPTURE_BYTES", 8_192)
+    (tmp_path / "large.txt").write_text("needle " + "x" * 200_000)
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle",
+        fixed_strings=True,
+    )
+
+    assert result.success is True
+    assert result.truncated is True
+    assert "search output capture truncated" in result.output
+    assert len(result.output) < 10_000
 
 
 @pytest.mark.asyncio
