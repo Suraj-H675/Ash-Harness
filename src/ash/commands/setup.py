@@ -134,7 +134,10 @@ def _provider_status(config, descriptor: ProviderDescriptor) -> str:
 def _render_setup_status(config, *, title: str = "Current setup") -> None:
     """Render a bounded, secret-free setup summary."""
 
+    from ash.profiles import active_profile_name
+
     console = _setup_console()
+    profile = active_profile_name()
     model = str(getattr(config, "model", "") or "not selected")
     workspace_root = getattr(config, "workspace_root", Path.cwd())
     if not isinstance(workspace_root, Path):
@@ -156,7 +159,8 @@ def _render_setup_status(config, *, title: str = "Current setup") -> None:
     ]
     console.print(Panel(
         f"[bold]{provider_name}[/bold]  [dim]{model}[/dim]\n"
-        f"Provider route: {provider_state}  •  Fallbacks: {fallback_count}",
+        f"Profile: {profile}  •  Provider route: {provider_state}  •  "
+        f"Fallbacks: {fallback_count}",
         title=title,
         border_style="cyan",
         padding=(0, 1),

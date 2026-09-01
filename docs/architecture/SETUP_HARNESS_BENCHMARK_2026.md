@@ -50,7 +50,7 @@ Ash is not limited to four providers today; the setup catalogue has six entries:
 | Auth | API key or no-key Ollama. | No OAuth, subscription/CLI/ACP, AWS profile, GCP ADC, gateway login, keychain, logout, or explicit auth-route choice. |
 | Endpoint | Provider-specific base URL override and one OpenAI-compatible custom endpoint. | No protocol selector, custom headers/query parameters, streaming toggle, TLS/proxy settings, or Anthropic/Ollama-compatible custom routes. |
 | Model choice | Live `/models`/Ollama discovery with manual fallback. | No intent or capability filters, aliases, context/pricing display, fallback chain, model roles, or cached catalog. |
-| Profiles | One active global model/config path plus `custom_providers`. | No named provider/auth/model profiles, environment switching, or `--profile`. |
+| Profiles | Named isolated config/credential directories with persistent active selection and one-shot `--profile` override. | Profile-owned tool/policy/memory/agent roles and credential rotation remain. |
 | Setup scope | Model, optional web search, and browser. | No guided setup for tools, MCP, memory, agents, permissions, sandbox, channels, gateway, or scheduled work. |
 | Visual UX | Plain ASCII headers and numeric prompts. | No progress steps, status cards, arrow-key navigation, search, verification summary, or accessible rich/non-color modes. |
 | CLI surface | Parser accepts `ash setup providers`, but the wizard has no providers branch; that command currently falls through to “Setup complete!” without configuring anything. | Setup sections need real behavior and matching tests. |

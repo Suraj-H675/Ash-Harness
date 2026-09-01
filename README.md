@@ -38,6 +38,7 @@ ash setup
 ash setup status
 ash providers list
 ash providers test
+ash profile list
 ash doctor --connect
 ash
 ```
@@ -109,6 +110,10 @@ ash -c --fork-session           # branch latest history under a new ID
 ash providers list              # show built-in provider routes
 ash providers test              # verify ASH_MODEL and discover its models
 ash providers test ollama/coder # verify a route without changing config
+ash profile add work             # create isolated user config/credential state
+ash profile use work             # make that profile active for future commands
+ash --profile work setup         # use a profile for one invocation
+ash profile show work --json     # inspect profile paths/status without secrets
 ash sessions tree               # inspect the latest conversation tree
 ash sessions tree --session NAME --json
 ash --session SESSION_ID        # legacy explicit-ID compatibility

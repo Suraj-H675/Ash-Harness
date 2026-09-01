@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ash.profiles import active_profile_name, profile_directory
+
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -40,7 +42,11 @@ def _paths() -> tuple[Path, Path, Path]:
     configured = (ASH_DIR, ENV_FILE, CONFIG_FILE)
     if configured != _INITIAL_PATHS:
         return configured
-    ash_dir = Path.home() / ".ash"
+    base_dir = Path.home() / ".ash"
+    ash_dir = profile_directory(
+        active_profile_name(ash_dir=base_dir),
+        ash_dir=base_dir,
+    )
     return ash_dir, ash_dir / ".env", ash_dir / "ash.toml"
 
 

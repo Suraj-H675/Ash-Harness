@@ -19,6 +19,7 @@ from pydantic_settings import (
 )
 
 from ash.provider_catalog import BUILTIN_PROVIDER_IDS
+from ash.profiles import active_profile_name, profile_directory
 
 
 CURRENT_CONFIG_SCHEMA_VERSION = 1
@@ -973,15 +974,26 @@ class AshConfig(BaseSettings):
         trusted project config, user TOML, user dotenv, then built-in defaults.
         """
 
+        base_config_directory = Path.home() / ".ash"
+        active_profile = active_profile_name(ash_dir=base_config_directory)
+        profile_state_directory = profile_directory(
+            active_profile,
+            ash_dir=base_config_directory,
+        )
+        if active_profile != "default" and not profile_state_directory.is_dir():
+            raise ValueError(
+                f"Ash profile does not exist: {active_profile!r}; "
+                f"run `ash profile add {active_profile}` first"
+            )
         user_config_path = _configured_settings_path(
             "toml_file",
             _INITIAL_USER_CONFIG_PATH,
-            Path.home() / ".ash" / "ash.toml",
+            profile_state_directory / "ash.toml",
         )
         dotenv_path = _configured_settings_path(
             "env_file",
             _INITIAL_DOTENV_PATH,
-            Path.home() / ".ash" / ".env",
+            profile_state_directory / ".env",
         )
 
         raw_dotenv_values = DotEnvSettingsSource(cls, env_file=dotenv_path)()

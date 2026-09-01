@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import importlib.metadata
 import json
+import os
 import re
 import sys
 import webbrowser
@@ -1761,6 +1762,10 @@ def main(argv: list[str] | None = None) -> int:
         version = "0.1.0"
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser.add_argument("--version", action="version", version=f"ash {version}")
+    parser.add_argument(
+        "--profile",
+        help="Use a named user profile for this invocation (overrides the active profile)",
+    )
     subparsers = parser.add_subparsers(dest="command")
     setup_parser = subparsers.add_parser(
         "setup",
@@ -1782,6 +1787,26 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run in non-interactive mode (fail if input needed)",
     )
+    profile_parser = subparsers.add_parser(
+        "profile", help="List and select isolated provider/configuration profiles"
+    )
+    profile_subparsers = profile_parser.add_subparsers(
+        dest="profile_action", required=True
+    )
+    profile_list = profile_subparsers.add_parser("list", help="List available profiles")
+    profile_list.add_argument("--json", action="store_true")
+    profile_add = profile_subparsers.add_parser("add", help="Create an empty profile")
+    profile_add.add_argument("name")
+    profile_use = profile_subparsers.add_parser("use", help="Persist the active profile")
+    profile_use.add_argument("name")
+    profile_show = profile_subparsers.add_parser("show", help="Show one profile without secrets")
+    profile_show.add_argument("name")
+    profile_show.add_argument("--json", action="store_true")
+    profile_remove = profile_subparsers.add_parser(
+        "remove", help="Remove a profile and its user-owned state"
+    )
+    profile_remove.add_argument("name")
+    profile_remove.add_argument("--yes", action="store_true")
     providers_parser = subparsers.add_parser(
         "providers",
         help="List provider routes or test the active/provider model route",
@@ -2367,6 +2392,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Run without interactive prompts or ANSI; defaults one-shot output to stream-json.",
     )
     args, unknown_args = parser.parse_known_args(argv)
+    if args.profile:
+        from ash.profiles import validate_profile_name
+
+        try:
+            os.environ["ASH_PROFILE"] = validate_profile_name(args.profile)
+        except ValueError as exc:
+            parser.error(str(exc))
     if unknown_args:
         if args.command == "mcp" and getattr(args, "action", None) == "add":
             args.server_command = unknown_args
@@ -2403,6 +2435,36 @@ def main(argv: list[str] | None = None) -> int:
         from ash.commands.setup import cmd_setup
 
         return cmd_setup(args)
+
+    if args.command == "profile":
+        from ash.commands.profile import (
+            add_profile,
+            remove_profile,
+            render_profile_list,
+            render_profile_show,
+            use_profile,
+        )
+
+        try:
+            if args.profile_action == "list":
+                print(render_profile_list(json_output=args.json))
+                return 0
+            if args.profile_action == "add":
+                print(f"Created profile: {add_profile(args.name)}")
+                return 0
+            if args.profile_action == "use":
+                print(f"Active profile: {use_profile(args.name)}")
+                return 0
+            if args.profile_action == "show":
+                print(render_profile_show(args.name, json_output=args.json))
+                return 0
+            if args.profile_action == "remove":
+                print(f"Removed profile: {remove_profile(args.name, confirmed=args.yes)}")
+                return 0
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        parser.error(f"unsupported profile action: {args.profile_action}")
 
     if args.command == "providers":
         from ash.commands.providers import (
