@@ -201,6 +201,43 @@ async def test_http_jsonrpc_batch_and_protocol_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_jsonrpc_batch_rejects_non_object_members() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/rpc",
+            json=[
+                1,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "turn/run",
+                    "params": {"input": "hello"},
+                },
+            ],
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    responses = response.json()
+    assert responses[0] == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32600, "message": "Invalid Request"},
+    }
+    assert responses[1]["jsonrpc"] == "2.0"
+    assert responses[1]["id"] == 2
+    assert responses[1]["result"]["response"] == "HELLO"
+
+
+@pytest.mark.asyncio
 async def test_http_server_rate_limits_authenticated_requests() -> None:
     app = create_app(
         FakeClient(),  # type: ignore[arg-type]

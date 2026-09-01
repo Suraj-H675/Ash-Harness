@@ -26,7 +26,9 @@ class JSONRPCServer:
             "status": self._status,
         }
 
-    async def handle_request(self, request: dict[str, Any]) -> dict[str, Any] | None:
+    async def handle_request(self, request: Any) -> dict[str, Any] | None:
+        if not isinstance(request, dict):
+            return _error(None, -32600, "Invalid Request")
         request_id = request.get("id")
         if request.get("jsonrpc") != "2.0" or not isinstance(
             request.get("method"), str
