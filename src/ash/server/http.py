@@ -12,7 +12,7 @@ from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 from ash.sdk import AshClient
 from ash.core.events import EVENT_SCHEMA_VERSION
@@ -32,7 +32,7 @@ class SteeringRequest(BaseModel):
 
 
 class ForkSessionRequest(BaseModel):
-    message_count: int | None = Field(default=None, ge=0)
+    message_count: StrictInt | None = Field(default=None, ge=0)
     branch_name: str = Field(default="", max_length=128)
     branch_summary: str = Field(default="", max_length=12_000)
 
@@ -59,6 +59,7 @@ class SlidingWindowLimiter:
 
 MAX_JSONRPC_BODY_BYTES = 1_048_576
 MAX_JSONRPC_BATCH_REQUESTS = 32
+MAX_EVENT_LIST_LIMIT = 10_000
 
 
 def create_app(
@@ -219,6 +220,15 @@ def create_app(
         turn_id: str | None = None,
         limit: int = 1000,
     ) -> dict:
+        if after_sequence < 0:
+            raise HTTPException(
+                status_code=422, detail="after_sequence cannot be negative"
+            )
+        if not 1 <= limit <= MAX_EVENT_LIST_LIMIT:
+            raise HTTPException(
+                status_code=422,
+                detail=f"limit must be 1..{MAX_EVENT_LIST_LIMIT}",
+            )
         try:
             records = client.events(
                 session_id,

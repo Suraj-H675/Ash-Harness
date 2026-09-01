@@ -311,6 +311,35 @@ async def test_http_server_replays_events_with_cursor() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_server_rejects_invalid_event_cursors_and_limits() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        responses = [
+            await http.get(
+                "/v1/sessions/session-1/events?after_sequence=-1",
+                headers=headers,
+            ),
+            await http.get(
+                "/v1/sessions/session-1/events?limit=0",
+                headers=headers,
+            ),
+            await http.get(
+                "/v1/sessions/session-1/events?limit=10001",
+                headers=headers,
+            ),
+        ]
+
+    assert [response.status_code for response in responses] == [422, 422, 422]
+
+
+@pytest.mark.asyncio
 async def test_http_server_forks_and_returns_session_tree() -> None:
     app = create_app(
         FakeClient(),  # type: ignore[arg-type]
@@ -332,6 +361,26 @@ async def test_http_server_forks_and_returns_session_tree() -> None:
     assert forked.json() == {"session_id": "session-fork"}
     assert tree.status_code == 200
     assert tree.json()["sessions"][0]["children"] == ["session-fork"]
+
+
+@pytest.mark.asyncio
+async def test_http_server_rejects_boolean_fork_message_count() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/v1/sessions/session-1/fork",
+            json={"message_count": True},
+            headers=headers,
+        )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
