@@ -24,6 +24,9 @@ from typing import Iterator
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool
 
+MAX_SKILL_DISCOVERY_ENTRIES = 100_000
+MAX_SKILL_DISCOVERY_DEPTH = 32
+
 
 @dataclass(frozen=True)
 class SkillIndexEntry:
@@ -131,10 +134,10 @@ class ToolRegistry:
 
         seen: set[Path] = set()
         for root in self._skill_roots:
-            if not root.exists():
+            if not root.exists() or root.is_symlink():
                 continue
-            for path in sorted(root.rglob("*")):
-                if not path.is_file() or path in seen:
+            for path in _iter_skill_files(root):
+                if path in seen:
                     continue
                 seen.add(path)
                 try:
@@ -261,3 +264,38 @@ class ToolRegistry:
             trigger=getattr(module, "__ash_trigger__", "") or "",
         )
         return tool
+
+
+def _iter_skill_files(root: Path) -> Iterator[Path]:
+    """Yield skill files without following links or walking unbounded trees."""
+
+    pending: list[tuple[Path, int]] = [(root, 0)]
+    entries_seen = 0
+    while pending:
+        directory, depth = pending.pop()
+        entries: list[Path] = []
+        try:
+            for entry in directory.iterdir():
+                entries.append(entry)
+                if len(entries) >= MAX_SKILL_DISCOVERY_ENTRIES:
+                    break
+        except OSError:
+            continue
+        entries.sort(key=lambda path: path.name)
+        for path in entries:
+            entries_seen += 1
+            if entries_seen > MAX_SKILL_DISCOVERY_ENTRIES:
+                return
+            if path.is_symlink() or (
+                hasattr(path, "is_junction") and path.is_junction()
+            ):
+                continue
+            try:
+                is_directory = path.is_dir()
+                is_file = path.is_file()
+            except OSError:
+                continue
+            if is_file and path.suffix in {".py", ".md"}:
+                yield path
+            elif is_directory and depth < MAX_SKILL_DISCOVERY_DEPTH:
+                pending.append((path, depth + 1))

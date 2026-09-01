@@ -441,6 +441,38 @@ def test_registry_isolates_invalid_executable_skill_metadata(tmp_path: Path) -> 
     assert "exceeds 256 KiB" in registry.skill_errors[str(oversized)]
 
 
+def test_registry_skips_linked_skill_directories(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills"
+    skill_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text(
+        "async def execute(context):\n    return 'secret'\n", encoding="utf-8"
+    )
+    try:
+        (skill_dir / "linked").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    registry = ToolRegistry(_safety_guard(tmp_path), skill_roots=(skill_dir,))
+
+    assert registry.discover_skills() == []
+
+
+def test_registry_bounds_skill_discovery_entries(tmp_path: Path, monkeypatch) -> None:
+    skill_dir = tmp_path / "skills"
+    skill_dir.mkdir()
+    for name in ("a.py", "b.py", "c.py"):
+        (skill_dir / name).write_text(
+            f"async def execute(context):\n    return '{name}'\n", encoding="utf-8"
+        )
+    monkeypatch.setattr("ash.tools.registry.MAX_SKILL_DISCOVERY_ENTRIES", 2)
+
+    registry = ToolRegistry(_safety_guard(tmp_path), skill_roots=(skill_dir,))
+
+    assert len(registry.discover_skills()) == 2
+
+
 def test_registry_reports_duplicate_executable_skill_names(tmp_path: Path) -> None:
     skill_dir = tmp_path / "skills"
     skill_dir.mkdir()

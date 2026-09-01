@@ -146,8 +146,7 @@ class _MarkdownSkill:
 def parse_markdown_skill(path: Path) -> _MarkdownSkill:
     """Parse a markdown recipe file into a structured skill."""
 
-    validate_executable_skill_path(path)
-    text = path.read_text(encoding="utf-8")
+    text = _read_executable_skill_text(path)
     front: dict[str, str] = {}
     fm_match = _FRONTMATTER_RE.match(text)
     body = text
@@ -259,8 +258,7 @@ _PY_DOCSTRING_META_RE = re.compile(
 def parse_python_skill(path: Path) -> _PythonSkill:
     """Parse a Python skill file with the V7 docstring convention."""
 
-    validate_executable_skill_path(path)
-    source = path.read_text(encoding="utf-8")
+    source = _read_executable_skill_text(path)
     try:
         tree = ast.parse(source, filename=str(path))
     except SyntaxError as exc:
@@ -624,6 +622,17 @@ def validate_executable_skill_path(path: Path) -> None:
         raise SkillParseError(f"executable skill cannot be a link: {path}")
     if path.stat().st_size > MAX_EXECUTABLE_SKILL_BYTES:
         raise SkillParseError("executable skill exceeds 256 KiB")
+
+
+def _read_executable_skill_text(path: Path) -> str:
+    """Read a skill with a hard byte cap that remains safe across file races."""
+
+    validate_executable_skill_path(path)
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_EXECUTABLE_SKILL_BYTES + 1)
+    if len(raw) > MAX_EXECUTABLE_SKILL_BYTES:
+        raise SkillParseError("executable skill exceeds 256 KiB")
+    return raw.decode("utf-8")
 
 
 # --- self-extension ------------------------------------------------------
