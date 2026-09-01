@@ -343,7 +343,7 @@ requires-dist = [
     { name = "jsonschema", specifier = ">=4.23" },
     { name = "loguru", specifier = ">=0.7" },
     { name = "onnxruntime", marker = "extra == 'vector'", specifier = ">=1.16" },
-    { name = "openai", specifier = ">=1.82" },
+    { name = "openai", specifier = ">=1.82,<3" },
     { name = "packaging", specifier = ">=24.0" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.61.0" },
     { name = "prompt-toolkit", specifier = ">=3.0.51" },
