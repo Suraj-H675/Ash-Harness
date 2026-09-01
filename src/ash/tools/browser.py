@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 from ash.core.redaction import redact_text
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
+from ash.safety.scoped_io import atomic_write_scoped_bytes
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.tools.web import _normalize_allowed_domains, _validate_public_url
 
@@ -120,7 +121,7 @@ class BrowserSession:
                             user_data_dir=str(self.profile_path),
                             headless=self.headless,
                             env=browser_environment,
-                            accept_downloads=False,
+                            accept_downloads=True,
                             service_workers="block",
                             viewport={"width": 1280, "height": 800},
                         )
@@ -131,7 +132,7 @@ class BrowserSession:
                         env=browser_environment,
                     )
                     self._context = await self._browser.new_context(
-                        accept_downloads=False,
+                        accept_downloads=True,
                         service_workers="block",
                         viewport={"width": 1280, "height": 800},
                     )
@@ -280,6 +281,48 @@ class BrowserSession:
         await self._settle(page)
         return await self.snapshot()
 
+    async def download_file(
+        self,
+        ref: str,
+        file_path: str,
+        *,
+        safety_guard: SafetyGuard,
+        max_bytes: int,
+        overwrite: bool,
+    ) -> str:
+        """Save one bounded browser download into the trusted workspace."""
+
+        target = await asyncio.to_thread(
+            safety_guard.validate_mutation_path,
+            file_path,
+        )
+        page = await self.ensure_started()
+        locator = await self._locator(ref)
+        async with page.expect_download(timeout=self.timeout_ms) as download_info:
+            await locator.click(timeout=self.timeout_ms)
+        download = await download_info.value
+        failure = await download.failure()
+        if failure:
+            raise ValueError(f"browser download failed: {failure}")
+        temporary_path = await download.path()
+        if temporary_path is None:
+            raise ValueError("browser download did not produce a local file")
+        payload = await asyncio.to_thread(
+            _read_download_payload,
+            Path(temporary_path),
+            max_bytes,
+        )
+        await asyncio.to_thread(
+            atomic_write_scoped_bytes,
+            target,
+            payload,
+            safety_guard,
+            overwrite=overwrite,
+        )
+        await self._settle(page)
+        snapshot = await self.snapshot()
+        return f"Downloaded {len(payload)} bytes to {target}\n\n{snapshot}"
+
     async def click(self, ref: str) -> str:
         page = await self.ensure_started()
         locator = await self._locator(ref)
@@ -405,6 +448,29 @@ def _truncate_snapshot(value: str) -> str:
     return value[:half] + "\n[browser snapshot truncated]\n" + value[-half:]
 
 
+def _read_download_payload(path: Path, max_bytes: int) -> bytes:
+    """Read a Playwright temporary download without exceeding its byte cap."""
+
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"browser download cannot be inspected: {exc}") from exc
+    if size > max_bytes:
+        raise ValueError(
+            f"browser download exceeds {max_bytes} bytes; choose a smaller file"
+        )
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(max_bytes + 1)
+    except OSError as exc:
+        raise ValueError(f"browser download cannot be read: {exc}") from exc
+    if len(payload) > max_bytes:
+        raise ValueError(
+            f"browser download exceeds {max_bytes} bytes; choose a smaller file"
+        )
+    return payload
+
+
 class NavigateArgs(BaseModel):
     url: str = Field(..., min_length=1, max_length=2048)
     wait_until: Literal["commit", "domcontentloaded", "load", "networkidle"] = (
@@ -455,6 +521,17 @@ class UploadArgs(ElementArgs):
         le=20_000_000,
         description="Maximum upload payload accepted from the workspace.",
     )
+
+
+class DownloadArgs(ElementArgs):
+    file_path: str = Field(..., min_length=1, max_length=2048)
+    max_bytes: int = Field(
+        20_000_000,
+        ge=1,
+        le=20_000_000,
+        description="Maximum download payload written to the workspace.",
+    )
+    overwrite: bool = False
 
 
 class _BrowserTool(BaseTool):
@@ -618,6 +695,27 @@ class BrowserUploadTool(_BrowserTool):
         )
 
 
+class BrowserDownloadTool(_BrowserTool):
+    name = "browser_download"
+    description = (
+        "Save one bounded browser download to a workspace path; existing files "
+        "are preserved unless overwrite is explicitly requested."
+    )
+    args_schema = DownloadArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = DownloadArgs(**kwargs)
+        return await self._result(
+            self.session.download_file(
+                args.ref,
+                args.file_path,
+                safety_guard=self.safety_guard,
+                max_bytes=args.max_bytes,
+                overwrite=args.overwrite,
+            )
+        )
+
+
 def build_browser_tools(
     safety_guard: SafetyGuard,
     *,
@@ -641,4 +739,5 @@ def build_browser_tools(
         BrowserBackTool(safety_guard, session),
         BrowserScreenshotTool(safety_guard, session),
         BrowserUploadTool(safety_guard, session),
+        BrowserDownloadTool(safety_guard, session),
     ]

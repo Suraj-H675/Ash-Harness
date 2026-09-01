@@ -451,7 +451,9 @@ Playwright's pinned Chromium build. Browser pages use an isolated context with
 the canonical image block plus digest metadata; oversized captures fail safely.
 `browser_upload` uploads one bounded workspace file through a referenced file
 input using scoped reads and sensitive-file rejection.
-downloads and service workers disabled; navigation, subresources, and
+`browser_download` saves one bounded download to an explicit workspace path;
+it refuses overwrites unless requested and writes atomically. Service workers
+remain disabled; navigation, subresources, and
 WebSockets share the public-host and `allowed_web_domains` policy. The model
 receives bounded ARIA snapshots and stable element references rather than raw
 unbounded DOM content. Password fields are never filled by the browser tool.

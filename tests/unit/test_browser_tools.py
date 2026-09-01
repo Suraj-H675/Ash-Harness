@@ -13,6 +13,7 @@ from ash.tools.browser import (
     BrowserSession,
     BrowserBackTool,
     BrowserUploadTool,
+    BrowserDownloadTool,
     BrowserScreenshotTool,
     BrowserClickTool,
     BrowserNavigateTool,
@@ -82,6 +83,19 @@ class FakeBrowserSession:
         self.calls.append(("upload", (ref, file_path, max_bytes)))
         return "upload snapshot"
 
+    async def download_file(
+        self,
+        ref: str,
+        file_path: str,
+        *,
+        safety_guard,
+        max_bytes: int,
+        overwrite: bool,
+    ) -> str:
+        assert safety_guard is not None
+        self.calls.append(("download", (ref, file_path, max_bytes, overwrite)))
+        return "download snapshot"
+
     async def close(self) -> None:
         self.closed += 1
 
@@ -99,6 +113,7 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
         BrowserBackTool(guard, session),  # type: ignore[arg-type]
         BrowserScreenshotTool(guard, session),  # type: ignore[arg-type]
         BrowserUploadTool(guard, session),  # type: ignore[arg-type]
+        BrowserDownloadTool(guard, session),  # type: ignore[arg-type]
     ]
 
     results = [
@@ -114,6 +129,11 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
             file_path="docs/report.pdf",
             max_bytes=2_000_000,
         ),
+        await tools[8].run(
+            ref="e5",
+            file_path="downloads/report.pdf",
+            max_bytes=4_000_000,
+        ),
     ]
     await tools[0].aclose()
 
@@ -127,10 +147,80 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
         ("back", None),
         ("screenshot", 1_000_000),
         ("upload", ("e4", "docs/report.pdf", 2_000_000)),
+        ("download", ("e5", "downloads/report.pdf", 4_000_000, False)),
     ]
     assert session.closed == 1
     assert results[6].images[0]["sha256"] == "a" * 64
     assert results[6].image_blocks[0]["data"] == "cG5nLWRhdGE="
+
+
+@pytest.mark.asyncio
+async def test_browser_download_writes_bounded_payload_atomically(tmp_path: Path) -> None:
+    from ash.tools.browser import _read_download_payload
+
+    source = tmp_path / "playwright-download.tmp"
+    source.write_bytes(b"downloaded content")
+    assert _read_download_payload(source, 100) == b"downloaded content"
+
+    oversized = tmp_path / "oversized.tmp"
+    oversized.write_bytes(b"0123456789")
+    with pytest.raises(ValueError, match="exceeds 5 bytes"):
+        _read_download_payload(oversized, 5)
+
+
+@pytest.mark.asyncio
+async def test_browser_session_download_uses_workspace_scope_and_no_overwrite(
+    tmp_path: Path,
+) -> None:
+    class FakeDownload:
+        async def failure(self):
+            return None
+
+        async def path(self):
+            return str(source)
+
+    class DownloadContext:
+        def __init__(self):
+            self.value = self._download()
+
+        async def _download(self):
+            return FakeDownload()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeLocator:
+        async def click(self, *, timeout):
+            assert timeout == 1_000
+
+    class FakePage:
+        def expect_download(self, *, timeout):
+            assert timeout == 1_000
+            return DownloadContext()
+
+    source = tmp_path / "playwright-download.tmp"
+    source.write_bytes(b"safe payload")
+    session = BrowserSession(timeout_seconds=1)
+    guard = SafetyGuard(tmp_path)
+    session.ensure_started = AsyncMock(return_value=FakePage())  # type: ignore[method-assign]
+    session._locator = AsyncMock(return_value=FakeLocator())  # type: ignore[method-assign]
+    session._settle = AsyncMock()  # type: ignore[method-assign]
+    session.snapshot = AsyncMock(return_value="snapshot")  # type: ignore[method-assign]
+
+    result = await session.download_file(
+        "e1",
+        "downloads/report.txt",
+        safety_guard=guard,
+        max_bytes=100,
+        overwrite=False,
+    )
+
+    assert (tmp_path / "downloads/report.txt").read_bytes() == b"safe payload"
+    assert "Downloaded 12 bytes" in result
+    await session.close()
 
 
 def test_browser_url_policy_blocks_private_non_http_and_disallowed_hosts(
@@ -163,6 +253,15 @@ def test_browser_tools_share_one_lazy_session_and_permissions(tmp_path) -> None:
     assert (
         PermissionPolicy("interactive")
         .evaluate("browser_navigate", {"url": "https://example.com"})
+        .action
+        == PolicyAction.ASK
+    )
+    assert (
+        PermissionPolicy("interactive")
+        .evaluate(
+            "browser_download",
+            {"ref": "e1", "file_path": "downloads/file.bin"},
+        )
         .action
         == PolicyAction.ASK
     )
@@ -221,6 +320,7 @@ async def test_browser_profile_is_ephemeral_by_default() -> None:
     playwright.chromium.launch_persistent_context.assert_not_called()
     kwargs = playwright.chromium.launch.return_value.new_context.await_args.kwargs
     assert "user_data_dir" not in kwargs
+    assert kwargs["accept_downloads"] is True
     await session.close()
 
 

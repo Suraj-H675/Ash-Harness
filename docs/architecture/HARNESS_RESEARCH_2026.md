@@ -486,7 +486,7 @@ not remove them.
 | Safety/sandbox | Strong | Needs remote/plugin identity capabilities, network proxy policy, stronger resource limits, and platform CI. |
 | CLI/TUI/SDK/API | Strong local/remote | CLI, SDK, HTTP server, ACP v1, and A2A 1.0 adapters share the trusted runtime and versioned events. ACP provides bounded editor sessions and an official wire test. A2A provides authenticated/durable JSON-RPC and HTTP+JSON tasks, streaming/cancel/continuation, origin-pinned clients, and trusted delegation tools. WebSocket gateway, multi-conversation daemon ownership, web/desktop UI, and channel adapters remain. |
 | LSP | Verified locally | Bounded LSP 3.18 stdio clients start lazily per root, honor negotiated full/incremental sync and UTF position units, support push/pull diagnostics and semantic queries, filter external URIs, require workspace trust, use scrubbed environments, bound caches/results, and shut down process trees deterministically. Rename, code actions, broader server coverage, and multi-vendor conformance remain. |
-| Browser/media | Partial | Optional Playwright/Chromium navigation, ARIA snapshots, stable refs, form/click/scroll/history actions, network policy, screenshots/vision, bounded uploads, private profiles, and deterministic cleanup are live. Downloads, CDP attachment, and other media remain. |
+| Browser/media | Partial | Optional Playwright/Chromium navigation, ARIA snapshots, stable refs, form/click/scroll/history actions, network policy, screenshots/vision, bounded uploads, atomic bounded workspace downloads, private profiles, and deterministic cleanup are live. CDP attachment and other media remain. |
 | Automation/channels | Partial | Durable one-shot/interval/cron prompts, atomic multi-worker claims, renewable leases, cancellation, coalescing, misfire records, CLI/SDK/model tools, liveness diagnostics, and restart recovery are verified. Webhooks, event triggers, gateway routing, pairing, and channel delivery remain. |
 | Observability/evals | Absent | Logging and audit exist, but no OTel traces/metrics or task evaluation harness. |
 | Packaging | Improved | Distribution renamed to available `ash-ai`; public PyPI release/signing still required. |
@@ -632,7 +632,8 @@ resume after process interruption.
 ### Phase 4: general-purpose capability packs
 
 1. Web search and an isolated browser automation baseline are live; richer
-   extraction, persistent browser profiles, vision, uploads, and downloads remain.
+   extraction, persistent browser profiles, vision, uploads, and bounded
+   workspace downloads are live, while CDP attachment and other media remain.
 2. Media/document understanding and image/audio/video generation adapters.
 3. Durable scheduler and cron/worker heartbeats are live; add webhooks and
    external event triggers.
