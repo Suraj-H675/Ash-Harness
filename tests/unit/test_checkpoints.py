@@ -15,6 +15,30 @@ from ash.tools.filesystem import WholeEditTool
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_read_rejects_oversized_file_before_edit(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("ash.core.checkpoints.MAX_CHECKPOINT_BYTES", 8)
+    path = tmp_path / "large.txt"
+    path.write_bytes(b"x" * 9)
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    guard = SafetyGuard(tmp_path)
+    middleware = FileCheckpointMiddleware(
+        store, guard, lambda: (session.session_id, "turn-1")
+    )
+
+    with pytest.raises(ValueError, match="over 8 bytes"):
+        await middleware.before_tool(
+            "whole_edit",
+            {"file_path": "large.txt", "content": "replacement"},
+            WholeEditTool(guard),
+        )
+
+    assert path.read_bytes() == b"x" * 9
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_undo_and_conflict_detection(tmp_path) -> None:
     path = tmp_path / "file.txt"
     path.write_text("before")

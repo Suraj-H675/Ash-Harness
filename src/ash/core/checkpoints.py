@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+from itertools import islice
 import os
 import tempfile
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ EDIT_TOOLS = {
 }
 MAX_CHECKPOINT_BYTES = 20 * 1024 * 1024
 MAX_CHECKPOINT_DIFF_LINES = 400
+CHECKPOINT_READ_CHUNK_BYTES = 1024 * 1024
+OVERSIZED_DIGEST = "<checkpoint-file-too-large>"
 
 
 @dataclass(frozen=True)
@@ -95,9 +98,7 @@ class FileCheckpointMiddleware(ToolMiddleware):
         session_id, turn_id, call_id = _checkpoint_context(context)
         for path in self._paths(tool_name, arguments):
             existed = path.is_file()
-            content = path.read_bytes() if existed else None
-            if content is not None and len(content) > MAX_CHECKPOINT_BYTES:
-                raise ValueError(f"Refusing uncheckpointed edit over 20 MiB: {path}")
+            content = _read_checkpoint_bytes(path) if existed else None
             mode = path.stat().st_mode if existed else None
             self.store.save_file_checkpoint(
                 session_id,
@@ -233,9 +234,11 @@ def recover_interrupted_turns(
                 before_digest = _checkpoint_before_digest(row)
                 current_digest = _digest(path)
                 after_digest = row["after_sha256"]
-                if current_digest == before_digest:
+                if _digests_match(current_digest, before_digest):
                     safe_rows.append((row, path))
-                elif after_digest is not None and current_digest == after_digest:
+                elif after_digest is not None and _digests_match(
+                    current_digest, after_digest
+                ):
                     safe_rows.append((row, path))
                 else:
                     conflicts.append(path)
@@ -264,7 +267,7 @@ def recover_interrupted_turns(
             rows_to_restore = [
                 (row, path)
                 for row, path in safe_rows
-                if _digest(path) != _checkpoint_before_digest(row)
+                if not _digests_match(_digest(path), _checkpoint_before_digest(row))
             ]
             _restore_checkpoint_rows(rows_to_restore)
             restored_checkpoint_ids.extend(
@@ -346,7 +349,7 @@ def recover_interrupted_turns(
 def _checkpoint_before_digest(row: Any) -> str:
     if not bool(row["existed"]):
         return "missing"
-    return hashlib.sha256(bytes(row["before_content"] or b"")).hexdigest()
+    return hashlib.sha256(_checkpoint_content(row)).hexdigest()
 
 
 def _restore_checkpoint_rows(rows: list[tuple[Any, Path]]) -> None:
@@ -355,13 +358,13 @@ def _restore_checkpoint_rows(rows: list[tuple[Any, Path]]) -> None:
         existed = path.is_file()
         originals[path] = (
             existed,
-            path.read_bytes() if existed else b"",
+            _read_checkpoint_bytes(path) if existed else b"",
             path.stat().st_mode if existed else None,
         )
     try:
         for row, path in rows:
             if bool(row["existed"]):
-                _atomic_restore(path, bytes(row["before_content"] or b""))
+                _atomic_restore(path, _checkpoint_content(row))
                 if row["before_mode"] is not None:
                     os.chmod(path, int(row["before_mode"]))
             else:
@@ -392,7 +395,7 @@ def undo_latest_checkpoint(
         )
     for row, path in zip(rows, paths, strict=True):
         if bool(row["existed"]):
-            _atomic_restore(path, bytes(row["before_content"] or b""))
+            _atomic_restore(path, _checkpoint_content(row))
             if row["before_mode"] is not None:
                 os.chmod(path, int(row["before_mode"]))
         else:
@@ -428,7 +431,7 @@ def rewind_session_with_files(
         if current != after_sha256:
             conflicts.append(str(path))
         simulated[path] = (
-            hashlib.sha256(bytes(row["before_content"] or b"")).hexdigest()
+            hashlib.sha256(_checkpoint_content(row)).hexdigest()
             if bool(row["existed"])
             else "missing"
         )
@@ -445,14 +448,14 @@ def rewind_session_with_files(
         existed = path.is_file()
         originals[path] = (
             existed,
-            path.read_bytes() if existed else b"",
+            _read_checkpoint_bytes(path) if existed else b"",
             path.stat().st_mode if existed else None,
         )
 
     try:
         for row, path in zip(rows, paths, strict=True):
             if bool(row["existed"]):
-                _atomic_restore(path, bytes(row["before_content"] or b""))
+                _atomic_restore(path, _checkpoint_content(row))
                 if row["before_mode"] is not None:
                     os.chmod(path, int(row["before_mode"]))
             else:
@@ -509,34 +512,33 @@ def diff_latest_checkpoint(
     for row, path in zip(rows, paths, strict=True):
         earliest_by_path[path] = row
     for path, row in earliest_by_path.items():
-        before = bytes(row["before_content"] or b"") if bool(row["existed"]) else b""
-        after = path.read_bytes() if path.is_file() else b""
+        before = _checkpoint_content(row) if bool(row["existed"]) else b""
+        after = _read_checkpoint_bytes(path) if path.is_file() else b""
         if _looks_binary(before) or _looks_binary(after):
             lines.append(f"Binary file changed: {path}")
             continue
         relative = _relative_display(path, guard.project_root)
         before_lines = before.decode("utf-8", errors="replace").splitlines()
         after_lines = after.decode("utf-8", errors="replace").splitlines()
-        diff = list(
-            difflib.unified_diff(
-                before_lines,
-                after_lines,
-                fromfile=f"a/{relative}",
-                tofile=f"b/{relative}",
-                lineterm="",
-            )
-        )
-        if not diff:
-            continue
         remaining = max_lines - len(lines)
         if remaining <= 0:
             truncated = True
             break
-        if len(diff) > remaining:
-            lines.extend(diff[:remaining])
+        diff = difflib.unified_diff(
+            before_lines,
+            after_lines,
+            fromfile=f"a/{relative}",
+            tofile=f"b/{relative}",
+            lineterm="",
+        )
+        diff_lines = list(islice(diff, remaining + 1))
+        if not diff_lines:
+            continue
+        if len(diff_lines) > remaining:
+            lines.extend(diff_lines[:remaining])
             truncated = True
             break
-        lines.extend(diff)
+        lines.extend(diff_lines)
     if truncated:
         lines.append("[checkpoint diff truncated]")
     return "\n".join(lines) if lines else "No checkpoint diff."
@@ -547,7 +549,9 @@ def _checkpoint_chain_conflicts(rows: list[Any], paths: list[Path]) -> list[str]
     conflicts: list[str] = []
     for row, path in zip(rows, paths, strict=True):
         current = simulated.setdefault(path, _digest(path))
-        if row["after_sha256"] is None or current != row["after_sha256"]:
+        if row["after_sha256"] is None or not _digests_match(
+            current, row["after_sha256"]
+        ):
             conflicts.append(str(path))
         simulated[path] = _checkpoint_before_digest(row)
     return list(dict.fromkeys(conflicts))
@@ -556,7 +560,49 @@ def _checkpoint_chain_conflicts(rows: list[Any], paths: list[Path]) -> list[str]
 def _digest(path: Path) -> str:
     if not path.is_file():
         return "missing"
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(CHECKPOINT_READ_CHUNK_BYTES):
+            total += len(chunk)
+            if total > MAX_CHECKPOINT_BYTES:
+                return OVERSIZED_DIGEST
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _digests_match(left: str, right: str) -> bool:
+    """Compare only bounded, trustworthy file digests."""
+
+    return left != OVERSIZED_DIGEST and right != OVERSIZED_DIGEST and left == right
+
+
+def _checkpoint_content(row: Any) -> bytes:
+    """Return a durable checkpoint payload without accepting oversized rows."""
+
+    content = bytes(row["before_content"] or b"")
+    if len(content) > MAX_CHECKPOINT_BYTES:
+        raise ValueError(f"Checkpoint payload exceeds {MAX_CHECKPOINT_BYTES} bytes")
+    return content
+
+
+def _read_checkpoint_bytes(path: Path) -> bytes:
+    """Read a checkpoint candidate in bounded chunks."""
+
+    chunks: list[bytes] = []
+    total = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(
+            min(CHECKPOINT_READ_CHUNK_BYTES, MAX_CHECKPOINT_BYTES + 1 - total)
+        ):
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_CHECKPOINT_BYTES:
+                raise ValueError(
+                    f"Refusing uncheckpointed edit over {MAX_CHECKPOINT_BYTES} bytes: "
+                    f"{path}"
+                )
+    return b"".join(chunks)
 
 
 def _looks_binary(content: bytes) -> bool:
