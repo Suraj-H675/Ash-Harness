@@ -15,13 +15,14 @@ from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.sandbox._base import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable
 from ash.sandbox.manager import SandboxManager, SandboxResult
-from ash.sandbox.process_utils import communicate_process
+from ash.sandbox.process_utils import ProcessOutputLimitExceeded, communicate_process
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.sandbox.process_utils import process_group_options, terminate_process_tree
 
 
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_COMMAND_OUTPUT_CHARS = 100_000
+OUTPUT_CAPTURE_LIMIT_NOTICE = "Process output capture limit reached."
 MAX_DIAGNOSTIC_ITEMS = 50
 MAX_SUMMARY_ITEMS = 8
 POWERSHELL_FILE_CMDLETS = (
@@ -251,9 +252,22 @@ class RunCommandTool(BaseTool):
                 output="",
                 error=f"Sandbox unavailable; command was not run: {exc}",
             )
-        output, truncated = _truncate_command_output(result.stdout)
+        output, truncated = _truncate_command_output(
+            result.stdout,
+            force=result.output_truncated and bool(result.stdout),
+            notice=OUTPUT_CAPTURE_LIMIT_NOTICE,
+        )
         error, error_truncated = _truncate_command_output(result.stderr)
         if error_truncated:
+            truncated = True
+        if result.output_truncated and not result.stdout:
+            error, _ = _truncate_command_output(
+                result.stderr,
+                force=True,
+                notice=OUTPUT_CAPTURE_LIMIT_NOTICE,
+            )
+            truncated = True
+        elif result.output_truncated:
             truncated = True
         if not result.fallback_used and result.tier >= SANDBOX_TIER_BWRAP:
             annotation = f"[sandbox tier={result.tier} backend={result.backend_name}]"
@@ -306,7 +320,11 @@ class RunCommandTool(BaseTool):
                     **process_group_options(),
                 )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                communicate_process(process, stream_callback=stream_callback),
+                communicate_process(
+                    process,
+                    stream_callback=stream_callback,
+                    max_output_bytes=MAX_COMMAND_OUTPUT_CHARS,
+                ),
                 timeout=timeout_seconds,
             )
         except asyncio.TimeoutError:
@@ -321,6 +339,24 @@ class RunCommandTool(BaseTool):
             if "process" in locals():
                 await terminate_process_tree(process)
             raise
+        except ProcessOutputLimitExceeded as exc:
+            stdout = decode_stream(exc.stdout)
+            stderr = decode_stream(exc.stderr)
+            output, _ = _truncate_command_output(
+                stdout,
+                force=True,
+                notice=OUTPUT_CAPTURE_LIMIT_NOTICE,
+            )
+            error = _truncate_command_output(stderr)[0] if stderr else None
+            return ToolResult(
+                success=process.returncode == 0,
+                output=output,
+                error=error,
+                token_count=count_output_tokens(output),
+                truncated=True,
+                diagnostics=extract_diagnostics(stdout, stderr),
+                diagnostic_summary=extract_diagnostic_summary(stdout, stderr),
+            )
 
         stdout = decode_stream(stdout_bytes)
         stderr = decode_stream(stderr_bytes)
@@ -393,12 +429,17 @@ def build_scrubbed_command_env(
     return env
 
 
-def _truncate_command_output(output: str) -> tuple[str, bool]:
-    if len(output) <= MAX_COMMAND_OUTPUT_CHARS:
+def _truncate_command_output(
+    output: str,
+    *,
+    force: bool = False,
+    notice: str = "Output truncated. Command output exceeded 100000 characters.",
+) -> tuple[str, bool]:
+    if not force and len(output) <= MAX_COMMAND_OUTPUT_CHARS:
         return output, False
     return (
         output[:MAX_COMMAND_OUTPUT_CHARS]
-        + "\n[Warning: Output truncated. Command output exceeded 100000 characters.]",
+        + f"\n[Warning: {notice}]",
         True,
     )
 

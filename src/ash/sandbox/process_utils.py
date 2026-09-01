@@ -19,6 +19,11 @@ INHERIT_PROCESS_GROUP_ENV = "ASH_INTERNAL_INHERIT_PROCESS_GROUP"
 class ProcessOutputLimitExceeded(RuntimeError):
     """A managed subprocess exceeded its configured capture budget."""
 
+    def __init__(self, message: str, *, stdout: bytes = b"", stderr: bytes = b""):
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
+
 
 def process_group_options() -> dict[str, Any]:
     """Options that place a child in an independently terminable group."""
@@ -255,6 +260,8 @@ async def communicate_process(
     )
     if output_limit_exceeded:
         raise ProcessOutputLimitExceeded(
-            f"subprocess output exceeded {max_output_bytes} bytes"
+            f"subprocess output exceeded {max_output_bytes} bytes",
+            stdout=stdout,
+            stderr=stderr,
         )
     return stdout, stderr

@@ -723,6 +723,21 @@ async def test_run_command_bounds_live_output(
 
 
 @pytest.mark.asyncio
+async def test_run_command_handles_output_capture_limit_without_escaping(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    script = "import sys; sys.stdout.write('x' * 120000)"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+    result = await RunCommandTool(guard).run(command_line=command)
+
+    assert result.success is True
+    assert result.truncated is True
+    assert "Process output capture limit reached" in result.output
+
+
+@pytest.mark.asyncio
 async def test_run_command_scrubs_secret_environment(
     project_root: Path,
     guard: SafetyGuard,

@@ -33,6 +33,7 @@ from ash.sandbox._base import (
 from ash.sandbox.bwrap import BubblewrapSandbox, probe_bwrap
 from ash.sandbox.docker import DEFAULT_IMAGE, DockerSandbox, probe_docker
 from ash.sandbox.process_utils import (
+    ProcessOutputLimitExceeded,
     ProcessStreamCallback,
     communicate_process,
     process_group_options,
@@ -74,6 +75,7 @@ class SandboxResult:
     backend_name: str
     fallback_used: bool = False
     duration_seconds: float = 0.0
+    output_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -480,7 +482,11 @@ async def _run_scoped(
     )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            communicate_process(process, stream_callback=stream_callback),
+            communicate_process(
+                process,
+                stream_callback=stream_callback,
+                max_output_bytes=100_000,
+            ),
             timeout=deadline,
         )
     except asyncio.TimeoutError:
@@ -497,6 +503,17 @@ async def _run_scoped(
     except asyncio.CancelledError:
         await terminate_process_tree(process)
         raise
+    except ProcessOutputLimitExceeded as exc:
+        return SandboxResult(
+            exit_code=process.returncode if process.returncode is not None else -1,
+            stdout=exc.stdout.decode("utf-8", errors="replace"),
+            stderr=exc.stderr.decode("utf-8", errors="replace"),
+            tier=SANDBOX_TIER_SCOPED,
+            backend_name=backend.name,
+            fallback_used=fallback,
+            duration_seconds=time.monotonic() - start,
+            output_truncated=True,
+        )
     return SandboxResult(
         exit_code=process.returncode if process.returncode is not None else -1,
         stdout=stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else "",
@@ -531,7 +548,11 @@ async def _run_subprocess(
     )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            communicate_process(process, stream_callback=stream_callback),
+            communicate_process(
+                process,
+                stream_callback=stream_callback,
+                max_output_bytes=100_000,
+            ),
             timeout=deadline,
         )
     except asyncio.TimeoutError:
@@ -548,6 +569,17 @@ async def _run_subprocess(
     except asyncio.CancelledError:
         await terminate_process_tree(process)
         raise
+    except ProcessOutputLimitExceeded as exc:
+        return SandboxResult(
+            exit_code=process.returncode if process.returncode is not None else -1,
+            stdout=exc.stdout.decode("utf-8", errors="replace"),
+            stderr=exc.stderr.decode("utf-8", errors="replace"),
+            tier=tier,
+            backend_name=backend_name,
+            fallback_used=False,
+            duration_seconds=time.monotonic() - start,
+            output_truncated=True,
+        )
     return SandboxResult(
         exit_code=process.returncode if process.returncode is not None else -1,
         stdout=stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else "",

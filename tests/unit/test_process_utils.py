@@ -10,6 +10,8 @@ import pytest
 
 from ash.sandbox.process_utils import (
     INHERIT_PROCESS_GROUP_ENV,
+    ProcessOutputLimitExceeded,
+    communicate_process,
     process_group_options,
     terminate_process_tree,
 )
@@ -112,3 +114,22 @@ async def test_shared_group_termination_kills_only_target_descendant_tree(
         await asyncio.sleep(0.01)
     else:
         pytest.fail("descendant survived target tree termination")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX command syntax")
+@pytest.mark.asyncio
+async def test_communicate_process_preserves_bounded_output_on_overflow() -> None:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.write('x' * 120000)",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    with pytest.raises(ProcessOutputLimitExceeded) as raised:
+        await communicate_process(process, max_output_bytes=100_000)
+
+    assert process.returncode == 0
+    assert len(raised.value.stdout) == 100_000
+    assert raised.value.stderr == b""
