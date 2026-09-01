@@ -11,12 +11,19 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from ash.sandbox.process_utils import communicate_process
+from ash.sandbox.process_utils import (
+    ProcessOutputLimitExceeded,
+    communicate_process,
+    process_group_options,
+    terminate_process_tree,
+)
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 
 
 DEFAULT_MAX_RESULTS = 200
 HARD_MAX_RESULTS = 2_000
+MAX_SEARCH_CAPTURE_BYTES = 2_000_000
+SEARCH_TIMEOUT_SECONDS = 30
 
 
 class ListDirectoryArgs(BaseModel):
@@ -136,8 +143,30 @@ class SearchTextTool(BaseTool):
             cwd=root,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **process_group_options(),
         )
-        stdout, stderr = await communicate_process(process)
+        output_limited = False
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                communicate_process(
+                    process,
+                    max_output_bytes=MAX_SEARCH_CAPTURE_BYTES,
+                ),
+                timeout=SEARCH_TIMEOUT_SECONDS,
+            )
+        except ProcessOutputLimitExceeded as exc:
+            stdout, stderr = exc.stdout, exc.stderr
+            output_limited = True
+        except asyncio.TimeoutError:
+            await terminate_process_tree(process)
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"search timed out after {SEARCH_TIMEOUT_SECONDS} seconds",
+            )
+        except asyncio.CancelledError:
+            await terminate_process_tree(process)
+            raise
         if process.returncode not in (0, 1):
             return ToolResult(
                 success=False,
@@ -146,7 +175,11 @@ class SearchTextTool(BaseTool):
             )
         matches: list[str] = []
         for line in stdout.decode("utf-8", errors="replace").splitlines():
-            event = json.loads(line)
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                # A bounded capture may end in the middle of one JSON event.
+                continue
             if event.get("type") != "match":
                 continue
             data = event["data"]
@@ -158,13 +191,19 @@ class SearchTextTool(BaseTool):
                 break
         truncated = len(matches) >= args.max_results
         output = "\n".join(matches)
-        if truncated:
-            output += f"\n[truncated after {args.max_results} matches]"
+        if truncated or output_limited:
+            suffix = (
+                f"\n[search output capture truncated after "
+                f"{MAX_SEARCH_CAPTURE_BYTES} bytes]"
+                if output_limited
+                else f"\n[truncated after {args.max_results} matches]"
+            )
+            output += suffix
         return ToolResult(
             success=True,
             output=output,
             token_count=count_output_tokens(output),
-            truncated=truncated,
+            truncated=truncated or output_limited,
         )
 
     async def _python_fallback(
@@ -188,21 +227,22 @@ class SearchTextTool(BaseTool):
             if args.glob and not fnmatch.fnmatch(relative, args.glob):
                 continue
             try:
-                lines = path.read_text(encoding="utf-8").splitlines()
+                with path.open(encoding="utf-8") as handle:
+                    for line_number, text in enumerate(handle, 1):
+                        text = text.rstrip("\r\n")
+                        if regex.search(text):
+                            matches.append(f"{relative}:{line_number}:{text}")
+                            if len(matches) >= args.max_results:
+                                output = "\n".join(matches)
+                                output += f"\n[truncated after {args.max_results} matches]"
+                                return ToolResult(
+                                    success=True,
+                                    output=output,
+                                    token_count=count_output_tokens(output),
+                                    truncated=True,
+                                )
             except (OSError, UnicodeError):
                 continue
-            for line_number, text in enumerate(lines, 1):
-                if regex.search(text):
-                    matches.append(f"{relative}:{line_number}:{text}")
-                    if len(matches) >= args.max_results:
-                        output = "\n".join(matches)
-                        output += f"\n[truncated after {args.max_results} matches]"
-                        return ToolResult(
-                            success=True,
-                            output=output,
-                            token_count=count_output_tokens(output),
-                            truncated=True,
-                        )
         output = "\n".join(matches)
         return ToolResult(
             success=True,
