@@ -44,13 +44,21 @@ class SafetyGuard:
         "reg delete",
     )
     _DEFAULT_BLOCKLIST_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-        ("rm -rf /", re.compile(r"\brm\s+-[a-z]*r[a-z]*f[a-z]*\s+/", re.IGNORECASE)),
-        ("rm -rf /", re.compile(r"\brm\s+-[a-z]*f[a-z]*r[a-z]*\s+/", re.IGNORECASE)),
+        (
+            "rm -rf /",
+            re.compile(
+                r"\brm(?:\s+--?[\w-]+)*(?:\s+--)?\s+/",
+                re.IGNORECASE,
+            ),
+        ),
         ("mkfs", re.compile(r"\bmkfs(?:\.[\w-]+)?\b", re.IGNORECASE)),
         ("dd if=", re.compile(r"\bdd\b.*\bif=", re.IGNORECASE)),
         (
             "chmod -R 777 /",
-            re.compile(r"\bchmod\s+-[a-z]*r[a-z]*\s+777\s+/", re.IGNORECASE),
+            re.compile(
+                r"\bchmod(?:\s+--?[\w-]+)*(?:\s+--)?\s+777\s+/",
+                re.IGNORECASE,
+            ),
         ),
         ("chown", re.compile(r"\bchown\b", re.IGNORECASE)),
         ("shutdown", re.compile(r"\bshutdown\b", re.IGNORECASE)),
