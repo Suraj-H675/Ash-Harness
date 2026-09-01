@@ -51,6 +51,7 @@ async def test_search_text_bounds_oversized_rg_output(tmp_path) -> None:
     result = await SearchTextTool(SafetyGuard(tmp_path)).run(
         pattern="needle",
         fixed_strings=True,
+        max_results=2_000,
     )
 
     assert result.success is True
