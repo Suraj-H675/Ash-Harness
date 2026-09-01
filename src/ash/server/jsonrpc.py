@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Any, Awaitable, Callable
 
 from ash.sdk import AshClient
@@ -202,9 +203,11 @@ def _result(request_id: Any, value: Any) -> dict[str, Any]:
 
 
 def _is_valid_request_id(value: Any) -> bool:
-    return value is None or (
-        isinstance(value, (str, int, float)) and not isinstance(value, bool)
-    )
+    if value is None or isinstance(value, str):
+        return True
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return not isinstance(value, float) or math.isfinite(value)
 
 
 def _error(
