@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+import math
 
 import pytest
 
@@ -188,6 +189,16 @@ async def test_jsonrpc_rejects_unhashable_ids_and_cancel_targets() -> None:
         "id": 1,
         "error": {"code": -32602, "message": "cancel request id is invalid"},
     }
+
+    for identifier in (math.inf, -math.inf, math.nan):
+        response = await server.handle_request(
+            {"jsonrpc": "2.0", "id": identifier, "method": "status"}
+        )
+        assert response == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": "Invalid Request"},
+        }
 
 
 @pytest.mark.asyncio
