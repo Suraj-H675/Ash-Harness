@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,9 @@ from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 MAX_SKILL_BYTES = 512 * 1024
 MAX_SKILL_RESOURCE_BYTES = 512 * 1024
 MAX_LISTED_RESOURCES = 200
+MAX_SKILL_DISCOVERY_ENTRIES = 100_000
+MAX_SKILL_DISCOVERY_DEPTH = 32
+MAX_SKILL_RESOURCE_ENTRIES = 100_000
 SKILL_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 KNOWN_FRONTMATTER_FIELDS = frozenset(
     {
@@ -113,21 +117,31 @@ def _skill_paths(paths: tuple[Path, ...]) -> list[Path]:
 def _discover_skill_directory(directory: Path) -> set[Path]:
     """Find skill roots without treating files inside a skill as new skills."""
 
-    manifest = directory / "SKILL.md"
-    if manifest.is_file() or manifest.is_symlink():
-        return {manifest}
     discovered: set[Path] = set()
-    try:
-        children = directory.iterdir()
-    except OSError:
-        return discovered
-    for child in children:
-        if child.name.startswith(".") or child.name == "node_modules":
+    pending: list[tuple[Path, int]] = [(directory, 0)]
+    entries_seen = 0
+    while pending:
+        current, depth = pending.pop()
+        manifest = current / "SKILL.md"
+        if manifest.is_file() or manifest.is_symlink():
+            discovered.add(manifest)
             continue
-        if child.is_symlink():
+        try:
+            children = current.iterdir()
+            for child in children:
+                entries_seen += 1
+                if entries_seen > MAX_SKILL_DISCOVERY_ENTRIES:
+                    return discovered
+                if child.name.startswith(".") or child.name == "node_modules":
+                    continue
+                if child.is_symlink() or (
+                    hasattr(child, "is_junction") and child.is_junction()
+                ):
+                    continue
+                if child.is_dir() and depth < MAX_SKILL_DISCOVERY_DEPTH:
+                    pending.append((child, depth + 1))
+        except OSError:
             continue
-        if child.is_dir():
-            discovered.update(_discover_skill_directory(child))
     return discovered
 
 
@@ -138,9 +152,8 @@ def parse_instruction_skill(path: Path, *, namespace: str = "") -> InstructionSk
         raise ValueError("skill manifest cannot be a symbolic link")
     if path.name != "SKILL.md" or not path.is_file():
         raise ValueError("skill path must point to a SKILL.md file")
-    if path.stat().st_size > MAX_SKILL_BYTES:
-        raise ValueError("skill file exceeds 512 KiB")
-    text = path.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    text = _read_limited_text(path, MAX_SKILL_BYTES, "skill file exceeds 512 KiB")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     frontmatter_text, instructions = _split_frontmatter(text)
     try:
         raw = yaml.safe_load(frontmatter_text)
@@ -354,9 +367,11 @@ class ReadSkillResourceTool(BaseTool):
             )
         try:
             resource = _resolve_skill_resource(skill, args.path)
-            if resource.stat().st_size > MAX_SKILL_RESOURCE_BYTES:
-                raise ValueError("skill resource exceeds 512 KiB")
-            output = resource.read_text(encoding="utf-8")
+            output = _read_limited_text(
+                resource,
+                MAX_SKILL_RESOURCE_BYTES,
+                "skill resource exceeds 512 KiB",
+            )
         except (OSError, UnicodeError, ValueError) as exc:
             return ToolResult(success=False, output="", error=str(exc))
         return ToolResult(
@@ -368,14 +383,55 @@ class ReadSkillResourceTool(BaseTool):
 
 def _list_skill_resources(skill: InstructionSkill) -> list[str]:
     resources: list[str] = []
-    for path in sorted(skill.root.rglob("*")):
+    for path in _iter_skill_resource_paths(skill.root):
         if len(resources) >= MAX_LISTED_RESOURCES:
             resources.append("[resource listing truncated]")
             break
-        if path == skill.path or path.is_symlink() or not path.is_file():
+        if path == skill.path:
             continue
         resources.append(path.relative_to(skill.root).as_posix())
     return resources
+
+
+def _iter_skill_resource_paths(root: Path) -> Iterator[Path]:
+    pending: list[tuple[Path, int]] = [(root, 0)]
+    entries_seen = 0
+    while pending:
+        directory, depth = pending.pop()
+        children: list[Path] = []
+        try:
+            for child in directory.iterdir():
+                children.append(child)
+                if len(children) >= MAX_SKILL_RESOURCE_ENTRIES:
+                    break
+        except OSError:
+            continue
+        children.sort(key=lambda path: path.name)
+        for path in children:
+            entries_seen += 1
+            if entries_seen > MAX_SKILL_RESOURCE_ENTRIES:
+                return
+            if path.is_symlink() or (
+                hasattr(path, "is_junction") and path.is_junction()
+            ):
+                continue
+            try:
+                is_directory = path.is_dir()
+                is_file = path.is_file()
+            except OSError:
+                continue
+            if is_file:
+                yield path
+            elif is_directory and depth < MAX_SKILL_DISCOVERY_DEPTH:
+                pending.append((path, depth + 1))
+
+
+def _read_limited_text(path: Path, max_bytes: int, error: str) -> str:
+    with path.open("rb") as handle:
+        raw = handle.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(error)
+    return raw.decode("utf-8")
 
 
 def _resolve_skill_resource(skill: InstructionSkill, requested: str) -> Path:

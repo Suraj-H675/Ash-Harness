@@ -1,3 +1,7 @@
+from pathlib import Path
+
+import pytest
+
 from ash.commands.custom_commands import CommandSource, CustomCommandCatalog
 
 
@@ -55,3 +59,36 @@ def test_custom_command_catalog_reports_duplicate_names(tmp_path) -> None:
 
     assert len(commands) == 1
     assert "duplicate command name" in catalog.errors[str(second)]
+
+
+def test_custom_command_catalog_rejects_direct_linked_command(tmp_path: Path) -> None:
+    target = tmp_path / "target.md"
+    target.write_text("Run this prompt.", encoding="utf-8")
+    linked = tmp_path / "linked.md"
+    try:
+        linked.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    catalog = CustomCommandCatalog(
+        (CommandSource(paths=(linked,), source="user"),)
+    )
+
+    assert catalog.discover() == []
+    assert "cannot be a link" in catalog.errors[str(linked)]
+
+
+def test_custom_command_catalog_bounds_recursive_discovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "commands"
+    root.mkdir()
+    for name in ("a.md", "b.md", "c.md"):
+        (root / name).write_text(f"Prompt for {name}", encoding="utf-8")
+    monkeypatch.setattr(
+        "ash.commands.custom_commands.MAX_COMMAND_DISCOVERY_ENTRIES", 2
+    )
+
+    commands = CustomCommandCatalog(((root, "user"),)).discover()
+
+    assert len(commands) <= 2

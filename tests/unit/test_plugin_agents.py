@@ -7,7 +7,12 @@ import pytest
 
 from ash.agents.shared_state import SharedState
 from ash.cli import _build_tools
-from ash.plugins.agents import AgentCatalog, AgentDefinition, AgentSource
+from ash.plugins.agents import (
+    AgentCatalog,
+    AgentDefinition,
+    AgentSource,
+    parse_agent_definition,
+)
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.guard import SafetyGuard
@@ -48,6 +53,31 @@ def test_agent_catalog_isolates_invalid_definitions(tmp_path: Path) -> None:
 
     assert [definition.name for definition in definitions] == ["valid"]
     assert "base-role" in catalog.errors[str(invalid)]
+
+
+def test_agent_catalog_rejects_direct_linked_definition(tmp_path: Path) -> None:
+    target = tmp_path / "target.md"
+    target.write_text("Inspect the task.", encoding="utf-8")
+    linked = tmp_path / "linked.md"
+    try:
+        linked.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="cannot be a link"):
+        parse_agent_definition(linked)
+
+
+def test_agent_catalog_bounds_recursive_discovery(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "agents"
+    root.mkdir()
+    for name in ("a.md", "b.md", "c.md"):
+        (root / name).write_text(f"Instructions for {name}", encoding="utf-8")
+    monkeypatch.setattr("ash.plugins.agents.MAX_AGENT_DISCOVERY_ENTRIES", 2)
+
+    definitions = AgentCatalog((root,)).discover()
+
+    assert len(definitions) <= 2
 
 
 class CustomAgentProvider(ProviderABC):

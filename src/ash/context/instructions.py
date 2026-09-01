@@ -195,12 +195,15 @@ def _read_with_imports(
 def _read(path: Path, scope: str) -> InstructionFile | None:
     if not path.is_file():
         return None
-    size = path.stat().st_size
-    if size > MAX_INSTRUCTION_FILE_BYTES:
-        raise ValueError(f"Instruction file is too large ({size} bytes): {path}")
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_INSTRUCTION_FILE_BYTES + 1)
+    if len(raw) > MAX_INSTRUCTION_FILE_BYTES:
+        raise ValueError(
+            f"Instruction file is too large (>{MAX_INSTRUCTION_FILE_BYTES} bytes): {path}"
+        )
     return InstructionFile(
         path=path,
-        content=path.read_text(encoding="utf-8").strip(),
+        content=raw.decode("utf-8").strip(),
         scope=scope,
     )
 

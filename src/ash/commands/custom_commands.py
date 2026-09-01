@@ -8,6 +8,8 @@ from pathlib import Path
 
 
 MAX_COMMAND_BYTES = 128 * 1024
+MAX_COMMAND_DISCOVERY_ENTRIES = 100_000
+MAX_COMMAND_DISCOVERY_DEPTH = 32
 
 
 @dataclass(frozen=True)
@@ -85,11 +87,42 @@ class CustomCommandCatalog:
 
 def _command_paths(paths: tuple[Path, ...]) -> list[tuple[Path, Path]]:
     discovered: set[tuple[Path, Path]] = set()
+    entries_seen = 0
     for candidate in paths:
         if candidate.is_file() and candidate.suffix.casefold() == ".md":
             discovered.add((candidate, candidate.parent))
-        elif candidate.is_dir():
-            discovered.update((path, candidate) for path in candidate.rglob("*.md"))
+            continue
+        if not candidate.is_dir() or candidate.is_symlink():
+            continue
+        pending: list[tuple[Path, int]] = [(candidate, 0)]
+        while pending:
+            directory, depth = pending.pop()
+            children: list[Path] = []
+            try:
+                for child in directory.iterdir():
+                    children.append(child)
+                    if len(children) >= MAX_COMMAND_DISCOVERY_ENTRIES:
+                        break
+            except OSError:
+                continue
+            children.sort(key=lambda path: path.name)
+            for path in children:
+                entries_seen += 1
+                if entries_seen > MAX_COMMAND_DISCOVERY_ENTRIES:
+                    return sorted(discovered)
+                if path.is_symlink() or (
+                    hasattr(path, "is_junction") and path.is_junction()
+                ):
+                    continue
+                try:
+                    is_directory = path.is_dir()
+                    is_file = path.is_file()
+                except OSError:
+                    continue
+                if is_file and path.suffix.casefold() == ".md":
+                    discovered.add((path, candidate))
+                elif is_directory and depth < MAX_COMMAND_DISCOVERY_DEPTH:
+                    pending.append((path, depth + 1))
     return sorted(discovered)
 
 
@@ -100,9 +133,13 @@ def _parse(
     *,
     namespace: str = "",
 ) -> CustomCommand:
-    if path.stat().st_size > MAX_COMMAND_BYTES:
+    if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+        raise ValueError("command file cannot be a link")
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_COMMAND_BYTES + 1)
+    if len(raw) > MAX_COMMAND_BYTES:
         raise ValueError("command file exceeds 128 KiB")
-    text = path.read_text(encoding="utf-8")
+    text = raw.decode("utf-8")
     metadata: dict[str, str] = {}
     body = text
     if text.startswith("---\n"):
