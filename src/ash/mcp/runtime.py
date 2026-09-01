@@ -47,6 +47,7 @@ MAX_VALIDATION_PAYLOAD_BYTES = 2 * 1024 * 1024
 MAX_WORKER_OUTPUT_BYTES = 64 * 1024
 MAX_CONSECUTIVE_TOOL_REFRESHES = 3
 TOOL_REFRESH_DEBOUNCE_SECONDS = 0.05
+TOOL_REFRESH_QUIET_PERIOD_SECONDS = TOOL_REFRESH_DEBOUNCE_SECONDS * 2
 
 
 def _default_schema_dialect(protocol_version: str) -> str:
@@ -1288,15 +1289,24 @@ class MCPRuntime:
             self._event_sink(event)
 
     async def wait_for_refreshes(self) -> None:
-        idle_ticks = 0
-        while idle_ticks < 2:
-            await asyncio.sleep(0)
+        """Wait for refreshes and a quiet period for late notifications to dispatch."""
+
+        loop = asyncio.get_running_loop()
+        quiet_deadline: float | None = None
+        while True:
             tasks = tuple(self._refresh_tasks.values())
-            if not tasks:
-                idle_ticks += 1
+            if tasks:
+                quiet_deadline = None
+                await asyncio.gather(*tasks, return_exceptions=True)
                 continue
-            idle_ticks = 0
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if quiet_deadline is None:
+                quiet_deadline = (
+                    loop.time() + TOOL_REFRESH_QUIET_PERIOD_SECONDS
+                )
+            remaining = quiet_deadline - loop.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(TOOL_REFRESH_DEBOUNCE_SECONDS, remaining))
 
     async def close(self) -> None:
         self._closed = True
