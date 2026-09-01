@@ -282,7 +282,11 @@ def prepare_file_mentions(
             kind = "directory"
         elif path.is_file():
             try:
-                _, raw_content = read_scoped_bytes(path, guard)
+                _, raw_content = read_scoped_bytes(
+                    path,
+                    guard,
+                    max_bytes=MAX_IMAGE_BYTES + 1,
+                )
             except OSError as exc:
                 raise ValueError(
                     f"Cannot safely read attachment @{raw_path}: {exc}"

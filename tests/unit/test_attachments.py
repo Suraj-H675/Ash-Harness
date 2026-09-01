@@ -235,6 +235,17 @@ def test_prepare_file_mentions_rejects_image_for_nonvision_model(
         )
 
 
+def test_prepare_file_mentions_bounds_large_image_read(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("ash.commands.attachments.MAX_IMAGE_BYTES", 8)
+    image = tmp_path / "large.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x")
+
+    with pytest.raises(ValueError, match="exceeds 8 bytes"):
+        prepare_file_mentions(
+            "inspect @large.png", SafetyGuard(tmp_path), allow_images=True
+        )
+
+
 def test_prepare_file_mentions_enforces_combined_token_budget(tmp_path: Path) -> None:
     (tmp_path / "first.txt").write_text("a" * 40, encoding="utf-8")
     (tmp_path / "second.txt").write_text("b" * 40, encoding="utf-8")
