@@ -164,6 +164,79 @@ async def test_jsonrpc_turn_validation_and_unknown_method() -> None:
 
 
 @pytest.mark.asyncio
+async def test_jsonrpc_rejects_malformed_collection_parameters() -> None:
+    server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
+
+    invalid_requests = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/list",
+            "params": {"query": {}},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/list",
+            "params": {"limit": 1.5},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/list",
+            "params": {"limit": 101},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "event/list",
+            "params": {"after_sequence": float("inf")},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "event/list",
+            "params": {"turn_id": []},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "event/list",
+            "params": {"limit": 10_001},
+        },
+    ]
+
+    responses = [await server.handle_request(request) for request in invalid_requests]
+
+    assert [response["error"]["code"] for response in responses] == [-32602] * 6
+
+
+@pytest.mark.asyncio
+async def test_jsonrpc_rejects_oversized_turn_and_fork_metadata() -> None:
+    server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
+
+    oversized_turn = await server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "turn/run",
+            "params": {"input": "x" * 1_000_001},
+        }
+    )
+    oversized_branch = await server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/fork",
+            "params": {"branch_name": "x" * 129},
+        }
+    )
+
+    assert oversized_turn["error"]["code"] == -32602
+    assert oversized_branch["error"]["code"] == -32602
+
+
+@pytest.mark.asyncio
 async def test_jsonrpc_rejects_unhashable_ids_and_cancel_targets() -> None:
     server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
 

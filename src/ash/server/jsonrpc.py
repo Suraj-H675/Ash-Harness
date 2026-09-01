@@ -10,6 +10,13 @@ from ash.sdk import AshClient
 from ash.core.events import EVENT_SCHEMA_VERSION
 
 
+MAX_JSONRPC_TEXT_BYTES = 1_000_000
+MAX_JSONRPC_SESSION_LIST_LIMIT = 100
+MAX_JSONRPC_EVENT_LIST_LIMIT = 10_000
+MAX_JSONRPC_BRANCH_NAME_CHARS = 128
+MAX_JSONRPC_BRANCH_SUMMARY_CHARS = 12_000
+
+
 class JSONRPCServer:
     def __init__(self, client: AshClient) -> None:
         self.client = client
@@ -103,6 +110,10 @@ class JSONRPCServer:
         text = params.get("input")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("input must be a non-empty string")
+        if len(text.encode("utf-8")) > MAX_JSONRPC_TEXT_BYTES:
+            raise ValueError(
+                f"input must not exceed {MAX_JSONRPC_TEXT_BYTES} bytes"
+            )
         async with self._turn_lock:
             result = await self.client.prompt(text)
         return {
@@ -123,8 +134,15 @@ class JSONRPCServer:
         return {"session_id": await self.client.resume(session_id)}
 
     async def _list_sessions(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        query = str(params.get("query", ""))
-        limit = int(params.get("limit", 20))
+        query = params.get("query", "")
+        if not isinstance(query, str):
+            raise ValueError("query must be a string")
+        limit = _bounded_integer(
+            params.get("limit", 20),
+            name="limit",
+            minimum=1,
+            maximum=MAX_JSONRPC_SESSION_LIST_LIMIT,
+        )
         return [
             item.model_dump(mode="json")
             for item in self.client.sessions(query=query, limit=limit)
@@ -145,6 +163,15 @@ class JSONRPCServer:
         branch_summary = params.get("branch_summary", "")
         if not isinstance(branch_name, str) or not isinstance(branch_summary, str):
             raise ValueError("branch_name and branch_summary must be strings")
+        if len(branch_name) > MAX_JSONRPC_BRANCH_NAME_CHARS:
+            raise ValueError(
+                f"branch_name cannot exceed {MAX_JSONRPC_BRANCH_NAME_CHARS} characters"
+            )
+        if len(branch_summary) > MAX_JSONRPC_BRANCH_SUMMARY_CHARS:
+            raise ValueError(
+                "branch_summary cannot exceed "
+                f"{MAX_JSONRPC_BRANCH_SUMMARY_CHARS} characters"
+            )
         return {
             "session_id": await self.client.fork(
                 session_id,
@@ -167,11 +194,25 @@ class JSONRPCServer:
         session_id = params.get("session_id")
         if session_id is not None and not isinstance(session_id, str):
             raise ValueError("session_id must be a string")
+        after_sequence = _bounded_integer(
+            params.get("after_sequence", 0),
+            name="after_sequence",
+            minimum=0,
+        )
+        turn_id = params.get("turn_id")
+        if turn_id is not None and not isinstance(turn_id, str):
+            raise ValueError("turn_id must be a string")
+        limit = _bounded_integer(
+            params.get("limit", 1000),
+            name="limit",
+            minimum=1,
+            maximum=MAX_JSONRPC_EVENT_LIST_LIMIT,
+        )
         records = self.client.events(
             session_id,
-            after_sequence=int(params.get("after_sequence", 0)),
-            turn_id=params.get("turn_id"),
-            limit=int(params.get("limit", 1000)),
+            after_sequence=after_sequence,
+            turn_id=turn_id,
+            limit=limit,
         )
         return {
             "schema_version": EVENT_SCHEMA_VERSION,
@@ -182,7 +223,7 @@ class JSONRPCServer:
             "next_sequence": (
                 records[-1].sequence
                 if records
-                else int(params.get("after_sequence", 0))
+                else after_sequence
             ),
         }
 
@@ -196,6 +237,22 @@ class JSONRPCServer:
             "context_tokens": self.client.loop._last_context_tokens,
             "usage": self.client.loop.last_turn_usage,
         }
+
+
+def _bounded_integer(
+    value: Any,
+    *,
+    name: str,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be at most {maximum}")
+    return value
 
 
 def _result(request_id: Any, value: Any) -> dict[str, Any]:
