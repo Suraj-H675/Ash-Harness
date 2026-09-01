@@ -552,6 +552,16 @@ class FTS5FallbackIndex:
     ) -> int:
         return self._index.index_document(file_path, list(chunks), sha256=sha256)
 
+    def add_documents(
+        self,
+        documents: Sequence[tuple[Sequence[Chunk], str]],
+    ) -> int:
+        """Index multiple files in one SQLite transaction."""
+
+        return self._index.index_documents(
+            (file_path, chunks, None) for chunks, file_path in documents
+        )
+
     def query(self, query_text: str, top_k: int = 5) -> list[VectorHit]:
         rows = self._index.query(query_text, limit=top_k)
         return [
@@ -632,34 +642,61 @@ class VectorSearchPipeline:
     async def index_chunks(self, chunks: Sequence[Chunk], file_path: str) -> int:
         """Embed every chunk and upsert into the vector index."""
 
-        if not chunks:
-            return 0
-        if self._lexical_index is not None:
-            self._lexical_index.add(chunks, file_path)
-        if not self._vector_enabled:
-            return len(chunks)
-        texts = [chunk.content for chunk in chunks]
-        embeddings = await self._adapter.get_embeddings(texts)
-        ids: list[str] = []
-        metadatas: list[dict[str, Any]] = []
-        for chunk in chunks:
-            chunk_key = chunk.chunk_key
-            ids.append(chunk_key)
-            metadatas.append(
-                {
-                    "chunk_key": chunk_key,
-                    "file_path": file_path,
-                    "start_line": chunk.start_line,
-                    "end_line": chunk.end_line,
-                }
+        return await self.index_documents(((chunks, file_path),))
+
+    async def index_documents(
+        self,
+        documents: Sequence[tuple[Sequence[Chunk], str]],
+        *,
+        batch_size: int = 64,
+    ) -> int:
+        """Index multiple files with bounded memory and transaction churn."""
+
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+
+        indexed_chunks = 0
+        for offset in range(0, len(documents), batch_size):
+            batch = [
+                (chunks, file_path)
+                for chunks, file_path in documents[offset : offset + batch_size]
+                if chunks
+            ]
+            if not batch:
+                continue
+
+            if self._lexical_index is not None:
+                self._lexical_index.add_documents(batch)
+            batch_chunks = [chunk for chunks, _ in batch for chunk in chunks]
+            indexed_chunks += len(batch_chunks)
+            if not self._vector_enabled:
+                continue
+
+            texts = [chunk.content for chunk in batch_chunks]
+            embeddings = await self._adapter.get_embeddings(texts)
+            ids: list[str] = []
+            metadatas: list[dict[str, Any]] = []
+            file_paths = [
+                file_path for chunks, file_path in batch for _ in chunks
+            ]
+            for chunk, file_path in zip(batch_chunks, file_paths, strict=True):
+                chunk_key = chunk.chunk_key
+                ids.append(chunk_key)
+                metadatas.append(
+                    {
+                        "chunk_key": chunk_key,
+                        "file_path": file_path,
+                        "start_line": chunk.start_line,
+                        "end_line": chunk.end_line,
+                    }
+                )
+            self._vector_index.add(
+                ids=ids,
+                embeddings=embeddings,
+                documents=texts,
+                metadatas=metadatas,
             )
-        self._vector_index.add(
-            ids=ids,
-            embeddings=embeddings,
-            documents=texts,
-            metadatas=metadatas,
-        )
-        return len(ids)
+        return indexed_chunks
 
     async def search(
         self,

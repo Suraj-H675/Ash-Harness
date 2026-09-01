@@ -369,6 +369,33 @@ def test_pipeline_index_chunks_returns_count() -> None:
     assert asyncio.run(runner()) == 2
 
 
+def test_pipeline_index_documents_batches_files(tmp_path: Path) -> None:
+    pipeline = VectorSearchPipeline(
+        adapter=DeterministicEmbedding(),
+        vector_index=InMemoryVectorIndex(),
+        lexical_index=FTS5FallbackIndex(FTS5Index(tmp_path / "batch.db")),
+        vector_enabled=False,
+    )
+
+    async def runner() -> int:
+        return await pipeline.index_documents(
+            [
+                (
+                    [Chunk(file_path="a.py", start_line=1, end_line=1, content="alpha")],
+                    "a.py",
+                ),
+                (
+                    [Chunk(file_path="b.py", start_line=1, end_line=1, content="beta")],
+                    "b.py",
+                ),
+            ]
+        )
+
+    assert asyncio.run(runner()) == 2
+    assert pipeline.lexical_index is not None
+    assert len(pipeline.lexical_index.query("alpha")) == 1
+
+
 def test_pipeline_index_empty_chunks_is_noop() -> None:
     pipeline = VectorSearchPipeline(
         adapter=DeterministicEmbedding(),

@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Sequence
 
 from ash.context.compaction import Chunk
 from ash.core.session import get_db_connection
@@ -60,43 +60,88 @@ class FTS5Index:
         """
 
         with closing(get_db_connection(self.db_path)) as conn, conn:
-            conn.execute("DELETE FROM fts_index WHERE file_path = ?", (file_path,))
-            conn.execute(
-                "DELETE FROM document_metadata WHERE file_path = ?",
-                (file_path,),
+            return self._index_document(
+                conn,
+                file_path,
+                chunks,
+                symbol_tags=symbol_tags,
+                sha256=sha256,
             )
 
-            first_rowid = 0
-            for chunk in chunks:
-                cursor = conn.execute(
-                    """
-                    INSERT INTO fts_index (file_path, content, symbol_tags)
-                    VALUES (?, ?, ?)
-                    """,
-                    (file_path, chunk.content, symbol_tags),
-                )
-                if first_rowid == 0 and cursor.lastrowid is not None:
-                    first_rowid = int(cursor.lastrowid)
+    def index_documents(
+        self,
+        documents: Iterable[tuple[str, Sequence[Chunk], str | None]],
+        symbol_tags: str = "",
+    ) -> int:
+        """Replace and insert multiple documents in one SQLite transaction.
 
-            if first_rowid and sha256 is not None:
-                conn.execute(
-                    """
-                    INSERT INTO document_metadata (rowid, file_path, last_modified, sha256)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(rowid) DO UPDATE SET
-                        file_path = excluded.file_path,
-                        last_modified = excluded.last_modified,
-                        sha256 = excluded.sha256
-                    """,
-                    (
-                        first_rowid,
-                        file_path,
-                        datetime.now(timezone.utc).isoformat(),
-                        sha256,
-                    ),
-                )
+        Project indexing can touch hundreds of small files. Keeping the
+        connection and transaction open for the batch avoids paying SQLite's
+        WAL setup and commit cost once per file while preserving the
+        replacement semantics of :meth:`index_document`.
+        """
 
-            return first_rowid
+        indexed = 0
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            for file_path, chunks, sha256 in documents:
+                self._index_document(
+                    conn,
+                    file_path,
+                    chunks,
+                    symbol_tags=symbol_tags,
+                    sha256=sha256,
+                )
+                indexed += 1
+        return indexed
+
+    @staticmethod
+    def _index_document(
+        conn: sqlite3.Connection,
+        file_path: str,
+        chunks: Sequence[Chunk],
+        *,
+        symbol_tags: str,
+        sha256: str | None,
+    ) -> int:
+        """Index one document using an existing SQLite connection."""
+
+        conn.execute("DELETE FROM fts_index WHERE file_path = ?", (file_path,))
+        conn.execute(
+            "DELETE FROM document_metadata WHERE file_path = ?",
+            (file_path,),
+        )
+
+        first_rowid = 0
+        for chunk in chunks:
+            cursor = conn.execute(
+                """
+                INSERT INTO fts_index (file_path, content, symbol_tags)
+                VALUES (?, ?, ?)
+                """,
+                (file_path, chunk.content, symbol_tags),
+            )
+            if first_rowid == 0 and cursor.lastrowid is not None:
+                first_rowid = int(cursor.lastrowid)
+
+        if first_rowid and sha256 is not None:
+            conn.execute(
+                """
+                INSERT INTO document_metadata (rowid, file_path, last_modified, sha256)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(rowid) DO UPDATE SET
+                    file_path = excluded.file_path,
+                    last_modified = excluded.last_modified,
+                    sha256 = excluded.sha256
+                """,
+                (
+                    first_rowid,
+                    file_path,
+                    datetime.now(timezone.utc).isoformat(),
+                    sha256,
+                ),
+            )
+
+        return first_rowid
 
     def delete_document(self, file_path: str) -> int:
         """Remove all indexed chunks and metadata for ``file_path``."""

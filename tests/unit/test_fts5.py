@@ -208,6 +208,21 @@ def test_fts5_reindex_replaces_existing_chunks(fts5_index: FTS5Index) -> None:
     assert "dogs" in results[0]["content"]
 
 
+def test_fts5_index_documents_batches_replacements(fts5_index: FTS5Index) -> None:
+    indexed = fts5_index.index_documents(
+        [
+            ("a.py", _chunks("a.py", "alpha content"), None),
+            ("b.py", _chunks("b.py", "beta content"), None),
+        ]
+    )
+
+    assert indexed == 2
+    assert {row["file_path"] for row in fts5_index.query("content")} == {
+        "a.py",
+        "b.py",
+    }
+
+
 def test_fts5_query_ranks_more_relevant_chunk_first(fts5_index: FTS5Index) -> None:
     # file1 mentions the keyword five times; file2 mentions it once.
     fts5_index.index_document(

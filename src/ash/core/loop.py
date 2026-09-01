@@ -2798,13 +2798,15 @@ class AshLoop:
             if len(candidates) >= max_files:
                 break
 
-        indexed = 0
-        for path in sorted(candidates):
-            relative_path = path.relative_to(self.project_root).as_posix()
-            chunks = self._chunk_file(path)
-            await self._vector_pipeline.index_chunks(chunks, relative_path)
-            indexed += 1
-        return indexed
+        documents = [
+            (
+                self._chunk_file(path),
+                path.relative_to(self.project_root).as_posix(),
+            )
+            for path in sorted(candidates)
+        ]
+        await self._vector_pipeline.index_documents(documents)
+        return len(documents)
 
     def _chunk_file(self, file_path: Path) -> list["Chunk"]:
         """Split a file into memory-indexable chunks."""
