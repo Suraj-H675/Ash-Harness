@@ -27,6 +27,39 @@ MAX_SEARCH_CAPTURE_BYTES = 2_000_000
 SEARCH_TIMEOUT_SECONDS = 30
 MAX_SEARCH_LINE_CHARS = 64 * 1024
 MAX_SEARCH_MATCH_CARRY_CHARS = 4 * 1024
+MAX_LIST_DIRECTORY_DEPTH = 4
+
+
+def _iter_workspace_paths(
+    root: Path,
+    *,
+    recursive: bool,
+    max_depth: int | None = None,
+) -> Iterator[Path]:
+    """Yield workspace entries lazily without descending through links."""
+
+    def walk(directory: Path, depth: int) -> Iterator[Path]:
+        if max_depth is not None and depth >= max_depth:
+            return
+        try:
+            children = directory.iterdir()
+            for path in children:
+                yield path
+                if not recursive or (
+                    max_depth is not None and depth + 1 >= max_depth
+                ):
+                    continue
+                try:
+                    is_link = path.is_symlink()
+                    is_directory = path.is_dir()
+                except OSError:
+                    continue
+                if is_directory and not is_link:
+                    yield from walk(path, depth + 1)
+        except OSError:
+            return
+
+    yield from walk(root, 0)
 
 
 class ListDirectoryArgs(BaseModel):
@@ -47,15 +80,23 @@ class ListDirectoryTool(BaseTool):
             return ToolResult(
                 success=False, output="", error=f"Not a directory: {root}"
             )
-        iterator = root.rglob("*") if args.recursive else root.iterdir()
         entries: list[str] = []
         truncated = False
-        for path in sorted(iterator):
+        for path in _iter_workspace_paths(
+            root,
+            recursive=args.recursive,
+            max_depth=MAX_LIST_DIRECTORY_DEPTH,
+        ):
             if len(entries) >= args.max_results:
                 truncated = True
                 break
             relative = path.relative_to(root).as_posix()
-            entries.append(relative + ("/" if path.is_dir() else ""))
+            try:
+                is_directory = path.is_dir() and not path.is_symlink()
+            except OSError:
+                is_directory = False
+            entries.append(relative + ("/" if is_directory else ""))
+        entries.sort()
         output = "\n".join(entries)
         if truncated:
             output += f"\n[truncated after {args.max_results} entries]"

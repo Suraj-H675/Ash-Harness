@@ -15,6 +15,22 @@ async def test_list_directory_is_bounded(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_directory_caps_recursive_depth(tmp_path) -> None:
+    deep_file = tmp_path / "one" / "two" / "three" / "four" / "five.txt"
+    deep_file.parent.mkdir(parents=True)
+    deep_file.write_text("deep")
+
+    result = await ListDirectoryTool(SafetyGuard(tmp_path)).run(
+        recursive=True,
+        max_results=100,
+    )
+
+    assert result.success is True
+    assert "one/two/three/four/" in result.output
+    assert "one/two/three/four/five.txt" not in result.output
+
+
+@pytest.mark.asyncio
 async def test_glob_files_returns_relative_matches(tmp_path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "app.py").write_text("print('x')")
