@@ -357,7 +357,6 @@ def build_runtime(
         if managed_rules is None
         else managed_rules
     )
-    managed_rules = load_managed_permission_rules(config.workspace_root)
     guard = SafetyGuard(
         config.workspace_root,
         blocklist_commands=config.command_blocklist,
@@ -479,7 +478,6 @@ def build_runtime(
         rule_count=len(rules),
     )
     loop.permission_policy.set_managed_rules(managed)
-    loop.permission_policy.set_managed_rules(managed_rules)
     hooks.set_event_sink(loop._emit_event)
     if trusted and config.memory_auto_index and loop._vector_pipeline is not None:
         loop._memory_auto_index_task = asyncio.create_task(

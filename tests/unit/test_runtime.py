@@ -7,6 +7,7 @@ from ash.runtime import build_runtime
 from ash.config import AshConfig
 from ash.mcp.server import MCPServerConfig
 from ash.providers.base import ProviderABC
+from ash.safety.grants import PermissionRule, RuleEffect
 from ash.ui.headless import HeadlessUI
 
 
@@ -239,3 +240,26 @@ def test_runtime_registers_only_trusted_configured_remote_agents(
         "review",
         "project",
     }
+
+
+def test_runtime_preserves_explicit_managed_permission_rules(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+    managed_rule = PermissionRule.create(RuleEffect.DENY, "run_command")
+
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=False,
+        managed_rules=[managed_rule],
+    )
+
+    assert runtime.loop.permission_policy.managed_rules == [managed_rule]
