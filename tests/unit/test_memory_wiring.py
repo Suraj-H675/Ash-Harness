@@ -87,6 +87,35 @@ async def test_project_memory_auto_index_is_bounded_and_respects_excludes(
 
 
 @pytest.mark.asyncio
+async def test_manual_memory_index_skips_oversized_file(tmp_path) -> None:
+    path = tmp_path / "large.py"
+    path.write_bytes(b"x" * 9)
+    config = AshConfig(
+        model="openai/memory-test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="fts5",
+        chroma_persist_dir=tmp_path / "memory",
+    )
+    loop = AshLoop(
+        session_store=SessionStore(config.db_directory / "sessions.db"),
+        provider=MemoryTestProvider(),
+        ui=HeadlessUI(output_format="text"),
+        safety_guard=SafetyGuard(project_root=tmp_path),
+        project_root=tmp_path,
+        config=config,
+        enable_semantic_memory=True,
+        memory_backend="fts5",
+        chroma_persist_dir=tmp_path / "memory",
+    )
+    try:
+        assert await loop.index_file_for_memory(path, max_bytes_per_file=8) == 0
+        assert await loop.semantic_search("x") == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_large_repository_memory_indexing_is_bounded(tmp_path) -> None:
     file_count = 120
     for index in range(file_count + 50):

@@ -21,6 +21,7 @@ import asyncio
 import fnmatch
 import json
 from collections import deque
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -68,6 +69,7 @@ from ash.providers.retry import (
 from ash.repo.repomap import RepoMap
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy, PolicyAction, READ_ONLY_TOOLS
+from ash.safety.scoped_io import read_scoped_bytes
 from ash.tools.base import (
     BaseTool,
     ToolExecutionContract,
@@ -138,6 +140,34 @@ FILE_WRITE_TOOLS = {
 }
 REPO_MAP_FILE_TOOLS = {*FILE_WRITE_TOOLS, "read_file"}
 MAX_ACTIVE_REPO_FILES = 20
+DEFAULT_MEMORY_MAX_BYTES_PER_FILE = 128_000
+MAX_MEMORY_SCAN_ENTRIES = 100_000
+MAX_MEMORY_SCAN_DEPTH = 32
+
+
+def _iter_project_paths(root: Path, *, max_depth: int) -> Iterator[Path]:
+    """Yield workspace entries lazily without descending through links."""
+
+    def walk(directory: Path, depth: int) -> Iterator[Path]:
+        if depth >= max_depth:
+            return
+        try:
+            children = directory.iterdir()
+            for path in children:
+                yield path
+                if depth + 1 >= max_depth:
+                    continue
+                try:
+                    is_link = path.is_symlink()
+                    is_directory = path.is_dir()
+                except OSError:
+                    continue
+                if is_directory and not is_link:
+                    yield from walk(path, depth + 1)
+        except OSError:
+            return
+
+    yield from walk(root, 0)
 
 
 def _provider_capabilities(provider: Any) -> ProviderCapabilities:
@@ -2726,13 +2756,26 @@ class AshLoop:
             vector_enabled=memory_backend != "fts5",
         )
 
-    async def index_file_for_memory(self, file_path: Path) -> None:
+    async def index_file_for_memory(
+        self,
+        file_path: Path,
+        *,
+        max_bytes_per_file: int = DEFAULT_MEMORY_MAX_BYTES_PER_FILE,
+    ) -> int:
         """Index a file into the semantic memory pipeline."""
         if self._vector_pipeline is None:
-            return
+            return 0
+        if max_bytes_per_file < 1:
+            raise ValueError("memory indexing limits must be positive")
 
-        chunks = self._chunk_file(file_path)
+        try:
+            chunks = self._chunk_file(file_path, max_bytes_per_file)
+        except (OSError, UnicodeError):
+            return 0
+        if not chunks:
+            return 0
         await self._vector_pipeline.index_chunks(chunks, str(file_path))
+        return 1
 
     async def semantic_search(self, query: str, top_k: int = 5) -> list["VectorHit"]:
         """Search semantic memory for relevant context."""
@@ -2759,8 +2802,18 @@ class AshLoop:
             else ()
         )
         candidates: list[Path] = []
-        for path in sorted(self.project_root.rglob("*")):
-            if not path.is_file():
+        scanned = 0
+        for path in _iter_project_paths(
+            self.project_root,
+            max_depth=MAX_MEMORY_SCAN_DEPTH,
+        ):
+            scanned += 1
+            if scanned > MAX_MEMORY_SCAN_ENTRIES:
+                break
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+            except OSError:
                 continue
             if path.suffix.lower() not in {
                 ".c",
@@ -2795,25 +2848,37 @@ class AshLoop:
             except OSError:
                 continue
             candidates.append(path)
-            if len(candidates) >= max_files:
-                break
 
-        documents = [
-            (
-                self._chunk_file(path),
-                path.relative_to(self.project_root).as_posix(),
-            )
-            for path in sorted(candidates)
-        ]
+        documents: list[tuple[list["Chunk"], str]] = []
+        for path in sorted(candidates)[:max_files]:
+            try:
+                chunks = self._chunk_file(path, max_bytes_per_file)
+            except (OSError, UnicodeError):
+                continue
+            if chunks:
+                documents.append(
+                    (chunks, path.relative_to(self.project_root).as_posix())
+                )
         await self._vector_pipeline.index_documents(documents)
         return len(documents)
 
-    def _chunk_file(self, file_path: Path) -> list["Chunk"]:
+    def _chunk_file(
+        self,
+        file_path: Path,
+        max_bytes_per_file: int = DEFAULT_MEMORY_MAX_BYTES_PER_FILE,
+    ) -> list["Chunk"]:
         """Split a file into memory-indexable chunks."""
 
         from ash.context.compaction import Chunk
 
-        content = file_path.read_text(errors="replace")
+        if max_bytes_per_file < 1:
+            raise ValueError("memory indexing limits must be positive")
+        _, raw_content = read_scoped_bytes(
+            file_path,
+            self.safety_guard,
+            max_bytes=max_bytes_per_file,
+        )
+        content = raw_content.decode(errors="replace")
         lines = content.splitlines()
         chunks: list[Chunk] = []
         for i in range(0, len(lines), 50):

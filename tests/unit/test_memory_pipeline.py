@@ -125,6 +125,10 @@ def test_semantic_memory_injects_into_system_prompt(tmp_path: Path) -> None:
     provider.stream_chat = mock_stream
 
     safety_guard = MagicMock(spec=SafetyGuard)
+    safety_guard.project_root = tmp_path
+    safety_guard.validate_mutation_path.side_effect = lambda value: Path(
+        value
+    ).resolve()
     ui = MagicMock(spec=TerminalUI)
     ui.request_tool_approval.return_value = True
     ui.begin_turn.return_value.__enter__ = MagicMock(return_value=None)

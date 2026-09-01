@@ -1615,8 +1615,22 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     if not memory_path.is_file():
                         print(f"Error: not a file: {memory_path}", file=sys.stderr)
                         continue
-                    await loop.index_file_for_memory(memory_path)
-                    print(f"Indexed {memory_path}")
+                    indexed = await loop.index_file_for_memory(
+                        memory_path,
+                        max_bytes_per_file=(
+                            loop._config.memory_auto_index_max_bytes_per_file
+                            if loop._config is not None
+                            else 128_000
+                        ),
+                    )
+                    if indexed:
+                        print(f"Indexed {memory_path}")
+                    else:
+                        print(
+                            f"Skipped {memory_path}: file is unavailable or exceeds "
+                            "the memory indexing limit",
+                            file=sys.stderr,
+                        )
                     continue
                 if action == "index-workspace":
                     if len(arguments) > 2:
