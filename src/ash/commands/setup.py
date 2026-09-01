@@ -8,15 +8,20 @@ from __future__ import annotations
 
 import getpass
 import importlib.util
+import os
 import re
 import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 from ash.commands.config import (
     backup_config_file,
@@ -30,12 +35,26 @@ from ash.commands.config import (
     save_config,
     save_env_values,
 )
+from ash.provider_catalog import (
+    BUILTIN_PROVIDERS,
+    ProviderDescriptor,
+    get_provider_descriptor,
+)
 
 
 class SetupOutcome(IntEnum):
     SUCCESS = 0
     CANCELLED = 1
     ERROR = 2
+
+
+class ProviderManagementAction(Enum):
+    ADD = "add"
+    REPLACE = "replace"
+    MOVE = "move"
+    REMOVE = "remove"
+    CLEAR = "clear"
+    DONE = "done"
 
 
 class SetupBack(Exception):
@@ -50,18 +69,15 @@ class SetupCancelled(Exception):
 # Provider catalogue
 # ---------------------------------------------------------------------------
 
-PROVIDERS = [
-    ("anthropic", "Anthropic", "Anthropic API models - ANTHROPIC_API_KEY"),
-    ("openai", "OpenAI", "OpenAI API models - OPENAI_API_KEY"),
-    ("deepseek", "DeepSeek", "DeepSeek API models - DEEPSEEK_API_KEY"),
-    ("groq", "Groq", "Groq-hosted models - GROQ_API_KEY"),
-    ("ollama", "Ollama", "Local models (no API key needed)"),
-    (
+PROVIDERS = BUILTIN_PROVIDERS + (
+    ProviderDescriptor(
         "openai-compatible",
-        "OpenAI-Compatible",
-        "Custom endpoint with any OpenAI-compatible API",
+        "Custom endpoint",
+        "Custom route",
+        "Any OpenAI-compatible endpoint with a manual provider ID",
+        "",
     ),
-]
+)
 WEB_SEARCH_PROVIDERS = (
     (
         "brave",
@@ -87,6 +103,70 @@ class ModelProbe:
     @property
     def verified(self) -> bool:
         return self.error is None
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _setup_console() -> Console:
+    """Return a setup console that is friendly to pipes and screen readers."""
+
+    return Console(
+        no_color=_env_truthy("NO_COLOR") or _env_truthy("ASH_NO_COLOR"),
+        soft_wrap=True,
+    )
+
+
+def _provider_status(config, descriptor: ProviderDescriptor) -> str:
+    """Describe whether a catalog provider has enough local setup to try."""
+
+    if descriptor.local:
+        return "available to test"
+    return "key detected" if descriptor.key_env and get_env_value(descriptor.key_env) else "needs key"
+
+
+def _render_setup_status(config, *, title: str = "Current setup") -> None:
+    """Render a bounded, secret-free setup summary."""
+
+    console = _setup_console()
+    model = str(getattr(config, "model", "") or "not selected")
+    workspace_root = getattr(config, "workspace_root", Path.cwd())
+    if not isinstance(workspace_root, Path):
+        workspace_root = Path.cwd()
+    provider_id = model.split("/", 1)[0] if "/" in model else ""
+    descriptor = get_provider_descriptor(provider_id) if provider_id else None
+    provider_name = descriptor.name if descriptor else provider_id or "Not configured"
+    provider_state = "ready to test" if _has_provider_configured(config) else "needs setup"
+    fallback_count = len(getattr(config, "fallback_models", []) or [])
+    optional = [
+        ("Web search", "configured" if _has_web_search_configured(config) else "not configured"),
+        (
+            "Browser",
+            "installed" if _browser_is_installed() else "optional",
+        ),
+        ("MCP", "configured" if (workspace_root / ".mcp.json").is_file() else "none"),
+        ("Memory", str(getattr(config, "memory_backend", "auto"))),
+        ("Sandbox", str(getattr(config, "sandbox_backend", "auto"))),
+    ]
+    console.print(Panel(
+        f"[bold]{provider_name}[/bold]  [dim]{model}[/dim]\n"
+        f"Provider route: {provider_state}  •  Fallbacks: {fallback_count}",
+        title=title,
+        border_style="cyan",
+        padding=(0, 1),
+    ))
+    table = Table(show_header=True, header_style="bold cyan", box=None, pad_edge=False)
+    table.add_column("Capability", style="bold")
+    table.add_column("Status")
+    for capability, status in optional:
+        table.add_row(capability, status)
+    console.print(table)
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +197,9 @@ def run_setup_wizard(args) -> SetupOutcome:
     config = AshConfig.load()
 
     if non_interactive or not is_interactive_stdin():
+        if section == "status":
+            _render_setup_status(config)
+            return SetupOutcome.SUCCESS
         if section == "browser":
             if _browser_is_installed():
                 print("Playwright Chromium is installed.")
@@ -152,15 +235,33 @@ def run_setup_wizard(args) -> SetupOutcome:
 
     # Banner
     _print_header("Ash Setup Wizard")
+    _render_setup_status(config, title="Before you begin")
 
     # Check for old ash.toml and offer migration
     _migrate_old_ash_toml()
 
-    if section in ("model", "providers", "all"):
-        result = setup_model_provider(config, quick=quick)
-        if result != SetupOutcome.SUCCESS:
-            print("Setup cancelled.", file=sys.stderr)
-            return result
+    setup_result = SetupOutcome.SUCCESS
+    if section == "model":
+        setup_result = setup_model_provider(config, quick=quick)
+    elif section == "providers":
+        setup_result = setup_providers(config, quick=quick)
+    elif section == "all":
+        keep_existing = False
+        if not quick and _has_provider_configured(config):
+            choice = _prompt_choice(
+                "An inference route is already configured",
+                ["Keep current route", "Change provider or model", "Cancel setup"],
+                default=0,
+            )
+            keep_existing = choice == 0
+            if choice == 2:
+                setup_result = SetupOutcome.CANCELLED
+        if not keep_existing and setup_result == SetupOutcome.SUCCESS:
+            setup_result = setup_model_provider(config, quick=quick)
+
+    if setup_result != SetupOutcome.SUCCESS:
+        print("Setup cancelled.", file=sys.stderr)
+        return setup_result
 
     if section == "all" and quick:
         _print_info("QuickStart skipped optional web search and browser setup.")
@@ -172,8 +273,18 @@ def run_setup_wizard(args) -> SetupOutcome:
             return result
 
     if section == "browser":
-        return setup_browser()
+        setup_result = setup_browser()
+        if setup_result != SetupOutcome.SUCCESS:
+            print("Setup cancelled.", file=sys.stderr)
+            return setup_result
 
+    try:
+        config = AshConfig.load()
+    except Exception:
+        # The individual setup flow has already persisted its changes. A
+        # summary failure must not turn a successful setup into a false error.
+        pass
+    _render_setup_status(config, title="Setup complete")
     _print_info("Setup complete!")
     return SetupOutcome.SUCCESS
 
@@ -186,6 +297,178 @@ def setup_model_provider(config, *, quick: bool = False) -> SetupOutcome:
         print("Run 'ash doctor --connect' to verify endpoint connectivity.")
         return SetupOutcome.SUCCESS
     return select_provider_and_model(config)
+
+
+def _choose_provider_management_action() -> ProviderManagementAction:
+    choice = _prompt_choice(
+        prompt="Manage fallback models",
+        options=["Add", "Replace", "Move", "Remove", "Clear", "Done"],
+        default=5,
+    )
+    actions = (
+        ProviderManagementAction.ADD,
+        ProviderManagementAction.REPLACE,
+        ProviderManagementAction.MOVE,
+        ProviderManagementAction.REMOVE,
+        ProviderManagementAction.CLEAR,
+        ProviderManagementAction.DONE,
+    )
+    return actions[choice]
+
+
+def _handle_add_fallback(config) -> SetupOutcome:
+    fallbacks = list(getattr(config, "fallback_models", []) or [])
+    while True:
+        try:
+            model = _prompt_fallback_model(config)
+        except SetupBack:
+            return SetupOutcome.SUCCESS
+        except ValueError as exc:
+            print(f"  Invalid fallback: {exc}")
+            continue
+        if model == getattr(config, "model", ""):
+            print("  A fallback must differ from the primary model.")
+            continue
+        if model in fallbacks:
+            print("  That model is already in the fallback chain.")
+            continue
+        fallbacks.append(model)
+        _save_fallback_models(config, fallbacks)
+        _print_info(f"Added fallback {model}.")
+        return SetupOutcome.SUCCESS
+
+
+def setup_providers(config, *, quick: bool = False) -> SetupOutcome:
+    """Manage configured provider fallbacks."""
+    del quick
+    fallbacks = list(getattr(config, "fallback_models", []) or [])
+    while True:
+        _print_header("Provider Fallbacks")
+        print(f"Primary: {config.model}")
+        if fallbacks:
+            print("Fallback chain (tried in order):")
+            for index, model in enumerate(fallbacks, 1):
+                print(f"  {index}. {model}")
+        else:
+            print("No fallback models configured.")
+        print("\nChanges are saved after each successful action.\n")
+
+        try:
+            action = _choose_provider_management_action()
+            if action is ProviderManagementAction.ADD:
+                result = _handle_add_fallback(config)
+                if result != SetupOutcome.SUCCESS:
+                    return result
+                fallbacks = list(getattr(config, "fallback_models", []) or [])
+                continue
+            elif action is ProviderManagementAction.REPLACE:
+                selected_index = _prompt_fallback_index(fallbacks, "replace")
+                if selected_index is not None:
+                    try:
+                        replacement = _prompt_fallback_model(config)
+                    except ValueError as exc:
+                        print(f"  Invalid fallback: {exc}")
+                        continue
+                    if replacement == config.model or replacement in fallbacks[:selected_index] + fallbacks[selected_index + 1 :]:
+                        print("  Choose a model that is not the primary or another fallback.")
+                        continue
+                    fallbacks[selected_index] = replacement
+                    _save_fallback_models(config, fallbacks)
+                    _print_info(f"Replaced fallback {selected_index + 1} with {replacement}.")
+                    continue
+            elif action is ProviderManagementAction.MOVE:
+                selected_index = _prompt_fallback_index(fallbacks, "move")
+                if selected_index is not None:
+                    position = _prompt_position(len(fallbacks))
+                    if position is not None:
+                        model = fallbacks.pop(selected_index)
+                        fallbacks.insert(position, model)
+                        _save_fallback_models(config, fallbacks)
+                        _print_info(f"Moved {model} to position {position + 1}.")
+                        continue
+            elif action is ProviderManagementAction.REMOVE:
+                selected_index = _prompt_fallback_index(fallbacks, "remove")
+                if selected_index is not None:
+                    removed = fallbacks.pop(selected_index)
+                    _save_fallback_models(config, fallbacks)
+                    _print_info(f"Removed fallback {removed}.")
+                    continue
+            elif action is ProviderManagementAction.CLEAR:
+                if not fallbacks:
+                    _print_info("Fallback chain is already empty.")
+                else:
+                    answer = _prompt_setup_text(
+                        "  Clear every fallback? [y/N]: ", allow_empty=True
+                    ).casefold()
+                    if answer in {"y", "yes"}:
+                        fallbacks.clear()
+                        _save_fallback_models(config, fallbacks)
+                        _print_info("Cleared the fallback chain.")
+                    continue
+            else:
+                return SetupOutcome.SUCCESS
+        except SetupBack:
+            return SetupOutcome.SUCCESS
+        except SetupCancelled:
+            return SetupOutcome.CANCELLED
+
+
+def _known_fallback_providers(config) -> set[str]:
+    custom = getattr(config, "custom_providers", {})
+    custom_ids = custom.keys() if isinstance(custom, dict) else ()
+    return {descriptor.id for descriptor in PROVIDERS} | {
+        str(provider).casefold() for provider in custom_ids
+    }
+
+
+def _prompt_fallback_model(config) -> str:
+    """Ask for a canonical fallback model while showing the supported routes."""
+
+    print("\n  Supported providers:")
+    print("  " + ", ".join(descriptor.id for descriptor in PROVIDERS))
+    custom = getattr(config, "custom_providers", {})
+    if isinstance(custom, dict) and custom:
+        print("  Custom: " + ", ".join(sorted(custom, key=str.casefold)))
+    raw = _prompt_setup_text(
+        "  Fallback model (provider/model, 'b' back, 'c' cancel): "
+    )
+    from ash.providers.identifiers import parse_model_string
+
+    provider, model = parse_model_string(raw)
+    if provider not in _known_fallback_providers(config):
+        raise ValueError(
+            f"unknown provider {provider!r}; choose a listed provider or configure a custom endpoint first"
+        )
+    return f"{provider}/{model}"
+
+
+def _prompt_fallback_index(fallbacks: list[str], action: str) -> int | None:
+    if not fallbacks:
+        _print_info(f"Nothing to {action}; the fallback chain is empty.")
+        return None
+    choice = _prompt_choice(
+        f"Select a fallback to {action}",
+        [str(index) for index in range(1, len(fallbacks) + 1)],
+        default=0,
+    )
+    return choice
+
+
+def _prompt_position(length: int) -> int | None:
+    raw = _prompt_setup_text(f"  New position (1-{length}): ")
+    if not raw.isdigit() or not 1 <= int(raw) <= length:
+        print(f"  Position must be a number from 1 to {length}.")
+        return None
+    return int(raw) - 1
+
+
+def _save_fallback_models(config, fallbacks: list[str]) -> None:
+    """Persist a fallback chain without dropping other user configuration."""
+
+    user_config = load_config(strict=True)
+    user_config["fallback_models"] = list(fallbacks)
+    save_config(user_config)
+    config.fallback_models = list(fallbacks)
 
 
 def setup_web_search() -> SetupOutcome:
@@ -296,10 +579,20 @@ def select_provider_and_model(config) -> SetupOutcome:
     """Show provider list, route to provider flow, verify model."""
     while True:
         _print_header("Select your inference provider")
-        print("Choose a provider:\n")
-        for i, (_provider_id, name, desc) in enumerate(PROVIDERS, 1):
-            print(f"  [{i}] {name}")
-            print(f"      {desc}\n")
+        print("Choose a provider. Existing keys and local runtimes are marked:\n")
+        table = Table(show_header=True, header_style="bold cyan", box=None, pad_edge=False)
+        table.add_column("#", justify="right")
+        table.add_column("Provider", style="bold")
+        table.add_column("Route")
+        table.add_column("Setup")
+        for i, descriptor in enumerate(PROVIDERS, 1):
+            table.add_row(
+                str(i),
+                descriptor.name,
+                descriptor.category,
+                _provider_status(config, descriptor),
+            )
+        _setup_console().print(table)
 
         try:
             choice = _prompt_choice(
@@ -307,7 +600,8 @@ def select_provider_and_model(config) -> SetupOutcome:
                 [str(i) for i in range(1, len(PROVIDERS) + 1)],
                 default=0,
             )
-            provider_id = PROVIDERS[choice][0]
+            descriptor = PROVIDERS[choice]
+            provider_id = descriptor.id
             current = _get_current_model_for_provider(config, provider_id)
             if provider_id == "anthropic":
                 return _flow_anthropic(current)
@@ -319,7 +613,9 @@ def select_provider_and_model(config) -> SetupOutcome:
                 return _flow_groq(current)
             if provider_id == "ollama":
                 return _flow_ollama(current)
-            return _flow_openai_compatible()
+            if provider_id == "openai-compatible":
+                return _flow_openai_compatible()
+            return _flow_openai_compatible_builtin(descriptor, current)
         except SetupBack:
             print("  Returning to provider selection.")
         except SetupCancelled:
@@ -329,6 +625,43 @@ def select_provider_and_model(config) -> SetupOutcome:
 # ---------------------------------------------------------------------------
 # Provider flows
 # ---------------------------------------------------------------------------
+
+
+def _flow_openai_compatible_builtin(
+    descriptor: ProviderDescriptor,
+    current: str,
+) -> SetupOutcome:
+    """Configure a catalog provider that speaks the OpenAI wire protocol."""
+
+    _print_header(f"{descriptor.name} Configuration")
+    api_key = ""
+    if descriptor.key_env is not None:
+        api_key = _prompt_api_key(descriptor.key_env, f"{descriptor.name} API key")
+
+    base_env = f"{descriptor.id.upper().replace('-', '_')}_API_BASE"
+    base_url_override = _prompt_optional_url(base_env, descriptor.base_url)
+    base_url = base_url_override or descriptor.base_url
+    models, verified = _discover_models(
+        descriptor.name,
+        lambda: _probe_models_detailed(base_url, api_key or None),
+        fallback=[current] if current else [],
+        guidance=(
+            "Start the local runtime and load a model, then retry."
+            if descriptor.local
+            else "Check the API key and endpoint, then retry."
+        ),
+    )
+    model = _prompt_model_list(models, current)
+    _confirm_undiscovered_model(model, models, verified)
+
+    settings: dict[str, str] = {"ASH_MODEL": f"{descriptor.id}/{model}"}
+    if descriptor.key_env is not None:
+        settings[descriptor.key_env] = api_key
+    if base_url_override:
+        settings[base_env] = base_url_override
+    save_env_values(settings)
+    _print_verification_status(verified)
+    return SetupOutcome.SUCCESS
 
 
 def _flow_anthropic(current: str) -> SetupOutcome:
@@ -495,7 +828,9 @@ def _flow_openai_compatible() -> SetupOutcome:
     _print_header("OpenAI-Compatible Endpoint")
 
     name = _prompt_setup_text("  Provider name (e.g. my-minimax): ")
-    if not _PROVIDER_NAME.fullmatch(name) or name in {item[0] for item in PROVIDERS}:
+    if not _PROVIDER_NAME.fullmatch(name) or name.casefold() in {
+        item.id for item in PROVIDERS
+    }:
         print("  Provider name must be a unique identifier without spaces or '/'.")
         raise SetupBack
 
@@ -1033,11 +1368,14 @@ def _prompt_setup_text(prompt: str, *, allow_empty: bool = False) -> str:
 
 
 def _print_header(title: str) -> None:
-    sep = "=" * 60
-    print(f"\n{sep}")
-    print(f"  {title}")
-    print(sep)
+    _setup_console().print(
+        Panel(
+            title,
+            border_style="cyan",
+            padding=(0, 1),
+        )
+    )
 
 
 def _print_info(msg: str) -> None:
-    print(f"  {msg}")
+    _setup_console().print(f"[green]✓[/green] {msg}")

@@ -25,17 +25,6 @@ if TYPE_CHECKING:
     from ash.safety.guard import SafetyGuard
 
 
-KNOWN_PROVIDERS = frozenset(
-    {
-        "anthropic",
-        "openai",
-        "deepseek",
-        "groq",
-        "ollama",
-        "openai-compatible",
-    }
-)
-
 AVAILABLE_MODELS: list[str] = [
     "anthropic/claude-opus-4-7",
     "anthropic/claude-sonnet-4-6",
@@ -1780,7 +1769,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_parser.add_argument(
         "section",
         nargs="?",
-        choices=["model", "providers", "web", "browser", "all"],
+        choices=["model", "providers", "web", "browser", "status", "all"],
         help="Which section to configure",
     )
     setup_parser.add_argument(
@@ -1793,6 +1782,27 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run in non-interactive mode (fail if input needed)",
     )
+    providers_parser = subparsers.add_parser(
+        "providers",
+        help="List provider routes or test the active/provider model route",
+    )
+    providers_subparsers = providers_parser.add_subparsers(
+        dest="providers_action", required=True
+    )
+    providers_list = providers_subparsers.add_parser(
+        "list", help="List built-in provider routes without network access"
+    )
+    providers_list.add_argument("--json", action="store_true")
+    providers_test = providers_subparsers.add_parser(
+        "test", help="Verify a configured route and discover its models"
+    )
+    providers_test.add_argument(
+        "model",
+        nargs="?",
+        help="Optional provider/model override; defaults to ASH_MODEL",
+    )
+    providers_test.add_argument("--json", action="store_true")
+    providers_test.add_argument("--timeout", type=float, default=10.0)
     doctor_parser = subparsers.add_parser(
         "doctor", help="Diagnose local setup and runtime dependencies"
     )
@@ -2393,6 +2403,34 @@ def main(argv: list[str] | None = None) -> int:
         from ash.commands.setup import cmd_setup
 
         return cmd_setup(args)
+
+    if args.command == "providers":
+        from ash.commands.providers import (
+            ProviderConfigurationError,
+            ProviderVerificationError,
+            provider_test_error,
+            render_provider_catalog,
+            render_provider_test,
+            test_provider,
+        )
+
+        if args.providers_action == "list":
+            print(render_provider_catalog(json_output=args.json))
+            return 0
+        config, exit_code = _load_config_or_report()
+        if config is None:
+            return exit_code
+        try:
+            verification = test_provider(
+                config,
+                model=args.model,
+                timeout=args.timeout,
+            )
+        except (ProviderConfigurationError, ProviderVerificationError, ValueError) as exc:
+            print(provider_test_error(exc, json_output=args.json), file=sys.stderr)
+            return 2
+        print(render_provider_test(verification, json_output=args.json))
+        return 0 if verification.selected_model_available else 1
 
     if args.command == "doctor":
         from ash.commands.doctor import render_doctor, run_doctor

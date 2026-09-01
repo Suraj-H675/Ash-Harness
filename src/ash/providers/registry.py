@@ -13,6 +13,7 @@ from ash.providers.capabilities import (
     get_capability_registry,
 )
 from ash.providers.identifiers import PROVIDER_NAME, parse_model_string
+from ash.provider_catalog import BUILTIN_PROVIDER_IDS
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
@@ -155,7 +156,8 @@ def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderAB
     provider = OpenAIProvider(
         model_name=model_name,
         api_key=connection.api_key,
-        base_url=None if connection.uses_default_base_url else connection.base_url,
+        base_url=connection.base_url,
+        allow_anonymous=connection.auth_mode == "none",
     )
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider
@@ -229,6 +231,10 @@ def create_default_provider_registry() -> ProviderRegistry:
     registry.register("ollama", _build_ollama)
     registry.register("deepseek", _build_deepseek)
     registry.register("groq", _build_groq)
+    for provider_id in sorted(
+        BUILTIN_PROVIDER_IDS - {"anthropic", "openai", "deepseek", "groq", "ollama"}
+    ):
+        registry.register(provider_id, _build_openai_compatible)
     return registry
 
 

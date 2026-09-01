@@ -18,6 +18,8 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
+from ash.provider_catalog import BUILTIN_PROVIDER_IDS
+
 
 CURRENT_CONFIG_SCHEMA_VERSION = 1
 
@@ -57,9 +59,7 @@ def _publish_dotenv_runtime_values(
 
 PROJECT_CONFIG_DIRECTORY = ".ash"
 PROJECT_CONFIG_FILENAME = "config.toml"
-PROJECT_MODEL_PROVIDERS = frozenset(
-    {"anthropic", "openai", "deepseek", "groq", "ollama"}
-)
+PROJECT_MODEL_PROVIDERS = BUILTIN_PROVIDER_IDS
 
 # Project configuration is repository-controlled input. Keep host security,
 # credentials, persistence paths, and network destinations user-owned.

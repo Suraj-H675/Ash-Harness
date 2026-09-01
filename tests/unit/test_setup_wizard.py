@@ -701,13 +701,18 @@ class TestBrowserSetup:
 
 
 class TestSetupNavigation:
-    def test_providers_section_dispatches_provider_setup(
+    @pytest.mark.parametrize(
+        ("section", "entrypoint"),
+        [("model", "setup_model_provider"), ("providers", "setup_providers")],
+    )
+    def test_setup_sections_dispatch_to_their_distinct_entrypoints(
         self, monkeypatch: pytest.MonkeyPatch
+        , section: str, entrypoint: str
     ) -> None:
         from ash.commands.setup import SetupOutcome, run_setup_wizard
 
         config = MagicMock(model="openai/test-model")
-        args = SimpleNamespace(section="providers", quick=False, non_interactive=False)
+        args = SimpleNamespace(section=section, quick=False, non_interactive=False)
         monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: True)
 
         with (
@@ -717,13 +722,125 @@ class TestSetupNavigation:
                 "ash.commands.setup.setup_model_provider",
                 return_value=SetupOutcome.SUCCESS,
             ) as setup_model,
+            patch(
+                "ash.commands.setup.setup_providers",
+                return_value=SetupOutcome.SUCCESS,
+            ) as setup_providers,
             patch("ash.commands.setup._print_header"),
             patch("ash.commands.setup._print_info"),
         ):
             result = run_setup_wizard(args)
 
         assert result == SetupOutcome.SUCCESS
-        setup_model.assert_called_once_with(config, quick=False)
+        if entrypoint == "setup_model_provider":
+            setup_model.assert_called_once_with(config, quick=False)
+            setup_providers.assert_not_called()
+        else:
+            setup_providers.assert_called_once_with(config, quick=False)
+            setup_model.assert_not_called()
+
+    def test_setup_providers_displays_ordered_chain_without_saving(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, setup_providers
+
+        config = SimpleNamespace(
+            model="openai/primary",
+            fallback_models=["anthropic/backup", "ollama/local"],
+        )
+        monkeypatch.setattr("builtins.input", _fake_input(["6"]))
+        with patch("ash.commands.setup.save_config") as save_config:
+            result = setup_providers(config)
+
+        assert result == SetupOutcome.SUCCESS
+        output = capsys.readouterr().out
+        assert "Primary: openai/primary" in output
+        assert "1. anthropic/backup" in output
+        assert "2. ollama/local" in output
+        save_config.assert_not_called()
+        assert config.fallback_models == ["anthropic/backup", "ollama/local"]
+
+    def test_setup_providers_displays_empty_fallback_state(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, setup_providers
+
+        config = SimpleNamespace(model="openai/primary", fallback_models=[])
+        monkeypatch.setattr("builtins.input", _fake_input(["6"]))
+
+        assert setup_providers(config) == SetupOutcome.SUCCESS
+        assert "No fallback models configured" in capsys.readouterr().out
+
+    def test_setup_providers_routes_add_fallback_selection(self) -> None:
+        from ash.commands.setup import (
+            ProviderManagementAction,
+            _choose_provider_management_action,
+        )
+
+        with patch("ash.commands.setup._prompt_choice", return_value=0):
+            action = _choose_provider_management_action()
+
+        assert action is ProviderManagementAction.ADD
+
+    def test_setup_providers_dispatches_add_fallback_route(self) -> None:
+        from ash.commands.setup import (
+            ProviderManagementAction,
+            SetupOutcome,
+            setup_providers,
+        )
+
+        config = SimpleNamespace(model="openai/primary", fallback_models=[])
+        with (
+            patch(
+                "ash.commands.setup._choose_provider_management_action",
+                side_effect=[
+                    ProviderManagementAction.ADD,
+                    ProviderManagementAction.DONE,
+                ],
+            ) as choose_action,
+            patch(
+                "ash.commands.setup._handle_add_fallback",
+                return_value=SetupOutcome.SUCCESS,
+            ) as add_fallback,
+        ):
+            outcome = setup_providers(config)
+
+        assert choose_action.call_count == 2
+        add_fallback.assert_called_once_with(config)
+        assert outcome is SetupOutcome.SUCCESS
+
+    def test_setup_providers_adds_multiple_fallbacks_and_persists_each_change(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, setup_providers
+
+        config = SimpleNamespace(model="openai/primary", fallback_models=[])
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(["1", "anthropic/backup", "1", "ollama/local", "6"]),
+        )
+        saved: list[dict[str, object]] = []
+
+        with patch(
+            "ash.commands.setup.load_config", return_value={"other": "preserved"}
+        ), patch(
+            "ash.commands.setup.save_config",
+            side_effect=lambda value: saved.append(dict(value)),
+        ):
+            outcome = setup_providers(config)
+
+        assert outcome is SetupOutcome.SUCCESS
+        assert config.fallback_models == ["anthropic/backup", "ollama/local"]
+        assert saved == [
+            {
+                "other": "preserved",
+                "fallback_models": ["anthropic/backup"],
+            },
+            {
+                "other": "preserved",
+                "fallback_models": ["anthropic/backup", "ollama/local"],
+            },
+        ]
 
     @pytest.mark.parametrize("section", ["model", "providers"])
     def test_noninteractive_configured_route_accepts_provider_sections(

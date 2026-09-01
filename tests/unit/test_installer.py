@@ -77,6 +77,55 @@ def test_existing_pipx_install_is_rebuilt_without_exposing_uv_edge_cases() -> No
     assert outcome.version == "ash 0.1.0"
 
 
+def test_existing_pypi_style_pipx_spec_preserves_capability_extras() -> None:
+    calls: list[list[str]] = []
+    metadata = json.dumps(
+        {
+            "venvs": {
+                "ash-ai": {
+                    "metadata": {
+                        "main_package": {
+                            "package_or_url": "ash-ai[browser,server]",
+                            "app_paths": [
+                                {
+                                    "__Path__": "/isolated/bin/ash",
+                                    "__type__": "Path",
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+    )
+
+    def runner(command, **kwargs):
+        calls.append(list(command))
+        if command[1:] == ["list", "--json"]:
+            return _completed(stdout=metadata)
+        if command[1:3] == ["install", "--force"]:
+            return _completed()
+        if command == ["/isolated/bin/ash", "--version"]:
+            return _completed(stdout="ash 0.1.0\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    install(
+        runner=runner,
+        which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
+        environ={
+            "PATH": "/isolated/bin:/usr/bin",
+            "PIPX_BIN_DIR": "/isolated/bin",
+        },
+    )
+
+    assert [
+        "/usr/bin/pipx",
+        "install",
+        "--force",
+        "ash-ai[browser,server] @ git+https://github.com/Suraj-H675/Ash-Harness.git",
+    ] in calls
+
+
 def test_uv_is_a_supported_fallback_when_pipx_is_unavailable() -> None:
     calls: list[list[str]] = []
 

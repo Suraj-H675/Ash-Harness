@@ -24,7 +24,7 @@ REPOSITORY_URL = "https://github.com/Suraj-H675/Ash-Harness.git"
 SUPPORTED_EXTRAS = ("a2a", "acp", "browser", "server", "vector")
 _PACKAGE_NAME = "ash-ai"
 _EXTRAS_PATTERN = re.compile(
-    rf"^\s*{re.escape(_PACKAGE_NAME)}(?:\[([^]]+)\])?\s*@",
+    rf"^\s*{re.escape(_PACKAGE_NAME)}(?:\[([^]]+)\])?(?:\s*@.*)?\s*$",
     re.IGNORECASE,
 )
 _UV_EXTRAS_PATTERN = re.compile(r"\[extras:\s*([^]]+)\]", re.IGNORECASE)

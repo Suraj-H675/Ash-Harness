@@ -102,6 +102,54 @@ _BUILTIN_CONNECTIONS: dict[str, tuple[str, str, CatalogFormat, AuthMode]] = {
         "openai",
         "bearer",
     ),
+    "openrouter": (
+        "https://openrouter.ai/api/v1",
+        "OPENROUTER_API_BASE",
+        "openai",
+        "bearer",
+    ),
+    "mistral": (
+        "https://api.mistral.ai/v1",
+        "MISTRAL_API_BASE",
+        "openai",
+        "bearer",
+    ),
+    "xai": (
+        "https://api.x.ai/v1",
+        "XAI_API_BASE",
+        "openai",
+        "bearer",
+    ),
+    "together": (
+        "https://api.together.xyz/v1",
+        "TOGETHER_API_BASE",
+        "openai",
+        "bearer",
+    ),
+    "fireworks": (
+        "https://api.fireworks.ai/inference/v1",
+        "FIREWORKS_API_BASE",
+        "openai",
+        "bearer",
+    ),
+    "cerebras": (
+        "https://api.cerebras.ai/v1",
+        "CEREBRAS_API_BASE",
+        "openai",
+        "bearer",
+    ),
+    "lmstudio": (
+        "http://localhost:1234/v1",
+        "LMSTUDIO_API_BASE",
+        "openai",
+        "none",
+    ),
+    "vllm": (
+        "http://localhost:8000/v1",
+        "VLLM_API_BASE",
+        "openai",
+        "none",
+    ),
 }
 
 _BUILTIN_KEY_ENV = {
@@ -110,6 +158,12 @@ _BUILTIN_KEY_ENV = {
     "openai-compatible": "OPENAI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "groq": "GROQ_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "xai": "XAI_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "fireworks": "FIREWORKS_API_KEY",
+    "cerebras": "CEREBRAS_API_KEY",
 }
 
 
@@ -179,8 +233,12 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
         default, base_env, catalog_format, auth_mode = builtin
         supplied = os.environ.get(base_env)
         base_url = _normalize_base_url(supplied or default, provider=provider)
-        key_env = _BUILTIN_KEY_ENV[provider]
-        api_key = _require_key(provider, key_env, os.environ.get(key_env, ""))
+        key_env = _BUILTIN_KEY_ENV.get(provider)
+        if auth_mode == "none":
+            api_key = ""
+        else:
+            assert key_env is not None
+            api_key = _require_key(provider, key_env, os.environ.get(key_env, ""))
         return ProviderConnection(
             provider=provider,
             model_name=model_name,

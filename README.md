@@ -2,8 +2,9 @@
 
 Ash is a terminal-native coding agent harness for Linux, macOS, and Windows.
 It supports API-key providers, custom OpenAI-compatible endpoints, and local
-Ollama models. Subscription-based model-provider login is intentionally out of
-scope; protected remote MCP servers support the MCP OAuth 2.1 flow.
+Ollama, LM Studio, and vLLM runtimes. Subscription-based model-provider login
+is intentionally out of scope; protected remote MCP servers support the MCP
+OAuth 2.1 flow.
 
 ## Install
 
@@ -34,9 +35,20 @@ Then configure and verify the runtime:
 
 ```bash
 ash setup
+ash setup status
+ash providers list
+ash providers test
 ash doctor --connect
 ash
 ```
+
+`ash setup` can configure Anthropic, OpenAI, OpenRouter, DeepSeek, Groq,
+Mistral, xAI, Together AI, Fireworks, Cerebras, Ollama, LM Studio, vLLM, or a
+custom OpenAI-compatible endpoint. It discovers models when the endpoint is
+available, keeps an existing route unless you choose to change it, and lets
+you continue with an unverified model when a service is offline. Rerunning the
+installer is safe: it repairs the managed environment and preserves recorded
+optional capability packs.
 
 Lightweight commands such as `ash --version` and `ash --help` lazy-load the
 runtime stack; provider SDKs, the agent loop, repository parser, and TUI are
@@ -94,6 +106,9 @@ ash -c                          # continue this project's latest session
 ash -r                          # choose from searchable project sessions
 ash -r SESSION_ID_OR_NAME       # resume an exact durable session
 ash -c --fork-session           # branch latest history under a new ID
+ash providers list              # show built-in provider routes
+ash providers test              # verify ASH_MODEL and discover its models
+ash providers test ollama/coder # verify a route without changing config
 ash sessions tree               # inspect the latest conversation tree
 ash sessions tree --session NAME --json
 ash --session SESSION_ID        # legacy explicit-ID compatibility

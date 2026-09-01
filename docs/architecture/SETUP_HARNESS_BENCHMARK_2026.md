@@ -37,6 +37,11 @@ Hermes then exposes a broad [tool and toolset registry](https://hermes-agent.nou
 
 ## Ash current-state audit
 
+> Implementation update: the provider catalog, fallback manager, setup status
+> screen, and `ash providers list/test` landed after this baseline audit. The
+> original rows below describe the pre-implementation gaps; use the target
+> blueprint and the live commands to assess the remaining work.
+
 Ash is not limited to four providers today; the setup catalogue has six entries: Anthropic, OpenAI, DeepSeek, Groq, Ollama, and one generic OpenAI-compatible route ([setup.py](../../src/ash/commands/setup.py#L55)). The problem is that they appear as six flat choices and all but Ollama follow almost the same API-key/base-URL/model-probe flow. That makes the product feel smaller than its runtime already is.
 
 | Area | Current Ash behavior | Product gap exposed by the benchmark |

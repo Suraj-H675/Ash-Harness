@@ -108,12 +108,67 @@ def test_registry_builds_fallback_chain_through_same_factories() -> None:
 def test_default_registry_exposes_builtins_without_constructing_them() -> None:
     assert create_default_provider_registry().names() == (
         "anthropic",
+        "cerebras",
         "deepseek",
+        "fireworks",
         "groq",
+        "lmstudio",
+        "mistral",
         "ollama",
         "openai",
         "openai-compatible",
+        "openrouter",
+        "together",
+        "vllm",
+        "xai",
     )
+
+
+@pytest.mark.parametrize(
+    ("provider", "key", "base_url"),
+    [
+        ("openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1"),
+        ("mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1"),
+        ("xai", "XAI_API_KEY", "https://api.x.ai/v1"),
+        ("together", "TOGETHER_API_KEY", "https://api.together.xyz/v1"),
+        ("fireworks", "FIREWORKS_API_KEY", "https://api.fireworks.ai/inference/v1"),
+        ("cerebras", "CEREBRAS_API_KEY", "https://api.cerebras.ai/v1"),
+    ],
+)
+def test_openai_compatible_catalog_providers_build_with_their_route(
+    provider: str,
+    key: str,
+    base_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(key, "test-key")
+    config = AshConfig(model=f"{provider}/test-model")
+
+    result = create_default_provider_registry().build(config)
+
+    assert result.model_name == "test-model"
+    assert result._base_url == base_url
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("lmstudio", "http://localhost:1234/v1"),
+        ("vllm", "http://localhost:8000/v1"),
+    ],
+)
+def test_local_openai_compatible_catalog_providers_are_anonymous(
+    provider: str,
+    base_url: str,
+) -> None:
+    result = create_default_provider_registry().build(
+        AshConfig(model=f"{provider}/local-model")
+    )
+
+    assert result.model_name == "local-model"
+    assert result._base_url == base_url
+    assert result._api_key == ""
+    assert result._client.api_key == "ash-anonymous"
 
 
 @pytest.mark.asyncio
