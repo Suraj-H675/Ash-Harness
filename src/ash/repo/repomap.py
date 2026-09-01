@@ -21,7 +21,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from ash.repo.parser import SOURCE_SUFFIXES, SourceLocation, Symbol, SymbolExtractor
+from ash.repo.parser import (
+    MAX_SOURCE_FILE_BYTES,
+    SOURCE_SUFFIXES,
+    SourceLocation,
+    Symbol,
+    SymbolExtractor,
+)
+
+MAX_REPO_DISCOVERY_ENTRIES = 100_000
+MAX_REPO_DISCOVERY_DEPTH = 32
 
 # Folders that should never be descended into when building a repo map.
 DEFAULT_IGNORED_DIRS = frozenset(
@@ -79,25 +88,56 @@ def _discover_source_files(
 ) -> list[Path]:
     patterns = tuple(exclude_patterns)
     files: list[Path] = []
-    for entry in sorted(project_root.iterdir(), key=lambda p: p.name):
-        relative = entry.relative_to(project_root)
-        if _matches_exclude_pattern(relative, patterns, is_dir=entry.is_dir()):
-            continue
-        if entry.is_dir():
-            if entry.name in ignored_dirs or entry.name.startswith("."):
+
+    entries_seen = 0
+
+    def walk(directory: Path, local_patterns: tuple[str, ...], depth: int) -> bool:
+        nonlocal entries_seen
+        entries: list[Path] = []
+        try:
+            for entry in directory.iterdir():
+                entries.append(entry)
+                if len(entries) >= MAX_REPO_DISCOVERY_ENTRIES:
+                    break
+        except OSError:
+            return False
+        entries.sort(key=lambda p: p.name)
+        for entry in entries:
+            entries_seen += 1
+            if entries_seen > MAX_REPO_DISCOVERY_ENTRIES:
+                return True
+            if entry.is_symlink() or (
+                hasattr(entry, "is_junction") and entry.is_junction()
+            ):
                 continue
-            files.extend(
-                _discover_source_files(
-                    entry,
-                    ignored_dirs=ignored_dirs,
-                    exclude_patterns=(
-                        _relative_pattern_for_child(pattern, entry.name)
-                        for pattern in patterns
-                    ),
+            try:
+                is_directory = entry.is_dir()
+                is_file = entry.is_file()
+            except OSError:
+                continue
+            relative = entry.relative_to(project_root)
+            if _matches_exclude_pattern(
+                relative, local_patterns, is_dir=is_directory
+            ):
+                continue
+            if is_directory:
+                if (
+                    entry.name in ignored_dirs
+                    or entry.name.startswith(".")
+                    or depth >= MAX_REPO_DISCOVERY_DEPTH
+                ):
+                    continue
+                child_patterns = tuple(
+                    _relative_pattern_for_child(pattern, entry.name)
+                    for pattern in local_patterns
                 )
-            )
-        elif entry.is_file() and entry.suffix.casefold() in SOURCE_SUFFIXES:
-            files.append(entry)
+                if walk(entry, child_patterns, depth + 1):
+                    return True
+            elif is_file and entry.suffix.casefold() in SOURCE_SUFFIXES:
+                files.append(entry)
+        return False
+
+    walk(project_root, patterns, 0)
     return files
 
 
@@ -630,6 +670,8 @@ class RepoMap:
             try:
                 stat = path.stat()
             except OSError:
+                continue
+            if stat.st_size > MAX_SOURCE_FILE_BYTES:
                 continue
             fingerprint = (stat.st_mtime_ns, stat.st_size)
             cached = self._file_cache.get(resolved)

@@ -105,6 +105,46 @@ def test_repomap_skips_ignored_directories(tmp_path: Path) -> None:
     assert names == {"keep.py"}
 
 
+def test_repomap_skips_directory_links(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "keep.py").write_text("def keep(): pass\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("def secret(): pass\n")
+    try:
+        (workspace / "linked").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    repo_map = RepoMap(workspace)
+
+    assert {node.path.name for node in repo_map.files} == {"keep.py"}
+
+
+def test_repomap_bounds_discovery_entries(tmp_path: Path, monkeypatch) -> None:
+    for name in ("a.py", "b.py", "c.py"):
+        (tmp_path / name).write_text(f"def {name[0]}(): pass\n")
+    monkeypatch.setattr("ash.repo.repomap.MAX_REPO_DISCOVERY_ENTRIES", 2)
+
+    repo_map = RepoMap(tmp_path)
+
+    assert len(repo_map.files) == 2
+    assert {node.path.name for node in repo_map.files} <= {"a.py", "b.py", "c.py"}
+
+
+def test_repomap_bounds_discovery_depth(tmp_path: Path, monkeypatch) -> None:
+    nested = tmp_path / "one" / "two"
+    nested.mkdir(parents=True)
+    (nested / "hidden.py").write_text("def hidden(): pass\n")
+    (tmp_path / "visible.py").write_text("def visible(): pass\n")
+    monkeypatch.setattr("ash.repo.repomap.MAX_REPO_DISCOVERY_DEPTH", 1)
+
+    repo_map = RepoMap(tmp_path)
+
+    assert [node.path.name for node in repo_map.files] == ["visible.py"]
+
+
 def test_repomap_excludes_node_modules(tmp_path: Path) -> None:
     from ash.repo.repomap import RepoMap
 

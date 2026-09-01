@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from ash.repo.parser import SymbolExtractor
+from ash.repo.parser import MAX_SOURCE_FILE_BYTES, SymbolExtractor
 
 
 def test_extract_imports_functions_classes_and_methods(tmp_path: Path) -> None:
@@ -187,6 +187,13 @@ def test_extracts_supported_source_languages(
 def test_extract_returns_empty_for_unsupported_language(tmp_path: Path) -> None:
     path = tmp_path / "notes.txt"
     path.write_text("not source code")
+    assert SymbolExtractor().extract(path) == []
+
+
+def test_extract_skips_oversized_source_file(tmp_path: Path) -> None:
+    path = tmp_path / "oversized.py"
+    path.write_bytes(b"x" * (MAX_SOURCE_FILE_BYTES + 1))
+
     assert SymbolExtractor().extract(path) == []
 
 

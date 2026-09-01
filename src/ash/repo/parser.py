@@ -19,6 +19,9 @@ import tree_sitter_rust as tsrust
 import tree_sitter_typescript as tstypescript
 
 
+MAX_SOURCE_FILE_BYTES = 8 * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class Symbol:
     """A named source construct or import discovered in one file."""
@@ -293,8 +296,13 @@ class SymbolExtractor:
         if spec is None:
             return None
         try:
-            source = file_path.read_bytes()
+            if file_path.stat().st_size > MAX_SOURCE_FILE_BYTES:
+                return None
+            with file_path.open("rb") as handle:
+                source = handle.read(MAX_SOURCE_FILE_BYTES + 1)
         except OSError:
+            return None
+        if len(source) > MAX_SOURCE_FILE_BYTES:
             return None
         parser = self._parsers.get(spec.name)
         if parser is None:
