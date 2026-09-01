@@ -34,6 +34,10 @@ from ash.ui.theme import get_theme
 
 
 ApprovalCallback = Callable[[str, dict[str, Any]], bool | str]
+MAX_EDIT_PREVIEW_FILE_BYTES = 1_000_000
+MAX_EDIT_PREVIEW_TEXT_CHARS = 128_000
+MAX_EDIT_PREVIEW_LINES = 400
+DIFF_PREVIEW_TRUNCATED = "[diff preview truncated]"
 
 
 @dataclass
@@ -45,6 +49,35 @@ class _LiveBuffers:
     @classmethod
     def fresh(cls) -> "_LiveBuffers":
         return cls(thought=Text(), response="", tool_output=Text())
+
+
+def _bounded_preview_lines(value: str) -> tuple[list[str], bool]:
+    snippet = value[:MAX_EDIT_PREVIEW_TEXT_CHARS]
+    truncated = len(snippet) < len(value)
+    lines = snippet.splitlines()
+    if len(lines) > MAX_EDIT_PREVIEW_LINES:
+        lines = lines[:MAX_EDIT_PREVIEW_LINES]
+        truncated = True
+    return lines, truncated
+
+
+def _append_preview_truncation(preview: str, truncated: bool) -> str:
+    if not preview:
+        return preview
+    lines = preview.splitlines()
+    if len(lines) > 200:
+        return "\n".join(lines[:200] + [DIFF_PREVIEW_TRUNCATED])
+    if truncated and not preview.endswith(DIFF_PREVIEW_TRUNCATED):
+        return f"{preview}\n{DIFF_PREVIEW_TRUNCATED}"
+    return preview
+
+
+def _read_preview_file(path: Path) -> str | None:
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_EDIT_PREVIEW_FILE_BYTES + 1)
+    if len(raw) > MAX_EDIT_PREVIEW_FILE_BYTES:
+        return None
+    return raw.decode("utf-8")
 
 
 class TerminalUI:
@@ -519,21 +552,26 @@ class TerminalUI:
         if tool_name == "apply_patch":
             patch = arguments.get("patch")
             if isinstance(patch, str):
-                lines = patch.splitlines()
+                lines, truncated = _bounded_preview_lines(patch)
                 return "\n".join(
                     lines[:200]
-                    + (["[diff preview truncated]"] if len(lines) > 200 else [])
+                    + ([DIFF_PREVIEW_TRUNCATED] if truncated or len(lines) > 200 else [])
                 )
         if tool_name == "replace_file_content":
             before = arguments.get("target_content")
             after = arguments.get("replacement_content")
             if isinstance(before, str) and isinstance(after, str):
-                return self._render_diff(
+                before_lines, before_truncated = _bounded_preview_lines(before)
+                after_lines, after_truncated = _bounded_preview_lines(after)
+                preview = self._render_diff(
                     "target",
                     "replacement",
-                    before.splitlines(),
-                    after.splitlines(),
+                    before_lines,
+                    after_lines,
                     side_by_side=side_by_side,
+                )
+                return _append_preview_truncation(
+                    preview, before_truncated or after_truncated
                 )
         if tool_name == "replace_file_edits":
             edits = arguments.get("edits")
@@ -546,12 +584,17 @@ class TerminalUI:
                     after = edit.get("replacement_content")
                     if not isinstance(before, str) or not isinstance(after, str):
                         continue
+                    before_lines, before_truncated = _bounded_preview_lines(before)
+                    after_lines, after_truncated = _bounded_preview_lines(after)
                     diff = self._render_diff(
                         f"edit-{index}-target",
                         f"edit-{index}-replacement",
-                        before.splitlines(),
-                        after.splitlines(),
+                        before_lines,
+                        after_lines,
                         side_by_side=side_by_side,
+                    )
+                    diff = _append_preview_truncation(
+                        diff, before_truncated or after_truncated
                     )
                     if diff:
                         previews.append(diff)
@@ -570,27 +613,40 @@ class TerminalUI:
         path = Path(raw_path).expanduser()
         if not path.is_absolute():
             path = self.workspace_root / path
-        path = path.resolve()
+        try:
+            path = path.resolve()
+        except OSError:
+            return "[preview unavailable: path cannot be resolved]"
         try:
             relative = path.relative_to(self.workspace_root)
         except ValueError:
             return "[preview unavailable: path is outside workspace]"
         try:
-            before = path.read_text(encoding="utf-8") if path.is_file() else ""
+            before = _read_preview_file(path) if path.is_file() else ""
+            if before is None:
+                return (
+                    "[preview unavailable: existing file exceeds "
+                    f"{MAX_EDIT_PREVIEW_FILE_BYTES} bytes]"
+                )
         except (OSError, UnicodeError):
             return "[preview unavailable: existing file is not readable text]"
+        before_lines, before_truncated = _bounded_preview_lines(before)
+        content_lines, content_truncated = _bounded_preview_lines(content)
         preview = self._render_diff(
             f"a/{relative.as_posix()}",
             f"b/{relative.as_posix()}",
-            before.splitlines(),
-            content.splitlines(),
+            before_lines,
+            content_lines,
             side_by_side=side_by_side,
+        )
+        preview = _append_preview_truncation(
+            preview, before_truncated or content_truncated
         )
         if not preview:
             return preview
         lines = preview.splitlines()
         if len(lines) > 200:
-            lines = lines[:200] + ["[diff preview truncated]"]
+            lines = lines[:200] + [DIFF_PREVIEW_TRUNCATED]
         return "\n".join(lines)
 
     @staticmethod
@@ -643,7 +699,7 @@ class TerminalUI:
                 + new_line[:right_width]
             )
         if len(rows) > 198:
-            output.append("[diff preview truncated]")
+            output.append(DIFF_PREVIEW_TRUNCATED)
         return "\n".join(output)
 
     # --- sprint planning surface (Sprint 12 / V5) -----------------------

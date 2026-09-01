@@ -201,6 +201,32 @@ def test_side_by_side_approval_preview_is_bounded_and_labeled(tmp_path):
     assert " | " in approval.content
 
 
+def test_terminal_ui_does_not_read_oversized_existing_file(tmp_path, monkeypatch):
+    target = tmp_path / "large.txt"
+    target.write_text("x" * 33)
+    monkeypatch.setattr("ash.ui.terminal.MAX_EDIT_PREVIEW_FILE_BYTES", 32)
+    ui = TerminalUI(workspace_root=tmp_path)
+
+    preview = ui._edit_preview(
+        "whole_edit", {"file_path": "large.txt", "content": "replacement"}
+    )
+
+    assert preview == "[preview unavailable: existing file exceeds 32 bytes]"
+
+
+def test_terminal_ui_bounds_inline_diff_inputs():
+    ui = TerminalUI()
+    huge = "line\n" * 1_000
+
+    preview = ui._edit_preview(
+        "replace_file_content",
+        {"target_content": huge, "replacement_content": "replacement\n"},
+    )
+
+    assert preview.endswith("[diff preview truncated]")
+    assert len(preview.splitlines()) <= 201
+
+
 def test_show_tool_approval_rejects_unknown_diff_mode():
     ui = TerminalUI(safety_tier="dry_run")
     with pytest.raises(ValueError, match="diff_mode"):
