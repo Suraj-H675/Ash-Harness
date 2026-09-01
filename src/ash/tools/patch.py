@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.sandbox.process_utils import (
+    ProcessOutputLimitExceeded,
     communicate_process,
     process_group_options,
     terminate_process_tree,
@@ -23,6 +24,11 @@ class ApplyPatchArgs(BaseModel):
     dry_run: bool = False
 
 
+MAX_PATCH_BYTES = 8 * 1024 * 1024
+MAX_PATCH_OUTPUT_BYTES = 100_000
+PATCH_OUTPUT_LIMIT_EXIT = -2
+
+
 class ApplyPatchTool(BaseTool):
     name = "apply_patch"
     description = "Validate and atomically apply a unified multi-file patch."
@@ -30,6 +36,13 @@ class ApplyPatchTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ApplyPatchArgs(**kwargs)
+        patch_bytes = args.patch.encode("utf-8")
+        if len(patch_bytes) > MAX_PATCH_BYTES:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Patch exceeds {MAX_PATCH_BYTES} bytes",
+            )
         try:
             paths = extract_patch_paths(args.patch, self.safety_guard)
         except (ValueError, SafetyViolation) as exc:
@@ -121,7 +134,19 @@ async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, s
     )
     try:
         stdout, stderr = await asyncio.wait_for(
-            communicate_process(process, input_data=patch.encode("utf-8")), timeout=30
+            communicate_process(
+                process,
+                input_data=patch.encode("utf-8"),
+                max_output_bytes=MAX_PATCH_OUTPUT_BYTES,
+            ),
+            timeout=30,
+        )
+    except ProcessOutputLimitExceeded as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace").strip()
+        return (
+            PATCH_OUTPUT_LIMIT_EXIT,
+            exc.stdout.decode("utf-8", errors="replace"),
+            detail or f"git apply output exceeded {MAX_PATCH_OUTPUT_BYTES} bytes",
         )
     except (asyncio.TimeoutError, asyncio.CancelledError):
         await terminate_process_tree(process)

@@ -1,13 +1,21 @@
 import asyncio
 import os
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from ash.safety.guard import SafetyGuard
-from ash.sandbox.process_utils import communicate_process
-from ash.tools.git import AutoCommitTool, GitDiffTool, GitLogTool, GitStatusTool
+from ash.sandbox.process_utils import ProcessOutputLimitExceeded, communicate_process
+from ash.tools.git import (
+    GIT_OUTPUT_LIMIT_EXIT,
+    AutoCommitTool,
+    GitDiffTool,
+    GitLogTool,
+    GitStatusTool,
+    _git_result,
+    _run_git,
+)
 from ash.tools.patch import ApplyPatchTool
 
 
@@ -67,12 +75,63 @@ async def test_git_inspection_reports_process_timeout(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_git_capture_limit_is_reported_as_truncated_read_only_output(
+    tmp_path: Path,
+) -> None:
+    with patch(
+        "ash.tools.git._run_git",
+        AsyncMock(
+            return_value=(GIT_OUTPUT_LIMIT_EXIT, "partial", "output exceeded")
+        ),
+    ):
+        result = await _git_result(tmp_path, ["diff"])
+
+    assert result.success is True
+    assert result.truncated is True
+    assert "partial" in result.output
+    assert "output truncated" in result.output
+
+
+@pytest.mark.asyncio
+async def test_git_capture_limit_returns_a_bounded_failure_to_callers(
+    tmp_path: Path,
+) -> None:
+    process = Mock(returncode=0)
+    with (
+        patch("ash.tools.git.asyncio.create_subprocess_exec", AsyncMock(return_value=process)),
+        patch(
+            "ash.tools.git.communicate_process",
+            AsyncMock(
+                side_effect=ProcessOutputLimitExceeded(
+                    "too much", stdout=b"partial", stderr=b""
+                )
+            ),
+        ),
+    ):
+        code, stdout, stderr = await _run_git(tmp_path, ["status"])
+
+    assert code == GIT_OUTPUT_LIMIT_EXIT
+    assert stdout == "partial"
+    assert "exceeded" in stderr
+
+
+@pytest.mark.asyncio
 async def test_patch_rejects_parent_escape(tmp_path: Path) -> None:
     result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(
         patch="--- a/../outside\n+++ b/../outside\n@@ -0,0 +1 @@\n+x\n"
     )
     assert result.success is False
     assert "out-of-scope" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_patch_rejects_oversized_input_before_spawning_git(tmp_path: Path) -> None:
+    result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(
+        patch="x" * (8 * 1024 * 1024 + 1)
+    )
+
+    assert result.success is False
+    assert "exceeds" in (result.error or "")
 
 
 @pytest.mark.asyncio

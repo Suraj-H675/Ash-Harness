@@ -20,6 +20,7 @@ from ash.core.redaction import find_secret_candidates
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
 from ash.sandbox.process_utils import (
+    ProcessOutputLimitExceeded,
     communicate_process,
     process_group_options,
     terminate_process_tree,
@@ -29,6 +30,7 @@ from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 
 DEFAULT_COMMIT_AUTHOR = "ash <ash@local>"
 DEFAULT_GIT_OUTPUT_LIMIT = 100_000
+GIT_OUTPUT_LIMIT_EXIT = -2
 MAX_SECRET_FINDINGS = 20
 _DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
@@ -308,7 +310,18 @@ async def _run_git(
     )
     try:
         stdout, stderr = await asyncio.wait_for(
-            communicate_process(process), timeout=30
+            communicate_process(
+                process,
+                max_output_bytes=DEFAULT_GIT_OUTPUT_LIMIT,
+            ),
+            timeout=30,
+        )
+    except ProcessOutputLimitExceeded as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace").strip()
+        return (
+            GIT_OUTPUT_LIMIT_EXIT,
+            exc.stdout.decode("utf-8", errors="replace"),
+            detail or f"git output exceeded {DEFAULT_GIT_OUTPUT_LIMIT} bytes",
         )
     except asyncio.TimeoutError:
         await terminate_process_tree(process)
@@ -395,10 +408,10 @@ def _scan_added_secret_findings(diff: str) -> list[tuple[str, str]]:
 async def _git_result(cwd: Path, args: Sequence[str]) -> ToolResult:
     code, stdout, stderr = await _run_git(cwd, args)
     output = stdout
-    truncated = len(output) > DEFAULT_GIT_OUTPUT_LIMIT
+    truncated = code == GIT_OUTPUT_LIMIT_EXIT or len(output) > DEFAULT_GIT_OUTPUT_LIMIT
     if truncated:
         output = output[:DEFAULT_GIT_OUTPUT_LIMIT] + "\n[output truncated]"
-    if code != 0:
+    if code != 0 and code != GIT_OUTPUT_LIMIT_EXIT:
         return ToolResult(success=False, output=output, error=stderr.strip())
     return ToolResult(
         success=True,

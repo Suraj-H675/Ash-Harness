@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Sequence
 
 from ash.sandbox.process_utils import (
+    ProcessOutputLimitExceeded,
     communicate_process,
     process_group_options,
     terminate_process_tree,
@@ -18,6 +19,10 @@ from ash.sandbox.process_utils import (
 
 class WorktreeError(RuntimeError):
     """A managed worktree operation could not be completed safely."""
+
+
+MAX_WORKTREE_GIT_OUTPUT_BYTES = 100_000
+WORKTREE_GIT_OUTPUT_LIMIT_EXIT = -2
 
 
 @dataclass(frozen=True)
@@ -348,8 +353,23 @@ async def _run_git(
     )
     try:
         stdout, stderr = await asyncio.wait_for(
-            communicate_process(process), timeout=30
+            communicate_process(
+                process,
+                max_output_bytes=MAX_WORKTREE_GIT_OUTPUT_BYTES,
+            ),
+            timeout=30,
         )
+    except ProcessOutputLimitExceeded as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace").strip()
+        result = GitResult(
+            WORKTREE_GIT_OUTPUT_LIMIT_EXIT,
+            exc.stdout.decode("utf-8", errors="replace"),
+            detail
+            or f"git output exceeded {MAX_WORKTREE_GIT_OUTPUT_BYTES} bytes",
+        )
+        if check:
+            raise WorktreeError(result.stderr) from exc
+        return result
     except (asyncio.TimeoutError, asyncio.CancelledError):
         await terminate_process_tree(process)
         raise

@@ -5,7 +5,7 @@ from __future__ import annotations
 import difflib
 from pathlib import Path
 
-from ash.tools.git import _run_git
+from ash.tools.git import GIT_OUTPUT_LIMIT_EXIT, _run_git
 
 
 MAX_REVIEW_CHARS = 160_000
@@ -131,6 +131,8 @@ async def _untracked_patches(root: Path) -> str:
 
 async def _git(root: Path, arguments: list[str], action: str) -> str:
     code, stdout, stderr = await _run_git(root, arguments)
+    if code == GIT_OUTPUT_LIMIT_EXIT:
+        return stdout.rstrip() + "\n[git output truncated]"
     if code != 0:
         detail = stderr.strip() or stdout.strip() or f"Git exited with status {code}"
         raise ValueError(f"Could not {action}: {detail}")
