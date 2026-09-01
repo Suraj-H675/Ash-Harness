@@ -163,6 +163,34 @@ async def test_jsonrpc_turn_validation_and_unknown_method() -> None:
 
 
 @pytest.mark.asyncio
+async def test_jsonrpc_rejects_unhashable_ids_and_cancel_targets() -> None:
+    server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
+
+    invalid_request_id = await server.handle_request(
+        {"jsonrpc": "2.0", "id": [], "method": "status"}
+    )
+    invalid_cancel_target = await server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "$/cancelRequest",
+            "params": {"id": {}},
+        }
+    )
+
+    assert invalid_request_id == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32600, "message": "Invalid Request"},
+    }
+    assert invalid_cancel_target == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32602, "message": "cancel request id is invalid"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_jsonrpc_cancellation() -> None:
     client = FakeClient()
 

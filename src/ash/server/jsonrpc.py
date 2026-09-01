@@ -30,6 +30,8 @@ class JSONRPCServer:
         if not isinstance(request, dict):
             return _error(None, -32600, "Invalid Request")
         request_id = request.get("id")
+        if "id" in request and not _is_valid_request_id(request_id):
+            return _error(None, -32600, "Invalid Request")
         if request.get("jsonrpc") != "2.0" or not isinstance(
             request.get("method"), str
         ):
@@ -39,7 +41,10 @@ class JSONRPCServer:
         if not isinstance(params, dict):
             return _error(request_id, -32602, "Params must be an object")
         if method == "$/cancelRequest":
-            cancelled = self.cancel(params.get("id"))
+            target_id = params.get("id")
+            if "id" not in params or not _is_valid_request_id(target_id):
+                return _error(request_id, -32602, "cancel request id is invalid")
+            cancelled = self.cancel(target_id)
             return None if request_id is None else _result(request_id, cancelled)
         handler = self._methods.get(method)
         if handler is None:
@@ -194,6 +199,12 @@ class JSONRPCServer:
 
 def _result(request_id: Any, value: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "result": value}
+
+
+def _is_valid_request_id(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, (str, int, float)) and not isinstance(value, bool)
+    )
 
 
 def _error(
