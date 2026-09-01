@@ -7,7 +7,11 @@ import pytest
 
 from ash.safety.guard import SafetyGuard
 from ash.sandbox import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable, SandboxInvocation
-from ash.tools.process import BackgroundProcessTool
+from ash.tools.process import (
+    BACKGROUND_OUTPUT_TRUNCATION_MARKER,
+    MAX_BACKGROUND_OUTPUT_CHARS,
+    BackgroundProcessTool,
+)
 
 
 @pytest.mark.asyncio
@@ -50,6 +54,33 @@ async def test_background_process_forwards_allowlisted_environment(
             break
 
     assert "4312\nmissing" in output
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_process_handles_long_lines_and_bounds_output(tmp_path) -> None:
+    script = (
+        "import sys; "
+        f"sys.stdout.write('x' * {MAX_BACKGROUND_OUTPUT_CHARS + 1024})"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+
+    started = await tool.run(action="start", command=command)
+    job_id = started.output.split()[1]
+    await asyncio.sleep(0.1)
+
+    job = tool.jobs[job_id]
+    polled = await tool.run(action="poll", job_id=job_id)
+
+    assert job.process.returncode == 0
+    assert job.output_size == MAX_BACKGROUND_OUTPUT_CHARS
+    assert job.output_truncated is True
+    assert BACKGROUND_OUTPUT_TRUNCATION_MARKER.rstrip() in polled.output
+    assert polled.truncated is True
+    assert len("".join(job.output)) == (
+        MAX_BACKGROUND_OUTPUT_CHARS + len(BACKGROUND_OUTPUT_TRUNCATION_MARKER)
+    )
     await tool.aclose()
 
 

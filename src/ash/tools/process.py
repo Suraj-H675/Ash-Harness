@@ -18,6 +18,13 @@ from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.tools.command import build_scrubbed_command_env
 
 
+MAX_BACKGROUND_OUTPUT_CHARS = 100_000
+BACKGROUND_OUTPUT_TRUNCATION_MARKER = (
+    "\n[background process output truncated after "
+    f"{MAX_BACKGROUND_OUTPUT_CHARS} characters]\n"
+)
+
+
 @dataclass
 class Job:
     job_id: str
@@ -25,6 +32,8 @@ class Job:
     process: asyncio.subprocess.Process
     output: list[str] = field(default_factory=list)
     cursor: int = 0
+    output_size: int = 0
+    output_truncated: bool = False
     readers: list[asyncio.Task[None]] = field(default_factory=list)
     sandbox_backend: str = "scoped"
 
@@ -69,7 +78,10 @@ class BackgroundProcessTool(BaseTool):
         if args.action == "poll":
             output = "".join(job.output[job.cursor :])
             job.cursor = len(job.output)
-            return self._result(f"{self._status(job)}\n{output}".rstrip())
+            return self._result(
+                f"{self._status(job)}\n{output}".rstrip(),
+                truncated=job.output_truncated,
+            )
         if args.action == "write":
             if job.process.stdin is None or job.process.returncode is not None:
                 return ToolResult(
@@ -139,8 +151,28 @@ class BackgroundProcessTool(BaseTool):
         return self._result(f"Started {job.job_id} (pid {process.pid}).")
 
     async def _read(self, stream: asyncio.StreamReader, job: Job, prefix: str) -> None:
-        while line := await stream.readline():
-            job.output.append(prefix + line.decode("utf-8", errors="replace"))
+        while chunk := await stream.read(4096):
+            self._append_output(
+                job,
+                prefix + chunk.decode("utf-8", errors="replace"),
+            )
+
+    @staticmethod
+    def _append_output(job: Job, text: str) -> None:
+        """Retain a bounded preview while continuing to drain the child pipe."""
+
+        if not text or job.output_truncated:
+            return
+        remaining = MAX_BACKGROUND_OUTPUT_CHARS - job.output_size
+        if len(text) <= remaining:
+            job.output.append(text)
+            job.output_size += len(text)
+            return
+        if remaining:
+            job.output.append(text[:remaining])
+            job.output_size += remaining
+        job.output.append(BACKGROUND_OUTPUT_TRUNCATION_MARKER)
+        job.output_truncated = True
 
     @staticmethod
     def _status(job: Job) -> str:
@@ -152,9 +184,12 @@ class BackgroundProcessTool(BaseTool):
         return f"{job.job_id} {state} [{job.sandbox_backend}]: {job.command}"
 
     @staticmethod
-    def _result(output: str) -> ToolResult:
+    def _result(output: str, *, truncated: bool = False) -> ToolResult:
         return ToolResult(
-            success=True, output=output, token_count=count_output_tokens(output)
+            success=True,
+            output=output,
+            token_count=count_output_tokens(output),
+            truncated=truncated,
         )
 
     async def aclose(self) -> None:
