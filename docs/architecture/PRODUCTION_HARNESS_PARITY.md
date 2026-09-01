@@ -38,7 +38,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | `ash` console command | Verified locally | Wheel and sdist build; clean-environment console smoke test passes |
 | `python -m ash` | Verified locally | Keep as supported fallback |
 | Dependency separation | Verified locally | Lean default runtime/provider install, standardized dev group, published vector/server extras, actionable missing-extra errors, and lockfile/artifact checks |
-| First-run wizard | Verified locally | No-key detection, deterministic cancel/back, endpoint retry/save-unverified choices, non-billable model discovery, secret input, atomic related settings, non-TTY guidance, and fresh-process API/local checks |
+| First-run wizard | Verified locally | No-key detection, deterministic cancel/back, endpoint retry/save-unverified choices, non-billable model discovery, secret input, atomic related settings, non-TTY guidance, secret-free JSON status, and fresh-process API/local checks |
 | API-key providers | Partial | Anthropic, OpenAI, Groq, DeepSeek and custom endpoints tested from fresh process; runtime model switches now close the previous provider deterministically |
 | Local models | Partial | Ollama URL validation, installed-model discovery, health failure detail, fresh-process configuration checks, safe bounded pull execution, dynamic tool/context capability probing with fail-closed fallback, and forced `/capabilities --refresh` re-probing are wired; broader runtime capability refresh remains |
 | Custom endpoints | Verified locally | Per-provider credentials are stored in mode-0600 env storage, not TOML |

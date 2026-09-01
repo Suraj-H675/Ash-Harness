@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -604,6 +605,42 @@ class TestCmdSetup:
         output = capsys.readouterr().out
         assert "Ash is configured for" in output
         assert "doctor --connect" in output
+
+    def test_status_json_is_secret_free_and_reports_capabilities(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from ash.commands.setup import cmd_setup
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: False)
+        monkeypatch.setattr("ash.commands.setup._browser_is_installed", lambda: False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-status-secret")
+        config = SimpleNamespace(
+            model="openai/gpt-status",
+            fallback_models=["ollama/local"],
+            custom_providers={},
+            web_search_provider="auto",
+            memory_backend="fts5",
+            sandbox_backend="auto",
+            workspace_root=tmp_path,
+        )
+        monkeypatch.setattr("ash.config.AshConfig.load", lambda: config)
+
+        args = SimpleNamespace(
+            section="status",
+            quick=False,
+            non_interactive=True,
+            json=True,
+        )
+        assert cmd_setup(args) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["profile"] == "default"
+        assert payload["provider"]["id"] == "openai"
+        assert payload["provider"]["ready"] is True
+        assert payload["fallback_models"] == ["ollama/local"]
+        assert payload["capabilities"]["memory"]["backend"] == "fts5"
+        assert "sk-status-secret" not in json.dumps(payload)
 
 
 class TestWebSearchSetup:

@@ -1787,6 +1787,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run in non-interactive mode (fail if input needed)",
     )
+    setup_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Render setup status as secret-free JSON (status section only)",
+    )
     profile_parser = subparsers.add_parser(
         "profile", help="List and select isolated provider/configuration profiles"
     )

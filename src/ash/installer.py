@@ -152,7 +152,10 @@ def install(
                 environment=environment,
                 previous=previous_uv,
             )
-    selected_extras = _normalize_extras(extras or previous.extras)
+    # ``--extra`` augments the installed capability set. There is no public
+    # remove-extra operation, so a repair cannot silently uninstall an
+    # already-enabled pack when a user adds another one later.
+    selected_extras = _normalize_extras([*previous.extras, *extras])
     package_spec = _package_spec(selected_extras, ref=ref)
     install_environment = dict(environment)
     install_environment["UV_VENV_CLEAR"] = "1"
@@ -334,7 +337,10 @@ def _install_with_uv(
     environment: Mapping[str, str],
     previous: _UvState,
 ) -> InstallResult:
-    package_spec = _package_spec(_normalize_extras(extras), ref=ref)
+    # Keep existing capability packs when adding one through a later
+    # pipx/uv invocation. This makes upgrades and repairs additive and safe.
+    selected_extras = _normalize_extras([*previous.extras, *extras])
+    package_spec = _package_spec(selected_extras, ref=ref)
     completed = runner(
         [uv, "tool", "install", "--force", "--reinstall", package_spec],
         env=dict(environment),

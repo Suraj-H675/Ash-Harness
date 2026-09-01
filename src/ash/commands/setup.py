@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import getpass
 import importlib.util
+import json
 import os
 import re
 import subprocess
@@ -16,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlsplit
 
 from rich.console import Console
@@ -131,31 +132,76 @@ def _provider_status(config, descriptor: ProviderDescriptor) -> str:
     return "key detected" if descriptor.key_env and get_env_value(descriptor.key_env) else "needs key"
 
 
-def _render_setup_status(config, *, title: str = "Current setup") -> None:
-    """Render a bounded, secret-free setup summary."""
+def _setup_status_payload(config) -> dict[str, Any]:
+    """Return the secret-free setup inventory used by human and JSON output."""
 
     from ash.profiles import active_profile_name
 
-    console = _setup_console()
-    profile = active_profile_name()
-    model = str(getattr(config, "model", "") or "not selected")
+    model = str(getattr(config, "model", "") or "")
+    provider_id = model.split("/", 1)[0] if "/" in model else ""
+    descriptor = get_provider_descriptor(provider_id) if provider_id else None
     workspace_root = getattr(config, "workspace_root", Path.cwd())
     if not isinstance(workspace_root, Path):
         workspace_root = Path.cwd()
-    provider_id = model.split("/", 1)[0] if "/" in model else ""
-    descriptor = get_provider_descriptor(provider_id) if provider_id else None
-    provider_name = descriptor.name if descriptor else provider_id or "Not configured"
-    provider_state = "ready to test" if _has_provider_configured(config) else "needs setup"
-    fallback_count = len(getattr(config, "fallback_models", []) or [])
+    return {
+        "profile": active_profile_name(),
+        "model": model or None,
+        "provider": {
+            "id": provider_id or None,
+            "name": descriptor.name if descriptor else provider_id or None,
+            "category": descriptor.category if descriptor else None,
+            "ready": _has_provider_configured(config),
+        },
+        "fallback_models": list(getattr(config, "fallback_models", []) or []),
+        "capabilities": {
+            "web_search": {
+                "configured": _has_web_search_configured(config),
+                "provider": str(getattr(config, "web_search_provider", "auto")),
+            },
+            "browser": {"installed": _browser_is_installed()},
+            "mcp": {"configured": (workspace_root / ".mcp.json").is_file()},
+            "memory": {"backend": str(getattr(config, "memory_backend", "auto"))},
+            "sandbox": {"backend": str(getattr(config, "sandbox_backend", "auto"))},
+        },
+    }
+
+
+def _render_setup_status(
+    config,
+    *,
+    title: str = "Current setup",
+    json_output: bool = False,
+) -> None:
+    """Render a bounded, secret-free setup summary."""
+
+    payload = _setup_status_payload(config)
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    console = _setup_console()
+    profile = str(payload["profile"])
+    model = str(payload["model"] or "not selected")
+    provider = payload["provider"]
+    provider_name = str(provider["name"] or "Not configured")
+    provider_state = "ready to test" if provider["ready"] else "needs setup"
+    fallback_count = len(payload["fallback_models"])
+    capabilities = payload["capabilities"]
     optional = [
-        ("Web search", "configured" if _has_web_search_configured(config) else "not configured"),
+        (
+            "Web search",
+            "configured" if capabilities["web_search"]["configured"] else "not configured",
+        ),
         (
             "Browser",
-            "installed" if _browser_is_installed() else "optional",
+            "installed" if capabilities["browser"]["installed"] else "optional",
         ),
-        ("MCP", "configured" if (workspace_root / ".mcp.json").is_file() else "none"),
-        ("Memory", str(getattr(config, "memory_backend", "auto"))),
-        ("Sandbox", str(getattr(config, "sandbox_backend", "auto"))),
+        (
+            "MCP",
+            "configured" if capabilities["mcp"]["configured"] else "none",
+        ),
+        ("Memory", str(capabilities["memory"]["backend"])),
+        ("Sandbox", str(capabilities["sandbox"]["backend"])),
     ]
     console.print(Panel(
         f"[bold]{provider_name}[/bold]  [dim]{model}[/dim]\n"
@@ -202,7 +248,7 @@ def run_setup_wizard(args) -> SetupOutcome:
 
     if non_interactive or not is_interactive_stdin():
         if section == "status":
-            _render_setup_status(config)
+            _render_setup_status(config, json_output=getattr(args, "json", False) is True)
             return SetupOutcome.SUCCESS
         if section == "browser":
             if _browser_is_installed():

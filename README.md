@@ -36,6 +36,7 @@ Then configure and verify the runtime:
 ```bash
 ash setup
 ash setup status
+ash setup status --json
 ash providers list
 ash providers test
 ash profile list
@@ -69,7 +70,8 @@ curl -fsSL https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/src/ash
 
 Repeat `--extra` to choose multiple capability packs, for example
 `--extra server --extra vector`. When no extras are supplied, an existing
-pipx installation keeps the extras recorded in its package metadata.
+installation keeps the extras recorded in its package metadata; supplied
+extras are additive on upgrades and repairs.
 
 For development:
 
