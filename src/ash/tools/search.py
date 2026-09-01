@@ -28,6 +28,11 @@ SEARCH_TIMEOUT_SECONDS = 30
 MAX_SEARCH_LINE_CHARS = 64 * 1024
 MAX_SEARCH_MATCH_CARRY_CHARS = 4 * 1024
 MAX_LIST_DIRECTORY_DEPTH = 4
+MAX_GLOB_SCAN_ENTRIES = 100_000
+MAX_GLOB_DEPTH = 32
+MAX_SEARCH_SCAN_ENTRIES = 100_000
+MAX_SEARCH_DEPTH = 32
+MAX_SEARCH_FILE_BYTES = 8 * 1024 * 1024
 
 
 def _iter_workspace_paths(
@@ -127,26 +132,41 @@ class GlobFilesTool(BaseTool):
                 success=False, output="", error=f"Not a directory: {root}"
             )
         matches: list[str] = []
-        truncated = False
-        for path in root.rglob("*"):
-            if not path.is_file():
+        match_truncated = False
+        scan_truncated = False
+        scanned = 0
+        for path in _iter_workspace_paths(
+            root,
+            recursive=True,
+            max_depth=MAX_GLOB_DEPTH,
+        ):
+            scanned += 1
+            if scanned > MAX_GLOB_SCAN_ENTRIES:
+                scan_truncated = True
+                break
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+            except OSError:
                 continue
             relative = path.relative_to(root).as_posix()
             if not fnmatch.fnmatch(relative, args.pattern):
                 continue
             if len(matches) >= args.max_results:
-                truncated = True
+                match_truncated = True
                 break
             matches.append(relative)
         matches.sort()
         output = "\n".join(matches)
-        if truncated:
+        if match_truncated:
             output += f"\n[truncated after {args.max_results} matches]"
+        elif scan_truncated:
+            output += f"\n[workspace scan truncated after {MAX_GLOB_SCAN_ENTRIES} entries]"
         return ToolResult(
             success=True,
             output=output,
             token_count=count_output_tokens(output),
-            truncated=truncated,
+            truncated=match_truncated or scan_truncated,
         )
 
 
@@ -174,7 +194,17 @@ class SearchTextTool(BaseTool):
         if shutil.which("rg") is None:
             return await self._python_fallback(root, args)
 
-        command = ["rg", "--json", "--line-number", "--color", "never"]
+        command = [
+            "rg",
+            "--json",
+            "--line-number",
+            "--color",
+            "never",
+            "--max-depth",
+            str(MAX_SEARCH_DEPTH),
+            "--max-filesize",
+            str(MAX_SEARCH_FILE_BYTES),
+        ]
         if args.fixed_strings:
             command.append("--fixed-strings")
         if not args.case_sensitive:
@@ -305,8 +335,21 @@ class SearchTextTool(BaseTool):
         output_bytes = 0
         output_limited = False
         match_limited = False
-        for path in root.rglob("*"):
-            if not path.is_file():
+        scan_truncated = False
+        scanned = 0
+        for path in _iter_workspace_paths(
+            root,
+            recursive=True,
+            max_depth=MAX_SEARCH_DEPTH,
+        ):
+            scanned += 1
+            if scanned > MAX_SEARCH_SCAN_ENTRIES:
+                scan_truncated = True
+                break
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+            except OSError:
                 continue
             relative = path.relative_to(root).as_posix()
             if args.glob and not fnmatch.fnmatch(relative, args.glob):
@@ -346,9 +389,14 @@ class SearchTextTool(BaseTool):
             )
         elif match_limited:
             output += f"\n[truncated after {args.max_results} matches]"
+        elif scan_truncated:
+            output += (
+                f"\n[workspace scan truncated after "
+                f"{MAX_SEARCH_SCAN_ENTRIES} entries]"
+            )
         return ToolResult(
             success=True,
             output=output,
             token_count=count_output_tokens(output),
-            truncated=output_limited or match_limited,
+            truncated=output_limited or match_limited or scan_truncated,
         )
