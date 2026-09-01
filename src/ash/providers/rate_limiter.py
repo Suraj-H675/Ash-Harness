@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from typing import Tuple
 
@@ -17,9 +18,14 @@ class TokenBucketRateLimiter:
     """
 
     def __init__(self, capacity: int, fill_rate: float) -> None:
-        if capacity <= 0:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
             raise ValueError("capacity must be positive")
-        if fill_rate < 0:
+        if (
+            isinstance(fill_rate, bool)
+            or not isinstance(fill_rate, int | float)
+            or not math.isfinite(fill_rate)
+            or fill_rate < 0
+        ):
             raise ValueError("fill_rate must be non-negative")
         self.capacity = capacity
         self.fill_rate = fill_rate
@@ -42,6 +48,7 @@ class TokenBucketRateLimiter:
         is unsatisfiable and returns an infinite wait time.
         """
 
+        self._validate_tokens_needed(tokens_needed)
         if tokens_needed > self.capacity:
             return False, float("inf")
 
@@ -66,6 +73,7 @@ class TokenBucketRateLimiter:
         such a request can never be satisfied.
         """
 
+        self._validate_tokens_needed(tokens_needed)
         if tokens_needed > self.capacity:
             raise ValueError(
                 f"Requested tokens ({tokens_needed}) exceeds bucket capacity ({self.capacity})."
@@ -78,3 +86,11 @@ class TokenBucketRateLimiter:
                     return
 
             await asyncio.sleep(max(wait, 0.0))
+
+    def _validate_tokens_needed(self, tokens_needed: int) -> None:
+        if (
+            isinstance(tokens_needed, bool)
+            or not isinstance(tokens_needed, int)
+            or tokens_needed < 0
+        ):
+            raise ValueError("tokens_needed must be a non-negative integer")
