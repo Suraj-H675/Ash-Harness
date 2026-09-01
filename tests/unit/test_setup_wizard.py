@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -734,7 +735,28 @@ class TestBrowserSetup:
         setup.subprocess.run.assert_called_once_with(
             [setup.sys.executable, "-m", "playwright", "install", "chromium"],
             check=False,
+            timeout=setup.BROWSER_INSTALL_TIMEOUT_SECONDS,
         )
+
+    def test_browser_install_timeout_fails_cleanly(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, setup_browser
+
+        states = iter((False,))
+        monkeypatch.setattr(
+            "ash.commands.setup._browser_is_installed", lambda: next(states)
+        )
+        monkeypatch.setattr("builtins.input", _fake_input([""]))
+        monkeypatch.setattr(
+            "ash.commands.setup.subprocess.run",
+            MagicMock(side_effect=subprocess.TimeoutExpired("playwright", 300)),
+        )
+
+        assert setup_browser() == SetupOutcome.ERROR
+        assert "timed out" in capsys.readouterr().err
 
 
 class TestSetupNavigation:

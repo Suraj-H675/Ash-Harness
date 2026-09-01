@@ -94,6 +94,7 @@ WEB_SEARCH_PROVIDERS = (
     ),
 )
 _PROVIDER_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
+BROWSER_INSTALL_TIMEOUT_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -581,10 +582,20 @@ def setup_browser() -> SetupOutcome:
     ).casefold()
     if answer in {"n", "no"}:
         return SetupOutcome.CANCELLED
-    completed = subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False,
+            timeout=BROWSER_INSTALL_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            "  Chromium installation timed out after "
+            f"{BROWSER_INSTALL_TIMEOUT_SECONDS} seconds. "
+            "Retry setup when the network is available.",
+            file=sys.stderr,
+        )
+        return SetupOutcome.ERROR
     if completed.returncode != 0:
         print(
             "  Chromium installation failed. On supported Linux distributions, "
