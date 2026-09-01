@@ -9,6 +9,9 @@ from ash.safety.guard import SafetyGuard
 from ash.sandbox import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable, SandboxInvocation
 from ash.tools.process import (
     BACKGROUND_OUTPUT_TRUNCATION_MARKER,
+    MAX_BACKGROUND_COMMAND_CHARS,
+    MAX_BACKGROUND_INPUT_CHARS,
+    MAX_BACKGROUND_JOBS,
     MAX_BACKGROUND_OUTPUT_CHARS,
     BackgroundProcessTool,
 )
@@ -81,6 +84,31 @@ async def test_background_process_handles_long_lines_and_bounds_output(tmp_path)
     assert len("".join(job.output)) == (
         MAX_BACKGROUND_OUTPUT_CHARS + len(BACKGROUND_OUTPUT_TRUNCATION_MARKER)
     )
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_process_limits_job_count_and_argument_size(tmp_path) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    for _ in range(MAX_BACKGROUND_JOBS):
+        started = await tool.run(action="start", command="true")
+        assert started.success is True
+
+    rejected = await tool.run(action="start", command="true")
+    assert rejected.success is False
+    assert f"{MAX_BACKGROUND_JOBS} background jobs" in (rejected.error or "")
+
+    with pytest.raises(ValueError):
+        await tool.run(
+            action="start",
+            command="x" * (MAX_BACKGROUND_COMMAND_CHARS + 1),
+        )
+    with pytest.raises(ValueError):
+        await tool.run(
+            action="write",
+            job_id="missing",
+            input="x" * (MAX_BACKGROUND_INPUT_CHARS + 1),
+        )
     await tool.aclose()
 
 

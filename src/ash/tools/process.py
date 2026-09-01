@@ -19,6 +19,11 @@ from ash.tools.command import build_scrubbed_command_env
 
 
 MAX_BACKGROUND_OUTPUT_CHARS = 100_000
+MAX_BACKGROUND_JOBS = 32
+MAX_BACKGROUND_COMMAND_CHARS = 100_000
+MAX_BACKGROUND_INPUT_CHARS = 1_000_000
+MAX_BACKGROUND_JOB_ID_CHARS = 128
+MAX_BACKGROUND_CWD_CHARS = 4_096
 BACKGROUND_OUTPUT_TRUNCATION_MARKER = (
     "\n[background process output truncated after "
     f"{MAX_BACKGROUND_OUTPUT_CHARS} characters]\n"
@@ -40,10 +45,10 @@ class Job:
 
 class BackgroundProcessArgs(BaseModel):
     action: str = Field(..., pattern="^(start|list|poll|write|stop)$")
-    command: str = ""
-    job_id: str = ""
-    input: str = ""
-    cwd: str | None = None
+    command: str = Field("", max_length=MAX_BACKGROUND_COMMAND_CHARS)
+    job_id: str = Field("", max_length=MAX_BACKGROUND_JOB_ID_CHARS)
+    input: str = Field("", max_length=MAX_BACKGROUND_INPUT_CHARS)
+    cwd: str | None = Field(None, max_length=MAX_BACKGROUND_CWD_CHARS)
 
 
 class BackgroundProcessTool(BaseTool):
@@ -97,6 +102,15 @@ class BackgroundProcessTool(BaseTool):
     async def _start(self, args: BackgroundProcessArgs) -> ToolResult:
         if not args.command:
             return ToolResult(success=False, output="", error="start requires command")
+        if len(self.jobs) >= MAX_BACKGROUND_JOBS:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Maximum of {MAX_BACKGROUND_JOBS} background jobs reached; "
+                    "stop or finish existing jobs before starting another."
+                ),
+            )
         self.safety_guard.validate_command(args.command)
         cwd = self.safety_guard.validate_path(
             args.cwd or self.safety_guard.project_root
