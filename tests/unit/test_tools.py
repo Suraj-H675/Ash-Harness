@@ -76,6 +76,59 @@ async def test_read_file_blocks_binary_null_byte(
 
 
 @pytest.mark.asyncio
+async def test_read_file_rejects_oversized_text(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ash.tools.filesystem.MAX_TEXT_FILE_BYTES", 4)
+    (project_root / "large.txt").write_bytes(b"12345")
+
+    result = await ReadFileTool(guard).run(file_path="large.txt")
+
+    assert result.success is False
+    assert result.error == "Error: file exceeds 4 bytes"
+
+
+@pytest.mark.asyncio
+async def test_write_file_rejects_oversized_text(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ash.tools.filesystem.MAX_TEXT_FILE_BYTES", 4)
+
+    result = await WriteFileTool(guard).run(file_path="large.txt", content="12345")
+
+    assert result.success is False
+    assert result.error == "Error: content exceeds 4 bytes"
+    assert not (project_root / "large.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_replace_file_rejects_oversized_text_without_mutating(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ash.tools.filesystem.MAX_TEXT_FILE_BYTES", 4)
+    target = project_root / "large.txt"
+    target.write_bytes(b"12345")
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="large.txt",
+        start_line=1,
+        end_line=1,
+        target_content="12345",
+        replacement_content="small",
+    )
+
+    assert result.success is False
+    assert result.error == "Error: file exceeds 4 bytes"
+    assert target.read_bytes() == b"12345"
+
+
+@pytest.mark.asyncio
 async def test_read_file_truncation_reports_follow_up_range(
     project_root: Path,
     guard: SafetyGuard,

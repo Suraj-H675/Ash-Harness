@@ -23,6 +23,8 @@ from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 
 BINARY_DETECTION_BYTES = 8192
 DEFAULT_MAX_READ_LINES = 800
+MAX_TEXT_FILE_BYTES = 8 * 1024 * 1024
+MAX_TEXT_ARGUMENT_CHARS = 8 * 1024 * 1024
 BINARY_FILE_ERROR = (
     "Error: Binary file detected. Use specialized image/binary viewer tools instead."
 )
@@ -71,7 +73,11 @@ class ReadFileArgs(BaseModel):
 
 class WriteFileArgs(BaseModel):
     file_path: str = Field(..., description="Target path for writing content.")
-    content: str = Field(..., description="Complete textual content to write.")
+    content: str = Field(
+        ...,
+        max_length=MAX_TEXT_ARGUMENT_CHARS,
+        description="Complete textual content to write.",
+    )
     overwrite: bool = Field(
         False,
         description="Set to true if target file already exists and overwrite is intended.",
@@ -92,10 +98,12 @@ class ReplaceFileContentArgs(BaseModel):
     )
     target_content: str = Field(
         ...,
+        max_length=MAX_TEXT_ARGUMENT_CHARS,
         description="Exact string of characters to search for within the specified line range.",
     )
     replacement_content: str = Field(
         ...,
+        max_length=MAX_TEXT_ARGUMENT_CHARS,
         description="The content to replace the target_content with.",
     )
     expected_sha256: str | None = Field(
@@ -120,10 +128,12 @@ class ReplacementEdit(BaseModel):
     )
     target_content: str = Field(
         ...,
+        max_length=MAX_TEXT_ARGUMENT_CHARS,
         description="Exact string to replace within this line range.",
     )
     replacement_content: str = Field(
         ...,
+        max_length=MAX_TEXT_ARGUMENT_CHARS,
         description="Replacement content for this line range.",
     )
 
@@ -150,7 +160,11 @@ class ReplaceFileEditsArgs(BaseModel):
 
 class WholeEditArgs(BaseModel):
     file_path: str = Field(..., description="Absolute or relative path to the file.")
-    content: str = Field(..., description="Complete new file content.")
+    content: str = Field(
+        ...,
+        max_length=MAX_TEXT_ARGUMENT_CHARS,
+        description="Complete new file content.",
+    )
     reason: str = Field("", description="Why the entire file is being replaced.")
 
 
@@ -174,7 +188,11 @@ class ReadFileTool(BaseTool):
                 success=False, output="", error=f"Error: Not a file: {args.file_path}"
             )
         try:
-            _, raw_content = read_scoped_bytes(resolved_path, self.safety_guard)
+            _, raw_content = read_scoped_bytes(
+                resolved_path,
+                self.safety_guard,
+                max_bytes=MAX_TEXT_FILE_BYTES,
+            )
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
         try:
@@ -300,7 +318,11 @@ class ReplaceFileContentTool(BaseTool):
                 success=False, output="", error=f"Error: Not a file: {args.file_path}"
             )
         try:
-            _, raw_content = read_scoped_bytes(resolved_path, self.safety_guard)
+            _, raw_content = read_scoped_bytes(
+                resolved_path,
+                self.safety_guard,
+                max_bytes=MAX_TEXT_FILE_BYTES,
+            )
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
         try:
@@ -394,7 +416,11 @@ class ReplaceFileEditsTool(BaseTool):
                 success=False, output="", error=f"Error: Not a file: {args.file_path}"
             )
         try:
-            _, raw_content = read_scoped_bytes(resolved_path, self.safety_guard)
+            _, raw_content = read_scoped_bytes(
+                resolved_path,
+                self.safety_guard,
+                max_bytes=MAX_TEXT_FILE_BYTES,
+            )
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
         try:
@@ -557,7 +583,10 @@ def _decode_text_bytes(content: bytes) -> tuple[str, TextEncoding]:
 
 
 def _encode_text_bytes(content: str, encoding: TextEncoding) -> bytes:
-    return encoding.bom + content.encode(encoding.codec)
+    payload = encoding.bom + content.encode(encoding.codec)
+    if len(payload) > MAX_TEXT_FILE_BYTES:
+        raise ScopedIOError(f"content exceeds {MAX_TEXT_FILE_BYTES} bytes")
+    return payload
 
 
 def _encode_for_write(
@@ -568,8 +597,8 @@ def _encode_for_write(
     preserve_existing: bool,
 ) -> tuple[bytes, str | None]:
     if not preserve_existing or not path.exists():
-        return content.encode("utf-8"), None
-    _, existing = read_scoped_bytes(path, guard)
+        return _encode_text_bytes(content, UTF8_ENCODING), None
+    _, existing = read_scoped_bytes(path, guard, max_bytes=MAX_TEXT_FILE_BYTES)
     _, encoding = _decode_text_bytes(existing)
     return _encode_text_bytes(content, encoding), _sha256_bytes(existing)
 
