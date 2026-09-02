@@ -434,6 +434,11 @@ class MCPClient:
                 message = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            except (UnicodeDecodeError, OverflowError, RecursionError) as exc:
+                error = MCPProtocolError(
+                    f"MCP server {self.config.name!r} sent invalid JSON: {exc}"
+                )
+                break
             if isinstance(message, dict):
                 self._dispatch_incoming(message)
         assert error is not None

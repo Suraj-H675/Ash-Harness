@@ -3117,6 +3117,24 @@ async def test_stdio_reader_fails_pending_request_on_framing_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stdio_reader_fails_pending_request_on_invalid_utf8() -> None:
+    class InvalidUtf8Reader:
+        async def readline(self) -> bytes:
+            return b"\xff\n"
+
+    client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
+    client._process = Mock(stdout=InvalidUtf8Reader())
+    future = asyncio.get_running_loop().create_future()
+    client._pending[3] = future
+
+    await client._read_stdio()
+
+    with pytest.raises(MCPProtocolError, match="invalid JSON"):
+        await future
+    assert client._pending == {}
+
+
+@pytest.mark.asyncio
 async def test_cancelled_stdio_connect_cleans_process_and_reader_tasks() -> None:
     client = MCPClient(
         MCPServerConfig(
