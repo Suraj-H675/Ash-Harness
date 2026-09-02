@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import base64
+from collections.abc import AsyncIterator
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -37,6 +38,8 @@ MAX_PAGINATION_PAGES = 100
 MAX_PAGINATION_SESSION_RESTARTS = 1
 MAX_STDIO_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_LEGACY_SSE_EVENT_BYTES = 8 * 1024 * 1024
+MAX_HTTP_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_HTTP_SSE_EVENT_BYTES = 8 * 1024 * 1024
 MAX_BUFFERED_LEGACY_SSE_RESPONSES = 1000
 SAFE_INTEGER_BOUND = 2**53 - 1
 MAX_HTTP_SESSION_ID_BYTES = 1024
@@ -787,12 +790,13 @@ class MCPClient:
             raise MCPProtocolError(
                 "MCP HTTP parameter headers require the http transport"
             )
-        response = await self._http.post(
+        async with self._http.stream(
+            "POST",
             endpoint,
             json=payload,
             headers=headers,
-        )
-        response.raise_for_status()
+        ) as response:
+            response.raise_for_status()
 
     @staticmethod
     def _safe_header_value(value: str) -> str:
@@ -1026,7 +1030,7 @@ class MCPClient:
                     header_annotations,
                 )
             )
-        response = await self._http.post(
+        response = await self._post_http_request(
             self.config.resolved_url,
             json=payload,
             headers=headers,
@@ -1052,7 +1056,7 @@ class MCPClient:
                 force_refresh=True,
                 rejected_access_token=rejected_access_token,
             )
-            response = await self._http.post(
+            response = await self._post_http_request(
                 self.config.resolved_url,
                 json=payload,
                 headers=headers,
@@ -1090,6 +1094,27 @@ class MCPClient:
                 _validate_http_session_id(session_id)
                 self._pending_initialize_session_id = session_id
         return response
+
+    async def _post_http_request(
+        self,
+        url: str,
+        **request_kwargs: Any,
+    ) -> httpx.Response:
+        """Send a POST while bounding any response retained in memory."""
+
+        if self._http is None:
+            raise MCPProtocolError("MCP HTTP client is not connected")
+        async with self._http.stream("POST", url, **request_kwargs) as response:
+            # Error responses other than a 400 compatibility probe, and
+            # notification acknowledgements, are only inspected for status and
+            # headers. Do not wait for an attacker-controlled response body.
+            if (
+                response.status_code in {202, 204}
+                or response.status_code >= 400
+                and response.status_code != 400
+            ):
+                return _copy_http_response(response, b"")
+            return await _read_bounded_http_response(response)
 
     async def _recover_http_session(
         self,
@@ -1574,12 +1599,13 @@ class MCPClient:
             headers["Mcp-Session-Id"] = session_id
             if self.protocol_version:
                 headers["MCP-Protocol-Version"] = self.protocol_version
-            response = await self._http.delete(
+            async with self._http.stream(
+                "DELETE",
                 self.config.resolved_url,
                 headers=headers,
-            )
-            if response.status_code != 405:
-                response.raise_for_status()
+            ) as response:
+                if response.status_code != 405:
+                    response.raise_for_status()
         except (httpx.HTTPError, MCPOAuthError):
             return
 
@@ -1608,17 +1634,15 @@ class MCPClient:
                     )
                 event_name = ""
                 data_lines: list[str] = []
-                event_bytes = 0
                 endpoint_discovered = False
 
                 def finish_event() -> None:
-                    nonlocal event_name, data_lines, event_bytes
+                    nonlocal event_name, data_lines
                     nonlocal endpoint_discovered
                     event_data = "\n".join(data_lines)
                     data_lines = []
                     name = event_name
                     event_name = ""
-                    event_bytes = 0
                     if name == "endpoint" and event_data:
                         try:
                             resolved_endpoint = urljoin(
@@ -1686,41 +1710,9 @@ class MCPClient:
                     else:
                         self._dispatch_incoming(payload)
 
-                while not endpoint_discovered:
-                    async for raw_line in response.aiter_lines():
-                        line = raw_line.rstrip("\r")
-                        event_bytes += len(line.encode()) + 1
-                        if event_bytes > MAX_LEGACY_SSE_EVENT_BYTES:
-                            raise MCPProtocolError(
-                                f"MCP SSE event exceeded "
-                                f"{MAX_LEGACY_SSE_EVENT_BYTES} bytes"
-                            )
-                        if line.startswith("retry:"):
-                            try:
-                                self._sse_retry_ms = max(0, int(line[6:].strip()))
-                            except ValueError as exc:
-                                raise MCPProtocolError(
-                                    "MCP SSE stream contained an invalid retry field"
-                                ) from exc
-                        elif line.startswith("event:"):
-                            event_name = line[6:].strip()
-                        elif line.startswith("data:"):
-                            data_lines.append(line[5:].lstrip())
-                        elif not line:
-                            finish_event()
-                    break
-                if not endpoint_discovered:
-                    raise MCPProtocolError(
-                        "MCP SSE discovery requires an endpoint event before "
-                        "the first message"
-                    )
-                async for raw_line in response.aiter_lines():
-                    line = raw_line.rstrip("\r")
-                    event_bytes += len(line.encode()) + 1
-                    if event_bytes > MAX_LEGACY_SSE_EVENT_BYTES:
-                        raise MCPProtocolError(
-                            f"MCP SSE event exceeded {MAX_LEGACY_SSE_EVENT_BYTES} bytes"
-                        )
+                async for line in _iter_bounded_sse_lines(
+                    response, MAX_HTTP_SSE_EVENT_BYTES
+                ):
                     if line.startswith("retry:"):
                         try:
                             self._sse_retry_ms = max(0, int(line[6:].strip()))
@@ -1734,6 +1726,11 @@ class MCPClient:
                         data_lines.append(line[5:].lstrip())
                     elif not line:
                         finish_event()
+                if not endpoint_discovered:
+                    raise MCPProtocolError(
+                        "MCP SSE discovery requires an endpoint event before "
+                        "the first message"
+                    )
         except (httpx.HTTPError, MCPProtocolError) as exc:
             error = (
                 exc
@@ -1781,8 +1778,9 @@ class MCPClient:
                         )
                     data_lines: list[str] = []
                     event_id = ""
-                    async for raw_line in response.aiter_lines():
-                        line = raw_line.rstrip("\r")
+                    async for line in _iter_bounded_sse_lines(
+                        response, MAX_HTTP_SSE_EVENT_BYTES
+                    ):
                         if line.startswith("retry:"):
                             try:
                                 self._sse_retry_ms = max(0, int(line[6:].strip()))
@@ -1802,9 +1800,18 @@ class MCPClient:
                         if event_id:
                             self._sse_last_event_id = event_id
                         if data_lines and any(data_lines):
-                            payload = json.loads("\n".join(data_lines))
-                            if isinstance(payload, dict):
-                                self._dispatch_incoming(payload)
+                            try:
+                                payload = json.loads("\n".join(data_lines))
+                            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                                raise MCPProtocolError(
+                                    "MCP SSE event contained invalid JSON"
+                                ) from exc
+                            if not isinstance(payload, dict):
+                                raise MCPProtocolError(
+                                    "MCP SSE data must contain a JSON-RPC object"
+                                )
+                            _validate_jsonrpc_message(payload)
+                            self._dispatch_incoming(payload)
                         data_lines.clear()
                         event_id = ""
             except (httpx.HTTPError, MCPProtocolError):
@@ -1829,11 +1836,99 @@ def _validate_http_session_id(session_id: str) -> None:
         )
 
 
+def _copy_http_response(response: httpx.Response, content: bytes) -> httpx.Response:
+    try:
+        request = response.request
+    except RuntimeError:
+        request = None
+    return httpx.Response(
+        response.status_code,
+        headers=response.headers,
+        content=content,
+        request=request,
+        extensions=response.extensions,
+    )
+
+
+async def _read_bounded_http_response(response: httpx.Response) -> httpx.Response:
+    content_length = response.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            declared_length = -1
+        if declared_length > MAX_HTTP_RESPONSE_BYTES:
+            raise MCPProtocolError(
+                f"MCP HTTP response exceeded {MAX_HTTP_RESPONSE_BYTES} bytes"
+            )
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > MAX_HTTP_RESPONSE_BYTES:
+            raise MCPProtocolError(
+                f"MCP HTTP response exceeded {MAX_HTTP_RESPONSE_BYTES} bytes"
+            )
+        body.extend(chunk)
+    return _copy_http_response(response, bytes(body))
+
+
+async def _iter_bounded_sse_lines(
+    response: httpx.Response,
+    max_event_bytes: int,
+) -> AsyncIterator[str]:
+    """Yield SSE lines without allowing an unterminated event to grow forever."""
+
+    pending = bytearray()
+    event_bytes = 0
+    async for chunk in response.aiter_bytes():
+        if len(chunk) > max_event_bytes:
+            raise MCPProtocolError(f"MCP SSE event exceeded {max_event_bytes} bytes")
+        pending.extend(chunk)
+        while True:
+            newline = pending.find(b"\n")
+            if newline < 0:
+                break
+            raw_line = bytes(pending[:newline])
+            del pending[: newline + 1]
+            event_bytes += len(raw_line) + 1
+            if event_bytes > max_event_bytes:
+                raise MCPProtocolError(
+                    f"MCP SSE event exceeded {max_event_bytes} bytes"
+                )
+            if raw_line.endswith(b"\r"):
+                raw_line = raw_line[:-1]
+            try:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise MCPProtocolError(
+                    "MCP SSE stream contained invalid UTF-8"
+                ) from exc
+            if not raw_line:
+                event_bytes = 0
+            yield line
+        if len(pending) > max_event_bytes:
+            raise MCPProtocolError(f"MCP SSE event exceeded {max_event_bytes} bytes")
+    if pending:
+        event_bytes += len(pending) + 1
+        if event_bytes > max_event_bytes:
+            raise MCPProtocolError(f"MCP SSE event exceeded {max_event_bytes} bytes")
+        if pending.endswith(b"\r"):
+            del pending[-1:]
+        try:
+            yield bytes(pending).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise MCPProtocolError("MCP SSE stream contained invalid UTF-8") from exc
+
+
 def _parse_http_messages(response: httpx.Response) -> list[dict[str, Any]]:
+    content = response.content
+    if len(content) > MAX_HTTP_RESPONSE_BYTES:
+        raise MCPProtocolError(
+            f"MCP HTTP response exceeded {MAX_HTTP_RESPONSE_BYTES} bytes"
+        )
     content_type = (
         response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
     )
-    if response.content and content_type not in {
+    if content and content_type not in {
         "application/json",
         "text/event-stream",
     }:
@@ -1841,7 +1936,7 @@ def _parse_http_messages(response: httpx.Response) -> list[dict[str, Any]]:
             "MCP HTTP response must use application/json or text/event-stream"
         )
     if content_type != "text/event-stream":
-        if not response.content:
+        if not content:
             return []
         try:
             payload = response.json()
@@ -1856,26 +1951,41 @@ def _parse_http_messages(response: httpx.Response) -> list[dict[str, Any]]:
 
     messages: list[dict[str, Any]] = []
     data_lines: list[str] = []
-    for line in [*response.text.splitlines(), ""]:
-        if line.startswith("data:"):
-            data_lines.append(line[5:].lstrip())
-            continue
-        if line or not data_lines:
-            continue
+    event_bytes = 0
+
+    def finish_event() -> None:
+        nonlocal event_bytes
         event_data = "\n".join(data_lines)
+        data_lines.clear()
+        event_bytes = 0
         if not event_data:
-            data_lines.clear()
-            continue
+            return
         try:
             payload = json.loads(event_data)
         except json.JSONDecodeError as exc:
             raise MCPProtocolError("MCP SSE event contained invalid JSON") from exc
-        data_lines.clear()
         if isinstance(payload, dict):
             _validate_jsonrpc_message(payload)
             messages.append(payload)
         else:
             raise MCPProtocolError("MCP SSE data must contain a JSON-RPC object")
+
+    try:
+        for line in response.iter_lines():
+            event_bytes += len(line.encode("utf-8")) + 1
+            if event_bytes > MAX_HTTP_SSE_EVENT_BYTES:
+                raise MCPProtocolError(
+                    f"MCP SSE event exceeded {MAX_HTTP_SSE_EVENT_BYTES} bytes"
+                )
+            if line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+                continue
+            if line:
+                continue
+            finish_event()
+    except UnicodeDecodeError as exc:
+        raise MCPProtocolError("MCP SSE response contained invalid UTF-8") from exc
+    finish_event()
     return messages
 
 

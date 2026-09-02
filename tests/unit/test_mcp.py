@@ -18,6 +18,7 @@ from ash.mcp.client import (
     MCPProtocolError,
     MCPTaskTimeout,
 )
+from ash.mcp import client as mcp_client_module
 from ash.mcp.oauth import MCPOAuthSession
 from ash.mcp.runtime import MCPRuntime, MCPTool, _extract_mcp_header_annotations
 from ash.mcp.server import (
@@ -1983,6 +1984,67 @@ async def test_streamable_http_tracks_session_and_parses_sse() -> None:
     assert seen_session == ["session-1"]
     assert seen_protocol == ["2025-06-18"]
     await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_post_rejects_oversized_response_before_json_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_client_module, "MAX_HTTP_RESPONSE_BYTES", 32)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=b"x" * 33,
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    try:
+        with pytest.raises(MCPProtocolError, match="response exceeded 32 bytes"):
+            await client._post_http(
+                {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                is_initialize=True,
+                bypass_session_readiness=True,
+            )
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sse_line_reader_rejects_unterminated_event() -> None:
+    response = httpx.Response(200, content=b"data: " + b"x" * 33)
+
+    with pytest.raises(MCPProtocolError, match="SSE event exceeded 32 bytes"):
+        async for _line in mcp_client_module._iter_bounded_sse_lines(response, 32):
+            pass
+
+
+def test_http_sse_parser_rejects_oversized_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_client_module, "MAX_HTTP_RESPONSE_BYTES", 128)
+    monkeypatch.setattr(mcp_client_module, "MAX_HTTP_SSE_EVENT_BYTES", 32)
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=b"data: " + b"x" * 33 + b"\n\n",
+    )
+
+    with pytest.raises(MCPProtocolError, match="SSE event exceeded 32 bytes"):
+        mcp_client_module._parse_http_messages(response)
 
 
 @pytest.mark.asyncio
