@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 from pathlib import Path
 
+from ash.safe_io import read_bounded_bytes
 from ash.tools.git import GIT_OUTPUT_LIMIT_EXIT, _run_git
 
 
@@ -91,22 +92,31 @@ async def _untracked_patches(root: Path) -> str:
     )
     patches: list[str] = []
     for relative_name in filter(None, output.split("\x00")):
-        path = (root / relative_name).resolve()
+        path = root / relative_name
+        resolved = path.resolve()
         try:
-            path.relative_to(root)
+            resolved.relative_to(root)
         except ValueError:
             patches.append(f"Untracked path outside workspace skipped: {relative_name}")
             continue
         try:
             if not path.is_file():
                 continue
-            size = path.stat().st_size
-            if size > MAX_UNTRACKED_FILE_BYTES:
+            data = read_bounded_bytes(
+                path,
+                MAX_UNTRACKED_FILE_BYTES,
+                label="untracked review file",
+            )
+        except ValueError as exc:
+            if "exceeds" in str(exc):
                 patches.append(
                     f"Untracked file omitted (larger than 1 MB): {relative_name}"
                 )
-                continue
-            data = path.read_bytes()
+            else:
+                patches.append(
+                    f"Untracked file unreadable: {relative_name}: {exc}"
+                )
+            continue
         except OSError as exc:
             patches.append(f"Untracked file unreadable: {relative_name}: {exc}")
             continue

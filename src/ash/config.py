@@ -137,12 +137,11 @@ def _is_git_marker(path: Path) -> bool:
     if not path.is_file():
         return False
     try:
+        marker = read_bounded_bytes(path, 1024, label="Git marker")
         return (
-            path.read_text(encoding="utf-8", errors="replace")[:1024]
-            .lstrip()
-            .startswith("gitdir:")
+            marker.decode("utf-8", errors="replace").lstrip().startswith("gitdir:")
         )
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 

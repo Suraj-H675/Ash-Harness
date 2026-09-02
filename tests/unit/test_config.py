@@ -522,6 +522,15 @@ def test_workspace_discovery_ignores_empty_git_marker(tmp_path: Path) -> None:
     assert discover_workspace_root(child) == child.resolve()
 
 
+def test_workspace_discovery_bounds_git_marker_reads(tmp_path: Path) -> None:
+    parent = tmp_path / "not-a-repository"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    (parent / ".git").write_bytes(b"gitdir: " + b"x" * 4096)
+
+    assert discover_workspace_root(child) == child.resolve()
+
+
 def test_untrusted_project_config_is_inert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -29,6 +29,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 from rich.text import Text
 
+from ash.safe_io import read_bounded_bytes
 from ash.ui.transcript import Transcript
 from ash.ui.theme import get_theme
 
@@ -73,10 +74,16 @@ def _append_preview_truncation(preview: str, truncated: bool) -> str:
 
 
 def _read_preview_file(path: Path) -> str | None:
-    with path.open("rb") as handle:
-        raw = handle.read(MAX_EDIT_PREVIEW_FILE_BYTES + 1)
-    if len(raw) > MAX_EDIT_PREVIEW_FILE_BYTES:
-        return None
+    try:
+        raw = read_bounded_bytes(
+            path,
+            MAX_EDIT_PREVIEW_FILE_BYTES,
+            label="edit preview file",
+        )
+    except ValueError as exc:
+        if "exceeds" in str(exc):
+            return None
+        raise OSError(str(exc)) from exc
     return raw.decode("utf-8")
 
 
@@ -610,11 +617,11 @@ class TerminalUI:
         content = arguments.get("content")
         if not isinstance(raw_path, str) or not isinstance(content, str):
             return ""
-        path = Path(raw_path).expanduser()
-        if not path.is_absolute():
-            path = self.workspace_root / path
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.workspace_root / candidate
         try:
-            path = path.resolve()
+            path = candidate.resolve()
         except OSError:
             return "[preview unavailable: path cannot be resolved]"
         try:
@@ -622,7 +629,9 @@ class TerminalUI:
         except ValueError:
             return "[preview unavailable: path is outside workspace]"
         try:
-            before = _read_preview_file(path) if path.is_file() else ""
+            if candidate.is_symlink():
+                return "[preview unavailable: existing file is not readable text]"
+            before = _read_preview_file(candidate) if candidate.is_file() else ""
             if before is None:
                 return (
                     "[preview unavailable: existing file exceeds "
@@ -837,11 +846,12 @@ class TerminalUI:
                 raise subprocess.SubprocessError(
                     f"editor exited with status {result.returncode}"
                 )
-            if file_path.stat().st_size > 1_000_000:
+            edited_plan = _read_preview_file(file_path)
+            if edited_plan is None:
                 raise ValueError("edited plan exceeds 1 MB")
             apply_sprint_markdown_edit(
                 execution,
-                file_path.read_text(encoding="utf-8"),
+                edited_plan,
             )
         finally:
             if file_path is not None:

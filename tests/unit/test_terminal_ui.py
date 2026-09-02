@@ -214,6 +214,23 @@ def test_terminal_ui_does_not_read_oversized_existing_file(tmp_path, monkeypatch
     assert preview == "[preview unavailable: existing file exceeds 32 bytes]"
 
 
+def test_terminal_ui_does_not_follow_symlinked_existing_file(tmp_path):
+    target = tmp_path / "target.txt"
+    target.write_text("private content", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    ui = TerminalUI(workspace_root=tmp_path)
+
+    preview = ui._edit_preview(
+        "whole_edit", {"file_path": "link.txt", "content": "replacement"}
+    )
+
+    assert preview == "[preview unavailable: existing file is not readable text]"
+
+
 def test_terminal_ui_bounds_inline_diff_inputs():
     ui = TerminalUI()
     huge = "line\n" * 1_000

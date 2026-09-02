@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from ash.commands.review import build_review_prompt, collect_review_changes
+from ash.commands.review import (
+    MAX_UNTRACKED_FILE_BYTES,
+    build_review_prompt,
+    collect_review_changes,
+)
 
 
 def git(root: Path, *arguments: str) -> str:
@@ -40,6 +44,31 @@ def test_collect_worktree_includes_tracked_and_untracked_text(repository: Path) 
     assert "+value = 2" in patch
     assert "b/new.py" in patch
     assert "+added = True" in patch
+
+
+def test_collect_worktree_omits_oversized_untracked_file(repository: Path) -> None:
+    (repository / "large.txt").write_bytes(b"x" * (MAX_UNTRACKED_FILE_BYTES + 1))
+
+    _, patch = asyncio.run(collect_review_changes(repository, []))
+
+    assert "Untracked file omitted (larger than 1 MB): large.txt" in patch
+
+
+def test_collect_worktree_does_not_follow_untracked_symlink(repository: Path) -> None:
+    secret = repository / "tracked-secret.txt"
+    secret.write_text("do not expose this", encoding="utf-8")
+    git(repository, "add", "tracked-secret.txt")
+    git(repository, "commit", "-qm", "add secret fixture")
+    link = repository / "untracked-link.txt"
+    try:
+        link.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    _, patch = asyncio.run(collect_review_changes(repository, []))
+
+    assert "do not expose this" not in patch
+    assert "untracked-link.txt" in patch
 
 
 def test_collect_staged_and_commit_scopes(repository: Path) -> None:
