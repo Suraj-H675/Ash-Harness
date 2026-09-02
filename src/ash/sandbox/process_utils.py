@@ -42,6 +42,8 @@ async def terminate_process_tree(
 ) -> None:
     """Terminate a subprocess and descendants, escalating to a hard kill."""
 
+    if not isinstance(process.pid, int) or process.pid <= 0:
+        return
     if sys.platform == "win32":
         if process.returncode is not None:
             return
@@ -85,7 +87,7 @@ def _signal_posix_processes(root: int, descendants: list[int], signum: int) -> N
     for pid in [root, *descendants]:
         try:
             group = getpgid(pid)
-        except ProcessLookupError:
+        except (OSError, TypeError, ValueError):
             continue
         if group == own_group:
             individual.append(pid)
