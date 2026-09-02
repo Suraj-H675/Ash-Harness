@@ -63,7 +63,7 @@ class WebFetchTool(BaseTool):
                 transport=self._transport,
                 allowed_domains=self._allowed_domains,
             )
-        except ValueError as exc:
+        except (ValueError, httpx.HTTPError) as exc:
             return ToolResult(success=False, output="", error=str(exc))
         text = _html_to_text(body) if "html" in content_type else body
         truncated = len(text) > args.max_chars

@@ -117,6 +117,24 @@ async def test_web_fetch_rejects_redirect_outside_allowed_domains(
     assert "allowed_web_domains" in (result.error or "")
 
 
+@pytest.mark.asyncio
+async def test_web_fetch_returns_network_failures_as_tool_results(
+    monkeypatch,
+    guard,
+) -> None:
+    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    tool = WebFetchTool(guard, transport=httpx.MockTransport(handler))
+    result = await tool.run(url="https://example.com/unavailable")
+
+    assert result.success is False
+    assert result.output == ""
+    assert result.error == "connection refused"
+
+
 def test_web_fetch_rejects_private_and_non_http_hosts(monkeypatch) -> None:
     with monkeypatch.context() as mp:
         mp.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
