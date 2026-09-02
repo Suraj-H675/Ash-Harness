@@ -8,7 +8,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
+
+from .provider_test_helpers import patch_catalog_client
 
 
 # ---------------------------------------------------------------------------
@@ -373,42 +376,39 @@ class TestProbeModels:
 
     def test_probe_models_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_probe_models returns model IDs on 200 response."""
-        mock_response = MagicMock(
-            status_code=200,
-            json=lambda: {
-                "object": "list",
-                "data": [
-                    {"id": "gpt-4o"},
-                    {"id": "gpt-4o-mini"},
-                ],
-            },
+        patch_catalog_client(
+            monkeypatch,
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {"id": "gpt-4o"},
+                        {"id": "gpt-4o-mini"},
+                    ],
+                },
+                request=request,
+            ),
         )
         monkeypatch.setenv("HOME", "/tmp")
-        with patch("ash.providers.readiness.httpx.get", return_value=mock_response):
-            from ash.commands.setup import _probe_models
+        from ash.commands.setup import _probe_models
 
-            result = _probe_models("https://api.openai.com/v1", "sk-test")
-            assert result == ["gpt-4o", "gpt-4o-mini"]
+        result = _probe_models("https://api.openai.com/v1", "sk-test")
+        assert result == ["gpt-4o", "gpt-4o-mini"]
 
     def test_openai_probe_uses_shared_catalog_probe(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from ash.commands.setup import _probe_models_detailed
 
-        response = MagicMock(
-            raise_for_status=lambda: None,
-            json=lambda: {"data": [{"id": "model-a"}, {"id": "model-b"}]},
+        patch_catalog_client(
+            monkeypatch,
+            lambda request: httpx.Response(
+                200,
+                json={"data": [{"id": "model-a"}, {"id": "model-b"}]},
+                request=request,
+            ),
         )
-
-        def shared_get(
-            url: str, *, headers: dict[str, str], timeout: float
-        ) -> MagicMock:
-            assert url == "https://gateway.example/v1/models"
-            assert headers == {"Authorization": "Bearer sk-test"}
-            assert timeout == 10.0
-            return response
-
-        monkeypatch.setattr("ash.providers.readiness.httpx.get", shared_get)
 
         result = _probe_models_detailed("https://gateway.example/v1", "sk-test")
 
@@ -457,26 +457,32 @@ class TestProbeModels:
     def test_probe_models_http_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_probe_models returns [] on HTTP error."""
         monkeypatch.setenv("HOME", "/tmp")
-        with patch(
-            "ash.providers.readiness.httpx.get", side_effect=Exception("network error")
-        ):
-            from ash.commands.setup import _probe_models
+        def fail_client(*, timeout: float) -> object:
+            raise RuntimeError("network error")
 
-            result = _probe_models("https://api.openai.com/v1", "sk-test")
-            assert result == []
+        monkeypatch.setattr("ash.providers.readiness.httpx.Client", fail_client)
+        from ash.commands.setup import _probe_models
 
-    def test_probe_error_redacts_echoed_api_key(self) -> None:
+        result = _probe_models("https://api.openai.com/v1", "sk-test")
+        assert result == []
+
+    def test_probe_error_redacts_echoed_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from ash.commands.setup import _probe_models_detailed
 
-        response = MagicMock(
-            status_code=401,
-            text="invalid key sk-secret-value",
+        patch_catalog_client(
+            monkeypatch,
+            lambda request: httpx.Response(
+                401,
+                text="invalid key sk-secret-value",
+                request=request,
+            ),
         )
-        with patch("ash.providers.readiness.httpx.get", return_value=response):
-            result = _probe_models_detailed(
-                "https://api.example.test/v1",
-                "sk-secret-value",
-            )
+        result = _probe_models_detailed(
+            "https://api.example.test/v1",
+            "sk-secret-value",
+        )
 
         assert result.models == ()
         assert "sk-secret-value" not in (result.error or "")
@@ -484,21 +490,24 @@ class TestProbeModels:
 
     def test_probe_ollama_models_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_probe_ollama_models returns model names on 200 response."""
-        mock_response = MagicMock(
-            status_code=200,
-            json=lambda: {
-                "models": [
-                    {"name": "llama3"},
-                    {"name": "qwen2.5-coder:7b"},
-                ],
-            },
+        patch_catalog_client(
+            monkeypatch,
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {"name": "llama3"},
+                        {"name": "qwen2.5-coder:7b"},
+                    ],
+                },
+                request=request,
+            ),
         )
         monkeypatch.setenv("HOME", "/tmp")
-        with patch("ash.providers.readiness.httpx.get", return_value=mock_response):
-            from ash.commands.setup import _probe_ollama_models
+        from ash.commands.setup import _probe_ollama_models
 
-            result = _probe_ollama_models("http://localhost:11434")
-            assert result == ["llama3", "qwen2.5-coder:7b"]
+        result = _probe_ollama_models("http://localhost:11434")
+        assert result == ["llama3", "qwen2.5-coder:7b"]
 
     def test_ollama_probe_uses_shared_catalog_probe(
         self, monkeypatch: pytest.MonkeyPatch

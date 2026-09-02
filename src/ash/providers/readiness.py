@@ -8,6 +8,7 @@ validated, immutable connection description.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Mapping
@@ -27,6 +28,8 @@ class ProviderConfigurationError(ValueError):
 
 CatalogFormat = Literal["openai", "anthropic", "ollama"]
 AuthMode = Literal["bearer", "anthropic", "none"]
+MAX_PROVIDER_CATALOG_BYTES = 2_000_000
+MAX_PROVIDER_ERROR_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -312,28 +315,27 @@ def probe_model_catalog(
     """Fetch and validate a provider model catalog without exposing secrets."""
 
     try:
-        response = httpx.get(endpoint, headers=dict(headers), timeout=timeout)
+        with httpx.Client(timeout=timeout) as client:
+            with client.stream("GET", endpoint, headers=dict(headers)) as response:
+                status_code = getattr(response, "status_code", None)
+                if isinstance(status_code, int) and status_code >= 400:
+                    detail = _read_error_detail(response, headers)
+                    suffix = f": {detail}" if detail else ""
+                    raise ProviderVerificationError(
+                        f"provider catalog returned HTTP {status_code}{suffix}"
+                    )
+                response.raise_for_status()
+                raw_payload = _read_bounded_catalog(response)
     except Exception as exc:  # noqa: BLE001 - normalize external request failures
+        if isinstance(exc, ProviderVerificationError):
+            raise
         raise ProviderVerificationError(
             f"provider catalog request failed ({type(exc).__name__})"
         ) from exc
 
     try:
-        status_code = getattr(response, "status_code", None)
-        if isinstance(status_code, int) and status_code >= 400:
-            detail = _redact_catalog_error(
-                str(getattr(response, "text", "") or "").strip(),
-                headers,
-            )
-            suffix = f": {detail}" if detail else ""
-            raise ProviderVerificationError(
-                f"provider catalog returned HTTP {status_code}{suffix}"
-            )
-        response.raise_for_status()
-        payload = response.json()
-    except ProviderVerificationError:
-        raise
-    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        payload = json.loads(raw_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
         raise ProviderVerificationError(
             f"provider catalog verification failed ({type(exc).__name__})"
         ) from exc
@@ -353,6 +355,58 @@ def probe_model_catalog(
     if not models:
         raise ProviderVerificationError("provider returned no model IDs")
     return tuple(models)
+
+
+def _read_bounded_catalog(response: httpx.Response) -> bytes:
+    content_length = response.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise ProviderVerificationError(
+                "provider catalog returned an invalid Content-Length"
+            ) from exc
+        if declared_length < 0:
+            raise ProviderVerificationError(
+                "provider catalog returned an invalid Content-Length"
+            )
+        if declared_length > MAX_PROVIDER_CATALOG_BYTES:
+            raise ProviderVerificationError(
+                "provider catalog response is larger than 2 MB"
+            )
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_bytes():
+        total += len(chunk)
+        if total > MAX_PROVIDER_CATALOG_BYTES:
+            raise ProviderVerificationError("provider catalog response is larger than 2 MB")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _read_error_detail(
+    response: httpx.Response,
+    headers: Mapping[str, str],
+) -> str:
+    try:
+        content_length = response.headers.get("content-length")
+        if content_length is not None:
+            declared_length = int(content_length)
+            if declared_length < 0 or declared_length > MAX_PROVIDER_ERROR_BYTES:
+                return ""
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_bytes():
+            total += len(chunk)
+            if total > MAX_PROVIDER_ERROR_BYTES:
+                return ""
+            chunks.append(chunk)
+        return _redact_catalog_error(
+            b"".join(chunks).decode("utf-8", errors="replace").strip(),
+            headers,
+        )
+    except (OSError, TypeError, ValueError, httpx.HTTPError):
+        return ""
 
 
 def verify_provider_connection(

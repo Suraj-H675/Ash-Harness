@@ -19,6 +19,7 @@ from ash.automation.schedules import build_schedule
 from ash.automation.store import AutomationStore
 from ash.config import AshConfig
 from ash.lsp.config import LSPServerConfig
+from .provider_test_helpers import patch_catalog_client
 
 
 def test_render_doctor_json_has_stable_schema() -> None:
@@ -33,11 +34,13 @@ def test_render_doctor_json_has_stable_schema() -> None:
 async def test_run_doctor_connect_uses_shared_provider_verification(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    requests: list[tuple[str, dict[str, str], float]] = []
-    response = httpx.Response(
-        200,
-        json={"data": [{"id": "gateway-model"}]},
-        request=httpx.Request("GET", "http://gateway.invalid/v1/models"),
+    requests = patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"data": [{"id": "gateway-model"}]},
+            request=request,
+        ),
     )
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("ASH_MODEL", "openai/gateway-model")
@@ -46,70 +49,57 @@ async def test_run_doctor_connect_uses_shared_provider_verification(
     monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("ASH_DB_DIRECTORY", str(tmp_path / "db"))
 
-    def fake_get(endpoint: str, *, headers: dict[str, str], timeout: float) -> object:
-        requests.append((endpoint, headers, timeout))
-        return response
-
-    monkeypatch.setattr("ash.providers.readiness.httpx.get", fake_get)
-
     checks = await run_doctor(connect=True)
 
     by_name = {check.name: check for check in checks}
     assert by_name["connectivity"].status == "pass"
-    assert requests == [
-        (
-            "http://gateway.invalid/v1/models",
-            {"Authorization": "Bearer gateway-secret"},
-            10.0,
-        )
-    ]
+    assert len(requests) == 1
+    request, timeout = requests[0]
+    assert str(request.url) == "http://gateway.invalid/v1/models"
+    assert request.headers["authorization"] == "Bearer gateway-secret"
+    assert timeout == 10.0
 
 
 @pytest.mark.asyncio
 async def test_connectivity_uses_runtime_openai_override_and_validates_model(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    requests: list[tuple[str, dict[str, str]]] = []
-    response = httpx.Response(
-        200,
-        json={"data": [{"id": "gateway-model"}]},
-        request=httpx.Request("GET", "http://gateway.invalid/v1/models"),
+    requests = patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"data": [{"id": "gateway-model"}]},
+            request=request,
+        ),
     )
     monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret")
     monkeypatch.setenv("OPENAI_API_BASE", "http://gateway.invalid/v1")
-    def fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
-        requests.append((url, headers))
-        return response
-
-    monkeypatch.setattr("ash.providers.readiness.httpx.get", fake_get)
 
     check = await _check_connectivity(
         AshConfig(model="openai/gateway-model", workspace_root=tmp_path)
     )
 
     assert check.status == "pass"
-    assert requests == [
-        ("http://gateway.invalid/v1/models", {"Authorization": "Bearer gateway-secret"})
-    ]
+    assert len(requests) == 1
+    request, _ = requests[0]
+    assert str(request.url) == "http://gateway.invalid/v1/models"
+    assert request.headers["authorization"] == "Bearer gateway-secret"
 
 
 @pytest.mark.asyncio
 async def test_connectivity_fails_when_selected_model_is_not_advertised(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    requests: list[tuple[str, dict[str, str]]] = []
-    response = httpx.Response(
-        200,
-        json={"data": [{"id": "another-model"}]},
-        request=httpx.Request("GET", "https://api.openai.com/v1/models"),
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"data": [{"id": "another-model"}]},
+            request=request,
+        ),
     )
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.delenv("OPENAI_API_BASE", raising=False)
-    def fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
-        requests.append((url, headers))
-        return response
-
-    monkeypatch.setattr("ash.providers.readiness.httpx.get", fake_get)
 
     check = await _check_connectivity(
         AshConfig(model="openai/missing-model", workspace_root=tmp_path)
@@ -123,34 +113,27 @@ async def test_connectivity_fails_when_selected_model_is_not_advertised(
 async def test_connectivity_checks_anthropic_catalog_with_runtime_headers(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    requests: list[tuple[str, dict[str, str]]] = []
-    response = httpx.Response(
-        200,
-        json={"data": [{"id": "claude-test"}]},
-        request=httpx.Request("GET", "http://gateway.invalid/v1/models"),
+    requests = patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"data": [{"id": "claude-test"}]},
+            request=request,
+        ),
     )
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
     monkeypatch.setenv("ANTHROPIC_API_BASE", "http://gateway.invalid")
-    def fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
-        requests.append((url, headers))
-        return response
-
-    monkeypatch.setattr("ash.providers.readiness.httpx.get", fake_get)
 
     check = await _check_connectivity(
         AshConfig(model="anthropic/claude-test", workspace_root=tmp_path)
     )
 
     assert check.status == "pass"
-    assert requests == [
-        (
-            "http://gateway.invalid/v1/models",
-            {
-                "x-api-key": "anthropic-secret",
-                "anthropic-version": "2023-06-01",
-            },
-        )
-    ]
+    assert len(requests) == 1
+    request, _ = requests[0]
+    assert str(request.url) == "http://gateway.invalid/v1/models"
+    assert request.headers["x-api-key"] == "anthropic-secret"
+    assert request.headers["anthropic-version"] == "2023-06-01"
 
 
 @pytest.mark.asyncio
