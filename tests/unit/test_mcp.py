@@ -1430,6 +1430,28 @@ async def test_mcp_list_tasks_paginates_and_validates_states() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mcp_list_tasks_rejects_oversized_aggregate_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, request = _task_client([])
+    task = {
+        "taskId": "working",
+        "status": "working",
+        "createdAt": "2025-11-25T10:00:00Z",
+        "lastUpdatedAt": "2025-11-25T10:01:00Z",
+        "ttl": None,
+    }
+    request.side_effect = [
+        {"tasks": [task], "nextCursor": "page-two"},
+        {"tasks": [{**task, "taskId": "second"}]},
+    ]
+    monkeypatch.setattr(mcp_client_module, "MAX_PAGINATION_RESULT_BYTES", 200)
+
+    with pytest.raises(MCPProtocolError, match="aggregate result exceeds"):
+        await client.list_mcp_tasks()
+
+
+@pytest.mark.asyncio
 async def test_mcp_list_tasks_requires_capability_and_fails_closed() -> None:
     client, request = _task_client([])
     request.side_effect = AssertionError("must not call unadvertised method")
@@ -3041,6 +3063,25 @@ async def test_http_tool_listing_follows_pagination() -> None:
 
     assert [tool["name"] for tool in tools] == ["first", "second"]
     assert cursors == [None, None, "page-2"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_paginated_catalog_rejects_oversized_aggregate_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MCPClient(
+        MCPServerConfig(name="fake", command="fake", args=[], env={}),
+    )
+    client.request = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            {"resources": [{"uri": "file:///first"}], "nextCursor": "page-two"},
+            {"resources": [{"uri": "file:///second"}]},
+        ]
+    )
+    monkeypatch.setattr(mcp_client_module, "MAX_PAGINATION_RESULT_BYTES", 49)
+
+    with pytest.raises(MCPProtocolError, match="aggregate result exceeds"):
+        await client.list_resources()
 
 
 @pytest.mark.asyncio

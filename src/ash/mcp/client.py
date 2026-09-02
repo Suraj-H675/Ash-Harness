@@ -36,6 +36,10 @@ MODERN_MISSING_CAPABILITY_ERROR = -32021
 MODERN_UNSUPPORTED_VERSION_ERROR = -32022
 MAX_PAGINATION_PAGES = 100
 MAX_PAGINATION_SESSION_RESTARTS = 1
+# A server can legally split a catalog across many pages. Bound the complete
+# catalog as well as each individual response so a hostile server cannot turn
+# pagination into an unbounded memory allocation.
+MAX_PAGINATION_RESULT_BYTES = 16 * 1024 * 1024
 MAX_STDIO_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_OUTBOUND_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_LEGACY_SSE_EVENT_BYTES = 8 * 1024 * 1024
@@ -93,6 +97,43 @@ class _EndpointDiscovered(Exception):
 
 class MCPTaskTimeout(MCPProtocolError):
     """A task-augmented operation exceeded the configured task wait limit."""
+
+
+def _append_bounded_paginated_items(
+    output: list[dict[str, Any]],
+    values: list[dict[str, Any]],
+    current_bytes: int,
+    *,
+    method: str,
+) -> int:
+    """Append catalog entries without exceeding the aggregate response cap."""
+
+    for value in values:
+        try:
+            item_bytes = len(
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            raise MCPProtocolError(
+                f"{method} returned an item that is not valid JSON"
+            ) from exc
+        separator_bytes = 1 if output else 0
+        candidate_bytes = current_bytes + separator_bytes + item_bytes
+        # Include the surrounding array brackets so the limit describes the
+        # JSON representation callers would receive, not just its entries.
+        if candidate_bytes + 2 > MAX_PAGINATION_RESULT_BYTES:
+            raise MCPProtocolError(
+                f"{method} aggregate result exceeds "
+                f"{MAX_PAGINATION_RESULT_BYTES} bytes"
+            )
+        output.append(value)
+        current_bytes = candidate_bytes
+    return current_bytes
 
 
 class MCPClient:
@@ -1368,6 +1409,7 @@ class MCPClient:
                 "MCP server does not advertise support for tasks/list"
             )
         output: list[dict[str, Any]] = []
+        output_bytes = 0
         cursor: str | None = None
         seen: set[str] = set()
         for _ in range(MAX_PAGINATION_PAGES):
@@ -1383,9 +1425,17 @@ class MCPClient:
                 isinstance(task, dict) for task in tasks
             ):
                 raise MCPProtocolError("MCP tasks/list returned an invalid task entry")
-            output.extend(
-                self._validate_task_result({"task": task}, method="tasks/list")["task"]
+            validated_tasks = [
+                self._validate_task_result({"task": task}, method="tasks/list")[
+                    "task"
+                ]
                 for task in tasks
+            ]
+            output_bytes = _append_bounded_paginated_items(
+                output,
+                validated_tasks,
+                output_bytes,
+                method="MCP tasks/list",
             )
             next_cursor = result.get("nextCursor")
             if next_cursor is None:
@@ -1499,6 +1549,7 @@ class MCPClient:
             if restart and not self.supports_server_capability(capability):
                 return []
             output: list[dict[str, Any]] = []
+            output_bytes = 0
             cursor: str | None = None
             seen: set[str] = set()
             generation = self._session_generation
@@ -1531,7 +1582,12 @@ class MCPClient:
                     raise MCPProtocolError(
                         f"{method} returned a non-object {key} entry"
                     )
-                output.extend(values)
+                output_bytes = _append_bounded_paginated_items(
+                    output,
+                    values,
+                    output_bytes,
+                    method=f"MCP {method}",
+                )
                 next_cursor = result.get("nextCursor")
                 if next_cursor is None:
                     return output
