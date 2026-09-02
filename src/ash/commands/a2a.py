@@ -6,6 +6,7 @@ import asyncio
 import os
 import json
 import sys
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -33,6 +34,8 @@ from ash.server.a2a import create_a2a_app
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 MAX_A2A_CLIENT_INPUT_BYTES = 1_000_000
 MAX_A2A_CLIENT_EVENTS = 10_000
+MAX_A2A_CLIENT_OUTPUT_BYTES = 1_000_000
+MAX_A2A_CLIENT_STATUS_BYTES = 64 * 1024
 TERMINAL_STATES = {
     TaskState.TASK_STATE_COMPLETED,
     TaskState.TASK_STATE_CANCELED,
@@ -116,12 +119,14 @@ async def send_a2a(args) -> int:
         validate_agent_card_origins(url, card.supported_interfaces)
         client = factory.create(card)
         task_id = ""
-        events: list[dict] = []
+        events: list[dict[str, Any]] = []
         event_count = 0
+        event_bytes = 0
         final_state: int | None = None
         immediate_message = False
         rendered_text = False
         status_message = ""
+        rendered_bytes = 0
         try:
             message = Message(
                 message_id=str(uuid4()),
@@ -136,7 +141,11 @@ async def send_a2a(args) -> int:
                 if event_count > MAX_A2A_CLIENT_EVENTS:
                     raise RuntimeError("A2A response exceeded 10,000 events")
                 if args.json:
-                    events.append(MessageToDict(event))
+                    event_bytes = _append_json_event(
+                        events,
+                        MessageToDict(event),
+                        event_bytes,
+                    )
                 if event.HasField("task"):
                     task_id = event.task.id
                     final_state = event.task.status.state
@@ -145,23 +154,29 @@ async def send_a2a(args) -> int:
                     if not args.json:
                         for part in event.message.parts:
                             if part.WhichOneof("content") == "text":
-                                print(part.text, end="", flush=True)
+                                rendered_bytes = _write_bounded_text(
+                                    part.text,
+                                    rendered_bytes,
+                                )
                                 rendered_text = True
                 elif event.HasField("status_update"):
                     task_id = event.status_update.task_id
                     final_state = event.status_update.status.state
                     if event.status_update.status.HasField("message"):
-                        status_message = "".join(
-                            part.text
-                            for part in event.status_update.status.message.parts
-                            if part.WhichOneof("content") == "text"
+                        status_message = _bounded_text_parts(
+                            event.status_update.status.message.parts,
+                            MAX_A2A_CLIENT_STATUS_BYTES,
+                            "A2A status message",
                         )
                 elif event.HasField("artifact_update"):
                     task_id = event.artifact_update.task_id
                     if not args.json:
                         for part in event.artifact_update.artifact.parts:
                             if part.WhichOneof("content") == "text":
-                                print(part.text, end="", flush=True)
+                                rendered_bytes = _write_bounded_text(
+                                    part.text,
+                                    rendered_bytes,
+                                )
                                 rendered_text = True
             if args.json:
                 print(
@@ -208,6 +223,50 @@ async def send_a2a(args) -> int:
 def _local_public_url(host: str, port: int) -> str:
     rendered_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
     return f"http://{rendered_host}:{port}"
+
+
+def _append_json_event(
+    events: list[dict[str, Any]],
+    event: dict[str, Any],
+    current_bytes: int,
+) -> int:
+    encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    contribution = len(encoded) + (1 if events else 0)
+    if current_bytes + contribution > MAX_A2A_CLIENT_OUTPUT_BYTES:
+        raise RuntimeError(
+            "A2A response exceeded "
+            f"{MAX_A2A_CLIENT_OUTPUT_BYTES} bytes"
+        )
+    events.append(event)
+    return current_bytes + contribution
+
+
+def _write_bounded_text(text: str, current_bytes: int) -> int:
+    encoded_bytes = len(text.encode("utf-8"))
+    if current_bytes + encoded_bytes > MAX_A2A_CLIENT_OUTPUT_BYTES:
+        raise RuntimeError(
+            "A2A response exceeded "
+            f"{MAX_A2A_CLIENT_OUTPUT_BYTES} bytes"
+        )
+    print(text, end="", flush=True)
+    return current_bytes + encoded_bytes
+
+
+def _bounded_text_parts(parts: Any, max_bytes: int, label: str) -> str:
+    chunks: list[str] = []
+    current_bytes = 0
+    for part in parts:
+        if part.WhichOneof("content") != "text":
+            continue
+        text = part.text
+        encoded_bytes = len(text.encode("utf-8"))
+        if current_bytes + encoded_bytes > max_bytes:
+            raise RuntimeError(f"{label} exceeded {max_bytes} bytes")
+        chunks.append(text)
+        current_bytes += encoded_bytes
+    return "".join(chunks)
 
 
 def _remote_url(value: str) -> str:

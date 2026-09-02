@@ -57,3 +57,14 @@ def test_a2a_stdin_prompt_is_bounded_before_network_use(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="A2A prompt exceeds"):
         asyncio.run(send_a2a(args))
+
+
+def test_a2a_json_event_accumulator_rejects_large_payload() -> None:
+    from ash.commands.a2a import _append_json_event
+
+    events: list[dict] = []
+
+    with pytest.raises(RuntimeError, match="A2A response exceeded"):
+        _append_json_event(events, {"text": "x" * 1_000_001}, 0)
+
+    assert events == []
