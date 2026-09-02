@@ -21,6 +21,10 @@ from ash.ui.transcript import Transcript
 from ash.ui.viewport import TranscriptViewport
 
 
+MAX_PATH_COMPLETION_SCAN_ENTRIES = 10_000
+MAX_PATH_COMPLETIONS = 200
+
+
 class AshCompleter(Completer):
     """Complete slash commands, ``@`` paths, symbols, and MCP resources."""
 
@@ -69,11 +73,18 @@ class AshCompleter(Completer):
         if not parent.is_dir():
             return
         prefix = relative.name.casefold()
+        children = []
         try:
-            children = sorted(parent.iterdir(), key=lambda item: item.name.casefold())
+            for index, child in enumerate(parent.iterdir(), 1):
+                if index > MAX_PATH_COMPLETION_SCAN_ENTRIES:
+                    break
+                children.append(child)
         except OSError:
             return
-        for child in children[:200]:
+        for child in sorted(
+            children,
+            key=lambda item: item.name.casefold(),
+        )[:MAX_PATH_COMPLETIONS]:
             if not child.name.casefold().startswith(prefix):
                 continue
             resolved = child.resolve()

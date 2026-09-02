@@ -444,6 +444,16 @@ class TestTomlConfig:
             cli_config.load_config(strict=True)
 
 
+def test_json_schema_loader_rejects_oversized_files(tmp_path: Path) -> None:
+    from ash.cli import MAX_JSON_SCHEMA_BYTES, _load_json_schema
+
+    schema = tmp_path / "schema.json"
+    schema.write_bytes(b" " * (MAX_JSON_SCHEMA_BYTES + 1))
+
+    with pytest.raises(ValueError, match="JSON Schema file exceeds"):
+        _load_json_schema(schema)
+
+
 class TestMaskKey:
     """Tests for mask_key display helper."""
 

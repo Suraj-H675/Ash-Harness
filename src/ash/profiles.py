@@ -8,11 +8,14 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
+from ash.safe_io import read_bounded_bytes
+
 
 DEFAULT_PROFILE = "default"
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ACTIVE_PROFILE_FILENAME = "active-profile"
 MAX_ACTIVE_PROFILE_BYTES = 256
+MAX_PROFILE_ENTRIES = 10_000
 
 
 def validate_profile_name(name: str) -> str:
@@ -61,14 +64,13 @@ def active_profile_name(
     if not marker.is_file():
         return DEFAULT_PROFILE
     try:
-        with marker.open("rb") as handle:
-            raw = handle.read(MAX_ACTIVE_PROFILE_BYTES + 1)
-        if len(raw) > MAX_ACTIVE_PROFILE_BYTES:
-            raise ValueError(
-                f"active Ash profile marker exceeds {MAX_ACTIVE_PROFILE_BYTES} bytes"
-            )
+        raw = read_bounded_bytes(
+            marker,
+            MAX_ACTIVE_PROFILE_BYTES,
+            label="active Ash profile marker",
+        )
         value = raw.decode("utf-8").strip()
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise ValueError(f"cannot read active Ash profile marker {marker}: {exc}") from exc
     return validate_profile_name(value or DEFAULT_PROFILE)
 
@@ -104,7 +106,15 @@ def list_profile_names(*, ash_dir: Path | None = None) -> tuple[str, ...]:
     root = profiles_directory(ash_dir)
     names = [DEFAULT_PROFILE]
     if root.is_dir():
-        for path in root.iterdir():
+        if root.is_symlink():
+            raise ValueError(f"refusing to enumerate symlinked profiles directory: {root}")
+        for index, path in enumerate(root.iterdir(), 1):
+            if index > MAX_PROFILE_ENTRIES:
+                raise ValueError(
+                    f"profile directory exceeds {MAX_PROFILE_ENTRIES} entries"
+                )
+            if path.is_symlink():
+                continue
             if not path.is_dir():
                 continue
             try:

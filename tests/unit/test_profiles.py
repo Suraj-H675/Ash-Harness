@@ -36,6 +36,34 @@ def test_profile_selection_is_atomic_and_lists_default_first(tmp_path: Path) -> 
     assert profile_directory("work", ash_dir=tmp_path) == tmp_path / "profiles" / "work"
 
 
+def test_profile_inventory_has_a_bounded_directory_scan(tmp_path: Path, monkeypatch) -> None:
+    import ash.profiles as profiles_module
+
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    for name in ("one", "two", "three"):
+        (profiles / name).mkdir()
+    monkeypatch.setattr(profiles_module, "MAX_PROFILE_ENTRIES", 2)
+
+    with pytest.raises(ValueError, match="exceeds 2 entries"):
+        profiles_module.list_profile_names(ash_dir=tmp_path)
+
+
+def test_active_profile_marker_symlink_is_not_followed(tmp_path: Path) -> None:
+    from ash.profiles import active_profile_name
+
+    target = tmp_path / "outside-marker"
+    target.write_text("work\n", encoding="utf-8")
+    marker = tmp_path / "active-profile"
+    try:
+        marker.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="symlinked active Ash profile marker"):
+        active_profile_name(environ={}, ash_dir=tmp_path)
+
+
 def test_profile_commands_keep_credentials_out_of_inventory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

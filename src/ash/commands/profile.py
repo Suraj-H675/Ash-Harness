@@ -16,6 +16,7 @@ from ash.profiles import (
     set_active_profile,
     validate_profile_name,
 )
+from ash.safe_io import read_bounded_bytes
 
 
 def _base_ash_directory() -> Path:
@@ -30,12 +31,13 @@ def _profile_metadata(name: str, *, base_directory: Path) -> dict[str, Any]:
     model = ""
     if env_path.is_file():
         try:
-            for line in env_path.read_text(encoding="utf-8").splitlines():
+            raw = read_bounded_bytes(env_path, 1024 * 1024, label="profile dotenv file")
+            for line in raw.decode("utf-8").splitlines():
                 key, separator, value = line.partition("=")
                 if separator and key.strip() == "ASH_MODEL":
                     model = value.strip()
                     break
-        except OSError:
+        except (OSError, UnicodeError, ValueError):
             model = ""
     return {
         "name": normalized,

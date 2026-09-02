@@ -185,3 +185,19 @@ def test_load_managed_policy_fails_closed_on_invalid_json(
 
     with pytest.raises(ValueError, match="invalid managed policy"):
         load_managed_permission_rules(tmp_path)
+
+
+def test_load_managed_policy_rejects_too_many_files(tmp_path: Path, monkeypatch) -> None:
+    from ash.safety import grants
+
+    directory = tmp_path / "policy"
+    directory.mkdir()
+    for index in range(3):
+        (directory / f"{index}.json").write_text(
+            json.dumps({"version": 2, "workspaces": {}})
+        )
+    monkeypatch.setattr(grants, "MAX_MANAGED_RULE_FILES", 2)
+    monkeypatch.setattr(grants, "managed_policy_paths", lambda: (directory,))
+
+    with pytest.raises(ValueError, match="more than 2 files"):
+        load_managed_permission_rules(tmp_path)

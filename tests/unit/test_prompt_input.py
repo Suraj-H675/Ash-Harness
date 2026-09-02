@@ -6,7 +6,7 @@ from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
 import ash.ui.prompt as prompt_module
-from ash.ui.prompt import PromptInput
+from ash.ui.prompt import AshCompleter, PromptInput
 
 
 class TtyStringIO(io.StringIO):
@@ -85,3 +85,26 @@ def test_prompt_completion_updates_after_plugin_reload(
     )
 
     assert [completion.text for completion in completions] == ["/example:review"]
+
+
+def test_path_completion_scans_a_bounded_number_of_entries(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path.resolve()
+    original_iterdir = prompt_module.Path.iterdir
+
+    def fake_iterdir(path):
+        if path == root:
+            return (root / f"file-{index:05d}.txt" for index in range(20_000))
+        return original_iterdir(path)
+
+    monkeypatch.setattr(prompt_module.Path, "iterdir", fake_iterdir)
+    completer = AshCompleter([], root)
+
+    completions = list(
+        completer.get_completions(
+            Document("@file-"), CompleteEvent(completion_requested=True)
+        )
+    )
+
+    assert len(completions) == prompt_module.MAX_PATH_COMPLETIONS

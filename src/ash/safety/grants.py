@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ash.safety.trust import canonical_workspace
+from ash.safe_io import read_bounded_bytes
 
 
 CURRENT_PERMISSION_RULE_VERSION = 2
@@ -539,17 +540,20 @@ def grants_path() -> Path:
 
 
 def _read_payload(path: Path) -> dict[str, Any]:
-    if not path.is_file():
+    if not path.exists():
         return {"version": CURRENT_PERMISSION_RULE_VERSION, "workspaces": {}}
     try:
-        with path.open("rb") as handle:
-            raw = handle.read(MAX_RULE_FILE_BYTES + 1)
-        if len(raw) > MAX_RULE_FILE_BYTES:
-            raise PermissionGrantError("permission rule file exceeds 1 MB")
+        raw = read_bounded_bytes(
+            path,
+            MAX_RULE_FILE_BYTES,
+            label="permission rule file",
+        )
         payload = json.loads(raw.decode("utf-8"))
     except PermissionGrantError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        if "exceeds" in str(exc):
+            raise PermissionGrantError("permission rule file exceeds 1 MB") from exc
         raise PermissionGrantError(f"cannot read permission rule file: {exc}") from exc
     if not isinstance(payload, dict):
         raise PermissionGrantError("permission rule file root must be an object")
@@ -622,11 +626,25 @@ def load_managed_permission_rules(workspace: Path) -> list[PermissionRule]:
         if not directory.exists():
             continue
         try:
-            files = sorted(path for path in directory.iterdir() if path.is_file())
+            files: list[Path] = []
+            for path in directory.iterdir():
+                if path.is_symlink():
+                    raise PermissionGrantError(
+                        f"managed policy contains symlink: {path}"
+                    )
+                if not path.is_file():
+                    continue
+                files.append(path)
+                if len(files) > MAX_MANAGED_RULE_FILES:
+                    raise PermissionGrantError(
+                        "managed policy contains more than "
+                        f"{MAX_MANAGED_RULE_FILES} files"
+                    )
+            files.sort()
         except OSError as exc:
             raise PermissionGrantError(f"cannot read managed policy: {exc}") from exc
-        if len(files) > MAX_MANAGED_RULE_FILES:
-            raise PermissionGrantError("managed policy contains more than 16 files")
+        except PermissionGrantError:
+            raise
         for path in files:
             try:
                 payload = _read_payload(path)

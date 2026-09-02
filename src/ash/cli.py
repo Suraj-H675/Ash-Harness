@@ -19,6 +19,8 @@ import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from ash.safe_io import read_bounded_bytes
+
 if TYPE_CHECKING:
     from ash.config import AshConfig
     from ash.core.loop import AshLoop
@@ -44,6 +46,8 @@ AVAILABLE_MODELS: list[str] = [
     "groq/compound-mini",
     "openai-compatible/<your-model>",
 ]
+MAX_SESSION_IMPORT_BYTES = 50 * 1024 * 1024
+MAX_JSON_SCHEMA_BYTES = 1024 * 1024
 
 
 def _emit_config_diagnostics(config: AshConfig) -> None:
@@ -1004,10 +1008,12 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     continue
                 try:
                     input_path = loop.safety_guard.validate_path(arguments[0])
-                    if input_path.stat().st_size > 50 * 1024 * 1024:
-                        raise ValueError("session import exceeds 50 MiB")
                     session = loop.session_store.import_session_jsonl(
-                        input_path.read_text(encoding="utf-8"),
+                        read_bounded_bytes(
+                            input_path,
+                            MAX_SESSION_IMPORT_BYTES,
+                            label="session import",
+                        ).decode("utf-8"),
                         project_path=str(loop.project_root),
                     )
                 except (OSError, ValueError) as exc:
@@ -3937,8 +3943,14 @@ async def _bootstrap_and_headless(
 
 def _load_json_schema(path: Path) -> dict[str, Any]:
     try:
-        schema = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        schema = json.loads(
+            read_bounded_bytes(
+                path,
+                MAX_JSON_SCHEMA_BYTES,
+                label="JSON Schema file",
+            ).decode("utf-8")
+        )
+    except (OSError, ValueError) as exc:
         raise ValueError(f"Invalid JSON Schema file: {exc}") from exc
     if not isinstance(schema, dict):
         raise ValueError("JSON Schema root must be an object")
