@@ -75,29 +75,32 @@ def fetch_catalog(
         raise PluginCatalogError("catalog fetch timeout must be 1 to 60 seconds")
     destination = catalog_cache_path(url)
     try:
-        if transport is not None:
-            with httpx.Client(
-                transport=transport,
-                timeout=timeout_seconds,
-                follow_redirects=False,
-            ) as client:
-                response = client.get(url, headers={"Accept": "application/json"})
-        else:
-            response = httpx.get(
-                url,
-                timeout=timeout_seconds,
-                follow_redirects=False,
-                headers={"Accept": "application/json"},
-            )
+        with httpx.Client(
+            transport=transport,
+            timeout=timeout_seconds,
+            follow_redirects=False,
+        ) as client:
+            with client.stream(
+                "GET", url, headers={"Accept": "application/json"}
+            ) as response:
+                if response.status_code != 200:
+                    raise PluginCatalogError(
+                        "plugin catalog endpoint returned "
+                        f"HTTP {response.status_code}"
+                    )
+                content_length = response.headers.get("content-length", "")
+                if content_length.isdigit() and int(content_length) > MAX_CATALOG_BYTES:
+                    raise PluginCatalogError("plugin catalog exceeds 256 KiB")
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > MAX_CATALOG_BYTES:
+                        raise PluginCatalogError("plugin catalog exceeds 256 KiB")
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
     except httpx.HTTPError as exc:
         raise PluginCatalogError(f"could not fetch plugin catalog: {exc}") from exc
-    if response.status_code != 200:
-        raise PluginCatalogError(
-            f"plugin catalog endpoint returned HTTP {response.status_code}"
-        )
-    raw = response.content
-    if len(raw) > MAX_CATALOG_BYTES:
-        raise PluginCatalogError("plugin catalog exceeds 256 KiB")
     try:
         envelope = _parse_strict_json(raw.decode("utf-8"))
         if not isinstance(envelope, dict) or "keyId" not in envelope:

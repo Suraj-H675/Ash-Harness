@@ -6,12 +6,15 @@ import subprocess
 from types import SimpleNamespace
 from pathlib import Path
 
+import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ash.plugins.catalog import (
+    MAX_CATALOG_BYTES,
     PluginCatalogError,
     CatalogEntry,
+    fetch_catalog,
     generate_catalog_signing_key,
     parse_and_verify_catalog,
     sign_catalog,
@@ -130,6 +133,48 @@ def test_local_catalog_symlink_is_not_followed(tmp_path: Path) -> None:
 
     with pytest.raises(PluginCatalogError, match="cannot read plugin catalog"):
         parse_and_verify_catalog(linked, trusted_keys_path=files["keys_path"])
+
+
+def test_remote_catalog_fetch_rejects_oversized_stream_without_materializing_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class OversizedStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"x" * (MAX_CATALOG_BYTES + 1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=OversizedStream())
+
+    monkeypatch.setattr(
+        "ash.plugins.catalog.catalog_cache_path",
+        lambda url: tmp_path / "catalog.json",
+    )
+    with pytest.raises(PluginCatalogError, match="exceeds 256 KiB"):
+        fetch_catalog(
+            "https://plugins.example/catalog.json",
+            transport=httpx.MockTransport(handler),
+        )
+    assert not (tmp_path / "catalog.json").exists()
+
+
+def test_remote_catalog_fetch_streams_valid_payload_into_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'{"keyId":"demo"}')
+
+    destination = tmp_path / "catalog.json"
+    monkeypatch.setattr(
+        "ash.plugins.catalog.catalog_cache_path", lambda url: destination
+    )
+    assert (
+        fetch_catalog(
+            "https://plugins.example/catalog.json",
+            transport=httpx.MockTransport(handler),
+        )
+        == destination
+    )
+    assert destination.read_bytes() == b'{"keyId":"demo"}'
 
 
 def test_rejects_duplicate_json_keys(tmp_path: Path) -> None:
