@@ -41,7 +41,7 @@ from ash.agents.a2a_remote import (
 )
 from ash.config import AshConfig
 from ash.safety.guard import SafetyGuard
-from ash.server.a2a import A2ASessionRegistry, create_a2a_app
+from ash.server.a2a import MAX_A2A_INPUT_BYTES, A2ASessionRegistry, _request_text, create_a2a_app
 
 
 class FakeAshClient:
@@ -64,6 +64,38 @@ class FakeAshClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+def test_a2a_request_text_stops_reading_parts_after_input_limit() -> None:
+    accesses = 0
+
+    class TextPart:
+        def __init__(self, value: str | None = None) -> None:
+            self.value = value
+
+        def WhichOneof(self, name: str) -> str:
+            assert name == "content"
+            return "text"
+
+        @property
+        def text(self) -> str:
+            nonlocal accesses
+            accesses += 1
+            if self.value is None:
+                raise AssertionError("request parser read past the byte limit")
+            return self.value
+
+    context = SimpleNamespace(
+        message=SimpleNamespace(
+            parts=[
+                TextPart("x" * (MAX_A2A_INPUT_BYTES + 1)),
+                TextPart(),
+            ]
+        )
+    )
+
+    assert _request_text(context) == ""
+    assert accesses == 1
 
 
 @pytest.mark.asyncio

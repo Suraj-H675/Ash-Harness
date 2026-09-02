@@ -480,12 +480,22 @@ def _request_text(context: RequestContext) -> str:
     message = context.message
     if message is None or not message.parts:
         return ""
-    if any(part.WhichOneof("content") != "text" for part in message.parts):
-        return ""
-    text = "\n".join(part.text for part in message.parts).strip()
-    if len(text.encode("utf-8")) > MAX_A2A_INPUT_BYTES:
-        return ""
-    return text
+    chunks: list[str] = []
+    total_bytes = 0
+    for part in message.parts:
+        if part.WhichOneof("content") != "text":
+            return ""
+        value = part.text
+        if not isinstance(value, str):
+            return ""
+        contribution = len(value.encode("utf-8"))
+        if chunks:
+            contribution += 1
+        total_bytes += contribution
+        if total_bytes > MAX_A2A_INPUT_BYTES:
+            return ""
+        chunks.append(value)
+    return "\n".join(chunks).strip()
 
 
 def _agent_message(updater: TaskUpdater, text: str) -> Message:
