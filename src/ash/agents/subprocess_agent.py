@@ -20,7 +20,6 @@ so the orchestrator can poll without blocking. It also pushes a final
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import subprocess
 import sys
@@ -30,6 +29,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
 from ash.agents.shared_state import SharedState
+from ash.safety.environment import build_scrubbed_environment
 
 
 # --- public enums and dataclasses -----------------------------------------
@@ -243,9 +243,13 @@ class SubprocessAgent:
             self.task,
         ]
         cmd.extend(extra_args)
-        env = os.environ.copy()
-        if self.workspace_root is not None:
-            env["ASH_WORKSPACE_ROOT"] = str(self.workspace_root)
+        env = build_scrubbed_environment(
+            overrides=(
+                {"ASH_WORKSPACE_ROOT": str(self.workspace_root)}
+                if self.workspace_root is not None
+                else None
+            )
+        )
         return subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
