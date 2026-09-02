@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import io
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +13,8 @@ from ash.installer import (
     InstallError,
     _ensure_shell_path,
     _quarantine_pipx_metadata,
+    _read_bounded_file,
+    _run_captured,
     install,
     main,
 )
@@ -735,3 +739,70 @@ def test_installer_does_not_quarantine_metadata_for_unrelated_pipx_failure(
 
     assert metadata_path.read_bytes() == original_metadata
     assert list(metadata_directory.glob("pipx_metadata.json.corrupt-*")) == []
+
+
+def test_installer_translates_backend_timeout_to_actionable_error() -> None:
+    def runner(command, **kwargs):
+        assert kwargs["timeout"] > 0
+        if command == ["/usr/bin/pipx", "list", "--json"]:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        raise AssertionError(f"unexpected command: {command}")
+
+    with pytest.raises(InstallError, match="Pipx state query timed out"):
+        install(
+            runner=runner,
+            which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
+            environ={"PATH": "/usr/bin"},
+        )
+
+
+def test_installer_rejects_oversized_manager_state_before_json_parsing() -> None:
+    oversized_state = "x" * (1024 * 1024 + 1)
+
+    def runner(command, **kwargs):
+        if command == ["/usr/bin/pipx", "list", "--json"]:
+            return _completed(stdout=oversized_state)
+        raise AssertionError(f"unexpected command: {command}")
+
+    with pytest.raises(InstallError, match="Pipx state query returned more"):
+        install(
+            runner=runner,
+            which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
+            environ={"PATH": "/usr/bin"},
+        )
+
+
+def test_real_installer_capture_terminates_noisy_child() -> None:
+    with pytest.raises(InstallError, match="returned more than 16384 bytes"):
+        _run_captured(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write('x' * 100000000)",
+            ],
+            runner=subprocess.run,
+            environment={},
+            timeout=10,
+            max_bytes=16 * 1024,
+            description="test command",
+        )
+
+
+def test_real_installer_capture_terminates_hung_child() -> None:
+    with pytest.raises(InstallError, match="timed out after 0.2 seconds"):
+        _run_captured(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            runner=subprocess.run,
+            environment={},
+            timeout=0.2,
+            max_bytes=16 * 1024,
+            description="test command",
+        )
+
+
+def test_installer_bounded_file_reader_rejects_oversized_metadata(tmp_path) -> None:
+    metadata_path = tmp_path / "pipx_metadata.json"
+    metadata_path.write_bytes(b"{" + b"x" * (1024 * 1024 + 1))
+
+    with pytest.raises(ValueError, match="exceeds 1048576 bytes"):
+        _read_bounded_file(metadata_path, max_bytes=1024 * 1024)

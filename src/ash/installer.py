@@ -10,10 +10,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
+import signal
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +33,15 @@ _EXTRAS_PATTERN = re.compile(
 )
 _UV_EXTRAS_PATTERN = re.compile(r"\[extras:\s*([^]]+)\]", re.IGNORECASE)
 _UV_ASH_PATH_PATTERN = re.compile(r"^-\s+ash\s+\(([^)]+)\)\s*$", re.MULTILINE)
+_INSTALL_TIMEOUT_SECONDS = 15 * 60
+_QUERY_TIMEOUT_SECONDS = 30
+_VERIFY_TIMEOUT_SECONDS = 30
+_MAX_STATE_OUTPUT_BYTES = 1024 * 1024
+_MAX_QUERY_OUTPUT_BYTES = 16 * 1024
+_MAX_VERSION_OUTPUT_BYTES = 16 * 1024
+_MAX_METADATA_BYTES = 1024 * 1024
+_CAPTURE_CHUNK_BYTES = 8192
+_CAPTURE_QUEUE_SIZE = 8
 
 
 class InstallError(RuntimeError):
@@ -65,6 +78,13 @@ class _UvState:
     installed: bool = False
     extras: tuple[str, ...] = ()
     executable: str | None = None
+
+
+@dataclass(frozen=True)
+class _CapturedResult:
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
 
 
 def install(
@@ -160,17 +180,14 @@ def install(
     install_environment = dict(environment)
     install_environment["UV_VENV_CLEAR"] = "1"
     try:
-        completed = runner(
+        _run_streaming(
             [pipx, "install", "--force", package_spec],
-            env=install_environment,
-            check=False,
+            runner=runner,
+            environment=install_environment,
+            timeout=_INSTALL_TIMEOUT_SECONDS,
+            description="pipx installation",
+            failure_message="pipx could not install Ash.",
         )
-        if int(getattr(completed, "returncode", 1)) != 0:
-            detail = _completed_output_detail(completed)
-            raise InstallError(
-                "pipx could not install Ash."
-                + (f" {detail}" if detail else "")
-            )
 
         current_inspection = _read_pipx_state(
             pipx,
@@ -246,12 +263,13 @@ def _pipx_bin_directory(
     if configured:
         directory = configured
     else:
-        completed = runner(
+        completed = _run_captured(
             [pipx, "environment", "--value", "PIPX_BIN_DIR"],
-            env=dict(environment),
-            check=False,
-            capture_output=True,
-            text=True,
+            runner=runner,
+            environment=environment,
+            timeout=_QUERY_TIMEOUT_SECONDS,
+            max_bytes=_MAX_QUERY_OUTPUT_BYTES,
+            description="pipx environment query",
         )
         if int(getattr(completed, "returncode", 1)) != 0:
             return None
@@ -277,12 +295,13 @@ def _pipx_home_directory(
     configured = environment.get("PIPX_HOME")
     if configured:
         return os.path.expanduser(configured)
-    completed = runner(
+    completed = _run_captured(
         [pipx, "environment", "--value", "PIPX_HOME"],
-        env=dict(environment),
-        check=False,
-        capture_output=True,
-        text=True,
+        runner=runner,
+        environment=environment,
+        timeout=_QUERY_TIMEOUT_SECONDS,
+        max_bytes=_MAX_QUERY_OUTPUT_BYTES,
+        description="pipx environment query",
     )
     if int(getattr(completed, "returncode", 1)) != 0:
         return None
@@ -296,14 +315,13 @@ def _corrupt_ash_metadata_path(pipx_home: str | None) -> Path | None:
     if not pipx_home:
         return None
     metadata_path = Path(pipx_home) / "venvs" / _PACKAGE_NAME / "pipx_metadata.json"
-    if not metadata_path.exists():
+    try:
+        contents = _read_bounded_file(metadata_path, max_bytes=_MAX_METADATA_BYTES)
+        text = contents.decode("utf-8")
+    except (OSError, UnicodeError, ValueError):
         return None
     try:
-        contents = metadata_path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        json.loads(contents)
+        json.loads(text)
     except json.JSONDecodeError:
         return metadata_path
     return None
@@ -322,7 +340,12 @@ def _quarantine_pipx_metadata(metadata_path: Path) -> Path:
 
 def _completed_output_detail(completed: Any) -> str:
     for attribute in ("stderr", "stdout"):
-        value = str(getattr(completed, attribute, "")).strip()
+        raw_value = getattr(completed, attribute, "")
+        if isinstance(raw_value, bytes):
+            value = raw_value.decode("utf-8", errors="replace")
+        else:
+            value = str(raw_value)
+        value = value[:_MAX_QUERY_OUTPUT_BYTES].strip()
         if value:
             return " ".join(value.split())[:240]
     return ""
@@ -341,21 +364,23 @@ def _install_with_uv(
     # pipx/uv invocation. This makes upgrades and repairs additive and safe.
     selected_extras = _normalize_extras([*previous.extras, *extras])
     package_spec = _package_spec(selected_extras, ref=ref)
-    completed = runner(
+    _run_streaming(
         [uv, "tool", "install", "--force", "--reinstall", package_spec],
-        env=dict(environment),
-        check=False,
+        runner=runner,
+        environment=environment,
+        timeout=_INSTALL_TIMEOUT_SECONDS,
+        description="uv installation",
+        failure_message="uv could not install Ash.",
     )
-    if int(getattr(completed, "returncode", 1)) != 0:
-        raise InstallError("uv could not install Ash.")
     executable = previous.executable
     if not executable:
-        directory = runner(
+        directory = _run_captured(
             [uv, "tool", "dir", "--bin"],
-            env=dict(environment),
-            check=False,
-            capture_output=True,
-            text=True,
+            runner=runner,
+            environment=environment,
+            timeout=_QUERY_TIMEOUT_SECONDS,
+            max_bytes=_MAX_QUERY_OUTPUT_BYTES,
+            description="uv tool directory query",
         )
         if int(getattr(directory, "returncode", 1)) != 0:
             raise InstallError(
@@ -403,12 +428,13 @@ def _ensure_shell_path(
         if manager == "pipx"
         else [manager_executable, "tool", "update-shell"]
     )
-    runner(
+    _run_captured(
         command,
-        env=dict(environment),
-        check=False,
-        capture_output=True,
-        text=True,
+        runner=runner,
+        environment=environment,
+        timeout=_QUERY_TIMEOUT_SECONDS,
+        max_bytes=_MAX_QUERY_OUTPUT_BYTES,
+        description=f"{manager} shell path setup",
     )
     return True
 
@@ -425,12 +451,13 @@ def _verify_executable(
     runner: Callable[..., Any],
     environment: Mapping[str, str],
 ) -> str:
-    verified = runner(
+    verified = _run_captured(
         [executable, "--version"],
-        env=dict(environment),
-        check=False,
-        capture_output=True,
-        text=True,
+        runner=runner,
+        environment=environment,
+        timeout=_VERIFY_TIMEOUT_SECONDS,
+        max_bytes=_MAX_VERSION_OUTPUT_BYTES,
+        description="Ash executable verification",
     )
     if int(getattr(verified, "returncode", 1)) != 0:
         raise InstallError("Ash was installed, but `ash --version` failed.")
@@ -446,12 +473,13 @@ def _read_pipx_state(
     runner: Callable[..., Any],
     environment: Mapping[str, str],
 ) -> _PipxInspection:
-    completed = runner(
+    completed = _run_captured(
         [pipx, "list", "--json"],
-        env=dict(environment),
-        check=False,
-        capture_output=True,
-        text=True,
+        runner=runner,
+        environment=environment,
+        timeout=_QUERY_TIMEOUT_SECONDS,
+        max_bytes=_MAX_STATE_OUTPUT_BYTES,
+        description="pipx state query",
     )
     if int(getattr(completed, "returncode", 1)) != 0:
         detail = _completed_output_detail(completed)
@@ -501,7 +529,7 @@ def _read_uv_state(
     runner: Callable[..., Any],
     environment: Mapping[str, str],
 ) -> _UvState:
-    completed = runner(
+    completed = _run_captured(
         [
             uv,
             "tool",
@@ -510,10 +538,11 @@ def _read_uv_state(
             "--show-version-specifiers",
             "--show-extras",
         ],
-        env=dict(environment),
-        check=False,
-        capture_output=True,
-        text=True,
+        runner=runner,
+        environment=environment,
+        timeout=_QUERY_TIMEOUT_SECONDS,
+        max_bytes=_MAX_STATE_OUTPUT_BYTES,
+        description="uv state query",
     )
     if int(getattr(completed, "returncode", 1)) != 0:
         return _UvState()
@@ -529,6 +558,246 @@ def _read_uv_state(
     path_match = _UV_ASH_PATH_PATTERN.search(output)
     executable = path_match.group(1).strip() if path_match else None
     return _UvState(installed=True, extras=extras, executable=executable)
+
+
+def _run_streaming(
+    command: Sequence[str],
+    *,
+    runner: Callable[..., Any],
+    environment: Mapping[str, str],
+    timeout: float,
+    description: str,
+    failure_message: str,
+) -> Any:
+    """Run a user-visible installer command with a hard upper time limit."""
+
+    try:
+        completed = runner(
+            list(command),
+            env=dict(environment),
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise InstallError(
+            f"{description} timed out after {timeout:g} seconds."
+        ) from exc
+    if int(getattr(completed, "returncode", 1)) != 0:
+        detail = _completed_output_detail(completed)
+        raise InstallError(
+            failure_message
+            + (f" {detail}" if detail else "")
+        )
+    return completed
+
+
+def _run_captured(
+    command: Sequence[str],
+    *,
+    runner: Callable[..., Any],
+    environment: Mapping[str, str],
+    timeout: float,
+    max_bytes: int,
+    description: str,
+) -> Any:
+    """Run a quiet query without retaining unbounded child-process output."""
+
+    if runner is subprocess.run:
+        return _run_bounded_subprocess(
+            command,
+            environment=environment,
+            timeout=timeout,
+            max_bytes=max_bytes,
+            description=description,
+        )
+    try:
+        completed = runner(
+            list(command),
+            env=dict(environment),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise InstallError(
+            f"{description.capitalize()} timed out after {timeout:g} seconds."
+        ) from exc
+    _validate_captured_result(completed, max_bytes=max_bytes, description=description)
+    return completed
+
+
+def _validate_captured_result(
+    completed: Any,
+    *,
+    max_bytes: int,
+    description: str,
+) -> None:
+    for attribute in ("stdout", "stderr"):
+        value = getattr(completed, attribute, "")
+        if isinstance(value, bytes):
+            size = len(value)
+        else:
+            size = len(str(value).encode("utf-8", errors="replace"))
+        if size > max_bytes:
+            raise InstallError(
+                f"{description.capitalize()} returned more than {max_bytes} bytes."
+            )
+
+
+def _run_bounded_subprocess(
+    command: Sequence[str],
+    *,
+    environment: Mapping[str, str],
+    timeout: float,
+    max_bytes: int,
+    description: str,
+) -> _CapturedResult:
+    """Capture at most ``max_bytes`` from each pipe and terminate noisy tools."""
+
+    popen_kwargs: dict[str, Any] = {
+        "env": dict(environment),
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(list(command), **popen_kwargs)
+    events: queue.Queue[tuple[str, bytes | None]] = queue.Queue(
+        maxsize=_CAPTURE_QUEUE_SIZE
+    )
+    stop_readers = threading.Event()
+    readers: list[threading.Thread] = []
+
+    def drain(name: str, stream: Any) -> None:
+        try:
+            while not stop_readers.is_set():
+                chunk = stream.read(_CAPTURE_CHUNK_BYTES)
+                if not chunk:
+                    break
+                while not stop_readers.is_set():
+                    try:
+                        events.put((name, chunk), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        except (OSError, ValueError):
+            pass
+        finally:
+            while not stop_readers.is_set():
+                try:
+                    events.put((name, None), timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+        thread = threading.Thread(target=drain, args=(name, stream), daemon=True)
+        thread.start()
+        readers.append(thread)
+
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    finished_streams: set[str] = set()
+    deadline = time.monotonic() + timeout
+    try:
+        while len(finished_streams) < 2:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process(process)
+                raise InstallError(
+                    f"{description.capitalize()} timed out after {timeout:g} seconds."
+                )
+            try:
+                name, chunk = events.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                continue
+            if chunk is None:
+                finished_streams.add(name)
+                continue
+            target = captured[name]
+            if len(target) + len(chunk) > max_bytes:
+                _terminate_process(process)
+                raise InstallError(
+                    f"{description.capitalize()} returned more than {max_bytes} bytes."
+                )
+            target.extend(chunk)
+        returncode = process.wait(timeout=max(1.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process(process)
+        raise InstallError(
+            f"{description.capitalize()} timed out after {timeout:g} seconds."
+        ) from exc
+    except BaseException:
+        _terminate_process(process)
+        raise
+    finally:
+        stop_readers.set()
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        for thread in readers:
+            thread.join(timeout=1)
+    return _CapturedResult(
+        returncode=returncode,
+        stdout=bytes(captured["stdout"]).decode("utf-8", errors="replace"),
+        stderr=bytes(captured["stderr"]).decode("utf-8", errors="replace"),
+    )
+
+
+def _terminate_process(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            process.terminate()
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                process.kill()
+        else:
+            process.kill()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _read_bounded_file(path: Path, *, max_bytes: int) -> bytes:
+    if path.is_symlink():
+        raise ValueError(f"refusing to read symlink: {path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            contents = handle.read(max_bytes + 1)
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+    if len(contents) > max_bytes:
+        raise ValueError(f"file exceeds {max_bytes} bytes: {path}")
+    return contents
 
 
 def _normalize_extras(values: Sequence[str]) -> tuple[str, ...]:
