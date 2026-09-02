@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import os
 import threading
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -17,12 +19,19 @@ from pydantic_settings import (
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
+from pydantic_settings.sources.providers.dotenv import (
+    dotenv_values,
+    parse_env_vars,
+)
 
 from ash.provider_catalog import BUILTIN_PROVIDER_IDS
 from ash.profiles import active_profile_name, profile_directory
+from ash.safe_io import read_bounded_bytes
 
 
 CURRENT_CONFIG_SCHEMA_VERSION = 1
+MAX_CONFIG_FILE_BYTES = 1024 * 1024
+MAX_DOTENV_FILE_BYTES = 1024 * 1024
 
 _INITIAL_USER_CONFIG_PATH = Path.home() / ".ash" / "ash.toml"
 _INITIAL_DOTENV_PATH = Path.home() / ".ash" / ".env"
@@ -206,13 +215,53 @@ def _apply_legacy_model_values(
 
 def _read_toml(path: Path) -> dict[str, Any]:
     try:
-        with path.open("rb") as handle:
-            value = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        value = tomllib.loads(
+            read_bounded_bytes(
+                path,
+                MAX_CONFIG_FILE_BYTES,
+                label="project TOML config",
+            ).decode("utf-8")
+        )
+    except (OSError, ValueError) as exc:
         raise ValueError(f"cannot load project config {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"project config {path} must contain a TOML table")
     return value
+
+
+class _BoundedTomlConfigSettingsSource(TomlConfigSettingsSource):
+    """Pydantic TOML source that cannot read an unbounded local file."""
+
+    def _read_file(self, file_path: Path) -> dict[str, Any]:
+        raw = read_bounded_bytes(
+            file_path,
+            MAX_CONFIG_FILE_BYTES,
+            label="user TOML config",
+        )
+        value = tomllib.loads(raw.decode("utf-8"))
+        return value if isinstance(value, dict) else {}
+
+
+class _BoundedDotEnvSettingsSource(DotEnvSettingsSource):
+    """Pydantic dotenv source that parses a bounded in-memory snapshot."""
+
+    def _read_env_file(
+        self,
+        file_path: Path,
+    ) -> Mapping[str, str | None]:
+        raw = read_bounded_bytes(
+            file_path,
+            MAX_DOTENV_FILE_BYTES,
+            label="dotenv file",
+        )
+        encoding = self.env_file_encoding or "utf-8"
+        file_vars = dotenv_values(stream=io.StringIO(raw.decode(encoding)))
+        return parse_env_vars(
+            file_vars,
+            self.case_sensitive,
+            self.env_ignore_empty,
+            self.env_parse_none_str,
+        )
 
 
 def _filter_project_config(
@@ -955,8 +1004,8 @@ class AshConfig(BaseSettings):
         return (
             init_settings,
             env_settings,
-            TomlConfigSettingsSource(settings_cls),
-            dotenv_settings,
+            _BoundedTomlConfigSettingsSource(settings_cls),
+            _BoundedDotEnvSettingsSource(settings_cls),
             file_secret_settings,
         )
 
@@ -996,11 +1045,11 @@ class AshConfig(BaseSettings):
             profile_state_directory / ".env",
         )
 
-        raw_dotenv_values = DotEnvSettingsSource(cls, env_file=dotenv_path)()
+        raw_dotenv_values = _BoundedDotEnvSettingsSource(cls, env_file=dotenv_path)()
         dotenv_values = _known_settings_values(cls, raw_dotenv_values)
         user_values = _known_settings_values(
             cls,
-            TomlConfigSettingsSource(cls, toml_file=user_config_path)(),
+            _BoundedTomlConfigSettingsSource(cls, toml_file=user_config_path)(),
         )
         env_values = _known_settings_values(cls, EnvSettingsSource(cls)())
 

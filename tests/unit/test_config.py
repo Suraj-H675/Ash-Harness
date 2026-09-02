@@ -727,6 +727,47 @@ def test_malformed_project_config_only_fails_after_trust(
         AshConfig.load()
 
 
+def test_oversized_user_config_is_rejected_before_toml_parsing() -> None:
+    from ash import config as config_module
+    from ash.commands import config as cli_config
+
+    cli_config.ensure_ash_dir()
+    cli_config.CONFIG_FILE.write_bytes(
+        b"#" * (config_module.MAX_CONFIG_FILE_BYTES + 1)
+    )
+
+    with pytest.raises(ValueError, match="user TOML config exceeds"):
+        AshConfig.load()
+
+
+def test_oversized_dotenv_is_rejected_before_settings_parsing() -> None:
+    from ash import config as config_module
+    from ash.commands import config as cli_config
+
+    cli_config.ensure_ash_dir()
+    cli_config.ENV_FILE.write_bytes(b"#" * (config_module.MAX_DOTENV_FILE_BYTES + 1))
+
+    with pytest.raises(ValueError, match="dotenv file exceeds"):
+        AshConfig.load()
+
+
+def test_user_config_symlink_is_not_followed(
+    tmp_path: Path,
+) -> None:
+    from ash.commands import config as cli_config
+
+    target = tmp_path / "outside.toml"
+    target.write_text('model = "ollama/unsafe"\n', encoding="utf-8")
+    cli_config.ensure_ash_dir()
+    try:
+        cli_config.CONFIG_FILE.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="symlinked user TOML config"):
+        AshConfig.load()
+
+
 def test_explicit_model_override_wins_legacy_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

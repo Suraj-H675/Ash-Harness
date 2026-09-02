@@ -361,6 +361,20 @@ class TestLoadEnv:
         assert env["KEY_TWO"] == "value2"
         assert env["KEY_THREE"] == "value3"
 
+    def test_load_env_rejects_oversized_dotenv(self, tmp_path: Path) -> None:
+        from ash.commands import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        cli_config.ensure_ash_dir()
+        cli_config.ENV_FILE.write_bytes(
+            b"#" * (cli_config.MAX_ENV_FILE_BYTES + 1)
+        )
+
+        with pytest.raises(ValueError, match="dotenv file exceeds"):
+            cli_config.load_env()
+
 
 class TestTomlConfig:
     """Tests for save_config / load_config with TOML."""
@@ -414,6 +428,20 @@ class TestTomlConfig:
         # No ensure_ash_dir, so ash.toml doesn't exist
         result = cli_config.load_config()
         assert result == {}
+
+    def test_load_config_rejects_oversized_toml(self, tmp_path: Path) -> None:
+        from ash.commands import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        cli_config.ensure_ash_dir()
+        cli_config.CONFIG_FILE.write_bytes(
+            b"#" * (cli_config.MAX_CONFIG_FILE_BYTES + 1)
+        )
+
+        with pytest.raises(ValueError, match="user TOML config exceeds"):
+            cli_config.load_config(strict=True)
 
 
 class TestMaskKey:

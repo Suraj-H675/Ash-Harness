@@ -32,6 +32,7 @@ from ash.commands.config import (
     is_interactive_stdin,
     load_config,
     mask_key,
+    MAX_CONFIG_FILE_BYTES,
     record_config_migration,
     save_config,
     save_env_values,
@@ -41,6 +42,7 @@ from ash.provider_catalog import (
     ProviderDescriptor,
     get_provider_descriptor,
 )
+from ash.safe_io import read_bounded_bytes
 
 
 class SetupOutcome(IntEnum):
@@ -1188,8 +1190,13 @@ def _migrate_old_ash_toml() -> None:
     try:
         import tomllib
 
-        with old_path.open("rb") as handle:
-            old_config = tomllib.load(handle)
+        old_config = tomllib.loads(
+            read_bounded_bytes(
+                old_path,
+                MAX_CONFIG_FILE_BYTES,
+                label="legacy TOML config",
+            ).decode("utf-8")
+        )
     except Exception:
         return
 

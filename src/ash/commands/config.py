@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from ash.profiles import active_profile_name, profile_directory
+from ash.safe_io import read_bounded_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +35,9 @@ _INITIAL_PATHS = (ASH_DIR, ENV_FILE, CONFIG_FILE)
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FILE_BACKED_ENV_VALUES: dict[str, tuple[str, str]] = {}
 _BACKUP_LABEL = re.compile(r"^[A-Za-z0-9_.-]+$")
+MAX_CONFIG_FILE_BYTES = 1024 * 1024
+MAX_ENV_FILE_BYTES = 1024 * 1024
+MAX_MIGRATION_STATE_BYTES = 1024 * 1024
 
 
 def _paths() -> tuple[Path, Path, Path]:
@@ -172,7 +176,13 @@ def _load_migration_state() -> dict[str, Any]:
     if not path.exists():
         return {"version": 1, "migrations": {}}
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(
+            read_bounded_bytes(
+                path,
+                MAX_MIGRATION_STATE_BYTES,
+                label="config migration state",
+            ).decode("utf-8")
+        )
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot load config migration state {path}: {exc}") from exc
     if (
@@ -241,17 +251,21 @@ def save_env_values(values: dict[str, str]) -> None:
     env_file = get_env_path()
     lines: list[str] = []
     if env_file.exists():
-        with env_file.open(encoding="utf-8") as f:
-            for raw_line in f:
-                stripped = raw_line.strip()
-                if not stripped or stripped.startswith("#"):
-                    lines.append(raw_line)
-                    continue
-                if "=" in stripped:
-                    existing_key = stripped.split("=", 1)[0]
-                    if existing_key in values:
-                        continue
+        raw = read_bounded_bytes(
+            env_file,
+            MAX_ENV_FILE_BYTES,
+            label="dotenv file",
+        )
+        for raw_line in raw.decode("utf-8").splitlines(keepends=True):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
                 lines.append(raw_line)
+                continue
+            if "=" in stripped:
+                existing_key = stripped.split("=", 1)[0]
+                if existing_key in values:
+                    continue
+            lines.append(raw_line)
 
     fd, tmp = tempfile.mkstemp(dir=str(ash_dir), suffix=".tmp")
     try:
@@ -299,15 +313,15 @@ def get_env_value(key: str) -> str | None:
     if not env_file.exists():
         return None
 
-    with env_file.open() as f:
-        for line in f:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            if "=" in stripped:
-                k, _, v = stripped.partition("=")
-                if k == key:
-                    return v
+    raw = read_bounded_bytes(env_file, MAX_ENV_FILE_BYTES, label="dotenv file")
+    for line in raw.decode("utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" in stripped:
+            k, _, v = stripped.partition("=")
+            if k == key:
+                return v
     return None
 
 
@@ -317,14 +331,14 @@ def load_env() -> dict[str, str]:
     env_file = get_env_path()
     if not env_file.exists():
         return env
-    with env_file.open() as f:
-        for line in f:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            if "=" in stripped:
-                k, _, v = stripped.partition("=")
-                env[k] = v
+    raw = read_bounded_bytes(env_file, MAX_ENV_FILE_BYTES, label="dotenv file")
+    for line in raw.decode("utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" in stripped:
+            k, _, v = stripped.partition("=")
+            env[k] = v
     return env
 
 
@@ -368,13 +382,23 @@ def load_config(*, strict: bool = False) -> dict[str, Any]:
         return {}
     try:
         if strict:
-            with config_file.open("rb") as handle:
-                value = tomllib.load(handle)
+            value = tomllib.loads(
+                read_bounded_bytes(
+                    config_file,
+                    MAX_CONFIG_FILE_BYTES,
+                    label="user TOML config",
+                ).decode("utf-8")
+            )
             return value if isinstance(value, dict) else {}
         import toml  # type: ignore[import-untyped]
 
-        with config_file.open() as f:
-            return toml.load(f)
+        return toml.loads(
+            read_bounded_bytes(
+                config_file,
+                MAX_CONFIG_FILE_BYTES,
+                label="user TOML config",
+            ).decode("utf-8")
+        )
     except Exception:
         if strict:
             raise
@@ -481,8 +505,13 @@ def _load_raw_toml_config() -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        with path.open("rb") as handle:
-            value = tomllib.load(handle)
+        value = tomllib.loads(
+            read_bounded_bytes(
+                path,
+                MAX_CONFIG_FILE_BYTES,
+                label="user TOML config",
+            ).decode("utf-8")
+        )
     except Exception:
         return {}
     return value if isinstance(value, dict) else {}
