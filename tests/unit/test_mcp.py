@@ -127,6 +127,19 @@ def test_load_mcp_servers_rejects_oversized_config(tmp_path: Path) -> None:
         load_mcp_servers(path)
 
 
+def test_load_mcp_servers_does_not_follow_symlinked_config(tmp_path: Path) -> None:
+    target = tmp_path / "outside.json"
+    target.write_text('{"server": {"command": "server"}}', encoding="utf-8")
+    path = tmp_path / ".mcp.json"
+    try:
+        path.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="symlinked MCP config"):
+        load_mcp_servers(path)
+
+
 def test_expand_env_vars() -> None:
     import os
 

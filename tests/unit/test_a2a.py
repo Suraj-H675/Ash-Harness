@@ -324,6 +324,25 @@ def test_a2a_remote_config_respects_trust_and_rejects_duplicates(
         )
 
 
+def test_a2a_remote_config_does_not_follow_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "outside-a2a.json"
+    target.write_text('{"agents": {}}', encoding="utf-8")
+    home = tmp_path / "home"
+    config_path = home / ".ash" / "a2a.json"
+    config_path.parent.mkdir(parents=True)
+    try:
+        config_path.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(ValueError, match="symlinked A2A config"):
+        load_remote_agent_configs(tmp_path / "workspace", include_project=False)
+
+
 @pytest.mark.asyncio
 async def test_remote_agent_inventory_hides_private_endpoint(tmp_path: Path) -> None:
     tool = ListRemoteAgentsTool(

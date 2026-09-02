@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+from ash.safe_io import read_bounded_bytes
 
 CATALOG_VERSION = 1
 MAX_CATALOG_BYTES = 256 * 1024
@@ -139,13 +140,15 @@ class SignedCatalog:
 
 def load_trusted_keys(path: Path) -> dict[str, bytes]:
     try:
-        raw = path.read_bytes()
-    except OSError as exc:
+        raw = read_bounded_bytes(path, 64 * 1024, label="trusted catalog keys")
+    except (OSError, ValueError) as exc:
+        if "exceeds" in str(exc):
+            raise PluginCatalogError(
+                f"trusted catalog keys exceed 64 KiB: {path}"
+            ) from exc
         raise PluginCatalogError(
             f"cannot read trusted catalog keys {path}: {exc}"
         ) from exc
-    if len(raw) > 64 * 1024:
-        raise PluginCatalogError(f"trusted catalog keys exceed 64 KiB: {path}")
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -191,11 +194,13 @@ def parse_and_verify_catalog(
     trusted_keys_path: Path,
 ) -> SignedCatalog:
     try:
-        raw = path.read_bytes()
-    except OSError as exc:
+        raw = read_bounded_bytes(path, MAX_CATALOG_BYTES, label="plugin catalog")
+    except (OSError, ValueError) as exc:
+        if "exceeds" in str(exc):
+            raise PluginCatalogError(
+                f"plugin catalog exceeds 256 KiB: {path}"
+            ) from exc
         raise PluginCatalogError(f"cannot read plugin catalog {path}: {exc}") from exc
-    if len(raw) > MAX_CATALOG_BYTES:
-        raise PluginCatalogError(f"plugin catalog exceeds 256 KiB: {path}")
     envelope = _parse_strict_json(raw.decode("utf-8"))
     if not isinstance(envelope, dict) or set(envelope) != {
         "catalog",

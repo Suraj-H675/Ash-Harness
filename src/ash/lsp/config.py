@@ -10,6 +10,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from ash.safe_io import read_bounded_bytes
+
 
 MAX_LSP_CONFIG_BYTES = 256 * 1024
 MAX_LSP_SERVERS = 32
@@ -165,11 +167,13 @@ def lsp_command_available(config: LSPServerConfig, workspace: Path) -> bool:
 
 def _read_config(path: Path) -> dict[str, Any]:
     try:
-        raw = path.read_bytes()
-        if len(raw) > MAX_LSP_CONFIG_BYTES:
-            raise ValueError(f"LSP config exceeds 256 KiB: {path}")
+        raw = read_bounded_bytes(
+            path,
+            MAX_LSP_CONFIG_BYTES,
+            label="LSP config",
+        )
         payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         raise ValueError(f"invalid LSP config {path}: {exc}") from exc
     if not isinstance(payload, dict) or set(payload) != {"servers"}:
         raise ValueError(f"LSP config {path} must contain only a servers object")

@@ -41,6 +41,7 @@ from ash.plugins.registry import (
 )
 from ash.plugins.skills import SkillCatalog, SkillSource
 from ash.safety.trust import canonical_workspace, is_workspace_trusted
+from ash.safe_io import read_bounded_bytes
 
 ExtensionKind = Literal["all", "skills", "agents", "plugins", "hooks"]
 PluginAction = Literal["install", "enable", "disable", "uninstall"]
@@ -690,10 +691,11 @@ def _discover_hooks(
         if not path.is_file():
             continue
         try:
-            with path.open("rb") as handle:
-                raw = handle.read(MAX_HOOK_CONFIG_BYTES + 1)
-            if len(raw) > MAX_HOOK_CONFIG_BYTES:
-                raise ValueError("hook config exceeds 1 MiB")
+            raw = read_bounded_bytes(
+                path,
+                MAX_HOOK_CONFIG_BYTES,
+                label="hook config",
+            )
             payload = json.loads(raw.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("hook config must be an object")

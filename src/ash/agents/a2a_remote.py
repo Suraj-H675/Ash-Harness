@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from ash.core.redaction import redact_text
 from ash.safety.guard import SafetyGuard
+from ash.safe_io import read_bounded_bytes
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 
 
@@ -185,11 +186,13 @@ def load_remote_agent_configs(
         if not path.is_file():
             continue
         try:
-            raw_bytes = path.read_bytes()
-            if len(raw_bytes) > MAX_A2A_CONFIG_BYTES:
-                raise ValueError(f"A2A config exceeds 256 KiB: {path}")
+            raw_bytes = read_bounded_bytes(
+                path,
+                MAX_A2A_CONFIG_BYTES,
+                label="A2A config",
+            )
             payload = json.loads(raw_bytes.decode("utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
             raise ValueError(f"invalid A2A config {path}: {exc}") from exc
         if not isinstance(payload, dict) or set(payload) != {"agents"}:
             raise ValueError(f"A2A config {path} must contain only an agents object")

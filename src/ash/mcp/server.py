@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ash.safety.environment import build_scrubbed_environment
+from ash.safe_io import read_bounded_bytes
 
 MAX_MCP_CONFIG_BYTES = 256 * 1024
 MCP_SERVER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -218,10 +219,16 @@ def load_mcp_servers(
         config_path = Path(".mcp.json")
     if not config_path.exists():
         return {}
-    with config_path.open("rb") as handle:
-        raw_bytes = handle.read(MAX_MCP_CONFIG_BYTES + 1)
-    if len(raw_bytes) > MAX_MCP_CONFIG_BYTES:
-        raise ValueError(f"MCP config exceeds 256 KiB: {config_path}")
+    try:
+        raw_bytes = read_bounded_bytes(
+            config_path,
+            MAX_MCP_CONFIG_BYTES,
+            label="MCP config",
+        )
+    except ValueError as exc:
+        if "exceeds" in str(exc):
+            raise ValueError(f"MCP config exceeds 256 KiB: {config_path}") from exc
+        raise ValueError(f"MCP config is not readable: {config_path}: {exc}") from exc
     raw: Any = json.loads(raw_bytes.decode("utf-8"))
 
     if not isinstance(raw, dict):

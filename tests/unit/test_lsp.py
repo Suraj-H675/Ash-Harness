@@ -123,6 +123,21 @@ def test_config_rejects_duplicate_keys_and_traversing_markers(
         load_lsp_server_configs(tmp_path, include_project=True, detect_builtins=False)
 
 
+def test_project_lsp_config_symlink_is_not_followed(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".ash"
+    config_dir.mkdir()
+    target = tmp_path / "outside-lsp.json"
+    target.write_text('{"servers": {}}', encoding="utf-8")
+    config_path = config_dir / "lsp.json"
+    try:
+        config_path.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="symlinked LSP config"):
+        load_lsp_server_configs(tmp_path, include_project=True, detect_builtins=False)
+
+
 def test_workspace_server_detection_requires_trust_and_executable_bit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

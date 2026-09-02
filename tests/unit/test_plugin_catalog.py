@@ -120,6 +120,18 @@ def test_rejects_unknown_key(tmp_path: Path) -> None:
         )
 
 
+def test_local_catalog_symlink_is_not_followed(tmp_path: Path) -> None:
+    files = _write_catalog(tmp_path / "catalog.json")
+    linked = tmp_path / "linked-catalog.json"
+    try:
+        linked.symlink_to(files["catalog_path"])
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(PluginCatalogError, match="cannot read plugin catalog"):
+        parse_and_verify_catalog(linked, trusted_keys_path=files["keys_path"])
+
+
 def test_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     files = _write_catalog(tmp_path / "catalog.json")
     raw = files["catalog_path"].read_text()
