@@ -9,6 +9,9 @@ import pytest
 
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.tools.command import (
+    MAX_COMMAND_CWD_CHARS,
+    MAX_COMMAND_INPUT_CHARS,
+    RunCommandArgs,
     RunCommandTool,
     decode_stream,
     quote_powershell_literal_path,
@@ -34,6 +37,15 @@ def project_root(tmp_path: Path) -> Path:
 @pytest.fixture
 def guard(project_root: Path) -> SafetyGuard:
     return SafetyGuard(project_root)
+
+
+def test_run_command_schema_rejects_oversized_command_and_cwd() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        RunCommandArgs(command_line="x" * (MAX_COMMAND_INPUT_CHARS + 1))
+    with pytest.raises(ValidationError):
+        RunCommandArgs(command_line="echo ok", cwd="x" * (MAX_COMMAND_CWD_CHARS + 1))
 
 
 @pytest.mark.asyncio

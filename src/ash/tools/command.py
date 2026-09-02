@@ -21,6 +21,8 @@ from ash.sandbox.process_utils import process_group_options, terminate_process_t
 
 
 DEFAULT_TIMEOUT_SECONDS = 300
+MAX_COMMAND_INPUT_CHARS = 100_000
+MAX_COMMAND_CWD_CHARS = 4_096
 MAX_COMMAND_OUTPUT_CHARS = 100_000
 OUTPUT_CAPTURE_LIMIT_NOTICE = "Process output capture limit reached."
 MAX_DIAGNOSTIC_ITEMS = 50
@@ -38,9 +40,15 @@ POWERSHELL_FILE_CMDLETS = (
 
 
 class RunCommandArgs(BaseModel):
-    command_line: str = Field(..., description="The shell command string to execute.")
+    command_line: str = Field(
+        ...,
+        max_length=MAX_COMMAND_INPUT_CHARS,
+        description="The shell command string to execute.",
+    )
     cwd: str | None = Field(
-        None, description="Directory path context to run the command in."
+        None,
+        max_length=MAX_COMMAND_CWD_CHARS,
+        description="Directory path context to run the command in.",
     )
     timeout_seconds: int = Field(
         DEFAULT_TIMEOUT_SECONDS,
