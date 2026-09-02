@@ -805,6 +805,43 @@ async def test_runtime_tools_start_once_after_session_is_available(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_loop_negotiates_ollama_capabilities_before_session_prompt(tmp_path):
+    from contextlib import asynccontextmanager
+
+    import httpx
+
+    from ash.providers.ollama import OllamaProvider
+
+    class MetadataClient:
+        @asynccontextmanager
+        async def stream(self, *args, **kwargs):
+            yield httpx.Response(
+                200,
+                json={
+                    "details": {"families": ["tools"]},
+                    "model_info": {"general.context_length": 16384},
+                },
+            )
+
+    provider = OllamaProvider(model_name="local-tools", client=MetadataClient())  # type: ignore[arg-type]
+    loop = AshLoop(
+        SessionStore(tmp_path / "ollama-capabilities.db"),
+        provider,
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+
+    await loop.start_session()
+
+    assert provider.capabilities.native_tools is True
+    assert provider.capabilities.context_window == 16384
+    assert "provider's native tool-calling interface" in loop.system_prompt
+    assert "<call_tool" not in loop.system_prompt
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_model_failure_emits_paired_lifecycle_and_closes_turn(tmp_path):
     observed = []
     hooks = HookRegistry()

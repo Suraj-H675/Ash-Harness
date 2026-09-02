@@ -468,6 +468,8 @@ class AshLoop:
         for tool in self.tools.values():
             tool.set_event_sink(self._emit_event)
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
+        self._generated_system_prompt = not bool(system_prompt)
+        self._additional_instructions = additional_instructions
         self.system_prompt = system_prompt or _default_system_prompt(
             project_root,
             native_tools=_provider_capabilities(provider).native_tools,
@@ -691,9 +693,30 @@ class AshLoop:
 
     # --- session lifecycle ------------------------------------------------
 
+    async def _negotiate_provider_capabilities(self) -> None:
+        """Resolve optional runtime capabilities before building a session prompt."""
+
+        detect = getattr(self.provider, "detect_capabilities", None)
+        if not callable(detect):
+            return
+        try:
+            await detect()
+        except Exception:  # noqa: BLE001 - capability negotiation is best-effort
+            return
+        if not self._generated_system_prompt:
+            return
+        base_prompt = _default_system_prompt(
+            self.project_root,
+            native_tools=_provider_capabilities(self.provider).native_tools,
+        )
+        if self._additional_instructions:
+            base_prompt = f"{base_prompt}\n\n{self._additional_instructions}"
+        self._base_system_prompt = base_prompt
+
     async def start_session(self, session_id: str | None = None) -> Session:
         """Create a new session or restore one by id."""
 
+        await self._negotiate_provider_capabilities()
         if self._mcp_configs and self._mcp_runtime is None:
             await self._start_mcp_runtime()
         search_tool = self.tools.get("search_tools")
