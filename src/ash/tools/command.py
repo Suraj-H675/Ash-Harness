@@ -21,6 +21,7 @@ from ash.sandbox.process_utils import process_group_options, terminate_process_t
 
 
 DEFAULT_TIMEOUT_SECONDS = 300
+MAX_COMMAND_TIMEOUT_SECONDS = 86_400
 MAX_COMMAND_INPUT_CHARS = 100_000
 MAX_COMMAND_CWD_CHARS = 4_096
 MAX_COMMAND_OUTPUT_CHARS = 100_000
@@ -53,6 +54,7 @@ class RunCommandArgs(BaseModel):
     timeout_seconds: int = Field(
         DEFAULT_TIMEOUT_SECONDS,
         ge=1,
+        le=MAX_COMMAND_TIMEOUT_SECONDS,
         description="Hard timeout for subprocess execution.",
     )
 

@@ -11,6 +11,7 @@ from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.tools.command import (
     MAX_COMMAND_CWD_CHARS,
     MAX_COMMAND_INPUT_CHARS,
+    MAX_COMMAND_TIMEOUT_SECONDS,
     RunCommandArgs,
     RunCommandTool,
     decode_stream,
@@ -46,6 +47,11 @@ def test_run_command_schema_rejects_oversized_command_and_cwd() -> None:
         RunCommandArgs(command_line="x" * (MAX_COMMAND_INPUT_CHARS + 1))
     with pytest.raises(ValidationError):
         RunCommandArgs(command_line="echo ok", cwd="x" * (MAX_COMMAND_CWD_CHARS + 1))
+    with pytest.raises(ValidationError):
+        RunCommandArgs(
+            command_line="echo ok",
+            timeout_seconds=MAX_COMMAND_TIMEOUT_SECONDS + 1,
+        )
 
 
 @pytest.mark.asyncio
