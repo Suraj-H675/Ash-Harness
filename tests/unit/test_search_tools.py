@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock, Mock
+
 import pytest
 
 from ash.safety.guard import SafetyGuard
@@ -64,6 +66,32 @@ async def test_search_text_returns_file_and_line(tmp_path) -> None:
     )
     assert result.success is True
     assert "app.py:2:needle here" in result.output
+
+
+@pytest.mark.asyncio
+async def test_search_text_skips_malformed_ripgrep_events(tmp_path, monkeypatch) -> None:
+    process = Mock(returncode=0)
+    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: "/usr/bin/rg")
+    monkeypatch.setattr(
+        "ash.tools.search.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    monkeypatch.setattr(
+        "ash.tools.search.communicate_process",
+        AsyncMock(
+            return_value=(
+                b'[]\n{"type":"match"}\n'
+                b'{"type":"match","data":{"path":{"text":"ok.py"},'
+                b'"line_number":3,"lines":{"text":"needle\\n"}}}\n',
+                b"",
+            )
+        ),
+    )
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(pattern="needle")
+
+    assert result.success is True
+    assert result.output == "ok.py:3:needle"
 
 
 @pytest.mark.asyncio

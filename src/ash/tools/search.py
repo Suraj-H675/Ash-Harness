@@ -254,12 +254,24 @@ class SearchTextTool(BaseTool):
             except json.JSONDecodeError:
                 # A bounded capture may end in the middle of one JSON event.
                 continue
-            if event.get("type") != "match":
+            if not isinstance(event, dict) or event.get("type") != "match":
                 continue
-            data = event["data"]
-            path = data["path"]["text"]
-            line_number = data["line_number"]
-            text = data["lines"]["text"].rstrip("\r\n")
+            data = event.get("data")
+            if not isinstance(data, dict):
+                continue
+            path_data = data.get("path")
+            lines_data = data.get("lines")
+            path = path_data.get("text") if isinstance(path_data, dict) else None
+            line_number = data.get("line_number")
+            text = lines_data.get("text") if isinstance(lines_data, dict) else None
+            if (
+                not isinstance(path, str)
+                or not isinstance(line_number, int)
+                or isinstance(line_number, bool)
+                or not isinstance(text, str)
+            ):
+                continue
+            text = text.rstrip("\r\n")
             matches.append(f"{path}:{line_number}:{text}")
             if len(matches) >= args.max_results:
                 break
