@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import subprocess
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,7 @@ from ash.plugins.catalog import (
     parse_and_verify_catalog,
     sign_catalog,
 )
-from ash.plugins.lifecycle import install_git_plugin
+from ash.plugins.lifecycle import PluginLifecycleError, install_git_plugin
 
 
 def _write_catalog(
@@ -197,6 +198,15 @@ def test_git_install_verifies_catalog_revision(tmp_path: Path) -> None:
 
     assert installed.name == "demo"
 
+    local_installed = install_git_plugin(
+        source,
+        ref="v1.2.3",
+        destination_root=tmp_path / "installed-local-uri",
+        replace=False,
+        validator=lambda root, manifest: None,
+    )
+    assert local_installed.name == "demo"
+
     bad_entry = CatalogEntry(
         name="demo",
         version="1.2.3",
@@ -213,3 +223,42 @@ def test_git_install_verifies_catalog_revision(tmp_path: Path) -> None:
             validator=lambda root, manifest: None,
             expected=bad_entry,
         )
+
+
+def test_git_install_times_out_without_leaking_clone_process(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], 300)
+
+    monkeypatch.setattr("ash.plugins.lifecycle.subprocess.run", timeout)
+
+    with pytest.raises(PluginLifecycleError) as exc_info:
+        install_git_plugin(
+            "https://plugins.example/demo.git",
+            ref="main",
+            destination_root=tmp_path / "installed",
+        )
+
+    assert "timed out" in str(exc_info.value)
+
+
+def test_git_install_caps_clone_error_detail(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def noisy_failure(*args, **kwargs):
+        kwargs["stderr"].write(b"x" * 100_000)
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr("ash.plugins.lifecycle.subprocess.run", noisy_failure)
+
+    with pytest.raises(PluginLifecycleError) as exc_info:
+        install_git_plugin(
+            "https://plugins.example/demo.git",
+            ref="main",
+            destination_root=tmp_path / "installed",
+        )
+
+    message = str(exc_info.value)
+    assert len(message) < 70_000
+    assert message.endswith("…")

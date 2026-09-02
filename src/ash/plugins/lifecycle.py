@@ -15,13 +15,20 @@ from typing import Any, Callable
 
 from ash.plugins.manifest import PLUGIN_NAME, PluginManifest
 from ash.plugins.catalog import CatalogEntry, PluginCatalogError
-from ash.plugins.registry import _iter_plugin_tree, _plugin_manifest_paths, _validate_manifest
+from ash.plugins.registry import (
+    _iter_plugin_tree,
+    _plugin_manifest_paths,
+    _validate_manifest,
+)
+from ash.sandbox.process_utils import process_group_options
 
 MAX_PLUGIN_FILES = 10_000
 MAX_PLUGIN_BYTES = 256 * 1024 * 1024
 MAX_EXTENSION_STATE_BYTES = 256 * 1024
 STATE_VERSION = 1
 MAX_GIT_CLONE_BYTES = MAX_PLUGIN_BYTES
+MAX_GIT_CLONE_SECONDS = 300
+MAX_GIT_ERROR_BYTES = 64 * 1024
 
 
 class PluginLifecycleError(ValueError):
@@ -253,37 +260,61 @@ def install_git_plugin(
     expected: CatalogEntry | None = None,
 ) -> InstalledPlugin:
     parsed = urllib.parse.urlsplit(source)
-    if expected is None and (
-        parsed.scheme.lower() not in {"https", "file"} or not parsed.hostname
-    ):
+    scheme = parsed.scheme.lower()
+    if scheme == "https":
+        if not parsed.hostname:
+            raise PluginLifecycleError("plugin Git source must use an HTTPS URL")
+    elif scheme == "file":
+        if parsed.hostname not in {None, "", "localhost"}:
+            raise PluginLifecycleError("plugin file source must be local")
+    else:
         raise PluginLifecycleError("plugin Git source must use an HTTPS URL")
     if not ref:
         raise PluginLifecycleError("plugin Git source requires an explicit --ref")
-    if "\x00" in ref or "\n" in ref or "\r" in ref:
+    if len(ref) > 255 or "\x00" in ref or "\n" in ref or "\r" in ref:
         raise PluginLifecycleError("plugin Git reference is invalid")
+    if len(source) > 2048:
+        raise PluginLifecycleError("plugin Git source URL is too long")
 
     temporary_root = Path(tempfile.mkdtemp(prefix="ash-plugin-git-"))
     checkout = temporary_root / "plugin"
     try:
-        completed = subprocess.run(
-            [
-                "git",
-                "clone",
-                "--depth",
-                "1",
-                "--branch",
-                ref,
-                "--single-branch",
-                source,
-                str(checkout),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+        with tempfile.TemporaryFile() as error_output:
+            try:
+                completed = subprocess.run(
+                    [
+                        "git",
+                        "clone",
+                        "--quiet",
+                        "--depth",
+                        "1",
+                        "--branch",
+                        ref,
+                        "--single-branch",
+                        source,
+                        str(checkout),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=error_output,
+                    check=False,
+                    timeout=MAX_GIT_CLONE_SECONDS,
+                    **process_group_options(),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise PluginLifecycleError(
+                    f"plugin Git clone timed out after {MAX_GIT_CLONE_SECONDS} seconds"
+                ) from exc
+            error_output.seek(0)
+            detail = error_output.read(MAX_GIT_ERROR_BYTES + 1)
         if completed.returncode:
-            detail = completed.stderr.decode("utf-8", errors="replace").strip()
-            raise PluginLifecycleError(f"could not clone plugin source: {detail}")
+            detail_text = detail.decode("utf-8", errors="replace").strip()
+            if len(detail) > MAX_GIT_ERROR_BYTES:
+                detail_text = detail_text[:MAX_GIT_ERROR_BYTES] + "…"
+            raise PluginLifecycleError(
+                "could not clone plugin source"
+                + (f": {detail_text}" if detail_text else "")
+            )
+        _validate_tree(checkout)
         if expected is not None:
             _verify_catalog_checkout(checkout, source, ref, expected)
         shutil.rmtree(checkout / ".git")
