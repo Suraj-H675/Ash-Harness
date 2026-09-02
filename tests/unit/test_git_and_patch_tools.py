@@ -9,6 +9,7 @@ from ash.safety.guard import SafetyGuard
 from ash.sandbox.process_utils import ProcessOutputLimitExceeded, communicate_process
 from ash.tools.git import (
     GIT_OUTPUT_LIMIT_EXIT,
+    AutoCommitArgs,
     AutoCommitTool,
     GitDiffTool,
     GitLogTool,
@@ -203,6 +204,15 @@ async def test_auto_commit_requires_explicit_paths(tmp_path: Path) -> None:
     status = await GitStatusTool(SafetyGuard(tmp_path)).run()
     assert " M tracked.txt" in status.output
     assert "?? untracked.txt" in status.output
+
+
+def test_auto_commit_argument_schema_rejects_empty_and_oversized_inputs() -> None:
+    with pytest.raises(ValueError):
+        AutoCommitArgs(message="scoped", paths=[""])
+    with pytest.raises(ValueError):
+        AutoCommitArgs(message="scoped", paths=["x" * 4097])
+    with pytest.raises(ValueError):
+        AutoCommitArgs(message="x" * 65_537)
 
 
 @pytest.mark.asyncio

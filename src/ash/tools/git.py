@@ -12,7 +12,7 @@ import asyncio
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Annotated, Any, Iterable, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -32,6 +32,11 @@ DEFAULT_COMMIT_AUTHOR = "ash <ash@local>"
 DEFAULT_GIT_OUTPUT_LIMIT = 100_000
 GIT_OUTPUT_LIMIT_EXIT = -2
 MAX_SECRET_FINDINGS = 20
+MAX_GIT_PATH_CHARS = 4_096
+MAX_COMMIT_MESSAGE_CHARS = 65_536
+MAX_COMMIT_PATHS = 1_000
+MAX_COMMIT_AUTHOR_CHARS = 512
+_GitPath = Annotated[str, Field(min_length=1, max_length=MAX_GIT_PATH_CHARS)]
 _DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
@@ -41,7 +46,7 @@ class GitStatusArgs(BaseModel):
 
 class GitDiffArgs(BaseModel):
     staged: bool = False
-    path: str = ""
+    path: str = Field("", max_length=MAX_GIT_PATH_CHARS)
 
 
 class GitLogArgs(BaseModel):
@@ -97,13 +102,20 @@ class GitLogTool(BaseTool):
 
 
 class AutoCommitArgs(BaseModel):
-    message: str = Field(..., description="Commit message body.")
-    paths: list[str] = Field(
+    message: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_COMMIT_MESSAGE_CHARS,
+        description="Commit message body.",
+    )
+    paths: list[_GitPath] = Field(
         default_factory=list,
+        max_length=MAX_COMMIT_PATHS,
         description="Explicit workspace-relative paths to stage and commit.",
     )
     author: str = Field(
         DEFAULT_COMMIT_AUTHOR,
+        max_length=MAX_COMMIT_AUTHOR_CHARS,
         description="Commit author in 'Name <email>' form.",
     )
 
