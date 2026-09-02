@@ -34,7 +34,11 @@ from ash.plugins.lifecycle import (
     user_plugin_root,
 )
 from ash.plugins.registry import PluginCatalog
-from ash.plugins.registry import DiscoveredPlugin, _validate_manifest
+from ash.plugins.registry import (
+    DiscoveredPlugin,
+    _plugin_manifest_paths,
+    _validate_manifest,
+)
 from ash.plugins.skills import SkillCatalog, SkillSource
 from ash.safety.trust import canonical_workspace, is_workspace_trusted
 
@@ -592,7 +596,11 @@ def _installed_user_manifests() -> dict[str, PluginManifest]:
     root = user_plugin_root()
     if not root.is_dir():
         return manifests
-    for path in sorted(root.glob("*/plugin.json")):
+    try:
+        manifest_paths = _plugin_manifest_paths(root)
+    except (OSError, ValueError) as exc:
+        raise PluginLifecycleError(f"cannot inspect installed plugins: {exc}") from exc
+    for path in manifest_paths:
         try:
             manifest = PluginManifest.load(path)
             _validate_manifest(manifest, path.parent)

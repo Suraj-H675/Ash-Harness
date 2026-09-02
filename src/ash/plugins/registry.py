@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 from ash.plugins.manifest import PluginManifest, validate_plugin_identity
+
+
+MAX_PLUGIN_DISCOVERY_ENTRIES = 10_000
+MAX_PLUGIN_TREE_ENTRIES = 100_000
+MAX_PLUGIN_TREE_DEPTH = 32
 
 
 @dataclass(frozen=True)
@@ -89,7 +95,12 @@ class PluginCatalog:
         for root, source in self.roots:
             if not root.is_dir():
                 continue
-            for path in sorted(root.glob("*/plugin.json")):
+            try:
+                manifest_paths = _plugin_manifest_paths(root)
+            except (OSError, ValueError) as exc:
+                self.errors[str(root)] = str(exc)
+                continue
+            for path in manifest_paths:
                 if path.parent.name in self.disabled_plugins and not include_disabled:
                     continue
                 try:
@@ -129,9 +140,8 @@ class PluginCatalog:
 
 
 def _validate_manifest(manifest: PluginManifest, root: Path) -> None:
-    for path in (root, *root.rglob("*")):
-        if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
-            raise ValueError(f"plugin tree contains a link: {path}")
+    for _ in _iter_plugin_tree(root):
+        pass
     validate_plugin_identity(manifest)
     for field, values in (
         ("commands", manifest.commands),
@@ -163,3 +173,77 @@ def _validate_manifest(manifest: PluginManifest, root: Path) -> None:
             raise ValueError(f"component path escapes plugin root: {relative}") from exc
         if not candidate.exists():
             raise ValueError(f"component path does not exist: {relative}")
+
+
+def _plugin_manifest_paths(root: Path) -> list[Path]:
+    if root.is_symlink() or (hasattr(root, "is_junction") and root.is_junction()):
+        raise ValueError(f"plugin root cannot be a link: {root}")
+    children: list[Path] = []
+    try:
+        for child in root.iterdir():
+            children.append(child)
+            if len(children) > MAX_PLUGIN_DISCOVERY_ENTRIES:
+                raise ValueError(
+                    f"plugin discovery exceeds {MAX_PLUGIN_DISCOVERY_ENTRIES} entries"
+                )
+    except OSError as exc:
+        raise ValueError(f"cannot read plugin root {root}: {exc}") from exc
+    paths: list[Path] = []
+    for child in sorted(children, key=lambda path: path.name):
+        if child.is_symlink() or (
+            hasattr(child, "is_junction") and child.is_junction()
+        ):
+            continue
+        try:
+            if child.is_dir():
+                manifest = child / "plugin.json"
+                if manifest.is_file() or manifest.is_symlink():
+                    paths.append(manifest)
+        except OSError:
+            continue
+    return paths
+
+
+def _iter_plugin_tree(root: Path) -> Iterator[Path]:
+    pending: list[tuple[Path, int]] = [(root, 0)]
+    entries_seen = 0
+    while pending:
+        current, depth = pending.pop()
+        if current.is_symlink() or (
+            hasattr(current, "is_junction") and current.is_junction()
+        ):
+            raise ValueError(f"plugin tree contains a link: {current}")
+        yield current
+        try:
+            is_directory = current.is_dir()
+        except OSError as exc:
+            raise ValueError(f"cannot inspect plugin path {current}: {exc}") from exc
+        if not is_directory:
+            continue
+        children: list[Path] = []
+        try:
+            for child in current.iterdir():
+                children.append(child)
+                if len(children) > MAX_PLUGIN_TREE_ENTRIES:
+                    raise ValueError(
+                        f"plugin tree exceeds {MAX_PLUGIN_TREE_ENTRIES} entries"
+                    )
+        except OSError as exc:
+            raise ValueError(f"cannot read plugin directory {current}: {exc}") from exc
+        children.sort(key=lambda path: path.name)
+        for child in reversed(children):
+            entries_seen += 1
+            if entries_seen > MAX_PLUGIN_TREE_ENTRIES:
+                raise ValueError(f"plugin tree exceeds {MAX_PLUGIN_TREE_ENTRIES} entries")
+            if child.is_symlink() or (
+                hasattr(child, "is_junction") and child.is_junction()
+            ):
+                raise ValueError(f"plugin tree contains a link: {child}")
+            try:
+                if child.is_dir() and depth >= MAX_PLUGIN_TREE_DEPTH:
+                    raise ValueError(
+                        f"plugin tree exceeds depth {MAX_PLUGIN_TREE_DEPTH}"
+                    )
+            except OSError as exc:
+                raise ValueError(f"cannot inspect plugin path {child}: {exc}") from exc
+            pending.append((child, depth + 1))

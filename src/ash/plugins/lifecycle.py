@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from ash.plugins.manifest import PLUGIN_NAME, PluginManifest
 from ash.plugins.catalog import CatalogEntry, PluginCatalogError
-from ash.plugins.registry import _validate_manifest
+from ash.plugins.registry import _iter_plugin_tree, _plugin_manifest_paths, _validate_manifest
 
 MAX_PLUGIN_FILES = 10_000
 MAX_PLUGIN_BYTES = 256 * 1024 * 1024
@@ -132,7 +132,11 @@ def install_local_plugin(
         root.chmod(0o700)
     destination = root / manifest.name
     installed_versions: dict[str, str] = {}
-    for installed_manifest in root.glob("*/plugin.json"):
+    try:
+        installed_manifests = _plugin_manifest_paths(root)
+    except (OSError, ValueError) as exc:
+        raise PluginLifecycleError(f"cannot inspect installed plugins: {exc}") from exc
+    for installed_manifest in installed_manifests:
         if installed_manifest.parent.name == manifest.name:
             continue
         try:
@@ -220,22 +224,23 @@ def uninstall_local_plugin(
 
 
 def _validate_tree(root: Path) -> None:
-    if _is_link(root):
-        raise PluginLifecycleError(f"plugin tree contains a link: {root}")
     files = 0
     total_bytes = 0
-    for path in root.rglob("*"):
-        if _is_link(path):
-            raise PluginLifecycleError(f"plugin tree contains a link: {path}")
-        if path.is_file():
-            files += 1
-            total_bytes += path.stat().st_size
-            if files > MAX_PLUGIN_FILES:
-                raise PluginLifecycleError(
-                    f"plugin contains more than {MAX_PLUGIN_FILES} files"
-                )
-            if total_bytes > MAX_PLUGIN_BYTES:
-                raise PluginLifecycleError("plugin exceeds 256 MiB")
+    try:
+        for path in _iter_plugin_tree(root):
+            if path.is_file():
+                files += 1
+                total_bytes += path.stat().st_size
+                if files > MAX_PLUGIN_FILES:
+                    raise PluginLifecycleError(
+                        f"plugin contains more than {MAX_PLUGIN_FILES} files"
+                    )
+                if total_bytes > MAX_PLUGIN_BYTES:
+                    raise PluginLifecycleError("plugin exceeds 256 MiB")
+    except PluginLifecycleError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise PluginLifecycleError(str(exc)) from exc
 
 
 def install_git_plugin(

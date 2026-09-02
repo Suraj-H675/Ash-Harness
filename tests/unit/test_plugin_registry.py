@@ -221,3 +221,32 @@ def test_plugin_catalog_rejects_linked_component_tree(tmp_path) -> None:
 
     assert catalog.discover() == []
     assert "plugin tree contains a link" in next(iter(catalog.errors.values()))
+
+
+def test_plugin_catalog_bounds_plugin_root_discovery(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "plugins"
+    for name in ("one", "two", "three"):
+        plugin = root / name
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.json").write_text(json.dumps({"name": name}))
+    monkeypatch.setattr("ash.plugins.registry.MAX_PLUGIN_DISCOVERY_ENTRIES", 2)
+
+    catalog = PluginCatalog(((root, "user"),))
+
+    assert catalog.discover() == []
+    assert "discovery exceeds" in next(iter(catalog.errors.values()))
+
+
+def test_plugin_catalog_rejects_excessively_deep_plugin_tree(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "plugins"
+    plugin = root / "example"
+    (plugin / "one" / "two").mkdir(parents=True)
+    (plugin / "plugin.json").write_text(json.dumps({"name": "example"}))
+    monkeypatch.setattr("ash.plugins.registry.MAX_PLUGIN_TREE_DEPTH", 1)
+
+    catalog = PluginCatalog(((root, "user"),))
+
+    assert catalog.discover() == []
+    assert "exceeds depth" in next(iter(catalog.errors.values()))
