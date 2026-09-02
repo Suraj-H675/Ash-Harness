@@ -37,6 +37,7 @@ MODERN_UNSUPPORTED_VERSION_ERROR = -32022
 MAX_PAGINATION_PAGES = 100
 MAX_PAGINATION_SESSION_RESTARTS = 1
 MAX_STDIO_MESSAGE_BYTES = 8 * 1024 * 1024
+MAX_OUTBOUND_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_LEGACY_SSE_EVENT_BYTES = 8 * 1024 * 1024
 MAX_HTTP_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_HTTP_SSE_EVENT_BYTES = 8 * 1024 * 1024
@@ -786,6 +787,7 @@ class MCPClient:
     ) -> None:
         if self._http is None:
             raise MCPProtocolError("MCP HTTP client is not connected")
+        encoded = _encode_outbound_message(payload)
         headers = httpx.Headers(self.config.resolved_headers)
         headers["Accept"] = "application/json"
         headers["Content-Type"] = "application/json"
@@ -798,7 +800,7 @@ class MCPClient:
         async with self._http.stream(
             "POST",
             endpoint,
-            json=payload,
+            content=encoded,
             headers=headers,
         ) as response:
             response.raise_for_status()
@@ -894,6 +896,7 @@ class MCPClient:
         _expected_tool_contract: tuple[str, str] | None = None,
         _header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
     ) -> None:
+        encoded = _encode_outbound_message(payload)
         if self.config.transport == "stdio":
             if self._process is None or self._process.stdin is None:
                 raise MCPProtocolError("MCP stdio client is not connected")
@@ -912,7 +915,7 @@ class MCPClient:
                         "the active verified server contract"
                     )
                 self._process.stdin.write(
-                    (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+                    encoded + b"\n"
                 )
                 await self._process.stdin.drain()
             return
@@ -992,6 +995,7 @@ class MCPClient:
     ) -> httpx.Response:
         if self._http is None:
             raise MCPProtocolError("MCP HTTP client is not connected")
+        encoded = _encode_outbound_message(payload)
         headers = httpx.Headers(self.config.resolved_headers)
         headers["Accept"] = "application/json, text/event-stream"
         headers["Content-Type"] = "application/json"
@@ -1037,7 +1041,7 @@ class MCPClient:
             )
         response = await self._post_http_request(
             self.config.resolved_url,
-            json=payload,
+            content=encoded,
             headers=headers,
         )
         if (
@@ -1063,7 +1067,7 @@ class MCPClient:
             )
             response = await self._post_http_request(
                 self.config.resolved_url,
-                json=payload,
+                content=encoded,
                 headers=headers,
             )
             if response.status_code == 401:
@@ -1839,6 +1843,24 @@ def _validate_http_session_id(session_id: str) -> None:
             "MCP HTTP session ID must contain at most "
             f"{MAX_HTTP_SESSION_ID_BYTES} visible ASCII characters"
         )
+
+
+def _encode_outbound_message(payload: dict[str, Any]) -> bytes:
+    try:
+        encoded = json.dumps(
+            payload,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise MCPProtocolError("MCP outbound message is not JSON-serializable") from exc
+    if len(encoded) + 1 > MAX_OUTBOUND_MESSAGE_BYTES:
+        raise MCPProtocolError(
+            "MCP outbound message exceeds "
+            f"{MAX_OUTBOUND_MESSAGE_BYTES} bytes"
+        )
+    return encoded
 
 
 def _copy_http_response(response: httpx.Response, content: bytes) -> httpx.Response:

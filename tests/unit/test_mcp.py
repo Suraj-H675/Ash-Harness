@@ -3072,6 +3072,31 @@ async def test_stdio_send_failure_cleans_pending_future() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mcp_rejects_oversized_outbound_message_before_writing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.mcp.client as mcp_client
+
+    monkeypatch.setattr(mcp_client, "MAX_OUTBOUND_MESSAGE_BYTES", 64)
+    stdin = Mock()
+    stdin.drain = AsyncMock()
+    client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
+    client._process = Mock(stdin=stdin)
+
+    with pytest.raises(MCPProtocolError, match="outbound message exceeds 64 bytes"):
+        await client._send_message(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {"value": "x" * 100},
+            }
+        )
+
+    stdin.write.assert_not_called()
+    stdin.drain.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_stdio_revalidates_tool_contract_inside_write_lock() -> None:
     client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
     stdin = Mock()
