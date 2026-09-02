@@ -218,11 +218,11 @@ def load_mcp_servers(
         config_path = Path(".mcp.json")
     if not config_path.exists():
         return {}
-    if config_path.stat().st_size > MAX_MCP_CONFIG_BYTES:
+    with config_path.open("rb") as handle:
+        raw_bytes = handle.read(MAX_MCP_CONFIG_BYTES + 1)
+    if len(raw_bytes) > MAX_MCP_CONFIG_BYTES:
         raise ValueError(f"MCP config exceeds 256 KiB: {config_path}")
-
-    with config_path.open() as f:
-        raw = json.load(f)
+    raw: Any = json.loads(raw_bytes.decode("utf-8"))
 
     if not isinstance(raw, dict):
         raise ValueError(f"MCP config must be an object: {config_path}")

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from ash.plugins.lifecycle import (
+    MAX_EXTENSION_STATE_BYTES,
     PluginLifecycleError,
     install_local_plugin,
     load_extension_state,
@@ -130,6 +131,14 @@ def test_invalid_extension_state_is_rejected(tmp_path) -> None:
     state_path.write_text('{"version": 999}', encoding="utf-8")
 
     with pytest.raises(PluginLifecycleError, match="invalid extension state"):
+        load_extension_state(state_path)
+
+
+def test_oversized_extension_state_is_rejected(tmp_path) -> None:
+    state_path = tmp_path / "extensions.json"
+    state_path.write_bytes(b" " * (MAX_EXTENSION_STATE_BYTES + 1))
+
+    with pytest.raises(PluginLifecycleError, match="exceeds"):
         load_extension_state(state_path)
 
 

@@ -19,6 +19,7 @@ from ash.plugins.registry import _validate_manifest
 
 MAX_PLUGIN_FILES = 10_000
 MAX_PLUGIN_BYTES = 256 * 1024 * 1024
+MAX_EXTENSION_STATE_BYTES = 256 * 1024
 STATE_VERSION = 1
 MAX_GIT_CLONE_BYTES = MAX_PLUGIN_BYTES
 
@@ -52,7 +53,20 @@ def load_extension_state(path: Path | None = None) -> ExtensionState:
     if not state_path.exists():
         return ExtensionState()
     try:
-        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        if _is_link(state_path):
+            raise PluginLifecycleError(
+                f"extension state cannot be a link: {state_path}"
+            )
+        with state_path.open("rb") as handle:
+            raw = handle.read(MAX_EXTENSION_STATE_BYTES + 1)
+        if len(raw) > MAX_EXTENSION_STATE_BYTES:
+            raise PluginLifecycleError(
+                f"extension state exceeds {MAX_EXTENSION_STATE_BYTES} bytes: "
+                f"{state_path}"
+            )
+        payload = json.loads(raw.decode("utf-8"))
+    except PluginLifecycleError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise PluginLifecycleError(
             f"cannot load extension state {state_path}: {exc}"

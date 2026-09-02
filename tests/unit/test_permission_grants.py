@@ -4,6 +4,7 @@ import pytest
 
 from ash.safety.grants import (
     ArgumentMatcher,
+    MAX_RULE_FILE_BYTES,
     MatchOperator,
     PermissionGrantError,
     PermissionRule,
@@ -158,6 +159,20 @@ def test_permission_rule_file_refuses_corruption_and_future_versions(
 
     path.write_text('{"version": 999, "workspaces": {}}', encoding="utf-8")
     with pytest.raises(PermissionGrantError, match="newer than supported"):
+        load_permission_rules(workspace)
+
+
+def test_permission_rule_file_rejects_oversized_payload(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    path = grants_path()
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b" " * (MAX_RULE_FILE_BYTES + 1))
+
+    with pytest.raises(PermissionGrantError, match="exceeds 1 MB"):
         load_permission_rules(workspace)
 
 

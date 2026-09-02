@@ -63,9 +63,11 @@ def load_command_hooks(
         path = source.path
         if not path.is_file():
             continue
-        if path.stat().st_size > MAX_HOOK_CONFIG_BYTES:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_HOOK_CONFIG_BYTES + 1)
+        if len(raw) > MAX_HOOK_CONFIG_BYTES:
             raise ValueError(f"Hook config exceeds 1 MiB: {path}")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError(f"Hook config must be an object: {path}")
         for item in _entries(payload, "pre_tool", path):

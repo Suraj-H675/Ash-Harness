@@ -300,3 +300,16 @@ def test_manifest_rejects_oversized_file(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="exceeds 128 KiB"):
         PluginManifest.load(manifest_file)
+
+
+def test_manifest_rejects_linked_file(tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text('{"name":"demo","version":"1.0.0"}', encoding="utf-8")
+    linked = tmp_path / "plugin.json"
+    try:
+        linked.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="cannot be a link"):
+        PluginManifest.load(linked)

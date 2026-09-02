@@ -682,9 +682,11 @@ def _discover_hooks(
         if not path.is_file():
             continue
         try:
-            if path.stat().st_size > MAX_HOOK_CONFIG_BYTES:
+            with path.open("rb") as handle:
+                raw = handle.read(MAX_HOOK_CONFIG_BYTES + 1)
+            if len(raw) > MAX_HOOK_CONFIG_BYTES:
                 raise ValueError("hook config exceeds 1 MiB")
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(raw.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("hook config must be an object")
             summary = HookConfigSummary(

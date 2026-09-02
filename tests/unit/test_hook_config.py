@@ -3,7 +3,7 @@ import sys
 
 import pytest
 
-from ash.hooks.config import HookConfigSource, load_command_hooks
+from ash.hooks.config import MAX_HOOK_CONFIG_BYTES, HookConfigSource, load_command_hooks
 from ash.hooks.registry import HookBlock
 
 
@@ -127,3 +127,11 @@ async def test_session_start_supports_structured_context_and_caps_output(
 
     assert registry.get_injected_prompt() == ""
     assert "exceeded" in registry.diagnostics[0].error
+
+
+def test_hook_config_rejects_oversized_file(tmp_path) -> None:
+    config = tmp_path / "hooks.json"
+    config.write_bytes(b" " * (MAX_HOOK_CONFIG_BYTES + 1))
+
+    with pytest.raises(ValueError, match="exceeds 1 MiB"):
+        load_command_hooks([config])

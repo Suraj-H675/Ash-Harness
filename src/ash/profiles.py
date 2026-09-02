@@ -12,6 +12,7 @@ from pathlib import Path
 DEFAULT_PROFILE = "default"
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ACTIVE_PROFILE_FILENAME = "active-profile"
+MAX_ACTIVE_PROFILE_BYTES = 256
 
 
 def validate_profile_name(name: str) -> str:
@@ -60,7 +61,13 @@ def active_profile_name(
     if not marker.is_file():
         return DEFAULT_PROFILE
     try:
-        value = marker.read_text(encoding="utf-8").strip()
+        with marker.open("rb") as handle:
+            raw = handle.read(MAX_ACTIVE_PROFILE_BYTES + 1)
+        if len(raw) > MAX_ACTIVE_PROFILE_BYTES:
+            raise ValueError(
+                f"active Ash profile marker exceeds {MAX_ACTIVE_PROFILE_BYTES} bytes"
+            )
+        value = raw.decode("utf-8").strip()
     except OSError as exc:
         raise ValueError(f"cannot read active Ash profile marker {marker}: {exc}") from exc
     return validate_profile_name(value or DEFAULT_PROFILE)

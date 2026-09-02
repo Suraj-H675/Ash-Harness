@@ -280,9 +280,15 @@ class PluginManifest:
 
     @classmethod
     def load(cls, path: Path) -> PluginManifest:
-        if path.stat().st_size > MAX_PLUGIN_MANIFEST_BYTES:
+        if path.is_symlink() or (
+            hasattr(path, "is_junction") and path.is_junction()
+        ):
+            raise ValueError("plugin manifest cannot be a link")
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_PLUGIN_MANIFEST_BYTES + 1)
+        if len(raw) > MAX_PLUGIN_MANIFEST_BYTES:
             raise ValueError("plugin manifest exceeds 128 KiB")
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(raw.decode("utf-8"))
         if not isinstance(data, dict):
             raise ValueError("plugin manifest must be a JSON object")
         return cls.from_dict(data)

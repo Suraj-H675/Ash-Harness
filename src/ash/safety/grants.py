@@ -542,9 +542,11 @@ def _read_payload(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {"version": CURRENT_PERMISSION_RULE_VERSION, "workspaces": {}}
     try:
-        if path.stat().st_size > MAX_RULE_FILE_BYTES:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_RULE_FILE_BYTES + 1)
+        if len(raw) > MAX_RULE_FILE_BYTES:
             raise PermissionGrantError("permission rule file exceeds 1 MB")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
     except PermissionGrantError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:

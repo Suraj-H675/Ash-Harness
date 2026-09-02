@@ -6,6 +6,7 @@ from ash.context.instructions import (
     InstructionFile,
 )
 from ash.safety.trust import is_workspace_trusted, set_workspace_trusted
+from ash.safety.trust import MAX_TRUST_STORE_BYTES, trust_store_path
 
 
 def test_trust_round_trip_uses_canonical_workspace(tmp_path, monkeypatch) -> None:
@@ -17,6 +18,15 @@ def test_trust_round_trip_uses_canonical_workspace(tmp_path, monkeypatch) -> Non
     assert is_workspace_trusted(workspace) is True
     assert set_workspace_trusted(workspace, False) is True
     assert is_workspace_trusted(workspace) is False
+
+
+def test_oversized_trust_store_fails_closed(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = trust_store_path()
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b" " * (MAX_TRUST_STORE_BYTES + 1))
+
+    assert is_workspace_trusted(tmp_path / "workspace") is False
 
 
 def test_project_instructions_require_trust_flag(tmp_path, monkeypatch) -> None:
