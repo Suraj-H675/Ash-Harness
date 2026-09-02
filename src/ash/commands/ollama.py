@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import os
 import re
 import shutil
 import sys
 
+from ash.sandbox.process_utils import terminate_process_tree
+
 
 MAX_PULL_OUTPUT_CHARS = 20_000
+PULL_READ_CHUNK_BYTES = 4096
 DEFAULT_PULL_TIMEOUT_SECONDS = 1800
 _MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}(?::[A-Za-z0-9._-]{1,64})?$")
 
@@ -50,39 +54,48 @@ async def pull_model(
             file=sys.stderr,
         )
         return 2
-    process = await asyncio.create_subprocess_exec(
-        executable,
-        "pull",
-        normalized,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        env=_scrubbed_environment(),
-    )
-    emitted = 0
     try:
+        process = await asyncio.create_subprocess_exec(
+            executable,
+            "pull",
+            normalized,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=_scrubbed_environment(),
+        )
+    except OSError as exc:
+        print(f"Error: could not start ollama pull: {exc}", file=sys.stderr)
+        return 2
+
+    async def drain_output() -> None:
+        emitted = 0
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
         assert process.stdout is not None
         while True:
-            chunk = await asyncio.wait_for(process.stdout.readline(), timeout_seconds)
+            chunk = await process.stdout.read(PULL_READ_CHUNK_BYTES)
             if not chunk:
                 break
-            text = chunk.decode("utf-8", errors="replace")
+            text = decoder.decode(chunk)
             remaining = MAX_PULL_OUTPUT_CHARS - emitted
             if remaining > 0 and text:
-                sys.stdout.write(text[:remaining])
+                visible = text[:remaining]
+                sys.stdout.write(visible)
                 sys.stdout.flush()
-                emitted += min(len(text), remaining)
-            if emitted >= MAX_PULL_OUTPUT_CHARS:
-                break
-        await asyncio.wait_for(process.wait(), timeout_seconds)
-    except asyncio.TimeoutError:
-        from ash.sandbox.process_utils import terminate_process_tree
+                emitted += len(visible)
+        trailing = decoder.decode(b"", final=True)
+        remaining = MAX_PULL_OUTPUT_CHARS - emitted
+        if remaining > 0 and trailing:
+            sys.stdout.write(trailing[:remaining])
+            sys.stdout.flush()
+        await process.wait()
 
+    try:
+        await asyncio.wait_for(drain_output(), timeout_seconds)
+    except asyncio.TimeoutError:
         await terminate_process_tree(process)
         print(f"\nError: ollama pull timed out after {timeout_seconds} seconds.", file=sys.stderr)
         return 124
     except asyncio.CancelledError:
-        from ash.sandbox.process_utils import terminate_process_tree
-
         await terminate_process_tree(process)
         raise
     if process.returncode == 0:
