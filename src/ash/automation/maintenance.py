@@ -9,6 +9,10 @@ from typing import Any
 
 from ash.automation.store import AutomationStore
 from ash.core.session import SessionStore
+from ash.safe_io import read_bounded_text
+
+
+MAX_MAINTENANCE_REQUEST_BYTES = 1024 * 1024
 
 
 def run_maintenance(request: dict[str, Any]) -> None:
@@ -56,7 +60,13 @@ def _required_int(request: dict[str, Any], key: str, *, minimum: int) -> int:
 
 def main() -> int:
     try:
-        raw = json.load(sys.stdin)
+        raw = json.loads(
+            read_bounded_text(
+                sys.stdin,
+                MAX_MAINTENANCE_REQUEST_BYTES,
+                label="maintenance request",
+            )
+        )
         if not isinstance(raw, dict):
             raise ValueError("maintenance request must be a JSON object")
         run_maintenance(raw)

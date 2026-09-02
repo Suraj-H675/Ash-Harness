@@ -19,7 +19,7 @@ import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from ash.safe_io import read_bounded_bytes
+from ash.safe_io import read_bounded_bytes, read_bounded_text
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
@@ -48,6 +48,8 @@ AVAILABLE_MODELS: list[str] = [
 ]
 MAX_SESSION_IMPORT_BYTES = 50 * 1024 * 1024
 MAX_JSON_SCHEMA_BYTES = 1024 * 1024
+MAX_CLI_INPUT_BYTES = 1_000_000
+MAX_CRON_PROMPT_BYTES = 64 * 1024
 
 
 def _emit_config_diagnostics(config: AshConfig) -> None:
@@ -2433,15 +2435,27 @@ def main(argv: list[str] | None = None) -> int:
         args.server_command = []
     if args.json_schema is not None and args.prompt is None:
         parser.error("--json-schema requires --prompt")
-    if args.prompt == "-":
-        args.prompt = sys.stdin.read()
-    elif args.prompt is None and not sys.stdin.isatty() and args.command is None:
-        try:
-            piped_prompt = sys.stdin.read()
-        except OSError:
-            piped_prompt = ""
-        if piped_prompt.strip():
-            args.prompt = piped_prompt
+    try:
+        if args.prompt == "-":
+            args.prompt = read_bounded_text(
+                sys.stdin,
+                MAX_CLI_INPUT_BYTES,
+                label="stdin prompt",
+            )
+        elif args.prompt is None and not sys.stdin.isatty() and args.command is None:
+            try:
+                piped_prompt = read_bounded_text(
+                    sys.stdin,
+                    MAX_CLI_INPUT_BYTES,
+                    label="piped prompt",
+                )
+            except OSError:
+                piped_prompt = ""
+            if piped_prompt.strip():
+                args.prompt = piped_prompt
+    except (OSError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
     if args.ci:
         if args.command is None and args.prompt is None:
             print(
@@ -2896,7 +2910,13 @@ def main(argv: list[str] | None = None) -> int:
                             "automation; run `ash trust add`"
                         )
                     prompt = (
-                        sys.stdin.read() if args.prompt == "-" else str(args.prompt)
+                        read_bounded_text(
+                            sys.stdin,
+                            MAX_CRON_PROMPT_BYTES,
+                            label="automation prompt",
+                        )
+                        if args.prompt == "-"
+                        else str(args.prompt)
                     )
                     job = create_job_from_cli(
                         config,

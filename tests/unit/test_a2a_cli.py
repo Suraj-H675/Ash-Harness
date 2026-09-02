@@ -1,4 +1,9 @@
+import asyncio
+import io
+import sys
+
 import httpx
+import pytest
 
 from ash.cli import main
 
@@ -27,3 +32,28 @@ def test_a2a_client_network_failure_has_stable_cli_error(monkeypatch, capsys) ->
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "A2A operation failed: connection refused" in captured.err
+
+
+def test_a2a_stdin_prompt_is_bounded_before_network_use(monkeypatch) -> None:
+    from ash.commands.a2a import MAX_A2A_CLIENT_INPUT_BYTES, send_a2a
+
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO("x" * (MAX_A2A_CLIENT_INPUT_BYTES + 1)),
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "url": "https://agent.example.com",
+            "prompt": "-",
+            "context_id": None,
+            "token_env": "ASH_A2A_TOKEN",
+            "timeout": 30.0,
+            "json": False,
+        },
+    )()
+
+    with pytest.raises(ValueError, match="A2A prompt exceeds"):
+        asyncio.run(send_a2a(args))

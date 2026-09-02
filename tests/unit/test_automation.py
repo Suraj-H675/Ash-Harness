@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import sqlite3
 import stat
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,7 +20,10 @@ from ash.automation.schedules import (
     parse_duration,
 )
 from ash.automation.models import AutomationWorkerSummary
-from ash.automation.runner import _execute as execute_automation_subprocess_request
+from ash.automation.runner import (
+    MAX_AUTOMATION_PROMPT_BYTES,
+    _execute as execute_automation_subprocess_request,
+)
 from ash.automation.store import (
     AUTOMATION_SCHEMA_VERSION,
     AutomationError,
@@ -75,6 +80,43 @@ async def test_subprocess_runner_rechecks_workspace_trust(
                 "user_metadata": None,
             }
         )
+
+
+@pytest.mark.asyncio
+async def test_subprocess_runner_rejects_oversized_prompt_before_client_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    config = AshConfig(workspace_root=workspace)
+    monkeypatch.setattr("ash.automation.runner.is_workspace_trusted", lambda path: True)
+
+    with pytest.raises(ValueError, match="prompt exceeds"):
+        await execute_automation_subprocess_request(
+            {
+                "config": config.model_dump(mode="json"),
+                "workspace": str(workspace),
+                "prompt": "x" * (MAX_AUTOMATION_PROMPT_BYTES + 1),
+                "user_metadata": None,
+            }
+        )
+
+
+def test_automation_runner_rejects_oversized_protocol_input(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.automation.runner import MAX_AUTOMATION_REQUEST_BYTES, main
+
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO("x" * (MAX_AUTOMATION_REQUEST_BYTES + 1)),
+    )
+
+    assert main() == 1
+    assert "automation request exceeds" in capsys.readouterr().out
 
 
 def test_cron_trigger_handles_spring_forward_and_fall_back() -> None:

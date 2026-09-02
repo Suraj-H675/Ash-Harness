@@ -13,9 +13,12 @@ from ash.config import AshConfig
 from ash.core.redaction import redact_text
 from ash.safety.trust import is_workspace_trusted
 from ash.sdk import AshClient
+from ash.safe_io import read_bounded_text
 
 
 _RESULT_PREFIX = "ASH_AUTOMATION_RESULT="
+MAX_AUTOMATION_REQUEST_BYTES = 4 * 1024 * 1024
+MAX_AUTOMATION_PROMPT_BYTES = 64 * 1024
 
 
 async def _execute(request: dict[str, Any]) -> dict[str, Any]:
@@ -35,6 +38,10 @@ async def _execute(request: dict[str, Any]) -> dict[str, Any]:
     prompt = request.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("automation request prompt must be non-empty")
+    if len(prompt.encode("utf-8")) > MAX_AUTOMATION_PROMPT_BYTES:
+        raise ValueError(
+            f"automation request prompt exceeds {MAX_AUTOMATION_PROMPT_BYTES} bytes"
+        )
     metadata = request.get("user_metadata")
     if metadata is not None and not isinstance(metadata, dict):
         raise ValueError("automation request metadata must be an object")
@@ -54,7 +61,13 @@ async def _execute(request: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     try:
-        request = json.load(sys.stdin)
+        request = json.loads(
+            read_bounded_text(
+                sys.stdin,
+                MAX_AUTOMATION_REQUEST_BYTES,
+                label="automation request",
+            )
+        )
         if not isinstance(request, dict):
             raise ValueError("automation request must be an object")
         payload = asyncio.run(_execute(request))

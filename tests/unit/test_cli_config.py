@@ -809,3 +809,18 @@ def test_config_explain_reports_global_cli_overrides(
     assert entries["safety_tier"]["value"] == "plan"
     assert entries["db_directory"]["source"] == "cli"
     assert entries["db_directory"]["value"] == str(tmp_path / "db")
+
+
+def test_cli_rejects_oversized_stdin_prompt_before_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.cli import MAX_CLI_INPUT_BYTES, main
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO("x" * (MAX_CLI_INPUT_BYTES + 1)))
+
+    assert main(["--prompt", "-"]) == 2
+    assert (
+        f"stdin prompt exceeds {MAX_CLI_INPUT_BYTES} bytes"
+        in capsys.readouterr().err
+    )

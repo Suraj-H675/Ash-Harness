@@ -26,6 +26,7 @@ from google.protobuf.json_format import MessageToDict
 
 from ash.config import AshConfig
 from ash.agents.a2a_remote import validate_agent_card_origins
+from ash.safe_io import read_bounded_text
 from ash.server.a2a import create_a2a_app
 
 
@@ -88,7 +89,15 @@ async def inspect_a2a(args) -> int:
 
 async def send_a2a(args) -> int:
     url = _remote_url(args.url)
-    prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
+    prompt = (
+        read_bounded_text(
+            sys.stdin,
+            MAX_A2A_CLIENT_INPUT_BYTES,
+            label="A2A prompt",
+        )
+        if args.prompt == "-"
+        else args.prompt
+    )
     if not prompt.strip() or len(prompt.encode("utf-8")) > MAX_A2A_CLIENT_INPUT_BYTES:
         raise ValueError("A2A prompt must be non-empty and no larger than 1 MB")
     if args.context_id and len(args.context_id.encode("utf-8")) > 512:
