@@ -42,9 +42,9 @@ async def terminate_process_tree(
 ) -> None:
     """Terminate a subprocess and descendants, escalating to a hard kill."""
 
-    if process.returncode is not None:
-        return
     if sys.platform == "win32":
+        if process.returncode is not None:
+            return
         killer = await asyncio.create_subprocess_exec(
             "taskkill",
             "/PID",
@@ -213,6 +213,14 @@ async def communicate_process(
     output_limit_exceeded = False
     captured_total = 0
     read_total = 0
+    termination_started = False
+
+    async def terminate_after_output_limit() -> None:
+        nonlocal termination_started
+        if termination_started:
+            return
+        termination_started = True
+        await terminate_process_tree(process)
 
     async def read_stream(
         stream: asyncio.StreamReader | None,
@@ -237,6 +245,7 @@ async def communicate_process(
                 captured_total += min(len(chunk), remaining)
             if max_output_bytes is not None and read_total > max_output_bytes:
                 output_limit_exceeded = True
+                await terminate_after_output_limit()
             text = chunk.decode("utf-8", errors="replace")
             if stream_callback is not None:
                 try:

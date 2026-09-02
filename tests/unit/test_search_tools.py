@@ -113,6 +113,21 @@ async def test_search_text_fallback_bounds_long_line(tmp_path, monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_search_text_fallback_skips_oversized_files(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: None)
+    monkeypatch.setattr("ash.tools.search.MAX_SEARCH_FILE_BYTES", 32)
+    (tmp_path / "large.txt").write_text("needle " + "x" * 40)
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle",
+        fixed_strings=True,
+    )
+
+    assert result.success is True
+    assert result.output == ""
+
+
+@pytest.mark.asyncio
 async def test_search_text_fallback_bounds_workspace_scan(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: None)
     monkeypatch.setattr("ash.tools.search.MAX_SEARCH_SCAN_ENTRIES", 2)

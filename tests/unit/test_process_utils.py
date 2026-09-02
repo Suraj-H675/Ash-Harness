@@ -133,3 +133,24 @@ async def test_communicate_process_preserves_bounded_output_on_overflow() -> Non
     assert process.returncode == 0
     assert len(raised.value.stdout) == 100_000
     assert raised.value.stderr == b""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX command syntax")
+@pytest.mark.asyncio
+async def test_communicate_process_stops_a_chatty_child_on_output_overflow() -> None:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import sys,time; sys.stdout.write('x' * 1000000); sys.stdout.flush(); time.sleep(60)",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        **process_group_options(),
+    )
+
+    with pytest.raises(ProcessOutputLimitExceeded):
+        await asyncio.wait_for(
+            communicate_process(process, max_output_bytes=100_000),
+            timeout=5,
+        )
+
+    assert process.returncode is not None

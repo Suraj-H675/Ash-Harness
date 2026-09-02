@@ -171,7 +171,7 @@ class GlobFilesTool(BaseTool):
 
 
 class SearchTextArgs(BaseModel):
-    pattern: str = Field(..., min_length=1)
+    pattern: str = Field(..., min_length=1, max_length=4_096)
     directory_path: str = "."
     glob: str | None = None
     fixed_strings: bool = False
@@ -298,6 +298,7 @@ class SearchTextTool(BaseTool):
             handle: TextIO,
         ) -> Iterator[tuple[int, str, bool, bool]]:
             line_number = 0
+            file_bytes = 0
             while True:
                 chunks: list[str] = []
                 preview_chars = 0
@@ -309,6 +310,9 @@ class SearchTextTool(BaseTool):
                     chunk = handle.readline(MAX_SEARCH_LINE_CHARS)
                     if not chunk:
                         break
+                    file_bytes += len(chunk.encode("utf-8"))
+                    if file_bytes > MAX_SEARCH_FILE_BYTES:
+                        return
                     saw_data = True
                     candidate = carry + chunk
                     if not matched and regex.search(candidate):
@@ -353,6 +357,11 @@ class SearchTextTool(BaseTool):
                 continue
             relative = path.relative_to(root).as_posix()
             if args.glob and not fnmatch.fnmatch(relative, args.glob):
+                continue
+            try:
+                if path.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                    continue
+            except OSError:
                 continue
             try:
                 with path.open(encoding="utf-8") as handle:
