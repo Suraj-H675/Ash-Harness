@@ -95,6 +95,57 @@ async def test_search_text_skips_malformed_ripgrep_events(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_search_text_does_not_mark_exact_ripgrep_limit_truncated(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    process = Mock(returncode=0)
+    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: "/usr/bin/rg")
+    monkeypatch.setattr(
+        "ash.tools.search.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    monkeypatch.setattr(
+        "ash.tools.search.communicate_process",
+        AsyncMock(
+            return_value=(
+                b'{"type":"match","data":{"path":{"text":"ok.py"},'
+                b'"line_number":3,"lines":{"text":"needle\\n"}}}\n',
+                b"",
+            )
+        ),
+    )
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle",
+        max_results=1,
+    )
+
+    assert result.success is True
+    assert result.truncated is False
+    assert result.output == "ok.py:3:needle"
+
+
+@pytest.mark.asyncio
+async def test_search_text_does_not_mark_exact_fallback_limit_truncated(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: None)
+    (tmp_path / "ok.py").write_text("needle\n")
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle",
+        fixed_strings=True,
+        max_results=1,
+    )
+
+    assert result.success is True
+    assert result.truncated is False
+    assert result.output == "ok.py:1:needle"
+
+
+@pytest.mark.asyncio
 async def test_search_text_rejects_out_of_scope_directory(tmp_path) -> None:
     with pytest.raises(Exception, match="outside project scope"):
         await SearchTextTool(SafetyGuard(tmp_path)).run(

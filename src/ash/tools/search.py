@@ -248,6 +248,7 @@ class SearchTextTool(BaseTool):
                 error=stderr.decode("utf-8", errors="replace").strip(),
             )
         matches: list[str] = []
+        match_truncated = False
         for line in stdout.decode("utf-8", errors="replace").splitlines():
             try:
                 event = json.loads(line)
@@ -272,10 +273,11 @@ class SearchTextTool(BaseTool):
             ):
                 continue
             text = text.rstrip("\r\n")
-            matches.append(f"{path}:{line_number}:{text}")
             if len(matches) >= args.max_results:
+                match_truncated = True
                 break
-        truncated = len(matches) >= args.max_results
+            matches.append(f"{path}:{line_number}:{text}")
+        truncated = match_truncated or output_limited
         output = "\n".join(matches)
         if truncated or output_limited:
             suffix = (
@@ -393,11 +395,11 @@ class SearchTextTool(BaseTool):
                         ):
                             output_limited = True
                             break
-                        matches.append(rendered)
-                        output_bytes += separator_bytes + rendered_bytes
                         if len(matches) >= args.max_results:
                             match_limited = True
                             break
+                        matches.append(rendered)
+                        output_bytes += separator_bytes + rendered_bytes
             except (OSError, UnicodeError):
                 continue
             if output_limited or match_limited:
