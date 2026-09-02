@@ -85,6 +85,12 @@ def backup_config_file(path: str | Path, *, label: str) -> Path:
         raise FileNotFoundError(source)
 
     before = source.stat()
+    contents = read_bounded_bytes(
+        source,
+        MAX_CONFIG_FILE_BYTES,
+        label="config backup source",
+    )
+    source_digest = hashlib.sha256(contents).digest()
     backup_dir = ensure_ash_dir() / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
@@ -96,19 +102,25 @@ def backup_config_file(path: str | Path, *, label: str) -> Path:
         prefix=f".{label}.",
         suffix=".tmp",
     )
-    source_digest = hashlib.sha256()
     try:
-        with source.open("rb") as source_handle, os.fdopen(fd, "wb") as target:
-            while chunk := source_handle.read(1024 * 1024):
-                source_digest.update(chunk)
-                target.write(chunk)
+        with os.fdopen(fd, "wb") as target:
+            target.write(contents)
             target.flush()
             os.fsync(target.fileno())
         after = source.stat()
-        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        if (before.st_size, before.st_mtime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+        ):
             raise OSError(f"config changed while it was being backed up: {source}")
-        copied_digest = hashlib.sha256(Path(temporary).read_bytes()).digest()
-        if copied_digest != source_digest.digest():
+        copied_digest = hashlib.sha256(
+            read_bounded_bytes(
+                temporary,
+                MAX_CONFIG_FILE_BYTES,
+                label="temporary config backup",
+            )
+        ).digest()
+        if copied_digest != source_digest:
             raise OSError(f"config backup verification failed: {source}")
         os.replace(temporary, destination)
         if os.name != "nt":
@@ -123,12 +135,13 @@ def backup_config_file(path: str | Path, *, label: str) -> Path:
 
 
 def config_file_digest(path: str | Path) -> str:
-    source = Path(path).expanduser()
-    digest = hashlib.sha256()
-    with source.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return hashlib.sha256(
+        read_bounded_bytes(
+            path,
+            MAX_CONFIG_FILE_BYTES,
+            label="config file",
+        )
+    ).hexdigest()
 
 
 def migration_state_path() -> Path:
@@ -150,7 +163,7 @@ def is_config_migration_recorded(path: str | Path) -> bool:
     backup = Path(backup_value)
     try:
         return config_file_digest(source) == digest == config_file_digest(backup)
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 

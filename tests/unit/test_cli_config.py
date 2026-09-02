@@ -171,6 +171,28 @@ class TestAtomicWrite:
         with pytest.raises(ValueError, match="backup label"):
             cli_config.backup_config_file(source, label="../escape")
 
+    def test_config_backup_rejects_oversized_source(self, tmp_path: Path) -> None:
+        from ash.commands import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        source = tmp_path / "large.toml"
+        source.write_bytes(b"x" * (cli_config.MAX_CONFIG_FILE_BYTES + 1))
+
+        with pytest.raises(ValueError, match="config backup source exceeds"):
+            cli_config.backup_config_file(source, label="large")
+        assert not (cli_config.ASH_DIR / "backups").exists()
+
+    def test_config_file_digest_rejects_oversized_source(self, tmp_path: Path) -> None:
+        from ash.commands import config as cli_config
+
+        source = tmp_path / "large.toml"
+        source.write_bytes(b"x" * (cli_config.MAX_CONFIG_FILE_BYTES + 1))
+
+        with pytest.raises(ValueError, match="config file exceeds"):
+            cli_config.config_file_digest(source)
+
     def test_migration_record_requires_exact_source_and_backup(
         self, tmp_path: Path
     ) -> None:
