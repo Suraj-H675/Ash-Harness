@@ -802,6 +802,190 @@ def test_config_explain_cli_json_smoke(
     assert any(entry["field"] == "model" for entry in payload["config"])
 
 
+def test_config_explain_cli_json_redacts_nested_mcp_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.cli import main
+    from ash.config import AshConfig
+
+    bearer = "Bearer nested-bearer-secret-value"
+    proxy = "Basic nested-proxy-secret-value"
+    api_key = "nested-api-key-secret-value"
+    token = "nested-token-secret-value"
+    password = "nested-password-secret-value"
+    secret = "nested-client-secret-value"
+    plural_api_keys = "plural-api-keys-secret-value"
+    hyphen_plural_api_keys = "hyphen-api-keys-secret-value"
+    camel_plural_tokens = "camel-access-tokens-secret-value"
+    camel_plural_secrets = "camel-client-secrets-secret-value"
+    plural_passwords = "plural-passwords-secret-value"
+    max_access_token = "max-access-token-secret-value"
+    max_auth_token = "max-auth-token-secret-value"
+    credential = "credential-secret-value"
+    credentials = "credentials-secret-value"
+    private_key = "private-key-secret-value"
+    private_key_camel = "private-key-camel-secret-value"
+    cookie = "session-cookie-secret-value"
+    set_cookie = "session-set-cookie-secret-value"
+    short_secret = "x"
+    mcp_servers = {
+        "remote": {
+            "transport": "http",
+            "headers": {
+                "Authorization": bearer,
+                "proxy-authorization": proxy,
+                "X-API-Key": api_key,
+                "x-request-token": token,
+                "dbPassword": password,
+                "clientSecret": secret,
+                "apiKeys": plural_api_keys,
+                "API-KEYS": hyphen_plural_api_keys,
+                "accessTokens": camel_plural_tokens,
+                "clientSecrets": camel_plural_secrets,
+                "PASSWORDS": plural_passwords,
+                "Cookie": cookie,
+                "Set-Cookie": set_cookie,
+                "Accept": "application/json",
+            },
+            "nested": [
+                {"TOKEN": token, "ordinary": "keep-this-value"},
+                {
+                    "tokenizer": "keep-tokenizer-value",
+                    "secretary": "keep-secretary-value",
+                },
+            ],
+            "args": ["--safe", "ordinary-argument"],
+            "metadata": {
+                "apiKey": short_secret,
+                "credential": credential,
+                "credentials": credentials,
+                "private_key": private_key,
+                "privateKey": private_key_camel,
+                "maxAccessToken": max_access_token,
+                "max_auth_token": max_auth_token,
+                "max_context_tokens": 2048,
+                "description": "example",
+            },
+        }
+    }
+    config = AshConfig(
+        model="ollama/test",
+        mcp_servers=mcp_servers,
+        max_context_tokens=64000,
+        agent_token_budget=4000,
+        show_token_meter=True,
+    )
+    config._config_sources = {
+        "mcp_servers": ("env", f"resolved from {bearer}; short secret {short_secret}"),
+    }
+    original_mcp_servers = json.loads(json.dumps(mcp_servers))
+
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    assert main(["config", "explain", "--json"]) == 0
+    rendered = capsys.readouterr().out
+    payload = json.loads(rendered)
+    mcp_value = next(
+        entry["value"] for entry in payload["config"] if entry["field"] == "mcp_servers"
+    )
+
+    for raw_secret in (
+        bearer,
+        proxy,
+        api_key,
+        token,
+        password,
+        secret,
+        plural_api_keys,
+        hyphen_plural_api_keys,
+        camel_plural_tokens,
+        camel_plural_secrets,
+        plural_passwords,
+        max_access_token,
+        max_auth_token,
+        credential,
+        credentials,
+        private_key,
+        private_key_camel,
+        cookie,
+        set_cookie,
+    ):
+        assert raw_secret not in rendered
+    assert mcp_value["remote"]["headers"]["Authorization"] == "Bear...alue"
+    assert mcp_value["remote"]["headers"]["proxy-authorization"] == "Basi...alue"
+    assert mcp_value["remote"]["headers"]["X-API-Key"] == "nest...alue"
+    assert mcp_value["remote"]["headers"]["apiKeys"] == "plur...alue"
+    assert mcp_value["remote"]["headers"]["API-KEYS"] == "hyph...alue"
+    assert mcp_value["remote"]["headers"]["accessTokens"] == "came...alue"
+    assert mcp_value["remote"]["headers"]["clientSecrets"] == "came...alue"
+    assert mcp_value["remote"]["headers"]["PASSWORDS"] == "plur...alue"
+    assert mcp_value["remote"]["headers"]["Cookie"] == "sess...alue"
+    assert mcp_value["remote"]["headers"]["Set-Cookie"] == "sess...alue"
+    assert mcp_value["remote"]["headers"]["Accept"] == "application/json"
+    assert mcp_value["remote"]["nested"][0]["ordinary"] == "keep-this-value"
+    assert mcp_value["remote"]["nested"][1]["tokenizer"] == "keep-tokenizer-value"
+    assert mcp_value["remote"]["nested"][1]["secretary"] == "keep-secretary-value"
+    assert mcp_value["remote"]["metadata"] == {
+        "apiKey": "****",
+        "credential": "cred...alue",
+        "credentials": "cred...alue",
+        "private_key": "priv...alue",
+        "privateKey": "priv...alue",
+        "maxAccessToken": "max-...alue",
+        "max_auth_token": "max-...alue",
+        "max_context_tokens": 2048,
+        "description": "example",
+    }
+    config_values = {entry["field"]: entry["value"] for entry in payload["config"]}
+    assert config_values["max_context_tokens"] == 64000
+    assert config_values["agent_token_budget"] == 4000
+    assert config_values["show_token_meter"] is True
+    assert "resolved from" in next(
+        entry["detail"]
+        for entry in payload["config"]
+        if entry["field"] == "mcp_servers"
+    )
+    assert next(
+        entry["detail"]
+        for entry in payload["config"]
+        if entry["field"] == "mcp_servers"
+    ) == "resolved from Bear...alue; short secret ****"
+    assert mcp_servers == original_mcp_servers
+    assert config.mcp_servers == original_mcp_servers
+
+    capsys.readouterr()
+    assert main(["config", "explain"]) == 0
+    human_rendered = capsys.readouterr().out
+    for raw_secret in (
+        bearer,
+        proxy,
+        api_key,
+        token,
+        password,
+        secret,
+        plural_api_keys,
+        hyphen_plural_api_keys,
+        camel_plural_tokens,
+        camel_plural_secrets,
+        plural_passwords,
+        max_access_token,
+        max_auth_token,
+        credential,
+        credentials,
+        private_key,
+        private_key_camel,
+        cookie,
+        set_cookie,
+    ):
+        assert raw_secret not in human_rendered
+    assert "keep-this-value" in human_rendered
+
+
 def test_config_explain_reports_global_cli_overrides(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

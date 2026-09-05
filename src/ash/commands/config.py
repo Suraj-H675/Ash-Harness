@@ -15,6 +15,7 @@ import re
 import sys
 import tempfile
 import tomllib
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,17 @@ _INITIAL_PATHS = (ASH_DIR, ENV_FILE, CONFIG_FILE)
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FILE_BACKED_ENV_VALUES: dict[str, tuple[str, str]] = {}
 _BACKUP_LABEL = re.compile(r"^[A-Za-z0-9_.-]+$")
+_NON_SECRET_TOKEN_KEYS = frozenset(
+    {
+        "max_context_tokens",
+        "max_completion_tokens",
+        "max_turn_total_tokens",
+        "max_tool_result_tokens",
+        "max_attachment_tokens",
+        "agent_token_budget",
+        "show_token_meter",
+    }
+)
 MAX_CONFIG_FILE_BYTES = 1024 * 1024
 MAX_ENV_FILE_BYTES = 1024 * 1024
 MAX_MIGRATION_STATE_BYTES = 1024 * 1024
@@ -443,6 +455,8 @@ def explain_config(config: Any) -> list[ConfigExplanation]:
     """Explain each AshConfig field's selected source and masked value."""
 
     fields = getattr(type(config), "model_fields", {})
+    field_values = {field: getattr(config, field) for field in fields}
+    secret_values = _collect_secret_values(field_values)
     toml_values = _load_raw_toml_config()
     dotenv_values = load_env()
     env_path = get_env_path()
@@ -474,9 +488,11 @@ def explain_config(config: Any) -> list[ConfigExplanation]:
         explanations.append(
             ConfigExplanation(
                 field=field,
-                value=_mask_config_value(field, getattr(config, field)),
-                source=source,
-                detail=detail,
+                value=_redact_known_secrets(
+                    _mask_config_value(field, field_values[field]), secret_values
+                ),
+                source=_redact_known_secrets(source, secret_values),
+                detail=_redact_known_secrets(detail, secret_values),
             )
         )
     return explanations
@@ -531,18 +547,7 @@ def _load_raw_toml_config() -> dict[str, Any]:
 
 
 def _mask_config_value(field: str, value: Any) -> Any:
-    if _is_secret_name(field):
-        return _mask_secret(str(value))
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {
-            str(key): _mask_nested_config_value(str(key), nested)
-            for key, nested in value.items()
-        }
-    if isinstance(value, list):
-        return [_mask_nested_config_value(field, item) for item in value]
-    return value
+    return _mask_nested_config_value(field, value)
 
 
 def _mask_nested_config_value(key: str, value: Any) -> Any:
@@ -550,29 +555,94 @@ def _mask_nested_config_value(key: str, value: Any) -> Any:
         return _mask_secret(str(value))
     if isinstance(value, Path):
         return str(value)
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {
             str(nested_key): _mask_nested_config_value(str(nested_key), nested_value)
             for nested_key, nested_value in value.items()
         }
-    if isinstance(value, list):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_mask_nested_config_value(key, item) for item in value]
     return value
 
 
 def _is_secret_name(name: str) -> bool:
-    lowered = name.casefold()
-    secret_markers = (
-        "api_key",
-        "apikey",
-        "secret",
-        "password",
-        "access_token",
-        "auth_token",
-        "bearer_token",
-        "refresh_token",
+    normalized = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", name)
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized)
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").casefold()
+    if normalized in {
+        "authorization",
+        "authorizations",
+        "proxy_authorization",
+        "proxy_authorizations",
+        "credential",
+        "credentials",
+        "private_key",
+        "private_keys",
+        "privatekey",
+        "privatekeys",
+        "cookie",
+        "cookies",
+        "set_cookie",
+        "set_cookies",
+    }:
+        return True
+    parts = normalized.split("_")
+    if any(part in {"password", "passwords", "secret", "secrets"} for part in parts):
+        return True
+    if any(part in {"token", "tokens"} for part in parts):
+        return normalized not in _NON_SECRET_TOKEN_KEYS
+    if any(part in {"apikey", "apikeys"} for part in parts):
+        return True
+    return any(
+        parts[index] == "api" and parts[index + 1] in {"key", "keys"}
+        for index in range(len(parts) - 1)
     )
-    return any(marker in lowered for marker in secret_markers)
+
+
+def _collect_secret_values(value: Any, *, secret_context: bool = False) -> set[str]:
+    values: set[str] = set()
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            values.update(
+                _collect_secret_values(
+                    nested,
+                    secret_context=secret_context or _is_secret_name(str(key)),
+                )
+            )
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            values.update(
+                _collect_secret_values(item, secret_context=secret_context)
+            )
+    elif secret_context and isinstance(value, str) and value:
+        values.add(value)
+    return values
+
+
+def _redact_known_secrets(value: Any, secret_values: set[str]) -> Any:
+    if isinstance(value, str):
+        redacted = value
+        for secret in sorted(secret_values, key=len, reverse=True):
+            replacement = _mask_secret(secret)
+            if redacted == secret:
+                return replacement
+            if len(secret) >= 4:
+                redacted = redacted.replace(secret, replacement)
+            else:
+                redacted = re.sub(
+                    rf"(?<![A-Za-z0-9_-]){re.escape(secret)}(?![A-Za-z0-9_-])",
+                    replacement,
+                    redacted,
+                )
+        return redacted
+    if isinstance(value, Mapping):
+        return {
+            key: _redact_known_secrets(nested, secret_values)
+            for key, nested in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_redact_known_secrets(item, secret_values) for item in value]
+    return value
 
 
 def _mask_secret(value: str) -> str:
