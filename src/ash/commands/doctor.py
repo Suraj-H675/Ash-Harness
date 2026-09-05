@@ -11,8 +11,10 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 from ash.config import AshConfig
@@ -122,20 +124,59 @@ def _check_browser() -> DoctorCheck:
 
 
 def _check_storage(config: AshConfig) -> DoctorCheck:
+    temporary_directory: Path | None = None
+    database: Path | None = None
+    connection: sqlite3.Connection | None = None
+    result = DoctorCheck("storage", "fail", "Storage check did not complete")
     try:
         config.db_directory.mkdir(parents=True, exist_ok=True)
-        db = config.db_directory / ".doctor.sqlite3"
-        connection = sqlite3.connect(db)
-        try:
-            connection.execute("PRAGMA quick_check").fetchone()
-        finally:
-            connection.close()
-            db.unlink(missing_ok=True)
+        temporary_directory = Path(
+            tempfile.mkdtemp(prefix=".doctor-", dir=config.db_directory)
+        )
+        database = temporary_directory / "probe.sqlite3"
+        connection = sqlite3.connect(database)
+        connection.execute("CREATE TABLE doctor_probe (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO doctor_probe VALUES (?)", ("ok",))
+        connection.commit()
+        if connection.execute("SELECT value FROM doctor_probe").fetchone() != ("ok",):
+            raise sqlite3.DatabaseError("SQLite round-trip verification failed")
+        if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise sqlite3.DatabaseError("SQLite integrity check failed")
+        result = DoctorCheck("storage", "pass", str(config.db_directory))
     except (OSError, sqlite3.Error) as exc:
-        return DoctorCheck(
+        result = DoctorCheck(
             "storage", "fail", f"Database directory is not writable: {exc}"
         )
-    return DoctorCheck("storage", "pass", str(config.db_directory))
+
+    cleanup_errors: list[str] = []
+    if connection is not None:
+        try:
+            connection.close()
+        except (OSError, sqlite3.Error) as exc:
+            cleanup_errors.append(str(exc))
+    if database is not None:
+        for path in (
+            database,
+            Path(f"{database}-journal"),
+            Path(f"{database}-wal"),
+            Path(f"{database}-shm"),
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_errors.append(str(exc))
+    if temporary_directory is not None:
+        try:
+            temporary_directory.rmdir()
+        except OSError as exc:
+            cleanup_errors.append(str(exc))
+    if cleanup_errors:
+        result = DoctorCheck(
+            "storage",
+            "fail",
+            f"{result.message}; cleanup failed: {'; '.join(cleanup_errors)}",
+        )
+    return result
 
 
 def _check_automation(config: AshConfig) -> DoctorCheck:

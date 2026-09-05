@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -153,6 +154,7 @@ async def test_doctor_reports_local_runtime_without_network(
     assert by_name["extensions"].status == "pass"
     assert "connectivity" not in by_name
     assert not (tmp_path / "db" / ".doctor.sqlite3").exists()
+    assert not any((tmp_path / "db").glob(".doctor-*"))
     assert not (tmp_path / "db" / "automation.db").exists()
 
 
@@ -167,6 +169,78 @@ def test_storage_check_reports_sqlite_open_failures(
     assert check.name == "storage"
     assert check.status == "fail"
     assert "unable to open database file" in check.message
+
+
+def test_storage_check_preserves_pre_existing_doctor_database(tmp_path) -> None:
+    database_directory = tmp_path / "db"
+    database_directory.mkdir()
+    sentinel = database_directory / ".doctor.sqlite3"
+    with sqlite3.connect(sentinel) as connection:
+        connection.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO sentinel VALUES ('do not delete')")
+    sentinel_bytes = sentinel.read_bytes()
+    sentinel_stat = sentinel.stat()
+
+    check = _check_storage(AshConfig(db_directory=database_directory))
+
+    assert check.status == "pass"
+    assert sentinel.read_bytes() == sentinel_bytes
+    assert sentinel.stat().st_mode == sentinel_stat.st_mode
+    assert sentinel.stat().st_mtime_ns == sentinel_stat.st_mtime_ns
+
+
+def test_storage_checks_can_run_concurrently_without_colliding(tmp_path) -> None:
+    database_directory = tmp_path / "db"
+    database_directory.mkdir()
+    sentinel = database_directory / ".doctor.sqlite3"
+    with sqlite3.connect(sentinel) as connection:
+        connection.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO sentinel VALUES ('do not delete')")
+    sentinel_bytes = sentinel.read_bytes()
+    config = AshConfig(db_directory=database_directory)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        checks = list(executor.map(_check_storage, (config, config)))
+
+    assert [check.status for check in checks] == ["pass", "pass"]
+    assert sentinel.read_bytes() == sentinel_bytes
+    assert not any(database_directory.glob(".doctor-*"))
+
+
+def test_storage_check_cleans_probe_artifacts_after_sqlite_failure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_directory = tmp_path / "db"
+    database_directory.mkdir()
+    sentinel = database_directory / ".doctor.sqlite3"
+    sentinel.write_bytes(b"user database")
+
+    def fail_connect(database: object, *args: object, **kwargs: object) -> None:
+        probe = os.fspath(database)
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            with open(f"{probe}{suffix}", "wb") as handle:
+                handle.write(b"probe artifact")
+        raise sqlite3.OperationalError("probe failed")
+
+    monkeypatch.setattr("ash.commands.doctor.sqlite3.connect", fail_connect)
+
+    check = _check_storage(AshConfig(db_directory=database_directory))
+
+    assert check.status == "fail"
+    assert "probe failed" in check.message
+    assert sentinel.read_bytes() == b"user database"
+    assert not any(database_directory.glob(".doctor-*"))
+
+
+def test_storage_check_reports_malformed_database_directory(tmp_path) -> None:
+    database_directory = tmp_path / "db"
+    database_directory.write_text("not a directory", encoding="utf-8")
+
+    check = _check_storage(AshConfig(db_directory=database_directory))
+
+    assert check.status == "fail"
+    assert "Database directory is not writable" in check.message
+    assert database_directory.read_text(encoding="utf-8") == "not a directory"
 
 
 def test_automation_doctor_does_not_open_database_when_disabled(tmp_path) -> None:
