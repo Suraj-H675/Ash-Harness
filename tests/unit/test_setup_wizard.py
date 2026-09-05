@@ -302,6 +302,48 @@ class TestDiscoveryRecovery:
 class TestOpenaiCompatibleFlow:
     """Tests for _flow_openai_compatible — verifies TOML save."""
 
+    def test_preserves_existing_configuration_when_adding_provider(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Adding a custom endpoint must not erase unrelated user settings."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(
+                [
+                    "my-minimax",
+                    "https://api.minimax.io/v1",
+                    "MiniMax-M2.7",
+                ]
+            ),
+        )
+        monkeypatch.setattr("ash.commands.setup.getpass.getpass", _FakeGetpass(""))
+
+        from ash.commands import config as cli_config
+        from ash.commands.setup import ModelProbe, _flow_openai_compatible
+
+        cli_config.save_config(
+            {
+                "theme": "light",
+                "sandbox_backend": "native",
+                "fallback_models": ["ollama/local"],
+            }
+        )
+
+        with patch(
+            "ash.commands.setup._probe_models_detailed",
+            return_value=ModelProbe(models=("MiniMax-M2.7",)),
+        ):
+            _flow_openai_compatible()
+
+        saved = cli_config.load_config(strict=True)
+        assert saved["theme"] == "light"
+        assert saved["sandbox_backend"] == "native"
+        assert saved["fallback_models"] == ["ollama/local"]
+        assert saved["custom_providers"]["my-minimax"]["base_url"] == (
+            "https://api.minimax.io/v1"
+        )
+
     def test_saves_custom_provider_to_toml(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

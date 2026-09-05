@@ -933,8 +933,11 @@ def _flow_openai_compatible() -> SetupOutcome:
             raise SetupBack
     _confirm_undiscovered_model(model, models, verified)
 
-    # Save to ash.toml as custom_providers
-    custom = load_config().get("custom_providers", {})
+    # Update custom_providers without replacing unrelated user configuration.
+    user_config = load_config(strict=True)
+    custom = user_config.get("custom_providers", {})
+    if not isinstance(custom, dict):
+        raise ValueError("custom_providers must be a TOML table")
     custom_provider = {
         "base_url": base_url,
         "models": models,
@@ -943,7 +946,8 @@ def _flow_openai_compatible() -> SetupOutcome:
     if api_key:
         custom_provider["key_env"] = key_env
     custom[name] = custom_provider
-    save_config({"custom_providers": custom})
+    user_config["custom_providers"] = custom
+    save_config(user_config)
 
     settings = {"ASH_MODEL": f"{name}/{model}"}
     if api_key:
