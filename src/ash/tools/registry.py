@@ -14,6 +14,7 @@ only when a discovery pass runs.
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import sys
 import threading
@@ -108,6 +109,12 @@ class ToolRegistry:
         """Return the current index of every discovered skill."""
 
         return list(self._skill_index.values())
+
+    @property
+    def executable_skills_enabled(self) -> bool:
+        """Whether this registry may load in-process executable skills."""
+
+        return self._allow_executable_skills
 
     def index_skill(self, entry: SkillIndexEntry) -> None:
         """Register a skill in the index without compiling it."""
@@ -222,7 +229,16 @@ class ToolRegistry:
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         try:
-            spec.loader.exec_module(module)
+            loader = spec.loader
+            if isinstance(loader, importlib.machinery.SourceFileLoader):
+                source = loader.get_source(module_name)
+                if source is None:
+                    sys.modules.pop(module_name, None)
+                    return None
+                code = compile(source, str(path), "exec")
+                exec(code, module.__dict__)  # noqa: S102
+            else:
+                loader.exec_module(module)
         except Exception:
             sys.modules.pop(module_name, None)
             raise

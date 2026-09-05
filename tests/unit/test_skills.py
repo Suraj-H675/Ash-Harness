@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -296,6 +297,21 @@ def test_executable_skill_compilation_is_disabled_by_default(tmp_path: Path) -> 
         compile_skill(path, _safety_guard(tmp_path))
 
     assert not marker.exists()
+
+
+def test_python_skill_supports_sync_execute(tmp_path: Path) -> None:
+    path = tmp_path / "sync.py"
+    path.write_text(
+        '"""\nname: sync\ndescription: sync\n"""\n'
+        "def execute(context):\n    return 'sync result'\n",
+        encoding="utf-8",
+    )
+
+    tool = compile_skill(path, _safety_guard(tmp_path), allow_unsafe_code=True)
+    result = asyncio.run(tool.run())
+
+    assert result.success is True
+    assert result.output == "sync result"
 
 
 def test_executable_skill_context_cannot_create_missing_command_tool(
@@ -625,6 +641,40 @@ def test_write_python_skill_writes_and_registry_reloads(tmp_path: Path) -> None:
     assert reloaded is not None
     result2 = asyncio.run(reloaded.run())
     assert result2.output == "second"
+
+
+def test_registry_reload_uses_current_source_when_timestamp_and_size_match(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills"
+    guard = _safety_guard(tmp_path)
+    reg = ToolRegistry(guard, skill_roots=(skill_dir,), allow_executable_skills=True)
+
+    path = write_python_skill(
+        skill_dir,
+        name="same_size_skill",
+        description="same size",
+        trigger="",
+        body="async def execute(context):\n    return 'first'\n",
+        allow_unsafe_code=True,
+    )
+    first = reg.reload_skill_module("same_size_skill", path)
+    assert first is not None
+    first_stat = path.stat()
+
+    write_python_skill(
+        skill_dir,
+        name="same_size_skill",
+        description="same size",
+        trigger="",
+        body="async def execute(context):\n    return 'third'\n",
+        allow_unsafe_code=True,
+    )
+    os.utime(path, ns=(first_stat.st_atime_ns, first_stat.st_mtime_ns))
+
+    reloaded = reg.reload_skill_module("same_size_skill", path)
+    assert reloaded is not None
+    assert asyncio.run(reloaded.run()).output == "third"
 
 
 def test_write_python_skill_rejects_invalid_name(tmp_path: Path) -> None:

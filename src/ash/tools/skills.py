@@ -28,7 +28,7 @@ import textwrap
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence, cast
 
 from pydantic import BaseModel, create_model
 
@@ -42,6 +42,13 @@ UNSAFE_EXECUTABLE_SKILL_MESSAGE = (
     "unsafe executable-skill compatibility"
 )
 MAX_EXECUTABLE_SKILL_BYTES = 256 * 1024
+
+
+def validate_executable_skill_name(name: str) -> None:
+    """Validate the canonical identifier used for executable skill files."""
+
+    if not isinstance(name, str) or not name.isidentifier():
+        raise ValueError(f"skill name must be a valid Python identifier, got {name!r}")
 
 
 # --- SkillContext ----------------------------------------------------------
@@ -337,21 +344,22 @@ def build_tool_from_python_module(
     execute = getattr(module, "execute", None)
     if execute is None or not callable(execute):
         raise SkillParseError("module is missing an execute() function")
+    execute_fn = cast(Callable[..., Any], execute)
     tool_name = (
         parsed_name
         or getattr(module, "__ash_name__", None)
-        or getattr(execute, "__name__", "skill")
+        or getattr(execute_fn, "__name__", "skill")
     )
     if parsed_description is not None:
         tool_description: str = parsed_description
     else:
         fallback = getattr(module, "__ash_description__", None)
         if not fallback:
-            doc_first_line = (execute.__doc__ or "").strip().splitlines()[:1]
+            doc_first_line = (execute_fn.__doc__ or "").strip().splitlines()[:1]
             fallback = doc_first_line[0] if doc_first_line else ""
         tool_description = fallback or "Python skill"
 
-    tool_args_schema = _build_args_schema_from_signature(execute)
+    tool_args_schema = _build_args_schema_from_signature(execute_fn)
 
     class _PythonSkillTool(BaseTool):
         name = tool_name  # type: ignore[assignment,misc]
@@ -365,7 +373,10 @@ def build_tool_from_python_module(
                 project_root=_get_project_root(),
             )
             try:
-                result = await execute(context, **kwargs)  # type: ignore[misc]
+                if asyncio_is_coroutine(execute_fn):
+                    result = await execute_fn(context, **kwargs)
+                else:
+                    result = execute_fn(context, **kwargs)
             except SkillExecutionError as exc:
                 return ToolResult(success=False, output="", error=str(exc))
             except Exception as exc:  # noqa: BLE001
@@ -656,17 +667,39 @@ def write_python_skill(
 
     if not allow_unsafe_code:
         raise ValueError(UNSAFE_EXECUTABLE_SKILL_MESSAGE)
-    if not name.isidentifier():
-        raise ValueError(f"skill name must be a valid Python identifier, got {name!r}")
+    validate_executable_skill_name(name)
+    if not all(isinstance(value, str) for value in (description, trigger, body)):
+        raise ValueError("skill description, trigger, and body must be strings")
     skill_dir = skill_dir.expanduser()
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    path = skill_dir / f"{name}.py"
+    if skill_dir.is_symlink() or (
+        hasattr(skill_dir, "is_junction") and skill_dir.is_junction()
+    ):
+        raise ValueError(f"skill directory cannot be a link: {skill_dir}")
     body = textwrap.dedent(body).strip("\n")
     docstring = (
         f'"""\nname: {name}\ndescription: {description}\ntrigger: {trigger}\n"""'
     )
     contents = f"{docstring}\n\n{body}\n"
-    path.write_text(contents, encoding="utf-8")
+    serialized = contents.encode("utf-8")
+    if len(serialized) > MAX_EXECUTABLE_SKILL_BYTES:
+        raise ValueError("executable skill exceeds 256 KiB")
+    try:
+        tree = ast.parse(contents, filename=f"{name}.py")
+    except SyntaxError as exc:
+        raise ValueError(f"invalid Python skill: {exc}") from exc
+    if not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "execute"
+        for node in tree.body
+    ):
+        raise ValueError("invalid Python skill: no execute() function found")
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    path = skill_dir / f"{name}.py"
+    if path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    ):
+        raise ValueError(f"skill file cannot be a link: {path}")
+    path.write_bytes(serialized)
     return path
 
 
