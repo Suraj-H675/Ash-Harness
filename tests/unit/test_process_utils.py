@@ -63,7 +63,9 @@ async def test_windows_termination_kills_entire_process_tree() -> None:
 
 @pytest.mark.asyncio
 async def test_posix_termination_targets_process_group() -> None:
-    process = Mock(pid=1234, returncode=None)
+    # Above the PID range on supported POSIX and Windows systems.
+    sentinel_pid = 2**63 - 1
+    process = Mock(pid=sentinel_pid, returncode=None)
 
     async def finish() -> int:
         process.returncode = 0
@@ -73,13 +75,15 @@ async def test_posix_termination_targets_process_group() -> None:
 
     with (
         patch("ash.sandbox.process_utils.sys.platform", "linux"),
-        patch("ash.sandbox.process_utils.os.getpgid", return_value=1234),
+        patch(
+            "ash.sandbox.process_utils.os.getpgid", return_value=sentinel_pid
+        ),
         patch("ash.sandbox.process_utils.os.getpgrp", return_value=999),
         patch("ash.sandbox.process_utils.os.killpg") as killpg,
     ):
         await terminate_process_tree(process)
 
-    killpg.assert_called_once_with(1234, __import__("signal").SIGTERM)
+    killpg.assert_called_once_with(sentinel_pid, __import__("signal").SIGTERM)
     process.wait.assert_awaited_once()
 
 
