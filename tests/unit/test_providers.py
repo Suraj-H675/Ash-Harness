@@ -812,6 +812,132 @@ class _FakeAnthropicMessages:
 
 
 @pytest.mark.asyncio
+async def test_anthropic_custom_endpoint_does_not_inherit_ambient_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import sys
+
+    from ash.providers.anthropic import AnthropicProvider
+    from ash.providers.readiness import ProviderConfigurationError
+
+    ambient_key = "ambient-anthropic-key"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", ambient_key)
+    sdk_calls: list[dict[str, Any]] = []
+    inherited_keys: list[str] = []
+
+    def fake_async_anthropic(**kwargs: Any) -> Any:
+        sdk_calls.append(kwargs)
+        if "api_key" not in kwargs:
+            inherited_keys.append(os.environ["ANTHROPIC_API_KEY"])
+        return SimpleNamespace(messages=_FakeAnthropicMessages(SimpleNamespace()))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=fake_async_anthropic),
+    )
+
+    provider = AnthropicProvider(
+        model_name="claude-test",
+        api_key="",
+        base_url="https://gateway.example/v1",
+    )
+
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="Anthropic API key is required when using a custom base URL",
+    ) as exc_info:
+        _ = [
+            chunk
+            async for chunk in provider.stream_chat(
+                [{"role": "user", "content": "hello"}]
+            )
+        ]
+
+    assert ambient_key not in str(exc_info.value)
+    assert sdk_calls == []
+    assert inherited_keys == []
+
+
+@pytest.mark.asyncio
+async def test_anthropic_injected_client_bypasses_auth_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    from ash.providers.anthropic import AnthropicProvider
+
+    sdk_calls: list[dict[str, Any]] = []
+
+    def fake_async_anthropic(**kwargs: Any) -> Any:
+        sdk_calls.append(kwargs)
+        raise AssertionError("injected client should bypass SDK construction")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=fake_async_anthropic),
+    )
+    client = SimpleNamespace(messages=_FakeAnthropicMessages(SimpleNamespace()))
+    provider = AnthropicProvider(
+        model_name="claude-test",
+        api_key="",
+        base_url="https://gateway.example/v1",
+        client=client,
+    )
+
+    chunks = [
+        chunk
+        async for chunk in provider.stream_chat(
+            [{"role": "user", "content": "hello"}]
+        )
+    ]
+
+    assert "".join(chunk.content for chunk in chunks) == "hello"
+    assert sdk_calls == []
+
+
+@pytest.mark.asyncio
+async def test_anthropic_default_endpoint_preserves_sdk_api_key_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import sys
+
+    from ash.providers.anthropic import AnthropicProvider
+
+    ambient_key = "ambient-anthropic-key"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", ambient_key)
+    sdk_calls: list[dict[str, Any]] = []
+    inherited_keys: list[str] = []
+
+    def fake_async_anthropic(**kwargs: Any) -> Any:
+        sdk_calls.append(kwargs)
+        if "api_key" not in kwargs:
+            inherited_keys.append(os.environ["ANTHROPIC_API_KEY"])
+        return SimpleNamespace(messages=_FakeAnthropicMessages(SimpleNamespace()))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        SimpleNamespace(AsyncAnthropic=fake_async_anthropic),
+    )
+
+    provider = AnthropicProvider(model_name="claude-test", api_key="")
+    chunks = [
+        chunk
+        async for chunk in provider.stream_chat(
+            [{"role": "user", "content": "hello"}]
+        )
+    ]
+
+    assert "".join(chunk.content for chunk in chunks) == "hello"
+    assert sdk_calls == [{"max_retries": 0}]
+    assert inherited_keys == [ambient_key]
+
+
+@pytest.mark.asyncio
 async def test_anthropic_prompt_cache_normalizes_usage() -> None:
     from ash.providers.anthropic import AnthropicProvider
 

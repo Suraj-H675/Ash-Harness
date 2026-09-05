@@ -14,6 +14,7 @@ from typing import Any, AsyncGenerator
 from ash.context.tokens import AnthropicTokenCounter
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
+from ash.providers.readiness import ProviderConfigurationError
 
 
 class ProviderBackendUnavailable(ImportError):
@@ -123,8 +124,9 @@ class AnthropicProvider(ProviderABC):
     optional pre-built async client. Tests can inject a fake client to
     drive the loop without hitting the network. When ``client`` is
     ``None``, the adapter lazily builds an :class:`anthropic.AsyncAnthropic`
-    from ``api_key`` (or the ``ANTHROPIC_API_KEY`` environment variable
-    fallback handled by the SDK itself).
+    from ``api_key``. With no explicit ``base_url``, an empty key retains the
+    SDK's ``ANTHROPIC_API_KEY`` environment fallback; custom endpoints require
+    an explicit key to prevent credentials being redirected unexpectedly.
     """
 
     def __init__(
@@ -155,6 +157,11 @@ class AnthropicProvider(ProviderABC):
     def _resolve_client(self) -> Any:
         if self._client is not None:
             return self._client
+        if self._base_url and not self._api_key:
+            raise ProviderConfigurationError(
+                "Anthropic API key is required when using a custom base URL; "
+                "pass api_key explicitly (ambient ANTHROPIC_API_KEY is not used)."
+            )
 
         try:
             from anthropic import AsyncAnthropic  # type: ignore[import-not-found]
