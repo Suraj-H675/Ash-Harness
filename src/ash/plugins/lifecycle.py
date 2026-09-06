@@ -20,6 +20,7 @@ from ash.plugins.registry import (
     _plugin_manifest_paths,
     _validate_manifest,
 )
+from ash.safety.environment import resolve_host_executable
 from ash.sandbox.process_utils import process_group_options
 
 MAX_PLUGIN_FILES = 10_000
@@ -284,6 +285,13 @@ def install_git_plugin(
     if len(source) > 2048:
         raise PluginLifecycleError("plugin Git source URL is too long")
 
+    workspace = Path.cwd().resolve()
+    git_path = resolve_host_executable(
+        "git", workspace_root=workspace, cwd=workspace
+    )
+    if git_path is None:
+        raise PluginLifecycleError("git is unavailable outside the workspace")
+
     temporary_root = Path(tempfile.mkdtemp(prefix="ash-plugin-git-"))
     checkout = temporary_root / "plugin"
     try:
@@ -291,7 +299,7 @@ def install_git_plugin(
             try:
                 completed = subprocess.run(
                     [
-                        "git",
+                        git_path,
                         "clone",
                         "--quiet",
                         "--depth",
@@ -324,7 +332,9 @@ def install_git_plugin(
             )
         _validate_tree(checkout)
         if expected is not None:
-            _verify_catalog_checkout(checkout, source, ref, expected)
+            _verify_catalog_checkout(
+                checkout, source, ref, expected, git_path=git_path
+            )
         shutil.rmtree(checkout / ".git")
         return install_local_plugin(
             checkout,
@@ -341,13 +351,15 @@ def _verify_catalog_checkout(
     source: str,
     ref: str,
     expected: CatalogEntry,
+    *,
+    git_path: str,
 ) -> None:
     if expected.source != source or expected.ref != ref:
         raise PluginCatalogError("catalog entry does not match requested plugin source")
 
     def git(arguments: list[str]) -> str:
         completed = subprocess.run(
-            ["git", "-C", checkout, *arguments],
+            [git_path, "-C", checkout, *arguments],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=False,

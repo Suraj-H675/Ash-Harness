@@ -343,6 +343,29 @@ def test_git_install_rejects_query_or_fragment_before_clone(
     assert run is None
 
 
+def test_git_install_rejects_workspace_shadowed_git_before_clone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fake = tmp_path / "git"
+    marker = tmp_path / "marker"
+    fake.write_text(
+        f"#!/bin/sh\nprintf owned > {marker}\nexit 0\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    with pytest.raises(PluginLifecycleError, match="git is unavailable"):
+        install_git_plugin(
+            "https://plugins.example/demo.git",
+            ref="main",
+            destination_root=tmp_path / "installed",
+        )
+
+    assert not marker.exists()
+
+
 def test_git_install_caps_clone_error_detail(
     tmp_path: Path, monkeypatch
 ) -> None:

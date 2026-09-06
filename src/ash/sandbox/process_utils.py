@@ -11,6 +11,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from ash.safety.environment import resolve_host_executable
+
 
 ProcessStreamCallback = Callable[[str, str], None]
 INHERIT_PROCESS_GROUP_ENV = "ASH_INTERNAL_INHERIT_PROCESS_GROUP"
@@ -39,16 +41,25 @@ async def terminate_process_tree(
     process: asyncio.subprocess.Process,
     *,
     grace_seconds: float = 1.0,
+    workspace_root: str | Path | None = None,
 ) -> None:
     """Terminate a subprocess and descendants, escalating to a hard kill."""
 
     if not isinstance(process.pid, int) or process.pid <= 0:
         return
+    workspace = Path(workspace_root or Path.cwd()).resolve()
     if sys.platform == "win32":
         if process.returncode is not None:
             return
+        taskkill = resolve_host_executable(
+            "taskkill", workspace_root=workspace, cwd=workspace
+        )
+        if taskkill is None:
+            process.kill()
+            await _wait_for_returncode(process, grace_seconds)
+            return
         killer = await asyncio.create_subprocess_exec(
-            "taskkill",
+            taskkill,
             "/PID",
             str(process.pid),
             "/T",
@@ -60,7 +71,7 @@ async def terminate_process_tree(
         await _wait_for_returncode(process, grace_seconds)
         return
 
-    descendants = _descendant_pids(process.pid)
+    descendants = _descendant_pids(process.pid, workspace_root=workspace)
     _signal_posix_processes(process.pid, descendants, signal.SIGTERM)
     await asyncio.gather(
         _wait_for_returncode(process, grace_seconds),
@@ -105,7 +116,11 @@ def _signal_posix_processes(root: int, descendants: list[int], signum: int) -> N
             pass
 
 
-def _descendant_pids(root: int) -> list[int]:
+def _descendant_pids(
+    root: int,
+    *,
+    workspace_root: str | Path | None = None,
+) -> list[int]:
     parents: dict[int, list[int]] = {}
     proc = Path("/proc")
     if proc.is_dir():
@@ -127,16 +142,21 @@ def _descendant_pids(root: int) -> list[int]:
             if pid is not None and ppid is not None:
                 parents.setdefault(ppid, []).append(pid)
     else:
-        try:
-            completed = subprocess.run(
-                ["ps", "-axo", "pid=,ppid="],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+        workspace = Path(workspace_root or Path.cwd()).resolve()
+        ps = resolve_host_executable("ps", workspace_root=workspace, cwd=workspace)
+        if ps is None:
             completed = None
+        else:
+            try:
+                completed = subprocess.run(
+                    [ps, "-axo", "pid=,ppid="],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                completed = None
         for line in completed.stdout.splitlines() if completed is not None else ():
             fields = line.split()
             if len(fields) == 2 and all(field.isdigit() for field in fields):

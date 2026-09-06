@@ -4,6 +4,7 @@ import asyncio
 import os
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -12,6 +13,7 @@ from ash.sandbox.process_utils import (
     INHERIT_PROCESS_GROUP_ENV,
     ProcessOutputLimitExceeded,
     communicate_process,
+    _descendant_pids,
     process_group_options,
     terminate_process_tree,
 )
@@ -47,18 +49,57 @@ async def test_windows_termination_kills_entire_process_tree() -> None:
 
     with (
         patch("ash.sandbox.process_utils.sys.platform", "win32"),
+        patch(
+            "ash.sandbox.process_utils.resolve_host_executable",
+            return_value="C:/Windows/System32/taskkill.exe",
+        ),
         patch("ash.sandbox.process_utils.asyncio.create_subprocess_exec", create),
     ):
         await terminate_process_tree(process)
 
     assert create.await_args.args[:5] == (
-        "taskkill",
+        "C:/Windows/System32/taskkill.exe",
         "/PID",
         "4321",
         "/T",
         "/F",
     )
     process.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_windows_termination_rejects_workspace_shadowed_taskkill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "taskkill"
+    marker = tmp_path / "marker"
+    fake.write_text(f"#!/bin/sh\nprintf owned > {marker}\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    process = Mock(pid=4321, returncode=None)
+    process.wait = AsyncMock(return_value=0)
+    process.kill = Mock()
+
+    with patch("ash.sandbox.process_utils.sys.platform", "win32"):
+        await terminate_process_tree(process, workspace_root=tmp_path)
+
+    process.kill.assert_called_once_with()
+    assert not marker.exists()
+
+
+def test_posix_ps_fallback_rejects_workspace_shadowed_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "ps"
+    marker = tmp_path / "marker"
+    fake.write_text(f"#!/bin/sh\nprintf owned > {marker}\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
+
+    with patch("ash.sandbox.process_utils.Path.is_dir", return_value=False):
+        _descendant_pids(os.getpid(), workspace_root=tmp_path)
+
+    assert not marker.exists()
 
 
 @pytest.mark.asyncio

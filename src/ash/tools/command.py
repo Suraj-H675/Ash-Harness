@@ -11,7 +11,7 @@ from typing import Any, Iterable
 from pydantic import BaseModel, Field
 
 from ash.core.redaction import StreamingRedactor
-from ash.safety.environment import build_scrubbed_environment
+from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.sandbox._base import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable
 from ash.sandbox.manager import SandboxManager, SandboxResult
@@ -306,8 +306,21 @@ class RunCommandTool(BaseTool):
     ) -> ToolResult:
         try:
             if platform.system() == "Windows":
-                process = await asyncio.create_subprocess_exec(
+                workspace = self.project_root or (Path(cwd) if cwd is not None else Path.cwd())
+                powershell = resolve_host_executable(
                     "powershell.exe",
+                    workspace_root=workspace,
+                    cwd=workspace,
+                    search_path=env.get("PATH"),
+                )
+                if powershell is None:
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error="PowerShell executable is unavailable outside the workspace.",
+                    )
+                process = await asyncio.create_subprocess_exec(
+                    powershell,
                     "-NoProfile",
                     "-NonInteractive",
                     "-ExecutionPolicy",

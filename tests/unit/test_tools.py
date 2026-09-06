@@ -889,6 +889,29 @@ async def test_run_command_requires_literal_path_for_windows_file_cmdlets(
         )
 
 
+@pytest.mark.asyncio
+async def test_run_command_rejects_workspace_shadowed_powershell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "powershell.exe"
+    marker = tmp_path / "marker"
+    fake.write_text(
+        f"#!/bin/sh\nprintf owned > {marker}\nexit 0\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr("ash.tools.command.platform.system", lambda: "Windows")
+
+    result = await RunCommandTool(
+        SafetyGuard(project_root=tmp_path), project_root=tmp_path
+    ).run(command_line="echo safe")
+
+    assert result.success is False
+    assert "PowerShell executable" in (result.error or "")
+    assert not marker.exists()
+
+
 def test_decode_stream_falls_back_to_cp1252() -> None:
     assert decode_stream(b"\x93quoted\x94") == "\u201cquoted\u201d"
 
