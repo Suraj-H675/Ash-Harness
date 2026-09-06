@@ -473,7 +473,8 @@ async def test_async_sdk_rejects_cross_workspace_session_resume(tmp_path) -> Non
     async with await AshClient.create(
         config=first_config, provider=SDKProvider()
     ) as first_client:
-        session_id = first_client.loop.current_session.session_id
+        first_result = await first_client.prompt("private first-workspace turn")
+        session_id = first_result.session_id
 
     second_config = first_config.model_copy(update={"workspace_root": second_workspace})
     with pytest.raises(ValueError, match="different workspace"):
@@ -482,6 +483,24 @@ async def test_async_sdk_rejects_cross_workspace_session_resume(tmp_path) -> Non
             provider=SDKProvider(),
             session_id=session_id,
         )
+
+    async with await AshClient.create(
+        config=second_config, provider=SDKProvider()
+    ) as second_client:
+        with pytest.raises(ValueError, match="different workspace"):
+            second_client.events(session_id)
+        with pytest.raises(ValueError, match="different workspace"):
+            second_client.session_tree(session_id)
+        before = second_client.loop.session_store.list_sessions(
+            project_path=str(first_workspace), limit=100
+        )
+        with pytest.raises(ValueError, match="different workspace"):
+            await second_client.fork(session_id, branch_name="must-not-exist")
+        after = second_client.loop.session_store.list_sessions(
+            project_path=str(first_workspace), limit=100
+        )
+
+    assert [item.session_id for item in after] == [item.session_id for item in before]
 
 
 @pytest.mark.asyncio

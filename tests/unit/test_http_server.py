@@ -12,6 +12,7 @@ class FakeClient:
     def __init__(self):
         self.steering_error = None
         self.resume_error = None
+        self.tree_error = None
 
     async def prompt(self, text):
         return AshResult(text.upper(), "session-1", "fake/model", 2)
@@ -56,6 +57,8 @@ class FakeClient:
         return "session-fork"
 
     def session_tree(self, session_id=None):
+        if self.tree_error is not None:
+            raise self.tree_error
         return [
             SessionLineage(
                 session_id=session_id or "session-1",
@@ -426,6 +429,25 @@ async def test_http_server_forks_and_returns_session_tree() -> None:
     assert forked.json() == {"session_id": "session-fork"}
     assert tree.status_code == 200
     assert tree.json()["sessions"][0]["children"] == ["session-fork"]
+
+
+@pytest.mark.asyncio
+async def test_http_session_tree_rejects_cross_workspace_session() -> None:
+    client = FakeClient()
+    client.tree_error = ValueError("session belongs to a different workspace")
+    app = create_app(
+        client,  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.get("/v1/sessions/foreign/tree", headers=headers)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "session belongs to a different workspace"
 
 
 @pytest.mark.asyncio

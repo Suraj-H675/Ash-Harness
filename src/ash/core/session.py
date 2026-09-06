@@ -1013,6 +1013,20 @@ class SessionStore:
             ],
         )
 
+    def require_session_project(self, session_id: str, project_path: str | Path) -> None:
+        """Refuse access to a session outside the requested canonical project."""
+
+        project_key = normalize_project_path(project_path)
+        with closing(get_db_connection(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT project_key FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Session not found: {session_id}")
+        if str(row["project_key"]) != project_key:
+            raise ValueError("session belongs to a different workspace")
+
     def save_message(
         self,
         session_id: str,

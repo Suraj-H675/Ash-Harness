@@ -355,6 +355,9 @@ class AshClient:
         )
         if resolved_session_id is None:
             raise RuntimeError("no session is active; provide session_id")
+        self.loop.session_store.require_session_project(
+            resolved_session_id, self.loop.project_root
+        )
         return self.loop.session_store.session_tree(resolved_session_id)
 
     def automations(
@@ -617,6 +620,9 @@ class AshClient:
         )
         if resolved_session_id is None:
             raise RuntimeError("no session is active; provide session_id")
+        self.loop.session_store.require_session_project(
+            resolved_session_id, self.loop.project_root
+        )
         return [
             AshEventRecord(item.sequence, AshEvent.from_wire(item.event))
             for item in self.loop.session_store.list_runtime_events(
@@ -656,6 +662,9 @@ class AshClient:
             )
             if resolved_session_id is None:
                 raise RuntimeError("no session is active; provide session_id")
+            self.loop.session_store.require_session_project(
+                resolved_session_id, self.loop.project_root
+            )
             forked = self.loop.session_store.fork_session(
                 resolved_session_id,
                 message_count=message_count,

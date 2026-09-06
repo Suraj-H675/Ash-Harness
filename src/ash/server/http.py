@@ -253,6 +253,8 @@ def create_app(
             tree = client.session_tree(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"sessions": [item.model_dump(mode="json") for item in tree]}
 
     @app.post("/v1/sessions/{session_id}/fork", dependencies=[Depends(authorize)])

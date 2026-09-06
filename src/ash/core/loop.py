@@ -45,7 +45,6 @@ from ash.core.session import (
     Session,
     SessionStore,
     ToolCallRecord,
-    normalize_project_path,
 )
 from ash.core.redaction import redact_text, redact_value
 from ash.logging import get_logger
@@ -733,12 +732,8 @@ class AshLoop:
         self.system_prompt = self._base_system_prompt
 
         if session_id is not None:
+            self.session_store.require_session_project(session_id, self.project_root)
             self.current_session = self.session_store.load_session(session_id)
-            if normalize_project_path(
-                self.current_session.project_path
-            ) != normalize_project_path(self.project_root):
-                self.current_session = None
-                raise ValueError("session belongs to a different workspace")
             from ash.core.checkpoints import recover_interrupted_turns
 
             self.recovery_summary = recover_interrupted_turns(
