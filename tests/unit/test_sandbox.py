@@ -19,6 +19,7 @@ from ash.sandbox import (
     SANDBOX_TIER_SCOPED,
     SandboxBackendUnavailable,
     SandboxManager,
+    auto_approve_safety_error,
     has_bwrap,
     has_docker,
     has_sandbox_exec,
@@ -97,8 +98,27 @@ def test_manager_uses_sandbox_exec_on_macos(tmp_path: Path) -> None:
         patch("ash.sandbox.manager.has_docker", return_value=True),
     ):
         mgr = SandboxManager(workspace_root=tmp_path)
-        assert mgr.tier == SANDBOX_TIER_BWRAP
-        assert mgr.backend_name == "sandbox-exec"
+    assert mgr.tier == SANDBOX_TIER_BWRAP
+    assert mgr.backend_name == "sandbox-exec"
+    assert mgr.is_fully_isolated() is False
+    assert auto_approve_safety_error(mgr, allow_unsafe=False)
+
+
+def test_manager_reports_sandbox_exec_as_partial_isolation(tmp_path: Path) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "darwin"),
+        patch("ash.sandbox.manager.has_sandbox_exec", return_value=True),
+        patch("ash.sandbox.manager.has_docker", return_value=False),
+    ):
+        mgr = SandboxManager(workspace_root=tmp_path)
+
+    status = mgr.status()
+    assert status["backend"] == "sandbox-exec"
+    assert status["isolated"] is False
+    assert status["filesystem"] == "host-read;workspace-write"
+    assert status["network"] == "blocked"
+    assert "host file reads" in status["detail"]
+    assert "full filesystem isolation" in status["remediation"]
 
 
 def test_manager_reports_unisolated_windows_without_docker(tmp_path: Path) -> None:
@@ -225,6 +245,17 @@ def test_manager_is_fully_isolated_only_at_tier_2_plus(tmp_path: Path) -> None:
     ):
         mgr = SandboxManager(workspace_root=tmp_path)
         assert mgr.is_fully_isolated() is False
+
+
+def test_manager_keeps_docker_as_full_isolation_backend(tmp_path: Path) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "win32"),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        mgr = SandboxManager(workspace_root=tmp_path)
+
+    assert mgr.backend_name == "docker"
+    assert mgr.is_fully_isolated() is True
 
 
 def test_manager_status_describes_enforcement(tmp_path: Path) -> None:

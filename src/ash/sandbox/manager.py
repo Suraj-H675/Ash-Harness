@@ -63,6 +63,10 @@ __all__ = [
 # macOS-only tier constant (semantically distinct from bwrap).
 SANDBOX_TIER_SANDBOX_EXEC: int = SANDBOX_TIER_BWRAP
 
+# A tier identifies the command-wrapper shape; this capability identifies the
+# backends whose current semantics also prevent arbitrary host file reads.
+_FULL_ISOLATION_BACKENDS = frozenset({"bubblewrap", "docker"})
+
 
 @dataclass(frozen=True)
 class SandboxResult:
@@ -186,6 +190,7 @@ class SandboxManager:
     allow_scoped_fallback: bool = False
     backend_preference: str = "auto"
     docker_image: str = DEFAULT_IMAGE
+    _selected_backend: str = field(init=False, repr=False, default="scoped")
 
     def __post_init__(self) -> None:
         if self.preferred_tier not in {
@@ -216,7 +221,7 @@ class SandboxManager:
     def backend_name(self) -> str:
         """Human-readable name of the active backend."""
 
-        return _backend_name(self._tier)
+        return self._selected_backend
 
     def capabilities(self) -> dict[str, bool]:
         """Return the availability map for every backend."""
@@ -241,6 +246,18 @@ class SandboxManager:
                 "Commands are isolated to the workspace and temporary storage; "
                 f"network access is {network}."
             )
+        elif self.backend_name == "sandbox-exec":
+            filesystem = (
+                "host-read;workspace-read"
+                if self.workspace_read_only
+                else "host-read;workspace-write"
+            )
+            network = "enabled" if self.network else "blocked"
+            detail = (
+                "macOS sandbox-exec contains workspace writes and network access, "
+                "but host file reads remain available; full isolation and "
+                "auto-approval are disabled."
+            )
         else:
             filesystem = "host"
             network = "host"
@@ -261,17 +278,22 @@ class SandboxManager:
             "remediation": (
                 ""
                 if isolated or self.backend_preference == "direct"
-                else _sandbox_remediation(
-                    preference=self.backend_preference,
-                    docker_image=self.docker_image,
+                else (
+                    "Use Docker for full filesystem isolation; macOS sandbox-exec "
+                    "remains available for approval-gated partial containment."
+                    if self.backend_name == "sandbox-exec"
+                    else _sandbox_remediation(
+                        preference=self.backend_preference,
+                        docker_image=self.docker_image,
+                    )
                 )
             ),
         }
 
     def is_fully_isolated(self) -> bool:
-        """``True`` only when a Tier 2 or Tier 3 backend is active."""
+        """Whether the active backend prevents arbitrary host file reads."""
 
-        return self._tier >= SANDBOX_TIER_BWRAP
+        return self._selected_backend in _FULL_ISOLATION_BACKENDS
 
     async def run(
         self,
@@ -362,24 +384,29 @@ class SandboxManager:
         """Prefer a compatible native sandbox, then a verified container."""
 
         if self.backend_preference == "direct":
+            self._selected_backend = "scoped"
             return SANDBOX_TIER_SCOPED
         use_native = self.backend_preference in {"auto", "native"}
         use_docker = self.backend_preference in {"auto", "docker"}
         if use_native and self.preferred_tier >= SANDBOX_TIER_BWRAP:
             if sys.platform.startswith("linux") and self._backend_available("bwrap"):
+                self._selected_backend = "bubblewrap"
                 return SANDBOX_TIER_BWRAP
             if (
                 sys.platform == "darwin"
                 and not self.require_read_isolation
                 and self._backend_available("sandbox_exec")
             ):
+                self._selected_backend = "sandbox-exec"
                 return SANDBOX_TIER_BWRAP
         if (
             use_docker
             and self.preferred_tier >= SANDBOX_TIER_DOCKER
             and self._backend_available("docker")
         ):
+            self._selected_backend = "docker"
             return SANDBOX_TIER_DOCKER
+        self._selected_backend = "scoped"
         return SANDBOX_TIER_SCOPED
 
     def _backend_available(self, name: str) -> bool:
@@ -413,7 +440,7 @@ class SandboxManager:
                 )
             return docker_backend
         if tier == SANDBOX_TIER_BWRAP:
-            if sys.platform.startswith("linux"):
+            if self._selected_backend == "bubblewrap":
                 bwrap_backend = BubblewrapSandbox(
                     workspace_root=self.workspace_root,
                     read_only_paths=self.extra_read_only_paths,
@@ -423,7 +450,7 @@ class SandboxManager:
                 if not bwrap_backend.is_available():
                     raise SandboxBackendUnavailable("bwrap backend unavailable")
                 return bwrap_backend
-            if has_sandbox_exec():
+            if self._selected_backend == "sandbox-exec" and has_sandbox_exec():
                 if self.require_read_isolation:
                     raise SandboxBackendUnavailable(
                         "sandbox-exec does not isolate host file reads"

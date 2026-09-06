@@ -8,6 +8,7 @@ from ash.config import AshConfig
 from ash.mcp.server import MCPServerConfig
 from ash.providers.base import ProviderABC
 from ash.safety.grants import PermissionRule, RuleEffect
+from ash.sandbox import SandboxBackendUnavailable
 from ash.ui.headless import HeadlessUI
 
 
@@ -22,6 +23,28 @@ class RuntimeProvider(ProviderABC):
     async def stream_chat(self, messages, temperature=0.0, tools=None):
         if False:
             yield
+
+
+def test_runtime_rejects_macos_sandbox_exec_auto_approve(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("ash.sandbox.manager.sys.platform", "darwin")
+    monkeypatch.setattr("ash.sandbox.manager.has_sandbox_exec", lambda: True)
+    monkeypatch.setattr("ash.sandbox.manager.has_docker", lambda _image: False)
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        safety_tier="auto_approve",
+        repo_map_enabled=False,
+    )
+
+    with pytest.raises(SandboxBackendUnavailable, match="sandbox-exec"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            run_maintenance=False,
+        )
 
 
 def test_runtime_loads_project_mcp_only_when_trusted(tmp_path, monkeypatch) -> None:
