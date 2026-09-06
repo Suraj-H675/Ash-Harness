@@ -164,6 +164,26 @@ async def test_jsonrpc_turn_validation_and_unknown_method() -> None:
 
 
 @pytest.mark.asyncio
+async def test_jsonrpc_redacts_secrets_from_internal_errors() -> None:
+    client = FakeClient()
+    secret = "sk-proj-abcdefghijklmnop"
+
+    async def fail(_text: str) -> AshResult:
+        raise RuntimeError(f"provider failed api_key={secret}")
+
+    client.prompt = fail
+    server = JSONRPCServer(client)  # type: ignore[arg-type]
+
+    response = await server.handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "turn/run", "params": {"input": "hi"}}
+    )
+
+    assert response["error"]["code"] == -32603
+    assert secret not in str(response)
+    assert "[REDACTED]" in response["error"]["data"]["detail"]
+
+
+@pytest.mark.asyncio
 async def test_jsonrpc_rejects_malformed_collection_parameters() -> None:
     server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
 

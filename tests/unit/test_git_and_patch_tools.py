@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from ash.safety.guard import SafetyGuard
+from ash.sandbox import SandboxManager, SandboxResult
 from ash.sandbox.process_utils import ProcessOutputLimitExceeded, communicate_process
 from ash.tools.git import (
     GIT_OUTPUT_LIMIT_EXIT,
@@ -170,6 +171,78 @@ async def test_git_capture_limit_returns_a_bounded_failure_to_callers(
     assert code == GIT_OUTPUT_LIMIT_EXIT
     assert stdout == "partial"
     assert "exceeded" in stderr
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend_name", "expected_executable"),
+    [("bubblewrap", None), ("docker", "git")],
+)
+async def test_run_git_uses_supplied_sandbox_manager(
+    tmp_path: Path,
+    backend_name: str,
+    expected_executable: str | None,
+) -> None:
+    manager = Mock(backend_name=backend_name)
+    manager.run = AsyncMock(
+        return_value=SandboxResult(
+            exit_code=0,
+            stdout="sandboxed",
+            stderr="",
+            tier=2,
+            backend_name=backend_name,
+            fallback_used=False,
+            duration_seconds=0.01,
+        )
+    )
+
+    code, stdout, stderr = await _run_git(
+        tmp_path,
+        ["status", "--short"],
+        sandbox_manager=manager,
+    )
+
+    assert code == 0
+    assert stdout == "sandboxed"
+    assert stderr == ""
+    command = manager.run.await_args.args[0]
+    if expected_executable is None:
+        assert Path(command[0]).name == "git"
+        assert Path(command[0]).is_absolute()
+    else:
+        assert command[0] == expected_executable
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Git hook fixture")
+@pytest.mark.asyncio
+async def test_auto_commit_contains_git_hook_inside_runtime_sandbox(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    await _init_repo(workspace)
+    target = workspace / "tracked.txt"
+    target.write_text("old\n", encoding="utf-8")
+    await _git(workspace, "add", "tracked.txt")
+    await _git(workspace, "commit", "-qm", "initial")
+    target.write_text("new\n", encoding="utf-8")
+    outside = tmp_path / "outside-marker"
+    hook = workspace / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        f"#!/bin/sh\nprintf escaped > {outside} 2>/dev/null || true\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    manager = SandboxManager(workspace_root=workspace, backend_preference="native")
+    if not manager.is_fully_isolated():
+        pytest.skip("full native sandbox is unavailable on this host")
+
+    result = await AutoCommitTool(
+        SafetyGuard(workspace), sandbox_manager=manager
+    ).run(message="sandboxed hook", paths=["tracked.txt"])
+
+    assert result.success is True
+    assert not outside.exists()
 
 
 @pytest.mark.asyncio

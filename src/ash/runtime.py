@@ -163,6 +163,7 @@ def build_tools(
         AutoCommitTool(
             safety_guard,
             environment_allowlist=environment_allowlist,
+            sandbox_manager=sandbox_manager,
         ),
         GitStatusTool(safety_guard),
         GitDiffTool(safety_guard),

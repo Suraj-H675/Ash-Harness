@@ -300,6 +300,49 @@ def test_git_install_times_out_without_leaking_clone_process(
     assert "timed out" in str(exc_info.value)
 
 
+def test_git_install_rejects_embedded_url_credentials_before_clone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run = monkeypatch.setattr(
+        "ash.plugins.lifecycle.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("git clone must not run"),
+    )
+
+    with pytest.raises(PluginLifecycleError, match="embedded credentials"):
+        install_git_plugin(
+            "https://user:embeddedvalue@plugins.example/demo.git",
+            ref="main",
+            destination_root=tmp_path / "installed",
+        )
+
+    assert run is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://plugins.example/demo.git?access_token=embeddedvalue",
+        "https://plugins.example/demo.git#embeddedvalue",
+    ],
+)
+def test_git_install_rejects_query_or_fragment_before_clone(
+    tmp_path: Path, monkeypatch, source: str
+) -> None:
+    run = monkeypatch.setattr(
+        "ash.plugins.lifecycle.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("git clone must not run"),
+    )
+
+    with pytest.raises(PluginLifecycleError, match="query or fragment"):
+        install_git_plugin(
+            source,
+            ref="main",
+            destination_root=tmp_path / "installed",
+        )
+
+    assert run is None
+
+
 def test_git_install_caps_clone_error_detail(
     tmp_path: Path, monkeypatch
 ) -> None:

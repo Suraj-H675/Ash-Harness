@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from rich.console import Console
 from rich.table import Table
 
+from ash.core.redaction import redact_text
 from ash.provider_catalog import BUILTIN_PROVIDERS
 from ash.providers.readiness import (
     ProviderConfigurationError,
@@ -139,7 +140,7 @@ def test_provider(
 def provider_test_error(exc: Exception, *, json_output: bool = False) -> str:
     """Render a stable, secret-free provider test failure."""
 
-    message = str(exc)
+    message = redact_text(str(exc))
     if json_output:
         return json.dumps({"ok": False, "error": message}, sort_keys=True)
     return f"Provider test failed: {message}"

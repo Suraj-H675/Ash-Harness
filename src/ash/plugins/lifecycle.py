@@ -264,6 +264,14 @@ def install_git_plugin(
     if scheme == "https":
         if not parsed.hostname:
             raise PluginLifecycleError("plugin Git source must use an HTTPS URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise PluginLifecycleError(
+                "plugin Git source URL cannot contain embedded credentials"
+            )
+        if parsed.query or parsed.fragment:
+            raise PluginLifecycleError(
+                "plugin Git source URL cannot contain a query or fragment"
+            )
     elif scheme == "file":
         if parsed.hostname not in {None, "", "localhost"}:
             raise PluginLifecycleError("plugin file source must be local")

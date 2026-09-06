@@ -7,7 +7,6 @@ import asyncio
 import json
 import os
 import platform
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -26,6 +25,7 @@ from ash.providers.readiness import (
     verify_provider_connection,
 )
 from ash.sandbox import SandboxManager
+from ash.safety.environment import resolve_host_executable
 
 
 @dataclass(frozen=True)
@@ -465,6 +465,12 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
             )
         )
         return checks
+    git = resolve_host_executable(
+        "git", workspace_root=config.workspace_root, cwd=config.workspace_root
+    )
+    ripgrep = resolve_host_executable(
+        "rg", workspace_root=config.workspace_root, cwd=config.workspace_root
+    )
     checks.extend(
         [
             DoctorCheck(
@@ -478,14 +484,13 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
             _check_automation(config),
             DoctorCheck(
                 "git",
-                "pass" if shutil.which("git") else "warn",
-                shutil.which("git") or "git is not installed",
+                "pass" if git else "warn",
+                git or "git is not installed",
             ),
             DoctorCheck(
                 "ripgrep",
-                "pass" if shutil.which("rg") else "warn",
-                shutil.which("rg")
-                or "rg is unavailable; Python search fallback will be used",
+                "pass" if ripgrep else "warn",
+                ripgrep or "rg is unavailable; Python search fallback will be used",
             ),
         ]
     )

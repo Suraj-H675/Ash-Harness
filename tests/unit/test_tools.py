@@ -951,6 +951,19 @@ def test_default_command_tools_receive_environment_allowlist(tmp_path: Path) -> 
     assert tools["auto_commit"].environment_allowlist == ("BUILD_CHANNEL",)
 
 
+def test_default_auto_commit_tool_receives_runtime_sandbox(tmp_path: Path) -> None:
+    from ash.__main__ import _build_tools
+    from ash.safety.guard import SafetyGuard
+
+    manager = object()
+    tools = _build_tools(
+        SafetyGuard(project_root=tmp_path),
+        sandbox_manager=manager,
+    )
+
+    assert tools["auto_commit"].sandbox_manager is manager
+
+
 @pytest.mark.asyncio
 async def test_auto_commit_tool_runs_successfully(tmp_path):
     """AutoCommitTool should create a commit when called with valid args."""

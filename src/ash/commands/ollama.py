@@ -6,10 +6,11 @@ import asyncio
 import codecs
 import os
 import re
-import shutil
 import sys
+from pathlib import Path
 
 from ash.sandbox.process_utils import terminate_process_tree
+from ash.safety.environment import resolve_host_executable
 
 
 MAX_PULL_OUTPUT_CHARS = 20_000
@@ -43,11 +44,15 @@ async def pull_model(
     model: str,
     *,
     timeout_seconds: int = DEFAULT_PULL_TIMEOUT_SECONDS,
+    workspace_root: str | Path | None = None,
 ) -> int:
     """Pull one validated model with bounded output and process cleanup."""
 
     normalized = validate_ollama_model(model)
-    executable = shutil.which("ollama")
+    workspace = Path(workspace_root or Path.cwd()).resolve()
+    executable = resolve_host_executable(
+        "ollama", workspace_root=workspace, cwd=workspace
+    )
     if executable is None:
         print(
             "Error: ollama executable not found. Install Ollama first.",

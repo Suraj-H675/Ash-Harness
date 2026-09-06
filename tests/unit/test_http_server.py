@@ -5,7 +5,7 @@ import pytest
 
 from ash.sdk import AshEvent, AshEventRecord, AshResult
 from ash.core.session import SessionLineage
-from ash.server.http import create_app
+from ash.server.http import MAX_HTTP_BODY_BYTES, create_app
 
 
 class FakeClient:
@@ -117,6 +117,70 @@ async def test_http_server_requires_auth_and_runs_turn() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_rest_stops_reading_after_payload_limit() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    consumed: list[int] = []
+    chunk_size = 4 * 1024 * 1024
+
+    async def oversized_body():
+        yield b'{"input":"'
+        for index in range(8):
+            consumed.append(index)
+            yield b"x" * chunk_size
+        yield b'"}'
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/v1/turn",
+            content=oversized_body(),
+            headers={
+                "Authorization": "Bearer 0123456789abcdef",
+                "Content-Type": "application/json",
+            },
+        )
+
+    assert response.status_code == 413
+    assert consumed == [0, 1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_http_rest_rejects_oversized_content_length_without_reading_body() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    consumed = False
+
+    async def oversized_body():
+        nonlocal consumed
+        consumed = True
+        yield b"should-not-be-read"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/v1/turn",
+            content=oversized_body(),
+            headers={
+                "Authorization": "Bearer 0123456789abcdef",
+                "Content-Type": "application/json",
+                "Content-Length": str(MAX_HTTP_BODY_BYTES + 1),
+            },
+        )
+
+    assert response.status_code == 413
+    assert consumed is False
+
+
+@pytest.mark.asyncio
 async def test_http_resume_normalizes_missing_and_cross_workspace_sessions() -> None:
     client = FakeClient()
     app = create_app(
@@ -145,6 +209,58 @@ async def test_http_resume_normalizes_missing_and_cross_workspace_sessions() -> 
     assert missing.json()["detail"] == "'Session not found: missing'"
     assert wrong_workspace.status_code == 422
     assert wrong_workspace.json()["detail"] == "session belongs to a different workspace"
+
+
+@pytest.mark.asyncio
+async def test_http_server_redacts_secrets_from_error_details() -> None:
+    client = FakeClient()
+    secret = "sk-proj-abcdefghijklmnop"
+    client.steering_error = RuntimeError(f"provider failed token={secret}")
+    app = create_app(
+        client,  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/v1/turn/steer",
+            json={"input": "hello"},
+            headers={"Authorization": "Bearer 0123456789abcdef"},
+        )
+
+    assert response.status_code == 409
+    assert secret not in response.text
+    assert "[REDACTED]" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_http_stream_redacts_secrets_from_event_payloads() -> None:
+    client = FakeClient()
+    secret = "verylongpasswordvalue"
+
+    async def stream_with_secret(_text):
+        yield AshEvent("turn.error", {"error": f"provider failed password={secret}"})
+
+    client.stream_prompt = stream_with_secret
+    app = create_app(
+        client,  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/v1/turn/stream",
+            json={"input": "hello"},
+            headers={"Authorization": "Bearer 0123456789abcdef"},
+        )
+
+    assert response.status_code == 200
+    assert secret not in response.text
+    assert "[REDACTED]" in response.text
 
 
 @pytest.mark.asyncio

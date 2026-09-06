@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from ash.core.redaction import find_secret_candidates
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.safety.guard import SafetyGuard
+from ash.sandbox import SandboxBackendUnavailable, SandboxManager
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
     communicate_process,
@@ -132,9 +133,11 @@ class AutoCommitTool(BaseTool):
         safety_guard: SafetyGuard,
         *,
         environment_allowlist: Iterable[str] = (),
+        sandbox_manager: SandboxManager | None = None,
     ) -> None:
         super().__init__(safety_guard)
         self.environment_allowlist = tuple(environment_allowlist)
+        self.sandbox_manager = sandbox_manager
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = AutoCommitArgs(**kwargs)
@@ -177,7 +180,11 @@ class AutoCommitTool(BaseTool):
                     error=f"Refused to stage path outside Git workspace: {raw!r}",
                 )
             resolved_paths.append(relative.as_posix())
-        staged_before = await _cached_paths(workspace_root, self.environment_allowlist)
+        staged_before = await _cached_paths(
+            workspace_root,
+            self.environment_allowlist,
+            sandbox_manager=self.sandbox_manager,
+        )
         if staged_before is None:
             return ToolResult(
                 success=False,
@@ -197,7 +204,10 @@ class AutoCommitTool(BaseTool):
         stage_cmd = ["add", "--", *resolved_paths]
 
         stage_code, stage_stdout, stage_stderr = await _run_git(
-            workspace_root, stage_cmd, self.environment_allowlist
+            workspace_root,
+            stage_cmd,
+            self.environment_allowlist,
+            sandbox_manager=self.sandbox_manager,
         )
         if stage_code != 0:
             return ToolResult(
@@ -209,7 +219,11 @@ class AutoCommitTool(BaseTool):
             )
 
         # Skip commit if there's nothing staged.
-        staged_after = await _cached_paths(workspace_root, self.environment_allowlist)
+        staged_after = await _cached_paths(
+            workspace_root,
+            self.environment_allowlist,
+            sandbox_manager=self.sandbox_manager,
+        )
         if staged_after is None:
             return ToolResult(
                 success=False,
@@ -244,6 +258,7 @@ class AutoCommitTool(BaseTool):
                 *resolved_paths,
             ],
             self.environment_allowlist,
+            sandbox_manager=self.sandbox_manager,
         )
         if scan_code != 0:
             return ToolResult(
@@ -288,6 +303,7 @@ class AutoCommitTool(BaseTool):
                 args.message,
             ],
             self.environment_allowlist,
+            sandbox_manager=self.sandbox_manager,
         )
         if commit_code != 0:
             return ToolResult(
@@ -308,6 +324,8 @@ async def _run_git(
     cwd: Path,
     args: Sequence[str],
     environment_allowlist: Iterable[str] = (),
+    *,
+    sandbox_manager: SandboxManager | None = None,
 ) -> tuple[int, str, str]:
     """Run ``git <args>`` in ``cwd`` and return (exit, stdout, stderr)."""
 
@@ -315,10 +333,31 @@ async def _run_git(
     if git is None:
         return 127, "", "git is unavailable outside the workspace"
     cmd = [git, *args]
+    allowlist = tuple(environment_allowlist)
+    environment = build_scrubbed_environment(allowlist)
+    if sandbox_manager is not None:
+        sandbox_command = ["git", *args] if sandbox_manager.backend_name == "docker" else cmd
+        try:
+            result = await sandbox_manager.run(
+                sandbox_command,
+                cwd=cwd,
+                timeout=30,
+                env=environment,
+                passthrough_env_names=allowlist,
+            )
+        except SandboxBackendUnavailable as exc:
+            return 126, "", f"sandbox unavailable for git command: {exc}"
+        if result.output_truncated:
+            return (
+                GIT_OUTPUT_LIMIT_EXIT,
+                result.stdout,
+                result.stderr or f"git output exceeded {DEFAULT_GIT_OUTPUT_LIMIT} bytes",
+            )
+        return result.exit_code, result.stdout, result.stderr
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(cwd),
-        env=build_scrubbed_environment(environment_allowlist),
+        env=environment,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         **process_group_options(),
@@ -353,12 +392,16 @@ async def _run_git(
 
 
 async def _cached_paths(
-    cwd: Path, environment_allowlist: Iterable[str] = ()
+    cwd: Path,
+    environment_allowlist: Iterable[str] = (),
+    *,
+    sandbox_manager: SandboxManager | None = None,
 ) -> list[str] | None:
     code, stdout, _ = await _run_git(
         cwd,
         ["diff", "--cached", "--name-only", "-z"],
         environment_allowlist,
+        sandbox_manager=sandbox_manager,
     )
     if code != 0:
         return None

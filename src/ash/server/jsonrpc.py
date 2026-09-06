@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 
 from ash.sdk import AshClient
 from ash.core.events import EVENT_SCHEMA_VERSION
+from ash.core.redaction import redact_text
 
 
 MAX_JSONRPC_TEXT_BYTES = 1_000_000
@@ -72,9 +73,14 @@ class JSONRPCServer:
         except asyncio.CancelledError:
             return _error(request_id, -32800, "Request cancelled")
         except (KeyError, TypeError, ValueError) as exc:
-            return _error(request_id, -32602, str(exc))
+            return _error(request_id, -32602, redact_text(str(exc)))
         except Exception as exc:  # noqa: BLE001
-            return _error(request_id, -32603, "Internal error", {"detail": str(exc)})
+            return _error(
+                request_id,
+                -32603,
+                "Internal error",
+                {"detail": redact_text(str(exc))},
+            )
         finally:
             self._pending.pop(request_id, None)
 

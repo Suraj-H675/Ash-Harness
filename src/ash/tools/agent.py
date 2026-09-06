@@ -641,20 +641,28 @@ class SpawnAgentTool(BaseTool):
                     )
                 return report
             except asyncio.CancelledError:
+                current_status = self._shared_state.get_status(agent_id)
+                cancellation_reason = (
+                    current_status.current_task
+                    if current_status is not None
+                    and current_status.status == "failed"
+                    and current_status.current_task == "stopped by persisted message"
+                    else "subagent execution cancelled"
+                )
                 self._shared_state.tasks.cancel_task(
                     durable_task.task_id,
-                    reason="subagent execution cancelled",
+                    reason=cancellation_reason,
                 )
                 self._emit_task_lifecycle(
                     "agent.task.cancelled",
                     durable_task.task_id,
                     state="cancelled",
-                    reason="subagent execution cancelled",
+                    reason=cancellation_reason,
                 )
                 self._shared_state.update_status(
                     agent_id,
                     "failed",
-                    current_task="subagent execution cancelled",
+                    current_task=cancellation_reason,
                 )
                 raise
             except Exception as exc:

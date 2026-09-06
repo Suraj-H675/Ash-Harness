@@ -1662,15 +1662,22 @@ class AshLoop:
         if self.auto_commit:
             commit_paths = self.auto_commit_paths or sorted(self._turn_modified_paths)
             if commit_paths:
-                commit_result = await auto_commit_turn(
-                    self.project_root,
-                    message=f"ash: turn complete ({len(final_text)} chars)",
-                    paths=commit_paths,
-                    safety_guard=self.safety_guard,
-                    environment_allowlist=getattr(
-                        self._config, "command_env_allowlist", ()
-                    ),
-                )
+                registered_auto_commit = self.tools.get("auto_commit")
+                if registered_auto_commit is not None:
+                    commit_result = await registered_auto_commit.run(
+                        message=f"ash: turn complete ({len(final_text)} chars)",
+                        paths=[str(path) for path in commit_paths],
+                    )
+                else:
+                    commit_result = await auto_commit_turn(
+                        self.project_root,
+                        message=f"ash: turn complete ({len(final_text)} chars)",
+                        paths=commit_paths,
+                        safety_guard=self.safety_guard,
+                        environment_allowlist=getattr(
+                            self._config, "command_env_allowlist", ()
+                        ),
+                    )
                 if not commit_result.success and commit_result.error:
                     # Surface commit failures to the user but don't fail the turn.
                     self.ui.console.print(f"auto_commit failed: {commit_result.error}")

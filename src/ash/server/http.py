@@ -13,9 +13,11 @@ from typing import Any, AsyncIterator
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, StrictInt
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ash.sdk import AshClient
 from ash.core.events import EVENT_SCHEMA_VERSION
+from ash.core.redaction import redact_text, redact_value
 from ash.server.jsonrpc import JSONRPCServer
 
 
@@ -60,6 +62,70 @@ class SlidingWindowLimiter:
 MAX_JSONRPC_BODY_BYTES = 1_048_576
 MAX_JSONRPC_BATCH_REQUESTS = 32
 MAX_EVENT_LIST_LIMIT = 10_000
+MAX_HTTP_BODY_BYTES = 16 * 1024 * 1024
+
+
+class _BoundedRequestBodyMiddleware:
+    """Bound inbound REST bodies before framework parsing allocates them."""
+
+    def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] != "http"
+            or scope.get("path") == "/rpc"
+            or scope.get("method") not in {"POST", "PUT", "PATCH"}
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        for key, value in scope.get("headers", []):
+            if key.lower() != b"content-length":
+                continue
+            try:
+                content_length = int(value)
+            except ValueError:
+                break
+            if content_length > self.max_bytes:
+                await self._reject(scope, receive, send)
+                return
+            break
+
+        buffered: list[Message] = []
+        total = 0
+        while True:
+            message = await receive()
+            buffered.append(message)
+            if message["type"] != "http.request":
+                break
+            total += len(message.get("body", b""))
+            if total > self.max_bytes:
+                await self._reject(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+
+        index = 0
+
+        async def replay() -> Message:
+            nonlocal index
+            if index < len(buffered):
+                message = buffered[index]
+                index += 1
+                return message
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+    @staticmethod
+    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            status_code=413,
+            content={"detail": "Request body exceeds the server limit"},
+        )
+        await response(scope, receive, send)
 
 
 def create_app(
@@ -82,6 +148,7 @@ def create_app(
             await client.close()
 
     app = FastAPI(title="Ash API", version="1", lifespan=lifespan)
+    app.add_middleware(_BoundedRequestBodyMiddleware, max_bytes=MAX_HTTP_BODY_BYTES)
 
     async def authorize(
         request: Request,
@@ -188,7 +255,7 @@ def create_app(
     async def stream_turn(payload: TurnRequest) -> StreamingResponse:
         async def events() -> AsyncIterator[str]:
             async for event in client.stream_prompt(payload.input):
-                yield _sse(event.type, event.to_wire(include_type=False))
+                yield _sse(event.type, redact_value(event.to_wire(include_type=False)))
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
@@ -197,9 +264,9 @@ def create_app(
         try:
             pending = await client.steer(payload.input)
         except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(status_code=409, detail=redact_text(str(exc))) from exc
         except OverflowError as exc:
-            raise HTTPException(status_code=429, detail=str(exc)) from exc
+            raise HTTPException(status_code=429, detail=redact_text(str(exc))) from exc
         return {"pending": pending}
 
     @app.get("/v1/sessions", dependencies=[Depends(authorize)])
@@ -237,7 +304,7 @@ def create_app(
                 limit=limit,
             )
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise HTTPException(status_code=422, detail=redact_text(str(exc))) from exc
         return {
             "schema_version": EVENT_SCHEMA_VERSION,
             "events": [
@@ -252,9 +319,9 @@ def create_app(
         try:
             tree = client.session_tree(session_id)
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(status_code=404, detail=redact_text(str(exc))) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise HTTPException(status_code=422, detail=redact_text(str(exc))) from exc
         return {"sessions": [item.model_dump(mode="json") for item in tree]}
 
     @app.post("/v1/sessions/{session_id}/fork", dependencies=[Depends(authorize)])
@@ -269,11 +336,11 @@ def create_app(
                 branch_summary=payload.branch_summary,
             )
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(status_code=404, detail=redact_text(str(exc))) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise HTTPException(status_code=422, detail=redact_text(str(exc))) from exc
         except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(status_code=409, detail=redact_text(str(exc))) from exc
         return {"session_id": forked_id}
 
     @app.post("/v1/sessions", dependencies=[Depends(authorize)])
@@ -285,9 +352,9 @@ def create_app(
         try:
             session_id = await client.resume(payload.session_id)
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(status_code=404, detail=redact_text(str(exc))) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise HTTPException(status_code=422, detail=redact_text(str(exc))) from exc
         return {"session_id": session_id}
 
     return app

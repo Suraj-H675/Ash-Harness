@@ -44,6 +44,20 @@ def test_provider_test_rendering_never_includes_credentials() -> None:
     assert json.loads(rendered)["ok"] is True
 
 
+@pytest.mark.parametrize("json_output", [False, True])
+def test_provider_test_error_redacts_credentials(json_output: bool) -> None:
+    from ash.commands.providers import provider_test_error
+
+    secret = "verylongprovidersecret"
+    rendered = provider_test_error(
+        RuntimeError(f"upstream failed api_key={secret}"),
+        json_output=json_output,
+    )
+
+    assert secret not in rendered
+    assert "[REDACTED]" in rendered
+
+
 def test_main_lists_provider_catalog_without_loading_runtime_config(capsys) -> None:
     from ash.cli import main
 

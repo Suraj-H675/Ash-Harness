@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ash.sandbox import SandboxManager
+from ash.safety.environment import resolve_host_executable
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
@@ -46,10 +46,15 @@ def render_sandbox_status(status: dict[str, Any], *, json_output: bool = False) 
     return "\n".join(lines)
 
 
-def build_sandbox_image(image: str) -> int:
+def build_sandbox_image(
+    image: str, *, workspace_root: str | Path | None = None
+) -> int:
     """Build the packaged baseline image after an explicit user command."""
 
-    docker = shutil.which("docker")
+    workspace = Path(workspace_root or Path.cwd()).resolve()
+    docker = resolve_host_executable(
+        "docker", workspace_root=workspace, cwd=workspace
+    )
     if docker is None:
         raise RuntimeError("Docker CLI is not installed or is not on PATH")
     resource = files("ash.sandbox").joinpath("Dockerfile")
