@@ -122,8 +122,8 @@ def create_app(
                     "error": {"code": -32700, "message": "Unsupported media type"}
                 },
             )
-        body = await request.body()
-        if not 1 <= len(body) <= MAX_JSONRPC_BODY_BYTES:
+        body = await _read_bounded_body(request, MAX_JSONRPC_BODY_BYTES)
+        if body is None or not body:
             return JSONResponse(
                 status_code=413,
                 content={
@@ -293,6 +293,15 @@ def create_app(
 
 def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+
+async def _read_bounded_body(request: Request, max_bytes: int) -> bytes | None:
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > max_bytes:
+            return None
+        body.extend(chunk)
+    return bytes(body)
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

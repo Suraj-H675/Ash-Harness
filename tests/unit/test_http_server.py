@@ -235,6 +235,37 @@ async def test_http_jsonrpc_batch_and_protocol_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_jsonrpc_stops_reading_after_payload_limit() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    headers = {
+        "Authorization": "Bearer 0123456789abcdef",
+        "Content-Type": "application/json",
+    }
+    consumed: list[int] = []
+
+    async def oversized_body():
+        for index in range(6):
+            consumed.append(index)
+            yield b"x" * 600_000
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/rpc",
+            content=oversized_body(),
+            headers=headers,
+        )
+
+    assert response.status_code == 413
+    assert consumed == [0, 1]
+
+
+@pytest.mark.asyncio
 async def test_http_jsonrpc_batch_rejects_non_object_members() -> None:
     app = create_app(
         FakeClient(),  # type: ignore[arg-type]
