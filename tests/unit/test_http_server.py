@@ -11,6 +11,7 @@ from ash.server.http import create_app
 class FakeClient:
     def __init__(self):
         self.steering_error = None
+        self.resume_error = None
 
     async def prompt(self, text):
         return AshResult(text.upper(), "session-1", "fake/model", 2)
@@ -40,6 +41,8 @@ class FakeClient:
         return "session-new"
 
     async def resume(self, session_id):
+        if self.resume_error is not None:
+            raise self.resume_error
         return session_id
 
     async def fork(
@@ -108,6 +111,37 @@ async def test_http_server_requires_auth_and_runs_turn() -> None:
         assert response.status_code == 200
         assert response.json()["response"] == "HELLO"
         assert response.json()["usage"]["cache_read_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_http_resume_normalizes_missing_and_cross_workspace_sessions() -> None:
+    client = FakeClient()
+    app = create_app(
+        client,  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        client.resume_error = KeyError("Session not found: missing")
+        missing = await http.post(
+            "/v1/sessions/resume",
+            json={"session_id": "missing"},
+            headers=headers,
+        )
+        client.resume_error = ValueError("session belongs to a different workspace")
+        wrong_workspace = await http.post(
+            "/v1/sessions/resume",
+            json={"session_id": "foreign"},
+            headers=headers,
+        )
+
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "'Session not found: missing'"
+    assert wrong_workspace.status_code == 422
+    assert wrong_workspace.json()["detail"] == "session belongs to a different workspace"
 
 
 @pytest.mark.asyncio

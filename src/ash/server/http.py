@@ -280,7 +280,13 @@ def create_app(
 
     @app.post("/v1/sessions/resume", dependencies=[Depends(authorize)])
     async def resume_session(payload: ResumeRequest) -> dict[str, str]:
-        return {"session_id": await client.resume(payload.session_id)}
+        try:
+            session_id = await client.resume(payload.session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"session_id": session_id}
 
     return app
 
