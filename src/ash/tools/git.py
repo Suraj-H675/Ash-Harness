@@ -17,7 +17,7 @@ from typing import Annotated, Any, Iterable, Sequence
 from pydantic import BaseModel, Field
 
 from ash.core.redaction import find_secret_candidates
-from ash.safety.environment import build_scrubbed_environment
+from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.safety.guard import SafetyGuard
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
@@ -311,7 +311,10 @@ async def _run_git(
 ) -> tuple[int, str, str]:
     """Run ``git <args>`` in ``cwd`` and return (exit, stdout, stderr)."""
 
-    cmd = ["git", *args]
+    git = resolve_host_executable("git", workspace_root=cwd, cwd=cwd)
+    if git is None:
+        return 127, "", "git is unavailable outside the workspace"
+    cmd = [git, *args]
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(cwd),

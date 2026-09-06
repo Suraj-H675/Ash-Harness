@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import json
-import shutil
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, TextIO
 
 from pydantic import BaseModel, Field
 
+from ash.safety.environment import resolve_host_executable
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
     communicate_process,
@@ -191,11 +191,14 @@ class SearchTextTool(BaseTool):
             return ToolResult(
                 success=False, output="", error=f"Not a directory: {root}"
             )
-        if shutil.which("rg") is None:
+        rg = resolve_host_executable(
+            "rg", workspace_root=self.safety_guard.project_root, cwd=root
+        )
+        if rg is None:
             return await self._python_fallback(root, args)
 
         command = [
-            "rg",
+            rg,
             "--json",
             "--line-number",
             "--color",

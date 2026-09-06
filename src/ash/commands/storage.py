@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from ash.core.session import CURRENT_SCHEMA_VERSION, SessionStorageError, SessionStore
 from ash.core.redaction import redact_text
+from ash.safety.environment import resolve_host_executable
 
 
 @dataclass(frozen=True)
@@ -151,15 +152,20 @@ def create_debug_bundle(config, destination: str | Path | None = None) -> Path:
     database = config.db_directory / "sessions.db"
     check = check_database(database)
     try:
+        git = resolve_host_executable(
+            "git", workspace_root=config.workspace_root, cwd=config.workspace_root
+        )
         git_revision = redact_text(
             subprocess.run(
-                ["git", "rev-parse", "--short", "HEAD"],
+                [git, "rev-parse", "--short", "HEAD"],
                 cwd=config.workspace_root,
                 capture_output=True,
                 text=True,
                 timeout=2,
                 check=False,
             ).stdout.strip()
+            if git is not None
+            else ""
         )
     except (OSError, subprocess.TimeoutExpired):
         git_revision = ""

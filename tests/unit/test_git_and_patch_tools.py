@@ -65,6 +65,62 @@ async def test_git_inspection_and_patch(tmp_path: Path) -> None:
     assert "initial" in log.output
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
+@pytest.mark.asyncio
+async def test_git_tools_do_not_execute_workspace_shadowed_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _init_repo(tmp_path)
+    marker = tmp_path / "workspace-git-ran"
+    fake_git = tmp_path / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\nprintf ran > {marker}\nprintf FAKE_GIT_RAN\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+
+    result = await GitStatusTool(SafetyGuard(tmp_path)).run()
+
+    assert result.success is True
+    assert "FAKE_GIT_RAN" not in result.output
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
+@pytest.mark.asyncio
+async def test_patch_tool_does_not_execute_workspace_shadowed_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _init_repo(tmp_path)
+    target = tmp_path / "hello.txt"
+    target.write_text("old\n", encoding="utf-8")
+    await _git(tmp_path, "add", "hello.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    marker = tmp_path / "workspace-git-ran"
+    fake_git = tmp_path / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\nprintf ran > {marker}\nexit 0\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    patch_text = """diff --git a/hello.txt b/hello.txt
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1 @@
+-old
++new
+"""
+
+    result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(
+        patch=patch_text, dry_run=True
+    )
+
+    assert result.success is True
+    assert not marker.exists()
+
+
 @pytest.mark.asyncio
 async def test_git_inspection_reports_process_timeout(tmp_path: Path) -> None:
     with patch("ash.tools.git.communicate_process", side_effect=asyncio.TimeoutError):

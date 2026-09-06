@@ -9,6 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ash.safety.environment import resolve_host_executable
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
@@ -120,7 +121,10 @@ def _normalize_patch_path(path: str) -> str:
 
 
 async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, str]:
-    command = ["git", "apply", "--whitespace=nowarn"]
+    git = resolve_host_executable("git", workspace_root=cwd, cwd=cwd)
+    if git is None:
+        return 127, "", "git is unavailable outside the workspace"
+    command = [git, "apply", "--whitespace=nowarn"]
     if check:
         command.append("--check")
     command.append("-")

@@ -1,3 +1,4 @@
+import os
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -68,10 +69,36 @@ async def test_search_text_returns_file_and_line(tmp_path) -> None:
     assert "app.py:2:needle here" in result.output
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
+@pytest.mark.asyncio
+async def test_search_text_does_not_execute_workspace_shadowed_ripgrep(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "workspace-rg-ran"
+    fake_rg = tmp_path / "rg"
+    fake_rg.write_text(
+        f"#!/bin/sh\nprintf ran > {marker}\nexit 0\n",
+        encoding="utf-8",
+    )
+    fake_rg.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    (tmp_path / "notes.txt").write_text("needle\n", encoding="utf-8")
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle", fixed_strings=True
+    )
+
+    assert result.success is True
+    assert result.output == "notes.txt:1:needle"
+    assert not marker.exists()
+
+
 @pytest.mark.asyncio
 async def test_search_text_skips_malformed_ripgrep_events(tmp_path, monkeypatch) -> None:
     process = Mock(returncode=0)
-    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: "/usr/bin/rg")
+    monkeypatch.setattr(
+        "ash.tools.search.resolve_host_executable", lambda *args, **kwargs: "/usr/bin/rg"
+    )
     monkeypatch.setattr(
         "ash.tools.search.asyncio.create_subprocess_exec",
         AsyncMock(return_value=process),
@@ -100,7 +127,9 @@ async def test_search_text_does_not_mark_exact_ripgrep_limit_truncated(
     monkeypatch,
 ) -> None:
     process = Mock(returncode=0)
-    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: "/usr/bin/rg")
+    monkeypatch.setattr(
+        "ash.tools.search.resolve_host_executable", lambda *args, **kwargs: "/usr/bin/rg"
+    )
     monkeypatch.setattr(
         "ash.tools.search.asyncio.create_subprocess_exec",
         AsyncMock(return_value=process),
@@ -131,7 +160,9 @@ async def test_search_text_does_not_mark_exact_fallback_limit_truncated(
     tmp_path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: None)
+    monkeypatch.setattr(
+        "ash.tools.search.resolve_host_executable", lambda *args, **kwargs: None
+    )
     (tmp_path / "ok.py").write_text("needle\n")
 
     result = await SearchTextTool(SafetyGuard(tmp_path)).run(
@@ -158,7 +189,9 @@ async def test_search_text_rejects_out_of_scope_directory(tmp_path) -> None:
 async def test_search_text_bounds_oversized_fallback_output(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: None)
+    monkeypatch.setattr(
+        "ash.tools.search.resolve_host_executable", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr("ash.tools.search.MAX_SEARCH_CAPTURE_BYTES", 8_192)
     lines = ["needle " + "x" * 120 for _ in range(1_000)]
     (tmp_path / "large.txt").write_text("\n".join(lines))
@@ -176,7 +209,9 @@ async def test_search_text_bounds_oversized_fallback_output(
 
 @pytest.mark.asyncio
 async def test_search_text_fallback_bounds_long_line(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: None)
+    monkeypatch.setattr(
+        "ash.tools.search.resolve_host_executable", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr("ash.tools.search.MAX_SEARCH_CAPTURE_BYTES", 8_192)
     (tmp_path / "large.txt").write_text("needle " + "x" * 200_000)
 
@@ -193,7 +228,9 @@ async def test_search_text_fallback_bounds_long_line(tmp_path, monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_search_text_fallback_skips_oversized_files(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: None)
+    monkeypatch.setattr(
+        "ash.tools.search.resolve_host_executable", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr("ash.tools.search.MAX_SEARCH_FILE_BYTES", 32)
     (tmp_path / "large.txt").write_text("needle " + "x" * 40)
 
@@ -208,7 +245,9 @@ async def test_search_text_fallback_skips_oversized_files(tmp_path, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_search_text_fallback_bounds_workspace_scan(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: None)
+    monkeypatch.setattr(
+        "ash.tools.search.resolve_host_executable", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr("ash.tools.search.MAX_SEARCH_SCAN_ENTRIES", 2)
     for index in range(3):
         (tmp_path / f"{index}.txt").write_text(str(index))
@@ -226,7 +265,9 @@ async def test_search_text_fallback_bounds_workspace_scan(tmp_path, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_search_text_python_fallback_streams_lines(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("ash.tools.search.shutil.which", lambda _: None)
+    monkeypatch.setattr(
+        "ash.tools.search.resolve_host_executable", lambda *args, **kwargs: None
+    )
     (tmp_path / "notes.txt").write_text("first\nneedle\nlast\n")
 
     result = await SearchTextTool(SafetyGuard(tmp_path)).run(

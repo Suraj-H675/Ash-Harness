@@ -27,8 +27,13 @@ class RuntimeProvider(ProviderABC):
 
 def test_runtime_rejects_macos_sandbox_exec_auto_approve(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("ash.sandbox.manager.sys.platform", "darwin")
-    monkeypatch.setattr("ash.sandbox.manager.has_sandbox_exec", lambda: True)
-    monkeypatch.setattr("ash.sandbox.manager.has_docker", lambda _image: False)
+    monkeypatch.setattr(
+        "ash.sandbox.manager.has_sandbox_exec", lambda _workspace=None: True
+    )
+    monkeypatch.setattr(
+        "ash.sandbox.manager.has_docker",
+        lambda _image, *, workspace_root=None: False,
+    )
     config = AshConfig(
         model="ollama/runtime-model",
         workspace_root=tmp_path,

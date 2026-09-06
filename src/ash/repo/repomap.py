@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ash.safety.environment import resolve_host_executable
 from ash.repo.parser import (
     MAX_SOURCE_FILE_BYTES,
     SOURCE_SUFFIXES,
@@ -178,10 +179,13 @@ def _git_ignored_files(project_root: Path, paths: Iterable[Path]) -> set[Path]:
     relative_paths = [path.relative_to(project_root).as_posix() for path in paths]
     if not relative_paths:
         return set()
+    git = resolve_host_executable("git", workspace_root=project_root, cwd=project_root)
+    if git is None:
+        return set()
     payload = "\0".join(relative_paths).encode("utf-8") + b"\0"
     try:
         completed = subprocess.run(
-            ["git", "check-ignore", "--stdin", "-z"],
+            [git, "check-ignore", "--stdin", "-z"],
             cwd=project_root,
             input=payload,
             capture_output=True,

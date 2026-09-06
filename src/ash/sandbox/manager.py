@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -39,6 +38,7 @@ from ash.sandbox.process_utils import (
     process_group_options,
     terminate_process_tree,
 )
+from ash.safety.environment import resolve_host_executable
 
 
 # Re-export the tier constants for backwards compatibility with code
@@ -109,24 +109,34 @@ class SandboxStatus(TypedDict):
 # --- probe helpers ---------------------------------------------------------
 
 
-def has_bwrap() -> bool:
+def has_bwrap(workspace_root: Path | None = None) -> bool:
     """Whether ``bwrap`` is on PATH and the host is Linux."""
 
-    return sys.platform.startswith("linux") and probe_bwrap() is not None
+    return (
+        sys.platform.startswith("linux")
+        and probe_bwrap(workspace_root=workspace_root) is not None
+    )
 
 
-def has_sandbox_exec() -> bool:
+def has_sandbox_exec(workspace_root: Path | None = None) -> bool:
     """Whether ``sandbox-exec`` is available (macOS only)."""
 
     if sys.platform != "darwin":
         return False
-    return shutil.which("sandbox-exec") is not None
+    return (
+        resolve_host_executable(
+            "sandbox-exec", workspace_root=workspace_root
+        )
+        is not None
+    )
 
 
-def has_docker(image: str = DEFAULT_IMAGE) -> bool:
+def has_docker(
+    image: str = DEFAULT_IMAGE, *, workspace_root: Path | None = None
+) -> bool:
     """Whether Docker's daemon and selected local image are ready."""
 
-    return probe_docker(image=image) is not None
+    return probe_docker(image=image, workspace_root=workspace_root) is not None
 
 
 def auto_approve_safety_error(
@@ -414,9 +424,11 @@ class SandboxManager:
         if cached is not None:
             return cached
         probes = {
-            "bwrap": has_bwrap,
-            "sandbox_exec": has_sandbox_exec,
-            "docker": lambda: has_docker(self.docker_image),
+            "bwrap": lambda: has_bwrap(self.workspace_root),
+            "sandbox_exec": lambda: has_sandbox_exec(self.workspace_root),
+            "docker": lambda: has_docker(
+                self.docker_image, workspace_root=self.workspace_root
+            ),
         }
         available = probes[name]()
         self._available[name] = available
@@ -434,7 +446,9 @@ class SandboxManager:
             # restarting, or the configured image removed).  Re-probe here so
             # an unavailable isolation boundary is never reported as an
             # ordinary command failure.
-            if not has_docker(self.docker_image):
+            if not has_docker(
+                self.docker_image, workspace_root=self.workspace_root
+            ):
                 raise SandboxBackendUnavailable(
                     "docker daemon or configured sandbox image is unavailable"
                 )
@@ -450,7 +464,9 @@ class SandboxManager:
                 if not bwrap_backend.is_available():
                     raise SandboxBackendUnavailable("bwrap backend unavailable")
                 return bwrap_backend
-            if self._selected_backend == "sandbox-exec" and has_sandbox_exec():
+            if self._selected_backend == "sandbox-exec" and has_sandbox_exec(
+                self.workspace_root
+            ):
                 if self.require_read_isolation:
                     raise SandboxBackendUnavailable(
                         "sandbox-exec does not isolate host file reads"
@@ -630,9 +646,20 @@ class _SandboxExecBackend(SandboxBackend):
     workspace_root: Path | None = None
     network: bool = False
     workspace_read_only: bool = False
+    sandbox_exec_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.sandbox_exec_path is None:
+            object.__setattr__(
+                self,
+                "sandbox_exec_path",
+                resolve_host_executable(
+                    "sandbox-exec", workspace_root=self.workspace_root
+                ),
+            )
 
     def is_available(self) -> bool:
-        return has_sandbox_exec()
+        return sys.platform == "darwin" and self.sandbox_exec_path is not None
 
     def wrap(
         self,
@@ -667,7 +694,7 @@ class _SandboxExecBackend(SandboxBackend):
             network=self.network,
             workspace_read_only=self.workspace_read_only,
         )
-        return ["sandbox-exec", "-p", profile, *command]
+        return [self.sandbox_exec_path or "sandbox-exec", "-p", profile, *command]
 
 
 def _sandbox_exec_profile(

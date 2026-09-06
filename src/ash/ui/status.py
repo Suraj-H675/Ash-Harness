@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ash.safety.environment import resolve_host_executable
+
 if TYPE_CHECKING:
     from ash.config import AshConfig
     from ash.core.loop import AshLoop
@@ -73,8 +75,11 @@ def git_branch(root: Path) -> str:
     """Return branch or detached commit without invoking a shell or pager."""
 
     try:
+        git = resolve_host_executable("git", workspace_root=root, cwd=root)
+        if git is None:
+            return "none"
         result = subprocess.run(
-            ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+            [git, "symbolic-ref", "--quiet", "--short", "HEAD"],
             cwd=root,
             check=False,
             capture_output=True,
@@ -85,7 +90,7 @@ def git_branch(root: Path) -> str:
         if branch:
             return branch
         detached = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+            [git, "rev-parse", "--short", "HEAD"],
             cwd=root,
             check=False,
             capture_output=True,

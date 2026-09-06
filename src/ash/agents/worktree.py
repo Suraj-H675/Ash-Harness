@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from ash.safety.environment import resolve_host_executable
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
     communicate_process,
@@ -343,8 +344,14 @@ async def _run_git(
     *,
     check: bool,
 ) -> GitResult:
+    git = resolve_host_executable("git", workspace_root=cwd, cwd=cwd)
+    if git is None:
+        result = GitResult(127, "", "git is unavailable outside the workspace")
+        if check:
+            raise WorktreeError(result.stderr)
+        return result
     process = await asyncio.create_subprocess_exec(
-        "git",
+        git,
         *args,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,

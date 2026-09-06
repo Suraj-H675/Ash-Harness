@@ -12,7 +12,6 @@ to Tier 1.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -24,6 +23,7 @@ from ash.sandbox._base import (
     SandboxBackend,
     SandboxBackendUnavailable,
 )
+from ash.safety.environment import resolve_host_executable
 
 
 # Bwrap flags we always pass for hardened defaults.
@@ -73,7 +73,9 @@ class BubblewrapSandbox(SandboxBackend):
         # Resolve the bwrap binary lazily; the manager decides whether
         # to use this backend based on the probe result.
         if self.bwrap_path is None:
-            resolved = shutil.which("bwrap")
+            resolved = resolve_host_executable(
+                "bwrap", workspace_root=self.workspace_root
+            )
             if resolved is not None:
                 object.__setattr__(self, "bwrap_path", resolved)
 
@@ -176,7 +178,7 @@ class BubblewrapSandbox(SandboxBackend):
         return args
 
 
-def probe_bwrap() -> str | None:
+def probe_bwrap(*, workspace_root: Path | None = None) -> str | None:
     """Return a usable ``bwrap`` path, not merely an installed binary.
 
     Container hosts frequently expose the executable while denying the user or
@@ -184,7 +186,7 @@ def probe_bwrap() -> str | None:
     backend that will fail every command at runtime.
     """
 
-    path = shutil.which("bwrap")
+    path = resolve_host_executable("bwrap", workspace_root=workspace_root)
     if path is None or not sys.platform.startswith("linux"):
         return None
     try:

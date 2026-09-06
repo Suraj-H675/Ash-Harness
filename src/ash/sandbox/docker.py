@@ -11,7 +11,6 @@ raises :class:`SandboxBackendUnavailable`.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import sys
 import os
@@ -24,6 +23,7 @@ from ash.sandbox._base import (
     SandboxBackend,
     SandboxBackendUnavailable,
 )
+from ash.safety.environment import resolve_host_executable
 
 
 DEFAULT_IMAGE = "ash-sandbox:latest"
@@ -47,7 +47,9 @@ class DockerSandbox(SandboxBackend):
 
     def __post_init__(self) -> None:
         if self.docker_path is None:
-            resolved = shutil.which("docker")
+            resolved = resolve_host_executable(
+                "docker", workspace_root=self.workspace_root
+            )
             object.__setattr__(self, "docker_path", resolved)
 
     def is_available(self) -> bool:
@@ -151,10 +153,12 @@ class DockerSandbox(SandboxBackend):
         return args
 
 
-def probe_docker(*, image: str = DEFAULT_IMAGE) -> str | None:
+def probe_docker(
+    *, image: str = DEFAULT_IMAGE, workspace_root: Path | None = None
+) -> str | None:
     """Return Docker's path only when its daemon and sandbox image are ready."""
 
-    path = shutil.which("docker")
+    path = resolve_host_executable("docker", workspace_root=workspace_root)
     if path is None:
         return None
     try:

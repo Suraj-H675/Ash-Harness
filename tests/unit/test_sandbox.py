@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +26,7 @@ from ash.sandbox import (
 )
 from ash.sandbox.bwrap import probe_bwrap
 from ash.sandbox.docker import DEFAULT_IMAGE, probe_docker
+from ash.safety.environment import resolve_host_executable
 from ash.tools.command import RunCommandTool
 
 
@@ -48,8 +49,54 @@ def test_has_sandbox_exec_only_on_macos() -> None:
     if sys.platform != "darwin":
         assert has_sandbox_exec() is False
     else:
-        # On macOS, reflects whether the binary is actually on PATH.
-        assert has_sandbox_exec() is (shutil.which("sandbox-exec") is not None)
+        # On macOS, reflects whether a host binary is actually on PATH.
+        assert has_sandbox_exec() is (
+            resolve_host_executable("sandbox-exec") is not None
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
+def test_resolve_host_executable_skips_workspace_shadow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    host_bin = tmp_path / "host-bin"
+    workspace.mkdir()
+    host_bin.mkdir()
+    for directory in (workspace, host_bin):
+        executable = directory / "helper"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join((str(workspace), str(host_bin))))
+
+    resolved = resolve_host_executable(
+        "helper", workspace_root=workspace, cwd=workspace
+    )
+
+    assert resolved == str((host_bin / "helper").resolve())
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="bubblewrap is Linux-only")
+def test_manager_does_not_trust_workspace_shadowed_bwrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    host_bin = tmp_path / "host-bin"
+    workspace.mkdir()
+    host_bin.mkdir()
+    for directory in (workspace, host_bin):
+        executable = directory / "bwrap"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join((str(workspace), str(host_bin))))
+
+    manager = SandboxManager(workspace_root=workspace, backend_preference="native")
+    invocation = manager.prepare(["true"], cwd=workspace)
+
+    assert manager.backend_name == "bubblewrap"
+    assert manager.is_fully_isolated() is True
+    assert auto_approve_safety_error(manager, allow_unsafe=False) is None
+    assert Path(invocation.argv[0]).resolve() == (host_bin / "bwrap").resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +254,9 @@ def test_manager_explicit_docker_uses_configured_image(tmp_path: Path) -> None:
 
     assert manager.tier == SANDBOX_TIER_DOCKER
     bwrap.assert_not_called()
-    docker.assert_called_once_with("company/ash-sandbox:v2")
+    docker.assert_called_once_with(
+        "company/ash-sandbox:v2", workspace_root=tmp_path
+    )
 
 
 def test_manager_capabilities_reports_each_backend(tmp_path: Path) -> None:
@@ -499,23 +548,59 @@ def test_probe_docker_requires_daemon_and_image() -> None:
     ready = subprocess.CompletedProcess([], 0, stdout=b"27.0\n", stderr=b"")
     image = subprocess.CompletedProcess([], 0, stdout=b"[]", stderr=b"")
     with (
-        patch("ash.sandbox.docker.shutil.which", return_value="/usr/bin/docker"),
+        patch(
+            "ash.sandbox.docker.resolve_host_executable",
+            return_value="/usr/bin/docker",
+        ),
         patch("ash.sandbox.docker.subprocess.run", side_effect=[ready, image]) as run,
     ):
         assert probe_docker() == "/usr/bin/docker"
     assert run.call_args_list[1].args[0][-1] == DEFAULT_IMAGE
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
+def test_probe_docker_skips_workspace_shadowed_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    host_bin = tmp_path / "host-bin"
+    workspace.mkdir()
+    host_bin.mkdir()
+    script = """#!/bin/sh
+if [ "$1" = "version" ]; then
+  printf '27.0\n'
+fi
+exit 0
+"""
+    for directory in (workspace, host_bin):
+        executable = directory / "docker"
+        executable.write_text(script, encoding="utf-8")
+        executable.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join((str(workspace), str(host_bin))))
+
+    resolved = probe_docker(workspace_root=workspace)
+    backend = DockerSandbox(workspace_root=workspace)
+
+    assert resolved == str((host_bin / "docker").resolve())
+    assert backend.docker_path == str((host_bin / "docker").resolve())
+
+
 def test_probe_docker_rejects_unreachable_daemon_or_missing_image() -> None:
     failed = subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"failed")
     ready = subprocess.CompletedProcess([], 0, stdout=b"27.0\n", stderr=b"")
     with (
-        patch("ash.sandbox.docker.shutil.which", return_value="/usr/bin/docker"),
+        patch(
+            "ash.sandbox.docker.resolve_host_executable",
+            return_value="/usr/bin/docker",
+        ),
         patch("ash.sandbox.docker.subprocess.run", return_value=failed),
     ):
         assert probe_docker() is None
     with (
-        patch("ash.sandbox.docker.shutil.which", return_value="/usr/bin/docker"),
+        patch(
+            "ash.sandbox.docker.resolve_host_executable",
+            return_value="/usr/bin/docker",
+        ),
         patch("ash.sandbox.docker.subprocess.run", side_effect=[ready, failed]),
     ):
         assert probe_docker() is None
@@ -697,8 +782,11 @@ def test_macos_profile_only_writes_workspace_and_temp(tmp_path: Path) -> None:
 
     workspace = tmp_path / 'workspace "quoted"'
     workspace.mkdir()
-    with patch("ash.sandbox.manager.has_sandbox_exec", return_value=True):
-        argv = _SandboxExecBackend(workspace_root=workspace).wrap(
+    with patch("ash.sandbox.manager.sys.platform", "darwin"):
+        argv = _SandboxExecBackend(
+            workspace_root=workspace,
+            sandbox_exec_path="/usr/bin/sandbox-exec",
+        ).wrap(
             ["echo", "ok"], cwd=workspace
         )
 
@@ -712,10 +800,12 @@ def test_macos_profile_only_writes_workspace_and_temp(tmp_path: Path) -> None:
 def test_macos_profile_can_explicitly_allow_network(tmp_path: Path) -> None:
     from ash.sandbox.manager import _SandboxExecBackend
 
-    with patch("ash.sandbox.manager.has_sandbox_exec", return_value=True):
-        profile = _SandboxExecBackend(workspace_root=tmp_path, network=True).wrap(
-            ["echo", "ok"], cwd=tmp_path
-        )[2]
+    with patch("ash.sandbox.manager.sys.platform", "darwin"):
+        profile = _SandboxExecBackend(
+            workspace_root=tmp_path,
+            network=True,
+            sandbox_exec_path="/usr/bin/sandbox-exec",
+        ).wrap(["echo", "ok"], cwd=tmp_path)[2]
     assert "(allow network*)" in profile
     assert "(deny network-outbound)" not in profile
 
@@ -723,10 +813,11 @@ def test_macos_profile_can_explicitly_allow_network(tmp_path: Path) -> None:
 def test_macos_profile_can_deny_workspace_writes(tmp_path: Path) -> None:
     from ash.sandbox.manager import _SandboxExecBackend
 
-    with patch("ash.sandbox.manager.has_sandbox_exec", return_value=True):
+    with patch("ash.sandbox.manager.sys.platform", "darwin"):
         profile = _SandboxExecBackend(
             workspace_root=tmp_path,
             workspace_read_only=True,
+            sandbox_exec_path="/usr/bin/sandbox-exec",
         ).wrap(["echo", "ok"], cwd=tmp_path)[2]
 
     assert f'(allow file-write* (subpath "{tmp_path}"))' not in profile

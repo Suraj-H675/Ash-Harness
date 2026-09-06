@@ -66,9 +66,16 @@ class SteeringSDKProvider(SDKProvider):
 
 @pytest.mark.asyncio
 async def test_async_sdk_rejects_unisolated_auto_approve(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("ash.sandbox.manager.has_docker", lambda _image: False)
-    monkeypatch.setattr("ash.sandbox.manager.has_bwrap", lambda: False)
-    monkeypatch.setattr("ash.sandbox.manager.has_sandbox_exec", lambda: False)
+    monkeypatch.setattr(
+        "ash.sandbox.manager.has_docker",
+        lambda _image, *, workspace_root=None: False,
+    )
+    monkeypatch.setattr(
+        "ash.sandbox.manager.has_bwrap", lambda _workspace=None: False
+    )
+    monkeypatch.setattr(
+        "ash.sandbox.manager.has_sandbox_exec", lambda _workspace=None: False
+    )
     config = AshConfig(
         model="ollama/sdk-model",
         workspace_root=tmp_path,
