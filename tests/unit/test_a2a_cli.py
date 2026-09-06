@@ -5,6 +5,8 @@ import sys
 import httpx
 import pytest
 
+from ash.commands.a2a import _remote_url
+
 from ash.cli import main
 
 
@@ -57,6 +59,12 @@ def test_a2a_stdin_prompt_is_bounded_before_network_use(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="A2A prompt exceeds"):
         asyncio.run(send_a2a(args))
+
+
+def test_a2a_cli_remote_url_rejects_plaintext_non_loopback() -> None:
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        _remote_url("http://agent.example.com")
+    assert _remote_url("http://localhost:8765") == "http://localhost:8765"
 
 
 def test_a2a_json_event_accumulator_rejects_large_payload() -> None:

@@ -26,7 +26,7 @@ from a2a.utils.constants import TransportProtocol
 from google.protobuf.json_format import MessageToDict
 
 from ash.config import AshConfig
-from ash.agents.a2a_remote import validate_agent_card_origins
+from ash.agents.a2a_remote import _validate_remote_url, validate_agent_card_origins
 from ash.safe_io import read_bounded_text
 from ash.server.a2a import create_a2a_app
 
@@ -235,10 +235,7 @@ def _append_json_event(
     )
     contribution = len(encoded) + (1 if events else 0)
     if current_bytes + contribution > MAX_A2A_CLIENT_OUTPUT_BYTES:
-        raise RuntimeError(
-            "A2A response exceeded "
-            f"{MAX_A2A_CLIENT_OUTPUT_BYTES} bytes"
-        )
+        raise RuntimeError(f"A2A response exceeded {MAX_A2A_CLIENT_OUTPUT_BYTES} bytes")
     events.append(event)
     return current_bytes + contribution
 
@@ -246,10 +243,7 @@ def _append_json_event(
 def _write_bounded_text(text: str, current_bytes: int) -> int:
     encoded_bytes = len(text.encode("utf-8"))
     if current_bytes + encoded_bytes > MAX_A2A_CLIENT_OUTPUT_BYTES:
-        raise RuntimeError(
-            "A2A response exceeded "
-            f"{MAX_A2A_CLIENT_OUTPUT_BYTES} bytes"
-        )
+        raise RuntimeError(f"A2A response exceeded {MAX_A2A_CLIENT_OUTPUT_BYTES} bytes")
     print(text, end="", flush=True)
     return current_bytes + encoded_bytes
 
@@ -270,23 +264,7 @@ def _bounded_text_parts(parts: Any, max_bytes: int, label: str) -> str:
 
 
 def _remote_url(value: str) -> str:
-    try:
-        parsed = urlsplit(value)
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("invalid A2A agent URL") from exc
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-        or (port is not None and not 0 < port <= 65535)
-    ):
-        raise ValueError(
-            "A2A agent URL must be HTTP(S) without credentials, query, or fragment"
-        )
+    _validate_remote_url(value)
     return value.rstrip("/")
 
 

@@ -41,7 +41,12 @@ from ash.agents.a2a_remote import (
 )
 from ash.config import AshConfig
 from ash.safety.guard import SafetyGuard
-from ash.server.a2a import MAX_A2A_INPUT_BYTES, A2ASessionRegistry, _request_text, create_a2a_app
+from ash.server.a2a import (
+    MAX_A2A_INPUT_BYTES,
+    A2ASessionRegistry,
+    _request_text,
+    create_a2a_app,
+)
 
 
 class FakeAshClient:
@@ -122,7 +127,7 @@ async def test_a2a_official_client_streams_and_resumes_durable_context(
     monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
     app = create_a2a_app(
         config,
-        public_url="http://testserver",
+        public_url="https://testserver",
         bearer_token="0123456789abcdef",
         requests_per_minute=100,
         task_store=InMemoryTaskStore(),
@@ -222,7 +227,7 @@ async def test_a2a_official_client_streams_and_resumes_durable_context(
             delegated = await send_remote_agent(
                 RemoteAgentConfig(
                     name="local",
-                    url="http://testserver",
+                    url="https://testserver",
                     token_env="REMOTE_A2A_TOKEN",
                 ),
                 "delegated task",
@@ -354,6 +359,39 @@ def test_a2a_remote_config_respects_trust_and_rejects_duplicates(
                 )
             ],
         )
+
+
+def test_a2a_remote_config_rejects_plaintext_remote_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    config_path = home / ".ash" / "a2a.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        '{"agents":{"review":{"url":"http://agent.example.com",'
+        '"token_env":"REVIEW_TOKEN"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        load_remote_agent_configs(tmp_path / "workspace", include_project=False)
+
+
+def test_a2a_remote_config_allows_loopback_http(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    config_path = home / ".ash" / "a2a.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        '{"agents":{"local":{"url":"http://127.0.0.1:8765"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    agents = load_remote_agent_configs(tmp_path / "workspace", include_project=False)
+    assert agents["local"].url == "http://127.0.0.1:8765"
 
 
 def test_a2a_remote_config_does_not_follow_symlinks(

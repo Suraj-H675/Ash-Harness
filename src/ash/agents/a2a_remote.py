@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -133,10 +134,7 @@ class DelegateRemoteAgentTool(BaseTool):
                 return ToolResult(
                     success=False,
                     output="",
-                    error=(
-                        "A2A support requires "
-                        f"`{pipx_install_command('a2a')}`."
-                    ),
+                    error=(f"A2A support requires `{pipx_install_command('a2a')}`."),
                 )
             raise
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:
@@ -228,6 +226,7 @@ async def send_remote_agent(
     )
     from a2a.utils.constants import TransportProtocol
 
+    _validate_remote_url(config.url)
     if not prompt.strip() or len(prompt.encode("utf-8")) > 1_000_000:
         raise ValueError("remote-agent prompt must be non-empty and at most 1 MB")
     if context_id and len(context_id.encode("utf-8")) > 512:
@@ -357,6 +356,18 @@ def _validate_remote_url(value: str) -> None:
         raise ValueError(
             "A2A remote URL must be HTTP(S) without credentials, query, or fragment"
         )
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+        raise ValueError("A2A remote URL must use HTTPS except for loopback HTTP")
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    host = hostname.casefold().rstrip(".")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def validate_agent_card_origins(configured_url: str, interfaces: Any) -> None:
