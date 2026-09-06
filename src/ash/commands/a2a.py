@@ -57,9 +57,21 @@ async def serve_a2a(args) -> int:
     loopback = args.host in LOOPBACK_HOSTS
     if not loopback and not args.allow_remote:
         raise ValueError("Non-loopback A2A binding requires --allow-remote")
+    ssl_certfile = getattr(args, "ssl_certfile", None)
+    ssl_keyfile = getattr(args, "ssl_keyfile", None)
+    if bool(ssl_certfile) != bool(ssl_keyfile):
+        raise ValueError("A2A TLS requires both --ssl-certfile and --ssl-keyfile")
+    if not loopback and not ssl_certfile:
+        raise ValueError(
+            "Non-loopback A2A binding requires TLS via --ssl-certfile and --ssl-keyfile"
+        )
     if not loopback and not args.public_url:
         raise ValueError("Remote A2A binding requires an explicit --public-url")
-    public_url = args.public_url or _local_public_url(args.host, args.port)
+    public_url = args.public_url or _local_public_url(
+        args.host,
+        args.port,
+        secure=bool(ssl_certfile),
+    )
     if not loopback and urlsplit(public_url).scheme != "https":
         raise ValueError("Remote A2A public URL must use HTTPS")
 
@@ -76,6 +88,8 @@ async def serve_a2a(args) -> int:
             host=args.host,
             port=args.port,
             log_level=args.log_level,
+            ssl_certfile=ssl_certfile,
+            ssl_keyfile=ssl_keyfile,
         )
     )
     await server.serve()
@@ -220,9 +234,10 @@ async def send_a2a(args) -> int:
     )
 
 
-def _local_public_url(host: str, port: int) -> str:
+def _local_public_url(host: str, port: int, *, secure: bool = False) -> str:
     rendered_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
-    return f"http://{rendered_host}:{port}"
+    scheme = "https" if secure else "http"
+    return f"{scheme}://{rendered_host}:{port}"
 
 
 def _append_json_event(

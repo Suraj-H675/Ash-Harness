@@ -13,6 +13,8 @@ def args(**overrides):
         "port": 8765,
         "rate_limit": 60,
         "allow_remote": False,
+        "ssl_certfile": None,
+        "ssl_keyfile": None,
         "log_level": "info",
     }
     values.update(overrides)
@@ -31,6 +33,22 @@ async def test_serve_requires_remote_opt_in(monkeypatch) -> None:
     monkeypatch.setenv("ASH_SERVER_TOKEN", "0123456789abcdef")
     with pytest.raises(ValueError, match="allow-remote"):
         await serve_http(args(host="0.0.0.0"))
+
+
+@pytest.mark.asyncio
+async def test_serve_requires_tls_for_remote_binding(monkeypatch) -> None:
+    monkeypatch.setenv("ASH_SERVER_TOKEN", "0123456789abcdef")
+
+    with pytest.raises(ValueError, match="requires TLS"):
+        await serve_http(args(host="0.0.0.0", allow_remote=True))
+
+
+@pytest.mark.asyncio
+async def test_serve_requires_tls_cert_and_key_together(monkeypatch) -> None:
+    monkeypatch.setenv("ASH_SERVER_TOKEN", "0123456789abcdef")
+
+    with pytest.raises(ValueError, match="both --ssl-certfile and --ssl-keyfile"):
+        await serve_http(args(ssl_certfile="cert.pem"))
 
 
 @pytest.mark.asyncio
@@ -70,9 +88,13 @@ async def test_serve_closes_client_when_server_stops(monkeypatch) -> None:
             nonlocal closed
             closed = True
 
+    observed_config = None
+
     class Server:
         def __init__(self, config) -> None:
+            nonlocal observed_config
             self.config = config
+            observed_config = config
 
         async def serve(self) -> None:
             return None
@@ -83,5 +105,9 @@ async def test_serve_closes_client_when_server_stops(monkeypatch) -> None:
     monkeypatch.setattr("ash.commands.serve.AshClient.create", create_client)
     monkeypatch.setattr("ash.commands.serve.uvicorn.Server", Server)
 
-    assert await serve_http(args()) == 0
+    assert await serve_http(
+        args(ssl_certfile="cert.pem", ssl_keyfile="key.pem")
+    ) == 0
     assert closed is True
+    assert observed_config.ssl_certfile == "cert.pem"
+    assert observed_config.ssl_keyfile == "key.pem"

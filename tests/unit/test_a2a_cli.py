@@ -5,7 +5,7 @@ import sys
 import httpx
 import pytest
 
-from ash.commands.a2a import _remote_url
+from ash.commands.a2a import _local_public_url, _remote_url
 
 from ash.cli import main
 
@@ -22,6 +22,33 @@ def test_a2a_serve_requires_an_operator_token(monkeypatch, capsys) -> None:
 
     assert main(["a2a", "serve"]) == 2
     assert "Set ASH_A2A_TOKEN" in capsys.readouterr().err
+
+
+def test_a2a_serve_requires_tls_for_remote_binding(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("ASH_A2A_TOKEN", "0123456789abcdef")
+
+    assert (
+        main(
+            [
+                "a2a",
+                "serve",
+                "--host",
+                "0.0.0.0",
+                "--allow-remote",
+                "--public-url",
+                "https://agent.example.com",
+            ]
+        )
+        == 2
+    )
+    assert "requires TLS" in capsys.readouterr().err
+
+
+def test_a2a_serve_requires_tls_cert_and_key_together(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("ASH_A2A_TOKEN", "0123456789abcdef")
+
+    assert main(["a2a", "serve", "--ssl-certfile", "cert.pem"]) == 2
+    assert "both --ssl-certfile and --ssl-keyfile" in capsys.readouterr().err
 
 
 def test_a2a_client_network_failure_has_stable_cli_error(monkeypatch, capsys) -> None:
@@ -65,6 +92,13 @@ def test_a2a_cli_remote_url_rejects_plaintext_non_loopback() -> None:
     with pytest.raises(ValueError, match="must use HTTPS"):
         _remote_url("http://agent.example.com")
     assert _remote_url("http://localhost:8765") == "http://localhost:8765"
+
+
+def test_a2a_local_public_url_matches_tls_transport() -> None:
+    assert _local_public_url("127.0.0.1", 8770) == "http://127.0.0.1:8770"
+    assert (
+        _local_public_url("::1", 8770, secure=True) == "https://[::1]:8770"
+    )
 
 
 def test_a2a_json_event_accumulator_rejects_large_payload() -> None:

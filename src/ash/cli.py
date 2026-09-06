@@ -2245,6 +2245,8 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser.add_argument("--token-env", default="ASH_SERVER_TOKEN")
     serve_parser.add_argument("--rate-limit", type=int, default=60)
     serve_parser.add_argument("--allow-remote", action="store_true")
+    serve_parser.add_argument("--ssl-certfile")
+    serve_parser.add_argument("--ssl-keyfile")
     serve_parser.add_argument(
         "--log-level",
         choices=["critical", "error", "warning", "info", "debug"],
@@ -2272,6 +2274,8 @@ def main(argv: list[str] | None = None) -> int:
     a2a_serve.add_argument("--token-env", default="ASH_A2A_TOKEN")
     a2a_serve.add_argument("--rate-limit", type=int, default=60)
     a2a_serve.add_argument("--allow-remote", action="store_true")
+    a2a_serve.add_argument("--ssl-certfile")
+    a2a_serve.add_argument("--ssl-keyfile")
     a2a_serve.add_argument(
         "--log-level",
         choices=["critical", "error", "warning", "info", "debug"],

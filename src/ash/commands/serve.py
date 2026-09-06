@@ -28,8 +28,17 @@ async def serve_http(args) -> int:
         raise ValueError(
             f"Set {args.token_env} to a bearer token containing at least 16 characters"
         )
-    if args.host not in LOOPBACK_HOSTS and not args.allow_remote:
+    remote = args.host not in LOOPBACK_HOSTS
+    if remote and not args.allow_remote:
         raise ValueError("Non-loopback binding requires --allow-remote")
+    ssl_certfile = getattr(args, "ssl_certfile", None)
+    ssl_keyfile = getattr(args, "ssl_keyfile", None)
+    if bool(ssl_certfile) != bool(ssl_keyfile):
+        raise ValueError("TLS requires both --ssl-certfile and --ssl-keyfile")
+    if remote and not ssl_certfile:
+        raise ValueError(
+            "Non-loopback binding requires TLS via --ssl-certfile and --ssl-keyfile"
+        )
     if not 1 <= args.port <= 65535:
         raise ValueError("Port must be between 1 and 65535")
     if args.rate_limit < 1:
@@ -55,6 +64,8 @@ async def serve_http(args) -> int:
                 host=args.host,
                 port=args.port,
                 log_level=args.log_level,
+                ssl_certfile=ssl_certfile,
+                ssl_keyfile=ssl_keyfile,
             )
         )
         await server.serve()
