@@ -8,6 +8,7 @@ validated, immutable connection description.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 from dataclasses import dataclass
@@ -188,6 +189,26 @@ def _normalize_base_url(value: object, *, provider: str) -> str:
     return base_url
 
 
+def require_secure_provider_transport(base_url: str, *, provider: str) -> None:
+    """Refuse credential-bearing provider traffic over remote plaintext HTTP."""
+
+    parsed = urlsplit(base_url)
+    if parsed.scheme != "http" or not parsed.hostname:
+        return
+    hostname = parsed.hostname.casefold().rstrip(".")
+    if hostname == "localhost":
+        return
+    try:
+        if ipaddress.ip_address(hostname).is_loopback:
+            return
+    except ValueError:
+        pass
+    raise ProviderConfigurationError(
+        f"provider {provider!r} credentialed endpoint must use HTTPS "
+        "except for loopback HTTP"
+    )
+
+
 def _catalog_endpoint(base_url: str, catalog_format: CatalogFormat) -> str:
     if catalog_format == "ollama":
         return f"{base_url}/api/tags"
@@ -242,6 +263,7 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
         else:
             assert key_env is not None
             api_key = _require_key(provider, key_env, os.environ.get(key_env, ""))
+            require_secure_provider_transport(base_url, provider=provider)
         return ProviderConnection(
             provider=provider,
             model_name=model_name,
@@ -275,6 +297,7 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
         api_key = _require_key(
             provider, source, os.environ.get(key_env, "") or inline_key
         )
+        require_secure_provider_transport(base_url, provider=provider)
     else:
         custom_auth_mode = "none"
         api_key = ""
@@ -313,6 +336,16 @@ def probe_model_catalog(
     timeout: float = 10.0,
 ) -> tuple[str, ...]:
     """Fetch and validate a provider model catalog without exposing secrets."""
+
+    credentialed = any(
+        name.casefold() in {"authorization", "x-api-key"} and bool(value)
+        for name, value in headers.items()
+    )
+    if credentialed:
+        try:
+            require_secure_provider_transport(endpoint, provider="catalog")
+        except ProviderConfigurationError as exc:
+            raise ProviderVerificationError(str(exc)) from exc
 
     try:
         with httpx.Client(timeout=timeout) as client:

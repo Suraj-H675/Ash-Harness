@@ -46,7 +46,7 @@ async def test_run_doctor_connect_uses_shared_provider_verification(
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("ASH_MODEL", "openai/gateway-model")
     monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret")
-    monkeypatch.setenv("OPENAI_API_BASE", "http://gateway.invalid/v1")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://gateway.invalid/v1")
     monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("ASH_DB_DIRECTORY", str(tmp_path / "db"))
 
@@ -56,7 +56,7 @@ async def test_run_doctor_connect_uses_shared_provider_verification(
     assert by_name["connectivity"].status == "pass"
     assert len(requests) == 1
     request, timeout = requests[0]
-    assert str(request.url) == "http://gateway.invalid/v1/models"
+    assert str(request.url) == "https://gateway.invalid/v1/models"
     assert request.headers["authorization"] == "Bearer gateway-secret"
     assert timeout == 10.0
 
@@ -74,7 +74,7 @@ async def test_connectivity_uses_runtime_openai_override_and_validates_model(
         ),
     )
     monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret")
-    monkeypatch.setenv("OPENAI_API_BASE", "http://gateway.invalid/v1")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://gateway.invalid/v1")
 
     check = await _check_connectivity(
         AshConfig(model="openai/gateway-model", workspace_root=tmp_path)
@@ -83,7 +83,7 @@ async def test_connectivity_uses_runtime_openai_override_and_validates_model(
     assert check.status == "pass"
     assert len(requests) == 1
     request, _ = requests[0]
-    assert str(request.url) == "http://gateway.invalid/v1/models"
+    assert str(request.url) == "https://gateway.invalid/v1/models"
     assert request.headers["authorization"] == "Bearer gateway-secret"
 
 
@@ -123,7 +123,7 @@ async def test_connectivity_checks_anthropic_catalog_with_runtime_headers(
         ),
     )
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
-    monkeypatch.setenv("ANTHROPIC_API_BASE", "http://gateway.invalid")
+    monkeypatch.setenv("ANTHROPIC_API_BASE", "https://gateway.invalid")
 
     check = await _check_connectivity(
         AshConfig(model="anthropic/claude-test", workspace_root=tmp_path)
@@ -132,9 +132,31 @@ async def test_connectivity_checks_anthropic_catalog_with_runtime_headers(
     assert check.status == "pass"
     assert len(requests) == 1
     request, _ = requests[0]
-    assert str(request.url) == "http://gateway.invalid/v1/models"
+    assert str(request.url) == "https://gateway.invalid/v1/models"
     assert request.headers["x-api-key"] == "anthropic-secret"
     assert request.headers["anthropic-version"] == "2023-06-01"
+
+
+@pytest.mark.asyncio
+async def test_connectivity_refuses_plaintext_remote_credentials_before_network(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests = patch_catalog_client(
+        monkeypatch,
+        lambda request: (_ for _ in ()).throw(
+            AssertionError("network request must not be attempted")
+        ),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret")
+    monkeypatch.setenv("OPENAI_API_BASE", "http://gateway.invalid/v1")
+
+    check = await _check_connectivity(
+        AshConfig(model="openai/gateway-model", workspace_root=tmp_path)
+    )
+
+    assert check.status == "fail"
+    assert "must use HTTPS" in check.message
+    assert requests == []
 
 
 @pytest.mark.asyncio

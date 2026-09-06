@@ -783,6 +783,39 @@ async def test_openai_compatible_endpoint_omits_openai_cache_options() -> None:
     assert "prompt_cache_retention" not in client.completions.kwargs
 
 
+def test_provider_adapters_reject_plaintext_remote_credentials() -> None:
+    from ash.providers.anthropic import AnthropicProvider
+    from ash.providers.deepseek import DeepSeekProvider
+    from ash.providers.groq import GroqProvider
+    from ash.providers.openai import OpenAIProvider
+    from ash.providers.readiness import ProviderConfigurationError
+
+    with pytest.raises(ProviderConfigurationError, match="must use HTTPS"):
+        OpenAIProvider(
+            model_name="model",
+            api_key="secret",
+            base_url="http://gateway.example/v1",
+        )
+    with pytest.raises(ProviderConfigurationError, match="must use HTTPS"):
+        AnthropicProvider(
+            model_name="model",
+            api_key="secret",
+            base_url="http://gateway.example/v1",
+        )
+    with pytest.raises(ProviderConfigurationError, match="must use HTTPS"):
+        DeepSeekProvider(
+            model_name="model",
+            api_key="secret",
+            base_url="http://gateway.example/v1",
+        )
+    with pytest.raises(ProviderConfigurationError, match="must use HTTPS"):
+        GroqProvider(
+            model_name="model",
+            api_key="secret",
+            base_url="http://gateway.example/v1",
+        )
+
+
 class _FakeAnthropicStream:
     def __init__(self, final_message: Any) -> None:
         self._final_message = final_message

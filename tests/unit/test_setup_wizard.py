@@ -412,6 +412,30 @@ class TestOpenaiCompatibleFlow:
         assert custom["auth_mode"] == "none"
         assert "key_env" not in custom
 
+    def test_rejects_plaintext_remote_endpoint_before_probe_or_save(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(["remote", "http://gateway.example/v1"]),
+        )
+        monkeypatch.setattr(
+            "ash.commands.setup.getpass.getpass", _FakeGetpass("gateway-secret")
+        )
+
+        from ash.commands.setup import _flow_openai_compatible
+
+        with (
+            patch("ash.commands.setup._probe_models_detailed") as probe,
+            patch("ash.commands.setup.save_config") as save_config,
+            pytest.raises(ValueError, match="must use HTTPS"),
+        ):
+            _flow_openai_compatible()
+
+        probe.assert_not_called()
+        save_config.assert_not_called()
+
 
 class TestProbeModels:
     """Tests for _probe_models and _probe_ollama_models."""

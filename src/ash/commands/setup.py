@@ -704,6 +704,7 @@ def _flow_openai_compatible_builtin(
     base_env = f"{descriptor.id.upper().replace('-', '_')}_API_BASE"
     base_url_override = _prompt_optional_url(base_env, descriptor.base_url)
     base_url = base_url_override or descriptor.base_url
+    _require_secure_provider_transport(base_url, descriptor.id, api_key)
     models, verified = _discover_models(
         descriptor.name,
         lambda: _probe_models_detailed(base_url, api_key or None),
@@ -737,6 +738,7 @@ def _flow_anthropic(current: str) -> SetupOutcome:
         "https://api.anthropic.com",
     )
     base_url = base_url_override or "https://api.anthropic.com"
+    _require_secure_provider_transport(base_url, "anthropic", api_key)
 
     models, verified = _discover_models(
         "Anthropic",
@@ -768,6 +770,7 @@ def _flow_openai(current: str) -> SetupOutcome:
         "https://api.openai.com/v1",
     )
     base_url = base_url_override or "https://api.openai.com/v1"
+    _require_secure_provider_transport(base_url, "openai", api_key)
     models, verified = _discover_models(
         "OpenAI",
         lambda: _probe_models_detailed(base_url, api_key),
@@ -798,6 +801,7 @@ def _flow_deepseek(current: str) -> SetupOutcome:
         "https://api.deepseek.com/v1",
     )
     base_url = base_url_override or "https://api.deepseek.com/v1"
+    _require_secure_provider_transport(base_url, "deepseek", api_key)
     models, verified = _discover_models(
         "DeepSeek",
         lambda: _probe_models_detailed(base_url, api_key),
@@ -827,6 +831,7 @@ def _flow_groq(current: str) -> SetupOutcome:
         "https://api.groq.com/openai/v1",
     )
     base_url = base_url_override or "https://api.groq.com/openai/v1"
+    _require_secure_provider_transport(base_url, "groq", api_key)
 
     models, verified = _discover_models(
         "Groq",
@@ -905,6 +910,7 @@ def _flow_openai_compatible() -> SetupOutcome:
         raise SetupCancelled
     if api_key.casefold() in {"b", "back"}:
         raise SetupBack
+    _require_secure_provider_transport(base_url, name, api_key)
     key_env = (
         "ASH_PROVIDER_"
         + "".join(
@@ -1379,6 +1385,18 @@ def _validate_base_url(value: str) -> str:
     if parsed.query or parsed.fragment:
         raise ValueError("query strings and fragments are not allowed")
     return value.strip().rstrip("/")
+
+
+def _require_secure_provider_transport(
+    base_url: str,
+    provider: str,
+    api_key: str,
+) -> None:
+    if not api_key:
+        return
+    from ash.providers.readiness import require_secure_provider_transport
+
+    require_secure_provider_transport(base_url, provider=provider)
 
 
 def _prompt_model_list(models: list[str], current: str) -> str:

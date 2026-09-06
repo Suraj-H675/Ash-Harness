@@ -14,7 +14,10 @@ from typing import Any, AsyncGenerator
 from ash.context.tokens import AnthropicTokenCounter
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
-from ash.providers.readiness import ProviderConfigurationError
+from ash.providers.readiness import (
+    ProviderConfigurationError,
+    require_secure_provider_transport,
+)
 
 
 class ProviderBackendUnavailable(ImportError):
@@ -138,6 +141,8 @@ class AnthropicProvider(ProviderABC):
         client: Any | None = None,
         token_counter: TokenCounterLike | None = None,
     ) -> None:
+        if base_url and api_key:
+            require_secure_provider_transport(base_url, provider="anthropic")
         self._model_name = model_name
         self._api_key = api_key
         self._base_url = base_url

@@ -28,7 +28,7 @@ def test_verify_provider_connection_uses_resolved_openai_route(
     )
 
     monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret")
-    monkeypatch.setenv("OPENAI_API_BASE", "http://gateway.example/v1")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://gateway.example/v1")
 
     result = verify_provider_connection(_config("openai/gateway-model"))
 
@@ -36,7 +36,7 @@ def test_verify_provider_connection_uses_resolved_openai_route(
     assert result.selected_model_available is True
     assert len(requests) == 1
     request, timeout = requests[0]
-    assert str(request.url) == "http://gateway.example/v1/models"
+    assert str(request.url) == "https://gateway.example/v1/models"
     assert request.headers["authorization"] == "Bearer gateway-secret"
     assert timeout == 10.0
 
@@ -114,6 +114,51 @@ def test_resolve_provider_connection_supports_gateway_key_and_endpoint(
     assert result.base_url == "https://openrouter.ai/api/v1"
     assert result.catalog_endpoint == "https://openrouter.ai/api/v1/models"
     assert result.headers == {"Authorization": "Bearer gateway-key"}
+
+
+def test_resolve_provider_connection_rejects_plaintext_remote_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.readiness import (
+        ProviderConfigurationError,
+        resolve_provider_connection,
+    )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret")
+    monkeypatch.setenv("OPENAI_API_BASE", "http://gateway.example/v1")
+
+    with pytest.raises(ProviderConfigurationError, match="must use HTTPS"):
+        resolve_provider_connection(_config("openai/gateway-model"))
+
+
+def test_resolve_provider_connection_allows_loopback_http_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.readiness import resolve_provider_connection
+
+    monkeypatch.setenv("OPENAI_API_KEY", "local-secret")
+    monkeypatch.setenv("OPENAI_API_BASE", "http://127.0.0.1:8080/v1")
+
+    result = resolve_provider_connection(_config("openai/local-model"))
+
+    assert result.base_url == "http://127.0.0.1:8080/v1"
+    assert result.headers == {"Authorization": "Bearer local-secret"}
+
+
+def test_probe_model_catalog_refuses_plaintext_credentials_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_client(*args, **kwargs):
+        raise AssertionError("network client must not be constructed")
+
+    monkeypatch.setattr(readiness.httpx, "Client", fail_client)
+
+    with pytest.raises(readiness.ProviderVerificationError, match="must use HTTPS"):
+        readiness.probe_model_catalog(
+            "http://gateway.example/v1/models",
+            headers={"Authorization": "Bearer gateway-secret"},
+            catalog_format="openai",
+        )
 
 
 def test_resolve_local_openai_compatible_provider_never_requires_a_key(

@@ -15,6 +15,7 @@ from ash.context.tokens import AnthropicTokenCounter
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import CanonicalToolCall, MessageInput
 from ash.providers.openai import prepare_openai_messages
+from ash.providers.readiness import require_secure_provider_transport
 
 
 class DeepSeekProvider(ProviderABC):
@@ -36,6 +37,7 @@ class DeepSeekProvider(ProviderABC):
         self._model_name = model_name
         self._api_key = api_key
         self._base_url = base_url or "https://api.deepseek.com/v1"
+        require_secure_provider_transport(self._base_url, provider="deepseek")
         self._token_counter = token_counter or AnthropicTokenCounter()
         self._client = openai.AsyncOpenAI(
             api_key=api_key,

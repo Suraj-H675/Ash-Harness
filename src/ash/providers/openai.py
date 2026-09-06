@@ -11,6 +11,7 @@ import openai  # type: ignore[import-not-found]
 from ash.context.tokens import OpenAITokenCounter
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
+from ash.providers.readiness import require_secure_provider_transport
 
 
 class _PartialToolCall:
@@ -99,6 +100,8 @@ class OpenAIProvider(ProviderABC):
                 "OpenAI API key is required. "
                 "Set the OPENAI_API_KEY environment variable or pass api_key."
             )
+        if base_url and api_key and not allow_anonymous:
+            require_secure_provider_transport(base_url, provider="openai")
         self._model_name = model_name
         self._api_key = api_key
         self._base_url = base_url
