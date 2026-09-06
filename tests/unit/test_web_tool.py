@@ -152,6 +152,65 @@ def test_web_fetch_rejects_private_and_non_http_hosts(monkeypatch) -> None:
         _validate_public_url("https://private.example")
 
 
+@pytest.mark.asyncio
+async def test_web_fetch_pins_vetted_dns_result_against_rebinding(
+    monkeypatch, guard
+) -> None:
+    import asyncio
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from ash.tools.web import _fetch_public_text
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"private-local-service")
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    original = socket.getaddrinfo
+    resolutions = 0
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        nonlocal resolutions
+        hostname = host.decode() if isinstance(host, bytes) else host
+        if hostname != "rebind.test":
+            return original(host, port, *args, **kwargs)
+        resolutions += 1
+        address = "93.184.216.34" if resolutions == 1 else "127.0.0.1"
+        socket_type = kwargs.get("type", socket.SOCK_STREAM)
+        return [
+            (
+                socket.AF_INET,
+                socket_type,
+                socket.IPPROTO_TCP,
+                "",
+                (address, port or 0),
+            )
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    try:
+        with pytest.raises(ValueError, match="non-public"):
+            await _fetch_public_text(f"http://rebind.test:{server.server_port}/private")
+    finally:
+        server.shutdown()
+        await asyncio.to_thread(thread.join, 2)
+
+
+def test_web_fetch_rejects_embedded_url_credentials(monkeypatch) -> None:
+    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
+    with pytest.raises(ValueError, match="embedded credentials"):
+        _validate_public_url("https://alice:credential-value@example.com/private")
+
+
 def test_web_fetch_requires_approval_in_interactive_policy() -> None:
     decision = PermissionPolicy("interactive").evaluate(
         "web_fetch", {"url": "https://example.com"}

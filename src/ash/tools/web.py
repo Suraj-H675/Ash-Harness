@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 from html.parser import HTMLParser
@@ -101,9 +102,10 @@ async def _fetch_public_text(
     allowed_domains: tuple[str, ...] = (),
 ) -> tuple[str, int, str, str]:
     url = _validate_public_url(raw_url, allowed_domains=allowed_domains)
+    effective_transport = transport or _PinnedPublicTransport()
     async with httpx.AsyncClient(
         timeout=10.0,
-        transport=transport,
+        transport=effective_transport,
         headers={
             "User-Agent": "ash-web-fetch/0.1",
             "Accept": "text/*,application/json,application/xml;q=0.9,*/*;q=0.1",
@@ -163,6 +165,8 @@ def _validate_public_url(
         raise ValueError("Only http and https URLs are supported")
     if not parsed.hostname:
         raise ValueError("URL must include a hostname")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs cannot contain embedded credentials")
     if allowed_domains and not _host_allowed(parsed.hostname, allowed_domains):
         raise ValueError(f"Host {parsed.hostname!r} is not in allowed_web_domains")
     _ensure_public_host(parsed.hostname)
@@ -195,7 +199,38 @@ def _host_allowed(hostname: str, allowed_domains: tuple[str, ...]) -> bool:
     return False
 
 
-def _ensure_public_host(hostname: str) -> None:
+class _PinnedPublicTransport(httpx.AsyncBaseTransport):
+    """Resolve and pin each outbound connection to a vetted public address."""
+
+    def __init__(self) -> None:
+        self._transport = httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        hostname = request.url.host
+        addresses = await asyncio.to_thread(_resolve_public_addresses, hostname)
+        last_error: httpx.ConnectError | httpx.ConnectTimeout | None = None
+        for address in addresses:
+            extensions = dict(request.extensions)
+            extensions["sni_hostname"] = hostname
+            pinned_request = httpx.Request(
+                request.method,
+                request.url.copy_with(host=address),
+                headers=request.headers.raw,
+                stream=request.stream,
+                extensions=extensions,
+            )
+            try:
+                return await self._transport.handle_async_request(pinned_request)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
+
+def _resolve_public_addresses(hostname: str) -> tuple[str, ...]:
     try:
         addresses = [ipaddress.ip_address(hostname)]
     except ValueError:
@@ -206,7 +241,10 @@ def _ensure_public_host(hostname: str) -> None:
         except OSError as exc:
             raise ValueError(f"Could not resolve host {hostname!r}: {exc}") from exc
         addresses = [ipaddress.ip_address(info[4][0]) for info in infos]
-    for address in addresses:
+    unique_addresses = tuple(dict.fromkeys(addresses))
+    if not unique_addresses:
+        raise ValueError(f"Could not resolve host {hostname!r}")
+    for address in unique_addresses:
         if any(
             (
                 address.is_private,
@@ -218,6 +256,11 @@ def _ensure_public_host(hostname: str) -> None:
             )
         ):
             raise ValueError(f"Refusing to fetch non-public address: {address}")
+    return tuple(str(address) for address in unique_addresses)
+
+
+def _ensure_public_host(hostname: str) -> None:
+    _resolve_public_addresses(hostname)
 
 
 class _HTMLTextExtractor(HTMLParser):
