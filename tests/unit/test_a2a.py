@@ -30,6 +30,7 @@ from a2a.types.a2a_pb2 import (
     TaskState,
 )
 from a2a.utils.constants import TransportProtocol
+from a2a.utils.errors import TaskNotFoundError
 
 from ash.sdk import AshEvent
 from ash.agents.a2a_remote import (
@@ -475,6 +476,96 @@ async def test_a2a_registry_rejects_cross_workspace_context(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="different workspace"):
         await A2ASessionRegistry(db_path, second).get("context")
+
+
+@pytest.mark.asyncio
+async def test_a2a_default_task_store_isolates_workspaces(
+    tmp_path: Path, monkeypatch
+) -> None:
+    first_workspace = tmp_path / "first"
+    second_workspace = tmp_path / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    database = tmp_path / "db"
+    base_config = AshConfig(
+        model="ollama/test",
+        workspace_root=first_workspace,
+        db_directory=database,
+        memory_backend="off",
+    )
+
+    async def create_client(**kwargs: Any) -> FakeAshClient:
+        requested = kwargs.get("session_id")
+        return FakeAshClient(requested or "first-session", [])
+
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
+    first_app = create_a2a_app(
+        base_config,
+        public_url="http://first.test",
+        bearer_token="first-token-0001",
+        requests_per_minute=100,
+    )
+    second_app = create_a2a_app(
+        base_config.model_copy(update={"workspace_root": second_workspace}),
+        public_url="http://second.test",
+        bearer_token="second-token-001",
+        requests_per_minute=100,
+    )
+
+    async with first_app.router.lifespan_context(first_app):
+        async with second_app.router.lifespan_context(second_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=first_app),
+                base_url="http://first.test",
+                headers={"Authorization": "Bearer first-token-0001"},
+            ) as first_http:
+                first_client = await ClientFactory(
+                    ClientConfig(
+                        httpx_client=first_http,
+                        streaming=True,
+                        supported_protocol_bindings=[TransportProtocol.JSONRPC],
+                        accepted_output_modes=["text/plain"],
+                    )
+                ).create_from_url("http://first.test")
+                events = [
+                    event
+                    async for event in first_client.send_message(
+                        SendMessageRequest(
+                            message=Message(
+                                message_id="first-message",
+                                context_id="first-context",
+                                role=Role.ROLE_USER,
+                                parts=[Part(text="private first-workspace task")],
+                            )
+                        )
+                    )
+                ]
+                task_id = next(
+                    event.status_update.task_id
+                    for event in events
+                    if event.HasField("status_update")
+                )
+                stored = await first_client.get_task(GetTaskRequest(id=task_id))
+                assert stored.id == task_id
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=second_app),
+                base_url="http://second.test",
+                headers={"Authorization": "Bearer second-token-001"},
+            ) as second_http:
+                second_client = await ClientFactory(
+                    ClientConfig(
+                        httpx_client=second_http,
+                        streaming=True,
+                        supported_protocol_bindings=[TransportProtocol.JSONRPC],
+                        accepted_output_modes=["text/plain"],
+                    )
+                ).create_from_url("http://second.test")
+                with pytest.raises(TaskNotFoundError):
+                    await second_client.get_task(GetTaskRequest(id=task_id))
+                listed = await second_client.list_tasks(ListTasksRequest(page_size=10))
+
+            assert task_id not in {task.id for task in listed.tasks}
 
 
 @pytest.mark.asyncio

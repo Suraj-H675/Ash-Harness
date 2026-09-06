@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import sqlite3
 import time
@@ -65,19 +66,25 @@ MAX_A2A_RATE_LIMIT_KEYS = 10_000
 
 
 class _TokenUser(User):
+    def __init__(self, owner_scope: str) -> None:
+        self._owner_scope = owner_scope
+
     @property
     def is_authenticated(self) -> bool:
         return True
 
     @property
     def user_name(self) -> str:
-        return "ash-a2a-token"
+        return self._owner_scope
 
 
 class _AuthenticatedContextBuilder(DefaultServerCallContextBuilder):
+    def __init__(self, workspace: Path) -> None:
+        self._owner_scope = _a2a_owner_scope(workspace)
+
     def build(self, request: Request) -> ServerCallContext:
         context = super().build(request)
-        context.user = _TokenUser()
+        context.user = _TokenUser(self._owner_scope)
         return context
 
 
@@ -379,7 +386,7 @@ def create_a2a_app(
         task_store=task_store,
         agent_card=card,
     )
-    context_builder = _AuthenticatedContextBuilder()
+    context_builder = _AuthenticatedContextBuilder(config.workspace_root)
 
     async def health(request: Request) -> JSONResponse:
         return JSONResponse(
@@ -505,6 +512,11 @@ def _agent_message(updater: TaskUpdater, text: str) -> Message:
 def _validate_context_id(value: str) -> None:
     if not value or len(value.encode("utf-8")) > MAX_A2A_CONTEXT_ID_BYTES:
         raise ValueError("invalid A2A context ID")
+
+
+def _a2a_owner_scope(workspace: Path) -> str:
+    project_key = normalize_project_path(workspace).encode("utf-8")
+    return f"ash-a2a:{hashlib.sha256(project_key).hexdigest()}"
 
 
 def _public_url(value: str) -> str:
