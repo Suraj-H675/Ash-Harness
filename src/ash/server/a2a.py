@@ -51,7 +51,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message as ASGIMessage, Receive, Scope, Send
 
 from ash.sdk import AshClient
 from ash.config import AshConfig
@@ -60,6 +60,7 @@ from ash.core.session import normalize_project_path
 
 
 MAX_A2A_INPUT_BYTES = 1_000_000
+MAX_A2A_BODY_BYTES = 8 * 1024 * 1024
 MAX_A2A_CONTEXT_ID_BYTES = 512
 MAX_A2A_SESSION_MAPPINGS = 100_000
 MAX_A2A_RATE_LIMIT_KEYS = 10_000
@@ -174,7 +175,57 @@ class A2AAuthMiddleware:
             )
             await response(scope, receive, send)
             return
-        await self.app(scope, receive, send)
+        if scope.get("method") not in {"POST", "PUT", "PATCH"}:
+            await self.app(scope, receive, send)
+            return
+
+        for header_name, value in scope.get("headers", []):
+            if header_name.lower() != b"content-length":
+                continue
+            try:
+                content_length = int(value)
+            except ValueError:
+                break
+            if content_length > MAX_A2A_BODY_BYTES:
+                await self._reject_oversized_body(scope, receive, send)
+                return
+            break
+
+        buffered: list[ASGIMessage] = []
+        total = 0
+        while True:
+            message = await receive()
+            buffered.append(message)
+            if message["type"] != "http.request":
+                break
+            total += len(message.get("body", b""))
+            if total > MAX_A2A_BODY_BYTES:
+                await self._reject_oversized_body(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+
+        index = 0
+
+        async def replay() -> ASGIMessage:
+            nonlocal index
+            if index < len(buffered):
+                message = buffered[index]
+                index += 1
+                return message
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+    @staticmethod
+    async def _reject_oversized_body(
+        scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        response = JSONResponse(
+            {"detail": "Request body exceeds the A2A server limit"},
+            status_code=413,
+        )
+        await response(scope, receive, send)
 
 
 class A2ASessionRegistry:

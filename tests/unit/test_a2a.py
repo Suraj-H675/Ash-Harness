@@ -43,6 +43,7 @@ from ash.agents.a2a_remote import (
 from ash.config import AshConfig
 from ash.safety.guard import SafetyGuard
 from ash.server.a2a import (
+    MAX_A2A_BODY_BYTES,
     MAX_A2A_INPUT_BYTES,
     A2ASessionRegistry,
     _request_text,
@@ -102,6 +103,94 @@ def test_a2a_request_text_stops_reading_parts_after_input_limit() -> None:
 
     assert _request_text(context) == ""
     assert accesses == 1
+
+
+@pytest.mark.asyncio
+async def test_a2a_rejects_oversized_body_without_reading_remainder(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    app = create_a2a_app(
+        config,
+        public_url="https://testserver",
+        bearer_token="0123456789abcdef",
+        requests_per_minute=100,
+        task_store=InMemoryTaskStore(),
+    )
+    consumed: list[int] = []
+    chunk_size = MAX_A2A_BODY_BYTES // 2 + 1
+
+    async def oversized_body() -> AsyncIterator[bytes]:
+        for index in range(3):
+            consumed.append(index)
+            yield b"x" * chunk_size
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/a2a",
+            content=oversized_body(),
+            headers={
+                "Authorization": "Bearer 0123456789abcdef",
+                "Content-Type": "application/json",
+            },
+        )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "Request body exceeds the A2A server limit"}
+    assert consumed == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_a2a_rejects_oversized_content_length_without_reading_body(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    app = create_a2a_app(
+        config,
+        public_url="https://testserver",
+        bearer_token="0123456789abcdef",
+        requests_per_minute=100,
+        task_store=InMemoryTaskStore(),
+    )
+    consumed: list[int] = []
+
+    async def body() -> AsyncIterator[bytes]:
+        consumed.append(0)
+        yield b"{}"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/a2a",
+            content=body(),
+            headers={
+                "Authorization": "Bearer 0123456789abcdef",
+                "Content-Type": "application/json",
+                "Content-Length": str(MAX_A2A_BODY_BYTES + 1),
+            },
+        )
+
+    assert response.status_code == 413
+    assert consumed == []
 
 
 @pytest.mark.asyncio
