@@ -249,6 +249,83 @@ def test_mcp_oauth_rejects_stdio_transport() -> None:
         )
 
 
+def test_mcp_oauth_rejects_remote_plaintext_transport() -> None:
+    with pytest.raises(ValueError, match="OAuth URLs must use HTTPS, except localhost"):
+        MCPServerConfig(
+            name="protected",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="http://mcp.example.test/rpc",
+            auth="oauth",
+        )
+
+
+def test_mcp_oauth_allows_loopback_http_transport() -> None:
+    config = MCPServerConfig(
+        name="protected",
+        command="",
+        args=[],
+        env={},
+        transport="http",
+        url="http://127.0.0.1:43123/rpc",
+        auth="oauth",
+    )
+
+    assert config.resolved_url == "http://127.0.0.1:43123/rpc"
+
+
+def test_mcp_authorization_header_rejects_remote_plaintext_transport() -> None:
+    with pytest.raises(ValueError, match="OAuth URLs must use HTTPS, except localhost"):
+        MCPServerConfig(
+            name="protected",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="http://mcp.example.test/rpc",
+            headers={"Authorization": "Bearer ${MCP_TOKEN}"},
+        )
+
+
+def test_mcp_authorization_header_allows_loopback_http_transport() -> None:
+    config = MCPServerConfig(
+        name="protected",
+        command="",
+        args=[],
+        env={},
+        transport="http",
+        url="http://localhost:43123/rpc",
+        headers={"Authorization": "Bearer ${MCP_TOKEN}"},
+    )
+
+    assert config.resolved_url == "http://localhost:43123/rpc"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://mcp.example.test/rpc",
+        "https:///missing-host",
+        "https://user:password@mcp.example.test/rpc",
+        "https://mcp.example.test/rpc#fragment",
+    ],
+)
+def test_mcp_http_transport_rejects_malformed_or_embedded_credential_urls(
+    url: str,
+) -> None:
+    with pytest.raises(ValueError):
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url=url,
+        )
+
+
 def test_mcp_config_rejects_unimplemented_websocket_transport() -> None:
     with pytest.raises(ValueError, match="Unknown MCP transport"):
         MCPServerConfig(

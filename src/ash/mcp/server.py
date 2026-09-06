@@ -10,9 +10,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from ash.safety.environment import build_scrubbed_environment
 from ash.safe_io import read_bounded_bytes
+from ash.mcp.oauth import MCPOAuthError, canonical_resource_uri
 
 MAX_MCP_CONFIG_BYTES = 256 * 1024
 MCP_SERVER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -41,8 +43,32 @@ class MCPServerConfig:
             raise ValueError(f"Unknown MCP transport: {self.transport}")
         if self.auth not in {"none", "oauth"}:
             raise ValueError(f"Unknown MCP auth mode: {self.auth}")
+        if self.transport in {"http", "sse"}:
+            parsed = urlparse(self.resolved_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("MCP HTTP URLs must use http or https and include a hostname")
+            if parsed.username or parsed.password or parsed.fragment:
+                raise ValueError(
+                    "MCP HTTP URLs cannot contain credentials or fragments"
+                )
         if self.auth == "oauth" and self.transport not in {"http", "sse"}:
             raise ValueError("MCP OAuth requires the http or sse transport")
+        if self.auth == "oauth":
+            try:
+                canonical_resource_uri(self.resolved_url)
+            except MCPOAuthError as exc:
+                raise ValueError(str(exc)) from exc
+        credential_headers = {
+            name.casefold()
+            for name, value in (self.headers or {}).items()
+            if value and name.casefold()
+            in {"authorization", "proxy-authorization", "x-api-key"}
+        }
+        if self.transport in {"http", "sse"} and credential_headers:
+            try:
+                canonical_resource_uri(self.resolved_url)
+            except MCPOAuthError as exc:
+                raise ValueError(str(exc)) from exc
         if self.oauth is not None and not isinstance(self.oauth, dict):
             raise ValueError("MCP oauth configuration must be an object")
         _validate_oauth_data(self.name, self.auth, self.oauth or {})
