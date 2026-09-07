@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -12,13 +13,12 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.completion.base import Completer, Completion
 from prompt_toolkit.document import Document
-from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.enums import EditingMode
 
 from ash.commands.slash import COMMANDS
 from ash.ui.transcript import Transcript
-from ash.ui.viewport import TranscriptViewport
+from ash.ui.viewport import PrivateFileHistory, TranscriptViewport, validate_history_path
 
 
 MAX_PATH_COMPLETION_SCAN_ENTRIES = 10_000
@@ -237,7 +237,12 @@ class PromptInput:
         self.screen_reader_mode = screen_reader_mode
         if self.interactive:
             path = history_path or (Path.home() / ".ash" / "history")
+            validate_history_path(path)
             path.parent.mkdir(parents=True, exist_ok=True)
+            validate_history_path(path)
+            if history_path is None and os.name != "nt":
+                path.parent.chmod(0o700)
+            history = PrivateFileHistory(path)
             words = sorted(
                 {
                     f"/{name}"
@@ -258,6 +263,7 @@ class PromptInput:
                 self._viewport = TranscriptViewport(
                     transcript or Transcript(),
                     history_path=path,
+                    history=history,
                     completer=completer,
                     status_provider=status_provider,
                     input_mode=input_mode,
@@ -266,7 +272,7 @@ class PromptInput:
                 )
             else:
                 self._session = PromptSession(
-                    history=FileHistory(str(path)),
+                    history=history,
                     auto_suggest=(
                         None if screen_reader_mode else AutoSuggestFromHistory()
                     ),

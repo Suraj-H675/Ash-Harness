@@ -54,6 +54,29 @@ def test_symlinked_trust_store_cannot_grant_workspace_trust(
     assert is_workspace_trusted(workspace) is False
 
 
+def test_symlinked_user_state_root_cannot_redirect_workspace_trust(
+    tmp_path, monkeypatch
+) -> None:
+    import pytest
+
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    outside.mkdir()
+    workspace.mkdir()
+    try:
+        (home / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+    monkeypatch.setenv("HOME", str(home))
+
+    assert is_workspace_trusted(workspace) is False
+    with pytest.raises(ValueError, match="linked workspace trust state"):
+        set_workspace_trusted(workspace, True)
+    assert not (outside / "trusted-workspaces.json").exists()
+
+
 def test_malformed_or_unsupported_trust_store_fails_closed(
     tmp_path, monkeypatch
 ) -> None:

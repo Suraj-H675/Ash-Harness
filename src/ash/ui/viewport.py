@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import datetime
+import os
+import stat
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from io import StringIO
 from typing import Any
@@ -18,7 +21,7 @@ from prompt_toolkit.formatted_text import (
     FormattedText,
     to_formatted_text,
 )
-from prompt_toolkit.history import FileHistory
+from prompt_toolkit.history import FileHistory, History
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import (
@@ -37,6 +40,77 @@ from rich.markdown import Markdown
 from ash.ui.terminal import terminal_safe_text
 from ash.ui.transcript import Transcript, TranscriptEntry, TranscriptEvent
 from ash.ui.theme import Theme, get_theme, viewport_styles
+
+
+def _is_history_link(path: Path) -> bool:
+    return path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    )
+
+
+def validate_history_path(path: Path) -> None:
+    """Reject history files or immediate state directories that redirect via links."""
+
+    if _is_history_link(path) or _is_history_link(path.parent):
+        raise ValueError(f"refusing to use symlinked prompt history path: {path}")
+
+
+class PrivateFileHistory(FileHistory):
+    """Prompt-toolkit history with no-follow reads/writes and private POSIX mode."""
+
+    def __init__(self, filename: Path) -> None:
+        self._path = filename
+        validate_history_path(filename)
+        super().__init__(str(filename))
+        try:
+            descriptor = self._open_fd(os.O_RDONLY)
+        except FileNotFoundError:
+            return
+        else:
+            os.close(descriptor)
+
+    def _open_fd(self, flags: int, mode: int = 0o600) -> int:
+        validate_history_path(self._path)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self._path, flags, mode)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(descriptor)
+            raise ValueError(f"prompt history path is not a regular file: {self._path}")
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
+        return descriptor
+
+    def load_history_strings(self) -> Iterable[str]:
+        strings: list[str] = []
+        lines: list[str] = []
+
+        def add() -> None:
+            if lines:
+                strings.append("".join(lines)[:-1])
+
+        try:
+            descriptor = self._open_fd(os.O_RDONLY)
+        except FileNotFoundError:
+            return ()
+        with os.fdopen(descriptor, "rb") as handle:
+            for line_bytes in handle:
+                line = line_bytes.decode("utf-8", errors="replace")
+                if line.startswith("+"):
+                    lines.append(line[1:])
+                else:
+                    add()
+                    lines = []
+            add()
+        return reversed(strings)
+
+    def store_string(self, string: str) -> None:
+        descriptor = self._open_fd(os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        with os.fdopen(descriptor, "ab") as handle:
+            handle.write(f"\n# {datetime.datetime.now()}\n".encode("utf-8"))
+            for line in string.split("\n"):
+                handle.write(f"+{line}\n".encode("utf-8"))
 
 
 _ENTRY_STYLE = {
@@ -132,6 +206,7 @@ class TranscriptViewport:
         transcript: Transcript,
         *,
         history_path: Path,
+        history: History | None = None,
         completer: Any = None,
         status_provider: Callable[[], str] | None = None,
         input_mode: str = "emacs",
@@ -156,7 +231,7 @@ class TranscriptViewport:
         selected_theme: Theme = get_theme(theme)
 
         self.input_buffer = Buffer(
-            history=FileHistory(str(history_path)),
+            history=history or PrivateFileHistory(history_path),
             auto_suggest=AutoSuggestFromHistory(),
             completer=completer,
             complete_while_typing=True,

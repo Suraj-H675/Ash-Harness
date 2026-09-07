@@ -2669,14 +2669,19 @@ def main(argv: list[str] | None = None) -> int:
             set_workspace_trusted,
         )
 
-        if args.action == "status":
-            trusted = is_workspace_trusted(args.path)
-            print(
-                f"{canonical_workspace(args.path)}: {'trusted' if trusted else 'untrusted'}"
-            )
-            return 0 if trusted else 1
-        trusted = args.action == "add"
-        set_workspace_trusted(args.path, trusted)
+        try:
+            if args.action == "status":
+                trusted = is_workspace_trusted(args.path)
+                print(
+                    f"{canonical_workspace(args.path)}: "
+                    f"{'trusted' if trusted else 'untrusted'}"
+                )
+                return 0 if trusted else 1
+            trusted = args.action == "add"
+            set_workspace_trusted(args.path, trusted)
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
         print(
             f"{canonical_workspace(args.path)}: {'trusted' if trusted else 'untrusted'}"
         )
@@ -3602,7 +3607,11 @@ def main(argv: list[str] | None = None) -> int:
 
             oauth_store = MCPOAuthTokenStore(args.server_name)
             if args.action == "logout":
-                credentials_removed = oauth_store.remove()
+                try:
+                    credentials_removed = oauth_store.remove()
+                except MCPOAuthError as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    return 2
                 print(
                     f"Removed OAuth credentials for MCP server {args.server_name}."
                     if credentials_removed

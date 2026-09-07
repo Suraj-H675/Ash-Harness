@@ -1,5 +1,7 @@
 import asyncio
 import io
+import os
+import stat
 
 import pytest
 from prompt_toolkit.completion import CompleteEvent
@@ -108,3 +110,73 @@ def test_path_completion_scans_a_bounded_number_of_entries(
     )
 
     assert len(completions) == prompt_module.MAX_PATH_COMPLETIONS
+
+
+def test_interactive_prompt_history_rejects_symlink(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "target"
+    target.write_text("keep", encoding="utf-8")
+    history_path = tmp_path / "history"
+    try:
+        history_path.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    monkeypatch.setattr(prompt_module, "PromptSession", lambda **kwargs: None)
+
+    with pytest.raises(ValueError, match="symlinked prompt history"):
+        PromptInput(input_stream=TtyStringIO(), history_path=history_path)
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_interactive_prompt_history_is_private_and_nofollow(
+    tmp_path, monkeypatch
+) -> None:
+    captured = {}
+
+    class FakePromptSession:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(prompt_module, "PromptSession", FakePromptSession)
+    history_path = tmp_path / "history"
+    PromptInput(input_stream=TtyStringIO(), history_path=history_path)
+    history = captured["history"]
+
+    history.append_string("first\nsecond")
+    assert "first" in history_path.read_text(encoding="utf-8")
+    if os.name != "nt":
+        assert stat.S_IMODE(history_path.stat().st_mode) == 0o600
+
+    target = tmp_path / "outside"
+    target.write_text("keep", encoding="utf-8")
+    history_path.unlink()
+    try:
+        history_path.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    with pytest.raises((OSError, ValueError), match="symlink|link|loop|follow"):
+        history.append_string("redirected")
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_interactive_prompt_history_repairs_existing_posix_permissions(
+    tmp_path, monkeypatch
+) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX permissions are unavailable")
+    captured = {}
+
+    class FakePromptSession:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(prompt_module, "PromptSession", FakePromptSession)
+    history_path = tmp_path / "history"
+    history_path.write_text("", encoding="utf-8")
+    history_path.chmod(0o644)
+
+    PromptInput(input_stream=TtyStringIO(), history_path=history_path)
+
+    assert captured["history"] is not None
+    assert stat.S_IMODE(history_path.stat().st_mode) == 0o600

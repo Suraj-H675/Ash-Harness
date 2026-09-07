@@ -96,7 +96,27 @@ class MCPOAuthTokenStore:
         self.directory = directory or (Path.home() / ".ash" / "mcp-oauth")
         self.path = self.directory / f"{self.server_name}.json"
 
+    @staticmethod
+    def _is_link(path: Path) -> bool:
+        return path.is_symlink() or (
+            hasattr(path, "is_junction") and path.is_junction()
+        )
+
+    def _validate_storage_path(self) -> None:
+        for candidate in (self.path, self.directory, self.directory.parent):
+            if self._is_link(candidate):
+                if candidate == self.path:
+                    raise MCPOAuthError(
+                        f"refusing to use symlinked MCP OAuth credential file: {candidate}"
+                    )
+                if candidate == self.directory:
+                    raise MCPOAuthError("refusing to use a symlinked MCP OAuth directory")
+                raise MCPOAuthError(
+                    f"refusing to use linked MCP OAuth credential path: {candidate}"
+                )
+
     def load(self, resource: str) -> OAuthBundle | None:
+        self._validate_storage_path()
         if not self.path.exists():
             return None
         try:
@@ -179,10 +199,10 @@ class MCPOAuthTokenStore:
                 "expires_at": bundle.tokens.expires_at,
             },
         }
-        if self.directory.is_symlink():
-            raise MCPOAuthError("refusing to use a symlinked MCP OAuth directory")
+        self._validate_storage_path()
         self.directory.mkdir(parents=True, exist_ok=True)
-        if self.directory.is_symlink() or not self.directory.is_dir():
+        self._validate_storage_path()
+        if not self.directory.is_dir():
             raise MCPOAuthError("MCP OAuth credential path is not a private directory")
         if os.name != "nt":
             self.directory.chmod(0o700)
@@ -211,6 +231,7 @@ class MCPOAuthTokenStore:
             raise
 
     def remove(self) -> bool:
+        self._validate_storage_path()
         try:
             self.path.unlink()
         except FileNotFoundError:
@@ -220,6 +241,10 @@ class MCPOAuthTokenStore:
     def credential_state(self, resource: str) -> str:
         """Report bounded, non-secret credential health for diagnostics."""
 
+        try:
+            self._validate_storage_path()
+        except MCPOAuthError:
+            return "invalid"
         if not self.path.exists():
             return "missing"
         try:

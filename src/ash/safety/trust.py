@@ -13,8 +13,17 @@ from ash.safe_io import read_bounded_bytes
 MAX_TRUST_STORE_BYTES = 1_000_000
 
 
+def _is_link(path: Path) -> bool:
+    return path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
+
+
 def trust_store_path() -> Path:
     return Path.home() / ".ash" / "trusted-workspaces.json"
+
+
+def _validate_trust_store_path(path: Path) -> None:
+    if _is_link(path) or _is_link(path.parent):
+        raise ValueError(f"refusing to use linked workspace trust state: {path}")
 
 
 def canonical_workspace(path: str | Path) -> str:
@@ -32,6 +41,10 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def load_trusted_workspaces() -> set[str]:
     path = trust_store_path()
+    try:
+        _validate_trust_store_path(path)
+    except ValueError:
+        return set()
     if not path.exists():
         return set()
     try:
@@ -74,7 +87,11 @@ def set_workspace_trusted(path: str | Path, trusted: bool) -> bool:
 
 def _save(entries: set[str]) -> None:
     path = trust_store_path()
+    _validate_trust_store_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_trust_store_path(path)
+    if os.name != "nt":
+        path.parent.chmod(0o700)
     fd, temporary = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )

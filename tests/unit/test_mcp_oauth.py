@@ -113,6 +113,41 @@ def test_oauth_store_rejects_oversized_records_and_symlinked_directory(
         linked.save(_bundle(resource))
 
 
+def test_oauth_store_rejects_symlinked_user_state_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    try:
+        (home / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+    monkeypatch.setenv("HOME", str(home))
+    resource = "https://mcp.example.test/rpc"
+    bundle = _bundle(resource)
+    store = MCPOAuthTokenStore("remote")
+
+    with pytest.raises(MCPOAuthError, match="linked MCP OAuth credential path"):
+        store.save(bundle)
+    assert not (outside / "mcp-oauth").exists()
+
+    staged = MCPOAuthTokenStore("remote", tmp_path / "staged")
+    staged.save(bundle)
+    redirected_directory = outside / "mcp-oauth"
+    redirected_directory.mkdir()
+    redirected = redirected_directory / "remote.json"
+    redirected.write_bytes(staged.path.read_bytes())
+
+    with pytest.raises(MCPOAuthError, match="linked MCP OAuth credential path"):
+        store.load(resource)
+    with pytest.raises(MCPOAuthError, match="linked MCP OAuth credential path"):
+        store.remove()
+    assert redirected.exists()
+    assert store.credential_state(resource) == "invalid"
+
+
 def test_oauth_credential_state_reports_health_without_secrets(tmp_path: Path) -> None:
     resource = "https://mcp.example.test/rpc"
     store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
