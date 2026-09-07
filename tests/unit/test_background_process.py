@@ -71,9 +71,9 @@ async def test_background_process_handles_long_lines_and_bounds_output(tmp_path)
 
     started = await tool.run(action="start", command=command)
     job_id = started.output.split()[1]
-    await asyncio.sleep(0.1)
-
     job = tool.jobs[job_id]
+    await asyncio.wait_for(job.process.wait(), timeout=5.0)
+    await asyncio.wait_for(asyncio.gather(*job.readers), timeout=5.0)
     polled = await tool.run(action="poll", job_id=job_id)
 
     assert job.process.returncode == 0
