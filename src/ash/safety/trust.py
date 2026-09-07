@@ -7,6 +7,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from ash.safe_io import read_bounded_bytes
+
 
 MAX_TRUST_STORE_BYTES = 1_000_000
 
@@ -24,12 +26,13 @@ def load_trusted_workspaces() -> set[str]:
     if not path.exists():
         return set()
     try:
-        with path.open("rb") as handle:
-            raw = handle.read(MAX_TRUST_STORE_BYTES + 1)
-        if len(raw) > MAX_TRUST_STORE_BYTES:
-            return set()
+        raw = read_bounded_bytes(
+            path,
+            MAX_TRUST_STORE_BYTES,
+            label="trusted workspace store",
+        )
         payload = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return set()
     entries = payload.get("workspaces", []) if isinstance(payload, dict) else []
     return {str(entry) for entry in entries if isinstance(entry, str)}

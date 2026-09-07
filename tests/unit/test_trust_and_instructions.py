@@ -29,6 +29,31 @@ def test_oversized_trust_store_fails_closed(tmp_path, monkeypatch) -> None:
     assert is_workspace_trusted(tmp_path / "workspace") is False
 
 
+def test_symlinked_trust_store_cannot_grant_workspace_trust(
+    tmp_path, monkeypatch
+) -> None:
+    import json
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside-trust.json"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    outside.write_text(
+        json.dumps({"version": 1, "workspaces": [str(workspace.resolve())]}),
+        encoding="utf-8",
+    )
+    try:
+        trust_store_path().symlink_to(outside)
+    except OSError as exc:
+        import pytest
+
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    assert is_workspace_trusted(workspace) is False
+
+
 def test_project_instructions_require_trust_flag(tmp_path, monkeypatch) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "repo"
