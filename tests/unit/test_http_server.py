@@ -122,6 +122,40 @@ async def test_http_server_requires_auth_and_runs_turn() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_server_rejects_duplicate_authorization_headers() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+        requests_per_minute=10,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        for headers in (
+            [
+                ("Authorization", "Bearer 0123456789abcdef"),
+                ("Authorization", "Bearer wrongwrongwrongwrong"),
+            ],
+            [
+                ("Authorization", "Bearer wrongwrongwrongwrong"),
+                ("Authorization", "Bearer 0123456789abcdef"),
+            ],
+            [
+                ("Authorization", "Bearer 0123456789abcdef"),
+                ("authorization", "Bearer 0123456789abcdef"),
+            ],
+        ):
+            response = await http.post(
+                "/v1/turn",
+                json={"input": "hello"},
+                headers=headers,
+            )
+            assert response.status_code == 401
+            assert response.json()["detail"] == "Invalid bearer token"
+
+
+@pytest.mark.asyncio
 async def test_http_rest_stops_reading_after_payload_limit() -> None:
     app = create_app(
         FakeClient(),  # type: ignore[arg-type]

@@ -10,7 +10,7 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, StrictInt
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -166,13 +166,19 @@ def create_app(
     app = FastAPI(title="Ash API", version="1", lifespan=lifespan)
     app.add_middleware(_BoundedRequestBodyMiddleware, max_bytes=MAX_HTTP_BODY_BYTES)
 
-    async def authorize(
-        request: Request,
-        authorization: str | None = Header(default=None),
-    ) -> None:
-        scheme, _, supplied = (authorization or "").partition(" ")
-        if scheme.casefold() != "bearer" or not hmac.compare_digest(
-            supplied, bearer_token
+    async def authorize(request: Request) -> None:
+        authorization_values = [
+            value.decode("latin-1")
+            for key, value in request.scope.get("headers", [])
+            if key.lower() == b"authorization"
+        ]
+        scheme, _, supplied = (
+            authorization_values[0] if len(authorization_values) == 1 else ""
+        ).partition(" ")
+        if (
+            len(authorization_values) != 1
+            or scheme.casefold() != "bearer"
+            or not hmac.compare_digest(supplied, bearer_token)
         ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
