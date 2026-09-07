@@ -58,6 +58,7 @@ def extension_state_path() -> Path:
 
 def load_extension_state(path: Path | None = None) -> ExtensionState:
     state_path = path or extension_state_path()
+    _validate_lifecycle_path(state_path, "extension state")
     if not state_path.exists():
         return ExtensionState()
     try:
@@ -135,6 +136,7 @@ def install_local_plugin(
         raise PluginLifecycleError(f"invalid plugin manifest: {exc}") from exc
 
     root = (destination_root or user_plugin_root()).expanduser()
+    _validate_lifecycle_path(root, "plugin destination root")
     root.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         root.chmod(0o700)
@@ -206,6 +208,7 @@ def uninstall_local_plugin(
     if not confirmed:
         raise PluginLifecycleError("uninstall requires explicit confirmation")
     root = (destination_root or user_plugin_root()).expanduser()
+    _validate_lifecycle_path(root, "plugin destination root")
     destination = root / name
     if not destination.is_dir() or destination.is_symlink():
         raise PluginLifecycleError(f"plugin is not installed: {name}")
@@ -393,7 +396,14 @@ def _validate_plugin_name(name: str) -> None:
         raise PluginLifecycleError("plugin name must be a path-safe identifier")
 
 
+def _validate_lifecycle_path(path: Path, label: str) -> None:
+    for candidate in (path, path.parent):
+        if _is_link(candidate):
+            raise PluginLifecycleError(f"{label} cannot traverse a link: {candidate}")
+
+
 def _save_extension_state(state: ExtensionState, path: Path) -> None:
+    _validate_lifecycle_path(path, "extension state")
     path.parent.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         path.parent.chmod(0o700)

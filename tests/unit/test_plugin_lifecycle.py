@@ -81,6 +81,51 @@ def test_install_local_plugin_rejects_linked_source_directory(tmp_path) -> None:
         install_local_plugin(linked, destination_root=tmp_path / "installed")
 
 
+def test_plugin_lifecycle_rejects_symlinked_user_state_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    try:
+        (home / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+    monkeypatch.setenv("HOME", str(home))
+    source = _plugin(tmp_path / "source", name="example")
+
+    with pytest.raises(PluginLifecycleError, match="cannot traverse a link"):
+        install_local_plugin(source)
+    with pytest.raises(PluginLifecycleError, match="cannot traverse a link"):
+        set_plugin_enabled("example", enabled=False)
+
+    assert not (outside / "plugins").exists()
+    assert not (outside / "extensions.json").exists()
+
+
+def test_uninstall_rejects_symlinked_plugin_destination_root(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _plugin(outside / "example", name="example")
+    linked_root = tmp_path / "plugins"
+    try:
+        linked_root.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(PluginLifecycleError, match="cannot traverse a link"):
+        uninstall_local_plugin(
+            "example",
+            destination_root=linked_root,
+            confirmed=True,
+            state_path=tmp_path / "extensions.json",
+        )
+
+    assert victim.is_dir()
+    assert (victim / "README.md").read_text(encoding="utf-8") == "plugin contents"
+
+
 @pytest.mark.parametrize("name", [".", "bad name", "../outside", "bad/name"])
 def test_install_local_plugin_rejects_unsafe_names(tmp_path, name: str) -> None:
     source = _plugin(tmp_path / "source", name=name)
