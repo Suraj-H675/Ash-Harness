@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
-from ash.safe_io import read_bounded_bytes
+from ash.safe_io import read_bounded_bytes, strict_json_loads
 
 CATALOG_VERSION = 1
 MAX_CATALOG_BYTES = 256 * 1024
@@ -153,8 +153,8 @@ def load_trusted_keys(path: Path) -> dict[str, bytes]:
             f"cannot read trusted catalog keys {path}: {exc}"
         ) from exc
     try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
+        payload = strict_json_loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise PluginCatalogError(f"invalid trusted catalog keys {path}: {exc}") from exc
     if not isinstance(payload, dict) or payload.get("version") != 1:
         raise PluginCatalogError(f"unsupported trusted catalog keys: {path}")
@@ -323,24 +323,10 @@ def _canonical_json(value: Mapping[str, Any]) -> bytes:
 
 
 def _parse_strict_json(raw: str) -> Any:
-    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError(f"duplicate JSON object key: {key}")
-            result[key] = value
-        return result
-
     try:
-        return json.loads(
-            raw, object_pairs_hook=unique_object, parse_constant=_reject_constant
-        )
+        return strict_json_loads(raw)
     except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise PluginCatalogError(f"invalid signed plugin catalog JSON: {exc}") from exc
-
-
-def _reject_constant(value: str) -> None:
-    raise ValueError(f"invalid JSON constant: {value}")
 
 
 def _decode_base64url(value: Any, *, expected: int | None = None) -> bytes:

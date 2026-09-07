@@ -75,7 +75,12 @@ def parse_agent_definition(path: Path, *, namespace: str = "") -> AgentDefinitio
             for line in text[4:end].splitlines():
                 key, separator, value = line.partition(":")
                 if separator:
-                    metadata[key.strip().casefold()] = value.strip().strip("\"'")
+                    normalized_key = key.strip().casefold()
+                    if normalized_key in metadata:
+                        raise ValueError(
+                            f"duplicate agent metadata key: {normalized_key!r}"
+                        )
+                    metadata[normalized_key] = value.strip().strip("\"'")
             body = text[end + 5 :]
     name = metadata.get("name") or path.stem
     if (

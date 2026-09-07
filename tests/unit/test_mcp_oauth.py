@@ -31,6 +31,20 @@ from ash.mcp.oauth import (
 from ash.mcp.server import MCPServerConfig
 
 
+@pytest.mark.asyncio
+async def test_oauth_json_response_rejects_duplicate_fields() -> None:
+    from ash.mcp.oauth import _bounded_json_response
+
+    response = httpx.Response(
+        200,
+        content=b'{"access_token":"first","access_token":"second"}',
+        headers={"content-type": "application/json"},
+    )
+
+    with pytest.raises(MCPOAuthError, match="returned invalid JSON"):
+        await _bounded_json_response(response, "token endpoint")
+
+
 def _bundle(resource: str, *, expired: bool = False) -> OAuthBundle:
     canonical = canonical_resource_uri(resource)
     return OAuthBundle(

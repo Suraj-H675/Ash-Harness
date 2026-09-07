@@ -10,7 +10,13 @@ from ash.agents.tasks import (
     AgentTaskBudgetExceeded,
     AgentTaskCreate,
     AgentTaskError,
+    _json_object,
 )
+
+
+def test_durable_task_json_rejects_duplicate_fields() -> None:
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        _json_object('{"graph_id":"safe","graph_id":"override"}')
 
 
 @pytest.fixture

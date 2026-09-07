@@ -77,6 +77,18 @@ def test_update_check_handles_missing_and_invalid_releases() -> None:
         )
 
 
+def test_update_check_rejects_duplicate_release_fields() -> None:
+    def duplicate(request, timeout: int):
+        assert timeout == 5
+        return Response(
+            b'{"tag_name":"v9.9.9","tag_name":"v0.2.0",'
+            b'"html_url":"https://example.test/release"}'
+        )
+
+    with pytest.raises(ValueError, match="invalid release response"):
+        check_for_update(current_version="0.1.0", opener=duplicate)
+
+
 def test_apply_update_uses_the_same_verified_installer_as_first_run(capsys) -> None:
     calls = []
 

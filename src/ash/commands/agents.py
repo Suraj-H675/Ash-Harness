@@ -10,6 +10,7 @@ from typing import Any
 from ash.agents.shared_state import SharedState
 from ash.agents.tasks import TaskState
 from ash.agents.worktree import WorktreeManager
+from ash.safe_io import strict_json_loads
 
 
 def list_agent_statuses(db_path: str | Path) -> list[dict[str, Any]]:
@@ -197,9 +198,10 @@ def send_agent_message(
             )
         if json_content:
             try:
-                payload = json.loads(content)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"invalid JSON content: {exc.msg}") from exc
+                payload = strict_json_loads(content)
+            except (json.JSONDecodeError, ValueError) as exc:
+                detail = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+                raise ValueError(f"invalid JSON content: {detail}") from exc
             if not isinstance(payload, dict):
                 raise ValueError("JSON content must be an object")
             message_id = state.send_message(

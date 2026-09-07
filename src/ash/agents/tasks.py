@@ -18,6 +18,7 @@ from typing import Any, Literal, Sequence
 
 from ash.core.events import envelope_event
 from ash.core.redaction import redact_text
+from ash.safe_io import strict_json_loads
 
 TaskState = Literal[
     "queued",
@@ -1589,7 +1590,7 @@ def _bounded_json(value: dict[str, Any], label: str) -> str:
 
 
 def _json_object(value: str) -> dict[str, Any]:
-    parsed = json.loads(value, parse_constant=_reject_json_constant)
+    parsed = strict_json_loads(value)
     if not isinstance(parsed, dict):
         raise AgentTaskError("stored task JSON is not an object")
     return parsed
@@ -1601,7 +1602,3 @@ def _token_hash(token: str) -> str:
 
 def _from_epoch(value: float) -> datetime:
     return datetime.fromtimestamp(value, timezone.utc)
-
-
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"non-standard JSON constant: {value}")

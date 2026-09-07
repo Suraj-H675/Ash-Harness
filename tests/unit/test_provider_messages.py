@@ -118,6 +118,15 @@ def test_canonical_tool_arguments_must_be_strict_json() -> None:
         )
 
 
+def test_canonical_tool_arguments_reject_duplicate_json_keys() -> None:
+    with pytest.raises(ValueError, match="invalid JSON"):
+        CanonicalToolCall(
+            call_id="call-1",
+            name="tool",
+            arguments='{"file_path":"README.md","file_path":".env"}',
+        )
+
+
 def test_native_tool_calls_normalize_provider_ids_and_json_arguments() -> None:
     chunk = StreamChunk(
         native_tool_calls=[

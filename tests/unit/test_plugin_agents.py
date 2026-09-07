@@ -68,6 +68,17 @@ def test_agent_catalog_rejects_direct_linked_definition(tmp_path: Path) -> None:
         parse_agent_definition(linked)
 
 
+def test_agent_definition_rejects_duplicate_frontmatter_keys(tmp_path: Path) -> None:
+    path = tmp_path / "reviewer.md"
+    path.write_text(
+        "---\nname: reviewer\nname: override\n---\nReview the task.\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate agent metadata key"):
+        parse_agent_definition(path)
+
+
 def test_agent_catalog_bounds_recursive_discovery(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "agents"
     root.mkdir()

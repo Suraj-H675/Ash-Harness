@@ -16,6 +16,7 @@ from ash.plugins.catalog import (
     CatalogEntry,
     fetch_catalog,
     generate_catalog_signing_key,
+    load_trusted_keys,
     parse_and_verify_catalog,
     sign_catalog,
 )
@@ -186,6 +187,15 @@ def test_rejects_duplicate_json_keys(tmp_path: Path) -> None:
         parse_and_verify_catalog(
             files["catalog_path"], trusted_keys_path=files["keys_path"]
         )
+
+
+def test_rejects_duplicate_trusted_key_store_fields(tmp_path: Path) -> None:
+    files = _write_catalog(tmp_path / "catalog.json")
+    raw = files["keys_path"].read_text(encoding="utf-8")
+    files["keys_path"].write_text(raw[:-1] + ',"version":1}', encoding="utf-8")
+
+    with pytest.raises(PluginCatalogError, match="duplicate JSON object key"):
+        load_trusted_keys(files["keys_path"])
 
 
 def test_git_install_verifies_catalog_revision(tmp_path: Path) -> None:

@@ -17,6 +17,8 @@ from pydantic import (
     model_validator,
 )
 
+from ash.safe_io import strict_json_loads
+
 
 MAX_CANONICAL_MESSAGES = 10_000
 MAX_IMAGE_BASE64_CHARS = 14_000_000
@@ -73,8 +75,8 @@ class CanonicalToolCall(BaseModel):
         if not isinstance(value, str):
             return value
         try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError as exc:
+            parsed = strict_json_loads(value)
+        except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError("tool-call arguments contain invalid JSON") from exc
         if not isinstance(parsed, dict):
             raise ValueError("tool-call arguments JSON must decode to an object")

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ash.safe_io import strict_json_loads
 from ash.safety.grants import (
     ArgumentMatcher,
     MatchOperator,
@@ -130,8 +131,8 @@ def build_argument_matchers(
     for raw in exact or ():
         argument, value = _split_assignment(raw, option="--exact")
         try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError as exc:
+            parsed = strict_json_loads(value)
+        except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError(
                 f"--exact value for {argument!r} must be JSON; "
                 'quote string values, for example file_path="README.md"'
@@ -152,8 +153,8 @@ def build_argument_matchers(
     for raw in allowed_set or ():
         argument, value = _split_assignment(raw, option="--in")
         try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError as exc:
+            parsed = strict_json_loads(value)
+        except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError(
                 f"--in value for {argument!r} must be a JSON array of strings; "
                 'for example operation=["status","definition"]'

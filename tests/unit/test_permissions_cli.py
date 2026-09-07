@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from ash.cli import main
-from ash.commands.permissions import render_permission_grants
+from ash.commands.permissions import build_argument_matchers, render_permission_grants
 from ash.safety.grants import load_permission_rules, load_tool_grants, set_tool_grant
 from ash.safety.policy import PermissionPolicy, PolicyAction
 
@@ -429,6 +431,11 @@ def test_permissions_cli_rejects_invalid_scopes(
         main(["permissions", "allow", "write_file", "--exact", "file_path=README"]) == 2
     )
     assert "must be JSON" in capsys.readouterr().err
+
+
+def test_permission_exact_matcher_rejects_duplicate_json_fields() -> None:
+    with pytest.raises(ValueError, match="must be JSON"):
+        build_argument_matchers(exact=['payload={"x":1,"x":2}'])
 
 
 def test_interactive_runtime_reports_invalid_permission_policy(

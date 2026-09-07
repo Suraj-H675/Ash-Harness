@@ -35,6 +35,34 @@ KNOWN_FRONTMATTER_FIELDS = frozenset(
 )
 
 
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
+
+    def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
+        self.flatten_mapping(node)
+        mapping: dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in mapping
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found an unhashable mapping key",
+                    key_node.start_mark,
+                ) from exc
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate mapping key {key!r}",
+                    key_node.start_mark,
+                )
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
+
+
 @dataclass(frozen=True)
 class InstructionSkill:
     """One validated Agent Skills instruction package."""
@@ -156,7 +184,7 @@ def parse_instruction_skill(path: Path, *, namespace: str = "") -> InstructionSk
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     frontmatter_text, instructions = _split_frontmatter(text)
     try:
-        raw = yaml.safe_load(frontmatter_text)
+        raw = yaml.load(frontmatter_text, Loader=_UniqueKeySafeLoader)
     except yaml.YAMLError as exc:
         raise ValueError(f"invalid YAML frontmatter: {exc}") from exc
     if not isinstance(raw, dict) or not all(isinstance(key, str) for key in raw):

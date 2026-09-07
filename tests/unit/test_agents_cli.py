@@ -427,6 +427,21 @@ def test_agents_cli_send_validates_recipient_and_json_content(
                 "agents",
                 "send",
                 "missing",
+                '{"decision":"deny","decision":"allow"}',
+                "--json-content",
+                "--force",
+            ]
+        )
+        == 2
+    )
+    assert "invalid JSON content" in capsys.readouterr().err
+
+    assert (
+        main(
+            [
+                "agents",
+                "send",
+                "missing",
                 '{"summary": "queued"}',
                 "--json-content",
                 "--force",

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from ash.profiles import active_profile_name, profile_directory
-from ash.safe_io import read_bounded_bytes
+from ash.safe_io import read_bounded_bytes, strict_json_loads
 
 
 # ---------------------------------------------------------------------------
@@ -201,14 +201,14 @@ def _load_migration_state() -> dict[str, Any]:
     if not path.exists():
         return {"version": 1, "migrations": {}}
     try:
-        value = json.loads(
+        value = strict_json_loads(
             read_bounded_bytes(
                 path,
                 MAX_MIGRATION_STATE_BYTES,
                 label="config migration state",
             ).decode("utf-8")
         )
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"cannot load config migration state {path}: {exc}") from exc
     if (
         not isinstance(value, dict)

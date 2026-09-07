@@ -19,7 +19,7 @@ import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from ash.safe_io import read_bounded_bytes, read_bounded_text
+from ash.safe_io import read_bounded_bytes, read_bounded_text, strict_json_loads
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
@@ -3974,7 +3974,7 @@ async def _bootstrap_and_headless(
 
 def _load_json_schema(path: Path) -> dict[str, Any]:
     try:
-        schema = json.loads(
+        schema = strict_json_loads(
             read_bounded_bytes(
                 path,
                 MAX_JSON_SCHEMA_BYTES,
@@ -3992,8 +3992,8 @@ def validate_structured_output(response: str, schema: dict[str, Any]) -> Any:
     import jsonschema  # type: ignore[import-untyped]
 
     try:
-        value = json.loads(response)
-    except json.JSONDecodeError as exc:
+        value = strict_json_loads(response)
+    except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"Model output is not valid JSON: {exc}") from exc
     try:
         jsonschema.validate(value, schema)

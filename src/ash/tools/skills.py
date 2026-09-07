@@ -23,6 +23,7 @@ registry to reload it.
 from __future__ import annotations
 
 import ast
+import json
 import re
 import textwrap
 import types
@@ -32,6 +33,7 @@ from typing import Any, Callable, Mapping, Sequence, cast
 
 from pydantic import BaseModel, create_model
 
+from ash.safe_io import strict_json_loads
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult
 from ash.tools.registry import SkillIndexEntry
@@ -161,7 +163,12 @@ def parse_markdown_skill(path: Path) -> _MarkdownSkill:
         for line in fm_match.group("body").splitlines():
             if ":" in line:
                 key, _, value = line.partition(":")
-                front[key.strip().lower()] = value.strip()
+                normalized_key = key.strip().lower()
+                if normalized_key in front:
+                    raise SkillParseError(
+                        f"Duplicate markdown skill metadata key: {normalized_key}"
+                    )
+                front[normalized_key] = value.strip()
         body = text[fm_match.end() :]
 
     name = front.get("name") or _first_h1(body) or path.stem
@@ -219,12 +226,16 @@ def _parse_args_section(body: str) -> tuple[tuple[str, str, str, str], ...]:
     if not block:
         return ()
     args: list[tuple[str, str, str, str]] = []
+    seen_args: set[str] = set()
     bullet_re = re.compile(
         r"^\s*-\s*`?(?P<name>[A-Za-z_][A-Za-z0-9_]*)`?\s*:\s*(?P<rest>.+?)\s*$",
         re.MULTILINE,
     )
     for line_match in bullet_re.finditer(block):
         name = line_match.group("name")
+        if name in seen_args:
+            raise SkillParseError(f"Duplicate markdown skill argument: {name}")
+        seen_args.add(name)
         rest = line_match.group("rest")
         # The rest looks like: <type> [= default] - description
         type_match = re.match(r"`?([A-Za-z_][A-Za-z0-9_\[\], ]*)`?", rest)
@@ -275,8 +286,12 @@ def parse_python_skill(path: Path) -> _PythonSkill:
     name = path.stem
     description = ""
     trigger = ""
+    seen_metadata: set[str] = set()
     for line_match in _PY_DOCSTRING_META_RE.finditer(module_doc):
         key = line_match.group("key").lower()
+        if key in seen_metadata:
+            raise SkillParseError(f"Duplicate Python skill metadata key: {key}")
+        seen_metadata.add(key)
         value = line_match.group("value")
         if key == "name":
             name = value
@@ -603,12 +618,12 @@ def _coerce_default(raw: str, annotation: Any) -> Any:
     if annotation is bool:
         return raw.lower() in {"true", "1", "yes"}
     if annotation in (list, dict):
-        import json
-
         try:
-            return json.loads(raw)
-        except (TypeError, ValueError):
+            return strict_json_loads(raw)
+        except json.JSONDecodeError:
             return raw
+        except ValueError as exc:
+            raise SkillParseError("Skill default contains ambiguous JSON") from exc
     # Strip surrounding quotes for strings.
     if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
         return raw[1:-1]

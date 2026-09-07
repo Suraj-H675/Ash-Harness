@@ -105,6 +105,53 @@ def test_parse_markdown_skill_full(tmp_path: Path) -> None:
     assert "async def execute" in skill.code
 
 
+def test_parse_markdown_skill_rejects_duplicate_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate.md"
+    path.write_text(
+        textwrap.dedent(
+            """\
+            ---
+            name: safe_name
+            name: override_name
+            description: demo
+            ---
+            ## Code
+            ```python
+            async def execute(context):
+                return "ok"
+            ```
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillParseError, match="Duplicate markdown skill metadata"):
+        parse_markdown_skill(path)
+
+
+def test_parse_markdown_skill_rejects_duplicate_arguments(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-args.md"
+    path.write_text(
+        textwrap.dedent(
+            """\
+            # duplicate_args
+            ## Args
+            - `value`: str = "first" - first declaration
+            - `value`: str = "second" - second declaration
+            ## Code
+            ```python
+            async def execute(context, value="first"):
+                return value
+            ```
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillParseError, match="Duplicate markdown skill argument"):
+        parse_markdown_skill(path)
+
+
 def test_parse_markdown_skill_falls_back_to_h1(tmp_path: Path) -> None:
     md = textwrap.dedent(
         """\
@@ -168,6 +215,27 @@ def test_parse_python_skill_falls_back_to_filename(tmp_path: Path) -> None:
     assert skill.description == "Python skill"
 
 
+def test_parse_python_skill_rejects_duplicate_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate.py"
+    path.write_text(
+        textwrap.dedent(
+            """\
+            \"\"\"
+            name: safe_name
+            name: override_name
+            description: demo
+            \"\"\"
+            async def execute(context):
+                return \"ok\"
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillParseError, match="Duplicate Python skill metadata"):
+        parse_python_skill(path)
+
+
 def test_parse_python_skill_raises_without_execute(tmp_path: Path) -> None:
     path = tmp_path / "no_execute.py"
     path.write_text("x = 1\n", encoding="utf-8")
@@ -207,6 +275,28 @@ def test_compile_markdown_skill_executes(tmp_path: Path) -> None:
     result = asyncio.run(tool.run(prefix="hello"))
     assert result.success is True
     assert result.output == "hello: via-skill"
+
+
+def test_compile_markdown_skill_rejects_ambiguous_json_default(tmp_path: Path) -> None:
+    path = tmp_path / "ambiguous-default.md"
+    path.write_text(
+        textwrap.dedent(
+            """\
+            # ambiguous_default
+            ## Args
+            - `items`: list = [{"x":1,"x":2}] - ambiguous default
+            ## Code
+            ```python
+            async def execute(context, items=None):
+                return str(items)
+            ```
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillParseError, match="ambiguous JSON"):
+        compile_skill(path, _safety_guard(tmp_path), allow_unsafe_code=True)
 
 
 def test_compile_markdown_skill_invokes_run_command_via_context(tmp_path: Path) -> None:

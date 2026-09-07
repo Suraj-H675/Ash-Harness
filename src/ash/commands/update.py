@@ -13,6 +13,7 @@ from packaging.version import InvalidVersion, Version
 
 from ash.install import pipx_install_command
 from ash.installer import InstallError, InstallResult, install as install_ash
+from ash.safe_io import strict_json_loads
 
 
 LATEST_RELEASE_API = (
@@ -61,10 +62,10 @@ def check_for_update(
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ValueError("GitHub release response exceeded 1 MB")
     try:
-        payload = json.loads(raw)
+        payload = strict_json_loads(raw)
         tag = payload["tag_name"]
         release_url = payload["html_url"]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+    except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
         raise ValueError("GitHub returned an invalid release response") from exc
     if not isinstance(tag, str) or not isinstance(release_url, str):
         raise ValueError("GitHub returned an invalid release response")

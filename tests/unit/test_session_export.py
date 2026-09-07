@@ -4,6 +4,24 @@ from datetime import datetime, timezone
 from ash.core.session import Message, SessionStore
 
 
+def test_session_jsonl_import_rejects_duplicate_fields(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    content = (
+        '{"schema_version":2,"schema_version":1,"type":"session",'
+        '"title":"Imported","model":"provider/model"}\n'
+        '{"schema_version":1,"type":"message","role":"user",'
+        '"role":"assistant","content":"ambiguous",'
+        '"timestamp":"2026-01-01T00:00:00+00:00","metadata":{}}\n'
+    )
+
+    try:
+        store.import_session_jsonl(content, project_path=str(tmp_path / "new"))
+    except ValueError as exc:
+        assert "duplicate JSON object key" in str(exc)
+    else:
+        raise AssertionError("duplicate JSONL fields must be rejected")
+
+
 def test_fork_and_redacted_exports(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     source = store.create_session(str(tmp_path), model="provider/model")

@@ -233,6 +233,12 @@ class TestAtomicWrite:
         with pytest.raises(ValueError, match="cannot load config migration state"):
             cli_config.is_config_migration_recorded(source)
 
+        cli_config.migration_state_path().write_text(
+            '{"version":2,"version":1,"migrations":{}}', encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="duplicate JSON object key"):
+            cli_config.is_config_migration_recorded(source)
+
     def test_save_env_values_commits_related_settings_together(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -473,6 +479,16 @@ def test_json_schema_loader_rejects_oversized_files(tmp_path: Path) -> None:
     schema.write_bytes(b" " * (MAX_JSON_SCHEMA_BYTES + 1))
 
     with pytest.raises(ValueError, match="JSON Schema file exceeds"):
+        _load_json_schema(schema)
+
+
+def test_json_schema_loader_rejects_duplicate_fields(tmp_path: Path) -> None:
+    from ash.cli import _load_json_schema
+
+    schema = tmp_path / "schema.json"
+    schema.write_text('{"type":"string","type":"object"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
         _load_json_schema(schema)
 
 

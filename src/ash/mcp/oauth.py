@@ -750,8 +750,8 @@ async def _bounded_json_response(
                 raise MCPOAuthError(f"{label} response exceeded 1 MB")
             chunks.append(chunk)
         try:
-            payload = json.loads(b"".join(chunks))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            payload = strict_json_loads(b"".join(chunks))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise MCPOAuthError(f"{label} returned invalid JSON") from exc
         if not isinstance(payload, dict):
             raise MCPOAuthError(f"{label} returned a non-object response")

@@ -126,6 +126,17 @@ def test_instruction_skill_discovery_rejects_invalid_content(
     assert message in catalog.errors[str(path)]
 
 
+def test_instruction_skill_rejects_duplicate_frontmatter_keys(tmp_path: Path) -> None:
+    path = _write_skill(
+        tmp_path,
+        "review",
+        extra_frontmatter="description: overridden\n",
+    )
+
+    with pytest.raises(ValueError, match="duplicate mapping key 'description'"):
+        parse_instruction_skill(path)
+
+
 def test_instruction_skill_parses_standard_optional_metadata(tmp_path) -> None:
     path = _write_skill(
         tmp_path,

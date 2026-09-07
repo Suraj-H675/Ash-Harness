@@ -16,6 +16,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from ash.safe_io import strict_json_loads
+
 
 Role = Literal["system", "user", "assistant", "tool"]
 AuditAction = Literal[
@@ -2016,9 +2018,11 @@ class SessionStore:
         """Import Ash's versioned JSONL format into the current project."""
         try:
             records = [
-                json.loads(line) for line in content.splitlines() if line.strip()
+                strict_json_loads(line)
+                for line in content.splitlines()
+                if line.strip()
             ]
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"invalid session JSONL: {exc}") from exc
         if not records or not isinstance(records[0], dict):
             raise ValueError("session JSONL is empty")
