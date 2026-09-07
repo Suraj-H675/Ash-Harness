@@ -178,6 +178,33 @@ def test_remote_catalog_fetch_streams_valid_payload_into_cache(
     assert destination.read_bytes() == b'{"keyId":"demo"}'
 
 
+def test_remote_catalog_fetch_rejects_linked_cache_parent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = tmp_path / "linked-cache"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+    destination = linked / "catalog.json"
+    monkeypatch.setattr(
+        "ash.plugins.catalog.catalog_cache_path", lambda url: destination
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'{"keyId":"demo"}')
+
+    with pytest.raises(PluginCatalogError, match="symlink or junction"):
+        fetch_catalog(
+            "https://plugins.example/catalog.json",
+            transport=httpx.MockTransport(handler),
+        )
+
+    assert not (outside / "catalog.json").exists()
+
+
 def test_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     files = _write_catalog(tmp_path / "catalog.json")
     raw = files["catalog_path"].read_text()
@@ -196,6 +223,36 @@ def test_rejects_duplicate_trusted_key_store_fields(tmp_path: Path) -> None:
 
     with pytest.raises(PluginCatalogError, match="duplicate JSON object key"):
         load_trusted_keys(files["keys_path"])
+
+
+def test_trusted_catalog_keys_reject_linked_state_parent(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    try:
+        (home / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+    _, public_key, key_id = generate_catalog_signing_key()
+    (outside / "catalog-keys.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "keys": [
+                    {
+                        "keyId": key_id,
+                        "algorithm": "ed25519",
+                        "publicKey": public_key,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PluginCatalogError, match="symlink or junction"):
+        load_trusted_keys(home / ".ash" / "catalog-keys.json")
 
 
 def test_git_install_verifies_catalog_revision(tmp_path: Path) -> None:

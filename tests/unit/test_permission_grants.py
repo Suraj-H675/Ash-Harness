@@ -196,6 +196,27 @@ def test_permission_rule_file_rejects_oversized_payload(
         load_permission_rules(workspace)
 
 
+def test_permission_rule_file_rejects_symlinked_user_state_root(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    try:
+        (home / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+    monkeypatch.setenv("HOME", str(home))
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    with pytest.raises(PermissionGrantError, match="symlink or junction"):
+        set_tool_grant(workspace, "run_command", True)
+
+    assert not (outside / "permission-grants.json").exists()
+
+
 def test_exact_scope_never_silently_drops_large_non_content_arguments() -> None:
     with pytest.raises(PermissionGrantError, match="exceeds 8 KiB"):
         build_exact_scope_matchers(

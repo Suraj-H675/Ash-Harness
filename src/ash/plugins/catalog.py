@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
-from ash.safe_io import read_bounded_bytes, strict_json_loads
+from ash.safe_io import read_bounded_bytes, strict_json_loads, validate_unlinked_path
 
 CATALOG_VERSION = 1
 MAX_CATALOG_BYTES = 256 * 1024
@@ -74,6 +74,22 @@ def fetch_catalog(
     if not 1.0 <= timeout_seconds <= 60.0:
         raise PluginCatalogError("catalog fetch timeout must be 1 to 60 seconds")
     destination = catalog_cache_path(url)
+    home = Path.home()
+    try:
+        destination.relative_to(home)
+        trusted_root = home
+    except ValueError:
+        # Internal/test overrides may place the cache outside HOME. Keep the
+        # immediate cache parent below the validation root so it is inspected.
+        trusted_root = destination.parent.parent
+    try:
+        destination = validate_unlinked_path(
+            destination,
+            trusted_root=trusted_root,
+            label="plugin catalog cache",
+        )
+    except ValueError as exc:
+        raise PluginCatalogError(str(exc)) from exc
     try:
         with httpx.Client(
             transport=transport,
@@ -109,6 +125,14 @@ def fetch_catalog(
         # Do not cache malformed or unsigned payloads.
         raise PluginCatalogError("invalid signed plugin catalog response") from None
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        validate_unlinked_path(
+            destination,
+            trusted_root=trusted_root,
+            label="plugin catalog cache",
+        )
+    except ValueError as exc:
+        raise PluginCatalogError(str(exc)) from exc
     if os.name != "nt":
         destination.parent.chmod(0o700)
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
@@ -142,6 +166,21 @@ class SignedCatalog:
 
 
 def load_trusted_keys(path: Path) -> dict[str, bytes]:
+    candidate = path.expanduser()
+    home = Path.home()
+    try:
+        candidate.relative_to(home)
+        trusted_root = home
+    except ValueError:
+        trusted_root = candidate.parent.parent
+    try:
+        path = validate_unlinked_path(
+            candidate,
+            trusted_root=trusted_root,
+            label="trusted catalog keys",
+        )
+    except ValueError as exc:
+        raise PluginCatalogError(str(exc)) from exc
     try:
         raw = read_bounded_bytes(path, 64 * 1024, label="trusted catalog keys")
     except (OSError, ValueError) as exc:

@@ -73,6 +73,27 @@ class TestAtomicWrite:
         tmp_files = list((tmp_path / ".ash").glob("*.tmp"))
         assert tmp_files == []
 
+    def test_save_env_value_rejects_symlinked_state_directory(
+        self, tmp_path: Path
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        linked = tmp_path / ".ash"
+        try:
+            linked.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlinks are unavailable: {exc}")
+        cli_config.ASH_DIR = linked
+        cli_config.ENV_FILE = linked / ".env"
+        cli_config.CONFIG_FILE = linked / "ash.toml"
+
+        with pytest.raises(ValueError, match="symlink or junction"):
+            cli_config.save_env_value("ASH_REPRO", "secret")
+
+        assert not (outside / ".env").exists()
+
     def test_save_env_value_sets_os_environ(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

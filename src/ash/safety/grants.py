@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ash.safety.trust import canonical_workspace
-from ash.safe_io import read_bounded_bytes
+from ash.safe_io import read_bounded_bytes, validate_unlinked_path
 
 
 CURRENT_PERMISSION_RULE_VERSION = 2
@@ -539,6 +539,18 @@ def grants_path() -> Path:
     return Path.home() / ".ash" / "permission-grants.json"
 
 
+def _validated_grants_path() -> Path:
+    path = grants_path()
+    try:
+        return validate_unlinked_path(
+            path,
+            trusted_root=path.parent.parent,
+            label="permission rule state",
+        )
+    except ValueError as exc:
+        raise PermissionGrantError(str(exc)) from exc
+
+
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -549,6 +561,14 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _read_payload(path: Path) -> dict[str, Any]:
+    try:
+        validate_unlinked_path(
+            path,
+            trusted_root=path.parent.parent,
+            label="permission rule state",
+        )
+    except ValueError as exc:
+        raise PermissionGrantError(str(exc)) from exc
     if not path.exists():
         return {"version": CURRENT_PERMISSION_RULE_VERSION, "workspaces": {}}
     try:
@@ -750,8 +770,9 @@ def _update_rules(
     workspace: Path,
     update: Callable[[list[PermissionRule]], list[PermissionRule]],
 ) -> list[PermissionRule]:
-    path = grants_path()
+    path = _validated_grants_path()
     with _locked_rule_file(path):
+        path = _validated_grants_path()
         workspaces = _normalized_workspaces(_read_payload(path))
         key = canonical_workspace(workspace)
         rules = update(list(workspaces.get(key, ())))
@@ -759,6 +780,7 @@ def _update_rules(
             workspaces[key] = rules
         else:
             workspaces.pop(key, None)
+        path = _validated_grants_path()
         _write_workspaces(path, workspaces)
     return rules
 

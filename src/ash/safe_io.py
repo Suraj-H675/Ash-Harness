@@ -32,6 +32,27 @@ def strict_json_loads(value: str | bytes | bytearray) -> Any:
     )
 
 
+def validate_unlinked_path(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+) -> Path:
+    """Return one lexical path after rejecting link components below a trusted root."""
+
+    root = Path(trusted_root).expanduser()
+    root = Path(os.path.abspath(root))
+    target = lexical_target_path(path, root)
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"refusing to use {label} outside trusted root: {target}") from exc
+    link = path_has_link_component(target, root)
+    if link is not None:
+        raise ValueError(f"refusing to use {label} through a symlink or junction: {link}")
+    return target
+
+
 def read_bounded_bytes(
     path: str | Path,
     max_bytes: int,

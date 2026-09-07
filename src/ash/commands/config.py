@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from ash.profiles import active_profile_name, profile_directory
-from ash.safe_io import read_bounded_bytes, strict_json_loads
+from ash.safe_io import read_bounded_bytes, strict_json_loads, validate_unlinked_path
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +69,17 @@ def _paths() -> tuple[Path, Path, Path]:
 def ensure_ash_dir() -> Path:
     """Create ~/.ash/ directory if it does not exist. Returns the path."""
     ash_dir, _, _ = _paths()
+    validate_unlinked_path(
+        ash_dir,
+        trusted_root=ash_dir.parent,
+        label="Ash state directory",
+    )
     ash_dir.mkdir(parents=True, exist_ok=True)
+    validate_unlinked_path(
+        ash_dir,
+        trusted_root=ash_dir.parent,
+        label="Ash state directory",
+    )
     return ash_dir
 
 
