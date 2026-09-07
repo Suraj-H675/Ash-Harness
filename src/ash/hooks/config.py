@@ -23,6 +23,8 @@ from ash.hooks.registry import (
     PreToolUseHook,
     SessionStartHook,
 )
+from ash.safe_io import read_bounded_bytes
+from ash.safety.path_scope import lexical_target_path, path_has_link_component
 from ash.sandbox.process_utils import (
     communicate_process,
     process_group_options,
@@ -52,6 +54,7 @@ class HookConfigSource:
     path: Path
     cwd: Path | None = None
     environment: tuple[tuple[str, str], ...] = ()
+    trusted_root: Path | None = None
 
 
 def load_command_hooks(
@@ -63,10 +66,30 @@ def load_command_hooks(
         path = source.path
         if not path.is_file():
             continue
-        with path.open("rb") as handle:
-            raw = handle.read(MAX_HOOK_CONFIG_BYTES + 1)
-        if len(raw) > MAX_HOOK_CONFIG_BYTES:
-            raise ValueError(f"Hook config exceeds 1 MiB: {path}")
+        if source.trusted_root is not None:
+            trusted_root = source.trusted_root.expanduser().resolve()
+            lexical = lexical_target_path(path, trusted_root)
+            try:
+                lexical.relative_to(trusted_root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"hook config is outside its trusted root: {path}"
+                ) from exc
+            link = path_has_link_component(lexical, trusted_root)
+            if link is not None:
+                raise ValueError(
+                    f"hook config path contains a symlink or junction: {link}"
+                )
+        try:
+            raw = read_bounded_bytes(
+                path,
+                MAX_HOOK_CONFIG_BYTES,
+                label="hook config",
+            )
+        except ValueError as exc:
+            if "exceeds" in str(exc):
+                raise ValueError(f"Hook config exceeds 1 MiB: {path}") from exc
+            raise
         payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError(f"Hook config must be an object: {path}")

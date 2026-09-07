@@ -578,6 +578,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 Path.home() / ".ash" / "hooks.json",
                 cwd=loop.project_root,
                 environment=project_hook_environment,
+                trusted_root=Path.home(),
             )
         ]
         if trusted:
@@ -586,6 +587,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     loop.project_root / ".ash" / "hooks.json",
                     cwd=loop.project_root,
                     environment=project_hook_environment,
+                    trusted_root=loop.project_root,
                 )
             )
         hook_sources.extend(
@@ -593,6 +595,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 path,
                 cwd=plugin.root,
                 environment=(("ASH_PLUGIN_ROOT", str(plugin.root)),),
+                trusted_root=plugin.root,
             )
             for plugin in plugins
             for path in plugin.hook_paths()
@@ -2696,12 +2699,16 @@ def main(argv: list[str] | None = None) -> int:
         if not confirmed:
             print("Reset cancelled.", file=sys.stderr)
             return 2
-        removed = reset_local_state(
-            config=args.config or args.all,
-            sessions=args.sessions or args.all,
-            cache=args.cache or args.all,
-            confirmed=True,
-        )
+        try:
+            removed = reset_local_state(
+                config=args.config or args.all,
+                sessions=args.sessions or args.all,
+                cache=args.cache or args.all,
+                confirmed=True,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
         print(f"Removed {len(removed)} path(s).")
         return 0
 

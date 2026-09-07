@@ -667,6 +667,7 @@ def _validate_plugin_contents(root: Path, manifest: PluginManifest) -> None:
                     path,
                     cwd=root,
                     environment=(("ASH_PLUGIN_ROOT", str(root)),),
+                    trusted_root=root,
                 )
                 for path in plugin.hook_paths()
             ]

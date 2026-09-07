@@ -135,3 +135,41 @@ def test_hook_config_rejects_oversized_file(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="exceeds 1 MiB"):
         load_command_hooks([config])
+
+
+def test_hook_config_rejects_symlinked_file(tmp_path) -> None:
+    outside = tmp_path / "outside-hooks.json"
+    outside.write_text(json.dumps({"session_start": []}), encoding="utf-8")
+    config = tmp_path / "hooks.json"
+    try:
+        config.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="symlinked hook config"):
+        load_command_hooks([config])
+
+
+def test_hook_config_rejects_symlinked_parent_inside_trusted_root(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside.joinpath("hooks.json").write_text(
+        json.dumps({"session_start": []}),
+        encoding="utf-8",
+    )
+    try:
+        workspace.joinpath(".ash").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="contains a symlink or junction"):
+        load_command_hooks(
+            [
+                HookConfigSource(
+                    workspace / ".ash" / "hooks.json",
+                    trusted_root=workspace,
+                )
+            ]
+        )

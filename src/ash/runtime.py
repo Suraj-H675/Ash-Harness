@@ -409,6 +409,7 @@ def build_runtime(
             Path.home() / ".ash" / "hooks.json",
             cwd=config.workspace_root,
             environment=project_hook_environment,
+            trusted_root=Path.home(),
         )
     ]
     if trusted:
@@ -417,6 +418,7 @@ def build_runtime(
                 config.workspace_root / ".ash" / "hooks.json",
                 cwd=config.workspace_root,
                 environment=project_hook_environment,
+                trusted_root=config.workspace_root,
             )
         )
     hook_sources.extend(
@@ -424,6 +426,7 @@ def build_runtime(
             path=path,
             cwd=plugin.root,
             environment=(("ASH_PLUGIN_ROOT", str(plugin.root)),),
+            trusted_root=plugin.root,
         )
         for plugin in plugins
         for path in plugin.hook_paths()
