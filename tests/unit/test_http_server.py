@@ -5,7 +5,12 @@ import pytest
 
 from ash.sdk import AshEvent, AshEventRecord, AshResult
 from ash.core.session import SessionLineage
-from ash.server.http import MAX_HTTP_BODY_BYTES, create_app
+from ash.server.http import (
+    MAX_HTTP_BODY_BYTES,
+    MAX_HTTP_RATE_LIMIT_KEYS,
+    SlidingWindowLimiter,
+    create_app,
+)
 
 
 class FakeClient:
@@ -471,6 +476,25 @@ async def test_http_server_rate_limits_authenticated_requests() -> None:
     ) as http:
         assert (await http.get("/v1/sessions", headers=headers)).status_code == 200
         assert (await http.get("/v1/sessions", headers=headers)).status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_http_rate_limiter_bounds_client_buckets_and_reclaims_stale_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    monkeypatch.setattr("ash.server.http.time.monotonic", lambda: now)
+    limiter = SlidingWindowLimiter(1)
+
+    for index in range(MAX_HTTP_RATE_LIMIT_KEYS):
+        assert await limiter.allow(f"client-{index}") is True
+
+    assert await limiter.allow("overflow") is False
+    assert len(limiter._requests) == MAX_HTTP_RATE_LIMIT_KEYS
+
+    now = 61.0
+    assert await limiter.allow("replacement") is True
+    assert list(limiter._requests) == ["replacement"]
 
 
 @pytest.mark.asyncio

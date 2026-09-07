@@ -39,6 +39,9 @@ class ForkSessionRequest(BaseModel):
     branch_summary: str = Field(default="", max_length=12_000)
 
 
+MAX_HTTP_RATE_LIMIT_KEYS = 10_000
+
+
 class SlidingWindowLimiter:
     def __init__(self, requests_per_minute: int) -> None:
         if requests_per_minute < 1:
@@ -50,6 +53,19 @@ class SlidingWindowLimiter:
     async def allow(self, key: str) -> bool:
         now = time.monotonic()
         async with self._lock:
+            if (
+                key not in self._requests
+                and len(self._requests) >= MAX_HTTP_RATE_LIMIT_KEYS
+            ):
+                stale = [
+                    item_key
+                    for item_key, values in self._requests.items()
+                    if not values or values[-1] <= now - 60
+                ]
+                for item_key in stale:
+                    self._requests.pop(item_key, None)
+                if len(self._requests) >= MAX_HTTP_RATE_LIMIT_KEYS:
+                    return False
             entries = self._requests[key]
             while entries and entries[0] <= now - 60:
                 entries.popleft()
