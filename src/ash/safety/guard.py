@@ -152,26 +152,164 @@ class SafetyGuard:
         """
 
         scan_values = self._command_scan_values(command_str)
-        if self.blocklist_commands == list(self.default_blocklist()):
+        default_patterns_enabled = self._default_patterns_enabled()
+        if default_patterns_enabled:
+            ambiguous_pattern = self._ambiguous_destructive_posix_pattern(command_str)
+            if ambiguous_pattern is not None:
+                raise SafetyViolation(f"Blocked command pattern: {ambiguous_pattern}")
             for pattern, regex in self._DEFAULT_BLOCKLIST_PATTERNS:
                 if any(regex.search(value) for value in scan_values):
                     reason = f"Blocked command pattern: {pattern}"
                     raise SafetyViolation(reason)
-        else:
-            for pattern in self.blocklist_commands:
-                normalized_pattern = self._normalize_command(pattern)
-                if any(
-                    normalized_pattern in self._normalize_command(value)
-                    for value in scan_values
-                ):
-                    reason = f"Blocked command pattern: {pattern}"
-                    raise SafetyViolation(reason)
+
+        default_patterns = {
+            self._normalize_command(pattern) for pattern in self.default_blocklist()
+        }
+        for pattern in self.blocklist_commands:
+            normalized_pattern = self._normalize_command(pattern)
+            if default_patterns_enabled and normalized_pattern in default_patterns:
+                continue
+            if any(
+                normalized_pattern in self._normalize_command(value)
+                for value in scan_values
+            ):
+                reason = f"Blocked command pattern: {pattern}"
+                raise SafetyViolation(reason)
 
         return True, ""
 
     @staticmethod
     def _normalize_command(command_str: str) -> str:
         return " ".join(command_str.casefold().split())
+
+    def _default_patterns_enabled(self) -> bool:
+        configured = {
+            self._normalize_command(pattern) for pattern in self.blocklist_commands
+        }
+        defaults = {
+            self._normalize_command(pattern) for pattern in self.default_blocklist()
+        }
+        return defaults.issubset(configured)
+
+    @staticmethod
+    def _posix_command_segments(command_str: str) -> tuple[tuple[str, ...], ...]:
+        if os.name == "nt":
+            return ()
+        try:
+            lexer = shlex.shlex(
+                command_str,
+                posix=True,
+                punctuation_chars=";&|<>\n",
+            )
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
+        except ValueError:
+            return ()
+
+        punctuation = frozenset(";&|<>\n")
+        segments: list[tuple[str, ...]] = []
+        current: list[str] = []
+        for token in tokens:
+            if token and set(token) <= punctuation:
+                if current:
+                    segments.append(tuple(current))
+                    current = []
+                continue
+            current.append(token)
+        if current:
+            segments.append(tuple(current))
+        return tuple(segments)
+
+    @staticmethod
+    def _has_shell_expansion(token: str) -> bool:
+        return "$" in token or "`" in token
+
+    @classmethod
+    def _ambiguous_destructive_posix_pattern(cls, command_str: str) -> str | None:
+        """Fail closed when shell expansion can hide a protected absolute target."""
+
+        for segment in cls._posix_command_segments(command_str):
+            for index, token in enumerate(segment):
+                command = token.rsplit("/", 1)[-1].casefold()
+                arguments = segment[index + 1 :]
+                if command == "rm" and cls._ambiguous_recursive_rm(arguments):
+                    return "rm -rf /"
+                if command == "chmod" and cls._ambiguous_recursive_chmod(arguments):
+                    return "chmod -R 777 /"
+        return None
+
+    @classmethod
+    def _ambiguous_recursive_rm(cls, arguments: tuple[str, ...]) -> bool:
+        recursive = False
+        force = False
+        ambiguous_options = False
+        targets: list[str] = []
+        parse_options = True
+        for token in arguments:
+            if parse_options and token == "--":
+                parse_options = False
+                continue
+            if parse_options and token.startswith("--"):
+                option = token.split("=", 1)[0].casefold()
+                recursive = recursive or option == "--recursive"
+                force = force or option == "--force"
+                continue
+            if parse_options and token.startswith("-") and token != "-":
+                option = token[1:].casefold()
+                recursive = recursive or "r" in option
+                force = force or "f" in option
+                continue
+            if parse_options and cls._has_shell_expansion(token):
+                ambiguous_options = True
+            targets.append(token)
+        protected_target = "/" in targets
+        ambiguous_target = any(cls._has_shell_expansion(t) for t in targets)
+        return (recursive and force and (protected_target or ambiguous_target)) or (
+            protected_target and ambiguous_options
+        )
+
+    @classmethod
+    def _ambiguous_recursive_chmod(cls, arguments: tuple[str, ...]) -> bool:
+        recursive = False
+        mode_777 = False
+        mode_seen = False
+        ambiguous_mode = False
+        ambiguous_recursive = False
+        targets: list[str] = []
+        parse_options = True
+        for token in arguments:
+            if parse_options and token == "--":
+                parse_options = False
+                continue
+            if parse_options and token.startswith("--"):
+                recursive = recursive or token.split("=", 1)[0].casefold() == "--recursive"
+                continue
+            if parse_options and token.startswith("-") and token != "-":
+                recursive = recursive or "r" in token[1:].casefold()
+                continue
+            if not mode_seen and cls._has_shell_expansion(token):
+                ambiguous_mode = True
+                if parse_options:
+                    ambiguous_recursive = True
+                continue
+            if not mode_seen and token != "/":
+                mode_seen = True
+                mode_777 = token in {"777", "0777"}
+                continue
+            targets.append(token)
+        protected_target = "/" in targets
+        ambiguous_target = any(cls._has_shell_expansion(target) for target in targets)
+        return (
+            recursive and mode_777 and (protected_target or ambiguous_target)
+        ) or (
+            protected_target
+            and (
+                (recursive and ambiguous_mode)
+                or (mode_777 and ambiguous_recursive)
+                or (ambiguous_mode and ambiguous_recursive)
+            )
+        )
 
     @staticmethod
     def _command_scan_values(command_str: str) -> tuple[str, ...]:

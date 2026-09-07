@@ -358,9 +358,12 @@ def build_runtime(
         if managed_rules is None
         else managed_rules
     )
+    runtime_blocklist = list(
+        dict.fromkeys((*SafetyGuard.default_blocklist(), *config.command_blocklist))
+    )
     guard = SafetyGuard(
         config.workspace_root,
-        blocklist_commands=config.command_blocklist,
+        blocklist_commands=runtime_blocklist,
     )
     active_provider = provider or get_provider_registry().build(config)
     plugins = discover_active_plugins(config.workspace_root, include_project=trusted)
