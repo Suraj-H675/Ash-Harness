@@ -20,7 +20,13 @@ from ash.mcp.client import (
 )
 from ash.mcp import client as mcp_client_module
 from ash.mcp.oauth import MCPOAuthSession
-from ash.mcp.runtime import MCPRuntime, MCPTool, _extract_mcp_header_annotations
+from ash.mcp.runtime import (
+    CURRENT_SCHEMA_DIALECT,
+    MCPRuntime,
+    MCPTool,
+    _extract_mcp_header_annotations,
+    _validate_schema_instance,
+)
 from ash.mcp.server import (
     MCPServerConfig,
     MCPServerInstance,
@@ -756,6 +762,35 @@ async def test_mcp_schema_regex_cannot_block_runtime_or_reach_server(
     assert result.error is not None
     assert "deadline" in result.error or "resource limit" in result.error
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_schema_worker_ignores_workspace_shadow_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    package = workspace / "ash" / "mcp"
+    package.mkdir(parents=True)
+    (workspace / "ash" / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    marker = workspace / "shadow-executed.txt"
+    (package / "schema_worker.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+        "print('{\"valid\": true}')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(workspace)
+
+    result = await _validate_schema_instance(
+        {"type": "object", "properties": {"name": {"type": "string"}}},
+        {"name": "ash"},
+        default_dialect=CURRENT_SCHEMA_DIALECT,
+    )
+
+    assert result["valid"] is True
+    assert not marker.exists()
 
 
 @pytest.mark.asyncio

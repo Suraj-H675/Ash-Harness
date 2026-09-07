@@ -410,15 +410,29 @@ def test_browser_doctor_distinguishes_missing_extra_and_binary(
     monkeypatch.setattr(
         "ash.commands.doctor.importlib.util.find_spec", lambda name: object()
     )
-    monkeypatch.setattr(
-        "ash.commands.doctor.subprocess.run",
-        lambda *args, **kwargs: type(
-            "Completed", (), {"returncode": 0, "stdout": "", "stderr": ""}
-        )(),
-    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("ash.commands.doctor.subprocess.run", fake_run)
     missing_binary = _check_browser()
     assert missing_binary.status == "warn"
     assert "setup browser" in missing_binary.remedy
+    from ash.commands import doctor
+
+    assert calls == [
+        (
+            [doctor.sys.executable, "-I", "-m", "playwright", "install", "--list"],
+            {
+                "check": False,
+                "capture_output": True,
+                "text": True,
+                "timeout": 15,
+            },
+        )
+    ]
 
 
 def test_a2a_doctor_reports_unset_remote_credentials(

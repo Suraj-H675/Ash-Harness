@@ -808,7 +808,14 @@ class TestBrowserSetup:
         from ash.commands import setup
 
         setup.subprocess.run.assert_called_once_with(
-            [setup.sys.executable, "-m", "playwright", "install", "chromium"],
+            [
+                setup.sys.executable,
+                "-I",
+                "-m",
+                "playwright",
+                "install",
+                "chromium",
+            ],
             check=False,
             timeout=setup.BROWSER_INSTALL_TIMEOUT_SECONDS,
         )

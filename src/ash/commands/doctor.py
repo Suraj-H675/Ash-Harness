@@ -100,7 +100,7 @@ def _check_browser() -> DoctorCheck:
         )
     try:
         completed = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "--list"],
+            [sys.executable, "-I", "-m", "playwright", "install", "--list"],
             check=False,
             capture_output=True,
             text=True,

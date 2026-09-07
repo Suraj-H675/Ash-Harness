@@ -371,6 +371,7 @@ async def _validate_schema_instance(
     try:
         process = await asyncio.create_subprocess_exec(
             sys.executable,
+            "-I",
             "-m",
             "ash.mcp.schema_worker",
             stdin=asyncio.subprocess.PIPE,

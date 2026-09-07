@@ -586,7 +586,7 @@ def setup_browser() -> SetupOutcome:
         return SetupOutcome.CANCELLED
     try:
         completed = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
+            [sys.executable, "-I", "-m", "playwright", "install", "chromium"],
             check=False,
             timeout=BROWSER_INSTALL_TIMEOUT_SECONDS,
         )
@@ -621,7 +621,7 @@ def _browser_is_installed() -> bool:
         return False
     try:
         completed = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "--list"],
+            [sys.executable, "-I", "-m", "playwright", "install", "--list"],
             check=False,
             capture_output=True,
             text=True,

@@ -231,6 +231,7 @@ class SubprocessAgent:
 
         cmd: list[str] = [
             python_executable or sys.executable,
+            "-I",
             "-m",
             "ash.agents._agent_driver",
             "--agent-id",

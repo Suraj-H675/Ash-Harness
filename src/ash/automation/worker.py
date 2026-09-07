@@ -90,6 +90,7 @@ class _SubprocessAutomationClient:
         environment[INHERIT_PROCESS_GROUP_ENV] = "1"
         process = await asyncio.create_subprocess_exec(
             sys.executable,
+            "-I",
             "-m",
             "ash.automation.runner",
             cwd=self._workspace,
@@ -635,6 +636,7 @@ class AutomationWorkerService:
         }
         process = await asyncio.create_subprocess_exec(
             sys.executable,
+            "-I",
             "-m",
             "ash.automation.maintenance",
             stdin=asyncio.subprocess.PIPE,

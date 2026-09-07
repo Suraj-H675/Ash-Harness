@@ -119,6 +119,91 @@ def test_automation_runner_rejects_oversized_protocol_input(
     assert "automation request exceeds" in capsys.readouterr().out
 
 
+@pytest.mark.asyncio
+async def test_automation_subprocess_runner_uses_isolated_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.automation.worker import _SubprocessAutomationClient
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    captured: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+    async def fake_spawn(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return Process()
+
+    async def fake_communicate(*args, **kwargs):
+        del args, kwargs
+        return (
+            b'ASH_AUTOMATION_RESULT={"ok":true,"result":{"response":"ok",'
+            b'"session_id":"session","model":"fake/model","context_tokens":1}}\n',
+            b"",
+        )
+
+    monkeypatch.setattr(
+        "ash.automation.worker.asyncio.create_subprocess_exec", fake_spawn
+    )
+    monkeypatch.setattr("ash.automation.worker.communicate_process", fake_communicate)
+    client = _SubprocessAutomationClient(
+        AshConfig(workspace_root=workspace),
+        workspace,
+    )
+
+    result = await client.prompt("run")
+
+    assert result.response == "ok"
+    assert captured["args"][:4] == (
+        sys.executable,
+        "-I",
+        "-m",
+        "ash.automation.runner",
+    )
+
+
+@pytest.mark.asyncio
+async def test_automation_maintenance_uses_isolated_python(
+    tmp_path: Path,
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    captured: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+    async def fake_spawn(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return Process()
+
+    async def fake_communicate(*args, **kwargs):
+        del args, kwargs
+        return b"ASH_AUTOMATION_MAINTENANCE_OK\n", b""
+
+    monkeypatch.setattr(
+        "ash.automation.worker.asyncio.create_subprocess_exec", fake_spawn
+    )
+    monkeypatch.setattr("ash.automation.worker.communicate_process", fake_communicate)
+    worker = AutomationWorkerService(store, workspace)
+
+    await worker._run_maintenance()
+
+    assert captured["args"][:4] == (
+        sys.executable,
+        "-I",
+        "-m",
+        "ash.automation.maintenance",
+    )
+
+
 def test_cron_trigger_handles_spring_forward_and_fall_back() -> None:
     before_transition = datetime(2026, 3, 28, 12, tzinfo=timezone.utc)
     schedule = build_schedule(

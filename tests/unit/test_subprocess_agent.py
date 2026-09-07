@@ -70,6 +70,7 @@ def test_spawn_subprocess_does_not_inherit_provider_secrets(
     agent.spawn_subprocess()
 
     environment = captured["env"]
+    assert captured["command"][1:4] == ["-I", "-m", "ash.agents._agent_driver"]
     assert "OPENROUTER_API_KEY" not in environment
     assert "ASH_MODEL" not in environment
     assert environment["ASH_WORKSPACE_ROOT"] == str(workspace)
