@@ -25,7 +25,7 @@ from pydantic_settings.sources.providers.dotenv import (
 )
 
 from ash.provider_catalog import BUILTIN_PROVIDER_IDS
-from ash.profiles import active_profile_name, profile_directory
+from ash.profiles import active_profile_name, profile_directory, profile_exists
 from ash.safe_io import read_bounded_bytes
 
 
@@ -1028,7 +1028,10 @@ class AshConfig(BaseSettings):
             active_profile,
             ash_dir=base_config_directory,
         )
-        if active_profile != "default" and not profile_state_directory.is_dir():
+        if active_profile != "default" and not profile_exists(
+            active_profile,
+            ash_dir=base_config_directory,
+        ):
             raise ValueError(
                 f"Ash profile does not exist: {active_profile!r}; "
                 f"run `ash profile add {active_profile}` first"

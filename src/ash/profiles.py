@@ -128,9 +128,10 @@ def profile_exists(name: str, *, ash_dir: Path | None = None) -> bool:
     """Return whether a profile is usable; the default profile always exists."""
 
     normalized = validate_profile_name(name)
-    return normalized == DEFAULT_PROFILE or profile_directory(
-        normalized, ash_dir=ash_dir
-    ).is_dir()
+    if normalized == DEFAULT_PROFILE:
+        return True
+    directory = profile_directory(normalized, ash_dir=ash_dir)
+    return directory.is_dir() and not directory.is_symlink()
 
 
 __all__ = [

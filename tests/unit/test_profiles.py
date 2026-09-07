@@ -121,3 +121,31 @@ def test_missing_profile_fails_before_loading_default_state(
 
     with pytest.raises(ValueError, match="profile does not exist"):
         AshConfig.load()
+
+
+def test_symlinked_profile_cannot_redirect_config_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    profiles = home / ".ash" / "profiles"
+    outside = tmp_path / "outside-profile"
+    profiles.mkdir(parents=True)
+    outside.mkdir()
+    outside.joinpath(".env").write_text(
+        "ASH_MODEL=ollama/outside-model\n",
+        encoding="utf-8",
+    )
+    try:
+        profiles.joinpath("work").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("ASH_PROFILE", "work")
+    monkeypatch.delenv("ASH_MODEL", raising=False)
+
+    from ash.config import AshConfig
+    from ash.profiles import profile_exists
+
+    assert profile_exists("work") is False
+    with pytest.raises(ValueError, match="profile does not exist"):
+        AshConfig.load()
