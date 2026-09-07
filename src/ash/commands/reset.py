@@ -12,6 +12,8 @@ def reset_local_state(
     if not confirmed:
         raise ValueError("reset requires explicit confirmation")
     root = Path.home() / ".ash"
+    if root.is_symlink() or (hasattr(root, "is_junction") and root.is_junction()):
+        raise ValueError(f"refusing to reset through symlinked Ash state directory: {root}")
     targets: list[Path] = []
     if config:
         targets.extend(

@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
+from ash.cli import main
 from ash.commands.reset import reset_local_state
 from ash.core.session import SessionStore, get_db_connection
 
@@ -30,3 +33,45 @@ def test_session_retention_and_selective_reset(tmp_path, monkeypatch) -> None:
     )
     assert home / ".ash" / ".env" in removed
     assert not (home / ".ash" / ".env").exists()
+
+
+def test_reset_rejects_symlinked_ash_state_directory(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    victim = outside / ".env"
+    victim.write_text("KEEP=value\n", encoding="utf-8")
+    try:
+        (home / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(ValueError, match="symlinked Ash state directory"):
+        reset_local_state(config=True, sessions=False, cache=False, confirmed=True)
+
+    assert victim.read_text(encoding="utf-8") == "KEEP=value\n"
+
+
+def test_reset_cli_reports_symlinked_state_without_traceback(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    victim = outside / ".env"
+    victim.write_text("KEEP=value\n", encoding="utf-8")
+    try:
+        (home / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+    monkeypatch.setenv("HOME", str(home))
+
+    assert main(["reset", "--config", "--yes"]) == 2
+
+    captured = capsys.readouterr()
+    assert "symlinked Ash state directory" in captured.err
+    assert "Traceback" not in captured.err
+    assert victim.read_text(encoding="utf-8") == "KEEP=value\n"
