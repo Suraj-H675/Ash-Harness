@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from ash.json_utils import strict_json_loads
+from ash.safe_io import strict_json_loads
 from ash.providers.identifiers import parse_model_string
 
 if TYPE_CHECKING:

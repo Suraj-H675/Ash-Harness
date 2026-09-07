@@ -8,7 +8,7 @@ from typing import Any, AsyncGenerator
 import httpx
 
 from ash.context.tokens import AnthropicTokenCounter
-from ash.json_utils import strict_json_loads
+from ash.safe_io import strict_json_loads
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import (

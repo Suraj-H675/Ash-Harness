@@ -24,7 +24,7 @@ from urllib.request import parse_http_list, parse_keqv_list
 
 import httpx
 
-from ash.json_utils import strict_json_loads
+from ash.safe_io import strict_json_loads
 
 
 MAX_OAUTH_RESPONSE_BYTES = 1_000_000

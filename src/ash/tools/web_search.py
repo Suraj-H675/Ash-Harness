@@ -16,7 +16,7 @@ import httpx
 from pydantic import BaseModel, Field, field_validator
 
 from ash.core.redaction import redact_text
-from ash.json_utils import strict_json_loads
+from ash.safe_io import strict_json_loads
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.tools.web import _host_allowed, _normalize_allowed_domains

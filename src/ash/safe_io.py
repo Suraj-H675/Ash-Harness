@@ -2,12 +2,34 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 from pathlib import Path
 from typing import Any, TextIO
 
 from ash.safety.path_scope import lexical_target_path, path_has_link_component
+
+
+def strict_json_loads(value: str | bytes | bytearray) -> Any:
+    """Parse JSON while rejecting duplicate object keys and invalid constants."""
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON object key: {key!r}")
+            result[key] = item
+        return result
+
+    def reject_constant(raw: str) -> None:
+        raise ValueError(f"invalid JSON constant: {raw}")
+
+    return json.loads(
+        value,
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
 
 
 def read_bounded_bytes(

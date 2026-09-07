@@ -13,7 +13,7 @@ from packaging.version import InvalidVersion, parse
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
 
-from ash.json_utils import strict_json_loads
+from ash.safe_io import strict_json_loads
 
 
 CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION = 2

@@ -4,7 +4,20 @@ import io
 
 import pytest
 
-from ash.safe_io import read_bounded_text
+from ash.safe_io import read_bounded_text, strict_json_loads
+
+
+def test_strict_json_loads_accepts_standard_json() -> None:
+    assert strict_json_loads(b'{"name":"ash","enabled":true}') == {
+        "name": "ash",
+        "enabled": True,
+    }
+
+
+@pytest.mark.parametrize("payload", ['{"a":1,"a":2}', '{"a":NaN}'])
+def test_strict_json_loads_rejects_ambiguous_or_nonstandard_json(payload: str) -> None:
+    with pytest.raises(ValueError):
+        strict_json_loads(payload)
 
 
 def test_bounded_text_reads_text_streams_and_preserves_utf8() -> None:

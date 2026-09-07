@@ -12,7 +12,7 @@ from pathlib import Path
 from string import Template
 from typing import Any, Callable, cast
 
-from ash.json_utils import strict_json_loads
+from ash.safe_io import strict_json_loads
 from ash.hooks.registry import (
     HookBlock,
     HookCallbackResult,

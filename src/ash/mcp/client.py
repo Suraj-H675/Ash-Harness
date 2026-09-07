@@ -14,7 +14,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-from ash.json_utils import strict_json_loads
+from ash.safe_io import strict_json_loads
 from ash.mcp.server import MCPServerConfig
 from ash.mcp.oauth import (
     MCPAuthorizationRequired,

@@ -14,7 +14,7 @@ from typing import Any
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from jsonschema.exceptions import ValidationError  # type: ignore[import-untyped]
 
-from ash.json_utils import strict_json_loads
+from ash.safe_io import strict_json_loads
 from ash.plugins.manifest import (
     PLUGIN_RUNTIME_PROTOCOL_VERSION,
     PluginToolManifest,

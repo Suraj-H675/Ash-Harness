@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from ash.json_utils import strict_json_loads
+from ash.safe_io import strict_json_loads
 from ash.safety.environment import build_scrubbed_environment
 from ash.safe_io import read_bounded_bytes
 from ash.mcp.oauth import MCPOAuthError, canonical_resource_uri

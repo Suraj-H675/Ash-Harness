@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from ash.json_utils import strict_json_loads
+from ash.safe_io import strict_json_loads
 from ash.plugins.manifest import PLUGIN_NAME, PluginManifest
 from ash.plugins.catalog import CatalogEntry, PluginCatalogError
 from ash.plugins.registry import (
