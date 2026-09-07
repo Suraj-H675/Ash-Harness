@@ -34,6 +34,7 @@ from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markdown import Markdown
 
+from ash.ui.terminal import terminal_safe_text
 from ash.ui.transcript import Transcript, TranscriptEntry, TranscriptEvent
 from ash.ui.theme import Theme, get_theme, viewport_styles
 
@@ -57,10 +58,10 @@ def format_transcript(entries: tuple[TranscriptEntry, ...]) -> AnyFormattedText:
         if index:
             fragments.append(("", "\n\n"))
         style, default_title = _ENTRY_STYLE[entry.kind]
-        title = entry.title or default_title
+        title = terminal_safe_text(entry.title or default_title)
         fragments.append((style, f"{title} > "))
         body_style = "class:reasoning" if entry.kind == "reasoning" else ""
-        fragments.append((body_style, entry.content or " "))
+        fragments.append((body_style, terminal_safe_text(entry.content) or " "))
         if not entry.finalized:
             fragments.append(("class:streaming", "  ..."))
     return FormattedText(fragments)
@@ -84,19 +85,23 @@ class RichTranscriptFormatter:
             if index:
                 fragments.append(("", "\n\n"))
             style, default_title = _ENTRY_STYLE[entry.kind]
-            fragments.append((style, f"{entry.title or default_title} > "))
+            title = terminal_safe_text(entry.title or default_title)
+            fragments.append((style, f"{title} > "))
             if entry.kind == "assistant" and entry.content:
-                key = (entry.entry_id, entry.content, width)
+                safe_content = terminal_safe_text(entry.content)
+                key = (entry.entry_id, safe_content, width)
                 live_keys.add(key)
                 rendered = self._cache.get(key)
                 if rendered is None:
-                    rendered = self._render_markdown(entry.content, width=width)
+                    rendered = self._render_markdown(safe_content, width=width)
                     self._cache[key] = rendered
                 fragments.append(("", "\n"))
                 fragments.extend(to_formatted_text(rendered))
             else:
                 body_style = "class:reasoning" if entry.kind == "reasoning" else ""
-                fragments.append((body_style, entry.content or " "))
+                fragments.append(
+                    (body_style, terminal_safe_text(entry.content) or " ")
+                )
             if not entry.finalized:
                 fragments.append(("class:streaming", "  ..."))
         if len(self._cache) > max(32, len(live_keys) * 4):

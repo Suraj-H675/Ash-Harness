@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,21 @@ MAX_EDIT_PREVIEW_FILE_BYTES = 1_000_000
 MAX_EDIT_PREVIEW_TEXT_CHARS = 128_000
 MAX_EDIT_PREVIEW_LINES = 400
 DIFF_PREVIEW_TRUNCATED = "[diff preview truncated]"
+
+
+def terminal_safe_text(value: str) -> str:
+    """Render terminal controls visibly instead of allowing them to control a TTY."""
+
+    parts: list[str] = []
+    for character in value:
+        if character in {"\n", "\t"} or unicodedata.category(character) != "Cc":
+            parts.append(character)
+            continue
+        codepoint = ord(character)
+        parts.append(
+            f"\\x{codepoint:02x}" if codepoint <= 0xFF else f"\\u{codepoint:04x}"
+        )
+    return "".join(parts)
 
 
 @dataclass
@@ -247,6 +263,7 @@ class TerminalUI:
     def print_token(self, text: str) -> None:
         if not text:
             return
+        text = terminal_safe_text(text)
         buffers = self._active_buffers_required()
         buffers.response += text
         if self._assistant_entry_id is None:
@@ -257,6 +274,7 @@ class TerminalUI:
     def print_thought(self, text: str) -> None:
         if not text:
             return
+        text = terminal_safe_text(text)
         buffers = self._active_buffers_required()
         if self._reasoning_entry_id is None:
             self._reasoning_entry_id = self.transcript.begin(
@@ -333,10 +351,10 @@ class TerminalUI:
             "tool.error",
         }:
             return
-        tool = str(payload.get("tool", "unknown"))
-        call_id = str(payload.get("call_id", ""))
+        tool = terminal_safe_text(str(payload.get("tool", "unknown")))
+        call_id = terminal_safe_text(str(payload.get("call_id", "")))
         if event_type == "tool.output":
-            delta = str(payload.get("delta", ""))
+            delta = terminal_safe_text(str(payload.get("delta", "")))
             if not delta:
                 return
             entry_id = self._tool_output_entries.get(call_id)
@@ -477,6 +495,7 @@ class TerminalUI:
             side_by_side=side_by_side,
         )
         if preview:
+            preview = terminal_safe_text(preview)
             body.append(
                 "\nDiff preview (side-by-side):\n" if side_by_side else "\nDiff preview:\n",
                 style="bold",
@@ -524,7 +543,7 @@ class TerminalUI:
     def record_user_input(self, text: str) -> None:
         """Commit submitted user input to the interactive transcript."""
 
-        self.transcript.append("user", text, title="you")
+        self.transcript.append("user", terminal_safe_text(text), title="you")
 
     def load_session_transcript(self, session: Any | None) -> None:
         """Replace viewport history from a durable session snapshot."""
@@ -533,7 +552,7 @@ class TerminalUI:
         if session is None:
             return
         for message in session.messages:
-            content = str(message.content)
+            content = terminal_safe_text(str(message.content))
             if message.role == "user":
                 self.transcript.append("user", content, title="you")
             elif message.role == "assistant" and content:
@@ -740,8 +759,10 @@ class TerminalUI:
                     self._edit_plan(execution)
                 except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     self.console.print(
-                        f"Plan edit failed: {exc}",
+                        terminal_safe_text(f"Plan edit failed: {exc}"),
                         style=self.theme.error,
+                        markup=False,
+                        highlight=False,
                     )
                     return False
         finally:
@@ -761,16 +782,16 @@ class TerminalUI:
     def _render_plan(self, execution: Any) -> None:
         body = Text()
         body.append("Goal: ", style="bold")
-        body.append(execution.contract.goal)
+        body.append(terminal_safe_text(execution.contract.goal))
         body.append("\n\n")
         body.append("Definition of Done:\n", style="bold")
         for item in execution.contract.definition_of_done:
-            body.append(f"  - {item}\n")
+            body.append(f"  - {terminal_safe_text(item)}\n")
         if not execution.contract.definition_of_done:
             body.append("  (none)\n")
         body.append("\nFiles in Scope:\n", style="bold")
         for path in execution.contract.files_in_scope:
-            body.append(f"  - {path}\n")
+            body.append(f"  - {terminal_safe_text(path)}\n")
         if not execution.contract.files_in_scope:
             body.append("  - (none)\n")
         body.append("\nChecklist:\n", style="bold")
@@ -780,7 +801,10 @@ class TerminalUI:
                     mark = "[x]" if item.status.value in {"done", "skipped"} else "[ ]"
                 else:
                     mark = "☑" if item.status.value in {"done", "skipped"} else "☐"
-                body.append(f"  {mark} [{item.section}] {item.description}\n")
+                body.append(
+                    f"  {mark} [{terminal_safe_text(item.section)}] "
+                    f"{terminal_safe_text(item.description)}\n"
+                )
         else:
             body.append("  (empty)\n")
         body.append(
@@ -811,6 +835,7 @@ class TerminalUI:
                 )
 
     def write_status(self, text: str, *, error: bool = False) -> None:
+        text = terminal_safe_text(text)
         if error:
             self.transcript.append("error", text, title="error")
         else:
@@ -819,6 +844,8 @@ class TerminalUI:
             self.console.print(
                 text,
                 style=self.theme.error if error else None,
+                markup=False,
+                highlight=False,
             )
 
     def _edit_plan(self, execution: Any) -> None:

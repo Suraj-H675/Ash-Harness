@@ -1,4 +1,5 @@
 from ash.ui.transcript import Transcript
+from ash.ui.viewport import RichTranscriptFormatter, format_transcript
 
 
 def test_transcript_streaming_replaces_immutable_snapshots() -> None:
@@ -60,3 +61,15 @@ def test_transcript_rejects_invalid_limits_and_finalized_updates() -> None:
         pass
     else:
         raise AssertionError("finalized transcript entry accepted a delta")
+
+
+def test_viewport_formatters_neutralize_terminal_controls() -> None:
+    transcript = Transcript()
+    transcript.append("tool", "tool\x1b[2Joutput", title="bad\x1b]0;title\x07")
+    transcript.append("assistant", "answer\x1b[3J")
+
+    plain = format_transcript(transcript.snapshot())
+    rich = RichTranscriptFormatter().format(transcript.snapshot(), width=80)
+
+    assert all("\x1b" not in fragment[1] for fragment in plain)
+    assert all("\x1b" not in fragment[1] for fragment in rich)

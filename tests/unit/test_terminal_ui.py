@@ -305,3 +305,86 @@ def test_terminal_ui_streams_and_finalizes_command_output() -> None:
     assert streamed.finalized is True
     assert "one" in output.getvalue()
     assert "warning" in output.getvalue()
+
+
+def test_terminal_ui_neutralizes_terminal_controls_in_untrusted_output() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        console=Console(
+            file=output,
+            force_terminal=True,
+            color_system="standard",
+            width=80,
+        )
+    )
+    malicious = "safe\x1b[2Jafter\x1b]52;c;SEVMTE8=\x07done\n"
+
+    ui.emit_event(
+        {
+            "type": "tool.output",
+            "tool": "run_command",
+            "call_id": "c1",
+            "stream": "stdout",
+            "delta": malicious,
+        }
+    )
+    rendered = output.getvalue()
+
+    assert "\x1b[2J" not in rendered
+    assert "\x1b]52;" not in rendered
+    assert "\x07" not in rendered
+    assert r"\x1b[2J" in rendered
+    assert r"\x1b]52;c;SEVMTE8=\x07" in rendered
+    assert ui.transcript.snapshot()[0].content == (
+        r"safe\x1b[2Jafter\x1b]52;c;SEVMTE8=\x07done" + "\n"
+    )
+
+
+def test_terminal_ui_neutralizes_controls_in_live_assistant_and_tool_output() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        console=Console(
+            file=output,
+            force_terminal=True,
+            color_system="standard",
+            width=80,
+        )
+    )
+
+    with ui.begin_turn():
+        ui.print_token("answer\x1b[2J")
+        ui.print_thought("reason\x1b]0;title\x07")
+        ui.emit_event(
+            {
+                "type": "tool.output",
+                "tool": "run_command",
+                "call_id": "c1",
+                "stream": "stdout",
+                "delta": "tool\x1b[3J",
+            }
+        )
+    ui.finalize_turn()
+
+    rendered = output.getvalue()
+    assert "\x1b[2J" not in rendered
+    assert "\x1b]0;" not in rendered
+    assert "\x1b[3J" not in rendered
+    assert all("\x1b" not in entry.content for entry in ui.transcript.snapshot())
+
+
+def test_terminal_ui_status_does_not_interpret_rich_markup() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        console=Console(
+            file=output,
+            force_terminal=True,
+            color_system="standard",
+            width=80,
+        )
+    )
+
+    ui.write_status("[link=https://evil.test]click[/link]")
+
+    rendered = output.getvalue()
+    assert "\x1b]8;" not in rendered
+    assert "[link=https://evil.test]click[/link]" in rendered

@@ -18,6 +18,24 @@ MAX_ACTIVE_PROFILE_BYTES = 256
 MAX_PROFILE_ENTRIES = 10_000
 
 
+def _is_link(path: Path) -> bool:
+    return path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
+
+
+def _state_root(ash_dir: Path | None = None) -> Path:
+    root = ash_dir or (Path.home() / ".ash")
+    if _is_link(root):
+        raise ValueError(f"refusing to use symlinked Ash state directory: {root}")
+    return root
+
+
+def _profiles_root(ash_dir: Path | None = None) -> Path:
+    root = _state_root(ash_dir) / "profiles"
+    if _is_link(root):
+        raise ValueError(f"refusing to use symlinked profiles directory: {root}")
+    return root
+
+
 def validate_profile_name(name: str) -> str:
     """Normalize a profile name and reject path traversal or shell-like input."""
 
@@ -35,17 +53,17 @@ def validate_profile_name(name: str) -> str:
 def profiles_directory(ash_dir: Path | None = None) -> Path:
     """Return the user-owned directory containing named profile directories."""
 
-    return (ash_dir or (Path.home() / ".ash")) / "profiles"
+    return _profiles_root(ash_dir)
 
 
 def profile_directory(name: str, *, ash_dir: Path | None = None) -> Path:
     """Return the isolated state directory for a validated profile."""
 
     normalized = validate_profile_name(name)
-    root = ash_dir or (Path.home() / ".ash")
+    root = _state_root(ash_dir)
     if normalized == DEFAULT_PROFILE:
         return root
-    return profiles_directory(root) / normalized
+    return _profiles_root(root) / normalized
 
 
 def active_profile_name(
@@ -60,7 +78,7 @@ def active_profile_name(
         value = str(environment["ASH_PROFILE"]).strip()
         return validate_profile_name(value or DEFAULT_PROFILE)
 
-    marker = (ash_dir or (Path.home() / ".ash")) / _ACTIVE_PROFILE_FILENAME
+    marker = _state_root(ash_dir) / _ACTIVE_PROFILE_FILENAME
     if not marker.is_file():
         return DEFAULT_PROFILE
     try:
@@ -79,7 +97,7 @@ def set_active_profile(name: str, *, ash_dir: Path | None = None) -> str:
     """Persist the active profile marker atomically and return its normalized name."""
 
     normalized = validate_profile_name(name)
-    root = ash_dir or (Path.home() / ".ash")
+    root = _state_root(ash_dir)
     root.mkdir(parents=True, exist_ok=True)
     marker = root / _ACTIVE_PROFILE_FILENAME
     fd, temporary = tempfile.mkstemp(dir=root, prefix=f".{marker.name}.", suffix=".tmp")

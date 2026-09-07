@@ -149,3 +149,55 @@ def test_symlinked_profile_cannot_redirect_config_reads(
     assert profile_exists("work") is False
     with pytest.raises(ValueError, match="profile does not exist"):
         AshConfig.load()
+
+
+def test_symlinked_profiles_root_cannot_redirect_profile_mutations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    ash_dir = home / ".ash"
+    outside = tmp_path / "outside"
+    ash_dir.mkdir(parents=True)
+    outside.mkdir()
+    try:
+        (ash_dir / "profiles").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+    monkeypatch.setenv("HOME", str(home))
+
+    from ash.commands.profile import add_profile, remove_profile
+
+    with pytest.raises(ValueError, match="symlinked profiles directory"):
+        add_profile("work")
+    assert not (outside / "work").exists()
+
+    victim = outside / "work"
+    victim.mkdir()
+    victim.joinpath("sentinel.txt").write_text("keep", encoding="utf-8")
+    with pytest.raises(ValueError, match="symlinked profiles directory"):
+        remove_profile("work", confirmed=True)
+    assert victim.joinpath("sentinel.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_symlinked_user_state_root_cannot_redirect_profile_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    outside.joinpath(".env").write_text(
+        "ASH_MODEL=ollama/outside-model\n", encoding="utf-8"
+    )
+    try:
+        (home / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("ASH_PROFILE", raising=False)
+    monkeypatch.delenv("ASH_MODEL", raising=False)
+
+    from ash.config import AshConfig
+
+    with pytest.raises(ValueError, match="symlinked Ash state directory"):
+        AshConfig.load()
