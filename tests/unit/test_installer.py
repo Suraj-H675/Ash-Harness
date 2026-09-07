@@ -5,6 +5,7 @@ import io
 import os
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -800,9 +801,46 @@ def test_real_installer_capture_terminates_hung_child() -> None:
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")
+def test_real_streaming_installer_timeout_terminates_child_processes(tmp_path) -> None:
+    sentinel = tmp_path / "child-finished"
+    child = (
+        "import time; from pathlib import Path; "
+        f"time.sleep(0.35); Path({str(sentinel)!r}).write_text('done')"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c',{child!r}]); time.sleep(60)"
+    )
+
+    with pytest.raises(InstallError, match="timed out after 0.1 seconds"):
+        from ash.installer import _run_streaming
+
+        _run_streaming(
+            [sys.executable, "-c", parent],
+            runner=subprocess.run,
+            environment={},
+            timeout=0.1,
+            description="test installation",
+            failure_message="install failed",
+        )
+
+    time.sleep(0.5)
+    assert not sentinel.exists()
+
+
 def test_installer_bounded_file_reader_rejects_oversized_metadata(tmp_path) -> None:
     metadata_path = tmp_path / "pipx_metadata.json"
     metadata_path.write_bytes(b"{" + b"x" * (1024 * 1024 + 1))
 
     with pytest.raises(ValueError, match="exceeds 1048576 bytes"):
         _read_bounded_file(metadata_path, max_bytes=1024 * 1024)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are unavailable")
+def test_installer_bounded_file_reader_rejects_fifo_without_blocking(tmp_path) -> None:
+    metadata_path = tmp_path / "pipx_metadata.json"
+    os.mkfifo(metadata_path)
+
+    with pytest.raises(ValueError, match="non-regular file"):
+        _read_bounded_file(metadata_path, max_bytes=1024)

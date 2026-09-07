@@ -12,6 +12,7 @@ from pathlib import Path
 from string import Template
 from typing import Any, Callable, cast
 
+from ash.json_utils import strict_json_loads
 from ash.hooks.registry import (
     HookBlock,
     HookCallbackResult,
@@ -90,7 +91,7 @@ def load_command_hooks(
             if "exceeds" in str(exc):
                 raise ValueError(f"Hook config exceeds 1 MiB: {path}") from exc
             raise
-        payload = json.loads(raw.decode("utf-8"))
+        payload = strict_json_loads(raw)
         if not isinstance(payload, dict):
             raise ValueError(f"Hook config must be an object: {path}")
         for item in _entries(payload, "pre_tool", path):
@@ -235,8 +236,8 @@ async def _session_start(
     if not response or not response.startswith("{"):
         return response
     try:
-        payload = json.loads(response)
-    except json.JSONDecodeError as exc:
+        payload = strict_json_loads(response)
+    except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError("session_start hook returned invalid JSON") from exc
     if not isinstance(payload, dict) or not isinstance(
         payload.get("additional_context", ""), str
@@ -268,8 +269,8 @@ def _enforce_pre_tool_response(response: str | None) -> None:
     if not response.startswith("{"):
         return
     try:
-        payload = json.loads(response)
-    except json.JSONDecodeError as exc:
+        payload = strict_json_loads(response)
+    except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError("pre_tool hook output must be a JSON object or empty") from exc
     if not isinstance(payload, dict):
         raise ValueError("pre_tool hook output must be a JSON object")

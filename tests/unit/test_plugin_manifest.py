@@ -23,6 +23,17 @@ def test_load_minimal_manifest(tmp_path: Path) -> None:
     assert manifest.description == ""
 
 
+def test_load_manifest_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    manifest_file = tmp_path / "plugin.json"
+    manifest_file.write_text(
+        '{"name":"first","name":"second","version":"1.0.0"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        PluginManifest.load(manifest_file)
+
+
 def test_load_full_manifest(tmp_path: Path) -> None:
     manifest_file = tmp_path / "plugin.json"
     manifest_file.write_text(

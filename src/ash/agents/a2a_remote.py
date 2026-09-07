@@ -17,6 +17,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from ash.core.redaction import redact_text
+from ash.json_utils import strict_json_loads
 from ash.safety.guard import SafetyGuard
 from ash.safe_io import read_bounded_bytes
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
@@ -192,7 +193,7 @@ def load_remote_agent_configs(
                 label="A2A config",
                 trusted_root=trusted_root,
             )
-            payload = json.loads(raw_bytes.decode("utf-8"))
+            payload = strict_json_loads(raw_bytes)
         except (OSError, ValueError) as exc:
             raise ValueError(f"invalid A2A config {path}: {exc}") from exc
         if not isinstance(payload, dict) or set(payload) != {"agents"}:

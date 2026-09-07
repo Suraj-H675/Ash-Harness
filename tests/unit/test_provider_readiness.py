@@ -103,6 +103,27 @@ def test_probe_model_catalog_rejects_invalid_content_length(monkeypatch) -> None
         )
 
 
+def test_probe_model_catalog_rejects_duplicate_json_keys(monkeypatch) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            content=(
+                b'{"data":[{"id":"first"}],'
+                b'"data":[{"id":"second"}]}'
+            ),
+            request=request,
+        ),
+    )
+
+    with pytest.raises(readiness.ProviderVerificationError, match="verification failed"):
+        readiness.probe_model_catalog(
+            "https://gateway.example/v1/models",
+            headers={},
+            catalog_format="openai",
+        )
+
+
 def test_resolve_provider_connection_supports_gateway_key_and_endpoint(
     monkeypatch,
 ) -> None:

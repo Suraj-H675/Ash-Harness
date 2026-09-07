@@ -274,6 +274,17 @@ async def test_ollama_rejects_non_object_stream_messages() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ollama_rejects_duplicate_json_keys_in_stream() -> None:
+    provider = OllamaProvider(
+        model_name="test",
+        client=_FakeOllamaClient(b'{"done":true,"done":false}\n'),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="invalid JSON"):
+        _ = [chunk async for chunk in provider.stream_chat([])]
+
+
+@pytest.mark.asyncio
 async def test_ollama_stream_chat_handles_chunked_ndjson_and_usage() -> None:
     lines = [
         b'{"message":{"content":"hello"},"done":false}\n',

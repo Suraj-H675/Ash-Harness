@@ -179,6 +179,17 @@ def test_invalid_extension_state_is_rejected(tmp_path) -> None:
         load_extension_state(state_path)
 
 
+def test_extension_state_rejects_duplicate_json_keys(tmp_path) -> None:
+    state_path = tmp_path / "extensions.json"
+    state_path.write_text(
+        '{"version":1,"disabled_plugins":["first"],"disabled_plugins":[]}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PluginLifecycleError, match="duplicate JSON object key"):
+        load_extension_state(state_path)
+
+
 def test_oversized_extension_state_is_rejected(tmp_path) -> None:
     state_path = tmp_path / "extensions.json"
     state_path.write_bytes(b" " * (MAX_EXTENSION_STATE_BYTES + 1))

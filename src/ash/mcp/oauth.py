@@ -24,6 +24,8 @@ from urllib.request import parse_http_list, parse_keqv_list
 
 import httpx
 
+from ash.json_utils import strict_json_loads
+
 
 MAX_OAUTH_RESPONSE_BYTES = 1_000_000
 MAX_OAUTH_RECORD_BYTES = 1_000_000
@@ -98,7 +100,7 @@ class MCPOAuthTokenStore:
         if not self.path.exists():
             return None
         try:
-            raw = json.loads(self._read_record())
+            raw = strict_json_loads(self._read_record())
             if (
                 not isinstance(raw, dict)
                 or isinstance(raw.get("version"), bool)

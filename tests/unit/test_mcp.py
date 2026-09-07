@@ -147,6 +147,18 @@ def test_load_mcp_servers_does_not_follow_symlinked_config(tmp_path: Path) -> No
         load_mcp_servers(path)
 
 
+def test_load_mcp_servers_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    path = tmp_path / ".mcp.json"
+    path.write_text(
+        '{"mcpServers":{"server":{"command":"first"},'
+        '"server":{"command":"second"}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        load_mcp_servers(path)
+
+
 def test_expand_env_vars() -> None:
     import os
 
@@ -307,6 +319,21 @@ def test_mcp_authorization_header_allows_loopback_http_transport() -> None:
     )
 
     assert config.resolved_url == "http://localhost:43123/rpc"
+
+
+def test_mcp_config_rejects_case_variant_duplicate_headers() -> None:
+    with pytest.raises(ValueError, match="duplicate header names"):
+        MCPServerConfig.from_dict(
+            "remote",
+            {
+                "transport": "http",
+                "url": "https://mcp.example.test/rpc",
+                "headers": {
+                    "Authorization": "Bearer first",
+                    "authorization": "Bearer second",
+                },
+            },
+        )
 
 
 @pytest.mark.parametrize(
@@ -2181,6 +2208,30 @@ def test_http_sse_parser_rejects_oversized_event(
         mcp_client_module._parse_http_messages(response)
 
 
+@pytest.mark.parametrize(
+    ("content_type", "body"),
+    [
+        (
+            "application/json",
+            b'{"jsonrpc":"2.0","id":1,"result":{},"result":{"x":1}}',
+        ),
+        (
+            "text/event-stream",
+            b'data: {"jsonrpc":"2.0","id":1,"result":{},"result":{"x":1}}\n\n',
+        ),
+    ],
+)
+def test_http_parsers_reject_duplicate_json_keys(content_type: str, body: bytes) -> None:
+    response = httpx.Response(
+        200,
+        headers={"content-type": content_type},
+        content=body,
+    )
+
+    with pytest.raises(MCPProtocolError, match="invalid JSON"):
+        mcp_client_module._parse_http_messages(response)
+
+
 @pytest.mark.asyncio
 async def test_http_get_stream_dispatches_events_and_honors_405() -> None:
     requests: list[httpx.Request] = []
@@ -3308,6 +3359,29 @@ async def test_stdio_reader_fails_pending_request_on_invalid_utf8() -> None:
     await client._read_stdio()
 
     with pytest.raises(MCPProtocolError, match="invalid JSON"):
+        await future
+    assert client._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_stdio_reader_fails_pending_request_on_duplicate_json_keys() -> None:
+    class DuplicateKeyReader:
+        sent = False
+
+        async def readline(self) -> bytes:
+            if self.sent:
+                return b""
+            self.sent = True
+            return b'{"jsonrpc":"2.0","id":3,"result":{},"result":{"x":1}}\n'
+
+    client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
+    client._process = Mock(stdout=DuplicateKeyReader())
+    future = asyncio.get_running_loop().create_future()
+    client._pending[3] = future
+
+    await client._read_stdio()
+
+    with pytest.raises(MCPProtocolError, match="duplicate JSON object key"):
         await future
     assert client._pending == {}
 

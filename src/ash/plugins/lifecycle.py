@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from ash.json_utils import strict_json_loads
 from ash.plugins.manifest import PLUGIN_NAME, PluginManifest
 from ash.plugins.catalog import CatalogEntry, PluginCatalogError
 from ash.plugins.registry import (
@@ -73,10 +74,10 @@ def load_extension_state(path: Path | None = None) -> ExtensionState:
                 f"extension state exceeds {MAX_EXTENSION_STATE_BYTES} bytes: "
                 f"{state_path}"
             )
-        payload = json.loads(raw.decode("utf-8"))
+        payload = strict_json_loads(raw)
     except PluginLifecycleError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         raise PluginLifecycleError(
             f"cannot load extension state {state_path}: {exc}"
         ) from exc

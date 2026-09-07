@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, AsyncGenerator
 
 import httpx
 
 from ash.context.tokens import AnthropicTokenCounter
+from ash.json_utils import strict_json_loads
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import (
@@ -66,7 +66,7 @@ class OllamaProvider(ProviderABC):
                         max_bytes=MAX_OLLAMA_METADATA_BYTES,
                         label="Ollama metadata response",
                     )
-                    payload = json.loads(raw_payload)
+                    payload = strict_json_loads(raw_payload)
                     if not isinstance(payload, dict):
                         raise ValueError("metadata payload must be an object")
                     details = payload.get("details")
@@ -292,8 +292,8 @@ def _decode_stream_line(line: bytes) -> str:
 
 def _parse_stream_message(line: str) -> dict[str, Any]:
     try:
-        data = json.loads(line)
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        data = strict_json_loads(line)
+    except (TypeError, ValueError) as exc:
         raise RuntimeError("Ollama stream contained invalid JSON") from exc
     if not isinstance(data, dict):
         raise RuntimeError("Ollama stream message must be an object")

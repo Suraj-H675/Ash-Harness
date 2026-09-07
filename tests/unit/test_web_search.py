@@ -203,6 +203,29 @@ async def test_web_search_rejects_invalid_provider_response_lengths(
 
 
 @pytest.mark.asyncio
+async def test_web_search_rejects_duplicate_json_keys(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-test-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=b'{"web":{"results":[]},"web":{"results":[{"title":"x"}]}}',
+        )
+
+    tool = WebSearchTool(
+        SafetyGuard(tmp_path),
+        provider="brave",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await tool.run(query="anything")
+
+    assert result.success is False
+    assert "invalid JSON" in (result.error or "")
+
+
+@pytest.mark.asyncio
 async def test_web_search_rejects_blank_queries(tmp_path) -> None:
     tool = WebSearchTool(SafetyGuard(tmp_path))
 

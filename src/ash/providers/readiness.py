@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from ash.json_utils import strict_json_loads
 from ash.providers.identifiers import parse_model_string
 
 if TYPE_CHECKING:
@@ -367,7 +368,7 @@ def probe_model_catalog(
         ) from exc
 
     try:
-        payload = json.loads(raw_payload)
+        payload = strict_json_loads(raw_payload)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
         raise ProviderVerificationError(
             f"provider catalog verification failed ({type(exc).__name__})"

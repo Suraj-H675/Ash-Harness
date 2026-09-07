@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from ash.json_utils import strict_json_loads
 from ash.safety.environment import build_scrubbed_environment
 from ash.safe_io import read_bounded_bytes
 from ash.mcp.oauth import MCPOAuthError, canonical_resource_uri
@@ -255,7 +256,7 @@ def load_mcp_servers(
         if "exceeds" in str(exc):
             raise ValueError(f"MCP config exceeds 256 KiB: {config_path}") from exc
         raise ValueError(f"MCP config is not readable: {config_path}: {exc}") from exc
-    raw: Any = json.loads(raw_bytes.decode("utf-8"))
+    raw: Any = strict_json_loads(raw_bytes)
 
     if not isinstance(raw, dict):
         raise ValueError(f"MCP config must be an object: {config_path}")
@@ -370,6 +371,15 @@ def _validate_server_data(name: str, data: dict[str, Any]) -> None:
         for key, value in headers.items()
     ):
         raise ValueError(f"MCP server {name!r} headers must contain string values")
+    folded_headers: dict[str, str] = {}
+    for key in headers:
+        folded = key.casefold()
+        if folded in folded_headers:
+            raise ValueError(
+                f"MCP server {name!r} has duplicate header names: "
+                f"{folded_headers[folded]!r} and {key!r}"
+            )
+        folded_headers[folded] = key
     if not isinstance(cwd, str):
         raise ValueError(f"MCP server {name!r} cwd must be a string")
     if auth not in {"none", "oauth"}:

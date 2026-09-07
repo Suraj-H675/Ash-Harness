@@ -129,6 +129,21 @@ def test_oauth_store_rejects_coerced_credential_types(tmp_path: Path) -> None:
         store.load(resource)
 
 
+def test_oauth_store_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource))
+    raw = store.path.read_text(encoding="utf-8")
+    raw = raw.replace(
+        '"access_token":"old-access"',
+        '"access_token":"first","access_token":"old-access"',
+    )
+    store.path.write_text(raw, encoding="utf-8")
+
+    with pytest.raises(MCPOAuthError, match="invalid OAuth credential record"):
+        store.load(resource)
+
+
 def test_oauth_discovery_url_builders_preserve_resource_identity() -> None:
     resource = canonical_resource_uri("HTTPS://MCP.Example.Test/team/mcp?tenant=one")
 

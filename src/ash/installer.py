@@ -14,6 +14,7 @@ import queue
 import re
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -571,6 +572,27 @@ def _run_streaming(
 ) -> Any:
     """Run a user-visible installer command with a hard upper time limit."""
 
+    if runner is subprocess.run:
+        popen_kwargs: dict[str, Any] = {"env": dict(environment)}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+        process = subprocess.Popen(list(command), **popen_kwargs)
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            _terminate_process(process)
+            raise InstallError(
+                f"{description} timed out after {timeout:g} seconds."
+            ) from exc
+        completed = _CapturedResult(returncode=returncode)
+        if returncode != 0:
+            raise InstallError(failure_message)
+        return completed
+
     try:
         completed = runner(
             list(command),
@@ -786,9 +808,13 @@ def _read_bounded_file(path: Path, *, max_bytes: int) -> bytes:
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     descriptor = -1
     try:
         descriptor = os.open(path, flags)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"refusing to read non-regular file: {path}")
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = -1
             contents = handle.read(max_bytes + 1)

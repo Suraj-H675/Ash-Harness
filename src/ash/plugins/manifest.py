@@ -13,6 +13,8 @@ from packaging.version import InvalidVersion, parse
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
 
+from ash.json_utils import strict_json_loads
+
 
 CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION = 2
 MINIMUM_SUPPORTED_PLUGIN_MANIFEST_SCHEMA_VERSION = 1
@@ -288,7 +290,7 @@ class PluginManifest:
             raw = handle.read(MAX_PLUGIN_MANIFEST_BYTES + 1)
         if len(raw) > MAX_PLUGIN_MANIFEST_BYTES:
             raise ValueError("plugin manifest exceeds 128 KiB")
-        data = json.loads(raw.decode("utf-8"))
+        data = strict_json_loads(raw)
         if not isinstance(data, dict):
             raise ValueError("plugin manifest must be a JSON object")
         return cls.from_dict(data)

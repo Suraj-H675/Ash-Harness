@@ -14,6 +14,7 @@ from typing import Any
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from jsonschema.exceptions import ValidationError  # type: ignore[import-untyped]
 
+from ash.json_utils import strict_json_loads
 from ash.plugins.manifest import (
     PLUGIN_RUNTIME_PROTOCOL_VERSION,
     PluginToolManifest,
@@ -231,7 +232,7 @@ class PluginHostClient:
                     "plugin response exceeds the 1 MiB protocol limit"
                 )
             try:
-                response = json.loads(line, parse_constant=_reject_json_constant)
+                response = strict_json_loads(line)
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 raise PluginRuntimeError("plugin returned malformed JSON") from exc
             if not isinstance(response, dict) or response.get("jsonrpc") != "2.0":
@@ -449,7 +450,3 @@ def _plugin_environment() -> dict[str, str]:
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUNBUFFERED": "1",
     }
-
-
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"non-standard JSON constant: {value}")

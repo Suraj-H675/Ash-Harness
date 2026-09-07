@@ -16,6 +16,7 @@ import httpx
 from pydantic import BaseModel, Field, field_validator
 
 from ash.core.redaction import redact_text
+from ash.json_utils import strict_json_loads
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.tools.web import _host_allowed, _normalize_allowed_domains
@@ -231,8 +232,8 @@ async def _request_json(
         )
         raise WebSearchBackendError(f"{provider} {reason}") from exc
     try:
-        payload = json.loads(raw_response)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload = strict_json_loads(raw_response)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise WebSearchBackendError(f"{provider} returned invalid JSON") from exc
     if not isinstance(payload, dict):
         raise WebSearchBackendError(f"{provider} returned a non-object response")

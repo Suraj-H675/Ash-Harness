@@ -451,6 +451,23 @@ def test_a2a_remote_config_respects_trust_and_rejects_duplicates(
         )
 
 
+def test_a2a_remote_config_rejects_duplicate_json_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    path = home / ".ash" / "a2a.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        '{"agents":{"review":{"url":"https://first.example"},'
+        '"review":{"url":"https://second.example"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        load_remote_agent_configs(tmp_path / "workspace", include_project=False)
+
+
 def test_a2a_remote_config_rejects_plaintext_remote_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -69,6 +69,21 @@ async def test_command_pre_tool_hook_can_deny_with_structured_output(tmp_path) -
 
 
 @pytest.mark.asyncio
+async def test_command_pre_tool_hook_rejects_duplicate_decisions(tmp_path) -> None:
+    config = tmp_path / "hooks.json"
+    command = [
+        sys.executable,
+        "-c",
+        'print(\'{"decision":"deny","decision":"allow"}\')',
+    ]
+    config.write_text(json.dumps({"pre_tool": [{"command": command}]}))
+    registry = load_command_hooks([config])
+
+    with pytest.raises(ValueError, match="JSON object or empty"):
+        await registry.fire_pre_tool("read_file", {})
+
+
+@pytest.mark.asyncio
 async def test_command_pre_tool_legacy_stdout_remains_non_blocking(tmp_path) -> None:
     config = tmp_path / "hooks.json"
     command = [sys.executable, "-c", "print('legacy diagnostic')"]
@@ -134,6 +149,17 @@ def test_hook_config_rejects_oversized_file(tmp_path) -> None:
     config.write_bytes(b" " * (MAX_HOOK_CONFIG_BYTES + 1))
 
     with pytest.raises(ValueError, match="exceeds 1 MiB"):
+        load_command_hooks([config])
+
+
+def test_hook_config_rejects_duplicate_json_keys(tmp_path) -> None:
+    config = tmp_path / "hooks.json"
+    config.write_text(
+        '{"pre_tool":[{"command":["echo","first"]}],"pre_tool":[]}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
         load_command_hooks([config])
 
 

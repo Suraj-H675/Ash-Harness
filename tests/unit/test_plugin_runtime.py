@@ -56,6 +56,9 @@ for line in sys.stdin:
         if action == "nonstandard_json":
             print('{"jsonrpc":"2.0","id":%d,"result":NaN}' % request["id"], flush=True)
             continue
+        if action == "duplicate_json_key":
+            print('{"jsonrpc":"2.0","id":%d,"result":{},"result":{"success":true}}' % request["id"], flush=True)
+            continue
         if action == "extra_response_field":
             print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {}, "extra": True}), flush=True)
             continue
@@ -262,6 +265,7 @@ async def test_plugin_host_does_not_inherit_ambient_secrets(
         "malformed",
         "oversized",
         "nonstandard_json",
+        "duplicate_json_key",
         "extra_response_field",
         "result_and_error",
     ],

@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from ash.json_utils import strict_json_loads
 from ash.mcp.server import MCPServerConfig
 from ash.mcp.oauth import (
     MCPAuthorizationRequired,
@@ -473,10 +474,10 @@ class MCPClient:
                 )
                 break
             try:
-                message = json.loads(line)
+                message = strict_json_loads(line)
             except json.JSONDecodeError:
                 continue
-            except (UnicodeDecodeError, OverflowError, RecursionError) as exc:
+            except (UnicodeDecodeError, ValueError, OverflowError, RecursionError) as exc:
                 error = MCPProtocolError(
                     f"MCP server {self.config.name!r} sent invalid JSON: {exc}"
                 )
@@ -1741,8 +1742,8 @@ class MCPClient:
                     if name != "message" or not event_data:
                         return
                     try:
-                        payload = json.loads(event_data)
-                    except json.JSONDecodeError as exc:
+                        payload = strict_json_loads(event_data)
+                    except (json.JSONDecodeError, ValueError) as exc:
                         raise MCPProtocolError(
                             "MCP SSE event contained invalid JSON"
                         ) from exc
@@ -1866,8 +1867,12 @@ class MCPClient:
                             self._sse_last_event_id = event_id
                         if data_lines and any(data_lines):
                             try:
-                                payload = json.loads("\n".join(data_lines))
-                            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                                payload = strict_json_loads("\n".join(data_lines))
+                            except (
+                                UnicodeDecodeError,
+                                json.JSONDecodeError,
+                                ValueError,
+                            ) as exc:
                                 raise MCPProtocolError(
                                     "MCP SSE event contained invalid JSON"
                                 ) from exc
@@ -2022,8 +2027,8 @@ def _parse_http_messages(response: httpx.Response) -> list[dict[str, Any]]:
         if not content:
             return []
         try:
-            payload = response.json()
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            payload = strict_json_loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise MCPProtocolError("MCP HTTP response contained invalid JSON") from exc
         if not isinstance(payload, dict):
             raise MCPProtocolError(
@@ -2044,8 +2049,8 @@ def _parse_http_messages(response: httpx.Response) -> list[dict[str, Any]]:
         if not event_data:
             return
         try:
-            payload = json.loads(event_data)
-        except json.JSONDecodeError as exc:
+            payload = strict_json_loads(event_data)
+        except (json.JSONDecodeError, ValueError) as exc:
             raise MCPProtocolError("MCP SSE event contained invalid JSON") from exc
         if isinstance(payload, dict):
             _validate_jsonrpc_message(payload)
