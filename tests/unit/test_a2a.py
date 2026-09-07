@@ -503,6 +503,30 @@ def test_a2a_remote_config_does_not_follow_symlinks(
         load_remote_agent_configs(tmp_path / "workspace", include_project=False)
 
 
+def test_project_a2a_config_rejects_symlinked_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "a2a.json").write_text(
+        '{"agents":{"escaped":{"url":"https://agent.example"}}}',
+        encoding="utf-8",
+    )
+    try:
+        (workspace / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        load_remote_agent_configs(workspace, include_project=True)
+
+
 @pytest.mark.asyncio
 async def test_remote_agent_inventory_hides_private_endpoint(tmp_path: Path) -> None:
     tool = ListRemoteAgentsTool(

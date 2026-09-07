@@ -132,6 +132,10 @@ def test_allowed_directories_cannot_expand_beyond_project_root(tmp_path: Path) -
         "sudo rm --force -R /",
         "rm -rf harmless /",
         "rm ${OPTS:--rf} /",
+        'cmd=rm; "$cmd" -rf /',
+        'cmd=chmod; "$cmd" -R 777 /',
+        "$(printf r)m -rf /",
+        "`printf r`m -rf /",
         "mkfs.ext4 /dev/sda1",
         "dd if=/dev/zero of=/dev/sda",
         "chmod -R 777 /",
@@ -174,3 +178,9 @@ def test_validate_command_allows_non_blocklisted_commands(tmp_path: Path) -> Non
     guard = SafetyGuard(tmp_path)
 
     assert guard.validate_command("python -m pytest tests/unit") == (True, "")
+
+
+def test_validate_command_allows_expansion_in_arguments(tmp_path: Path) -> None:
+    guard = SafetyGuard(tmp_path)
+
+    assert guard.validate_command('printf "%s\\n" "$HOME"') == (True, "")

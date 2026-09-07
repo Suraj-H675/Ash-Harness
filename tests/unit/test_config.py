@@ -736,6 +736,28 @@ def test_malformed_project_config_only_fails_after_trust(
         AshConfig.load()
 
 
+def test_trusted_project_config_rejects_symlinked_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ash.safety.trust import set_workspace_trusted
+
+    _use_temporary_trust_store(tmp_path, monkeypatch)
+    root = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    _make_git_root(root)
+    outside.mkdir()
+    (outside / "config.toml").write_text('theme = "light"\n', encoding="utf-8")
+    try:
+        (root / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    monkeypatch.chdir(root)
+    set_workspace_trusted(root, True)
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        AshConfig.load()
+
+
 def test_oversized_user_config_is_rejected_before_toml_parsing() -> None:
     from ash import config as config_module
     from ash.commands import config as cli_config

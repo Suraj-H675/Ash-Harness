@@ -124,13 +124,15 @@ def load_lsp_server_configs(
                 config, command=(executable, *config.command[1:])
             )
 
-    paths = [Path.home() / ".ash" / "lsp.json"]
+    paths: list[tuple[Path, Path | None]] = [
+        (Path.home() / ".ash" / "lsp.json", None)
+    ]
     if include_project:
-        paths.append(workspace / ".ash" / "lsp.json")
-    for path in paths:
+        paths.append((workspace / ".ash" / "lsp.json", workspace))
+    for path, trusted_root in paths:
         if not path.is_file():
             continue
-        for name, raw in _read_config(path).items():
+        for name, raw in _read_config(path, trusted_root=trusted_root).items():
             existing = servers.get(name)
             parsed = _parse_server(name, raw, path, existing)
             if parsed.disabled:
@@ -165,12 +167,17 @@ def lsp_command_available(config: LSPServerConfig, workspace: Path) -> bool:
     return shutil.which(config.command[0]) is not None
 
 
-def _read_config(path: Path) -> dict[str, Any]:
+def _read_config(
+    path: Path,
+    *,
+    trusted_root: Path | None = None,
+) -> dict[str, Any]:
     try:
         raw = read_bounded_bytes(
             path,
             MAX_LSP_CONFIG_BYTES,
             label="LSP config",
+            trusted_root=trusted_root,
         )
         payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
     except (OSError, ValueError) as exc:

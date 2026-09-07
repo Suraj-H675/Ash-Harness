@@ -154,6 +154,12 @@ class SafetyGuard:
         scan_values = self._command_scan_values(command_str)
         default_patterns_enabled = self._default_patterns_enabled()
         if default_patterns_enabled:
+            dynamic_executable = self._dynamic_executable_expansion(command_str)
+            if dynamic_executable is not None:
+                raise SafetyViolation(
+                    "Blocked command pattern: dynamic executable expansion "
+                    f"({dynamic_executable})"
+                )
             ambiguous_pattern = self._ambiguous_destructive_posix_pattern(command_str)
             if ambiguous_pattern is not None:
                 raise SafetyViolation(f"Blocked command pattern: {ambiguous_pattern}")
@@ -224,6 +230,29 @@ class SafetyGuard:
     @staticmethod
     def _has_shell_expansion(token: str) -> bool:
         return "$" in token or "`" in token
+
+    @staticmethod
+    def _is_shell_assignment(token: str) -> bool:
+        name, separator, _ = token.partition("=")
+        return bool(
+            separator
+            and name
+            and (name[0].isalpha() or name[0] == "_")
+            and all(character.isalnum() or character == "_" for character in name)
+        )
+
+    @classmethod
+    def _dynamic_executable_expansion(cls, command_str: str) -> str | None:
+        """Reject a shell-expanded command name that could conceal the blocklist."""
+
+        for segment in cls._posix_command_segments(command_str):
+            executable = next(
+                (token for token in segment if not cls._is_shell_assignment(token)),
+                None,
+            )
+            if executable is not None and cls._has_shell_expansion(executable):
+                return executable
+        return None
 
     @classmethod
     def _ambiguous_destructive_posix_pattern(cls, command_str: str) -> str | None:

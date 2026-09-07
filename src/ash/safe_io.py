@@ -7,12 +7,15 @@ import stat
 from pathlib import Path
 from typing import Any, TextIO
 
+from ash.safety.path_scope import lexical_target_path, path_has_link_component
+
 
 def read_bounded_bytes(
     path: str | Path,
     max_bytes: int,
     *,
     label: str,
+    trusted_root: str | Path | None = None,
 ) -> bytes:
     """Read one regular file without following links or exceeding ``max_bytes``."""
 
@@ -21,6 +24,19 @@ def read_bounded_bytes(
     source = Path(path).expanduser()
     if source.is_symlink():
         raise ValueError(f"refusing to read symlinked {label}: {source}")
+    if trusted_root is not None:
+        root = Path(trusted_root).expanduser().resolve()
+        lexical = lexical_target_path(source, root)
+        try:
+            lexical.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"refusing to read {label} outside trusted root: {source}") from exc
+        link = path_has_link_component(lexical, root)
+        if link is not None:
+            raise ValueError(
+                f"refusing to read {label} through a symlink or junction: {link}"
+            )
+        source = lexical
 
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):

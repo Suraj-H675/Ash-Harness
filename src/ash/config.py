@@ -212,13 +212,14 @@ def _apply_legacy_model_values(
     return details
 
 
-def _read_toml(path: Path) -> dict[str, Any]:
+def _read_toml(path: Path, *, trusted_root: Path | None = None) -> dict[str, Any]:
     try:
         value = tomllib.loads(
             read_bounded_bytes(
                 path,
                 MAX_CONFIG_FILE_BYTES,
                 label="project TOML config",
+                trusted_root=trusted_root,
             ).decode("utf-8")
         )
     except (OSError, ValueError) as exc:
@@ -1087,7 +1088,7 @@ class AshConfig(BaseSettings):
             for path in project_config_paths(workspace_root):
                 if not path.is_file():
                     continue
-                values = _read_toml(path)
+                values = _read_toml(path, trusted_root=workspace_root)
                 filtered = _filter_project_config(cls, path, values, diagnostics)
                 project_layers.append((path, filtered))
 

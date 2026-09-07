@@ -138,6 +138,28 @@ def test_project_lsp_config_symlink_is_not_followed(tmp_path: Path) -> None:
         load_lsp_server_configs(tmp_path, include_project=True, detect_builtins=False)
 
 
+def test_project_lsp_config_rejects_symlinked_parent(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "lsp.json").write_text(
+        '{"servers":{"escaped":{"command":["server"],"extensions":{".x":"x"}}}}',
+        encoding="utf-8",
+    )
+    try:
+        (workspace / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        load_lsp_server_configs(
+            workspace,
+            include_project=True,
+            detect_builtins=False,
+        )
+
+
 def test_workspace_server_detection_requires_trust_and_executable_bit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -176,11 +176,13 @@ def load_remote_agent_configs(
     *,
     include_project: bool,
 ) -> dict[str, RemoteAgentConfig]:
-    paths = [Path.home() / ".ash" / "a2a.json"]
+    paths: list[tuple[Path, Path | None]] = [
+        (Path.home() / ".ash" / "a2a.json", None)
+    ]
     if include_project:
-        paths.append(workspace / ".ash" / "a2a.json")
+        paths.append((workspace / ".ash" / "a2a.json", workspace))
     agents: dict[str, RemoteAgentConfig] = {}
-    for path in paths:
+    for path, trusted_root in paths:
         if not path.is_file():
             continue
         try:
@@ -188,6 +190,7 @@ def load_remote_agent_configs(
                 path,
                 MAX_A2A_CONFIG_BYTES,
                 label="A2A config",
+                trusted_root=trusted_root,
             )
             payload = json.loads(raw_bytes.decode("utf-8"))
         except (OSError, ValueError) as exc:
