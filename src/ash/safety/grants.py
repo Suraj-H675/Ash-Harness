@@ -539,6 +539,15 @@ def grants_path() -> Path:
     return Path.home() / ".ash" / "permission-grants.json"
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        value[key] = item
+    return value
+
+
 def _read_payload(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"version": CURRENT_PERMISSION_RULE_VERSION, "workspaces": {}}
@@ -548,7 +557,10 @@ def _read_payload(path: Path) -> dict[str, Any]:
             MAX_RULE_FILE_BYTES,
             label="permission rule file",
         )
-        payload = json.loads(raw.decode("utf-8"))
+        payload = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+        )
     except PermissionGrantError:
         raise
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:

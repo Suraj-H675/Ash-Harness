@@ -54,6 +54,46 @@ def test_symlinked_trust_store_cannot_grant_workspace_trust(
     assert is_workspace_trusted(workspace) is False
 
 
+def test_malformed_or_unsupported_trust_store_fails_closed(
+    tmp_path, monkeypatch
+) -> None:
+    import json
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    path = trust_store_path()
+    canonical = str(workspace.resolve())
+
+    for payload in (
+        {"version": 999, "workspaces": [canonical]},
+        {"version": 1, "workspaces": canonical},
+        {"version": 1, "workspaces": [canonical, 1]},
+        {"workspaces": [canonical]},
+    ):
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        assert is_workspace_trusted(workspace) is False
+
+
+def test_duplicate_trust_store_keys_fail_closed(tmp_path, monkeypatch) -> None:
+    import json
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    canonical = json.dumps(str(workspace.resolve()))
+    trust_store_path().write_text(
+        '{"version":1,"workspaces":[],"workspaces":[' + canonical + "]}",
+        encoding="utf-8",
+    )
+
+    assert is_workspace_trusted(workspace) is False
+
+
 def test_project_instructions_require_trust_flag(tmp_path, monkeypatch) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "repo"

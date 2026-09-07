@@ -1,6 +1,8 @@
 """Safety validation for filesystem paths and shell commands."""
 
+import os
 import re
+import shlex
 from pathlib import Path
 from typing import Tuple
 
@@ -47,7 +49,7 @@ class SafetyGuard:
         (
             "rm -rf /",
             re.compile(
-                r"\brm(?:\s+--?[\w-]+)*(?:\s+--)?\s+/",
+                r"\brm(?:\s+--?[\w-]+)*(?:\s+--)?\s+[\"']?/",
                 re.IGNORECASE,
             ),
         ),
@@ -56,7 +58,8 @@ class SafetyGuard:
         (
             "chmod -R 777 /",
             re.compile(
-                r"\bchmod(?:\s+--?[\w-]+)*(?:\s+--)?\s+777\s+/",
+                r"\bchmod(?:\s+--?[\w-]+)*(?:\s+--)?\s+0?777"
+                r"(?:\s+--?[\w-]+)*(?:\s+--)?\s+[\"']?/",
                 re.IGNORECASE,
             ),
         ),
@@ -148,16 +151,19 @@ class SafetyGuard:
         SafetyViolation when a blocklisted command pattern is present.
         """
 
-        normalized = self._normalize_command(command_str)
+        scan_values = self._command_scan_values(command_str)
         if self.blocklist_commands == list(self.default_blocklist()):
             for pattern, regex in self._DEFAULT_BLOCKLIST_PATTERNS:
-                if regex.search(command_str):
+                if any(regex.search(value) for value in scan_values):
                     reason = f"Blocked command pattern: {pattern}"
                     raise SafetyViolation(reason)
         else:
             for pattern in self.blocklist_commands:
                 normalized_pattern = self._normalize_command(pattern)
-                if normalized_pattern in normalized:
+                if any(
+                    normalized_pattern in self._normalize_command(value)
+                    for value in scan_values
+                ):
                     reason = f"Blocked command pattern: {pattern}"
                     raise SafetyViolation(reason)
 
@@ -166,3 +172,17 @@ class SafetyGuard:
     @staticmethod
     def _normalize_command(command_str: str) -> str:
         return " ".join(command_str.casefold().split())
+
+    @staticmethod
+    def _command_scan_values(command_str: str) -> tuple[str, ...]:
+        """Return raw and dequoted POSIX shell spellings for blocklist checks."""
+
+        values = [command_str]
+        if os.name != "nt":
+            try:
+                lexical = " ".join(shlex.split(command_str, posix=True))
+            except ValueError:
+                lexical = ""
+            if lexical and lexical != command_str:
+                values.append(lexical)
+        return tuple(values)

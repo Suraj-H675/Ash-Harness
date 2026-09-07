@@ -21,6 +21,15 @@ def canonical_workspace(path: str | Path) -> str:
     return os.path.normcase(str(Path(path).expanduser().resolve()))
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        value[key] = item
+    return value
+
+
 def load_trusted_workspaces() -> set[str]:
     path = trust_store_path()
     if not path.exists():
@@ -31,11 +40,20 @@ def load_trusted_workspaces() -> set[str]:
             MAX_TRUST_STORE_BYTES,
             label="trusted workspace store",
         )
-        payload = json.loads(raw.decode("utf-8"))
+        payload = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+        )
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return set()
-    entries = payload.get("workspaces", []) if isinstance(payload, dict) else []
-    return {str(entry) for entry in entries if isinstance(entry, str)}
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return set()
+    entries = payload.get("workspaces")
+    if not isinstance(entries, list) or any(
+        not isinstance(entry, str) for entry in entries
+    ):
+        return set()
+    return set(entries)
 
 
 def is_workspace_trusted(path: str | Path) -> bool:

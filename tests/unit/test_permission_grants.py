@@ -162,6 +162,26 @@ def test_permission_rule_file_refuses_corruption_and_future_versions(
         load_permission_rules(workspace)
 
 
+def test_permission_rule_file_rejects_duplicate_json_keys(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    path = grants_path()
+    path.parent.mkdir(parents=True)
+    rule = PermissionRule.create(RuleEffect.ALLOW, "run_command")
+    path.write_text(
+        '{"version":2,"workspaces":{},"workspaces":{'
+        + json.dumps(str(workspace.resolve()))
+        + ":["
+        + json.dumps(rule.as_payload(), separators=(",", ":"))
+        + "]}}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PermissionGrantError, match="duplicate JSON object key"):
+        load_permission_rules(workspace)
+
+
 def test_permission_rule_file_rejects_oversized_payload(
     tmp_path, monkeypatch
 ) -> None:
