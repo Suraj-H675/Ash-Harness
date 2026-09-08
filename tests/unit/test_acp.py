@@ -240,6 +240,28 @@ async def test_acp_maps_mcp_prompts_events_and_editor_permissions(
 
 
 @pytest.mark.asyncio
+async def test_acp_contains_downstream_mcp_config_validation_errors(
+    tmp_path: Path,
+) -> None:
+    agent = AshACPAgent()
+
+    with pytest.raises(acp.RequestError) as invalid_fragment:
+        await agent.new_session(
+            str(tmp_path),
+            mcp_servers=[
+                HttpMcpServer(
+                    type="http",
+                    name="fragment-url",
+                    url="https://mcp.example.test/rpc#fragment",
+                    headers=[],
+                )
+            ],
+        )
+
+    assert "mcpServers" in invalid_fragment.value.data
+
+
+@pytest.mark.asyncio
 async def test_acp_cancel_returns_cancelled_stop_reason(tmp_path: Path) -> None:
     started = asyncio.Event()
     cancelled = asyncio.Event()
@@ -275,6 +297,86 @@ async def test_acp_cancel_returns_cancelled_stop_reason(tmp_path: Path) -> None:
     assert response.stop_reason == "cancelled"
     assert cancelled.is_set()
     await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_prompt_cannot_start_after_concurrent_session_close(
+    tmp_path: Path,
+) -> None:
+    lookup_finished = asyncio.Event()
+    release_lookup = asyncio.Event()
+
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        return FakeAshClient(
+            session_id or "close-race-session",
+            [AshEvent("turn.completed", {"response": "should not run"})],
+            approval_callback,
+        )
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    session = await agent.new_session(str(tmp_path))
+    original_session = agent._session
+
+    async def delayed_session(session_id: str):
+        state = await original_session(session_id)
+        lookup_finished.set()
+        await release_lookup.wait()
+        return state
+
+    agent._session = delayed_session  # type: ignore[method-assign]
+    prompt_task = asyncio.create_task(
+        agent.prompt(session.session_id, [text_block("race close")])
+    )
+    await asyncio.wait_for(lookup_finished.wait(), timeout=2)
+
+    await agent.close_session(session.session_id)
+    release_lookup.set()
+
+    with pytest.raises(acp.RequestError):
+        await asyncio.wait_for(prompt_task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_acp_new_session_cancellation_closes_created_client(
+    tmp_path: Path,
+) -> None:
+    factory_started = asyncio.Event()
+    release_factory = asyncio.Event()
+    clients: list[FakeAshClient] = []
+
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        client = FakeAshClient("cancelled-new-session", [], approval_callback)
+        clients.append(client)
+        factory_started.set()
+        await release_factory.wait()
+        return client
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    task = asyncio.create_task(agent.new_session(str(tmp_path)))
+    await asyncio.wait_for(factory_started.wait(), timeout=2)
+    await agent._lock.acquire()
+    try:
+        release_factory.set()
+        await asyncio.sleep(0)
+        task.cancel()
+    finally:
+        agent._lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert clients[0].closed is True
 
 
 @pytest.mark.asyncio
@@ -369,6 +471,126 @@ async def test_acp_load_replays_and_lists_durable_sessions(
 
     await agent.aclose()
     assert clients[0].closed
+
+
+@pytest.mark.asyncio
+async def test_acp_load_does_not_succeed_after_concurrent_session_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    stored = store.create_session(str(workspace), model="test")
+    store.save_message(
+        stored.session_id,
+        Message(
+            role="assistant",
+            content="replay me",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        return FakeAshClient(session_id or "new", [], approval_callback)
+
+    replay_started = asyncio.Event()
+    release_replay = asyncio.Event()
+
+    class BlockingReplayConnection(FakeACPConnection):
+        async def session_update(self, session_id: str, update: Any) -> None:
+            replay_started.set()
+            await release_replay.wait()
+            await super().session_update(session_id, update)
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(BlockingReplayConnection())  # type: ignore[arg-type]
+    load_task = asyncio.create_task(agent.load_session(str(workspace), stored.session_id))
+    await asyncio.wait_for(replay_started.wait(), timeout=2)
+
+    await agent.close_session(stored.session_id)
+    release_replay.set()
+
+    with pytest.raises(acp.RequestError):
+        await asyncio.wait_for(load_task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_acp_load_cancellation_closes_and_unregisters_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    stored = store.create_session(str(workspace), model="test")
+    store.save_message(
+        stored.session_id,
+        Message(
+            role="assistant",
+            content="block replay",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    clients: list[FakeAshClient] = []
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        client = FakeAshClient(session_id or "new", [], approval_callback)
+        clients.append(client)
+        return client
+
+    replay_started = asyncio.Event()
+
+    class BlockingReplayConnection(FakeACPConnection):
+        async def session_update(self, session_id: str, update: Any) -> None:
+            replay_started.set()
+            await asyncio.Event().wait()
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(BlockingReplayConnection())  # type: ignore[arg-type]
+    load_task = asyncio.create_task(agent.load_session(str(workspace), stored.session_id))
+    await asyncio.wait_for(replay_started.wait(), timeout=2)
+    load_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await load_task
+
+    assert clients[0].closed is True
+    with pytest.raises(acp.RequestError):
+        await agent.close_session(stored.session_id)
 
 
 class WireClient(FakeACPConnection):

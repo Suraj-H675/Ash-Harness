@@ -180,7 +180,7 @@ class AshACPAgent:
                     raise RuntimeError("Ash returned a duplicate session ID")
                 self._sessions[session_id] = _ACPSession(workspace, client)
             return NewSessionResponse(session_id=session_id)
-        except Exception:
+        except BaseException:
             if client is not None:
                 await client.close()
             raise
@@ -215,15 +215,20 @@ class AshACPAgent:
             client = await self._client_factory(
                 workspace, session_id, configs, approval
             )
+            state = _ACPSession(workspace, client)
             async with self._lock:
-                self._sessions[session_id] = _ACPSession(workspace, client)
+                self._sessions[session_id] = state
             await self._replay(session_id, stored.messages, stored.tool_calls)
+            async with self._lock:
+                if self._sessions.get(session_id) is not state:
+                    client = None
+                    raise RequestError.resource_not_found(session_id)
             return LoadSessionResponse()
         except KeyError as exc:
             if client is not None:
                 await client.close()
             raise RequestError.resource_not_found(session_id) from exc
-        except Exception:
+        except BaseException:
             if client is not None:
                 await client.close()
             async with self._lock:
@@ -287,6 +292,8 @@ class AshACPAgent:
         if current is None:
             raise RequestError.internal_error()
         async with self._lock:
+            if self._sessions.get(session_id) is not state:
+                raise RequestError.resource_not_found(session_id)
             if state.prompt_task is not None and not state.prompt_task.done():
                 raise RequestError.invalid_request(
                     {"sessionId": session_id, "reason": "turn already running"}
@@ -668,13 +675,18 @@ def _mcp_configs(servers: list[Any]) -> dict[str, MCPServerConfig]:
             fields.extend(
                 value for item in server.env for value in (item.name, item.value)
             )
-            config = MCPServerConfig(
-                name=name,
-                command=server.command,
-                args=list(server.args),
-                env={item.name: item.value for item in server.env},
-                transport="stdio",
-            )
+            try:
+                config = MCPServerConfig(
+                    name=name,
+                    command=server.command,
+                    args=list(server.args),
+                    env={item.name: item.value for item in server.env},
+                    transport="stdio",
+                )
+            except ValueError as exc:
+                raise RequestError.invalid_params(
+                    {"mcpServers": "invalid server configuration"}
+                ) from exc
         elif isinstance(server, (HttpMcpServer, SseMcpServer)):
             if len(server.headers) > MAX_ACP_MCP_VALUES:
                 raise RequestError.invalid_params({"mcpServers": "too many headers"})
@@ -689,15 +701,20 @@ def _mcp_configs(servers: list[Any]) -> dict[str, MCPServerConfig]:
             fields.extend(
                 value for item in server.headers for value in (item.name, item.value)
             )
-            config = MCPServerConfig(
-                name=name,
-                command="",
-                args=[],
-                env={},
-                transport="http" if isinstance(server, HttpMcpServer) else "sse",
-                url=server.url,
-                headers={item.name: item.value for item in server.headers},
-            )
+            try:
+                config = MCPServerConfig(
+                    name=name,
+                    command="",
+                    args=[],
+                    env={},
+                    transport="http" if isinstance(server, HttpMcpServer) else "sse",
+                    url=server.url,
+                    headers={item.name: item.value for item in server.headers},
+                )
+            except ValueError as exc:
+                raise RequestError.invalid_params(
+                    {"mcpServers": "invalid server configuration"}
+                ) from exc
         else:
             raise RequestError.invalid_params({"mcpServers": "unknown server type"})
         encoded_sizes = [len(value.encode("utf-8")) for value in fields]

@@ -89,6 +89,46 @@ async def test_async_sdk_rejects_unisolated_auto_approve(tmp_path, monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_async_sdk_create_cancellation_closes_allocated_runtime(
+    tmp_path, monkeypatch
+) -> None:
+    started = asyncio.Event()
+
+    class FakeLoop:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    loop = FakeLoop()
+    runtime = type("Runtime", (), {"loop": loop})()
+    monkeypatch.setattr("ash.sdk.build_runtime", lambda *args, **kwargs: runtime)
+
+    async def blocked_start(self, session_id=None):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(AshClient, "start", blocked_start)
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    task = asyncio.create_task(
+        AshClient.create(config=config, provider=SDKProvider())
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert loop.closed is True
+
+
+@pytest.mark.asyncio
 async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
     config = AshConfig(
         model="ollama/sdk-model",

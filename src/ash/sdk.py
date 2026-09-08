@@ -209,7 +209,7 @@ class AshClient:
         client = cls(runtime.loop, runtime_config)
         try:
             await client.start(session_id)
-        except Exception:
+        except BaseException:
             await runtime.loop.aclose()
             raise
         return client
