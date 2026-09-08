@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -135,18 +136,33 @@ def fetch_catalog(
         raise PluginCatalogError(str(exc)) from exc
     if os.name != "nt":
         destination.parent.chmod(0o700)
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    descriptor = -1
+    temporary: Path | None = None
     try:
-        temporary.write_bytes(raw)
-        if os.name != "nt":
-            temporary.chmod(0o600)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        if os.name != "nt" and hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, destination)
     except OSError as exc:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
         raise PluginCatalogError(f"could not save plugin catalog: {exc}") from exc
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
     return destination
 
 

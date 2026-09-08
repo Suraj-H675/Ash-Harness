@@ -485,9 +485,19 @@ def manage_local_plugin(
 
         if target.startswith(("https://", "http://")):
             expected = None
-            if catalog is not None or default_catalog_path() is not None:
+            if git_ref and (catalog is not None or default_catalog_path() is not None):
                 verified_catalog = _verified_catalog(catalog)
-                expected = verified_catalog.entries.get(target)
+                matches = [
+                    entry
+                    for entry in verified_catalog.entries.values()
+                    if entry.source == target and entry.ref == git_ref
+                ]
+                if len(matches) != 1:
+                    raise PluginLifecycleError(
+                        "signed plugin catalog does not contain exactly one entry for "
+                        f"{target}@{git_ref}"
+                    )
+                expected = matches[0]
             installed = install_git_plugin(
                 target,
                 ref=git_ref or "",

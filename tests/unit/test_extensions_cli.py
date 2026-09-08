@@ -285,10 +285,10 @@ def test_extensions_cli_installs_https_git_plugin(
         stdout=subprocess.DEVNULL,
     )
 
-    original_run = subprocess.run
+    original_popen = subprocess.Popen
     monkeypatch.setattr(
-        "ash.plugins.lifecycle.subprocess.run",
-        lambda args, **kwargs: original_run(
+        "ash.plugins.lifecycle.subprocess.Popen",
+        lambda args, **kwargs: original_popen(
             [
                 *args[:-2],
                 str(source),
@@ -632,6 +632,98 @@ def test_extensions_catalog_search_and_name_install_are_pinned(
     assert installed["name"] == "demo"
     assert installed["enabled"] is True
     assert Path(installed["root"]).is_relative_to(home / ".ash" / "plugins")
+
+
+def test_direct_url_install_uses_matching_signed_catalog_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from ash.commands.extensions import manage_local_plugin
+    from ash.plugins.catalog import CatalogEntry
+    from ash.plugins.lifecycle import InstalledPlugin
+
+    source = "https://plugins.example/demo.git"
+    expected = CatalogEntry(
+        name="demo",
+        version="1.2.3",
+        source=source,
+        ref="v1.2.3",
+        digest="a" * 40,
+    )
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "ash.commands.extensions._verified_catalog",
+        lambda catalog=None: SimpleNamespace(entries={"demo": expected}),
+    )
+    monkeypatch.setattr(
+        "ash.commands.extensions.load_extension_state",
+        lambda: SimpleNamespace(disabled_plugins=frozenset()),
+    )
+
+    def install(source_arg: str, **kwargs):
+        observed["source"] = source_arg
+        observed.update(kwargs)
+        return InstalledPlugin("demo", "1.2.3", tmp_path / "installed" / "demo")
+
+    monkeypatch.setattr("ash.commands.extensions.install_git_plugin", install)
+    monkeypatch.setattr(
+        "ash.commands.extensions.set_plugin_enabled", lambda *args, **kwargs: None
+    )
+
+    result = manage_local_plugin(
+        "install",
+        source,
+        git_ref="v1.2.3",
+        catalog=tmp_path / "catalog.json",
+    )
+
+    assert result["name"] == "demo"
+    assert observed["source"] == source
+    assert observed["expected"] == expected
+
+
+def test_direct_url_install_fails_closed_when_catalog_does_not_pin_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from ash.commands.extensions import manage_local_plugin
+    from ash.plugins.catalog import CatalogEntry
+    from ash.plugins.lifecycle import PluginLifecycleError
+
+    source = "https://plugins.example/demo.git"
+    entry = CatalogEntry(
+        name="demo",
+        version="1.2.3",
+        source=source,
+        ref="v1.2.3",
+        digest="a" * 40,
+    )
+    monkeypatch.setattr(
+        "ash.commands.extensions._verified_catalog",
+        lambda catalog=None: SimpleNamespace(entries={"demo": entry}),
+    )
+    monkeypatch.setattr(
+        "ash.commands.extensions.load_extension_state",
+        lambda: SimpleNamespace(disabled_plugins=frozenset()),
+    )
+
+    def unexpected_install(*args, **kwargs):
+        raise AssertionError("unverified Git install must not start")
+
+    monkeypatch.setattr(
+        "ash.commands.extensions.install_git_plugin", unexpected_install
+    )
+
+    with pytest.raises(PluginLifecycleError, match="does not contain exactly one entry"):
+        manage_local_plugin(
+            "install",
+            source,
+            git_ref="v9.9.9",
+            catalog=tmp_path / "catalog.json",
+        )
 
 
 def test_extensions_catalog_requires_configuration(capsys) -> None:

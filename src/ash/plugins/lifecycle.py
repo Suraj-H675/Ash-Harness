@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 import urllib.parse
 from dataclasses import dataclass
@@ -31,6 +33,7 @@ STATE_VERSION = 1
 MAX_GIT_CLONE_BYTES = MAX_PLUGIN_BYTES
 MAX_GIT_CLONE_SECONDS = 300
 MAX_GIT_ERROR_BYTES = 64 * 1024
+_GIT_CLONE_POLL_SECONDS = 0.05
 
 
 class PluginLifecycleError(ValueError):
@@ -300,33 +303,50 @@ def install_git_plugin(
     checkout = temporary_root / "plugin"
     try:
         with tempfile.TemporaryFile() as error_output:
+            group_options = process_group_options()
+            process = subprocess.Popen(
+                [
+                    git_path,
+                    "clone",
+                    "--quiet",
+                    "--depth",
+                    "1",
+                    "--branch",
+                    ref,
+                    "--single-branch",
+                    source,
+                    str(checkout),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=error_output,
+                **group_options,
+            )
+            deadline = time.monotonic() + MAX_GIT_CLONE_SECONDS
             try:
-                completed = subprocess.run(
-                    [
-                        git_path,
-                        "clone",
-                        "--quiet",
-                        "--depth",
-                        "1",
-                        "--branch",
-                        ref,
-                        "--single-branch",
-                        source,
-                        str(checkout),
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=error_output,
-                    check=False,
-                    timeout=MAX_GIT_CLONE_SECONDS,
-                    **process_group_options(),
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise PluginLifecycleError(
-                    f"plugin Git clone timed out after {MAX_GIT_CLONE_SECONDS} seconds"
-                ) from exc
+                while True:
+                    if _tree_exceeds_bytes(temporary_root, MAX_GIT_CLONE_BYTES):
+                        _terminate_git_clone(process, group_options)
+                        raise PluginLifecycleError(
+                            "plugin Git clone exceeds "
+                            f"{MAX_GIT_CLONE_BYTES} bytes"
+                        )
+                    returncode = process.poll()
+                    if returncode is not None:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        _terminate_git_clone(process, group_options)
+                        raise PluginLifecycleError(
+                            "plugin Git clone timed out after "
+                            f"{MAX_GIT_CLONE_SECONDS} seconds"
+                        )
+                    time.sleep(min(_GIT_CLONE_POLL_SECONDS, remaining))
+            except BaseException:
+                _terminate_git_clone(process, group_options)
+                raise
             error_output.seek(0)
             detail = error_output.read(MAX_GIT_ERROR_BYTES + 1)
-        if completed.returncode:
+        if returncode:
             detail_text = detail.decode("utf-8", errors="replace").strip()
             if len(detail) > MAX_GIT_ERROR_BYTES:
                 detail_text = detail_text[:MAX_GIT_ERROR_BYTES] + "…"
@@ -348,6 +368,59 @@ def install_git_plugin(
         )
     finally:
         shutil.rmtree(temporary_root, ignore_errors=True)
+
+
+def _tree_exceeds_bytes(root: Path, limit: int) -> bool:
+    total = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                            continue
+                        total += entry.stat(follow_symlinks=False).st_size
+                    except FileNotFoundError:
+                        continue
+                    if total > limit:
+                        return True
+        except FileNotFoundError:
+            continue
+    return False
+
+
+def _terminate_git_clone(
+    process: subprocess.Popen[Any],
+    group_options: dict[str, Any],
+) -> None:
+    if process.poll() is not None:
+        return
+    if os.name != "nt" and group_options.get("start_new_session"):
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            process.terminate()
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=1)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name != "nt" and group_options.get("start_new_session"):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            process.kill()
+    else:
+        process.kill()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _verify_catalog_checkout(

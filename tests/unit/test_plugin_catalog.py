@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import subprocess
-from types import SimpleNamespace
+import time
 from pathlib import Path
 
 import httpx
@@ -175,6 +176,38 @@ def test_remote_catalog_fetch_streams_valid_payload_into_cache(
         )
         == destination
     )
+    assert destination.read_bytes() == b'{"keyId":"demo"}'
+
+
+def test_remote_catalog_fetch_does_not_follow_predictable_temp_symlink(
+    tmp_path: Path, monkeypatch
+) -> None:
+    destination = tmp_path / "catalog.json"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not overwrite", encoding="utf-8")
+    predictable = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    try:
+        predictable.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+    monkeypatch.setattr(
+        "ash.plugins.catalog.catalog_cache_path", lambda url: destination
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'{"keyId":"demo"}')
+
+    assert (
+        fetch_catalog(
+            "https://plugins.example/catalog.json",
+            transport=httpx.MockTransport(handler),
+        )
+        == destination
+    )
+
+    assert victim.read_text(encoding="utf-8") == "do not overwrite"
+    assert destination.is_file()
+    assert not destination.is_symlink()
     assert destination.read_bytes() == b'{"keyId":"demo"}'
 
 
@@ -352,26 +385,74 @@ def test_git_install_verifies_catalog_revision(tmp_path: Path) -> None:
 def test_git_install_times_out_without_leaking_clone_process(
     tmp_path: Path, monkeypatch
 ) -> None:
-    def timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired(args[0], 300)
+    if os.name == "nt":
+        pytest.skip("process-group termination probe is POSIX-only")
+    fake_git = tmp_path / "fake-git"
+    marker = tmp_path / "clone-survived"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        f'(sleep 0.3; printf survived > "{marker}") &\n'
+        "sleep 5\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(
+        "ash.plugins.lifecycle.resolve_host_executable",
+        lambda *args, **kwargs: str(fake_git),
+    )
+    monkeypatch.setattr("ash.plugins.lifecycle.MAX_GIT_CLONE_SECONDS", 0.1)
 
-    monkeypatch.setattr("ash.plugins.lifecycle.subprocess.run", timeout)
-
-    with pytest.raises(PluginLifecycleError) as exc_info:
+    with pytest.raises(PluginLifecycleError, match="timed out"):
         install_git_plugin(
             "https://plugins.example/demo.git",
             ref="main",
             destination_root=tmp_path / "installed",
         )
 
-    assert "timed out" in str(exc_info.value)
+    time.sleep(0.5)
+    assert not marker.exists()
+
+
+def test_git_install_stops_clone_when_disk_budget_is_exceeded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    if os.name == "nt":
+        pytest.skip("process-group termination probe is POSIX-only")
+    fake_git = tmp_path / "fake-git"
+    marker = tmp_path / "clone-survived"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "for checkout do :; done\n"
+        "mkdir -p \"$checkout\"\n"
+        "dd if=/dev/zero of=\"$checkout/blob\" bs=2048 count=1 2>/dev/null\n"
+        f'(sleep 0.3; printf survived > "{marker}") &\n'
+        "sleep 5\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(
+        "ash.plugins.lifecycle.resolve_host_executable",
+        lambda *args, **kwargs: str(fake_git),
+    )
+    monkeypatch.setattr("ash.plugins.lifecycle.MAX_GIT_CLONE_BYTES", 1024)
+
+    with pytest.raises(PluginLifecycleError, match="clone exceeds 1024 bytes"):
+        install_git_plugin(
+            "https://plugins.example/demo.git",
+            ref="main",
+            destination_root=tmp_path / "installed",
+        )
+
+    time.sleep(0.5)
+    assert not marker.exists()
+    assert not (tmp_path / "installed").exists()
 
 
 def test_git_install_rejects_embedded_url_credentials_before_clone(
     tmp_path: Path, monkeypatch
 ) -> None:
-    run = monkeypatch.setattr(
-        "ash.plugins.lifecycle.subprocess.run",
+    popen = monkeypatch.setattr(
+        "ash.plugins.lifecycle.subprocess.Popen",
         lambda *args, **kwargs: pytest.fail("git clone must not run"),
     )
 
@@ -382,7 +463,7 @@ def test_git_install_rejects_embedded_url_credentials_before_clone(
             destination_root=tmp_path / "installed",
         )
 
-    assert run is None
+    assert popen is None
 
 
 @pytest.mark.parametrize(
@@ -395,8 +476,8 @@ def test_git_install_rejects_embedded_url_credentials_before_clone(
 def test_git_install_rejects_query_or_fragment_before_clone(
     tmp_path: Path, monkeypatch, source: str
 ) -> None:
-    run = monkeypatch.setattr(
-        "ash.plugins.lifecycle.subprocess.run",
+    popen = monkeypatch.setattr(
+        "ash.plugins.lifecycle.subprocess.Popen",
         lambda *args, **kwargs: pytest.fail("git clone must not run"),
     )
 
@@ -407,7 +488,7 @@ def test_git_install_rejects_query_or_fragment_before_clone(
             destination_root=tmp_path / "installed",
         )
 
-    assert run is None
+    assert popen is None
 
 
 def test_git_install_rejects_workspace_shadowed_git_before_clone(
@@ -436,11 +517,19 @@ def test_git_install_rejects_workspace_shadowed_git_before_clone(
 def test_git_install_caps_clone_error_detail(
     tmp_path: Path, monkeypatch
 ) -> None:
+    class NoisyFailure:
+        def __init__(self) -> None:
+            self.returncode = 1
+            self.pid = 1
+
+        def poll(self):
+            return self.returncode
+
     def noisy_failure(*args, **kwargs):
         kwargs["stderr"].write(b"x" * 100_000)
-        return SimpleNamespace(returncode=1)
+        return NoisyFailure()
 
-    monkeypatch.setattr("ash.plugins.lifecycle.subprocess.run", noisy_failure)
+    monkeypatch.setattr("ash.plugins.lifecycle.subprocess.Popen", noisy_failure)
 
     with pytest.raises(PluginLifecycleError) as exc_info:
         install_git_plugin(
