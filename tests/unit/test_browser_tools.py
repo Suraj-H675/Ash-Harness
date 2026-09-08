@@ -11,6 +11,7 @@ from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy, PolicyAction
 from ash.tools.browser import (
     BrowserSession,
+    BrowserUnavailableError,
     BrowserBackTool,
     BrowserUploadTool,
     BrowserDownloadTool,
@@ -364,3 +365,38 @@ async def test_browser_optin_profile_creates_private_directory(tmp_path: Path) -
     kwargs = playwright.chromium.launch_persistent_context.await_args.kwargs
     assert kwargs["user_data_dir"] == str(profile)
     await session.close()
+
+
+def test_browser_profile_rejects_symlinked_state_path(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    profile = tmp_path / "state" / "browser-profile"
+    profile.parent.mkdir()
+    try:
+        profile.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="browser profile directory.*symlink or junction"):
+        BrowserSession(profile_path=profile)
+
+
+@pytest.mark.asyncio
+async def test_browser_profile_revalidates_before_start(tmp_path: Path) -> None:
+    profile = tmp_path / "state" / "browser-profile"
+    session = BrowserSession(profile_path=profile)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    profile.parent.mkdir()
+    try:
+        profile.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(
+        BrowserUnavailableError,
+        match="browser profile directory.*symlink or junction",
+    ):
+        await session.ensure_started()
+
+    assert list(outside.iterdir()) == []

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from ash.safe_io import read_bounded_bytes
+from ash.safe_io import read_bounded_bytes, validate_unlinked_directory_path
 
 
 MAX_MEMORY_CONTENT_BYTES = 8 * 1024 * 1024
@@ -15,11 +15,13 @@ MAX_MEMORY_KEY_CHARS = 128
 
 class MarkdownMemoryStore:
     def __init__(self, memory_dir: Path) -> None:
-        memory_dir = memory_dir.expanduser()
-        if memory_dir.is_symlink():
-            raise ValueError(f"memory directory cannot be a symlink: {memory_dir}")
+        memory_dir = validate_unlinked_directory_path(
+            memory_dir, label="memory directory"
+        )
         memory_dir.mkdir(parents=True, exist_ok=True)
-        self.memory_dir = memory_dir.resolve()
+        self.memory_dir = validate_unlinked_directory_path(
+            memory_dir, label="memory directory"
+        )
 
     def save(self, key: str, content: str) -> None:
         path = self._path_for_key(key)
@@ -58,6 +60,7 @@ class MarkdownMemoryStore:
         return raw.decode("utf-8")
 
     def list_keys(self) -> list[str]:
+        self._validate_memory_directory()
         keys: list[str] = []
         for index, path in enumerate(self.memory_dir.iterdir(), 1):
             if index > MAX_MEMORY_KEYS:
@@ -77,4 +80,8 @@ class MarkdownMemoryStore:
             or Path(key).name != key
         ):
             raise ValueError("memory key must be one safe filename component")
+        self._validate_memory_directory()
         return self.memory_dir / f"{key}.md"
+
+    def _validate_memory_directory(self) -> None:
+        validate_unlinked_directory_path(self.memory_dir, label="memory directory")

@@ -53,15 +53,25 @@ def validate_unlinked_path(
     return target
 
 
-def validate_unlinked_file_path(path: str | Path, *, label: str) -> Path:
-    """Reject a linked file or immediate parent while preserving wider path aliases."""
-
+def _validate_unlinked_target_and_parent(path: str | Path, *, label: str) -> Path:
     target = Path(os.path.abspath(Path(path).expanduser()))
     return validate_unlinked_path(
         target,
         trusted_root=target.parent.parent,
         label=label,
     )
+
+
+def validate_unlinked_file_path(path: str | Path, *, label: str) -> Path:
+    """Reject a linked file or immediate parent while preserving wider path aliases."""
+
+    return _validate_unlinked_target_and_parent(path, label=label)
+
+
+def validate_unlinked_directory_path(path: str | Path, *, label: str) -> Path:
+    """Reject a linked directory or immediate parent without resolving wider aliases."""
+
+    return _validate_unlinked_target_and_parent(path, label=label)
 
 
 def read_bounded_bytes(

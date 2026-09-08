@@ -54,6 +54,46 @@ def test_markdown_memory_store_does_not_follow_file_symlinks(tmp_path) -> None:
         store.save("linked", "replacement")
 
 
+def test_markdown_memory_store_rejects_symlinked_parent_directory(tmp_path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    try:
+        linked_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="memory directory.*symlink or junction"):
+        MarkdownMemoryStore(linked_parent / "memory")
+
+    assert not (outside / "memory").exists()
+
+
+def test_markdown_memory_store_rejects_directory_swap_after_initialization(
+    tmp_path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    store = MarkdownMemoryStore(memory_dir)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "existing.md").write_text("outside", encoding="utf-8")
+    memory_dir.rmdir()
+    try:
+        memory_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="memory directory.*symlink or junction"):
+        store.save("new", "must not escape")
+    with pytest.raises(ValueError, match="memory directory.*symlink or junction"):
+        store.load("existing")
+    with pytest.raises(ValueError, match="memory directory.*symlink or junction"):
+        store.list_keys()
+
+    assert not (outside / "new.md").exists()
+    assert (outside / "existing.md").read_text(encoding="utf-8") == "outside"
+
+
 def test_markdown_memory_store_bounds_key_inventory(tmp_path, monkeypatch) -> None:
     store = MarkdownMemoryStore(tmp_path / "memory")
     monkeypatch.setattr(

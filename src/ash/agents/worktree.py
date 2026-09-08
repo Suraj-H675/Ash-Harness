@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from ash.safe_io import validate_unlinked_directory_path, validate_unlinked_path
 from ash.safety.environment import resolve_host_executable
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
@@ -39,7 +40,7 @@ class WorktreeManager:
 
     def __init__(self, repository: Path, storage_root: Path) -> None:
         self.repository = repository.expanduser().resolve()
-        self.storage_root = storage_root.expanduser().resolve()
+        self.storage_root = self._validate_storage_root(storage_root)
 
     async def create(self, agent_id: str) -> WorktreeLease:
         safe_id = _safe_agent_id(agent_id)
@@ -69,7 +70,7 @@ class WorktreeManager:
         )
         if branch_check.returncode == 0:
             raise WorktreeError(f"agent branch already exists: {branch}")
-        self.storage_root.mkdir(parents=True, exist_ok=True)
+        self._prepare_storage_root()
         path = self.storage_root / safe_id
         if path.exists() or path.is_symlink():
             raise WorktreeError(f"agent worktree path already exists: {path}")
@@ -155,6 +156,7 @@ class WorktreeManager:
                 seen.add(actual)
 
         accepted = False
+        self._prepare_storage_root()
         hooks = self.storage_root / "empty-hooks"
         hooks.mkdir(parents=True, exist_ok=True)
         for commit in verified:
@@ -245,6 +247,7 @@ class WorktreeManager:
         if status.stdout:
             raise WorktreeError("applying agent changes requires a clean lead worktree")
         commit = (await self._git("rev-parse", "--verify", branch)).stdout.strip()
+        self._prepare_storage_root()
         hooks = self.storage_root / "empty-hooks"
         hooks.mkdir(parents=True, exist_ok=True)
         result = await self._git(
@@ -307,9 +310,27 @@ class WorktreeManager:
         result = await self._git("rev-parse", "--show-toplevel")
         return Path(result.stdout.strip()).resolve()
 
-    def _validate_lease_path(self, lease: WorktreeLease) -> None:
+    def _validate_storage_root(self, path: Path) -> Path:
         try:
-            lease.path.resolve().relative_to(self.storage_root)
+            return validate_unlinked_directory_path(
+                path, label="agent worktree storage"
+            )
+        except ValueError as exc:
+            raise WorktreeError(str(exc)) from exc
+
+    def _prepare_storage_root(self) -> None:
+        self._validate_storage_root(self.storage_root)
+        self.storage_root.mkdir(parents=True, exist_ok=True)
+        self._validate_storage_root(self.storage_root)
+
+    def _validate_lease_path(self, lease: WorktreeLease) -> None:
+        self._validate_storage_root(self.storage_root)
+        try:
+            validate_unlinked_path(
+                lease.path,
+                trusted_root=self.storage_root,
+                label="agent worktree",
+            )
         except ValueError as exc:
             raise WorktreeError(
                 f"worktree is outside managed storage: {lease.path}"

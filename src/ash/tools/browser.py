@@ -14,6 +14,7 @@ from urllib.parse import urlparse, urlunparse
 from pydantic import BaseModel, Field, field_validator
 
 from ash.core.redaction import redact_text
+from ash.safe_io import validate_unlinked_directory_path
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
 from ash.safety.scoped_io import atomic_write_scoped_bytes
@@ -72,7 +73,11 @@ class BrowserSession:
         self.timeout_ms = int(timeout_seconds * 1000)
         self.allowed_domains = _normalize_allowed_domains(allowed_domains or ())
         self.profile_path = (
-            profile_path.expanduser().resolve() if profile_path is not None else None
+            validate_unlinked_directory_path(
+                profile_path, label="browser profile directory"
+            )
+            if profile_path is not None
+            else None
         )
         self._lock = asyncio.Lock()
         self._playwright: Any | None = None
@@ -94,9 +99,16 @@ class BrowserSession:
                     "`ash setup browser` to enable browser tools."
                 ) from exc
             try:
+                if self.profile_path is not None:
+                    validate_unlinked_directory_path(
+                        self.profile_path, label="browser profile directory"
+                    )
                 self._playwright = await async_playwright().start()
                 if self.profile_path is not None:
                     self.profile_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    validate_unlinked_directory_path(
+                        self.profile_path, label="browser profile directory"
+                    )
                     if os.name != "nt":
                         self.profile_path.chmod(0o700)
                 browser_environment_names = {

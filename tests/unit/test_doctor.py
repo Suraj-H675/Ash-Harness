@@ -265,6 +265,23 @@ def test_storage_check_reports_malformed_database_directory(tmp_path) -> None:
     assert database_directory.read_text(encoding="utf-8") == "not a directory"
 
 
+def test_storage_check_rejects_symlinked_database_directory(tmp_path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    database_directory = tmp_path / "db"
+    try:
+        database_directory.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    check = _check_storage(AshConfig(db_directory=database_directory))
+
+    assert check.status == "fail"
+    assert "database probe" in check.message
+    assert "symlink or junction" in check.message
+    assert list(outside.iterdir()) == []
+
+
 def test_automation_doctor_does_not_open_database_when_disabled(tmp_path) -> None:
     database = tmp_path / "db" / "automation.db"
     database.parent.mkdir()
@@ -348,6 +365,27 @@ def test_automation_doctor_reports_corrupt_database(tmp_path) -> None:
 
     assert check.status == "fail"
     assert "Cannot validate automation database" in check.message
+
+
+def test_automation_doctor_rejects_symlinked_database(tmp_path) -> None:
+    database_directory = tmp_path / "db"
+    database_directory.mkdir()
+    outside = tmp_path / "outside.db"
+    with AutomationStore(outside):
+        pass
+    database = database_directory / "automation.db"
+    try:
+        database.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    check = _check_automation(
+        AshConfig(db_directory=database_directory, workspace_root=tmp_path)
+    )
+
+    assert check.status == "fail"
+    assert "automation database" in check.message
+    assert "symlink or junction" in check.message
 
 
 def test_automation_doctor_refuses_future_schema(tmp_path) -> None:

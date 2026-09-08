@@ -8,6 +8,7 @@ import pytest
 from ash.safe_io import (
     read_bounded_text,
     strict_json_loads,
+    validate_unlinked_directory_path,
     validate_unlinked_file_path,
     validate_unlinked_path,
 )
@@ -87,3 +88,21 @@ def test_validate_unlinked_file_path_rejects_leaf_and_parent_links(
     for path in (linked_file, linked_parent / "state.db"):
         with pytest.raises(ValueError, match="symlink or junction"):
             validate_unlinked_file_path(path, label="test database")
+
+
+def test_validate_unlinked_directory_path_rejects_directory_and_parent_links(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_directory = tmp_path / "linked-directory"
+    linked_parent = tmp_path / "linked-parent"
+    try:
+        linked_directory.symlink_to(outside, target_is_directory=True)
+        linked_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    for path in (linked_directory, linked_parent / "state"):
+        with pytest.raises(ValueError, match="symlink or junction"):
+            validate_unlinked_directory_path(path, label="test state directory")

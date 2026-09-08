@@ -24,6 +24,7 @@ from ash.providers.readiness import (
     resolve_provider_connection,
     verify_provider_connection,
 )
+from ash.safe_io import validate_unlinked_file_path
 from ash.sandbox import SandboxManager
 from ash.safety.environment import resolve_host_executable
 
@@ -129,9 +130,17 @@ def _check_storage(config: AshConfig) -> DoctorCheck:
     connection: sqlite3.Connection | None = None
     result = DoctorCheck("storage", "fail", "Storage check did not complete")
     try:
-        config.db_directory.mkdir(parents=True, exist_ok=True)
+        probe_anchor = validate_unlinked_file_path(
+            config.db_directory / "probe.sqlite3", label="database probe"
+        )
+        database_directory = probe_anchor.parent
+        database_directory.mkdir(parents=True, exist_ok=True)
+        probe_anchor = validate_unlinked_file_path(
+            database_directory / "probe.sqlite3", label="database probe"
+        )
+        database_directory = probe_anchor.parent
         temporary_directory = Path(
-            tempfile.mkdtemp(prefix=".doctor-", dir=config.db_directory)
+            tempfile.mkdtemp(prefix=".doctor-", dir=database_directory)
         )
         database = temporary_directory / "probe.sqlite3"
         connection = sqlite3.connect(database)
@@ -142,8 +151,8 @@ def _check_storage(config: AshConfig) -> DoctorCheck:
             raise sqlite3.DatabaseError("SQLite round-trip verification failed")
         if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
             raise sqlite3.DatabaseError("SQLite integrity check failed")
-        result = DoctorCheck("storage", "pass", str(config.db_directory))
-    except (OSError, sqlite3.Error) as exc:
+        result = DoctorCheck("storage", "pass", str(database_directory))
+    except (OSError, sqlite3.Error, ValueError) as exc:
         result = DoctorCheck(
             "storage", "fail", f"Database directory is not writable: {exc}"
         )
@@ -185,7 +194,17 @@ def _check_automation(config: AshConfig) -> DoctorCheck:
             "automation", "pass", "Durable automation is disabled by configuration"
         )
 
-    db = (config.db_directory / "automation.db").expanduser().resolve()
+    try:
+        db = validate_unlinked_file_path(
+            config.db_directory / "automation.db", label="automation database"
+        )
+    except ValueError as exc:
+        return DoctorCheck(
+            "automation",
+            "fail",
+            f"Cannot validate automation database: {exc}",
+            "Check automation.db permissions and integrity.",
+        )
     if not db.exists():
         return DoctorCheck("automation", "pass", "No automation database yet")
 

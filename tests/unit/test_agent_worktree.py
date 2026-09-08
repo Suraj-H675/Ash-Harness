@@ -247,6 +247,49 @@ def test_worktree_rejects_unsafe_agent_id(repository: Path, tmp_path: Path) -> N
         asyncio.run(manager.create("../escape"))
 
 
+def test_worktree_rejects_symlinked_storage_parent(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "worktrees"
+    try:
+        linked_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(WorktreeError, match="agent worktree storage.*symlink or junction"):
+        WorktreeManager(repository, linked_parent / "project")
+
+    assert list(outside.iterdir()) == []
+
+
+def test_worktree_revalidates_storage_before_create(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    storage_root = tmp_path / "agents"
+    manager = WorktreeManager(repository, storage_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        storage_root.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(WorktreeError, match="agent worktree storage.*symlink or junction"):
+        asyncio.run(manager.create("coder-swap"))
+
+    assert list(outside.iterdir()) == []
+    result = subprocess.run(
+        ["git", "show-ref", "--verify", "refs/heads/ash-agent/coder-swap"],
+        cwd=repository,
+        check=False,
+    )
+    assert result.returncode != 0
+
+
 def test_worktree_apply_rejects_dirty_lead(repository: Path, tmp_path: Path) -> None:
     manager = WorktreeManager(repository, tmp_path / "agents")
 
