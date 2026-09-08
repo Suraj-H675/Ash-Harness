@@ -718,6 +718,59 @@ def _openai_chunk(
     return SimpleNamespace(choices=choices, usage=usage)
 
 
+def _openai_tool_chunk(arguments: str) -> Any:
+    tool_call = SimpleNamespace(
+        index=0,
+        id="call-1",
+        function=SimpleNamespace(name="read_file", arguments=arguments),
+    )
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content="", tool_calls=[tool_call]),
+                finish_reason=None,
+            )
+        ],
+        usage=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "error_name"),
+    [
+        ("openai", "OpenAI"),
+        ("deepseek", "DeepSeek"),
+        ("groq", "Groq"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_openai_compatible_providers_bound_streamed_tool_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_name: str,
+    error_name: str,
+) -> None:
+    import ash.providers.openai as openai_module
+    from ash.providers.deepseek import DeepSeekProvider
+    from ash.providers.groq import GroqProvider
+    from ash.providers.openai import OpenAIProvider
+
+    monkeypatch.setattr(openai_module, "MAX_OPENAI_COMPATIBLE_STREAM_BYTES", 32)
+    client = _FakeOpenAIClient([_openai_tool_chunk("x" * 64)])
+    if provider_name == "openai":
+        provider = OpenAIProvider("test", "key", client=client)
+    elif provider_name == "deepseek":
+        monkeypatch.setattr(
+            "ash.providers.deepseek.openai.AsyncOpenAI", lambda **_: client
+        )
+        provider = DeepSeekProvider("test", "key")
+    else:
+        monkeypatch.setattr("ash.providers.groq.openai.AsyncOpenAI", lambda **_: client)
+        provider = GroqProvider("test", "key")
+
+    with pytest.raises(RuntimeError, match=rf"{error_name} stream exceeded 32 bytes"):
+        _ = [chunk async for chunk in provider.stream_chat([])]
+
+
 @pytest.mark.asyncio
 async def test_openai_prompt_cache_and_usage_only_chunk() -> None:
     from ash.providers.openai import OpenAIProvider
@@ -814,6 +867,35 @@ def test_provider_adapters_reject_plaintext_remote_credentials() -> None:
             api_key="secret",
             base_url="http://gateway.example/v1",
         )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://gateway.example:not-a-port/v1",
+        "https://gateway.example:99999/v1",
+        "https://gateway.example:0/v1",
+    ],
+)
+def test_provider_adapters_reject_invalid_base_url_ports(base_url: str) -> None:
+    from ash.providers.anthropic import AnthropicProvider
+    from ash.providers.deepseek import DeepSeekProvider
+    from ash.providers.groq import GroqProvider
+    from ash.providers.ollama import OllamaProvider
+    from ash.providers.openai import OpenAIProvider
+    from ash.providers.readiness import ProviderConfigurationError
+
+    constructors = [
+        lambda: OpenAIProvider("model", "secret", base_url=base_url),
+        lambda: AnthropicProvider("model", "secret", base_url=base_url),
+        lambda: DeepSeekProvider("model", "secret", base_url=base_url),
+        lambda: GroqProvider("model", "secret", base_url=base_url),
+        lambda: OllamaProvider("model", base_url=base_url),
+    ]
+
+    for construct in constructors:
+        with pytest.raises(ProviderConfigurationError, match="base URL"):
+            construct()
 
 
 class _FakeAnthropicStream:

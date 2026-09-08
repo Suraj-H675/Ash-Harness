@@ -152,6 +152,30 @@ def test_resolve_provider_connection_rejects_plaintext_remote_credentials(
         resolve_provider_connection(_config("openai/gateway-model"))
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://gateway.example:not-a-port/v1",
+        "https://gateway.example:99999/v1",
+        "https://gateway.example:0/v1",
+    ],
+)
+def test_resolve_provider_connection_rejects_invalid_ports(
+    monkeypatch: pytest.MonkeyPatch,
+    base_url: str,
+) -> None:
+    from ash.providers.readiness import (
+        ProviderConfigurationError,
+        resolve_provider_connection,
+    )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret")
+    monkeypatch.setenv("OPENAI_API_BASE", base_url)
+
+    with pytest.raises(ProviderConfigurationError, match="base URL"):
+        resolve_provider_connection(_config("openai/gateway-model"))
+
+
 def test_resolve_provider_connection_allows_loopback_http_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

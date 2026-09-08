@@ -16,6 +16,7 @@ from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
 from ash.providers.readiness import (
     ProviderConfigurationError,
+    normalize_provider_base_url,
     require_secure_provider_transport,
 )
 
@@ -141,6 +142,8 @@ class AnthropicProvider(ProviderABC):
         client: Any | None = None,
         token_counter: TokenCounterLike | None = None,
     ) -> None:
+        if base_url:
+            base_url = normalize_provider_base_url(base_url, provider="anthropic")
         if base_url and api_key:
             require_secure_provider_transport(base_url, provider="anthropic")
         self._model_name = model_name

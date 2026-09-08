@@ -172,10 +172,20 @@ _BUILTIN_KEY_ENV = {
 }
 
 
-def _normalize_base_url(value: object, *, provider: str) -> str:
+def normalize_provider_base_url(value: object, *, provider: str) -> str:
     base_url = str(value or "").strip().rstrip("/")
-    parsed = urlsplit(base_url)
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ProviderConfigurationError(
+            f"provider {provider!r} needs an absolute http:// or https:// base URL"
+        ) from exc
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ProviderConfigurationError(
+            f"provider {provider!r} needs an absolute http:// or https:// base URL"
+        )
+    if port is not None and not 0 < port <= 65535:
         raise ProviderConfigurationError(
             f"provider {provider!r} needs an absolute http:// or https:// base URL"
         )
@@ -242,7 +252,7 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
     if provider == "ollama":
         default = "http://localhost:11434"
         supplied = os.environ.get("OLLAMA_API_BASE")
-        base_url = _normalize_base_url(supplied or default, provider=provider)
+        base_url = normalize_provider_base_url(supplied or default, provider=provider)
         return ProviderConnection(
             provider=provider,
             model_name=model_name,
@@ -257,7 +267,7 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
     if builtin is not None:
         default, base_env, catalog_format, auth_mode = builtin
         supplied = os.environ.get(base_env)
-        base_url = _normalize_base_url(supplied or default, provider=provider)
+        base_url = normalize_provider_base_url(supplied or default, provider=provider)
         key_env = _BUILTIN_KEY_ENV.get(provider)
         if auth_mode == "none":
             api_key = ""
@@ -282,7 +292,7 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
     )
     if not isinstance(custom, dict):
         raise ProviderConfigurationError(f"unknown provider {provider!r}")
-    base_url = _normalize_base_url(custom.get("base_url"), provider=provider)
+    base_url = normalize_provider_base_url(custom.get("base_url"), provider=provider)
     key_env = str(custom.get("key_env") or "").strip()
     inline_key = str(custom.get("api_key") or "")
     declared_auth = str(custom.get("auth_mode") or "").strip().casefold()

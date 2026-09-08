@@ -14,8 +14,14 @@ import openai  # type: ignore[import-not-found]
 from ash.context.tokens import AnthropicTokenCounter
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import CanonicalToolCall, MessageInput
-from ash.providers.openai import prepare_openai_messages
-from ash.providers.readiness import require_secure_provider_transport
+from ash.providers.openai import (
+    account_openai_compatible_stream_bytes,
+    prepare_openai_messages,
+)
+from ash.providers.readiness import (
+    normalize_provider_base_url,
+    require_secure_provider_transport,
+)
 
 
 class DeepSeekProvider(ProviderABC):
@@ -36,7 +42,9 @@ class DeepSeekProvider(ProviderABC):
             )
         self._model_name = model_name
         self._api_key = api_key
-        self._base_url = base_url or "https://api.deepseek.com/v1"
+        self._base_url = normalize_provider_base_url(
+            base_url or "https://api.deepseek.com/v1", provider="deepseek"
+        )
         require_secure_provider_transport(self._base_url, provider="deepseek")
         self._token_counter = token_counter or AnthropicTokenCounter()
         self._client = openai.AsyncOpenAI(
@@ -80,10 +88,14 @@ class DeepSeekProvider(ProviderABC):
 
         partials: dict[int, Any] = {}
         completed: list[CanonicalToolCall] = []
+        stream_bytes = 0
 
         async for chunk in stream:
             delta = chunk.choices[0].delta
             content = delta.content or ""
+            stream_bytes = account_openai_compatible_stream_bytes(
+                stream_bytes, content, provider="DeepSeek"
+            )
             is_done = chunk.choices[0].finish_reason is not None
             prompt_tokens = 0
             completion_tokens = 0
@@ -98,7 +110,18 @@ class DeepSeekProvider(ProviderABC):
                             "name": tc.function.name or "",
                             "arguments": "",
                         }
+                        stream_bytes = account_openai_compatible_stream_bytes(
+                            stream_bytes, partials[idx]["id"], provider="DeepSeek"
+                        )
+                        stream_bytes = account_openai_compatible_stream_bytes(
+                            stream_bytes, partials[idx]["name"], provider="DeepSeek"
+                        )
                     if tc.function.arguments:
+                        stream_bytes = account_openai_compatible_stream_bytes(
+                            stream_bytes,
+                            tc.function.arguments,
+                            provider="DeepSeek",
+                        )
                         partials[idx]["arguments"] += tc.function.arguments
 
             if is_done:

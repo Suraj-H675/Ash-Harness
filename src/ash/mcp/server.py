@@ -47,9 +47,17 @@ class MCPServerConfig:
         if self.auth not in {"none", "oauth"}:
             raise ValueError(f"Unknown MCP auth mode: {self.auth}")
         if self.transport in {"http", "sse"}:
-            parsed = urlparse(self.resolved_url)
+            try:
+                parsed = urlparse(self.resolved_url)
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError(
+                    "MCP HTTP URLs must use http or https and include a hostname"
+                ) from exc
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 raise ValueError("MCP HTTP URLs must use http or https and include a hostname")
+            if port is not None and not 0 < port <= 65535:
+                raise ValueError("MCP HTTP URLs must include a valid port")
             if parsed.username or parsed.password or parsed.fragment:
                 raise ValueError(
                     "MCP HTTP URLs cannot contain credentials or fragments"

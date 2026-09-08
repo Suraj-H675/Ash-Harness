@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import base64
+import math
 from collections.abc import AsyncIterator
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -49,6 +50,10 @@ MAX_HTTP_SSE_EVENT_BYTES = 8 * 1024 * 1024
 MAX_BUFFERED_LEGACY_SSE_RESPONSES = 1000
 SAFE_INTEGER_BOUND = 2**53 - 1
 MAX_HTTP_SESSION_ID_BYTES = 1024
+MAX_PENDING_MCP_NOTIFICATIONS = 64
+# Keep reconnection sleeps representable on every event loop while preserving
+# arbitrarily large valid SSE retry values by waiting in multiple slices.
+MAX_SSE_RETRY_SLEEP_SLICE_MS = 2**31 - 1
 MIN_TASK_POLL_INTERVAL_SECONDS = 0.01
 MAX_TASK_POLL_INTERVAL_SECONDS = 30.0
 TASK_STATUS_NOTIFICATION = "notifications/tasks/status"
@@ -157,7 +162,12 @@ class MCPClient:
         tool_contract_validator: ToolContractValidator | None = None,
         oauth_session: MCPOAuthSession | None = None,
     ) -> None:
-        if timeout <= 0:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
             raise ValueError("MCP timeout must be positive")
         invalid_modes = set(elicitation_modes) - {"form", "url"}
         if invalid_modes:
@@ -516,6 +526,14 @@ class MCPClient:
             if future is not None and not future.done():
                 future.set_result(message)
             return
+        if (
+            "id" not in message
+            and len(self._server_tasks) >= MAX_PENDING_MCP_NOTIFICATIONS
+        ):
+            # Keep protocol-critical local state current even when optional
+            # notification-handler work is shed under peer-induced pressure.
+            self._handle_internal_notification(message)
+            return
         task = asyncio.create_task(self._handle_incoming(message))
         self._server_tasks.add(task)
         incoming_id = message.get("id") if "method" in message else None
@@ -538,6 +556,24 @@ class MCPClient:
         if not task.cancelled():
             task.exception()
 
+    def _handle_internal_notification(self, message: dict[str, Any]) -> None:
+        method = message.get("method")
+        params = message.get("params", {})
+        if not isinstance(method, str):
+            return
+        if not isinstance(params, dict):
+            params = {}
+        if method == "notifications/cancelled":
+            cancelled_id = params.get("requestId")
+            if isinstance(cancelled_id, (str, int)) and not isinstance(
+                cancelled_id, bool
+            ):
+                pending = self._incoming_requests.get(cancelled_id)
+                if pending is not None:
+                    pending.cancel()
+        if method == TASK_STATUS_NOTIFICATION:
+            self._resolve_task_status_notification(params)
+
     async def _handle_incoming(self, message: dict[str, Any]) -> None:
         method = message.get("method")
         if not isinstance(method, str):
@@ -546,16 +582,7 @@ class MCPClient:
         if not isinstance(params, dict):
             params = {}
         if "id" not in message:
-            if method == "notifications/cancelled":
-                cancelled_id = params.get("requestId")
-                if isinstance(cancelled_id, (str, int)) and not isinstance(
-                    cancelled_id, bool
-                ):
-                    pending = self._incoming_requests.get(cancelled_id)
-                    if pending is not None:
-                        pending.cancel()
-            if method == TASK_STATUS_NOTIFICATION:
-                self._resolve_task_status_notification(params)
+            self._handle_internal_notification(message)
             if self.notification_handler is not None:
                 try:
                     notification_result = self.notification_handler(method, params)
@@ -1252,7 +1279,12 @@ class MCPClient:
         ):
             raise ValueError("MCP task TTL must be a positive number of milliseconds")
         wait_timeout = task_timeout if task_timeout is not None else self.timeout
-        if isinstance(wait_timeout, bool) or wait_timeout <= 0:
+        if (
+            isinstance(wait_timeout, bool)
+            or not isinstance(wait_timeout, (int, float))
+            or not math.isfinite(wait_timeout)
+            or wait_timeout <= 0
+        ):
             raise ValueError("MCP task timeout must be positive")
         tasks_capability = self.server_capabilities.get("tasks")
         task_requests = (
@@ -1886,7 +1918,17 @@ class MCPClient:
                         event_id = ""
             except (httpx.HTTPError, MCPProtocolError):
                 pass
-            await asyncio.sleep(self._sse_retry_ms / 1000)
+            await self._sleep_sse_retry()
+
+    async def _sleep_sse_retry(self) -> None:
+        remaining_ms = self._sse_retry_ms
+        if remaining_ms <= 0:
+            await asyncio.sleep(0)
+            return
+        while remaining_ms > 0 and self._initialized:
+            slice_ms = min(remaining_ms, MAX_SSE_RETRY_SLEEP_SLICE_MS)
+            await asyncio.sleep(slice_ms / 1000)
+            remaining_ms -= slice_ms
 
     def _stop_http_events(self) -> None:
         self._sse_generation += 1

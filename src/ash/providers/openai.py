@@ -11,7 +11,29 @@ import openai  # type: ignore[import-not-found]
 from ash.context.tokens import OpenAITokenCounter
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
-from ash.providers.readiness import require_secure_provider_transport
+from ash.providers.readiness import (
+    normalize_provider_base_url,
+    require_secure_provider_transport,
+)
+
+
+MAX_OPENAI_COMPATIBLE_STREAM_BYTES = 16 * 1024 * 1024
+
+
+def account_openai_compatible_stream_bytes(
+    total: int,
+    value: str,
+    *,
+    provider: str,
+) -> int:
+    """Bound decoded response text retained from OpenAI-compatible streams."""
+
+    total += len(value.encode("utf-8"))
+    if total > MAX_OPENAI_COMPATIBLE_STREAM_BYTES:
+        raise RuntimeError(
+            f"{provider} stream exceeded {MAX_OPENAI_COMPATIBLE_STREAM_BYTES} bytes"
+        )
+    return total
 
 
 class _PartialToolCall:
@@ -100,6 +122,8 @@ class OpenAIProvider(ProviderABC):
                 "OpenAI API key is required. "
                 "Set the OPENAI_API_KEY environment variable or pass api_key."
             )
+        if base_url:
+            base_url = normalize_provider_base_url(base_url, provider="openai")
         if base_url and api_key and not allow_anonymous:
             require_secure_provider_transport(base_url, provider="openai")
         self._model_name = model_name
@@ -183,6 +207,7 @@ class OpenAIProvider(ProviderABC):
         partials: dict[int, _PartialToolCall] = {}
         # Completed native tool calls ready to emit.
         completed: list[CanonicalToolCall] = []
+        stream_bytes = 0
 
         async for chunk in stream:
             choices = getattr(chunk, "choices", None) or []
@@ -203,6 +228,9 @@ class OpenAIProvider(ProviderABC):
             choice = choices[0]
             delta = choice.delta
             content = delta.content or ""
+            stream_bytes = account_openai_compatible_stream_bytes(
+                stream_bytes, content, provider="OpenAI"
+            )
             is_done = choice.finish_reason is not None
             prompt_tokens = 0
             completion_tokens = 0
@@ -219,8 +247,19 @@ class OpenAIProvider(ProviderABC):
                             id=tc.id or f"call_{idx}",
                             name=tc.function.name or "",
                         )
+                        stream_bytes = account_openai_compatible_stream_bytes(
+                            stream_bytes, partials[idx].id, provider="OpenAI"
+                        )
+                        stream_bytes = account_openai_compatible_stream_bytes(
+                            stream_bytes, partials[idx].name, provider="OpenAI"
+                        )
                     partial = partials[idx]
                     if tc.function.arguments:
+                        stream_bytes = account_openai_compatible_stream_bytes(
+                            stream_bytes,
+                            tc.function.arguments,
+                            provider="OpenAI",
+                        )
                         partial.arguments += tc.function.arguments
 
             # On terminal chunk, finalise every partial tool call.

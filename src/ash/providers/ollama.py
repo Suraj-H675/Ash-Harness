@@ -16,6 +16,7 @@ from ash.providers.messages import (
     MessageInput,
     normalize_messages,
 )
+from ash.providers.readiness import normalize_provider_base_url
 from ash.providers.retry import ProviderHTTPError
 
 MAX_OLLAMA_METADATA_BYTES = 1_000_000
@@ -37,7 +38,7 @@ class OllamaProvider(ProviderABC):
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._model_name = model_name
-        self._base_url = base_url.rstrip("/")
+        self._base_url = normalize_provider_base_url(base_url, provider="ollama")
         self._token_counter = token_counter or AnthropicTokenCounter()
         self._client = (
             client if client is not None else httpx.AsyncClient(timeout=60.0)

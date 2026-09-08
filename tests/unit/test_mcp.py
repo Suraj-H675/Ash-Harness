@@ -345,6 +345,9 @@ def test_mcp_config_rejects_case_variant_duplicate_headers() -> None:
         "https:///missing-host",
         "https://user:password@mcp.example.test/rpc",
         "https://mcp.example.test/rpc#fragment",
+        "https://mcp.example.test:not-a-port/rpc",
+        "https://mcp.example.test:99999/rpc",
+        "https://mcp.example.test:0/rpc",
     ],
 )
 def test_mcp_http_transport_rejects_malformed_or_embedded_credential_urls(
@@ -359,6 +362,23 @@ def test_mcp_http_transport_rejects_malformed_or_embedded_credential_urls(
             transport="http",
             url=url,
         )
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf")])
+def test_mcp_client_rejects_non_finite_timeout(timeout: float) -> None:
+    config = MCPServerConfig(name="fake", command="fake", args=[], env={})
+
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        MCPClient(config, timeout=timeout)
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.asyncio
+async def test_mcp_task_call_rejects_non_finite_timeout(timeout: float) -> None:
+    client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
+
+    with pytest.raises(ValueError, match="task timeout must be positive"):
+        await client.call_tool("slow", {}, as_task=True, task_timeout=timeout)
 
 
 def test_mcp_config_rejects_unimplemented_websocket_transport() -> None:
@@ -2371,6 +2391,46 @@ async def test_http_get_stream_dispatches_events_and_honors_405() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_get_stream_handles_huge_valid_retry_without_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retry = "9" * 400
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=f"retry: {retry}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        client._initialized = False
+
+    monkeypatch.setattr(mcp_client_module.asyncio, "sleep", fake_sleep)
+    client._initialized = True
+    await client._read_http_events()
+
+    assert client._sse_retry_ms == int(retry)
+    assert sleeps == [mcp_client_module.MAX_SSE_RETRY_SLEEP_SLICE_MS / 1000]
+    await http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_http_recovers_expired_session_without_replaying_tool_call() -> None:
     trace: list[tuple[str, str | None, int | None]] = []
     initialize_count = 0
@@ -3627,6 +3687,41 @@ async def test_server_cancellation_stops_incoming_request_without_response() -> 
     await asyncio.sleep(0)
 
     client._send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mcp_bounds_pending_notification_handler_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = asyncio.Event()
+    started = 0
+
+    async def handle_notification(method: str, params: dict) -> None:
+        nonlocal started
+        started += 1
+        await gate.wait()
+
+    monkeypatch.setattr(mcp_client_module, "MAX_PENDING_MCP_NOTIFICATIONS", 2)
+    client = MCPClient(
+        MCPServerConfig(name="fake", command="fake", args=[], env={}),
+        notification_handler=handle_notification,
+    )
+    message = {
+        "jsonrpc": "2.0",
+        "method": "notifications/message",
+        "params": {"level": "info", "data": "ready"},
+    }
+
+    for _ in range(10):
+        client._dispatch_incoming(message)
+    await asyncio.sleep(0)
+
+    assert started == 2
+    assert len(client._server_tasks) == 2
+    gate.set()
+    await asyncio.gather(*tuple(client._server_tasks))
+    await asyncio.sleep(0)
+    assert client._server_tasks == set()
 
 
 DYNAMIC_MCP_SERVER = r"""
