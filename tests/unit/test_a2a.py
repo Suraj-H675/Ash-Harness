@@ -46,6 +46,7 @@ from ash.server.a2a import (
     MAX_A2A_BODY_BYTES,
     MAX_A2A_INPUT_BYTES,
     A2ASessionRegistry,
+    _create_a2a_task_engine,
     _request_text,
     create_a2a_app,
 )
@@ -71,6 +72,94 @@ class FakeAshClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+def test_a2a_registry_rejects_linked_database_file_and_parent(tmp_path: Path) -> None:
+    import sqlite3
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = tmp_path / "target.db"
+    with sqlite3.connect(target) as connection:
+        connection.execute("CREATE TABLE marker(value TEXT)")
+    linked_file = tmp_path / "a2a_sessions.db"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked-db"
+    try:
+        linked_file.symlink_to(target)
+        linked_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    for database in (linked_file, linked_parent / "a2a_sessions.db"):
+        with pytest.raises(ValueError, match="symlink or junction"):
+            A2ASessionRegistry(database, workspace)
+
+    assert not (outside / "a2a_sessions.db").exists()
+    with sqlite3.connect(target) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name='ash_context_sessions'"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_a2a_task_engine_rechecks_link_before_lazy_connect(tmp_path: Path) -> None:
+    import sqlite3
+
+    database = tmp_path / "a2a_tasks.db"
+    target = tmp_path / "target.db"
+    engine = _create_a2a_task_engine(database)
+    try:
+        with sqlite3.connect(target) as connection:
+            connection.execute("CREATE TABLE marker(value TEXT)")
+        try:
+            database.symlink_to(target)
+        except OSError as exc:
+            pytest.skip(f"symlinks are unavailable: {exc}")
+
+        with pytest.raises(ValueError, match="symlink or junction"):
+            async with engine.begin():
+                pass
+    finally:
+        await engine.dispose()
+
+    with sqlite3.connect(target) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tasks'"
+        ).fetchone()[0] == 0
+
+
+def test_a2a_default_task_store_rejects_preexisting_linked_database(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    workspace = tmp_path / "workspace"
+    database_dir = tmp_path / "db"
+    workspace.mkdir()
+    database_dir.mkdir()
+    target = tmp_path / "target.db"
+    with sqlite3.connect(target) as connection:
+        connection.execute("CREATE TABLE marker(value TEXT)")
+    try:
+        (database_dir / "a2a_tasks.db").symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=database_dir,
+        memory_backend="off",
+    )
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        create_a2a_app(
+            config,
+            public_url="https://testserver",
+            bearer_token="0123456789abcdef",
+        )
 
 
 def test_a2a_request_text_stops_reading_parts_after_input_limit() -> None:

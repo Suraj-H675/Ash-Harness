@@ -101,6 +101,31 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
         }
 
 
+def test_session_store_rejects_linked_database_file_and_parent(tmp_path: Path) -> None:
+    target = tmp_path / "target.db"
+    with sqlite3.connect(target) as connection:
+        connection.execute("CREATE TABLE marker(value TEXT)")
+    linked_file = tmp_path / "sessions.db"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked-db"
+    try:
+        linked_file.symlink_to(target)
+        linked_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    for database in (linked_file, linked_parent / "sessions.db"):
+        with pytest.raises(SessionStorageError, match="symlink or junction"):
+            SessionStore(database)
+
+    assert not (outside / "sessions.db").exists()
+    with sqlite3.connect(target) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sessions'"
+        ).fetchone()[0] == 0
+
+
 def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     db_path = tmp_path / "legacy.db"
     with sqlite3.connect(db_path) as conn:

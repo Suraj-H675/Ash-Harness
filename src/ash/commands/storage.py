@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from ash.core.session import CURRENT_SCHEMA_VERSION, SessionStorageError, SessionStore
 from ash.core.redaction import redact_text
+from ash.safe_io import validate_unlinked_file_path
 from ash.safety.environment import resolve_host_executable
 
 
@@ -95,8 +96,11 @@ def restore_database(
 
     if not confirmed:
         raise SessionStorageError("Restore requires explicit confirmation")
-    database = Path(path).expanduser().resolve()
-    backup_path = Path(backup).expanduser().resolve()
+    try:
+        database = validate_unlinked_file_path(path, label="session database")
+        backup_path = validate_unlinked_file_path(backup, label="session backup")
+    except ValueError as exc:
+        raise SessionStorageError(str(exc)) from exc
     if database == backup_path:
         raise SessionStorageError("Backup and destination must differ")
     check = check_database(backup_path)
@@ -106,6 +110,11 @@ def restore_database(
         )
 
     database.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        database = validate_unlinked_file_path(database, label="session database")
+        backup_path = validate_unlinked_file_path(backup_path, label="session backup")
+    except ValueError as exc:
+        raise SessionStorageError(str(exc)) from exc
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     preserved: list[Path] = []
     for current in (database, Path(f"{database}-wal"), Path(f"{database}-shm")):
@@ -119,6 +128,11 @@ def restore_database(
 
     temporary = database.with_name(f".{database.name}.restore-{uuid4().hex}.tmp")
     try:
+        try:
+            validate_unlinked_file_path(database, label="session database")
+            validate_unlinked_file_path(backup_path, label="session backup")
+        except ValueError as exc:
+            raise SessionStorageError(str(exc)) from exc
         shutil.copy2(backup_path, temporary)
         _restrict(temporary)
         temporary_check = check_database(temporary)
@@ -129,6 +143,10 @@ def restore_database(
             )
         for sidecar in (Path(f"{database}-wal"), Path(f"{database}-shm")):
             sidecar.unlink(missing_ok=True)
+        try:
+            validate_unlinked_file_path(database, label="session database")
+        except ValueError as exc:
+            raise SessionStorageError(str(exc)) from exc
         os.replace(temporary, database)
         _restrict(database)
     finally:

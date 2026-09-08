@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import aiosqlite
 from a2a.auth.user import User
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.context import ServerCallContext
@@ -54,6 +55,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Message as ASGIMessage, Receive, Scope, Send
 
 from ash.sdk import AshClient
+from ash.safe_io import validate_unlinked_file_path
 from ash.config import AshConfig
 from ash.core.redaction import redact_text
 from ash.core.session import normalize_project_path
@@ -232,11 +234,16 @@ class A2ASessionRegistry:
     """Durably map opaque A2A context IDs to project-scoped Ash sessions."""
 
     def __init__(self, db_path: Path, workspace: Path) -> None:
-        self.db_path = db_path
+        self.db_path = validate_unlinked_file_path(
+            db_path, label="A2A session registry database"
+        )
         self.workspace = normalize_project_path(workspace)
         self._lock = asyncio.Lock()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(db_path)) as conn, conn:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path = validate_unlinked_file_path(
+            self.db_path, label="A2A session registry database"
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ash_context_sessions (
@@ -251,7 +258,10 @@ class A2ASessionRegistry:
     async def get(self, context_id: str) -> str | None:
         _validate_context_id(context_id)
         async with self._lock:
-            with closing(sqlite3.connect(self.db_path)) as conn:
+            database = validate_unlinked_file_path(
+                self.db_path, label="A2A session registry database"
+            )
+            with closing(sqlite3.connect(database)) as conn:
                 row = conn.execute(
                     "SELECT session_id, project_path FROM ash_context_sessions "
                     "WHERE context_id = ?",
@@ -268,7 +278,10 @@ class A2ASessionRegistry:
         if not session_id or len(session_id.encode("utf-8")) > 512:
             raise ValueError("invalid Ash session ID")
         async with self._lock:
-            with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            database = validate_unlinked_file_path(
+                self.db_path, label="A2A session registry database"
+            )
+            with closing(sqlite3.connect(database)) as conn, conn:
                 count = conn.execute(
                     "SELECT COUNT(*) FROM ash_context_sessions"
                 ).fetchone()[0]
@@ -293,6 +306,23 @@ class A2ASessionRegistry:
                     "(context_id, session_id, project_path) VALUES (?, ?, ?)",
                     (context_id, session_id, self.workspace),
                 )
+
+
+def _create_a2a_task_engine(db_path: Path) -> AsyncEngine:
+    """Create the SDK task engine with link checks at each new connection."""
+
+    database = validate_unlinked_file_path(db_path, label="A2A task database")
+    database.parent.mkdir(parents=True, exist_ok=True)
+    database = validate_unlinked_file_path(database, label="A2A task database")
+
+    async def connect() -> aiosqlite.Connection:
+        current = validate_unlinked_file_path(database, label="A2A task database")
+        return await aiosqlite.connect(current)
+
+    return create_async_engine(
+        f"sqlite+aiosqlite:///{database}",
+        async_creator=connect,
+    )
 
 
 class AshA2AExecutor(AgentExecutor):
@@ -427,8 +457,7 @@ def create_a2a_app(
     mapping_db_path = config.db_directory / "a2a_sessions.db"
     engine: AsyncEngine | None = None
     if task_store is None:
-        task_db_path.parent.mkdir(parents=True, exist_ok=True)
-        engine = create_async_engine(f"sqlite+aiosqlite:///{task_db_path}")
+        engine = _create_a2a_task_engine(task_db_path)
         task_store = DatabaseTaskStore(engine)
     registry = A2ASessionRegistry(mapping_db_path, config.workspace_root)
     card = build_agent_card(base_url)

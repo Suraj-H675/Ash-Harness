@@ -53,6 +53,17 @@ def validate_unlinked_path(
     return target
 
 
+def validate_unlinked_file_path(path: str | Path, *, label: str) -> Path:
+    """Reject a linked file or immediate parent while preserving wider path aliases."""
+
+    target = Path(os.path.abspath(Path(path).expanduser()))
+    return validate_unlinked_path(
+        target,
+        trusted_root=target.parent.parent,
+        label=label,
+    )
+
+
 def read_bounded_bytes(
     path: str | Path,
     max_bytes: int,

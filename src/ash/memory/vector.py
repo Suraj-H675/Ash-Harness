@@ -30,6 +30,7 @@ from typing import Any, Iterable, Sequence
 from ash.context.compaction import Chunk
 from ash.core.redaction import redact_text
 from ash.memory.fts5 import FTS5Index, query_lexical_fallback
+from ash.safe_io import validate_unlinked_file_path
 
 
 # ---------------------------------------------------------------------------
@@ -589,8 +590,8 @@ def fts5_query(
     so the vector module is self-contained for tests and ad-hoc scripts.
     """
 
-    db_path_str = str(Path(db_path).expanduser())
-    conn = sqlite3.connect(db_path_str)
+    database = validate_unlinked_file_path(db_path, label="FTS5 memory database")
+    conn = sqlite3.connect(database)
     conn.row_factory = sqlite3.Row
     try:
         return query_lexical_fallback(conn, query_text, limit=top_k)
@@ -769,7 +770,11 @@ class VectorSearchPipeline:
                 return vector_records[:limit]
         lexical = self._lexical_index
         if isinstance(lexical, FTS5FallbackIndex):
-            with closing(sqlite3.connect(str(lexical._index.db_path))) as connection:
+            database = validate_unlinked_file_path(
+                lexical._index.db_path,
+                label="FTS5 memory database",
+            )
+            with closing(sqlite3.connect(database)) as connection:
                 connection.row_factory = sqlite3.Row
                 rows = connection.execute(
                     """

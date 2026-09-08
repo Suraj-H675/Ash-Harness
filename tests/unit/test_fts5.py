@@ -160,6 +160,31 @@ def test_fts5_init_creates_virtual_and_metadata_tables(tmp_path: Path) -> None:
     assert "document_metadata" in table_names
 
 
+def test_fts5_index_rejects_linked_database_file_and_parent(tmp_path: Path) -> None:
+    target = tmp_path / "target.db"
+    with closing(get_db_connection(target)) as connection, connection:
+        connection.execute("CREATE TABLE marker(value TEXT)")
+    linked_file = tmp_path / "fts5.db"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked-db"
+    try:
+        linked_file.symlink_to(target)
+        linked_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    for database in (linked_file, linked_parent / "fts5.db"):
+        with pytest.raises(ValueError, match="symlink or junction"):
+            FTS5Index(database)
+
+    assert not (outside / "fts5.db").exists()
+    with closing(get_db_connection(target)) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='fts_index'"
+        ).fetchone()[0] == 0
+
+
 def test_fts5_index_document_inserts_chunks(fts5_index: FTS5Index) -> None:
     chunks = _chunks(
         "src/app.py",

@@ -18,7 +18,7 @@ from typing import Any, Literal, Sequence
 
 from ash.core.events import envelope_event
 from ash.core.redaction import redact_text
-from ash.safe_io import strict_json_loads
+from ash.safe_io import strict_json_loads, validate_unlinked_file_path
 
 TaskState = Literal[
     "queued",
@@ -138,7 +138,12 @@ class AgentTaskStore:
     """SQLite task scheduler with atomic claims and renewable ownership leases."""
 
     def __init__(self, db_path: Path | str, *, busy_timeout_ms: int = 5000) -> None:
-        self.db_path = str(Path(db_path).expanduser().resolve())
+        try:
+            self.db_path = str(
+                validate_unlinked_file_path(db_path, label="agent task database")
+            )
+        except ValueError as exc:
+            raise AgentTaskError(str(exc)) from exc
         self._conn = sqlite3.connect(
             self.db_path,
             check_same_thread=False,

@@ -80,6 +80,29 @@ def test_restore_refuses_unconfirmed_or_invalid_backup(tmp_path: Path) -> None:
         restore_database(path, backup, confirmed=True)
 
 
+def test_restore_rejects_linked_database_destination(tmp_path: Path) -> None:
+    target = tmp_path / "target.db"
+    target_store = SessionStore(target)
+    current = target_store.create_session("/current")
+    backup = tmp_path / "backup.db"
+    backup_store = SessionStore(backup)
+    replacement = backup_store.create_session("/backup")
+    linked = tmp_path / "sessions.db"
+    try:
+        linked.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(SessionStorageError, match="symlink or junction"):
+        restore_database(linked, backup, confirmed=True)
+
+    session_ids = {
+        item.session_id for item in SessionStore(target).list_sessions(limit=10)
+    }
+    assert current.session_id in session_ids
+    assert replacement.session_id not in session_ids
+
+
 def test_debug_bundle_is_bounded_json_and_restricted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

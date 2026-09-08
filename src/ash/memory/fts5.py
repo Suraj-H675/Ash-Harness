@@ -10,6 +10,7 @@ from typing import Any, Iterable, Sequence
 
 from ash.context.compaction import Chunk
 from ash.core.session import get_db_connection
+from ash.safe_io import validate_unlinked_file_path
 
 
 DEFAULT_QUERY_LIMIT = 5
@@ -20,7 +21,9 @@ class FTS5Index:
     """Manage an FTS5 virtual table that indexes chunked workspace documents."""
 
     def __init__(self, db_path: str | Path) -> None:
-        self.db_path = str(Path(db_path).expanduser().resolve())
+        self.db_path = str(
+            validate_unlinked_file_path(db_path, label="FTS5 memory database")
+        )
         self._init_db()
 
     def _init_db(self) -> None:

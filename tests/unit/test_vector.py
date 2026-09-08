@@ -256,6 +256,19 @@ def test_fts5_query_helper_returns_rows(tmp_path: Path) -> None:
     assert any("hello" in str(row.get("content", "")) for row in rows)
 
 
+def test_fts5_query_helper_rejects_linked_database(tmp_path: Path) -> None:
+    target = tmp_path / "target.db"
+    FTS5Index(target)
+    linked = tmp_path / "fts-link.db"
+    try:
+        linked.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        fts5_query(linked, "hello")
+
+
 # ---------------------------------------------------------------------------
 # VectorSearchPipeline
 # ---------------------------------------------------------------------------
@@ -449,3 +462,35 @@ def test_pipeline_export_is_bounded_and_redacted(tmp_path: Path) -> None:
     assert len(exported["records"]) == 1
     assert secret not in json.dumps(exported)
     assert "[REDACTED" in json.dumps(exported)
+
+
+def test_pipeline_export_rejects_lexical_database_link_swap(tmp_path: Path) -> None:
+    database = tmp_path / "export.db"
+    target = tmp_path / "outside.db"
+    lexical = FTS5Index(database)
+    outside = FTS5Index(target)
+    outside.index_document(
+        "private.txt",
+        [
+            Chunk(
+                file_path="private.txt",
+                start_line=1,
+                end_line=1,
+                content="outside-secret-marker",
+            )
+        ],
+    )
+    pipeline = VectorSearchPipeline(
+        adapter=DeterministicEmbedding(),
+        vector_index=InMemoryVectorIndex(),
+        lexical_index=FTS5FallbackIndex(lexical),
+        vector_enabled=False,
+    )
+    database.unlink()
+    try:
+        database.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        pipeline.export(limit=10)

@@ -28,6 +28,7 @@ from ash.automation.models import (
 from ash.automation.schedules import first_fire_time, next_fire_time
 from ash.core.events import EventContext, envelope_event
 from ash.core.redaction import redact_text
+from ash.safe_io import validate_unlinked_file_path
 
 
 MAX_JOB_NAME_BYTES = 256
@@ -68,8 +69,15 @@ class AutomationStore:
         busy_timeout_ms: int = 5000,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        self.db_path = str(Path(db_path).expanduser().resolve())
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            database = validate_unlinked_file_path(db_path, label="automation database")
+            database.parent.mkdir(parents=True, exist_ok=True)
+            database = validate_unlinked_file_path(
+                database, label="automation database"
+            )
+        except ValueError as exc:
+            raise AutomationError(str(exc)) from exc
+        self.db_path = str(database)
         self._clock = clock
         self._lock = threading.RLock()
         self._closed = False

@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
 from typing import Any
 
-from ash.core.session import SessionStore
+from ash.core.session import SessionStore, get_db_connection
 from ash.core.sprint import ChecklistStatus
 
 
@@ -45,8 +44,7 @@ def list_plans(
         raise ValueError("limit must be positive")
     where = "" if all_projects else "WHERE sessions.project_path = ?"
     params: tuple[Any, ...] = (limit,) if all_projects else (project_path, limit)
-    with closing(sqlite3.connect(store.db_path)) as conn:
-        conn.row_factory = sqlite3.Row
+    with closing(get_db_connection(store.db_path)) as conn:
         rows = conn.execute(
             f"""
             SELECT
@@ -117,8 +115,7 @@ def update_plan_item(
 
 
 def _plan_session_id(store: SessionStore, sprint_id: str) -> str:
-    with closing(sqlite3.connect(store.db_path)) as conn:
-        conn.row_factory = sqlite3.Row
+    with closing(get_db_connection(store.db_path)) as conn:
         row = conn.execute(
             "SELECT session_id FROM sprints WHERE sprint_id = ?",
             (sprint_id,),

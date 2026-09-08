@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from ash.safe_io import read_bounded_text, strict_json_loads, validate_unlinked_path
+from ash.safe_io import (
+    read_bounded_text,
+    strict_json_loads,
+    validate_unlinked_file_path,
+    validate_unlinked_path,
+)
 
 
 def test_strict_json_loads_accepts_standard_json() -> None:
@@ -62,3 +67,23 @@ def test_validate_unlinked_path_rejects_link_component(tmp_path: Path) -> None:
             trusted_root=tmp_path,
             label="test state",
         )
+
+
+def test_validate_unlinked_file_path_rejects_leaf_and_parent_links(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.db"
+    target.touch()
+    linked_file = tmp_path / "linked.db"
+    linked_parent = tmp_path / "linked-parent"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        linked_file.symlink_to(target)
+        linked_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    for path in (linked_file, linked_parent / "state.db"):
+        with pytest.raises(ValueError, match="symlink or junction"):
+            validate_unlinked_file_path(path, label="test database")

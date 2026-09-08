@@ -62,6 +62,34 @@ def test_schedule_validation_and_named_timezone() -> None:
         build_schedule(at=now.isoformat(), now=now)
 
 
+def test_automation_store_rejects_linked_database_file_and_parent(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.db"
+    with sqlite3.connect(target) as connection:
+        connection.execute("CREATE TABLE marker(value TEXT)")
+    linked_file = tmp_path / "automations.db"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked-db"
+    try:
+        linked_file.symlink_to(target)
+        linked_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    for database in (linked_file, linked_parent / "automations.db"):
+        with pytest.raises(AutomationError, match="symlink or junction"):
+            AutomationStore(database)
+
+    assert not (outside / "automations.db").exists()
+    with sqlite3.connect(target) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name='automation_jobs'"
+        ).fetchone()[0] == 0
+
+
 @pytest.mark.asyncio
 async def test_subprocess_runner_rechecks_workspace_trust(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

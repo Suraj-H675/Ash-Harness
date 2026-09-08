@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from ash.cli import main
 from ash.commands.plans import (
     list_plans,
@@ -12,7 +14,7 @@ from ash.commands.plans import (
     show_plan,
     update_plan_item,
 )
-from ash.core.session import SessionStore
+from ash.core.session import SessionStorageError, SessionStore
 from ash.core.sprint import (
     ChecklistItem,
     ChecklistStatus,
@@ -45,6 +47,22 @@ def test_plan_summary_renderer_emits_json(tmp_path: Path) -> None:
     assert payload["plans"][0]["goal"] == "ship feature"
     assert payload["plans"][0]["total_items"] == 2
     assert payload["plans"][0]["completed_items"] == 0
+
+
+def test_plan_list_rejects_session_database_link_swap(tmp_path: Path) -> None:
+    database = tmp_path / "sessions.db"
+    outside_database = tmp_path / "outside.db"
+    store = SessionStore(database)
+    outside = SessionStore(outside_database)
+    _save_plan(outside, tmp_path / "outside", "outside-secret-plan")
+    database.unlink()
+    try:
+        database.symlink_to(outside_database)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(SessionStorageError, match="symlink or junction"):
+        list_plans(store, project_path=str(tmp_path), all_projects=True)
 
 
 def test_plan_show_and_update_renderers_emit_json(tmp_path: Path) -> None:

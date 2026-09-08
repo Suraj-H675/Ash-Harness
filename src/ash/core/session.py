@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from ash.safe_io import strict_json_loads
+from ash.safe_io import strict_json_loads, validate_unlinked_file_path
 
 
 Role = Literal["system", "user", "assistant", "tool"]
@@ -143,7 +143,10 @@ _db_write_locks_guard = threading.Lock()
 
 
 def _normalize_db_path(db_path: str | Path) -> str:
-    return str(Path(db_path).expanduser().resolve())
+    try:
+        return str(validate_unlinked_file_path(db_path, label="session database"))
+    except ValueError as exc:
+        raise SessionStorageError(str(exc)) from exc
 
 
 def normalize_project_path(project_path: str | Path) -> str:
@@ -261,8 +264,9 @@ def _restrict_file_permissions(path: Path) -> None:
 def get_db_connection(db_path: str | Path) -> sqlite3.Connection:
     """Open a SQLite connection configured for WAL persistence."""
 
-    normalized_path = Path(db_path).expanduser()
+    normalized_path = Path(_normalize_db_path(db_path))
     normalized_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized_path = Path(_normalize_db_path(normalized_path))
 
     conn = sqlite3.connect(normalized_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row

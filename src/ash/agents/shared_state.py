@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ash.agents.tasks import AgentTaskStore
+from ash.safe_io import validate_unlinked_file_path
 
 
 # --- public type aliases ---------------------------------------------------
@@ -81,8 +82,12 @@ class SharedState:
     """SQLite-backed coordination layer with WAL concurrency."""
 
     def __init__(self, db_path: Path | str, *, busy_timeout_ms: int = 5000) -> None:
-        self.db_path = str(Path(db_path).expanduser().resolve())
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        database = validate_unlinked_file_path(db_path, label="agent shared-state database")
+        database.parent.mkdir(parents=True, exist_ok=True)
+        database = validate_unlinked_file_path(
+            database, label="agent shared-state database"
+        )
+        self.db_path = str(database)
         # check_same_thread=False because the connection is used by the
         # orchestrator thread and any spawned subagent threads.
         self._conn = sqlite3.connect(

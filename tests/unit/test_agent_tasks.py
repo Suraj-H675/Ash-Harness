@@ -14,6 +14,43 @@ from ash.agents.tasks import (
 )
 
 
+def test_agent_state_stores_reject_linked_database_file_and_parent(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    from ash.agents.tasks import AgentTaskStore
+
+    target = tmp_path / "target.db"
+    with sqlite3.connect(target) as connection:
+        connection.execute("CREATE TABLE marker(value TEXT)")
+    linked_file = tmp_path / "agents.db"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked-db"
+    try:
+        linked_file.symlink_to(target)
+        linked_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    for store_type in (SharedState, AgentTaskStore):
+        for database in (linked_file, linked_parent / "agents.db"):
+            with pytest.raises((ValueError, AgentTaskError), match="symlink or junction"):
+                store_type(database)
+
+    assert not (outside / "agents.db").exists()
+    with sqlite3.connect(target) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert "agent_status" not in tables
+    assert "agent_tasks" not in tables
+
+
 def test_durable_task_json_rejects_duplicate_fields() -> None:
     with pytest.raises(ValueError, match="duplicate JSON object key"):
         _json_object('{"graph_id":"safe","graph_id":"override"}')
