@@ -16,12 +16,14 @@ MAX_JSONRPC_SESSION_LIST_LIMIT = 100
 MAX_JSONRPC_EVENT_LIST_LIMIT = 10_000
 MAX_JSONRPC_BRANCH_NAME_CHARS = 128
 MAX_JSONRPC_BRANCH_SUMMARY_CHARS = 12_000
+MAX_PENDING_JSONRPC_NOTIFICATIONS = 64
 
 
 class JSONRPCServer:
     def __init__(self, client: AshClient) -> None:
         self.client = client
         self._pending: dict[str | int, asyncio.Future[Any]] = {}
+        self._notification_tasks: set[asyncio.Future[Any]] = set()
         self._turn_lock = asyncio.Lock()
         self._methods: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
             "initialize": self._initialize,
@@ -63,7 +65,11 @@ class JSONRPCServer:
                 else _error(request_id, -32601, f"Method not found: {method}")
             )
         if request_id is None:
-            asyncio.ensure_future(handler(params))
+            if len(self._notification_tasks) >= MAX_PENDING_JSONRPC_NOTIFICATIONS:
+                return None
+            notification_task = asyncio.ensure_future(handler(params))
+            self._notification_tasks.add(notification_task)
+            notification_task.add_done_callback(self._finish_notification)
             return None
         task: asyncio.Future[Any] = asyncio.ensure_future(handler(params))
         self._pending[request_id] = task
@@ -91,12 +97,22 @@ class JSONRPCServer:
         task.cancel()
         return True
 
-    async def close(self) -> None:
+    def _finish_notification(self, task: asyncio.Future[Any]) -> None:
+        self._notification_tasks.discard(task)
+        if task.cancelled():
+            return
+        # Notifications cannot receive an error response. Retrieve failures so
+        # malformed/failed notification work cannot become an unhandled task.
+        task.exception()
+
+    async def close(self, *, close_client: bool = True) -> None:
         tasks = list(self._pending.values())
-        for task in tasks:
+        notification_tasks = list(self._notification_tasks)
+        for task in (*tasks, *notification_tasks):
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await self.client.close()
+        await asyncio.gather(*tasks, *notification_tasks, return_exceptions=True)
+        if close_client:
+            await self.client.close()
 
     async def _initialize(self, params: dict[str, Any]) -> dict[str, Any]:
         return {

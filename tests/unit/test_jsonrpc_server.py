@@ -317,3 +317,47 @@ async def test_jsonrpc_cancellation() -> None:
     assert server.cancel("slow") is True
     response = await pending
     assert response["error"]["code"] == -32800
+
+
+@pytest.mark.asyncio
+async def test_jsonrpc_bounds_and_cancels_notification_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient()
+    started = asyncio.Event()
+    cancelled = 0
+
+    async def slow(_text: str) -> AshResult:
+        nonlocal cancelled
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled += 1
+            raise
+
+    client.prompt = slow
+    monkeypatch.setattr("ash.server.jsonrpc.MAX_PENDING_JSONRPC_NOTIFICATIONS", 4)
+    server = JSONRPCServer(client)  # type: ignore[arg-type]
+
+    for index in range(10):
+        response = await server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "method": "turn/run",
+                "params": {"input": f"notification {index}"},
+            }
+        )
+        assert response is None
+
+    await started.wait()
+    await asyncio.sleep(0)
+    assert len(server._notification_tasks) == 4
+    assert server._pending == {}
+    notification_tasks = tuple(server._notification_tasks)
+
+    await server.close(close_client=False)
+
+    assert server._notification_tasks == set()
+    assert all(task.done() for task in notification_tasks)
+    assert cancelled == 1

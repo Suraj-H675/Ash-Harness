@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 import httpx
@@ -344,6 +345,55 @@ async def test_http_jsonrpc_runs_requests_and_returns_notification_ack() -> None
     }
     assert notification.status_code == 204
     assert notification.content == b""
+
+
+@pytest.mark.asyncio
+async def test_http_lifespan_cancels_jsonrpc_notifications_without_owning_client() -> None:
+    client = FakeClient()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    closed = False
+
+    async def slow_prompt(_text: str) -> AshResult:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def close() -> None:
+        nonlocal closed
+        closed = True
+
+    client.prompt = slow_prompt
+    client.close = close
+    app = create_app(
+        client,  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+        close_client_on_shutdown=False,
+    )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as http:
+            response = await http.post(
+                "/rpc",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "turn/run",
+                    "params": {"input": "wait"},
+                },
+                headers=headers,
+            )
+            assert response.status_code == 204
+            await started.wait()
+
+    assert cancelled.is_set()
+    assert closed is False
 
 
 @pytest.mark.asyncio

@@ -159,9 +159,10 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.ash_client = client
-        yield
-        if close_client_on_shutdown:
-            await client.close()
+        try:
+            yield
+        finally:
+            await rpc.close(close_client=close_client_on_shutdown)
 
     app = FastAPI(title="Ash API", version="1", lifespan=lifespan)
     app.add_middleware(_BoundedRequestBodyMiddleware, max_bytes=MAX_HTTP_BODY_BYTES)
