@@ -61,6 +61,20 @@ def test_custom_command_catalog_reports_duplicate_names(tmp_path) -> None:
     assert "duplicate command name" in catalog.errors[str(second)]
 
 
+def test_custom_command_catalog_rejects_duplicate_metadata_keys(tmp_path) -> None:
+    root = tmp_path / "commands"
+    path = root / "ambiguous.md"
+    root.mkdir()
+    path.write_text(
+        "---\nname: safe\nname: override\n---\nRun this prompt.\n",
+        encoding="utf-8",
+    )
+    catalog = CustomCommandCatalog(((root, "user"),))
+
+    assert catalog.discover() == []
+    assert "duplicate command metadata key: 'name'" in catalog.errors[str(path)]
+
+
 def test_custom_command_catalog_rejects_direct_linked_command(tmp_path: Path) -> None:
     target = tmp_path / "target.md"
     target.write_text("Run this prompt.", encoding="utf-8")

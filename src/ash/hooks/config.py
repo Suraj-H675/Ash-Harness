@@ -48,6 +48,7 @@ LIFECYCLE_EVENTS: tuple[HookEvent, ...] = (
     "permission_changed",
     "tool_error",
 )
+HOOK_CONFIG_EVENTS = frozenset({"pre_tool", "post_tool", "session_start", *LIFECYCLE_EVENTS})
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,12 @@ def load_command_hooks(
         payload = strict_json_loads(raw)
         if not isinstance(payload, dict):
             raise ValueError(f"Hook config must be an object: {path}")
+        unknown_events = set(payload) - HOOK_CONFIG_EVENTS
+        if unknown_events:
+            raise ValueError(
+                f"Hook config contains unknown events in {path}: "
+                + ", ".join(sorted(str(event) for event in unknown_events))
+            )
         for item in _entries(payload, "pre_tool", path):
             matcher, command = _parse(item, path)
 

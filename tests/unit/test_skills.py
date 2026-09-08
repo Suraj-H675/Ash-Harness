@@ -152,6 +152,34 @@ def test_parse_markdown_skill_rejects_duplicate_arguments(tmp_path: Path) -> Non
         parse_markdown_skill(path)
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["bad name", "éxecute", "1starts_digit", "x" * 65],
+)
+def test_parse_markdown_skill_rejects_nonportable_name(
+    tmp_path: Path, name: str
+) -> None:
+    path = tmp_path / "invalid-name.md"
+    path.write_text(
+        textwrap.dedent(
+            f"""\
+            ---
+            name: {name}
+            ---
+            ## Code
+            ```python
+            async def execute(context):
+                return "ok"
+            ```
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillParseError, match="skill name must"):
+        parse_markdown_skill(path)
+
+
 def test_parse_markdown_skill_falls_back_to_h1(tmp_path: Path) -> None:
     md = textwrap.dedent(
         """\
@@ -233,6 +261,22 @@ def test_parse_python_skill_rejects_duplicate_metadata(tmp_path: Path) -> None:
     )
 
     with pytest.raises(SkillParseError, match="Duplicate Python skill metadata"):
+        parse_python_skill(path)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["bad name", "éxecute", "1starts_digit", "_private", "x" * 65],
+)
+def test_parse_python_skill_rejects_nonportable_name(tmp_path: Path, name: str) -> None:
+    path = tmp_path / "invalid_name.py"
+    path.write_text(
+        f'"""\nname: {name}\n"""\n'
+        "async def execute(context):\n    return 'ok'\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillParseError, match="skill name must"):
         parse_python_skill(path)
 
 
@@ -767,11 +811,15 @@ def test_registry_reload_uses_current_source_when_timestamp_and_size_match(
     assert asyncio.run(reloaded.run()).output == "third"
 
 
-def test_write_python_skill_rejects_invalid_name(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "name",
+    ["not-valid", "éxecute", "1starts_digit", "_private", "x" * 65],
+)
+def test_write_python_skill_rejects_invalid_name(tmp_path: Path, name: str) -> None:
     with pytest.raises(ValueError):
         write_python_skill(
             tmp_path,
-            name="not-valid",
+            name=name,
             description="x",
             trigger="x",
             body="async def execute(context): pass",

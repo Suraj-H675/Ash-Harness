@@ -27,6 +27,29 @@ MAX_PLUGIN_RUNTIME_TOOLS = 64
 PLUGIN_TOOL_NAME_MAX_LENGTH = 64
 
 
+def _aliased_value(
+    data: Mapping[str, Any],
+    camel_name: str,
+    snake_name: str,
+    default: Any = None,
+) -> Any:
+    """Read one compatibility alias while rejecting conflicting declarations."""
+
+    if camel_name in data and snake_name in data:
+        camel_value = data[camel_name]
+        snake_value = data[snake_name]
+        if camel_value != snake_value:
+            raise ValueError(
+                f"conflicting plugin fields {camel_name!r} and {snake_name!r}"
+            )
+        return camel_value
+    if camel_name in data:
+        return data[camel_name]
+    if snake_name in data:
+        return data[snake_name]
+    return default
+
+
 def namespaced_plugin_tool_name(plugin_name: str, tool_name: str) -> str:
     """Build an injective, provider-portable executable plugin tool name."""
 
@@ -61,16 +84,24 @@ class PluginRuntimeManifest:
             raise ValueError("plugin runtime command must be a non-empty argv list")
         if len(command) > 128 or any(len(part) > 4096 for part in command):
             raise ValueError("plugin runtime command is too large")
-        protocol_version = data.get(
+        protocol_version = _aliased_value(
+            data,
             "protocolVersion",
-            data.get("protocol_version", PLUGIN_RUNTIME_PROTOCOL_VERSION),
+            "protocol_version",
+            PLUGIN_RUNTIME_PROTOCOL_VERSION,
         )
-        if protocol_version != PLUGIN_RUNTIME_PROTOCOL_VERSION:
+        if (
+            not isinstance(protocol_version, int)
+            or isinstance(protocol_version, bool)
+            or protocol_version != PLUGIN_RUNTIME_PROTOCOL_VERSION
+        ):
             raise ValueError(
-                "plugin runtime protocolVersion must be "
+                "plugin runtime protocolVersion must be integer "
                 f"{PLUGIN_RUNTIME_PROTOCOL_VERSION}"
             )
-        timeout_seconds = data.get("timeoutSeconds", data.get("timeout_seconds", 30))
+        timeout_seconds = _aliased_value(
+            data, "timeoutSeconds", "timeout_seconds", 30
+        )
         if (
             not isinstance(timeout_seconds, (int, float))
             or isinstance(timeout_seconds, bool)
@@ -94,7 +125,7 @@ class PluginToolManifest:
             raise ValueError("plugin tool declarations must be objects")
         name = data.get("name")
         description = data.get("description")
-        schema = data.get("inputSchema", data.get("input_schema"))
+        schema = _aliased_value(data, "inputSchema", "input_schema")
         if not isinstance(name, str) or not PLUGIN_TOOL_NAME.fullmatch(name):
             raise ValueError(
                 "plugin tool name must start with a letter and contain only "
@@ -145,11 +176,13 @@ class PluginManifest:
     def from_dict(cls, data: dict[str, Any]) -> PluginManifest:
         if not isinstance(data, dict):
             raise ValueError("plugin manifest must be a JSON object")
-        raw_schema_version = data.get(
+        raw_schema_version = _aliased_value(
+            data,
             "schemaVersion",
-            data.get("schema_version", CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION),
+            "schema_version",
+            CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION,
         )
-        if not isinstance(raw_schema_version, int):
+        if not isinstance(raw_schema_version, int) or isinstance(raw_schema_version, bool):
             raise ValueError("plugin schemaVersion must be an integer")
         if raw_schema_version < MINIMUM_SUPPORTED_PLUGIN_MANIFEST_SCHEMA_VERSION:
             raise ValueError(

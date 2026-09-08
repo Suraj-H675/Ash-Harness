@@ -255,6 +255,17 @@ def test_mcp_oauth_constructor_rejects_invalid_options_before_save() -> None:
             auth="oauth",
             oauth={"redirect_port": -1},
         )
+    with pytest.raises(ValueError, match="redirect_port is invalid"):
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+            auth="oauth",
+            oauth={"redirect_port": True},
+        )
 
 
 def test_mcp_oauth_rejects_stdio_transport() -> None:

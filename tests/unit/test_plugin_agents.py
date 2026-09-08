@@ -79,6 +79,17 @@ def test_agent_definition_rejects_duplicate_frontmatter_keys(tmp_path: Path) -> 
         parse_agent_definition(path)
 
 
+def test_agent_definition_rejects_conflicting_role_aliases(tmp_path: Path) -> None:
+    path = tmp_path / "reviewer.md"
+    path.write_text(
+        "---\nrole: reviewer\nbase-role: general\n---\nReview the task.\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="conflicting agent metadata keys"):
+        parse_agent_definition(path)
+
+
 def test_agent_catalog_bounds_recursive_discovery(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "agents"
     root.mkdir()

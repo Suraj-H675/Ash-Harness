@@ -149,6 +149,18 @@ def test_pre_minimum_manifest_schema_version_is_refused(tmp_path: Path) -> None:
         PluginManifest.load(manifest_file)
 
 
+def test_manifest_rejects_boolean_schema_version() -> None:
+    with pytest.raises(ValueError, match="schemaVersion must be an integer"):
+        PluginManifest.from_dict({"name": "example", "schemaVersion": True})
+
+
+def test_manifest_rejects_conflicting_schema_version_aliases() -> None:
+    with pytest.raises(ValueError, match="conflicting plugin fields"):
+        PluginManifest.from_dict(
+            {"name": "example", "schemaVersion": 2, "schema_version": 1}
+        )
+
+
 def test_check_dependencies_returns_empty_for_installed_plugins(tmp_path: Path) -> None:
     manifest_file = tmp_path / "plugin.json"
     manifest_file.write_text(
@@ -259,6 +271,82 @@ def test_manifest_rejects_invalid_runtime_contracts(runtime, tools, message) -> 
 
     with pytest.raises(ValueError, match=message):
         PluginManifest.from_dict(payload)
+
+
+@pytest.mark.parametrize("protocol_version", [True, 1.0])
+def test_manifest_rejects_non_integer_runtime_protocol_version(
+    protocol_version,
+) -> None:
+    with pytest.raises(ValueError, match="protocolVersion must be integer 1"):
+        PluginManifest.from_dict(
+            {
+                "name": "runtime-plugin",
+                "runtime": {
+                    "command": ["python", "runtime.py"],
+                    "protocolVersion": protocol_version,
+                },
+                "tools": [
+                    {
+                        "name": "x",
+                        "description": "x",
+                        "inputSchema": {"type": "object"},
+                    }
+                ],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        {
+            "command": ["python", "runtime.py"],
+            "protocolVersion": 1,
+            "protocol_version": 2,
+        },
+        {
+            "command": ["python", "runtime.py"],
+            "timeoutSeconds": 2,
+            "timeout_seconds": 3,
+        },
+    ],
+)
+def test_manifest_rejects_conflicting_runtime_aliases(runtime) -> None:
+    with pytest.raises(ValueError, match="conflicting plugin fields"):
+        PluginManifest.from_dict(
+            {
+                "name": "runtime-plugin",
+                "runtime": runtime,
+                "tools": [
+                    {
+                        "name": "x",
+                        "description": "x",
+                        "inputSchema": {"type": "object"},
+                    }
+                ],
+            }
+        )
+
+
+def test_manifest_rejects_conflicting_tool_schema_aliases() -> None:
+    with pytest.raises(ValueError, match="conflicting plugin fields"):
+        PluginManifest.from_dict(
+            {
+                "name": "runtime-plugin",
+                "runtime": {"command": ["python", "runtime.py"]},
+                "tools": [
+                    {
+                        "name": "x",
+                        "description": "x",
+                        "inputSchema": {"type": "object"},
+                        "input_schema": {
+                            "type": "object",
+                            "required": ["different"],
+                        },
+                    }
+                ],
+            }
+        )
 
 
 def test_manifest_rejects_tool_name_too_long_after_namespacing() -> None:

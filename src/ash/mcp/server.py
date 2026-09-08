@@ -481,7 +481,11 @@ def _validate_oauth_data(name: str, auth: str, oauth: dict[str, Any]) -> None:
     ):
         raise ValueError(f"MCP server {name!r} oauth values must be strings")
     redirect_port = oauth.get("redirect_port", 0)
-    if not isinstance(redirect_port, int) or not 0 <= redirect_port <= 65535:
+    if (
+        not isinstance(redirect_port, int)
+        or isinstance(redirect_port, bool)
+        or not 0 <= redirect_port <= 65535
+    ):
         raise ValueError(f"MCP server {name!r} oauth redirect_port is invalid")
     client_secret = str(oauth.get("client_secret", ""))
     if client_secret and not re.fullmatch(

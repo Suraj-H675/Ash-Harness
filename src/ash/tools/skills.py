@@ -44,6 +44,7 @@ UNSAFE_EXECUTABLE_SKILL_MESSAGE = (
     "unsafe executable-skill compatibility"
 )
 MAX_EXECUTABLE_SKILL_BYTES = 256 * 1024
+EXECUTABLE_SKILL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 
 def validate_executable_skill_name(name: str) -> None:
@@ -51,6 +52,11 @@ def validate_executable_skill_name(name: str) -> None:
 
     if not isinstance(name, str) or not name.isidentifier():
         raise ValueError(f"skill name must be a valid Python identifier, got {name!r}")
+    if not EXECUTABLE_SKILL_NAME.fullmatch(name):
+        raise ValueError(
+            "skill name must start with an ASCII letter, contain only ASCII "
+            f"letters, numbers, or underscores, and be at most 64 characters: {name!r}"
+        )
 
 
 # --- SkillContext ----------------------------------------------------------
@@ -172,6 +178,10 @@ def parse_markdown_skill(path: Path) -> _MarkdownSkill:
         body = text[fm_match.end() :]
 
     name = front.get("name") or _first_h1(body) or path.stem
+    try:
+        validate_executable_skill_name(name)
+    except ValueError as exc:
+        raise SkillParseError(str(exc)) from exc
     description = front.get("description") or _section_after(
         body, "Description", fallback=""
     )
@@ -299,6 +309,11 @@ def parse_python_skill(path: Path) -> _PythonSkill:
             description = value
         elif key == "trigger":
             trigger = value
+
+    try:
+        validate_executable_skill_name(name)
+    except ValueError as exc:
+        raise SkillParseError(str(exc)) from exc
 
     # Find an `async def execute(...)` (or sync `def execute`) function.
     execute_node = None

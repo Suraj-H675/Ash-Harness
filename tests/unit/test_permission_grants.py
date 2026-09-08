@@ -161,6 +161,10 @@ def test_permission_rule_file_refuses_corruption_and_future_versions(
     with pytest.raises(PermissionGrantError, match="newer than supported"):
         load_permission_rules(workspace)
 
+    path.write_text('{"version": true, "workspaces": {}}', encoding="utf-8")
+    with pytest.raises(PermissionGrantError, match="version is invalid"):
+        load_permission_rules(workspace)
+
 
 def test_permission_rule_file_rejects_duplicate_json_keys(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path / "home"))

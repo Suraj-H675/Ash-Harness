@@ -90,6 +90,12 @@ def parse_agent_definition(path: Path, *, namespace: str = "") -> AgentDefinitio
         or any(character in name for character in ("/", "\\", "\x00"))
     ):
         raise ValueError("agent name must be a path-safe identifier without whitespace")
+    if (
+        "base-role" in metadata
+        and "role" in metadata
+        and metadata["base-role"] != metadata["role"]
+    ):
+        raise ValueError("conflicting agent metadata keys 'base-role' and 'role'")
     base_role = metadata.get("base-role", metadata.get("role", "general"))
     if base_role not in AGENT_ROLES:
         raise ValueError(f"agent base-role must be one of {AGENT_ROLES}")

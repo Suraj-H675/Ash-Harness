@@ -163,6 +163,17 @@ def test_hook_config_rejects_duplicate_json_keys(tmp_path) -> None:
         load_command_hooks([config])
 
 
+def test_hook_config_rejects_unknown_event_names(tmp_path) -> None:
+    config = tmp_path / "hooks.json"
+    config.write_text(
+        json.dumps({"pre_toll": [{"command": ["echo", "blocked"]}]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unknown events.*pre_toll"):
+        load_command_hooks([config])
+
+
 def test_hook_config_rejects_symlinked_file(tmp_path) -> None:
     outside = tmp_path / "outside-hooks.json"
     outside.write_text(json.dumps({"session_start": []}), encoding="utf-8")

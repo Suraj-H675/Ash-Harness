@@ -590,7 +590,7 @@ def _read_payload(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise PermissionGrantError("permission rule file root must be an object")
     version = payload.get("version", 1)
-    if not isinstance(version, int) or version < 1:
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
         raise PermissionGrantError("permission rule file version is invalid")
     if version > CURRENT_PERMISSION_RULE_VERSION:
         raise PermissionGrantError(

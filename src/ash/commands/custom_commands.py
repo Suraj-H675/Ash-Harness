@@ -148,7 +148,12 @@ def _parse(
             for line in text[4:end].splitlines():
                 key, separator, value = line.partition(":")
                 if separator:
-                    metadata[key.strip().casefold()] = value.strip().strip("\"'")
+                    normalized_key = key.strip().casefold()
+                    if normalized_key in metadata:
+                        raise ValueError(
+                            f"duplicate command metadata key: {normalized_key!r}"
+                        )
+                    metadata[normalized_key] = value.strip().strip("\"'")
             body = text[end + 5 :]
     relative = path.relative_to(root).with_suffix("")
     default_name = ":".join(relative.parts)
