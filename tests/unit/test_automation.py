@@ -447,6 +447,27 @@ def test_worker_numeric_boundaries_reject_malformed_values(
         store.prune_runs(workspace=workspace, older_than_days=1.5)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("token_budget", [1, 2, 5, 6, 10, 1000, 4000])
+def test_apply_token_budget_keeps_runtime_config_valid(token_budget: int) -> None:
+    from ash.automation.worker import _apply_token_budget
+    from ash.context.history import ContextBudgetAllocator
+
+    config = AshConfig(model="ollama/test")
+    bounded = _apply_token_budget(config, token_budget)
+
+    assert bounded.max_turn_total_tokens == token_budget
+    assert bounded.max_context_tokens >= len(bounded.context_budget_weights) + 1
+    assert (
+        bounded.max_context_tokens - bounded.max_completion_tokens
+        >= len(bounded.context_budget_weights)
+    )
+    ContextBudgetAllocator(
+        max_context_tokens=bounded.max_context_tokens,
+        completion_reserve=bounded.max_completion_tokens,
+        weights=bounded.context_budget_weights,
+    )
+
+
 def test_store_claims_both_fall_back_occurrences_without_stalling(
     tmp_path: Path, clock: list[float], store: AutomationStore
 ) -> None:
@@ -1170,6 +1191,63 @@ async def test_worker_executes_due_prompt_through_client(
     assert runs[0].estimated_cost_usd == 0.006
     assert client.closed is True
     assert store.list_workers(workspace) == []
+
+
+@pytest.mark.asyncio
+async def test_worker_executes_documented_small_token_budget_with_valid_config(
+    tmp_path: Path,
+    clock: list[float],
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.context.history import ContextBudgetAllocator
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    now = datetime.fromtimestamp(clock[0], tz=timezone.utc)
+    job = store.create_job(
+        name="small token budget",
+        prompt="Return a short response",
+        workspace=workspace,
+        schedule=build_schedule(every="1h", now=now),
+        token_budget=1000,
+        enabled=False,
+    )
+    client = _FakeClient()
+    observed: list[AshConfig] = []
+
+    async def factory(config: AshConfig, root: Path) -> _FakeClient:
+        assert root == workspace.resolve()
+        observed.append(config)
+        ContextBudgetAllocator(
+            max_context_tokens=config.max_context_tokens,
+            completion_reserve=config.max_completion_tokens,
+            weights=config.context_budget_weights,
+        )
+        return client
+
+    monkeypatch.setattr("ash.automation.worker.is_workspace_trusted", lambda path: True)
+    worker = AutomationWorkerService(
+        store,
+        workspace,
+        config=AshConfig(
+            workspace_root=workspace,
+            db_directory=tmp_path / "session-db",
+            model="ollama/automation-test",
+        ),
+        client_factory=factory,
+    )
+
+    result = await worker.run_manual(job.job_id)
+
+    assert result.status == "succeeded"
+    assert len(observed) == 1
+    assert observed[0].max_turn_total_tokens == 1000
+    assert (
+        observed[0].max_context_tokens - observed[0].max_completion_tokens
+        >= len(observed[0].context_budget_weights)
+    )
+    assert client.closed is True
 
 
 @pytest.mark.asyncio

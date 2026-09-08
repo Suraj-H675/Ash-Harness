@@ -666,16 +666,29 @@ class AutomationWorkerService:
 
 
 def _apply_token_budget(config: AshConfig, token_budget: int) -> AshConfig:
-    context_limit = max(2, min(config.max_context_tokens, token_budget))
-    completion_limit = max(1, min(config.max_completion_tokens, context_limit - 1))
+    minimum_input_tokens = len(config.context_budget_weights)
+    minimum_context_limit = minimum_input_tokens + 1
+    context_limit = max(
+        minimum_context_limit,
+        min(config.max_context_tokens, token_budget),
+    )
+    completion_limit = max(
+        1,
+        min(
+            config.max_completion_tokens,
+            context_limit - minimum_input_tokens,
+        ),
+    )
     attachment_limit = min(
         config.max_attachment_tokens, context_limit - completion_limit
     )
-    return config.model_copy(
-        update={
+    return config.with_overrides(
+        {
             "max_context_tokens": context_limit,
             "max_completion_tokens": completion_limit,
             "max_attachment_tokens": attachment_limit,
             "max_turn_total_tokens": token_budget,
-        }
+        },
+        source="automation",
+        detail="automation token budget",
     )

@@ -725,6 +725,23 @@ class AshConfig(BaseSettings):
         description="Path to ONNX MiniLM model for local embeddings",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_boolean_numeric_fields(cls, value: Any) -> Any:
+        """Do not let Python/TOML booleans silently become numeric settings."""
+
+        if not isinstance(value, Mapping):
+            return value
+        for field_name, raw_value in value.items():
+            field = cls.model_fields.get(field_name)
+            if (
+                field is not None
+                and field.annotation in {int, float}
+                and isinstance(raw_value, bool)
+            ):
+                raise ValueError(f"{field_name} must be numeric, not boolean")
+        return value
+
     @field_validator("memory_backend")
     @classmethod
     def validate_memory_backend(cls, value: str) -> str:
@@ -803,6 +820,15 @@ class AshConfig(BaseSettings):
             )
         return value
 
+    @field_validator("context_budget_weights", mode="before")
+    @classmethod
+    def reject_boolean_context_budget_weights(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and any(
+            isinstance(weight, bool) for weight in value.values()
+        ):
+            raise ValueError("context budget weights must be numeric, not boolean")
+        return value
+
     @field_validator("context_budget_weights")
     @classmethod
     def validate_context_budget_weights(
@@ -817,6 +843,19 @@ class AshConfig(BaseSettings):
     def validate_temperature(cls, value: float) -> float:
         if not math.isfinite(value):
             raise ValueError("temperature must be finite")
+        return value
+
+    @field_validator("model_pricing_usd_per_million", mode="before")
+    @classmethod
+    def reject_boolean_model_pricing(cls, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            for rates in value.values():
+                if isinstance(rates, Mapping) and any(
+                    isinstance(rate, bool) for rate in rates.values()
+                ):
+                    raise ValueError(
+                        "model pricing rates must be numeric, not boolean"
+                    )
         return value
 
     @field_validator("model_pricing_usd_per_million")
@@ -1203,10 +1242,16 @@ class AshConfig(BaseSettings):
     ) -> "AshConfig":
         """Copy settings while retaining provenance for explicit overrides."""
 
-        updated = self.model_copy(update=values)
+        payload = self.model_dump(mode="python")
+        payload.update(values)
+        updated = type(self).model_validate(payload)
         updated._config_sources = dict(self._config_sources)
         updated._config_sources.update(
-            {field: (source, detail) for field in values if field in self.model_fields}
+            {
+                field: (source, detail)
+                for field in values
+                if field in type(self).model_fields
+            }
         )
         updated._config_diagnostics = list(self._config_diagnostics)
         updated._record_derived_sources()

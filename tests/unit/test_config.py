@@ -243,6 +243,58 @@ def test_config_rejects_negative_model_pricing() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "temperature",
+        "max_completion_tokens",
+        "steering_queue_limit",
+        "tool_search_threshold",
+        "provider_max_attempts",
+        "provider_retry_base_delay",
+        "max_concurrent_agents",
+        "agent_token_budget",
+        "web_search_timeout_seconds",
+        "browser_timeout_seconds",
+        "session_retention_days",
+        "automation_max_concurrent_runs",
+        "automation_poll_seconds",
+        "automation_run_retention_days",
+        "repo_map_max_files",
+        "memory_auto_index_max_files",
+    ],
+)
+def test_numeric_config_fields_reject_booleans(field: str) -> None:
+    with pytest.raises(ValueError, match="must be numeric, not boolean"):
+        AshConfig(**{field: True})
+
+
+def test_nested_numeric_config_values_reject_booleans() -> None:
+    with pytest.raises(ValueError, match="context budget weights must be numeric"):
+        AshConfig(context_budget_weights={"system": True})
+    with pytest.raises(ValueError, match="model pricing rates must be numeric"):
+        AshConfig(
+            model_pricing_usd_per_million={
+                "openai/example": {"input": True, "output": 1.0}
+            }
+        )
+
+
+def test_with_overrides_revalidates_values_and_derived_preferences() -> None:
+    config = AshConfig(model="ollama/test")
+
+    with pytest.raises(ValueError, match="max_completion_tokens"):
+        config.with_overrides({"max_completion_tokens": config.max_context_tokens})
+
+    accessible = config.with_overrides({"screen_reader_mode": True})
+    assert accessible.screen_reader_mode is True
+    assert accessible.tui_mode == "inline"
+    assert accessible.theme == "dark"
+    assert accessible.no_color is True
+    assert accessible.reduced_motion is True
+    assert accessible.show_token_meter is False
+
+
 def test_context_reserves_reject_impossible_attachment_budget() -> None:
     with pytest.raises(ValueError, match="max_completion_tokens"):
         AshConfig(
