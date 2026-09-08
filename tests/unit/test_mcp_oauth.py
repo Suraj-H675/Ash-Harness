@@ -45,6 +45,26 @@ async def test_oauth_json_response_rejects_duplicate_fields() -> None:
         await _bounded_json_response(response, "token endpoint")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_length", ["not-a-number", "-1", "9" * 5000])
+async def test_oauth_json_response_rejects_malformed_content_length(
+    content_length: str,
+) -> None:
+    from ash.mcp.oauth import _bounded_json_response
+
+    response = httpx.Response(
+        200,
+        content=b'{"access_token":"token"}',
+        headers={
+            "content-type": "application/json",
+            "content-length": content_length,
+        },
+    )
+
+    with pytest.raises(MCPOAuthError, match="invalid Content-Length"):
+        await _bounded_json_response(response, "token endpoint")
+
+
 def _bundle(resource: str, *, expired: bool = False) -> OAuthBundle:
     canonical = canonical_resource_uri(resource)
     return OAuthBundle(

@@ -348,6 +348,13 @@ async def test_acp_load_replays_and_lists_durable_sessions(
     assert [(item.session_id, item.title) for item in listed.sessions] == [
         (stored.session_id, "Durable ACP session")
     ]
+    for malformed_cursor in (
+        "ash-v1:" + "9" * 5000,
+        "ash-v1:²",
+    ):
+        with pytest.raises(acp.RequestError) as invalid_cursor:
+            await agent.list_sessions(cwd=str(workspace), cursor=malformed_cursor)
+        assert invalid_cursor.value.data["cursor"] == "invalid cursor"
     with pytest.raises(acp.RequestError, match="session limit"):
         await agent.new_session(str(workspace))
     with pytest.raises(acp.RequestError) as duplicate:

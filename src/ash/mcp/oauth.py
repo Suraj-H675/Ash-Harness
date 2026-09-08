@@ -766,9 +766,18 @@ async def _bounded_json_response(
         content_type = response.headers.get("content-type", "").casefold()
         if content_type and "json" not in content_type:
             raise MCPOAuthError(f"{label} returned a non-JSON content type")
-        length = response.headers.get("content-length", "")
-        if length.isdigit() and int(length) > MAX_OAUTH_RESPONSE_BYTES:
-            raise MCPOAuthError(f"{label} response exceeded 1 MB")
+        length = response.headers.get("content-length")
+        if length is not None:
+            try:
+                declared_length = int(length)
+            except ValueError as exc:
+                raise MCPOAuthError(
+                    f"{label} returned an invalid Content-Length"
+                ) from exc
+            if declared_length < 0:
+                raise MCPOAuthError(f"{label} returned an invalid Content-Length")
+            if declared_length > MAX_OAUTH_RESPONSE_BYTES:
+                raise MCPOAuthError(f"{label} response exceeded 1 MB")
         chunks: list[bytes] = []
         size = 0
         async for chunk in response.aiter_bytes():

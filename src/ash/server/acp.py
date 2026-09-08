@@ -766,9 +766,18 @@ def _decode_cursor(cursor: str | None) -> int:
     if cursor is None:
         return 0
     prefix = "ash-v1:"
-    if not cursor.startswith(prefix) or not cursor[len(prefix) :].isdigit():
+    if not cursor.startswith(prefix):
         raise RequestError.invalid_params({"cursor": "invalid cursor"})
-    offset = int(cursor[len(prefix) :])
+    raw_offset = cursor[len(prefix) :]
+    max_digits = len(str(MAX_SESSION_CURSOR))
+    if (
+        not raw_offset
+        or len(raw_offset) > max_digits
+        or not raw_offset.isascii()
+        or not raw_offset.isdecimal()
+    ):
+        raise RequestError.invalid_params({"cursor": "invalid cursor"})
+    offset = int(raw_offset)
     if offset > MAX_SESSION_CURSOR:
         raise RequestError.invalid_params({"cursor": "cursor exceeds limit"})
     return offset
