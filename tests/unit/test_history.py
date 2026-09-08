@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from ash.context.history import (
@@ -136,6 +138,16 @@ def test_context_budget_allocator_rejects_invalid_weights() -> None:
             max_context_tokens=100,
             completion_reserve=10,
             weights={"unknown": 1},
+        )
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_context_budget_allocator_rejects_non_finite_weights(value: float) -> None:
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        ContextBudgetAllocator(
+            max_context_tokens=100,
+            completion_reserve=10,
+            weights={"history": value},
         )
 
 

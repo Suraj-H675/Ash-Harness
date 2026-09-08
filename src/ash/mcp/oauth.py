@@ -401,6 +401,8 @@ async def authorize_mcp_server(
 ) -> OAuthBundle:
     """Run an explicit authorization-code flow with S256 PKCE."""
 
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise MCPOAuthError("OAuth timeout must be positive and finite")
     config = dict(oauth_config or {})
     resource = canonical_resource_uri(server_url)
     explicit_scope = normalize_oauth_scope(requested_scope, "requested OAuth scope")

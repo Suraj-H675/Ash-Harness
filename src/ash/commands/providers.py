@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from io import StringIO
 from typing import TYPE_CHECKING, Any
@@ -127,8 +128,8 @@ def test_provider(
 ) -> ProviderVerification:
     """Verify one route, optionally overriding the active model for the probe."""
 
-    if timeout <= 0:
-        raise ValueError("provider test timeout must be positive")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("provider test timeout must be positive and finite")
     test_config = (
         config.model_copy(update={"model": model, "fallback_models": []})
         if model

@@ -1,4 +1,5 @@
 import json
+import math
 import time
 from pathlib import Path
 
@@ -406,6 +407,36 @@ def test_graph_cost_budget_exceedance_is_atomic_and_reported(
 
     with pytest.raises(ValueError, match="non-negative"):
         state.tasks.record_cost("cost-one", lease.token, -0.01)
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_graph_cost_budget_rejects_non_finite_values(
+    state: SharedState, value: float
+) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        state.tasks.create_task(
+            "cost bounded",
+            task_id=f"cost-{repr(value)}".replace("-", "neg"),
+            metadata={"graph_id": "cost-boundary"},
+            graph_cost_budget_usd=value,
+        )
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_record_cost_rejects_non_finite_values(
+    state: SharedState, value: float
+) -> None:
+    state.tasks.create_task("cost", task_id="finite-cost")
+    lease = state.tasks.claim_task("worker", task_id="finite-cost")
+    assert lease is not None
+    state.tasks.start_task("finite-cost", lease.token)
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        state.tasks.record_cost("finite-cost", lease.token, value)
+
+    task = state.tasks.get_task("finite-cost")
+    assert task is not None
+    assert task.used_cost_usd == 0.0
 
 
 def test_failed_dependency_is_terminally_propagated(state: SharedState) -> None:

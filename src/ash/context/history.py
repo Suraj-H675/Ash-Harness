@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Callable
@@ -227,8 +228,8 @@ def normalize_context_budget_weights(
             names = ", ".join(sorted(unknown))
             raise ValueError(f"unknown context budget bucket(s): {names}")
         source.update(weights)
-    if any(value < 0 for value in source.values()):
-        raise ValueError("context budget weights must be non-negative")
+    if any(not math.isfinite(value) or value < 0 for value in source.values()):
+        raise ValueError("context budget weights must be finite and non-negative")
     total = sum(source.values())
     if total <= 0:
         raise ValueError("at least one context budget weight must be positive")

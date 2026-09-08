@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import math
 import os
 import threading
 import tomllib
@@ -807,6 +808,27 @@ class AshConfig(BaseSettings):
         from ash.context.history import normalize_context_budget_weights
 
         return normalize_context_budget_weights(value)
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("temperature must be finite")
+        return value
+
+    @field_validator("model_pricing_usd_per_million")
+    @classmethod
+    def validate_model_pricing(
+        cls, value: dict[str, dict[str, float]]
+    ) -> dict[str, dict[str, float]]:
+        for model, rates in value.items():
+            for rate_name, rate in rates.items():
+                if not math.isfinite(rate) or rate < 0:
+                    raise ValueError(
+                        "model pricing rates must be finite and non-negative "
+                        f"({model!r} {rate_name!r})"
+                    )
+        return value
 
     @field_validator("allowed_web_domains")
     @classmethod

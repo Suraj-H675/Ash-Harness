@@ -242,6 +242,38 @@ def test_mcp_cli_login_is_explicit_and_logout_removes_credentials(
     assert not store.path.exists()
 
 
+def test_mcp_cli_login_rejects_non_finite_timeout(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert (
+        main(
+            [
+                "mcp",
+                "add",
+                "protected",
+                "--transport",
+                "http",
+                "--url",
+                "https://mcp.example.test/rpc",
+                "--auth",
+                "oauth",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    authorize = AsyncMock(return_value=None)
+    monkeypatch.setattr("ash.mcp.oauth.authorize_mcp_server", authorize)
+
+    assert main(["mcp", "login", "protected", "--timeout", "nan"]) == 2
+    assert "greater than 0 and at most 1800" in capsys.readouterr().err
+    assert authorize.await_count == 0
+
+
 def test_mcp_cli_status_reports_safe_oauth_credential_state(
     tmp_path: Path,
     monkeypatch,

@@ -2,7 +2,9 @@
 import asyncio
 import json
 import io
+import os
 import sys
+import time
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -428,6 +430,59 @@ def test_manager_starts_and_stops_server() -> None:
     assert instance.process.poll() is None
     manager.stop_server("test-server")
     assert manager.get_server("test-server") is None
+
+
+def test_manager_stop_server_terminates_descendants(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("descendant survival probe is POSIX-only")
+    marker = tmp_path / "child-survived"
+    child_code = (
+        "import time; "
+        "time.sleep(0.4); "
+        f"open({str(marker)!r}, 'w').write('survived'); "
+        "time.sleep(5)"
+    )
+    parent_code = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        "time.sleep(60)"
+    )
+    manager = MCPServerManager()
+    config = MCPServerConfig(
+        name="tree-server",
+        command=sys.executable,
+        args=["-c", parent_code],
+        env={},
+        transport="stdio",
+    )
+
+    manager.start_server(config)
+    time.sleep(0.15)
+    manager.stop_server("tree-server")
+    time.sleep(0.5)
+
+    assert not marker.exists()
+
+
+def test_manager_rejects_duplicate_server_without_leaking_original() -> None:
+    manager = MCPServerManager()
+    config = MCPServerConfig(
+        name="duplicate-server",
+        command=sys.executable,
+        args=["-c", "import time; time.sleep(60)"],
+        env={},
+        transport="stdio",
+    )
+
+    original = manager.start_server(config)
+    try:
+        with pytest.raises(ValueError, match="already registered"):
+            manager.start_server(config)
+        assert manager.get_server("duplicate-server") is original
+        assert original.process is not None
+        assert original.process.poll() is None
+    finally:
+        manager.stop_server("duplicate-server")
 
 
 def test_manager_scrubs_host_secrets_and_keeps_explicit_server_env(

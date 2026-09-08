@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -66,8 +67,9 @@ def test_main_lists_provider_catalog_without_loading_runtime_config(capsys) -> N
     assert any(item["id"] == "openrouter" for item in payload["providers"])
 
 
-def test_test_provider_rejects_non_positive_timeout() -> None:
+@pytest.mark.parametrize("timeout", [0.0, math.nan, math.inf, -math.inf])
+def test_test_provider_rejects_invalid_timeout(timeout: float) -> None:
     from ash.commands.providers import test_provider
 
-    with pytest.raises(ValueError, match="timeout must be positive"):
-        test_provider(SimpleNamespace(), timeout=0)
+    with pytest.raises(ValueError, match="timeout must be positive and finite"):
+        test_provider(SimpleNamespace(), timeout=timeout)

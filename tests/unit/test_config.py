@@ -1,4 +1,5 @@
 import os
+import math
 from pathlib import Path
 
 import pytest
@@ -215,6 +216,31 @@ def test_attachment_budget_defaults_to_quarter_of_usable_context() -> None:
     assert small.attachment_token_budget == 1500
     assert large.attachment_token_budget == 16000
     assert explicit.attachment_token_budget == 777
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_config_rejects_non_finite_temperature(value: float) -> None:
+    with pytest.raises(ValueError, match="temperature must be finite"):
+        AshConfig(temperature=value)
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_config_rejects_non_finite_model_pricing(value: float) -> None:
+    with pytest.raises(ValueError, match="pricing rates must be finite"):
+        AshConfig(
+            model_pricing_usd_per_million={
+                "openai/example": {"input": value, "output": 1.0}
+            }
+        )
+
+
+def test_config_rejects_negative_model_pricing() -> None:
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        AshConfig(
+            model_pricing_usd_per_million={
+                "openai/example": {"input": -0.01, "output": 1.0}
+            }
+        )
 
 
 def test_context_reserves_reject_impossible_attachment_budget() -> None:

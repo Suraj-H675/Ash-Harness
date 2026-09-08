@@ -298,6 +298,17 @@ async def test_runtime_requires_explicit_login_without_opening_a_browser(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf")])
+async def test_explicit_oauth_login_rejects_non_finite_timeout(timeout: float) -> None:
+    with pytest.raises(MCPOAuthError, match="timeout must be positive and finite"):
+        await authorize_mcp_server(
+            "protected",
+            "https://mcp.example.test/rpc",
+            timeout_seconds=timeout,
+        )
+
+
+@pytest.mark.asyncio
 async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

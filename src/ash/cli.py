@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import importlib.metadata
 import json
+import math
 import os
 import re
 import sys
@@ -3618,7 +3619,11 @@ def main(argv: list[str] | None = None) -> int:
                     else f"No OAuth credentials stored for {args.server_name}."
                 )
                 return 0
-            if args.timeout <= 0 or args.timeout > 1800:
+            if (
+                not math.isfinite(args.timeout)
+                or args.timeout <= 0
+                or args.timeout > 1800
+            ):
                 print(
                     "Error: --timeout must be greater than 0 and at most 1800 seconds.",
                     file=sys.stderr,

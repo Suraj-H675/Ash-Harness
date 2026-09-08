@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import secrets
 import sqlite3
@@ -493,8 +494,8 @@ class AgentTaskStore:
         token: str,
         cost_usd: float,
     ) -> AgentTask:
-        if cost_usd < 0:
-            raise ValueError("cost_usd must be non-negative")
+        if not math.isfinite(cost_usd) or cost_usd < 0:
+            raise ValueError("cost_usd must be finite and non-negative")
         return self._record_usage(task_id, token, token_count=0, cost_usd=cost_usd)
 
     def record_usage(
@@ -507,8 +508,8 @@ class AgentTaskStore:
     ) -> AgentTask:
         if token_count < 0:
             raise ValueError("token_count must be non-negative")
-        if cost_usd < 0:
-            raise ValueError("cost_usd must be non-negative")
+        if not math.isfinite(cost_usd) or cost_usd < 0:
+            raise ValueError("cost_usd must be finite and non-negative")
         return self._record_usage(
             task_id,
             token,
@@ -1427,8 +1428,10 @@ def _prepare_task_create(definition: AgentTaskCreate) -> _PreparedTaskCreate:
     if graph_token_budget is not None and graph_token_budget < 1:
         raise ValueError("graph_token_budget must be positive")
     graph_cost_budget = definition.graph_cost_budget_usd
-    if graph_cost_budget is not None and graph_cost_budget <= 0.0:
-        raise ValueError("graph_cost_budget_usd must be positive")
+    if graph_cost_budget is not None and (
+        not math.isfinite(graph_cost_budget) or graph_cost_budget <= 0.0
+    ):
+        raise ValueError("graph_cost_budget_usd must be finite and positive")
     time_budget = float(definition.time_budget_seconds)
     if not 0.1 <= time_budget <= 86_400:
         raise ValueError("time_budget_seconds must be between 0.1 and 86400")
@@ -1491,8 +1494,8 @@ def _validate_graph_cost_budgets(
         budget = definition.graph_cost_budget_usd
         if not isinstance(budget, (int, float)) or isinstance(budget, bool):
             raise ValueError("graph_cost_budget_usd must be a positive number")
-        if budget <= 0.0:
-            raise ValueError("graph_cost_budget_usd must be positive")
+        if not math.isfinite(float(budget)) or budget <= 0.0:
+            raise ValueError("graph_cost_budget_usd must be finite and positive")
         if graph_id in budgets and budgets[graph_id] != float(budget):
             raise ValueError(
                 "all tasks in one graph must declare the same "
