@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from ash.core.session import AuditLogRecord, SessionStore
+from ash.safe_io import validate_unlinked_file_path
 
 
 def audit_records_payload(records: list[AuditLogRecord]) -> list[dict]:
@@ -63,8 +64,16 @@ def export_audit_log(
 ) -> Path:
     """Write a versioned JSON audit bundle with verification status."""
 
-    output_path = Path(output).expanduser().resolve()
+    output_path = Path(os.path.abspath(Path(output).expanduser()))
+    try:
+        validate_unlinked_file_path(output_path, label="audit export")
+    except ValueError as exc:
+        raise OSError(str(exc)) from exc
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        validate_unlinked_file_path(output_path, label="audit export")
+    except ValueError as exc:
+        raise OSError(str(exc)) from exc
     records = store.list_audit_logs(session_id)
     errors = store.verify_audit_log(session_id)
     payload = {
@@ -76,15 +85,15 @@ def export_audit_log(
     }
     temporary = output_path.with_name(f".{output_path.name}.{uuid4().hex}.tmp")
     try:
-        temporary.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         if os.name != "nt":
             temporary.chmod(0o600)
+        try:
+            validate_unlinked_file_path(output_path, label="audit export")
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
         os.replace(temporary, output_path)
     finally:
         temporary.unlink(missing_ok=True)
-    if os.name != "nt":
-        output_path.chmod(0o600)
     return output_path

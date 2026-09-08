@@ -69,6 +69,22 @@ def test_backup_and_restore_preserve_current_database(tmp_path: Path) -> None:
     assert all(item.exists() for item in preserved)
 
 
+def test_backup_rejects_symlinked_destination(tmp_path: Path) -> None:
+    path = tmp_path / "sessions.db"
+    SessionStore(path).create_session("/workspace")
+    victim = tmp_path / "victim.db"
+    linked = tmp_path / "backup.db"
+    try:
+        linked.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(SessionStorageError, match="symlink or junction"):
+        backup_database(path, linked)
+
+    assert not victim.exists()
+
+
 def test_restore_refuses_unconfirmed_or_invalid_backup(tmp_path: Path) -> None:
     path = tmp_path / "sessions.db"
     SessionStore(path)
@@ -130,6 +146,32 @@ def test_debug_bundle_is_bounded_json_and_restricted(
     assert payload["storage"]["path"] == str(db_dir / "sessions.db")
     assert payload["runtime"]["workspace"] == str(workspace.resolve())
     assert oct(created.stat().st_mode & 0o777) in {"0o600", "0o644"}
+
+
+def test_debug_bundle_rejects_symlinked_destination(tmp_path: Path) -> None:
+    from ash.commands.storage import create_debug_bundle
+    from ash.config import AshConfig
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    config = AshConfig(
+        model="anthropic/claude-sonnet-4-6",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    victim = tmp_path / "victim.json"
+    victim.write_text("keep", encoding="utf-8")
+    linked = tmp_path / "bundle.json"
+    try:
+        linked.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(SessionStorageError, match="symlink or junction"):
+        create_debug_bundle(config, linked)
+
+    assert victim.read_text(encoding="utf-8") == "keep"
 
 
 def test_metrics_cli_reports_local_only_aggregate(

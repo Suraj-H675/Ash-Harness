@@ -1,6 +1,8 @@
 import json
 from datetime import datetime, timezone
 
+import pytest
+
 from ash.core.session import Message, SessionStore
 
 
@@ -20,6 +22,25 @@ def test_session_jsonl_import_rejects_duplicate_fields(tmp_path) -> None:
         assert "duplicate JSON object key" in str(exc)
     else:
         raise AssertionError("duplicate JSONL fields must be rejected")
+
+
+def test_session_jsonl_import_failure_is_atomic(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    content = (
+        '{"schema_version":1,"type":"session","title":"Broken",'
+        '"model":"provider/model"}\n'
+        '{"schema_version":1,"type":"message","role":"user",'
+        '"content":"must not persist","timestamp":"2026-01-01T00:00:00+00:00",'
+        '"metadata":{}}\n'
+        '{"schema_version":1,"type":"message","role":"invalid",'
+        '"content":"bad","timestamp":"2026-01-01T00:00:01+00:00",'
+        '"metadata":{}}\n'
+    )
+
+    with pytest.raises(ValueError, match="invalid imported message role"):
+        store.import_session_jsonl(content, project_path=str(tmp_path / "new"))
+
+    assert store.list_sessions(limit=10) == []
 
 
 def test_fork_and_redacted_exports(tmp_path) -> None:

@@ -4,6 +4,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from ash.cli import main
 from ash.commands.audit import (
     export_audit_log,
@@ -55,6 +57,38 @@ def test_audit_export_writes_verifiable_bundle(tmp_path: Path) -> None:
     assert payload["verified"] is True
     assert payload["verification_errors"] == []
     assert payload["records"][0]["target_resource"] == "pytest"
+
+
+@pytest.mark.parametrize("link_parent", [False, True])
+def test_audit_export_rejects_symlinked_destination(
+    tmp_path: Path,
+    link_parent: bool,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session("/workspace")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "audit.json"
+    outside_file.write_text("ORIGINAL\n", encoding="utf-8")
+
+    if link_parent:
+        destination_parent = tmp_path / "exports"
+        try:
+            destination_parent.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlinks are unavailable: {exc}")
+        destination = destination_parent / "audit.json"
+    else:
+        destination = tmp_path / "audit.json"
+        try:
+            destination.symlink_to(outside_file)
+        except OSError as exc:
+            pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(OSError, match="symlink or junction"):
+        export_audit_log(store, session.session_id, destination)
+
+    assert outside_file.read_text(encoding="utf-8") == "ORIGINAL\n"
 
 
 def test_audit_cli_honors_database_directory_override(

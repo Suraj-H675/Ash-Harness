@@ -211,15 +211,41 @@ def create_debug_bundle(config, destination: str | Path | None = None) -> Path:
         },
     }
     serialized = json.dumps(payload, indent=2, sort_keys=True)
-    destination_path = (
-        Path(destination).expanduser().resolve()
+    raw_destination = (
+        Path(destination).expanduser()
         if destination is not None
         else config.db_directory
         / f"debug-bundle-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.json"
     )
+    try:
+        destination_path = validate_unlinked_file_path(
+            raw_destination, label="debug bundle"
+        )
+    except ValueError as exc:
+        raise SessionStorageError(str(exc)) from exc
     destination_path.parent.mkdir(parents=True, exist_ok=True)
-    destination_path.write_text(serialized + "\n", encoding="utf-8")
-    _restrict(destination_path)
+    try:
+        destination_path = validate_unlinked_file_path(
+            destination_path, label="debug bundle"
+        )
+    except ValueError as exc:
+        raise SessionStorageError(str(exc)) from exc
+    temporary = destination_path.with_name(
+        f".{destination_path.name}.{uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(serialized + "\n")
+        _restrict(temporary)
+        try:
+            destination_path = validate_unlinked_file_path(
+                destination_path, label="debug bundle"
+            )
+        except ValueError as exc:
+            raise SessionStorageError(str(exc)) from exc
+        os.replace(temporary, destination_path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return destination_path
 
 

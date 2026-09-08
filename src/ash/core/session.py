@@ -671,7 +671,12 @@ class SessionStore:
                 f"{source_path.name}.{reason}.{timestamp}.backup"
             )
         else:
-            destination_path = Path(destination).expanduser().resolve()
+            try:
+                destination_path = validate_unlinked_file_path(
+                    destination, label="session backup"
+                )
+            except ValueError as exc:
+                raise SessionStorageError(str(exc)) from exc
         if destination_path == source_path:
             raise SessionStorageError(
                 "Backup destination must differ from the database"
@@ -681,6 +686,12 @@ class SessionStore:
                 f"Backup destination already exists: {destination_path}"
             )
         destination_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            destination_path = validate_unlinked_file_path(
+                destination_path, label="session backup"
+            )
+        except ValueError as exc:
+            raise SessionStorageError(str(exc)) from exc
         with (
             closing(get_db_connection(source_path)) as source,
             closing(sqlite3.connect(destination_path)) as target,
@@ -2037,10 +2048,8 @@ class SessionStore:
         header = records[0]
         if header.get("schema_version") != 1 or header.get("type") != "session":
             raise ValueError("unsupported session export schema")
-        session = self.create_session(project_path, model=str(header.get("model", "")))
         title = str(header.get("title", "")).strip()
-        if title:
-            self.rename_session(session.session_id, f"{title} (imported)")
+        imported_messages: list[Message] = []
         for record in records[1:]:
             if not isinstance(record, dict) or record.get("type") != "message":
                 raise ValueError("session export contains an invalid record")
@@ -2054,15 +2063,47 @@ class SessionStore:
             metadata = record.get("metadata", {})
             if not isinstance(metadata, dict):
                 raise ValueError("imported message metadata must be an object")
-            self.save_message(
-                session.session_id,
+            imported_messages.append(
                 Message(
                     role=role,
                     content=str(record.get("content", "")),
                     timestamp=timestamp,
                     metadata=metadata,
-                ),
+                )
             )
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            session = self._create_session_record(
+                conn,
+                project_path,
+                model=str(header.get("model", "")),
+            )
+            if title:
+                conn.execute(
+                    "UPDATE sessions SET title = ? WHERE session_id = ?",
+                    (f"{title} (imported)", session.session_id),
+                )
+            for message in imported_messages:
+                conn.execute(
+                    """
+                    INSERT INTO messages (
+                        session_id, role, content, timestamp, metadata_json,
+                        token_count, prompt_tokens, completion_tokens, turn_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, 0, 0, 0, NULL)
+                    """,
+                    (
+                        session.session_id,
+                        message.role,
+                        message.content,
+                        _serialize_datetime(message.timestamp),
+                        json.dumps(message.metadata),
+                    ),
+                )
+                conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                    (_serialize_datetime(message.timestamp), session.session_id),
+                )
         return self.load_session(session.session_id)
 
     def save_session_token_stats(

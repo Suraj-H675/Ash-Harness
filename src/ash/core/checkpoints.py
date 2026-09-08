@@ -393,13 +393,7 @@ def undo_latest_checkpoint(
             "Undo refused because files changed after Ash's edit: "
             + ", ".join(conflicts)
         )
-    for row, path in zip(rows, paths, strict=True):
-        if bool(row["existed"]):
-            _atomic_restore(path, _checkpoint_content(row))
-            if row["before_mode"] is not None:
-                os.chmod(path, int(row["before_mode"]))
-        else:
-            path.unlink(missing_ok=True)
+    _restore_checkpoint_rows(list(zip(rows, paths, strict=True)))
     store.mark_file_checkpoints_restored(session_id, rows[0]["turn_id"])
     return list(dict.fromkeys(paths))
 

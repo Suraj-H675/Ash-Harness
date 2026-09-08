@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from ash.safe_io import read_bounded_bytes, read_bounded_text, strict_json_loads
+from ash.safety.scoped_io import atomic_write_scoped_text
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
@@ -1005,11 +1006,15 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     else f"ash-session-{loop.current_session.session_id[:8]}{suffix}"
                 )
                 try:
-                    output_path = loop.safety_guard.validate_path(raw_path)
                     content = loop.session_store.export_session(
                         loop.current_session.session_id, format=export_format
                     )
-                    output_path.write_text(content, encoding="utf-8")
+                    output_path = atomic_write_scoped_text(
+                        raw_path,
+                        content,
+                        loop.safety_guard,
+                        overwrite=True,
+                    )
                 except (OSError, ValueError) as exc:
                     _print_classified_error(exc)
                     continue

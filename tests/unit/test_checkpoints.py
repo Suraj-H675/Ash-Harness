@@ -73,6 +73,49 @@ async def test_checkpoint_undo_and_conflict_detection(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_undo_rolls_files_forward_when_restore_fails(
+    tmp_path, monkeypatch
+) -> None:
+    import ash.core.checkpoints as checkpoints
+
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    guard = SafetyGuard(tmp_path)
+    tool = WholeEditTool(guard)
+    for name in ("a.txt", "b.txt"):
+        path = tmp_path / name
+        path.write_text(f"before-{name}")
+        middleware = FileCheckpointMiddleware(
+            store,
+            guard,
+            lambda name=name: (session.session_id, "turn-1", f"call-{name}"),
+        )
+        arguments = {"file_path": name, "content": f"after-{name}"}
+        await middleware.before_tool("whole_edit", arguments, tool)
+        result = await tool.run(**arguments)
+        await middleware.after_tool("whole_edit", arguments, result)
+
+    original_restore = checkpoints._atomic_restore
+    restore_calls = 0
+
+    def fail_second_restore(path, content):
+        nonlocal restore_calls
+        restore_calls += 1
+        if restore_calls == 2:
+            raise OSError("injected second-file failure")
+        original_restore(path, content)
+
+    monkeypatch.setattr(checkpoints, "_atomic_restore", fail_second_restore)
+
+    with pytest.raises(OSError, match="second-file failure"):
+        undo_latest_checkpoint(store, guard, session.session_id)
+
+    assert (tmp_path / "a.txt").read_text() == "after-a.txt"
+    assert (tmp_path / "b.txt").read_text() == "after-b.txt"
+    assert len(store.latest_file_checkpoints(session.session_id)) == 2
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_diff_renders_latest_turn(tmp_path) -> None:
     path = tmp_path / "file.txt"
     path.write_text("before\n")
