@@ -275,15 +275,23 @@ class AutomationStore:
         normalized_prompt = _bounded_text(prompt, "job prompt", MAX_PROMPT_BYTES)
         root = _workspace(workspace)
         identifier = _identifier(job_id or str(uuid.uuid4()), "job id")
-        grace = int(misfire_grace_seconds)
-        timeout = float(timeout_seconds)
-        budget = int(token_budget)
-        if not 0 <= grace <= 2_592_000:
+        if (
+            type(misfire_grace_seconds) is not int
+            or not 0 <= misfire_grace_seconds <= 2_592_000
+        ):
             raise ValueError("misfire_grace_seconds must be between 0 and 2592000")
-        if not 1 <= timeout <= 86_400:
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not math.isfinite(float(timeout_seconds))
+            or not 1 <= float(timeout_seconds) <= 86_400
+        ):
             raise ValueError("timeout_seconds must be between 1 and 86400")
-        if not 1 <= budget <= 10_000_000:
+        if type(token_budget) is not int or not 1 <= token_budget <= 10_000_000:
             raise ValueError("token_budget must be between 1 and 10000000")
+        grace = misfire_grace_seconds
+        timeout = float(timeout_seconds)
+        budget = token_budget
         now = self._clock()
         next_run = first_fire_time(schedule, now=_from_epoch(now)) if enabled else None
         with self._transaction():
@@ -338,7 +346,7 @@ class AutomationStore:
         include_disabled: bool = False,
         limit: int = 200,
     ) -> list[AutomationJob]:
-        if not 1 <= limit <= 1000:
+        if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
         root = _workspace(workspace)
         enabled_clause = "" if include_disabled else " AND enabled = 1"
@@ -484,7 +492,7 @@ class AutomationStore:
         root = _workspace(workspace)
         owner = _identifier(worker_id, "worker id")
         lease_duration = _lease_seconds(lease_seconds)
-        if not 1 <= limit <= 32:
+        if type(limit) is not int or not 1 <= limit <= 32:
             raise ValueError("limit must be between 1 and 32")
         claims: list[tuple[str, str]] = []
         skipped_ids: list[str] = []
@@ -661,9 +669,15 @@ class AutomationStore:
             estimated_prompt_tokens,
             estimated_completion_tokens,
         )
-        if any(value < 0 for value in token_values) or not all(
-            math.isfinite(value) and value >= 0
-            for value in (cost_usd, estimated_cost_usd)
+        if any(type(value) is not int or value < 0 for value in token_values):
+            raise ValueError("usage token values must be non-negative integers")
+        cost_values = (cost_usd, estimated_cost_usd)
+        if any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or value < 0
+            for value in cost_values
         ):
             raise ValueError("usage values must be non-negative")
         if usage_source not in {"unavailable", "provider", "estimated", "mixed"}:
@@ -808,7 +822,7 @@ class AutomationStore:
         job_id: str | None = None,
         limit: int = 100,
     ) -> list[AutomationRun]:
-        if not 1 <= limit <= 1000:
+        if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
         root = _workspace(workspace)
         params: list[Any] = [root]
@@ -848,9 +862,12 @@ class AutomationStore:
     ) -> AutomationWorker:
         identifier = _identifier(worker_id, "worker id")
         root = _workspace(workspace)
-        if pid < 1:
+        if type(pid) is not int or pid < 1:
             raise ValueError("worker pid must be positive")
-        if not 1 <= max_concurrent_runs <= 32:
+        if (
+            type(max_concurrent_runs) is not int
+            or not 1 <= max_concurrent_runs <= 32
+        ):
             raise ValueError("max_concurrent_runs must be between 1 and 32")
         with self._transaction():
             now = self._clock()
@@ -893,7 +910,12 @@ class AutomationStore:
         stale_after_seconds: float = 30.0,
     ) -> list[AutomationWorker]:
         root = _workspace(workspace)
-        if stale_after_seconds <= 0:
+        if (
+            not isinstance(stale_after_seconds, (int, float))
+            or isinstance(stale_after_seconds, bool)
+            or not math.isfinite(float(stale_after_seconds))
+            or stale_after_seconds <= 0
+        ):
             raise ValueError("stale_after_seconds must be positive")
         cutoff = self._clock() - float(stale_after_seconds)
         with self._lock:
@@ -943,7 +965,7 @@ class AutomationStore:
         workspace: Path | str,
         older_than_days: int = 30,
     ) -> int:
-        if not 1 <= older_than_days <= 3650:
+        if type(older_than_days) is not int or not 1 <= older_than_days <= 3650:
             raise ValueError("older_than_days must be between 1 and 3650")
         root = _workspace(workspace)
         with self._transaction():
@@ -1350,8 +1372,10 @@ def _identifier(value: str, label: str) -> str:
 
 
 def _lease_seconds(value: float) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError("lease_seconds must be between 5 and 3600")
     duration = float(value)
-    if not 5 <= duration <= 3600:
+    if not math.isfinite(duration) or not 5 <= duration <= 3600:
         raise ValueError("lease_seconds must be between 5 and 3600")
     return duration
 

@@ -334,6 +334,119 @@ def test_due_claim_is_atomic_advances_and_completes(
     assert store.get_job(job.job_id, workspace=workspace).consecutive_failures == 0
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("misfire_grace_seconds", 1.5, "misfire_grace_seconds"),
+        ("misfire_grace_seconds", True, "misfire_grace_seconds"),
+        ("token_budget", 1.5, "token_budget"),
+        ("token_budget", True, "token_budget"),
+        ("timeout_seconds", True, "timeout_seconds"),
+        ("timeout_seconds", float("nan"), "timeout_seconds"),
+    ],
+)
+def test_create_job_rejects_malformed_numeric_values(
+    tmp_path: Path,
+    clock: list[float],
+    store: AutomationStore,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir(exist_ok=True)
+    now = datetime.fromtimestamp(clock[0], tz=timezone.utc)
+
+    with pytest.raises(ValueError, match=message):
+        store.create_job(
+            name=f"invalid {field}",
+            prompt="Do not persist malformed values",
+            workspace=workspace,
+            schedule=build_schedule(every="1h", now=now),
+            **{field: value},  # type: ignore[arg-type]
+        )
+
+    assert store.list_jobs(workspace) == []
+
+
+@pytest.mark.parametrize("method", ["list_jobs", "list_runs"])
+def test_automation_list_apis_reject_fractional_limits(
+    tmp_path: Path, store: AutomationStore, method: str
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    with pytest.raises(ValueError, match="limit must be between"):
+        if method == "list_jobs":
+            store.list_jobs(workspace, limit=1.5)  # type: ignore[arg-type]
+        else:
+            store.list_runs(workspace=workspace, limit=1.5)  # type: ignore[arg-type]
+
+
+def test_claim_due_rejects_fractional_limit(
+    tmp_path: Path, store: AutomationStore
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    with pytest.raises(ValueError, match="limit must be between"):
+        store.claim_due(
+            workspace=workspace,
+            worker_id="worker",
+            limit=1.5,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("value", [1.5, True, float("nan"), float("inf")])
+def test_finish_run_rejects_non_integer_token_usage(
+    tmp_path: Path,
+    clock: list[float],
+    store: AutomationStore,
+    value: object,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    now = datetime.fromtimestamp(clock[0], tz=timezone.utc)
+    job = store.create_job(
+        name="typed usage",
+        prompt="Run",
+        workspace=workspace,
+        schedule=build_schedule(every="1h", now=now),
+        enabled=False,
+    )
+    lease = store.claim_manual(job.job_id, workspace=workspace, worker_id="worker")
+
+    with pytest.raises(ValueError, match="non-negative integers"):
+        store.finish_run(
+            lease.run.run_id,
+            lease.token,
+            status="succeeded",
+            prompt_tokens=value,  # type: ignore[arg-type]
+        )
+
+    run = store.get_run(lease.run.run_id)
+    assert run is not None
+    assert run.status == "running"
+    assert run.prompt_tokens == 0
+
+
+def test_worker_numeric_boundaries_reject_malformed_values(
+    tmp_path: Path, store: AutomationStore
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    with pytest.raises(ValueError, match="max_concurrent_runs"):
+        store.heartbeat_worker(
+            worker_id="worker",
+            workspace=workspace,
+            pid=1,
+            max_concurrent_runs=1.5,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="stale_after_seconds"):
+        store.list_workers(workspace, stale_after_seconds=float("nan"))
+    with pytest.raises(ValueError, match="older_than_days"):
+        store.prune_runs(workspace=workspace, older_than_days=1.5)  # type: ignore[arg-type]
+
+
 def test_store_claims_both_fall_back_occurrences_without_stalling(
     tmp_path: Path, clock: list[float], store: AutomationStore
 ) -> None:

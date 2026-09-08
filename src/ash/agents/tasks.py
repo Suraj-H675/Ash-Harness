@@ -392,9 +392,14 @@ class AgentTaskStore:
     ) -> AgentTaskLease | None:
         owner = _identifier(owner_agent_id, "owner agent id")
         requested = _optional_identifier(task_id, "task id")
-        if not 1 <= max_active <= 128:
+        if type(max_active) is not int or not 1 <= max_active <= 128:
             raise ValueError("max_active must be between 1 and 128")
-        if not 1 <= float(lease_seconds) <= 3600:
+        if (
+            not isinstance(lease_seconds, (int, float))
+            or isinstance(lease_seconds, bool)
+            or not math.isfinite(float(lease_seconds))
+            or not 1 <= float(lease_seconds) <= 3600
+        ):
             raise ValueError("lease_seconds must be between 1 and 3600")
         token = secrets.token_urlsafe(32)
         token_hash = _token_hash(token)
@@ -471,7 +476,12 @@ class AgentTaskStore:
         *,
         lease_seconds: float = 30.0,
     ) -> AgentTask:
-        if not 1 <= float(lease_seconds) <= 3600:
+        if (
+            not isinstance(lease_seconds, (int, float))
+            or isinstance(lease_seconds, bool)
+            or not math.isfinite(float(lease_seconds))
+            or not 1 <= float(lease_seconds) <= 3600
+        ):
             raise ValueError("lease_seconds must be between 1 and 3600")
         identifier = _identifier(task_id, "task id")
         now = time.time()
@@ -484,8 +494,8 @@ class AgentTaskStore:
         return self._required_task(identifier)
 
     def record_tokens(self, task_id: str, token: str, token_count: int) -> AgentTask:
-        if token_count < 0:
-            raise ValueError("token_count must be non-negative")
+        if type(token_count) is not int or token_count < 0:
+            raise ValueError("token_count must be a non-negative integer")
         return self._record_usage(task_id, token, token_count=token_count)
 
     def record_cost(
@@ -494,7 +504,12 @@ class AgentTaskStore:
         token: str,
         cost_usd: float,
     ) -> AgentTask:
-        if not math.isfinite(cost_usd) or cost_usd < 0:
+        if (
+            not isinstance(cost_usd, (int, float))
+            or isinstance(cost_usd, bool)
+            or not math.isfinite(float(cost_usd))
+            or cost_usd < 0
+        ):
             raise ValueError("cost_usd must be finite and non-negative")
         return self._record_usage(task_id, token, token_count=0, cost_usd=cost_usd)
 
@@ -506,9 +521,14 @@ class AgentTaskStore:
         token_count: int = 0,
         cost_usd: float = 0.0,
     ) -> AgentTask:
-        if token_count < 0:
-            raise ValueError("token_count must be non-negative")
-        if not math.isfinite(cost_usd) or cost_usd < 0:
+        if type(token_count) is not int or token_count < 0:
+            raise ValueError("token_count must be a non-negative integer")
+        if (
+            not isinstance(cost_usd, (int, float))
+            or isinstance(cost_usd, bool)
+            or not math.isfinite(float(cost_usd))
+            or cost_usd < 0
+        ):
             raise ValueError("cost_usd must be finite and non-negative")
         return self._record_usage(
             task_id,
@@ -883,7 +903,7 @@ class AgentTaskStore:
         graph_id: str | None = None,
         limit: int = 100,
     ) -> list[AgentTask]:
-        if not 1 <= limit <= 1000:
+        if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
         clauses: list[str] = []
         params: list[Any] = []
@@ -911,7 +931,7 @@ class AgentTaskStore:
     def list_ready_tasks(self, *, limit: int = 100) -> list[AgentTask]:
         """Return queued tasks whose dependencies have all succeeded."""
 
-        if not 1 <= limit <= 1000:
+        if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
         now = time.time()
         with self._transaction():
@@ -1055,9 +1075,9 @@ class AgentTaskStore:
     ) -> list[AgentTaskEvent]:
         """Replay durable task events in global insertion order."""
 
-        if after_sequence < 0:
-            raise ValueError("after_sequence must be non-negative")
-        if not 1 <= limit <= 10_000:
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ValueError("after_sequence must be a non-negative integer")
+        if type(limit) is not int or not 1 <= limit <= 10_000:
             raise ValueError("limit must be between 1 and 10000")
         clauses = ["sequence > ?"]
         params: list[Any] = [after_sequence]
@@ -1420,19 +1440,31 @@ def _prepare_task_create(definition: AgentTaskCreate) -> _PreparedTaskCreate:
         raise ValueError("task cannot depend on itself")
     if parent == identifier:
         raise ValueError("task cannot be its own parent")
-    if not 1 <= definition.max_attempts <= 10:
+    if type(definition.max_attempts) is not int or not 1 <= definition.max_attempts <= 10:
         raise ValueError("max_attempts must be between 1 and 10")
-    if definition.token_budget < 1:
-        raise ValueError("token_budget must be positive")
+    if type(definition.token_budget) is not int or definition.token_budget < 1:
+        raise ValueError("token_budget must be a positive integer")
     graph_token_budget = definition.graph_token_budget
-    if graph_token_budget is not None and graph_token_budget < 1:
-        raise ValueError("graph_token_budget must be positive")
+    if graph_token_budget is not None and (
+        type(graph_token_budget) is not int or graph_token_budget < 1
+    ):
+        raise ValueError("graph_token_budget must be a positive integer")
     graph_cost_budget = definition.graph_cost_budget_usd
     if graph_cost_budget is not None and (
-        not math.isfinite(graph_cost_budget) or graph_cost_budget <= 0.0
+        not isinstance(graph_cost_budget, (int, float))
+        or isinstance(graph_cost_budget, bool)
+        or not math.isfinite(float(graph_cost_budget))
+        or graph_cost_budget <= 0.0
     ):
         raise ValueError("graph_cost_budget_usd must be finite and positive")
-    time_budget = float(definition.time_budget_seconds)
+    raw_time_budget = definition.time_budget_seconds
+    if (
+        not isinstance(raw_time_budget, (int, float))
+        or isinstance(raw_time_budget, bool)
+        or not math.isfinite(float(raw_time_budget))
+    ):
+        raise ValueError("time_budget_seconds must be between 0.1 and 86400")
+    time_budget = float(raw_time_budget)
     if not 0.1 <= time_budget <= 86_400:
         raise ValueError("time_budget_seconds must be between 0.1 and 86400")
     return _PreparedTaskCreate(
@@ -1465,10 +1497,10 @@ def _validate_graph_token_budgets(
                 "graph_token_budget requires metadata.graph_id to identify "
                 "a task in this graph"
             )
-        if not isinstance(definition.graph_token_budget, int) or (
+        if type(definition.graph_token_budget) is not int or (
             definition.graph_token_budget < 1
         ):
-            raise ValueError("graph_token_budget must be positive")
+            raise ValueError("graph_token_budget must be a positive integer")
         if graph_id in budgets and budgets[graph_id] != definition.graph_token_budget:
             raise ValueError(
                 "all tasks in one graph must declare the same graph_token_budget"

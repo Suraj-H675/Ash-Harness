@@ -259,6 +259,31 @@ def test_context_reserves_reject_impossible_attachment_budget() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_context_tokens", 0),
+        ("max_context_tokens", -1),
+        ("max_completion_tokens", 0),
+        ("max_completion_tokens", -1),
+        ("max_tool_result_tokens", 0),
+        ("max_tool_result_tokens", -1),
+    ],
+)
+def test_token_limits_must_be_positive(field: str, value: int) -> None:
+    with pytest.raises(ValueError):
+        AshConfig(**{field: value})
+
+
+def test_context_reserves_require_room_for_every_budget_bucket() -> None:
+    with pytest.raises(ValueError, match="at least one token per context budget bucket"):
+        AshConfig(
+            model="ollama/test",
+            max_context_tokens=100,
+            max_completion_tokens=99,
+        )
+
+
 def test_config_loads_without_api_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

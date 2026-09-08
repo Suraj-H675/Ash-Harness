@@ -439,6 +439,57 @@ def test_record_cost_rejects_non_finite_values(
     assert task.used_cost_usd == 0.0
 
 
+@pytest.mark.parametrize("value", [1.5, True, math.nan, math.inf])
+def test_record_tokens_rejects_non_integer_values(
+    state: SharedState, value: object
+) -> None:
+    state.tasks.create_task("tokens", task_id="integer-usage")
+    lease = state.tasks.claim_task("worker", task_id="integer-usage")
+    assert lease is not None
+    state.tasks.start_task("integer-usage", lease.token)
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        state.tasks.record_tokens("integer-usage", lease.token, value)  # type: ignore[arg-type]
+
+    task = state.tasks.get_task("integer-usage")
+    assert task is not None
+    assert task.used_tokens == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("token_budget", 1.5, "positive integer"),
+        ("token_budget", True, "positive integer"),
+        ("max_attempts", 1.5, "between 1 and 10"),
+        ("max_attempts", True, "between 1 and 10"),
+        ("time_budget_seconds", True, "between 0.1 and 86400"),
+    ],
+)
+def test_task_creation_rejects_malformed_numeric_types(
+    state: SharedState, field: str, value: object, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        state.tasks.create_task(
+            "typed task",
+            task_id=f"typed-{field}-{type(value).__name__}",
+            **{field: value},  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("method", ["list_tasks", "list_ready_tasks", "list_events"])
+def test_task_list_apis_reject_fractional_limits(
+    state: SharedState, method: str
+) -> None:
+    with pytest.raises(ValueError, match="limit must be between"):
+        getattr(state.tasks, method)(limit=1.5)
+
+
+def test_task_event_replay_rejects_boolean_sequence(state: SharedState) -> None:
+    with pytest.raises(ValueError, match="non-negative integer"):
+        state.tasks.list_events(after_sequence=True)
+
+
 def test_failed_dependency_is_terminally_propagated(state: SharedState) -> None:
     state.tasks.create_task("parent", task_id="parent")
     state.tasks.create_task("child", task_id="child", dependencies=["parent"])

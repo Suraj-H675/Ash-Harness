@@ -335,10 +335,12 @@ class AshConfig(BaseSettings):
 
     max_context_tokens: int = Field(
         128000,
+        gt=0,
         description="Maximum total tokens in the input context window.",
     )
     max_completion_tokens: int = Field(
         4000,
+        gt=0,
         description="Maximum tokens generated in response completion.",
     )
     max_turn_total_tokens: int = Field(
@@ -352,6 +354,7 @@ class AshConfig(BaseSettings):
     )
     max_tool_result_tokens: int = Field(
         20000,
+        gt=0,
         description="Limit for single tool response strings before middle truncation.",
     )
     max_attachment_tokens: int = Field(
@@ -978,6 +981,11 @@ class AshConfig(BaseSettings):
         if self.max_completion_tokens >= self.max_context_tokens:
             raise ValueError("max_completion_tokens must be below max_context_tokens")
         usable = self.max_context_tokens - self.max_completion_tokens
+        if usable < len(self.context_budget_weights):
+            raise ValueError(
+                "usable input context must provide at least one token per "
+                "context budget bucket"
+            )
         if self.max_attachment_tokens > usable:
             raise ValueError(
                 "max_attachment_tokens must not exceed the usable input context"

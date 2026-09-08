@@ -102,6 +102,10 @@ class ContextBudgetAllocator:
         self.max_context_tokens = max_context_tokens
         self.completion_reserve = completion_reserve
         self.weights = normalize_context_budget_weights(weights)
+        if self.input_limit < len(self.weights):
+            raise ValueError(
+                "usable context must provide at least one token per budget bucket"
+            )
 
     @property
     def input_limit(self) -> int:
@@ -231,8 +235,8 @@ def normalize_context_budget_weights(
     if any(not math.isfinite(value) or value < 0 for value in source.values()):
         raise ValueError("context budget weights must be finite and non-negative")
     total = sum(source.values())
-    if total <= 0:
-        raise ValueError("at least one context budget weight must be positive")
+    if not math.isfinite(total) or total <= 0:
+        raise ValueError("context budget weight sum must be finite and positive")
     return {name: value / total for name, value in source.items()}
 
 

@@ -151,6 +151,23 @@ def test_context_budget_allocator_rejects_non_finite_weights(value: float) -> No
         )
 
 
+def test_context_budget_allocator_rejects_overflowing_weight_sum() -> None:
+    with pytest.raises(ValueError, match="weight sum must be finite and positive"):
+        ContextBudgetAllocator(
+            max_context_tokens=100,
+            completion_reserve=10,
+            weights={"system": 1e308, "tools": 1e308},
+        )
+
+
+def test_context_budget_allocator_rejects_too_little_usable_context() -> None:
+    with pytest.raises(ValueError, match="at least one token per budget bucket"):
+        ContextBudgetAllocator(
+            max_context_tokens=5,
+            completion_reserve=1,
+        )
+
+
 def test_context_fragment_records_provenance_without_content_copy() -> None:
     fragment = context_fragment(
         kind=ContextFragmentKind.REPO_MAP,
