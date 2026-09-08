@@ -95,7 +95,7 @@ WEB_SEARCH_PROVIDERS = (
         "https://app.tavily.com/",
     ),
 )
-_PROVIDER_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
+_PROVIDER_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 BROWSER_INSTALL_TIMEOUT_SECONDS = 300
 
 
@@ -903,7 +903,7 @@ def _flow_openai_compatible() -> SetupOutcome:
     """
     _print_header("OpenAI-Compatible Endpoint")
 
-    name = _prompt_setup_text("  Provider name (e.g. my-minimax): ")
+    name = _prompt_setup_text("  Provider name (e.g. my-minimax): ").casefold()
     if not _PROVIDER_NAME.fullmatch(name) or name.casefold() in {
         item.id for item in PROVIDERS
     }:
@@ -1005,9 +1005,10 @@ def _probe_anthropic_models_detailed(
     from ash.providers.readiness import (
         ProviderVerificationError,
         probe_model_catalog,
+        provider_catalog_endpoint,
     )
 
-    endpoint = f"{base_url.rstrip('/')}/models"
+    endpoint = provider_catalog_endpoint(base_url.rstrip("/"), "anthropic")
     try:
         models = probe_model_catalog(
             endpoint,
@@ -1392,6 +1393,12 @@ def _validate_base_url(value: str) -> str:
     parsed = urlsplit(value.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("use an absolute http:// or https:// URL")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("port must be an integer between 1 and 65535") from exc
+    if port is not None and not 0 < port <= 65535:
+        raise ValueError("port must be an integer between 1 and 65535")
     if parsed.username or parsed.password:
         raise ValueError("embedded credentials are not allowed")
     if parsed.query or parsed.fragment:

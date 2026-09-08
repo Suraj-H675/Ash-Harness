@@ -220,7 +220,9 @@ def require_secure_provider_transport(base_url: str, *, provider: str) -> None:
     )
 
 
-def _catalog_endpoint(base_url: str, catalog_format: CatalogFormat) -> str:
+def provider_catalog_endpoint(base_url: str, catalog_format: CatalogFormat) -> str:
+    """Return the model-catalog URL for a normalized provider base URL."""
+
     if catalog_format == "ollama":
         return f"{base_url}/api/tags"
     if catalog_format == "anthropic":
@@ -257,7 +259,7 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
             provider=provider,
             model_name=model_name,
             base_url=base_url,
-            catalog_endpoint=_catalog_endpoint(base_url, "ollama"),
+            catalog_endpoint=provider_catalog_endpoint(base_url, "ollama"),
             catalog_format="ollama",
             auth_mode="none",
             uses_default_base_url=not bool(supplied),
@@ -279,7 +281,7 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
             provider=provider,
             model_name=model_name,
             base_url=base_url,
-            catalog_endpoint=_catalog_endpoint(base_url, catalog_format),
+            catalog_endpoint=provider_catalog_endpoint(base_url, catalog_format),
             catalog_format=catalog_format,
             auth_mode=auth_mode,
             api_key=api_key,
@@ -316,7 +318,7 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
         provider=provider,
         model_name=model_name,
         base_url=base_url,
-        catalog_endpoint=_catalog_endpoint(base_url, "openai"),
+        catalog_endpoint=provider_catalog_endpoint(base_url, "openai"),
         catalog_format="openai",
         auth_mode=custom_auth_mode,
         api_key=api_key,

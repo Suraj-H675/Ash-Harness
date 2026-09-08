@@ -137,7 +137,7 @@ class OpenAIProvider(ProviderABC):
             "base_url": base_url,
             "max_retries": 0,
         }
-        if allow_anonymous:
+        if allow_anonymous and client is None:
             client_options["http_client"] = httpx.AsyncClient(
                 event_hooks={"request": [_strip_authorization_header]}
             )

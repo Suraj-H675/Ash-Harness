@@ -527,6 +527,28 @@ def test_openai_provider_initializes():
     assert provider.count_tokens("hello world") > 0
 
 
+def test_anonymous_openai_injected_client_does_not_allocate_http_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.openai import OpenAIProvider
+
+    def unexpected_http_client(*args: object, **kwargs: object) -> object:
+        raise AssertionError("injected provider client must not allocate an HTTP client")
+
+    monkeypatch.setattr("ash.providers.openai.httpx.AsyncClient", unexpected_http_client)
+    injected = SimpleNamespace()
+
+    provider = OpenAIProvider(
+        model_name="local-model",
+        api_key="",
+        base_url="http://127.0.0.1:8000/v1",
+        allow_anonymous=True,
+        client=injected,
+    )
+
+    assert provider._client is injected
+
+
 def test_ash_owned_sdk_clients_disable_nested_retries(monkeypatch) -> None:
     import sys
 

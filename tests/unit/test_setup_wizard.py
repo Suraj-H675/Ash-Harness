@@ -387,6 +387,55 @@ class TestOpenaiCompatibleFlow:
                 assert "ASH_PROVIDER_MY_MINIMAX_API_KEY=sk-cp-test\n" in env_text
                 assert "ASH_MODEL=my-minimax/MiniMax-M2.7\n" in env_text
 
+    def test_normalizes_custom_provider_name_to_runtime_identifier(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(["MyProvider", "http://127.0.0.1:8000/v1", "local-model"]),
+        )
+        monkeypatch.setattr("ash.commands.setup.getpass.getpass", _FakeGetpass(""))
+
+        from ash.commands.setup import ModelProbe, _flow_openai_compatible
+
+        with (
+            patch(
+                "ash.commands.setup._probe_models_detailed",
+                return_value=ModelProbe(models=("local-model",)),
+            ),
+            patch("ash.commands.setup.save_config") as save_config,
+        ):
+            _flow_openai_compatible()
+
+        saved = save_config.call_args.args[0]
+        assert "myprovider" in saved["custom_providers"]
+        assert "MyProvider" not in saved["custom_providers"]
+        env_text = (tmp_path / ".ash" / ".env").read_text()
+        assert "ASH_MODEL=myprovider/local-model\n" in env_text
+
+    @pytest.mark.parametrize("provider_name", ["my:provider", "-provider"])
+    def test_rejects_custom_provider_names_runtime_cannot_parse(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        provider_name: str,
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr("builtins.input", _fake_input([provider_name]))
+
+        from ash.commands.setup import SetupBack, _flow_openai_compatible
+
+        with (
+            patch("ash.commands.setup._probe_models_detailed") as probe,
+            patch("ash.commands.setup.save_config") as save_config,
+            pytest.raises(SetupBack),
+        ):
+            _flow_openai_compatible()
+
+        probe.assert_not_called()
+        save_config.assert_not_called()
+
     def test_saves_anonymous_custom_provider_without_a_missing_key_requirement(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -568,6 +617,26 @@ class TestProbeModels:
             )
         ]
 
+    def test_anthropic_default_probe_uses_v1_models_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands.setup import _probe_anthropic_models_detailed
+
+        endpoints: list[str] = []
+
+        def shared_probe(endpoint: str, **_: object) -> tuple[str, ...]:
+            endpoints.append(endpoint)
+            return ("claude-a",)
+
+        monkeypatch.setattr(
+            "ash.providers.readiness.probe_model_catalog", shared_probe
+        )
+
+        result = _probe_anthropic_models_detailed("anthropic-secret")
+
+        assert result.models == ("claude-a",)
+        assert endpoints == ["https://api.anthropic.com/v1/models"]
+
     def test_probe_models_http_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_probe_models returns [] on HTTP error."""
         monkeypatch.setenv("HOME", "/tmp")
@@ -666,6 +735,9 @@ class TestSetupValidation:
             "ftp://example.com",
             "https://user:secret@example.com/v1",
             "https://example.com/v1?token=secret",
+            "https://example.com:not-a-port/v1",
+            "https://example.com:99999/v1",
+            "https://example.com:0/v1",
         ],
     )
     def test_base_url_rejects_unsafe_or_ambiguous_values(self, value: str) -> None:
