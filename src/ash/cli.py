@@ -821,11 +821,18 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 continue
             if command.name == "sessions":
                 if arguments[:1] == ["prune"]:
-                    if len(arguments) != 2 or not arguments[1].isdigit():
+                    if len(arguments) != 2:
+                        print("Usage: /sessions prune <days>", file=sys.stderr)
+                        continue
+                    try:
+                        from ash.commands.sessions import parse_session_retention_days
+
+                        retention_days = parse_session_retention_days(arguments[1])
+                    except ValueError:
                         print("Usage: /sessions prune <days>", file=sys.stderr)
                         continue
                     deleted = loop.session_store.cleanup_sessions(
-                        int(arguments[1]), project_path=str(loop.project_root)
+                        retention_days, project_path=str(loop.project_root)
                     )
                     print(f"Deleted {deleted} expired session(s).")
                     continue

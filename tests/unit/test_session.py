@@ -332,6 +332,16 @@ def test_session_cleanup_deletes_only_complete_inactive_trees(tmp_path: Path) ->
         store.load_session(child.session_id)
 
 
+def test_session_cleanup_treats_unrepresentable_retention_as_noop(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "cleanup.db")
+    session = store.create_session(str(tmp_path))
+
+    assert store.cleanup_sessions(10**12) == 0
+    assert store.load_session(session.session_id).session_id == session.session_id
+
+
 def test_session_fork_rolls_back_the_entire_child_on_copy_failure(
     tmp_path: Path,
 ) -> None:

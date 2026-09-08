@@ -509,10 +509,18 @@ def _prompt_fallback_index(fallbacks: list[str], action: str) -> int | None:
 
 def _prompt_position(length: int) -> int | None:
     raw = _prompt_setup_text(f"  New position (1-{length}): ")
-    if not raw.isdigit() or not 1 <= int(raw) <= length:
+    if not raw.isdigit():
         print(f"  Position must be a number from 1 to {length}.")
         return None
-    return int(raw) - 1
+    try:
+        position = int(raw)
+    except ValueError:
+        print(f"  Position must be a number from 1 to {length}.")
+        return None
+    if not 1 <= position <= length:
+        print(f"  Position must be a number from 1 to {length}.")
+        return None
+    return position - 1
 
 
 def _save_fallback_models(config, fallbacks: list[str]) -> None:
@@ -931,7 +939,11 @@ def _flow_openai_compatible() -> SetupOutcome:
 
     # If user picked a number, resolve to model name
     if model.isdigit():
-        idx = int(model) - 1
+        try:
+            idx = int(model) - 1
+        except ValueError:
+            print("Invalid selection.")
+            raise SetupBack from None
         if 0 <= idx < len(models):
             model = models[idx]
         else:
@@ -1417,7 +1429,11 @@ def _prompt_model_list(models: list[str], current: str) -> str:
         if val.casefold() in ("b", "back"):
             raise SetupBack
         if val.isdigit():
-            idx = int(val) - 1
+            try:
+                idx = int(val) - 1
+            except ValueError:
+                print("  Invalid number.")
+                continue
             if 0 <= idx < len(models):
                 return models[idx]
             print("  Invalid number.")
@@ -1437,7 +1453,11 @@ def _prompt_choice(prompt: str, options: list[str], default: int) -> int:
         if val.casefold() in ("c", "q", "cancel", "quit"):
             raise SetupCancelled
         if val.isdigit():
-            idx = int(val) - 1
+            try:
+                idx = int(val) - 1
+            except ValueError:
+                print("  Invalid choice.")
+                continue
             if 0 <= idx < len(options):
                 return idx
         print("  Invalid choice.")

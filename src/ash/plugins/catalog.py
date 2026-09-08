@@ -105,9 +105,20 @@ def fetch_catalog(
                         "plugin catalog endpoint returned "
                         f"HTTP {response.status_code}"
                     )
-                content_length = response.headers.get("content-length", "")
-                if content_length.isdigit() and int(content_length) > MAX_CATALOG_BYTES:
-                    raise PluginCatalogError("plugin catalog exceeds 256 KiB")
+                content_length = response.headers.get("content-length")
+                if content_length is not None:
+                    try:
+                        declared_length = int(content_length)
+                    except ValueError as exc:
+                        raise PluginCatalogError(
+                            "plugin catalog returned an invalid Content-Length"
+                        ) from exc
+                    if declared_length < 0:
+                        raise PluginCatalogError(
+                            "plugin catalog returned an invalid Content-Length"
+                        )
+                    if declared_length > MAX_CATALOG_BYTES:
+                        raise PluginCatalogError("plugin catalog exceeds 256 KiB")
                 chunks: list[bytes] = []
                 total = 0
                 for chunk in response.iter_bytes():

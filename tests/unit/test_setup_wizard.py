@@ -436,6 +436,54 @@ class TestOpenaiCompatibleFlow:
         probe.assert_not_called()
         save_config.assert_not_called()
 
+    def test_rejects_unbounded_numeric_model_selection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(
+                ["custom", "https://gateway.example/v1", "9" * 5000]
+            ),
+        )
+        monkeypatch.setattr("ash.commands.setup.getpass.getpass", _FakeGetpass(""))
+
+        from ash.commands.setup import ModelProbe, SetupBack, _flow_openai_compatible
+
+        with (
+            patch(
+                "ash.commands.setup._probe_models_detailed",
+                return_value=ModelProbe(models=("model-1",)),
+            ),
+            pytest.raises(SetupBack),
+        ):
+            _flow_openai_compatible()
+
+        assert "Invalid selection." in capsys.readouterr().out
+
+
+def test_setup_numbered_prompts_reject_unbounded_numeric_input(
+    monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    from ash.commands.setup import _prompt_choice, _prompt_model_list, _prompt_position
+
+    huge_number = "9" * 5000
+    monkeypatch.setattr(
+        "ash.commands.setup._prompt_setup_text", lambda prompt: huge_number
+    )
+    assert _prompt_position(3) is None
+
+    monkeypatch.setattr("builtins.input", _fake_input([huge_number, "1"]))
+    assert _prompt_model_list(["model-1"], "") == "model-1"
+
+    monkeypatch.setattr("builtins.input", _fake_input([huge_number, "1"]))
+    assert _prompt_choice("Pick", ["one"], 0) == 0
+
+    output = capsys.readouterr().out
+    assert "Position must be a number" in output
+    assert "Invalid number." in output
+    assert "Invalid choice." in output
+
 
 class TestProbeModels:
     """Tests for _probe_models and _probe_ollama_models."""

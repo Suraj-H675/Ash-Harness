@@ -15,6 +15,20 @@ class StartupSessionSelection:
     cancelled: bool = False
 
 
+def parse_session_retention_days(raw: str) -> int:
+    """Parse the positive day count accepted by ``/sessions prune``."""
+
+    if not raw.isdigit():
+        raise ValueError("retention days must be a positive integer")
+    try:
+        retention_days = int(raw)
+    except ValueError as exc:
+        raise ValueError("retention days must be a positive integer") from exc
+    if retention_days < 1:
+        raise ValueError("retention days must be a positive integer")
+    return retention_days
+
+
 async def pick_session(
     store: SessionStore,
     *,

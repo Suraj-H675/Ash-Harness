@@ -1256,7 +1256,11 @@ class SessionStore:
         """Delete old sessions and compact the database explicitly."""
         if retention_days < 1:
             raise ValueError("retention_days must be positive")
-        cutoff = _utc_now() - timedelta(days=retention_days)
+        try:
+            cutoff = _utc_now() - timedelta(days=retention_days)
+        except OverflowError:
+            # No persisted datetime can be older than an unrepresentable cutoff.
+            return 0
         clause = " WHERE project_key = ?" if project_path is not None else ""
         params: tuple[Any, ...] = (
             (normalize_project_path(project_path), _serialize_datetime(cutoff))

@@ -159,6 +159,32 @@ def test_remote_catalog_fetch_rejects_oversized_stream_without_materializing_it(
     assert not (tmp_path / "catalog.json").exists()
 
 
+@pytest.mark.parametrize("content_length", ["not-a-number", "-1", "9" * 5000])
+def test_remote_catalog_fetch_rejects_malformed_content_length(
+    tmp_path: Path, monkeypatch, content_length: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b'{"keyId":"demo"}',
+            headers={"content-length": content_length},
+            request=request,
+        )
+
+    destination = tmp_path / "catalog.json"
+    monkeypatch.setattr(
+        "ash.plugins.catalog.catalog_cache_path", lambda url: destination
+    )
+
+    with pytest.raises(PluginCatalogError, match="invalid Content-Length"):
+        fetch_catalog(
+            "https://plugins.example/catalog.json",
+            transport=httpx.MockTransport(handler),
+        )
+
+    assert not destination.exists()
+
+
 def test_remote_catalog_fetch_streams_valid_payload_into_cache(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -10,6 +10,7 @@ import pytest
 from ash.cli import main
 from ash.commands.sessions import (
     list_session_summaries,
+    parse_session_retention_days,
     render_session_summaries,
     render_session_tree,
     select_startup_session,
@@ -146,6 +147,19 @@ def test_sessions_cli_rejects_invalid_limit(tmp_path: Path, capsys) -> None:
 
     assert status == 2
     assert "limit must be positive" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["0", "-1", "²", "9" * 5000],
+)
+def test_session_prune_days_reject_malformed_or_unbounded_values(raw: str) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        parse_session_retention_days(raw)
+
+
+def test_session_prune_days_accept_positive_decimal() -> None:
+    assert parse_session_retention_days("30") == 30
 
 
 def test_sessions_cli_rejects_tree_only_session_option(tmp_path: Path, capsys) -> None:
