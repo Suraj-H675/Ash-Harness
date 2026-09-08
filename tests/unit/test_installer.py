@@ -180,12 +180,21 @@ def test_explicit_pipx_extra_is_additive_to_existing_capability_packs() -> None:
 
 def test_uv_is_a_supported_fallback_when_pipx_is_unavailable() -> None:
     calls: list[list[str]] = []
+    installed = False
 
     def runner(command, **kwargs):
+        nonlocal installed
         calls.append(list(command))
         if command[1:3] == ["tool", "list"]:
-            return _completed(stdout="")
+            return _completed(
+                stdout=(
+                    "ash-ai v0.1.0 (/isolated/tools/ash-ai)\n"
+                    if installed
+                    else ""
+                )
+            )
         if command[1:3] == ["tool", "install"]:
+            installed = True
             return _completed()
         if command[1:] == ["tool", "dir", "--bin"]:
             return _completed(stdout="/isolated/bin\n")
@@ -209,6 +218,42 @@ def test_uv_is_a_supported_fallback_when_pipx_is_unavailable() -> None:
     ]
     assert outcome.manager == "uv"
     assert outcome.executable == "/isolated/bin/ash"
+
+
+def test_uv_install_rejects_empty_reported_launcher_directory() -> None:
+    calls: list[list[str]] = []
+    installed = False
+
+    def runner(command, **kwargs):
+        nonlocal installed
+        calls.append(list(command))
+        if command[1:3] == ["tool", "list"]:
+            return _completed(
+                stdout=(
+                    "ash-ai v0.1.0 (/isolated/tools/ash-ai)\n"
+                    if installed
+                    else ""
+                )
+            )
+        if command[1:3] == ["tool", "install"]:
+            installed = True
+            return _completed()
+        if command[1:] == ["tool", "dir", "--bin"]:
+            return _completed(stdout="\n")
+        if command == ["ash", "--version"]:
+            return _completed(stdout="ash 0.0.1\n")
+        if command[1:] == ["tool", "update-shell"]:
+            return _completed()
+        raise AssertionError(f"unexpected command: {command}")
+
+    with pytest.raises(InstallError, match="executable directory"):
+        install(
+            runner=runner,
+            which=lambda name: "/usr/bin/uv" if name == "uv" else None,
+            environ={"PATH": "/tmp/older-ash:/usr/bin"},
+        )
+
+    assert ["ash", "--version"] not in calls
 
 
 def test_public_installer_turns_manager_failures_into_one_clear_message() -> None:
@@ -331,6 +376,104 @@ def test_existing_uv_install_keeps_manager_and_capability_extras() -> None:
     assert outcome.manager == "uv"
 
 
+def test_uv_state_scopes_extras_and_executable_to_ash_tool() -> None:
+    calls: list[list[str]] = []
+    uv_listing = (
+        "other-tool v9.0.0 [extras: server] (/isolated/tools/other-tool)\n"
+        "- ash (/tmp/unowned/bin/ash)\n"
+        "ash-ai v0.1.0 [required: git+https://example.invalid/ash] "
+        "[extras: browser] (/isolated/tools/ash-ai)\n"
+        "- ash (/isolated/bin/ash)\n"
+    )
+
+    def runner(command, **kwargs):
+        calls.append(list(command))
+        if command == ["/usr/bin/pipx", "list", "--json"]:
+            return _completed(stdout='{"venvs": {}}')
+        if command[1:] == [
+            "tool",
+            "list",
+            "--show-paths",
+            "--show-version-specifiers",
+            "--show-extras",
+        ]:
+            return _completed(stdout=uv_listing)
+        if command[1:3] == ["tool", "install"]:
+            return _completed()
+        if command == ["/tmp/unowned/bin/ash", "--version"]:
+            return _completed(stdout="ash 9.0.0\n")
+        if command == ["/isolated/bin/ash", "--version"]:
+            return _completed(stdout="ash 0.1.0\n")
+        if command[1:] == ["tool", "update-shell"]:
+            return _completed()
+        raise AssertionError(f"unexpected command: {command}")
+
+    outcome = install(
+        runner=runner,
+        which=lambda name: {
+            "pipx": "/usr/bin/pipx",
+            "uv": "/usr/bin/uv",
+        }.get(name),
+        environ={"PATH": "/isolated/bin:/usr/bin"},
+    )
+
+    assert [
+        "/usr/bin/uv",
+        "tool",
+        "install",
+        "--force",
+        "--reinstall",
+        "ash-ai[browser] @ git+https://github.com/Suraj-H675/Ash-Harness.git",
+    ] in calls
+    assert outcome.executable == "/isolated/bin/ash"
+    assert ["/tmp/unowned/bin/ash", "--version"] not in calls
+
+
+def test_uv_install_rejects_success_without_resulting_ash_state() -> None:
+    calls: list[list[str]] = []
+    list_calls = 0
+    previous_listing = (
+        "ash-ai v0.1.0 [required: git+https://example.invalid/ash] "
+        "[extras: browser] (/isolated/tools/ash-ai)\n"
+        "- ash (/tmp/older-ash/bin/ash)\n"
+    )
+
+    def runner(command, **kwargs):
+        nonlocal list_calls
+        calls.append(list(command))
+        if command == ["/usr/bin/pipx", "list", "--json"]:
+            return _completed(stdout='{"venvs": {}}')
+        if command[1:] == [
+            "tool",
+            "list",
+            "--show-paths",
+            "--show-version-specifiers",
+            "--show-extras",
+        ]:
+            list_calls += 1
+            return _completed(stdout=previous_listing if list_calls == 1 else "")
+        if command[1:3] == ["tool", "install"]:
+            return _completed()
+        if command == ["/tmp/older-ash/bin/ash", "--version"]:
+            return _completed(stdout="ash 0.1.0\n")
+        if command[1:] == ["tool", "update-shell"]:
+            return _completed()
+        raise AssertionError(f"unexpected command: {command}")
+
+    with pytest.raises(InstallError, match="absent from the resulting uv state"):
+        install(
+            runner=runner,
+            which=lambda name: {
+                "pipx": "/usr/bin/pipx",
+                "uv": "/usr/bin/uv",
+            }.get(name),
+            environ={"PATH": "/tmp/older-ash/bin:/usr/bin"},
+        )
+
+    assert list_calls == 2
+    assert ["/tmp/older-ash/bin/ash", "--version"] not in calls
+
+
 def test_public_installer_contains_process_start_errors() -> None:
     stderr = io.StringIO()
 
@@ -345,12 +488,22 @@ def test_public_installer_contains_process_start_errors() -> None:
 
 
 def test_unusable_pipx_binary_falls_back_to_uv() -> None:
+    installed = False
+
     def runner(command, **kwargs):
+        nonlocal installed
         if command == ["/broken/pipx", "list", "--json"]:
             raise OSError("bad interpreter")
         if command[1:3] == ["tool", "list"]:
-            return _completed(stdout="")
+            return _completed(
+                stdout=(
+                    "ash-ai v0.1.0 (/isolated/tools/ash-ai)\n"
+                    if installed
+                    else ""
+                )
+            )
         if command[1:3] == ["tool", "install"]:
+            installed = True
             return _completed()
         if command[1:] == ["tool", "dir", "--bin"]:
             return _completed(stdout="/isolated/bin\n")
@@ -498,6 +651,50 @@ def test_installer_prefers_its_exposed_launcher_over_global_ash() -> None:
     assert ["/tmp/older-ash/bin/ash", "--version"] not in calls
 
 
+def test_pipx_install_does_not_verify_unowned_global_ash() -> None:
+    metadata = json.dumps(
+        {
+            "venvs": {
+                "ash-ai": {
+                    "metadata": {
+                        "main_package": {
+                            "package_or_url": "ash-ai @ git+https://example.invalid/ash",
+                            "app_paths": [],
+                        }
+                    }
+                }
+            }
+        }
+    )
+    calls: list[list[str]] = []
+
+    def runner(command, **kwargs):
+        calls.append(list(command))
+        if command[1:] == ["list", "--json"]:
+            return _completed(stdout=metadata)
+        if command[1:3] == ["install", "--force"]:
+            return _completed()
+        if command[1:] == ["environment", "--value", "PIPX_BIN_DIR"]:
+            return _completed(stdout="\n")
+        if command == ["/tmp/older-ash/bin/ash", "--version"]:
+            return _completed(stdout="ash 0.0.1\n")
+        if command[1:] == ["ensurepath"]:
+            return _completed()
+        raise AssertionError(f"unexpected command: {command}")
+
+    with pytest.raises(InstallError, match="executable could not be located"):
+        install(
+            runner=runner,
+            which=lambda name: {
+                "pipx": "/usr/bin/pipx",
+                "ash": "/tmp/older-ash/bin/ash",
+            }.get(name),
+            environ={"PATH": "/tmp/older-ash/bin:/usr/bin"},
+        )
+
+    assert ["/tmp/older-ash/bin/ash", "--version"] not in calls
+
+
 def test_ensure_shell_path_normalizes_symlink_equivalent_directories(tmp_path) -> None:
     actual = tmp_path / "actual-bin"
     actual.mkdir()
@@ -523,6 +720,21 @@ def test_ensure_shell_path_normalizes_symlink_equivalent_directories(tmp_path) -
 
     assert restart_required is False
     assert calls == []
+
+
+def test_ensure_shell_path_rejects_failed_manager_configuration() -> None:
+    def runner(command, **kwargs):
+        assert command == ["/usr/bin/pipx", "ensurepath"]
+        return _completed(returncode=1, stderr="permission denied")
+
+    with pytest.raises(InstallError, match="could not configure.*PATH"):
+        _ensure_shell_path(
+            "/usr/bin/pipx",
+            manager="pipx",
+            launcher_directory="/isolated/bin",
+            runner=runner,
+            environment={"PATH": "/usr/bin"},
+        )
 
 
 def test_installer_repairs_corrupt_pipx_metadata(tmp_path) -> None:

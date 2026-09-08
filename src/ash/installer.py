@@ -216,7 +216,6 @@ def install(
             current.executable
             or previous.executable
             or _executable_in_directory(launcher_directory)
-            or which("ash")
         )
         if not executable:
             raise InstallError(
@@ -373,7 +372,12 @@ def _install_with_uv(
         description="uv installation",
         failure_message="uv could not install Ash.",
     )
-    executable = previous.executable
+    current = _read_uv_state(uv, runner=runner, environment=environment)
+    if not current.installed:
+        raise InstallError(
+            "uv reported a successful install, but Ash is absent from the resulting uv state."
+        )
+    executable = current.executable
     if not executable:
         directory = _run_captured(
             [uv, "tool", "dir", "--bin"],
@@ -387,10 +391,13 @@ def _install_with_uv(
             raise InstallError(
                 "Ash was installed, but uv did not report its executable directory."
             )
+        launcher_directory = str(getattr(directory, "stdout", "")).strip()
+        if not launcher_directory:
+            raise InstallError(
+                "Ash was installed, but uv did not report its executable directory."
+            )
         executable_name = "ash.exe" if os.name == "nt" else "ash"
-        executable = str(
-            Path(str(getattr(directory, "stdout", "")).strip()) / executable_name
-        )
+        executable = str(Path(launcher_directory) / executable_name)
     version = _verify_executable(executable, runner=runner, environment=environment)
     restart_required = _ensure_shell_path(
         uv,
@@ -429,7 +436,7 @@ def _ensure_shell_path(
         if manager == "pipx"
         else [manager_executable, "tool", "update-shell"]
     )
-    _run_captured(
+    completed = _run_captured(
         command,
         runner=runner,
         environment=environment,
@@ -437,6 +444,12 @@ def _ensure_shell_path(
         max_bytes=_MAX_QUERY_OUTPUT_BYTES,
         description=f"{manager} shell path setup",
     )
+    if int(getattr(completed, "returncode", 1)) != 0:
+        detail = _completed_output_detail(completed)
+        suffix = f": {detail}" if detail else ""
+        raise InstallError(
+            f"{manager} could not configure Ash's executable directory on PATH{suffix}"
+        )
     return True
 
 
@@ -548,15 +561,30 @@ def _read_uv_state(
     if int(getattr(completed, "returncode", 1)) != 0:
         return _UvState()
     output = str(getattr(completed, "stdout", ""))
-    if not re.search(
-        rf"^{re.escape(_PACKAGE_NAME)}\s",
-        output,
-        re.MULTILINE | re.IGNORECASE,
-    ):
+    lines = output.splitlines()
+    header_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.match(
+                rf"^{re.escape(_PACKAGE_NAME)}\s",
+                line,
+                re.IGNORECASE,
+            )
+        ),
+        None,
+    )
+    if header_index is None:
         return _UvState()
-    extras_match = _UV_EXTRAS_PATTERN.search(output)
+    block_lines = [lines[header_index]]
+    for line in lines[header_index + 1 :]:
+        if not line.startswith("-"):
+            break
+        block_lines.append(line)
+    block = "\n".join(block_lines)
+    extras_match = _UV_EXTRAS_PATTERN.search(block_lines[0])
     extras = _normalize_extras(extras_match.group(1).split(",") if extras_match else ())
-    path_match = _UV_ASH_PATH_PATTERN.search(output)
+    path_match = _UV_ASH_PATH_PATTERN.search(block)
     executable = path_match.group(1).strip() if path_match else None
     return _UvState(installed=True, extras=extras, executable=executable)
 
