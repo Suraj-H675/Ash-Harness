@@ -162,6 +162,44 @@ skipped consolidation, and cancellation during a suspended async
 consolidation. The affected agent integration and adjacent unit suites pass;
 full-suite results are recorded below.
 
+### F-04/F-05 — CLI persistence correctness
+
+The corrupt-session-database CLI defect was reproduced before the fix: a
+malformed `sessions.db` made `metrics`, `sessions`, `plans list`, and the
+adjacent `audit list` path print a raw traceback, including under `--json`.
+The agent persistence defect was also reproduced: `ash --db-directory
+<alternate> agents list` read the default `agents.db` because that branch used
+a bare `AshConfig.load()`.
+
+The repair routes the affected session CLI construction and operations through
+the existing classified CLI error boundary. `SessionStore` initialization,
+SQLite failures, and malformed persisted rows/contracts now become Ash's
+storage error taxonomy with its existing backup/restore guidance. Human mode
+has no traceback; `--json` emits one structured error object with the classified
+exit code and no diagnostic text on stderr. Headless startup storage failures
+retain the established event envelope, while `ash storage check` remains
+unchanged. The session hydration paths now classify invalid stored timestamps,
+JSON, enum values, and incomplete SQLite structures as storage errors rather
+than leaking raw exceptions.
+
+Every `ash agents` action now uses the selected global CLI configuration. The
+same resolved `db_directory` supplies both `<db_directory>/agents.db` and
+`<db_directory>/worktrees`, so inspection and mutation cannot silently use
+different persistence roots. No schema, dependency, or public configuration
+format changed.
+
+Meaningful regressions cover corrupt construction and operation failures,
+malformed persisted session/plan data, structurally incomplete SQLite,
+malformed schema metadata, headless JSON event output, and distinguishable
+default/alternate agent databases. The focused CLI/persistence set passed
+**144 tests**. A real subprocess workflow passed all four corrupt-database
+human/JSON paths and verified alternate-database agent listing and message
+mutation without touching the default database.
+
+F-09 plugin lifecycle confinement remains a separate confirmed finding and is
+paused at the existing Sol decision boundary; no F-09 production changes were
+made in this batch.
+
 ### MCP OAuth private-store race
 
 The MCP OAuth token store had a confirmed filesystem-confinement defect: its
@@ -193,9 +231,11 @@ login/logout semantics, and dependency range were preserved.
 
 ### Verification checkpoint
 
-- `uv run pytest -q --timeout=120 --timeout-method=thread`: **2112 passed,
-  3 skipped** after the ACP lifecycle, MCP OAuth private-store, and F-03
-  cancellation fixes.
+- `uv run pytest -q --timeout=120 --timeout-method=thread`: **2165 passed,
+  3 skipped** after the ACP lifecycle, MCP OAuth private-store, F-03
+  cancellation, and F-04/F-05 CLI persistence fixes.
+- The focused F-04/F-05 persistence/CLI regression run passed **144 tests**;
+  the real subprocess workflow also passed.
 - The focused MCP OAuth/CLI regression run reports **49 passed**, including
   synchronized save/load/remove directory-substitution cases and the
   fail-closed unsupported-store path.
@@ -261,6 +301,8 @@ results retain structured error mappings: interactive targetless refreshes
 distinguish clean, partial, and previous-runtime-preserved failure states and
 print only redacted bounded server/error text.
 
-The focused MCP/lifecycle/redaction suite passed **218 tests**. The complete
-repository gate then passed **2137 tests with 3 skips**; Ruff and mypy passed,
-and `uv build` produced the source distribution and wheel successfully.
+The focused MCP/lifecycle/redaction suite passed **218 tests**. At that earlier
+MCP checkpoint, the complete repository gate passed **2137 tests with 3
+skips**; Ruff and mypy passed, and `uv build` produced the source distribution
+and wheel successfully. The later full gate, including the CLI persistence
+batch, is recorded in the verification checkpoint above.

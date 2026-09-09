@@ -104,7 +104,12 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
             exit_code=2,
         )
 
-    if name == "SessionStorageError" or "database" in lowered or "sqlite" in lowered:
+    if (
+        name == "SessionStorageError"
+        or module == "sqlite3"
+        or "database" in lowered
+        or "sqlite" in lowered
+    ):
         return ErrorInfo(
             ErrorCategory.STORAGE,
             message,

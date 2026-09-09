@@ -149,6 +149,13 @@ def _normalize_db_path(db_path: str | Path) -> str:
         raise SessionStorageError(str(exc)) from exc
 
 
+def _invalid_stored_data_error(db_path: str | Path) -> SessionStorageError:
+    return SessionStorageError(
+        f"Could not read session database {db_path}: stored data is invalid. "
+        "Run 'ash storage check' and restore a backup if needed."
+    )
+
+
 def normalize_project_path(project_path: str | Path) -> str:
     """Return the stable platform-aware identity used for session scoping."""
 
@@ -315,7 +322,7 @@ class SessionStore:
             _restrict_file_permissions(path)
         except SessionStorageError:
             raise
-        except (OSError, sqlite3.DatabaseError) as exc:
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
             raise SessionStorageError(
                 f"Could not initialize session database {path}: {exc}. "
                 "Run 'ash storage check' and restore a backup if needed."
@@ -989,46 +996,50 @@ class SessionStore:
                 (session_id,),
             ).fetchall()
 
-        return Session(
-            session_id=session_row["session_id"],
-            project_path=session_row["project_path"],
-            created_at=_deserialize_datetime(session_row["created_at"]),
-            title=session_row["title"] or "",
-            updated_at=_deserialize_datetime(
-                session_row["updated_at"] or session_row["created_at"]
-            ),
-            context_summary=session_row["context_summary"] or "",
-            model=session_row["model"] or "",
-            parent_session_id=session_row["parent_session_id"],
-            root_session_id=session_row["root_session_id"] or session_row["session_id"],
-            fork_message_count=session_row["fork_message_count"],
-            branch_name=session_row["branch_name"] or "",
-            branch_summary=session_row["branch_summary"] or "",
-            depth=int(session_row["depth"] or 0),
-            messages=[
-                Message(
-                    role=row["role"],
-                    content=row["content"],
-                    timestamp=_deserialize_datetime(row["timestamp"]),
-                    metadata=json.loads(row["metadata_json"] or "{}"),
-                )
-                for row in message_rows
-            ],
-            tool_calls=[
-                ToolCallRecord(
-                    call_id=row["call_id"],
-                    tool_name=row["tool_name"],
-                    arguments=json.loads(row["arguments_json"]),
-                    approved=bool(row["approved"]),
-                    executed=bool(row["executed"]),
-                    dispatched=bool(row["dispatched"]),
-                    result=row["result"],
-                    error=row["error"],
-                    timestamp=_deserialize_datetime(row["timestamp"]),
-                )
-                for row in tool_call_rows
-            ],
-        )
+        try:
+            return Session(
+                session_id=session_row["session_id"],
+                project_path=session_row["project_path"],
+                created_at=_deserialize_datetime(session_row["created_at"]),
+                title=session_row["title"] or "",
+                updated_at=_deserialize_datetime(
+                    session_row["updated_at"] or session_row["created_at"]
+                ),
+                context_summary=session_row["context_summary"] or "",
+                model=session_row["model"] or "",
+                parent_session_id=session_row["parent_session_id"],
+                root_session_id=session_row["root_session_id"]
+                or session_row["session_id"],
+                fork_message_count=session_row["fork_message_count"],
+                branch_name=session_row["branch_name"] or "",
+                branch_summary=session_row["branch_summary"] or "",
+                depth=int(session_row["depth"] or 0),
+                messages=[
+                    Message(
+                        role=row["role"],
+                        content=row["content"],
+                        timestamp=_deserialize_datetime(row["timestamp"]),
+                        metadata=json.loads(row["metadata_json"] or "{}"),
+                    )
+                    for row in message_rows
+                ],
+                tool_calls=[
+                    ToolCallRecord(
+                        call_id=row["call_id"],
+                        tool_name=row["tool_name"],
+                        arguments=json.loads(row["arguments_json"]),
+                        approved=bool(row["approved"]),
+                        executed=bool(row["executed"]),
+                        dispatched=bool(row["dispatched"]),
+                        result=row["result"],
+                        error=row["error"],
+                        timestamp=_deserialize_datetime(row["timestamp"]),
+                    )
+                    for row in tool_call_rows
+                ],
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
 
     def require_session_project(self, session_id: str, project_path: str | Path) -> None:
         """Refuse access to a session outside the requested canonical project."""
@@ -1123,24 +1134,27 @@ class SessionStore:
                 """,
                 params,
             ).fetchall()
-        return [
-            SessionSummary(
-                session_id=row["session_id"],
-                project_path=row["project_path"],
-                title=row["title"] or "",
-                created_at=_deserialize_datetime(row["created_at"]),
-                updated_at=_deserialize_datetime(row["updated_at"]),
-                message_count=int(row["message_count"]),
-                model=row["model"] or "",
-                parent_session_id=row["parent_session_id"],
-                root_session_id=row["root_session_id"] or row["session_id"],
-                fork_message_count=row["fork_message_count"],
-                branch_name=row["branch_name"] or "",
-                depth=int(row["depth"] or 0),
-                context_summary=row["context_summary"] or "",
-            )
-            for row in rows
-        ]
+        try:
+            return [
+                SessionSummary(
+                    session_id=row["session_id"],
+                    project_path=row["project_path"],
+                    title=row["title"] or "",
+                    created_at=_deserialize_datetime(row["created_at"]),
+                    updated_at=_deserialize_datetime(row["updated_at"]),
+                    message_count=int(row["message_count"]),
+                    model=row["model"] or "",
+                    parent_session_id=row["parent_session_id"],
+                    root_session_id=row["root_session_id"] or row["session_id"],
+                    fork_message_count=row["fork_message_count"],
+                    branch_name=row["branch_name"] or "",
+                    depth=int(row["depth"] or 0),
+                    context_summary=row["context_summary"] or "",
+                )
+                for row in rows
+            ]
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
 
     def latest_session(self, project_path: str) -> SessionSummary | None:
         """Return the most recently updated session in one project."""
@@ -1201,20 +1215,23 @@ class SessionStore:
                     "resume by session ID"
                 )
             row = rows[0]
-        return SessionSummary(
-            session_id=row["session_id"],
-            project_path=row["project_path"],
-            title=row["title"] or "",
-            created_at=_deserialize_datetime(row["created_at"]),
-            updated_at=_deserialize_datetime(row["updated_at"]),
-            message_count=int(row["message_count"]),
-            model=row["model"] or "",
-            parent_session_id=row["parent_session_id"],
-            root_session_id=row["root_session_id"] or row["session_id"],
-            fork_message_count=row["fork_message_count"],
-            branch_name=row["branch_name"] or "",
-            depth=int(row["depth"] or 0),
-        )
+        try:
+            return SessionSummary(
+                session_id=row["session_id"],
+                project_path=row["project_path"],
+                title=row["title"] or "",
+                created_at=_deserialize_datetime(row["created_at"]),
+                updated_at=_deserialize_datetime(row["updated_at"]),
+                message_count=int(row["message_count"]),
+                model=row["model"] or "",
+                parent_session_id=row["parent_session_id"],
+                root_session_id=row["root_session_id"] or row["session_id"],
+                fork_message_count=row["fork_message_count"],
+                branch_name=row["branch_name"] or "",
+                depth=int(row["depth"] or 0),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
 
     def get_session_usage(self, session_id: str) -> SessionUsage:
         """Return persisted token and explicitly configured cost totals."""
@@ -1935,10 +1952,13 @@ class SessionStore:
                 "ORDER BY created_at, session_id",
                 (session_id,),
             ).fetchall()
-        return _lineage_from_row(
-            row,
-            children=tuple(str(child["session_id"]) for child in children),
-        )
+        try:
+            return _lineage_from_row(
+                row,
+                children=tuple(str(child["session_id"]) for child in children),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
 
     def session_tree(self, session_id: str) -> list[SessionLineage]:
         """Return the complete conversation tree in stable parent-first order."""
@@ -1976,13 +1996,16 @@ class SessionStore:
             pending.extend(reversed(children_by_parent.get(current, ())))
         # Preserve visibility if a manually modified database contains an orphan.
         ordered_ids.extend(session for session in rows_by_id if session not in seen)
-        return [
-            _lineage_from_row(
-                rows_by_id[current],
-                children=tuple(children_by_parent.get(current, ())),
-            )
-            for current in ordered_ids
-        ]
+        try:
+            return [
+                _lineage_from_row(
+                    rows_by_id[current],
+                    children=tuple(children_by_parent.get(current, ())),
+                )
+                for current in ordered_ids
+            ]
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
 
     def export_session(self, session_id: str, *, format: str = "jsonl") -> str:
         """Serialize a redacted session transcript for local export."""
@@ -2309,7 +2332,10 @@ class SessionStore:
                 """,
                 (session_id,),
             ).fetchall()
-        return [_audit_record_from_row(row) for row in rows]
+        try:
+            return [_audit_record_from_row(row) for row in rows]
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
 
     def verify_audit_log(self, session_id: str) -> list[str]:
         """Return integrity errors for a session audit chain."""
@@ -2433,42 +2459,45 @@ class SessionStore:
             if row is None:
                 raise KeyError(f"Sprint not found: {sprint_id}")
 
-            contract_data = json.loads(row["contract_json"])
-            contract = SprintContract.from_dict(contract_data)
-            execution = SprintExecution(
-                contract=contract,
-                state=SprintState(row["state"]),
-                created_at=_deserialize_datetime(row["created_at"]),
-                started_at=_deserialize_datetime(row["started_at"])
-                if row["started_at"]
-                else None,
-                completed_at=_deserialize_datetime(row["completed_at"])
-                if row["completed_at"]
-                else None,
-                abort_reason=row["abort_reason"] or "",
-            )
+            try:
+                contract_data = json.loads(row["contract_json"])
+                contract = SprintContract.from_dict(contract_data)
+                execution = SprintExecution(
+                    contract=contract,
+                    state=SprintState(row["state"]),
+                    created_at=_deserialize_datetime(row["created_at"]),
+                    started_at=_deserialize_datetime(row["started_at"])
+                    if row["started_at"]
+                    else None,
+                    completed_at=_deserialize_datetime(row["completed_at"])
+                    if row["completed_at"]
+                    else None,
+                    abort_reason=row["abort_reason"] or "",
+                )
 
-            item_rows = conn.execute(
-                """
-                SELECT idx, section, description, status, notes
-                FROM checklist_items WHERE sprint_id = ?
-                ORDER BY idx ASC
-                """,
-                (sprint_id,),
-            ).fetchall()
-            execution.set_items(
-                [
-                    ChecklistItem(
-                        idx=r["idx"],
-                        section=r["section"],
-                        description=r["description"],
-                        status=ChecklistStatus(r["status"]),
-                        notes=r["notes"] or "",
-                    )
-                    for r in item_rows
-                ]
-            )
-            return execution
+                item_rows = conn.execute(
+                    """
+                    SELECT idx, section, description, status, notes
+                    FROM checklist_items WHERE sprint_id = ?
+                    ORDER BY idx ASC
+                    """,
+                    (sprint_id,),
+                ).fetchall()
+                execution.set_items(
+                    [
+                        ChecklistItem(
+                            idx=r["idx"],
+                            section=r["section"],
+                            description=r["description"],
+                            status=ChecklistStatus(r["status"]),
+                            notes=r["notes"] or "",
+                        )
+                        for r in item_rows
+                    ]
+                )
+                return execution
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise _invalid_stored_data_error(self.db_path) from exc
 
     def list_session_sprints(self, session_id: str) -> list[str]:
         """Return the sprint ids persisted against a session, newest first."""

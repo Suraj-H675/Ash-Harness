@@ -111,6 +111,34 @@ def _print_classified_error(exc: BaseException) -> None:
     print(format_error(classify_exception(exc)), file=sys.stderr, flush=True)
 
 
+def _report_cli_error(
+    exc: BaseException,
+    *,
+    json_output: bool = False,
+    event_output: bool = False,
+) -> int:
+    """Render a command failure through Ash's stable human/JSON error boundary."""
+
+    from ash.exceptions import classify_exception, format_error
+
+    error = classify_exception(exc)
+    if event_output:
+        from ash.core.events import envelope_event
+
+        print(
+            json.dumps(
+                envelope_event({"type": "error", "error": error.to_dict()}),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+    elif json_output:
+        print(json.dumps({"error": error.to_dict()}, sort_keys=True))
+    else:
+        print(format_error(error), file=sys.stderr)
+    return error.exit_code
+
+
 def _config_overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
     if (
@@ -2818,11 +2846,16 @@ def main(argv: list[str] | None = None) -> int:
         from ash.commands.storage import render_local_metrics
         from ash.core.session import SessionStore
 
-        metrics_config = AshConfig.load(
-            **({"db_directory": args.db_directory} if args.db_directory else {})
-        )
-        store = SessionStore(metrics_config.db_directory / "sessions.db")
-        summary = store.local_metrics_summary()
+        try:
+            metrics_config = AshConfig.load(
+                _override_source="cli",
+                _override_detail="command-line option",
+                **_config_overrides_from_args(args),
+            )
+            store = SessionStore(metrics_config.db_directory / "sessions.db")
+            summary = store.local_metrics_summary()
+        except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
+            return _report_cli_error(exc, json_output=args.json)
         print(render_local_metrics(summary, json_output=args.json))
         return 0
 
@@ -2847,16 +2880,14 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 bundle_path = create_debug_bundle(storage_config, args.destination)
             except (OSError, RuntimeError) as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                return 1
+                return _report_cli_error(exc)
             print(f"Debug bundle created: {bundle_path}")
             return 0
         if args.storage_action == "backup":
             try:
                 backup_path = backup_database(database, args.destination)
             except (OSError, RuntimeError) as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                return 1
+                return _report_cli_error(exc)
             print(f"Backup created: {backup_path}")
             return 0
         confirmed = args.yes
@@ -2869,8 +2900,7 @@ def main(argv: list[str] | None = None) -> int:
                 database, args.backup, confirmed=confirmed
             )
         except (OSError, RuntimeError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
+            return _report_cli_error(exc)
         print(f"Restored: {restored}")
         for path in preserved:
             print(f"Preserved previous data: {path}")
@@ -2883,41 +2913,45 @@ def main(argv: list[str] | None = None) -> int:
             render_audit_verification,
         )
 
-        audit_config = AshConfig.load(
-            **({"db_directory": args.db_directory} if args.db_directory else {})
-        )
-        store = SessionStore(audit_config.db_directory / "sessions.db")
         try:
-            store.load_session(args.audit_session)
-        except KeyError:
-            print(f"Error: session not found: {args.audit_session}", file=sys.stderr)
-            return 1
-        if args.audit_action == "list":
-            print(
-                render_audit_records(
-                    args.audit_session,
-                    store.list_audit_logs(args.audit_session),
-                    json_output=args.json,
-                )
+            audit_config = AshConfig.load(
+                _override_source="cli",
+                _override_detail="command-line option",
+                **_config_overrides_from_args(args),
             )
-            return 0
-        if args.audit_action == "verify":
-            errors = store.verify_audit_log(args.audit_session)
-            print(
-                render_audit_verification(
-                    args.audit_session,
-                    errors,
-                    json_output=args.json,
+            store = SessionStore(audit_config.db_directory / "sessions.db")
+            try:
+                store.load_session(args.audit_session)
+            except KeyError:
+                print(
+                    f"Error: session not found: {args.audit_session}",
+                    file=sys.stderr,
                 )
-            )
-            return 0 if not errors else 1
-        try:
+                return 1
+            if args.audit_action == "list":
+                print(
+                    render_audit_records(
+                        args.audit_session,
+                        store.list_audit_logs(args.audit_session),
+                        json_output=args.json,
+                    )
+                )
+                return 0
+            if args.audit_action == "verify":
+                errors = store.verify_audit_log(args.audit_session)
+                print(
+                    render_audit_verification(
+                        args.audit_session,
+                        errors,
+                        json_output=args.json,
+                    )
+                )
+                return 0 if not errors else 1
             exported = export_audit_log(store, args.audit_session, args.output)
-        except OSError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        print(f"Audit log exported: {exported}")
-        return 0
+            print(f"Audit log exported: {exported}")
+            return 0
+        except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
+            return _report_cli_error(exc, json_output=getattr(args, "json", False))
 
     if args.command == "cron":
         from ash.automation.store import AutomationError
@@ -3167,37 +3201,43 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     if args.command == "sessions":
+        from ash.core.session import SessionResolutionError
         from ash.commands.sessions import (
             list_session_summaries,
             render_session_summaries,
             render_session_tree,
         )
 
-        sessions_config = AshConfig.load(
-            **({"db_directory": args.db_directory} if args.db_directory else {})
-        )
-        store = SessionStore(sessions_config.db_directory / "sessions.db")
-        if args.sessions_action == "tree":
-            try:
-                selected_summary = (
-                    store.resolve_session(
-                        args.session, str(sessions_config.workspace_root)
-                    )
-                    if args.session
-                    else store.latest_session(str(sessions_config.workspace_root))
-                )
-                if selected_summary is None:
-                    raise ValueError("no sessions found in this project")
-                tree = store.session_tree(selected_summary.session_id)
-            except (KeyError, ValueError) as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                return 2
-            print(render_session_tree(tree, json_output=args.json))
-            return 0
-        if args.session:
-            print("Error: --session requires 'sessions tree'", file=sys.stderr)
-            return 2
         try:
+            sessions_config = AshConfig.load(
+                _override_source="cli",
+                _override_detail="command-line option",
+                **_config_overrides_from_args(args),
+            )
+            store = SessionStore(sessions_config.db_directory / "sessions.db")
+            if args.sessions_action == "tree":
+                try:
+                    selected_summary = (
+                        store.resolve_session(
+                            args.session, str(sessions_config.workspace_root)
+                        )
+                        if args.session
+                        else store.latest_session(str(sessions_config.workspace_root))
+                    )
+                    if selected_summary is None:
+                        raise SessionResolutionError("no sessions found in this project")
+                    tree = store.session_tree(selected_summary.session_id)
+                except (KeyError, SessionResolutionError) as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    return 2
+                print(render_session_tree(tree, json_output=args.json))
+                return 0
+            if args.session:
+                print("Error: --session requires 'sessions tree'", file=sys.stderr)
+                return 2
+            if args.limit < 1:
+                print("Error: limit must be positive", file=sys.stderr)
+                return 2
             sessions = list_session_summaries(
                 store,
                 project_path=str(sessions_config.workspace_root),
@@ -3205,11 +3245,10 @@ def main(argv: list[str] | None = None) -> int:
                 limit=args.limit,
                 query=args.query,
             )
-        except ValueError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 2
-        print(render_session_summaries(sessions, json_output=args.json))
-        return 0
+            print(render_session_summaries(sessions, json_output=args.json))
+            return 0
+        except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
+            return _report_cli_error(exc, json_output=args.json)
 
     if args.command == "plans":
         from ash.commands.plans import (
@@ -3221,12 +3260,17 @@ def main(argv: list[str] | None = None) -> int:
             update_plan_item,
         )
 
-        plans_config = AshConfig.load(
-            **({"db_directory": args.db_directory} if args.db_directory else {})
-        )
-        store = SessionStore(plans_config.db_directory / "sessions.db")
         try:
+            plans_config = AshConfig.load(
+                _override_source="cli",
+                _override_detail="command-line option",
+                **_config_overrides_from_args(args),
+            )
+            store = SessionStore(plans_config.db_directory / "sessions.db")
             if args.plans_action == "list":
+                if args.limit < 1:
+                    print("Error: limit must be positive", file=sys.stderr)
+                    return 2
                 print(
                     render_plan_summaries(
                         list_plans(
@@ -3246,6 +3290,9 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
             else:
+                if args.item_idx < 1:
+                    print("Error: item index must be positive", file=sys.stderr)
+                    return 2
                 print(
                     render_updated_plan_item(
                         update_plan_item(
@@ -3258,10 +3305,12 @@ def main(argv: list[str] | None = None) -> int:
                         json_output=args.json,
                     )
                 )
-        except (KeyError, ValueError) as exc:
+            return 0
+        except KeyError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
-        return 0
+        except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
+            return _report_cli_error(exc, json_output=args.json)
 
     if args.command == "permissions":
         from ash.commands.permissions import (
@@ -3350,7 +3399,11 @@ def main(argv: list[str] | None = None) -> int:
             send_agent_message,
         )
 
-        agents_config = AshConfig.load()
+        agents_config, exit_code = _load_config_or_report(
+            **_config_overrides_from_args(args)
+        )
+        if agents_config is None:
+            return exit_code
         database = agents_config.db_directory / "agents.db"
         worktree_storage = agents_config.db_directory / "worktrees"
         try:
@@ -3878,11 +3931,20 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     db_path = config.db_directory / "sessions.db"
-    session_store = SessionStore(db_path)
-    if config.session_retention_days > 0:
-        session_store.cleanup_sessions(
-            config.session_retention_days,
-            project_path=str(config.workspace_root.resolve()),
+    try:
+        session_store = SessionStore(db_path)
+        if config.session_retention_days > 0:
+            session_store.cleanup_sessions(
+                config.session_retention_days,
+                project_path=str(config.workspace_root.resolve()),
+            )
+    except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
+        return _report_cli_error(
+            exc,
+            event_output=(
+                args.prompt is not None
+                and args.output_format in {"json", "stream-json"}
+            ),
         )
     startup_session_id = args.session
     if args.continue_session or args.resume is not None or args.fork_session:
@@ -3907,6 +3969,14 @@ def main(argv: list[str] | None = None) -> int:
         except (KeyError, ValueError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
+        except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
+            return _report_cli_error(
+                exc,
+                event_output=(
+                    args.prompt is not None
+                    and args.output_format in {"json", "stream-json"}
+                ),
+            )
         if startup_selection.cancelled:
             return 0
         startup_session_id = startup_selection.session_id

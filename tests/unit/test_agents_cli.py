@@ -186,6 +186,71 @@ def test_agents_cli_lists_persisted_statuses(
     assert payload["agents"][0]["current_task"] == "fix tests"
 
 
+def test_agents_cli_honors_explicit_database_directory_for_read_and_write(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    default_dir = tmp_path / "default"
+    alternate_dir = tmp_path / "alternate"
+    default_state = SharedState(default_dir / "agents.db")
+    default_state.register_agent("default-agent", role="default")
+    default_state.close()
+    alternate_state = SharedState(alternate_dir / "agents.db")
+    alternate_state.register_agent("alternate-agent", role="alternate")
+    alternate_state.close()
+
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(default_dir))
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+
+    assert (
+        main(
+            [
+                "--db-directory",
+                str(alternate_dir),
+                "agents",
+                "list",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    listed = json.loads(capsys.readouterr().out)
+    assert [agent["agent_id"] for agent in listed["agents"]] == [
+        "alternate-agent"
+    ]
+
+    assert (
+        main(
+            [
+                "--db-directory",
+                str(alternate_dir),
+                "agents",
+                "send",
+                "alternate-agent",
+                "continue",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["message"]["recipient_id"] == (
+        "alternate-agent"
+    )
+
+    default_state = SharedState(default_dir / "agents.db")
+    alternate_state = SharedState(alternate_dir / "agents.db")
+    try:
+        assert default_state.fetch_messages("alternate-agent") == []
+        assert [
+            message.content for message in alternate_state.fetch_messages("alternate-agent")
+        ] == [{"content": "continue"}]
+    finally:
+        default_state.close()
+        alternate_state.close()
+
+
 def test_agents_cli_lists_filtered_durable_tasks(
     tmp_path: Path,
     monkeypatch,

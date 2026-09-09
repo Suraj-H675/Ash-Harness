@@ -205,6 +205,225 @@ def test_metrics_cli_reports_local_only_aggregate(
     assert payload["metrics"]["cost_usd"] == pytest.approx(0.01)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("metrics",),
+        ("sessions",),
+        ("plans", "list"),
+        ("audit", "list", "--session", "missing"),
+    ],
+    ids=["metrics", "sessions", "plans", "audit"],
+)
+def test_session_cli_reports_corrupt_database_without_traceback(
+    tmp_path: Path,
+    capsys,
+    command: tuple[str, ...],
+) -> None:
+    (tmp_path / "sessions.db").write_bytes(b"not sqlite")
+
+    assert main(["--db-directory", str(tmp_path), *command]) == 1
+    human = capsys.readouterr()
+    assert human.out == ""
+    assert "Error [storage]:" in human.err
+    assert "Run `ash storage check`" in human.err
+    assert "Traceback" not in human.err
+
+    assert main(["--db-directory", str(tmp_path), *command, "--json"]) == 1
+    structured = capsys.readouterr()
+    assert structured.err == ""
+    payload = json.loads(structured.out)
+    assert payload["error"]["category"] == "storage"
+    assert payload["error"]["exit_code"] == 1
+    assert "file is not a database" in payload["error"]["message"]
+
+
+def test_metrics_cli_classifies_store_operation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    database = tmp_path / "sessions.db"
+    SessionStore(database)
+
+    def fail_metrics(self: SessionStore) -> dict:
+        raise SessionStorageError("database read failed")
+
+    monkeypatch.setattr(SessionStore, "local_metrics_summary", fail_metrics)
+
+    assert main(["--db-directory", str(tmp_path), "metrics", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "error": {
+            "category": "storage",
+            "exit_code": 1,
+            "message": "database read failed",
+            "remedy": (
+                "Run `ash storage check`; if needed, create a backup and restore "
+                "a known-good sessions database."
+            ),
+            "retriable": False,
+        }
+    }
+
+
+def test_sessions_cli_classifies_corrupt_persisted_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    database = tmp_path / "sessions.db"
+    session = SessionStore(database).create_session(str(tmp_path))
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE sessions SET created_at = 'not-a-timestamp' "
+            "WHERE session_id = ?",
+            (session.session_id,),
+        )
+
+    assert main(["--db-directory", str(tmp_path), "sessions", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["error"]["category"] == "storage"
+    assert "stored data is invalid" in payload["error"]["message"]
+
+
+def test_plans_cli_classifies_corrupt_persisted_contract(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    from ash.core.sprint import ChecklistItem, SprintContract, SprintExecution
+
+    database = tmp_path / "sessions.db"
+    store = SessionStore(database)
+    session = store.create_session(str(tmp_path))
+    execution = SprintExecution(contract=SprintContract(goal="corruptible"))
+    execution.set_items([ChecklistItem(idx=1, section="test", description="item")])
+    store.save_sprint(session.session_id, execution)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE sprints SET contract_json = 'not-json' WHERE sprint_id = ?",
+            (execution.contract.contract_id,),
+        )
+
+    assert (
+        main(
+            [
+                "--db-directory",
+                str(tmp_path),
+                "plans",
+                "show",
+                execution.contract.contract_id,
+                "--json",
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["error"]["category"] == "storage"
+    assert "stored data is invalid" in payload["error"]["message"]
+
+
+def test_session_cli_classifies_structurally_incomplete_sqlite(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = tmp_path / "sessions.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations VALUES (11, 'now');
+            CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                project_path TEXT NOT NULL,
+                title TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                model TEXT
+            );
+            """
+        )
+
+    assert main(["--db-directory", str(tmp_path), "sessions", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out)["error"]["category"] == "storage"
+
+
+def test_session_cli_classifies_malformed_schema_metadata(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = tmp_path / "sessions.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations VALUES ('bad', 'now');
+            """
+        )
+
+    assert main(["--db-directory", str(tmp_path), "metrics", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out)["error"]["category"] == "storage"
+
+
+def test_startup_storage_error_uses_headless_event_envelope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    database = tmp_path / "sessions.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations VALUES ('bad', 'now');
+            """
+        )
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+
+    assert (
+        main(
+            [
+                "--db-directory",
+                str(tmp_path),
+                "--prompt",
+                "hello",
+                "--output-format",
+                "stream-json",
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["type"] == "error"
+    assert payload["schema_version"] == 1
+    assert payload["event_id"]
+    assert payload["timestamp"]
+    assert payload["source"] == {"type": "runtime", "id": "ash"}
+    assert payload["error"]["category"] == "storage"
+
+
 def test_storage_check_reports_newer_schema_as_unsupported(tmp_path: Path) -> None:
     path = tmp_path / "future.db"
     with sqlite3.connect(path) as connection:
