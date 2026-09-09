@@ -151,12 +151,21 @@ class SubagentOrchestrator:
         reports: list[AgentReport] = []
         try:
             reports = await self._run_agents(specs)
-        finally:
             elapsed = time.monotonic() - start
             if reports:
                 state = "complete" if all(r.success for r in reports) else "aborted"
             else:
                 state = "aborted"
+            consolidated = await self.consolidate_results(reports, goal)
+        except asyncio.CancelledError:
+            self.shared_state.update_sprint_state(sprint_id, "aborted")
+            self.shared_state.update_status(
+                self.lead_agent_id,
+                "failed",
+                current_task="batch cancelled",
+            )
+            raise
+        else:
             self.shared_state.update_sprint_state(sprint_id, state)
             self.shared_state.update_status(
                 self.lead_agent_id,
@@ -164,7 +173,6 @@ class SubagentOrchestrator:
                 current_task=f"batch done ({len(reports)} reports)",
             )
 
-        consolidated = await self.consolidate_results(reports, goal)
         return OrchestratorResult(
             goal=goal,
             sprint_id=sprint_id,
@@ -212,19 +220,34 @@ class SubagentOrchestrator:
         tasks = [asyncio.create_task(_run_one(spec)) for spec in specs]
 
         # Collect results as they complete (not in submission order).
-        for finished in asyncio.as_completed(tasks):
-            try:
-                report = await finished
-            except Exception as exc:  # noqa: BLE001
-                report = AgentReport(
-                    agent_id="<unknown>",
-                    role="general",
-                    task="<unknown>",
-                    success=False,
-                    summary=f"orchestrator caught: {exc}",
-                )
-            reports.append(report)
-            self._drain_lead_inbox()
+        try:
+            for finished in asyncio.as_completed(tasks):
+                try:
+                    report = await finished
+                except Exception as exc:  # noqa: BLE001
+                    report = AgentReport(
+                        agent_id="<unknown>",
+                        role="general",
+                        task="<unknown>",
+                        success=False,
+                        summary=f"orchestrator caught: {exc}",
+                    )
+                reports.append(report)
+                self._drain_lead_inbox()
+        finally:
+            pending = [task for task in tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                cleanup = asyncio.gather(*pending, return_exceptions=True)
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        # A second cancellation must not leave orchestrator-owned
+                        # workers running after this cleanup returns.
+                        continue
+                cleanup.result()
 
         return reports
 

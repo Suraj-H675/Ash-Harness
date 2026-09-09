@@ -465,6 +465,184 @@ async def test_max_concurrency_is_respected(shared_state):
     )
 
 
+@pytest.mark.asyncio
+async def test_batch_cancellation_cleans_up_workers_and_aborts_sprint(shared_state):
+    """Cancellation is durably recorded and drains every owned worker task."""
+
+    started = asyncio.Event()
+    fast_finished = asyncio.Event()
+    release_slow = asyncio.Event()
+    active_workers: set[str] = set()
+    cancelled_workers: set[str] = set()
+    started_workers: set[str] = set()
+
+    async def runner(ctx):
+        agent_id = ctx["agent_id"]
+        active_workers.add(agent_id)
+        started_workers.add(agent_id)
+        if len(started_workers) == 2:
+            started.set()
+        if agent_id == "fast-worker":
+            fast_finished.set()
+            active_workers.remove(agent_id)
+            return "completed before cancellation"
+        try:
+            await release_slow.wait()
+        except asyncio.CancelledError:
+            cancelled_workers.add(agent_id)
+            active_workers.remove(agent_id)
+            raise
+        active_workers.remove(agent_id)
+        return "unexpected slow completion"
+
+    consolidate_called = False
+
+    async def unexpected_consolidation(reports, goal):
+        nonlocal consolidate_called
+        consolidate_called = True
+        raise AssertionError("cancelled batches must not consolidate")
+
+    orchestrator = SubagentOrchestrator(shared_state, max_concurrency=2)
+    orchestrator.consolidate_results = unexpected_consolidation
+    specs = [
+        SubagentSpec(
+            role="coder",
+            task="finish quickly",
+            runner=runner,
+            agent_id="fast-worker",
+        ),
+        SubagentSpec(
+            role="tester",
+            task="wait for cancellation " + ("x" * 300),
+            runner=runner,
+            agent_id="slow-worker",
+        ),
+    ]
+
+    batch = asyncio.create_task(orchestrator.run_batch("cancel batch", specs))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await asyncio.wait_for(fast_finished.wait(), timeout=2)
+    batch.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await batch
+
+    assert started_workers == {"fast-worker", "slow-worker"}
+    assert cancelled_workers == {"slow-worker"}
+    assert active_workers == set()
+    assert consolidate_called is False
+
+    sprint = shared_state.list_sprints()[0]
+    assert sprint.state == "aborted"
+    assert shared_state.get_status(LEAD_AGENT_ID).status == "failed"
+    assert shared_state.get_status(LEAD_AGENT_ID).current_task == "batch cancelled"
+    assert shared_state.get_status("fast-worker").status == "completed"
+    slow_status = shared_state.get_status("slow-worker")
+    assert slow_status.status == "failed"
+    assert "cancelled" in slow_status.current_task
+    assert len(slow_status.current_task) == 200
+    assert all(
+        message.sender_id != "slow-worker"
+        for message in shared_state.fetch_messages(LEAD_AGENT_ID, undelivered_only=False)
+    )
+
+    current = asyncio.current_task()
+    owned_workers = [
+        task
+        for task in asyncio.all_tasks()
+        if task is not current
+        and not task.done()
+        and "_run_one" in task.get_coro().__qualname__
+    ]
+    assert owned_workers == []
+
+
+@pytest.mark.asyncio
+async def test_batch_cancellation_cancels_workers_waiting_for_capacity(shared_state):
+    """Workers queued behind the concurrency limit are cancelled too."""
+
+    active_workers: set[str] = set()
+    cancelled_workers: set[str] = set()
+    all_started = asyncio.Event()
+
+    async def runner(ctx):
+        agent_id = ctx["agent_id"]
+        active_workers.add(agent_id)
+        if len(active_workers) == 2:
+            all_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled_workers.add(agent_id)
+            active_workers.remove(agent_id)
+            raise
+
+    orchestrator = SubagentOrchestrator(shared_state, max_concurrency=2)
+    specs = [
+        SubagentSpec(
+            role="coder",
+            task=f"queued cancellation {index}",
+            runner=runner,
+            agent_id=f"queued-worker-{index}",
+        )
+        for index in range(3)
+    ]
+
+    batch = asyncio.create_task(orchestrator.run_batch("queued cancel", specs))
+    await asyncio.wait_for(all_started.wait(), timeout=2)
+    batch.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await batch
+
+    assert cancelled_workers == {"queued-worker-0", "queued-worker-1"}
+    assert active_workers == set()
+    assert shared_state.get_status("queued-worker-2") is None
+    assert shared_state.list_sprints()[0].state == "aborted"
+
+    current = asyncio.current_task()
+    assert not any(
+        task is not current
+        and not task.done()
+        and "_run_one" in task.get_coro().__qualname__
+        for task in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_cancellation_during_consolidation_aborts_sprint(shared_state):
+    """Cancellation is handled even if an async consolidator is suspended."""
+
+    consolidation_started = asyncio.Event()
+    release_consolidation = asyncio.Event()
+
+    async def consolidator(reports, goal):
+        consolidation_started.set()
+        await release_consolidation.wait()
+        raise AssertionError("consolidation should remain suspended in this test")
+
+    orchestrator = SubagentOrchestrator(shared_state, max_concurrency=1)
+    orchestrator.consolidate_results = consolidator
+    spec = SubagentSpec(
+        role="reviewer",
+        task="complete before consolidation",
+        runner=make_simple_text_task("completed"),
+        agent_id="consolidation-worker",
+    )
+
+    batch = asyncio.create_task(orchestrator.run_batch("cancel consolidation", [spec]))
+    await asyncio.wait_for(consolidation_started.wait(), timeout=2)
+    batch.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await batch
+
+    assert shared_state.list_sprints()[0].state == "aborted"
+    lead = shared_state.get_status(LEAD_AGENT_ID)
+    assert lead.status == "failed"
+    assert lead.current_task == "batch cancelled"
+
+
 # ---------------------------------------------------------------------------
 # H-9: Architect/Editor Dual-Model Mode
 # ---------------------------------------------------------------------------

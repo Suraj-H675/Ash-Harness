@@ -137,6 +137,31 @@ instead of guessing. Targeted checkpoint/scoped-I/O tests pass, including
 created-file deletion, mode restoration, stale-state refusal, rollback, and
 fallback coverage.
 
+### F-03 — subagent batch cancellation
+
+The pre-fix implementation was reproduced with two deterministic in-process
+workers blocked on an event. Cancelling `run_batch()` returned
+`asyncio.CancelledError` to the caller, but both worker runners remained
+active and the lead was persisted as `completed` while the sprint was
+`aborted`.
+
+The repair makes cancellation forward-only: `_run_agents()` cancels every
+unfinished worker task and awaits the complete task set before propagating
+the cancellation. `SubprocessAgent.run_in_process()` persists an actively
+cancelled worker as `failed` with bounded cancellation text and re-raises
+`CancelledError`; it does not publish a normal report. `run_batch()` skips
+consolidation on worker-phase cancellation, persists the sprint as `aborted`,
+persists the lead as `failed` with `batch cancelled`, and re-raises. Normal
+terminal worker states remain unchanged, and no compensation is attempted for
+effects that completed before cancellation.
+
+Deterministic regressions cover active workers, a worker queued behind the
+concurrency limit, no remaining orchestrator `_run_one` tasks, preservation of
+a completed worker, bounded cancellation text, no cancelled-worker report,
+skipped consolidation, and cancellation during a suspended async
+consolidation. The affected agent integration and adjacent unit suites pass;
+full-suite results are recorded below.
+
 ### MCP OAuth private-store race
 
 The MCP OAuth token store had a confirmed filesystem-confinement defect: its
@@ -168,8 +193,9 @@ login/logout semantics, and dependency range were preserved.
 
 ### Verification checkpoint
 
-- `uv run pytest -q --timeout=120 --timeout-method=thread`: **2109 passed,
-  3 skipped** after the ACP lifecycle and MCP OAuth private-store fixes.
+- `uv run pytest -q --timeout=120 --timeout-method=thread`: **2112 passed,
+  3 skipped** after the ACP lifecycle, MCP OAuth private-store, and F-03
+  cancellation fixes.
 - The focused MCP OAuth/CLI regression run reports **49 passed**, including
   synchronized save/load/remove directory-substitution cases and the
   fail-closed unsupported-store path.

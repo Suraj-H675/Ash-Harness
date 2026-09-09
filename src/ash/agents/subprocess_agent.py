@@ -184,6 +184,13 @@ class SubprocessAgent:
                     "shared_state": self.shared_state,
                 }
             )
+        except asyncio.CancelledError:
+            self.shared_state.update_status(
+                self.agent_id,
+                "failed",
+                current_task=f"agent cancelled: {self.task}"[:200],
+            )
+            raise
         except Exception as exc:  # noqa: BLE001
             self.shared_state.update_status(
                 self.agent_id, "failed", current_task=str(exc)
