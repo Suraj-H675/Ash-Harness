@@ -6,6 +6,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -670,31 +671,41 @@ def test_run_rejects_empty_command(tmp_path: Path) -> None:
         asyncio.run(mgr.run([]))
 
 
-def test_run_with_real_bwrap_actually_isolates(tmp_path: Path) -> None:
-    """End-to-end: if bwrap is available, the sandboxed child must not
-    be able to read files outside the workspace mount."""
+def test_run_with_real_bwrap_hides_outside_file_contents(tmp_path: Path) -> None:
+    """A real Tier-2 invocation cannot read a host file outside its mounts."""
 
     if not has_bwrap():
         pytest.skip("bwrap not installed on this host")
 
-    # Create a file outside the workspace.
-    outside = tmp_path / "outside.txt"
-    outside.write_text("secret")
+    # Use the host home directory rather than /tmp, which bwrap intentionally
+    # replaces with a fresh tmpfs.  The parent directory's existence is not
+    # sufficient evidence: bwrap may create empty mount-point parents for the
+    # workspace's absolute bind path.
+    outside_dir = Path(tempfile.mkdtemp(prefix=".ash-bwrap-outside-", dir=Path.home()))
+    outside = outside_dir / "outside-sentinel.txt"
+    outside.write_text("ASH_OUTSIDE_SENTINEL_CONTENT\n", encoding="utf-8")
+    try:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        mgr = SandboxManager(workspace_root=workspace, preferred_tier=2)
+        assert mgr.backend_name == "bubblewrap"
+        assert mgr.tier == SANDBOX_TIER_BWRAP
 
-    # Sandbox the workspace.
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    mgr = SandboxManager(workspace_root=workspace, preferred_tier=2)
-    assert mgr.tier == SANDBOX_TIER_BWRAP
+        invocation = mgr.prepare(["cat", str(outside)], cwd=workspace)
+        assert invocation.backend_name == "bubblewrap"
+        assert invocation.tier == SANDBOX_TIER_BWRAP
 
-    # Try to read the outside file from inside the sandbox.
-    async def runner() -> object:
-        return await mgr.run(["cat", str(outside)], cwd=workspace, timeout=15)
+        async def runner() -> object:
+            return await mgr.run(["cat", str(outside)], cwd=workspace, timeout=15)
 
-    result = asyncio.run(runner())
-    # The sandbox should make the file unreadable (No such file or
-    # Permission denied). Either is a containment success.
-    assert result.exit_code != 0
+        result = asyncio.run(runner())
+        assert result.backend_name == "bubblewrap"
+        assert result.tier == SANDBOX_TIER_BWRAP
+        assert result.exit_code != 0
+        assert "ASH_OUTSIDE_SENTINEL_CONTENT" not in result.stdout
+    finally:
+        outside.unlink(missing_ok=True)
+        outside_dir.rmdir()
 
 
 # ---------------------------------------------------------------------------

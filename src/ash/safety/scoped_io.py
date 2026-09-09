@@ -8,6 +8,7 @@ import os
 import secrets
 import stat
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -20,6 +21,16 @@ class ScopedIOError(OSError):
 
 class ScopedFileChanged(ScopedIOError):
     """The destination changed between validation and mutation."""
+
+
+@dataclass(frozen=True)
+class ScopedFileSnapshot:
+    """A bounded, safely opened snapshot of one workspace file."""
+
+    exists: bool
+    content: bytes
+    mode: int | None
+    sha256: str
 
 
 def read_scoped_bytes(
@@ -48,6 +59,53 @@ def read_scoped_bytes(
             finally:
                 os.close(fd)
     return target, _fallback_read(target, guard, max_bytes=max_bytes)
+
+
+def snapshot_scoped_file(
+    path: str | Path,
+    guard: SafetyGuard,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[Path, ScopedFileSnapshot]:
+    """Capture one regular file without following a changed path component."""
+
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes cannot be negative")
+    target = guard.validate_mutation_path(path)
+    if _supports_anchored_io():
+        try:
+            with _open_parent(target, guard, create=False) as (parent_fd, name):
+                existing = _stat_entry(parent_fd, name)
+                if existing is None:
+                    return target, _missing_snapshot()
+                if not stat.S_ISREG(existing.st_mode):
+                    raise ScopedIOError(f"not a regular file: {target}")
+                flags = os.O_RDONLY | _flag("O_CLOEXEC") | _flag("O_NOFOLLOW")
+                try:
+                    fd = os.open(name, flags, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    raise ScopedFileChanged(f"file disappeared while opening: {target}")
+                except OSError as exc:
+                    raise _scoped_open_error(target, exc) from exc
+                try:
+                    opened = os.fstat(fd)
+                    if not _same_file(existing, opened):
+                        raise ScopedFileChanged(f"file changed while opening: {target}")
+                    content = _read_all(fd, max_bytes=max_bytes)
+                    finished = os.fstat(fd)
+                    if not _same_snapshot(opened, finished):
+                        raise ScopedFileChanged(f"file changed while reading: {target}")
+                    return target, ScopedFileSnapshot(
+                        exists=True,
+                        content=content,
+                        mode=finished.st_mode,
+                        sha256=hashlib.sha256(content).hexdigest(),
+                    )
+                finally:
+                    os.close(fd)
+        except FileNotFoundError:
+            return target, _missing_snapshot()
+    return target, _fallback_snapshot(target, guard, max_bytes=max_bytes)
 
 
 def list_scoped_directory(
@@ -152,6 +210,70 @@ def atomic_write_scoped_bytes(
             guard,
             overwrite=overwrite,
             expected_sha256=expected_sha256,
+        )
+    return target
+
+
+def restore_scoped_file(
+    path: str | Path,
+    payload: bytes,
+    guard: SafetyGuard,
+    *,
+    expected_sha256: str,
+    mode: int | None,
+    max_bytes: int | None = None,
+) -> Path:
+    """Restore a file with an anchored expected-state check and staged mode."""
+
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes cannot be negative")
+    target = guard.validate_mutation_path(path)
+    if _supports_anchored_io():
+        _anchored_restore(
+            target,
+            payload,
+            guard,
+            expected_sha256=expected_sha256,
+            mode=mode,
+            max_bytes=max_bytes,
+        )
+    else:
+        _fallback_restore(
+            target,
+            payload,
+            guard,
+            expected_sha256=expected_sha256,
+            mode=mode,
+            max_bytes=max_bytes,
+        )
+    return target
+
+
+def remove_scoped_file(
+    path: str | Path,
+    guard: SafetyGuard,
+    *,
+    expected_sha256: str,
+    max_bytes: int | None = None,
+) -> Path:
+    """Remove a file only after an anchored expected-state check."""
+
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes cannot be negative")
+    target = guard.validate_mutation_path(path)
+    if _supports_anchored_io():
+        _anchored_remove(
+            target,
+            guard,
+            expected_sha256=expected_sha256,
+            max_bytes=max_bytes,
+        )
+    else:
+        _fallback_remove(
+            target,
+            guard,
+            expected_sha256=expected_sha256,
+            max_bytes=max_bytes,
         )
     return target
 
@@ -272,6 +394,104 @@ def _anchored_atomic_write(
                     pass
 
 
+def _anchored_restore(
+    target: Path,
+    payload: bytes,
+    guard: SafetyGuard,
+    *,
+    expected_sha256: str,
+    mode: int | None,
+    max_bytes: int | None,
+) -> None:
+    with _open_parent(target, guard, create=True) as (parent_fd, name):
+        existing = _stat_entry(parent_fd, name)
+        _require_expected(
+            _entry_digest(parent_fd, name, target, max_bytes=max_bytes),
+            expected_sha256,
+            target,
+        )
+        temp_name = f".{name}.{secrets.token_hex(8)}.tmp"
+        temp_fd = -1
+        try:
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | _flag("O_CLOEXEC")
+                | _flag("O_NOFOLLOW")
+            )
+            temp_fd = os.open(temp_name, flags, 0o666, dir_fd=parent_fd)
+            effective_mode = mode
+            if effective_mode is None and existing is not None:
+                effective_mode = existing.st_mode
+            _set_staged_mode(
+                temp_fd,
+                target.parent / temp_name,
+                effective_mode,
+            )
+            _write_all(temp_fd, payload)
+            os.fsync(temp_fd)
+            os.close(temp_fd)
+            temp_fd = -1
+            _require_expected(
+                _entry_digest(parent_fd, name, target, max_bytes=max_bytes),
+                expected_sha256,
+                target,
+            )
+            os.rename(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            if temp_fd >= 0:
+                os.close(temp_fd)
+            if temp_name:
+                try:
+                    os.unlink(temp_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+
+
+def _anchored_remove(
+    target: Path,
+    guard: SafetyGuard,
+    *,
+    expected_sha256: str,
+    max_bytes: int | None,
+) -> None:
+    try:
+        with _open_parent(target, guard, create=False) as (parent_fd, name):
+            _require_expected(
+                _entry_digest(parent_fd, name, target, max_bytes=max_bytes),
+                expected_sha256,
+                target,
+            )
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+    except FileNotFoundError:
+        if expected_sha256.casefold() != "missing":
+            raise ScopedFileChanged(f"file disappeared before removal: {target}")
+
+
+def _entry_digest(
+    parent_fd: int,
+    name: str,
+    target: Path,
+    *,
+    max_bytes: int | None,
+) -> str:
+    existing = _stat_entry(parent_fd, name)
+    if existing is None:
+        return "missing"
+    return _hash_entry(parent_fd, name, target, max_bytes=max_bytes)
+
+
+def _require_expected(actual: str, expected: str, target: Path) -> None:
+    if actual != expected.casefold():
+        raise ScopedFileChanged(
+            f"file changed before checkpoint restore: expected {expected}, got {actual}: "
+            f"{target}"
+        )
+
+
 def _fallback_read(
     target: Path, guard: SafetyGuard, *, max_bytes: int | None = None
 ) -> bytes:
@@ -292,6 +512,30 @@ def _fallback_read(
     return data
 
 
+def _missing_snapshot() -> ScopedFileSnapshot:
+    return ScopedFileSnapshot(exists=False, content=b"", mode=None, sha256="missing")
+
+
+def _fallback_snapshot(
+    target: Path,
+    guard: SafetyGuard,
+    *,
+    max_bytes: int | None,
+) -> ScopedFileSnapshot:
+    existing = _fallback_identity(target, missing_ok=True)
+    if existing is None:
+        return _missing_snapshot()
+    if not stat.S_ISREG(existing.st_mode):
+        raise ScopedIOError(f"not a regular file: {target}")
+    content = _fallback_read(target, guard, max_bytes=max_bytes)
+    return ScopedFileSnapshot(
+        exists=True,
+        content=content,
+        mode=existing.st_mode,
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+
 def _fallback_atomic_write(
     target: Path,
     payload: bytes,
@@ -300,8 +544,8 @@ def _fallback_atomic_write(
     overwrite: bool,
     expected_sha256: str | None,
 ) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
     guard.validate_mutation_path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
     existing = _fallback_identity(target, missing_ok=True)
     if existing is not None and not stat.S_ISREG(existing.st_mode):
         raise ScopedIOError(f"destination is not a regular file: {target}")
@@ -339,6 +583,83 @@ def _fallback_atomic_write(
             pass
 
 
+def _fallback_restore(
+    target: Path,
+    payload: bytes,
+    guard: SafetyGuard,
+    *,
+    expected_sha256: str,
+    mode: int | None,
+    max_bytes: int | None,
+) -> None:
+    guard.validate_mutation_path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    existing = _fallback_identity(target, missing_ok=True)
+    _require_expected(
+        _fallback_entry_digest(target, guard, max_bytes=max_bytes),
+        expected_sha256,
+        target,
+    )
+    temp = target.parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            effective_mode = mode
+            if effective_mode is None and existing is not None:
+                effective_mode = existing.st_mode
+            _set_staged_mode(fd, temp, effective_mode)
+            _write_all(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        guard.validate_mutation_path(target)
+        _require_expected(
+            _fallback_entry_digest(target, guard, max_bytes=max_bytes),
+            expected_sha256,
+            target,
+        )
+        os.replace(temp, target)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _fallback_remove(
+    target: Path,
+    guard: SafetyGuard,
+    *,
+    expected_sha256: str,
+    max_bytes: int | None,
+) -> None:
+    guard.validate_mutation_path(target)
+    _require_expected(
+        _fallback_entry_digest(target, guard, max_bytes=max_bytes),
+        expected_sha256,
+        target,
+    )
+    if _fallback_identity(target, missing_ok=True) is not None:
+        target.unlink()
+    guard.validate_mutation_path(target)
+
+
+def _fallback_entry_digest(
+    target: Path,
+    guard: SafetyGuard,
+    *,
+    max_bytes: int | None,
+) -> str:
+    existing = _fallback_identity(target, missing_ok=True)
+    if existing is None:
+        return "missing"
+    if not stat.S_ISREG(existing.st_mode):
+        raise ScopedIOError(f"destination is not a regular file: {target}")
+    return hashlib.sha256(
+        _fallback_read(target, guard, max_bytes=max_bytes)
+    ).hexdigest()
+
+
 def _stat_entry(parent_fd: int, name: str) -> os.stat_result | None:
     try:
         result = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -349,7 +670,13 @@ def _stat_entry(parent_fd: int, name: str) -> os.stat_result | None:
     return result
 
 
-def _hash_entry(parent_fd: int, name: str, target: Path) -> str:
+def _hash_entry(
+    parent_fd: int,
+    name: str,
+    target: Path,
+    *,
+    max_bytes: int | None = None,
+) -> str:
     flags = os.O_RDONLY | _flag("O_CLOEXEC") | _flag("O_NOFOLLOW")
     try:
         fd = os.open(name, flags, dir_fd=parent_fd)
@@ -359,7 +686,7 @@ def _hash_entry(parent_fd: int, name: str, target: Path) -> str:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode):
             raise ScopedIOError(f"not a regular file: {target}")
-        return hashlib.sha256(_read_all(fd)).hexdigest()
+        return hashlib.sha256(_read_all(fd, max_bytes=max_bytes)).hexdigest()
     finally:
         os.close(fd)
 
@@ -387,6 +714,16 @@ def _write_all(fd: int, payload: bytes) -> None:
         if written <= 0:
             raise ScopedIOError("short write")
         view = view[written:]
+
+
+def _set_staged_mode(fd: int, path: Path, mode: int | None) -> None:
+    if mode is None:
+        return
+    normalized = stat.S_IMODE(mode)
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, normalized)
+    else:
+        os.chmod(path, normalized)
 
 
 def _fallback_identity(

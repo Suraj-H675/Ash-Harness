@@ -602,7 +602,11 @@ class AshACPAgent:
 async def run_acp_agent() -> None:
     agent = AshACPAgent()
     try:
-        await run_agent(agent, stdio_buffer_limit_bytes=MAX_ACP_STDIO_BYTES)
+        await run_agent(
+            agent,
+            stdio_buffer_limit_bytes=MAX_ACP_STDIO_BYTES,
+            use_unstable_protocol=True,
+        )
     finally:
         await agent.aclose()
 

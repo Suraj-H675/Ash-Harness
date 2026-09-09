@@ -3,9 +3,13 @@ from __future__ import annotations
 # ruff: noqa: E402 - optional protocol dependency is checked before importing it
 
 import asyncio
+import json
 import os
+import sys
+import threading
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,6 +34,7 @@ from acp.schema import (
 from ash.sdk import AshEvent
 from ash.config import AshConfig
 from ash.core.session import Message, SessionStore, ToolCallRecord
+from ash.safety.trust import set_workspace_trusted
 from ash.server.acp import AshACPAgent
 
 
@@ -297,6 +302,55 @@ async def test_acp_cancel_returns_cancelled_stop_reason(tmp_path: Path) -> None:
     assert response.stop_reason == "cancelled"
     assert cancelled.is_set()
     await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_close_cancels_active_prompt_and_closes_client(
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    clients: list[FakeAshClient] = []
+
+    class BlockingAshClient(FakeAshClient):
+        async def stream_prompt(self, text: str) -> AsyncIterator[AshEvent]:
+            self.prompts.append(text)
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            if False:
+                yield AshEvent("turn.completed", {"response": ""})
+
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        client = BlockingAshClient(
+            session_id or "close-session", [], approval_callback
+        )
+        clients.append(client)
+        return client
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    session = await agent.new_session(str(tmp_path))
+    prompt = asyncio.create_task(agent.prompt(session.session_id, [text_block("wait")]))
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    await agent.close_session(session.session_id)
+    response = await asyncio.wait_for(prompt, timeout=2)
+
+    assert response.stop_reason == "cancelled"
+    assert cancelled.is_set()
+    assert clients[0].closed is True
+    with pytest.raises(acp.RequestError) as missing:
+        await agent.close_session(session.session_id)
+    assert missing.value.code == -32002
 
 
 @pytest.mark.asyncio
@@ -672,3 +726,154 @@ async def test_acp_official_sdk_wire_round_trip(tmp_path: Path) -> None:
         await asyncio.sleep(0)
         await connection.close()
         await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_production_acp_entrypoint_exposes_close_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the shipped ACP process through the official client wire."""
+
+    workspace = tmp_path / "workspace"
+    home = tmp_path / "home"
+    database = tmp_path / "db"
+    workspace.mkdir()
+    home.mkdir()
+    database.mkdir()
+    (workspace / "README.md").write_text("ACP smoke workspace\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    set_workspace_trusted(workspace, True)
+
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    class ProviderHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - HTTP handler API
+            content_length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(content_length))
+            requests.append((self.path, payload))
+            if self.path != "/v1/chat/completions":
+                self.send_error(404)
+                return
+            body = (
+                'data: {"id":"acp","choices":[{"delta":{"content":'
+                '"acp-real-ok"},"finish_reason":null}]}\n\n'
+                'data: {"id":"acp","choices":[{"delta":{},'
+                '"finish_reason":"stop"}]}\n\n'
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
+    provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    provider_thread.start()
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(home),
+            "ASH_WORKSPACE_ROOT": str(workspace),
+            "ASH_DB_DIRECTORY": str(database),
+            "ASH_MODEL": "openai/acp-real-model",
+            "OPENAI_API_KEY": "acp-loopback-key",
+            "OPENAI_API_BASE": (
+                f"http://127.0.0.1:{provider.server_port}/v1"
+            ),
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "ash",
+        "acp",
+        cwd=workspace,
+        env=environment,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert process.stdin is not None and process.stdout is not None
+    wire_client = WireClient()
+    connection = connect_to_agent(wire_client, process.stdin, process.stdout)
+    try:
+        initialized = await asyncio.wait_for(
+            connection.initialize(protocol_version=PROTOCOL_VERSION), timeout=15
+        )
+        capabilities = initialized.agent_capabilities
+        assert capabilities is not None
+        assert capabilities.session_capabilities is not None
+        assert capabilities.session_capabilities.close is not None
+        session = await asyncio.wait_for(
+            connection.new_session(cwd=str(workspace), mcp_servers=[]), timeout=30
+        )
+        prompted = await asyncio.wait_for(
+            connection.prompt(
+                session_id=session.session_id,
+                prompt=[text_block("Return the ACP response")],
+            ),
+            timeout=45,
+        )
+        assert prompted.stop_reason == "end_turn"
+        assert any(
+            update.session_update == "agent_message_chunk"
+            and update.content.text == "acp-real-ok"
+            for _, update in wire_client.updates
+        )
+
+        for unsupported in (
+            connection.fork_session(
+                session.session_id, cwd=str(workspace), mcp_servers=[]
+            ),
+            connection.resume_session(
+                session.session_id, cwd=str(workspace), mcp_servers=[]
+            ),
+        ):
+            with pytest.raises(acp.RequestError) as error:
+                await asyncio.wait_for(unsupported, timeout=10)
+            assert error.value.code == -32601
+
+        await asyncio.wait_for(
+            connection.close_session(session.session_id), timeout=15
+        )
+        with pytest.raises(acp.RequestError) as already_closed:
+            await asyncio.wait_for(
+                connection.close_session(session.session_id), timeout=10
+            )
+        assert already_closed.value.code == -32002
+        with pytest.raises(acp.RequestError) as missing:
+            await asyncio.wait_for(
+                connection.prompt(
+                    session_id=session.session_id,
+                    prompt=[text_block("must be rejected")],
+                ),
+                timeout=10,
+            )
+        assert missing.value.code == -32002
+        assert len(requests) == 1
+        assert requests[0][0] == "/v1/chat/completions"
+        assert requests[0][1]["model"] == "acp-real-model"
+        assert requests[0][1]["stream"] is True
+    finally:
+        await connection.close()
+        if process.stdin is not None:
+            process.stdin.close()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=15)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+        stderr = (
+            await process.stderr.read()
+            if process.stderr is not None
+            else b""
+        ).decode("utf-8", errors="replace")
+        provider.shutdown()
+        provider.server_close()
+        provider_thread.join(timeout=5)
+        assert process.returncode == 0, stderr

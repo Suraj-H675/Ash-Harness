@@ -1,5 +1,6 @@
 import pytest
 from datetime import datetime, timezone
+from pathlib import Path
 
 from ash.core.checkpoints import (
     FileCheckpointMiddleware,
@@ -73,6 +74,35 @@ async def test_checkpoint_undo_and_conflict_detection(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_undo_removes_created_file_and_restores_mode(tmp_path) -> None:
+    existing = tmp_path / "existing.txt"
+    existing.write_text("before", encoding="utf-8")
+    existing.chmod(0o640)
+    created = tmp_path / "created.txt"
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    guard = SafetyGuard(tmp_path)
+    middleware = FileCheckpointMiddleware(
+        store, guard, lambda: (session.session_id, "turn-1", "call-1")
+    )
+    tool = WholeEditTool(guard)
+
+    for path, content in ((existing, "after"), (created, "new content")):
+        arguments = {"file_path": path.name, "content": content}
+        await middleware.before_tool("whole_edit", arguments, tool)
+        result = await tool.run(**arguments)
+        await middleware.after_tool("whole_edit", arguments, result)
+
+    existing.chmod(0o600)
+    restored = undo_latest_checkpoint(store, guard, session.session_id)
+
+    assert set(restored) == {existing, created}
+    assert existing.read_text(encoding="utf-8") == "before"
+    assert existing.stat().st_mode & 0o777 == 0o640
+    assert not created.exists()
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_undo_rolls_files_forward_when_restore_fails(
     tmp_path, monkeypatch
 ) -> None:
@@ -95,17 +125,17 @@ async def test_checkpoint_undo_rolls_files_forward_when_restore_fails(
         result = await tool.run(**arguments)
         await middleware.after_tool("whole_edit", arguments, result)
 
-    original_restore = checkpoints._atomic_restore
+    original_restore = checkpoints.restore_scoped_file
     restore_calls = 0
 
-    def fail_second_restore(path, content):
+    def fail_second_restore(path, content, guard, **kwargs):
         nonlocal restore_calls
         restore_calls += 1
         if restore_calls == 2:
             raise OSError("injected second-file failure")
-        original_restore(path, content)
+        original_restore(path, content, guard, **kwargs)
 
-    monkeypatch.setattr(checkpoints, "_atomic_restore", fail_second_restore)
+    monkeypatch.setattr(checkpoints, "restore_scoped_file", fail_second_restore)
 
     with pytest.raises(OSError, match="second-file failure"):
         undo_latest_checkpoint(store, guard, session.session_id)
@@ -431,6 +461,76 @@ async def test_startup_recovery_compensates_only_the_pending_file_call(
         recover_interrupted_turns(store, guard, session.session_id).interrupted_turns
         == 0
     )
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_parent_swap_refuses_restore_without_escape(
+    tmp_path, monkeypatch
+) -> None:
+    """A parent swap after hashing cannot redirect recovery outside the workspace."""
+
+    import ash.core.checkpoints as checkpoints
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    parent = workspace / "victim"
+    parent.mkdir()
+    target = parent / "target.txt"
+    target.write_text("before", encoding="utf-8")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_target = outside / "target.txt"
+    outside_target.write_text("outside", encoding="utf-8")
+
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(workspace))
+    store.start_turn(session.session_id, "turn-1", "edit")
+    guard = SafetyGuard(workspace)
+    store.save_tool_call(
+        session.session_id,
+        _tool_record("call-pending", "whole_edit", executed=False),
+        turn_id="turn-1",
+    )
+    middleware = FileCheckpointMiddleware(
+        store,
+        guard,
+        lambda: (session.session_id, "turn-1", "call-pending"),
+    )
+    arguments = {"file_path": "victim/target.txt", "content": "after"}
+    tool = WholeEditTool(guard)
+    await middleware.before_tool("whole_edit", arguments, tool)
+    result = await tool.run(**arguments)
+    await middleware.after_tool("whole_edit", arguments, result)
+    assert target.read_text(encoding="utf-8") == "after"
+
+    original_digest = checkpoints._digest
+    swapped = False
+    displaced_parent = workspace / "victim-displaced"
+
+    def swap_parent_after_hash(path: Path, guard: SafetyGuard) -> str:
+        nonlocal swapped
+        digest = original_digest(path, guard)
+        if path == target and not swapped:
+            swapped = True
+            parent.rename(displaced_parent)
+            parent.symlink_to(outside, target_is_directory=True)
+        return digest
+
+    monkeypatch.setattr(checkpoints, "_digest", swap_parent_after_hash)
+    try:
+        summary = recover_interrupted_turns(store, guard, session.session_id)
+    finally:
+        if parent.is_symlink():
+            parent.unlink()
+        if displaced_parent.exists():
+            displaced_parent.rename(parent)
+
+    assert swapped is True
+    assert summary.needs_attention is True
+    assert summary.unresolved_files == (target,)
+    assert outside_target.read_text(encoding="utf-8") == "outside"
+    assert target.read_text(encoding="utf-8") == "after"
 
 
 @pytest.mark.asyncio

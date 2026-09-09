@@ -12,7 +12,9 @@ from ash.safety.scoped_io import (
     ScopedIOError,
     atomic_write_scoped_text,
     list_scoped_directory,
+    remove_scoped_file,
     read_scoped_bytes,
+    restore_scoped_file,
 )
 
 
@@ -103,6 +105,61 @@ def test_fallback_no_overwrite_is_atomic(tmp_path) -> None:
         )
 
     assert target.read_text(encoding="utf-8") == "existing"
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_scoped_restore_and_remove_check_state_and_mode(tmp_path, fallback: bool) -> None:
+    target = tmp_path / "existing.txt"
+    target.write_text("current", encoding="utf-8")
+    target.chmod(0o600)
+    created = tmp_path / "nested" / "created.txt"
+    guard = SafetyGuard(tmp_path)
+
+    mode = (
+        patch("ash.safety.scoped_io._supports_anchored_io", return_value=False)
+        if fallback
+        else nullcontext()
+    )
+    with mode:
+        restore_scoped_file(
+            target,
+            b"restored",
+            guard,
+            expected_sha256=hashlib.sha256(b"current").hexdigest(),
+            mode=0o640,
+        )
+        assert target.read_bytes() == b"restored"
+        assert target.stat().st_mode & 0o777 == 0o640
+
+        with pytest.raises(ScopedFileChanged):
+            restore_scoped_file(
+                target,
+                b"must-not-write",
+                guard,
+                expected_sha256=hashlib.sha256(b"current").hexdigest(),
+                mode=0o600,
+            )
+
+        restore_scoped_file(
+            created,
+            b"created",
+            guard,
+            expected_sha256="missing",
+            mode=0o640,
+        )
+        remove_scoped_file(
+            target,
+            guard,
+            expected_sha256=hashlib.sha256(b"restored").hexdigest(),
+        )
+        remove_scoped_file(
+            created,
+            guard,
+            expected_sha256=hashlib.sha256(b"created").hexdigest(),
+        )
+
+    assert not target.exists()
+    assert not created.exists()
 
 
 def test_scoped_directory_listing_does_not_follow_child_links(tmp_path) -> None:
