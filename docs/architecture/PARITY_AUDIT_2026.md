@@ -200,6 +200,26 @@ F-09 plugin lifecycle confinement remains a separate confirmed finding and is
 paused at the existing Sol decision boundary; no F-09 production changes were
 made in this batch.
 
+### F-06 — JSON-RPC explicit-null request IDs
+
+The JSON-RPC adapter previously used `request.get("id") is None` as the
+notification test, so an explicit `"id": null` request was executed without a
+response. That conflated the JSON-RPC notification distinction with the
+identifier value and also made explicit-null method errors disappear.
+
+The adapter now distinguishes `"id" not in request` from an explicit null
+identifier. Valid explicit-null requests return normal JSON-RPC results or
+errors containing `"id": null`; omitted-ID notifications still execute
+without a response. Explicit-null tasks are intentionally not registered in
+the existing string/integer pending cancellation map, because multiple null
+requests cannot be uniquely correlated. Other request IDs and invalid-ID
+validation remain unchanged.
+
+The focused JSON-RPC and HTTP boundary suite passed **34 tests**, covering
+omitted/null/zero/string IDs, method-not-found with null, invalid and
+non-finite IDs, cancellation behavior, and HTTP notification/response status
+semantics. No public cancellation-map redesign was introduced.
+
 ### MCP OAuth private-store race
 
 The MCP OAuth token store had a confirmed filesystem-confinement defect: its

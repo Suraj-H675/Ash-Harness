@@ -348,6 +348,45 @@ async def test_http_jsonrpc_runs_requests_and_returns_notification_ack() -> None
 
 
 @pytest.mark.asyncio
+async def test_http_jsonrpc_returns_explicit_null_id_responses() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        notification = await http.post(
+            "/rpc",
+            json={"jsonrpc": "2.0", "method": "initialize"},
+            headers=headers,
+        )
+        explicit_null = await http.post(
+            "/rpc",
+            json={"jsonrpc": "2.0", "id": None, "method": "initialize"},
+            headers=headers,
+        )
+        missing = await http.post(
+            "/rpc",
+            json={"jsonrpc": "2.0", "id": None, "method": "missing"},
+            headers=headers,
+        )
+
+    assert notification.status_code == 204
+    assert explicit_null.status_code == 200
+    assert explicit_null.json()["id"] is None
+    assert "result" in explicit_null.json()
+    assert missing.status_code == 200
+    assert missing.json() == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32601, "message": "Method not found: missing"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_http_lifespan_cancels_jsonrpc_notifications_without_owning_client() -> None:
     client = FakeClient()
     started = asyncio.Event()

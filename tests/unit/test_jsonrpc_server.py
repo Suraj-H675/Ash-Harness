@@ -164,6 +164,40 @@ async def test_jsonrpc_turn_validation_and_unknown_method() -> None:
 
 
 @pytest.mark.asyncio
+async def test_jsonrpc_explicit_null_id_is_a_request_not_a_notification() -> None:
+    server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
+
+    notification = await server.handle_request(
+        {"jsonrpc": "2.0", "method": "status"}
+    )
+    explicit_null = await server.handle_request(
+        {"jsonrpc": "2.0", "id": None, "method": "status"}
+    )
+    explicit_null_error = await server.handle_request(
+        {"jsonrpc": "2.0", "id": None, "method": "missing"}
+    )
+    numeric_zero = await server.handle_request(
+        {"jsonrpc": "2.0", "id": 0, "method": "status"}
+    )
+    string_id = await server.handle_request(
+        {"jsonrpc": "2.0", "id": "status", "method": "status"}
+    )
+
+    assert notification is None
+    assert explicit_null is not None
+    assert explicit_null["id"] is None
+    assert "result" in explicit_null
+    assert explicit_null_error == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32601, "message": "Method not found: missing"},
+    }
+    assert numeric_zero is not None and numeric_zero["id"] == 0
+    assert string_id is not None and string_id["id"] == "status"
+    assert server._pending == {}
+
+
+@pytest.mark.asyncio
 async def test_jsonrpc_redacts_secrets_from_internal_errors() -> None:
     client = FakeClient()
     secret = "sk-proj-abcdefghijklmnop"

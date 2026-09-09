@@ -40,8 +40,9 @@ class JSONRPCServer:
     async def handle_request(self, request: Any) -> dict[str, Any] | None:
         if not isinstance(request, dict):
             return _error(None, -32600, "Invalid Request")
+        has_request_id = "id" in request
         request_id = request.get("id")
-        if "id" in request and not _is_valid_request_id(request_id):
+        if has_request_id and not _is_valid_request_id(request_id):
             return _error(None, -32600, "Invalid Request")
         if request.get("jsonrpc") != "2.0" or not isinstance(
             request.get("method"), str
@@ -56,15 +57,15 @@ class JSONRPCServer:
             if "id" not in params or not _is_valid_request_id(target_id):
                 return _error(request_id, -32602, "cancel request id is invalid")
             cancelled = self.cancel(target_id)
-            return None if request_id is None else _result(request_id, cancelled)
+            return None if not has_request_id else _result(request_id, cancelled)
         handler = self._methods.get(method)
         if handler is None:
             return (
                 None
-                if request_id is None
+                if not has_request_id
                 else _error(request_id, -32601, f"Method not found: {method}")
             )
-        if request_id is None:
+        if not has_request_id:
             if len(self._notification_tasks) >= MAX_PENDING_JSONRPC_NOTIFICATIONS:
                 return None
             notification_task = asyncio.ensure_future(handler(params))
@@ -72,7 +73,10 @@ class JSONRPCServer:
             notification_task.add_done_callback(self._finish_notification)
             return None
         task: asyncio.Future[Any] = asyncio.ensure_future(handler(params))
-        self._pending[request_id] = task
+        # Explicit null is a request identifier, but it cannot safely identify
+        # one entry in the cancellation map when multiple such requests run.
+        if request_id is not None:
+            self._pending[request_id] = task
         try:
             value = await task
             return _result(request_id, value)
@@ -88,7 +92,8 @@ class JSONRPCServer:
                 {"detail": redact_text(str(exc))},
             )
         finally:
-            self._pending.pop(request_id, None)
+            if request_id is not None:
+                self._pending.pop(request_id, None)
 
     def cancel(self, request_id: Any) -> bool:
         task = self._pending.get(request_id)
