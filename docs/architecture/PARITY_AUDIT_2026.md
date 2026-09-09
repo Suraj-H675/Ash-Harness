@@ -233,3 +233,34 @@ login/logout semantics, and dependency range were preserved.
   MCP stdio and executable-plugin Bubblewrap probes also passed environment
   scrubbing, outside-file concealment, provider-backed plugin output, and
   process cleanup.
+
+### F-08/F-10/F-11 — MCP lifecycle and diagnostic integrity
+
+The MCP audit reproduced three independent user-facing defects: targeted
+replacement closed the newly published client through a temporary runtime,
+quoted/escaped and streamed MCP errors could leak secret values or grow
+without bound, and targetless `/mcp refresh` discarded reload failures before
+printing a clean-success message. Deterministic catalog, collision, failure,
+cancellation, concurrent-cleanup, and streaming-split probes established the
+responsible boundaries before the repair.
+
+Replacement is now prepared and published by the live `MCPRuntime`: the old
+client/tools remain usable until candidate connection, catalog validation,
+collision checks, and tool startup succeed. Candidate cancellation/failure
+cleans only candidate resources; publication transfers the complete live
+ownership boundary, and retired clients are serialized, retried, retained on
+failure, and surfaced as shutdown errors rather than silently orphaned. A
+real stdio failure probe confirmed `shutdown_error`, retained runtime/client
+state, and a second disconnect attempt when cleanup was forced to fail.
+
+MCP diagnostics now use one bounded redaction boundary for quoted, escaped,
+unquoted, nested, malformed, and application-error values. All split points in
+the escaped streaming regression passed without marker leakage, while raw
+malformed/application diagnostics and emitted events remain bounded. Reload
+results retain structured error mappings: interactive targetless refreshes
+distinguish clean, partial, and previous-runtime-preserved failure states and
+print only redacted bounded server/error text.
+
+The focused MCP/lifecycle/redaction suite passed **218 tests**. The complete
+repository gate then passed **2137 tests with 3 skips**; Ruff and mypy passed,
+and `uv build` produced the source distribution and wheel successfully.

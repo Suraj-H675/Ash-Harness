@@ -13,6 +13,7 @@ import pytest
 import httpx
 from ash.core.loop import AshLoop
 from ash.core.session import SessionStore
+from ash.core.secret_middleware import SecretRedactionMiddleware
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.guard import SafetyGuard
 from ash.mcp.client import (
@@ -24,6 +25,7 @@ from ash.mcp import client as mcp_client_module
 from ash.mcp.oauth import MCPOAuthSession
 from ash.mcp.runtime import (
     CURRENT_SCHEMA_DIALECT,
+    MCPListResourcesTool,
     MCPRuntime,
     MCPTool,
     _extract_mcp_header_annotations,
@@ -1065,6 +1067,57 @@ async def test_mcp_tool_keeps_structured_only_and_application_error_envelopes(
 
 
 @pytest.mark.asyncio
+async def test_mcp_application_error_output_is_redacted_and_bounded(
+    tmp_path: Path,
+) -> None:
+    marker = "synthetic application error marker"
+    remote_result = {
+        "content": [
+            {
+                "type": "text",
+                "text": f'password="{marker}" ' + "x" * 5000,
+            }
+        ],
+        "isError": True,
+    }
+    tool = _mcp_tool(
+        tmp_path,
+        StubMCPClient(remote_result),
+        input_schema={"type": "object"},
+    )
+
+    result = await tool.run()
+
+    assert result.success is False
+    assert marker not in result.output
+    assert marker not in (result.error or "")
+    assert len(result.output) <= 512
+    assert len(result.error or "") <= 512
+
+
+@pytest.mark.asyncio
+async def test_mcp_capability_tool_redacts_and_bounds_direct_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "synthetic capability error marker"
+    runtime = MCPRuntime({}, SafetyGuard(tmp_path))
+
+    async def fail_list_capability(method: str, *, server: str | None = None):
+        del method, server
+        raise ValueError(f'password="{marker}" ' + "x" * 5000)
+
+    monkeypatch.setattr(runtime, "list_capability", fail_list_capability)
+    tool = MCPListResourcesTool(SafetyGuard(tmp_path), runtime)
+
+    result = await tool.run()
+
+    assert result.success is False
+    assert marker not in (result.error or "")
+    assert len(result.error or "") <= 512
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("remote_result", "message"),
     [
@@ -1226,6 +1279,49 @@ async def test_mcp_tool_preserves_protocol_error_data_without_replay(
             "code": -32602,
             "data": {"field": "mode", "expected": ["safe", "fast"]},
         }
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_redacts_secret_values_in_protocol_errors(
+    tmp_path: Path,
+) -> None:
+    marker = "synthetic protocol marker"
+
+    class ErrorClient:
+        async def call_tool(
+            self,
+            name: str,
+            arguments: dict,
+            *,
+            expected_contract: str | None = None,
+            as_task: bool = False,
+            header_annotations: list | None = None,
+        ) -> dict:
+            del name, arguments, expected_contract, as_task, header_annotations
+            raise MCPProtocolError(
+                f'upstream payload={{\\"password\\": \\"{marker}\\"}} '
+                f'password="line one\n{marker}"',
+                code=-32602,
+                data={"password": marker, "detail": "not secret"},
+            )
+
+    tool = MCPTool(
+        SafetyGuard(tmp_path),
+        client=ErrorClient(),  # type: ignore[arg-type]
+        server_name="test",
+        definition={"name": "fails", "inputSchema": {"type": "object"}},
+    )
+
+    result = await tool.run()
+    await SecretRedactionMiddleware().after_tool("mcp__test__fails", {}, result)
+
+    assert marker not in result.output
+    assert marker not in (result.error or "")
+    payload = json.loads(result.output)
+    assert payload["error"]["data"] == {
+        "password": "[REDACTED]",
+        "detail": "not secret",
     }
 
 

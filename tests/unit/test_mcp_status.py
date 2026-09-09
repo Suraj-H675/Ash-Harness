@@ -30,7 +30,10 @@ async def test_mcp_runtime_status_snapshot_is_safe_and_bounded(tmp_path) -> None
     runtime.clients["healthy"] = object()
     runtime._server_tools["healthy"] = {f"tool-{index}": index for index in range(3)}
     runtime.errors["healthy:tools/refresh"] = (
-        "temporary catalog issue Bearer " + "s" * 32 + " " + "x" * 600
+        "temporary catalog issue Bearer "
+        + "s" * 32
+        + ' password="synthetic status marker" '
+        + "x" * 600
     )
 
     payload = runtime.status_snapshot()
@@ -42,6 +45,7 @@ async def test_mcp_runtime_status_snapshot_is_safe_and_bounded(tmp_path) -> None
     assert payload[0]["tools"] == 3
     assert len(payload[0]["errors"]) == 1
     assert payload[0]["errors"][0].startswith("temporary catalog issue [REDACTED] ")
+    assert "synthetic status marker" not in json.dumps(payload)
     assert payload[1] == {
         "name": "remote",
         "transport": "http",

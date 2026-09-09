@@ -48,6 +48,7 @@ from ash.core.session import (
 )
 from ash.core.redaction import redact_text, redact_value
 from ash.logging import get_logger
+from ash.mcp.diagnostics import safe_mcp_diagnostic
 from ash.mcp.server import MCPServerConfig, load_mcp_servers
 from ash.providers.base import (
     CompletionOutcome,
@@ -610,11 +611,21 @@ class AshLoop:
                 await self._mcp_runtime.close()
                 self._mcp_runtime = None
             if self._retired_mcp_runtimes:
-                await asyncio.gather(
-                    *(runtime.close() for runtime in self._retired_mcp_runtimes),
+                runtimes = tuple(self._retired_mcp_runtimes)
+                outcomes = await asyncio.gather(
+                    *(runtime.close() for runtime in runtimes),
                     return_exceptions=True,
                 )
-                self._retired_mcp_runtimes.clear()
+                failed = {
+                    runtime
+                    for runtime, outcome in zip(runtimes, outcomes, strict=True)
+                    if isinstance(outcome, BaseException)
+                }
+                self._retired_mcp_runtimes.difference_update(set(runtimes) - failed)
+                if failed:
+                    raise RuntimeError(
+                        f"failed to close {len(failed)} retired MCP runtime(s)"
+                    )
             self._mcp_tool_names.clear()
             self._mcp_tools_by_server.clear()
             await asyncio.gather(
@@ -825,57 +836,11 @@ class AshLoop:
                 return await self._publish_mcp_runtime(
                     {server_name: self._mcp_configs[server_name]}
                 )
-
-            old_client = runtime.clients.pop(server_name, None)
-            old_tools: set[str] = self._mcp_tools_by_server.get(server_name, set())
-            for name in old_tools:
-                old_tool = self.tools.pop(name, None)
-                if old_tool is not None:
-                    self._started_tool_ids.discard(id(old_tool))
-            self._mcp_tool_names.difference_update(old_tools)
-            self._mcp_tools_by_server.pop(server_name, None)
-            runtime._server_tools.pop(server_name, None)
-            for key in tuple(runtime.errors):
-                if key == server_name or key.startswith(f"{server_name}:"):
-                    runtime.errors.pop(key, None)
-            try:
-                from ash.mcp.runtime import MCPRuntime
-
-                replacement = MCPRuntime(
-                    {server_name: self._mcp_configs[server_name]},
-                    self.safety_guard,
-                    event_sink=self._emit_event,
-                )
-                server_tools = await replacement.start()
-            except BaseException as exc:
-                runtime.errors[server_name] = str(exc)
-                raise
-            occupied = self.tools.keys() - self._mcp_tool_names
-            duplicates = occupied & server_tools.keys()
-            if duplicates:
-                await asyncio.shield(replacement.close())
-                raise ValueError(
-                    "MCP tool collides with an existing tool: "
-                    + ", ".join(sorted(duplicates))
-                )
-            try:
-                for tool in server_tools.values():
-                    tool.set_event_sink(self._emit_event)
-                    await tool.start()
-                    self._started_tool_ids.add(id(tool))
-            except BaseException:
-                await asyncio.shield(replacement.close())
-                raise
-            self.tools.update(server_tools)
-            self._mcp_tool_names.update(server_tools)
-            self._mcp_tools_by_server[server_name] = set(server_tools)
-            runtime.clients[server_name] = replacement.clients[server_name]
-            runtime._server_tools[server_name] = dict(
-                replacement.server_tools_snapshot()[server_name]
+            await runtime.replace_server(
+                server_name,
+                self._mcp_configs[server_name],
+                defer_client_cleanup=self._turn_running,
             )
-            await replacement.close()
-            if old_client is not None:
-                await old_client.disconnect()
             return {}
 
     async def _reload_mcp_servers(
@@ -1014,7 +979,11 @@ class AshLoop:
             else:
                 await old_runtime.close()
         for name, error in runtime.errors.items():
-            _log.warning("MCP server %s unavailable: %s", name, error)
+            _log.warning(
+                "MCP server %s unavailable: %s",
+                safe_mcp_diagnostic(name),
+                safe_mcp_diagnostic(error),
+            )
         return dict(runtime.errors)
 
     async def _replace_mcp_server_tools(
@@ -1040,7 +1009,7 @@ class AshLoop:
             for tool in replacement.values():
                 tool.set_event_sink(self._emit_event)
                 await tool.start()
-        except Exception:
+        except BaseException:
             await asyncio.gather(
                 *(tool.aclose() for tool in replacement.values()),
                 return_exceptions=True,
@@ -1065,12 +1034,25 @@ class AshLoop:
 
     async def _close_retired_mcp_runtimes(self) -> None:
         if not self._retired_mcp_runtimes:
+            if self._mcp_runtime is not None:
+                await self._mcp_runtime.close_retired_clients()
             return
         runtimes = tuple(self._retired_mcp_runtimes)
-        self._retired_mcp_runtimes.clear()
-        await asyncio.gather(
+        outcomes = await asyncio.gather(
             *(runtime.close() for runtime in runtimes), return_exceptions=True
         )
+        failed = {
+            runtime
+            for runtime, outcome in zip(runtimes, outcomes, strict=True)
+            if isinstance(outcome, BaseException)
+        }
+        self._retired_mcp_runtimes.difference_update(set(runtimes) - failed)
+        if failed:
+            raise RuntimeError(
+                f"failed to close {len(failed)} retired MCP runtime(s)"
+            )
+        if self._mcp_runtime is not None:
+            await self._mcp_runtime.close_retired_clients()
 
     # --- the main turn ----------------------------------------------------
 

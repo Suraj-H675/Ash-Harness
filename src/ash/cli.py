@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 import importlib.metadata
 import json
 import math
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from ash.safe_io import read_bounded_bytes, read_bounded_text, strict_json_loads
+from ash.mcp.diagnostics import safe_mcp_diagnostic
 from ash.safety.scoped_io import atomic_write_scoped_text
 
 if TYPE_CHECKING:
@@ -52,6 +54,29 @@ MAX_SESSION_IMPORT_BYTES = 50 * 1024 * 1024
 MAX_JSON_SCHEMA_BYTES = 1024 * 1024
 MAX_CLI_INPUT_BYTES = 1_000_000
 MAX_CRON_PROMPT_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class PluginReloadResult:
+    summary: str
+    mcp_errors: dict[str, str]
+    previous_mcp_runtime_preserved: bool
+
+
+def _print_mcp_reload_errors(errors: dict[str, str]) -> None:
+    for name, error in sorted(errors.items()):
+        print(
+            f"{safe_mcp_diagnostic(name)}: {safe_mcp_diagnostic(error)}",
+            file=sys.stderr,
+        )
+
+
+def _mcp_reload_message(result: PluginReloadResult) -> str:
+    if not result.mcp_errors:
+        return "MCP configuration reloaded."
+    if result.previous_mcp_runtime_preserved:
+        return "MCP configuration reload failed; the previous runtime was preserved."
+    return "MCP configuration reloaded with errors."
 
 
 def _emit_config_diagnostics(config: AshConfig) -> None:
@@ -502,7 +527,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         notification_include_preview=config.notification_include_preview,
     )
 
-    async def reload_plugin_components() -> str:
+    async def reload_plugin_components() -> PluginReloadResult:
         nonlocal custom_commands, discovered_commands
 
         from ash.hooks.config import HookConfigSource, load_command_hooks
@@ -646,6 +671,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         next_hooks.set_event_sink(loop._emit_event)
         loop.hooks = next_hooks
         await loop.reload_plugin_runtime_tools(next_plugin_tools)
+        previous_mcp_runtime = loop._mcp_runtime
         mcp_errors = await loop.reload_mcp_servers(next_mcp)
         custom_commands = next_commands
         discovered_commands = next_discovered_commands
@@ -658,11 +684,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             f"{len(next_plugin_tools)} executable tools, "
             f"{len(hook_sources)} hook config(s), {len(next_mcp)} MCP server(s)."
         )
-        if mcp_errors:
-            summary += " MCP errors: " + "; ".join(
-                f"{name}: {error}" for name, error in sorted(mcp_errors.items())
-            )
-        return summary
+        return PluginReloadResult(
+            summary=summary,
+            mcp_errors=dict(mcp_errors),
+            previous_mcp_runtime_preserved=(
+                bool(mcp_errors) and loop._mcp_runtime is previous_mcp_runtime
+            ),
+        )
 
     print(
         "ash - type /help for commands",
@@ -1152,12 +1180,15 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             git_ref=ref,
                             catalog=catalog,
                         )
-                        reload_summary = await reload_plugin_components()
+                        reload_result = await reload_plugin_components()
                     except (OSError, PluginLifecycleError, ValueError) as exc:
-                        print(f"Error: {exc}", file=sys.stderr)
+                        print(
+                            f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
+                        )
                         continue
                     print(render_plugin_action(plugin_result, json_output=False))
-                    print(reload_summary)
+                    print(reload_result.summary)
+                    _print_mcp_reload_errors(reload_result.mcp_errors)
                     continue
 
                 roots = [(Path.home() / ".ash" / "plugins", "user")]
@@ -1185,9 +1216,14 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     print(f"Usage: {command.usage}", file=sys.stderr)
                     continue
                 try:
-                    print(await reload_plugin_components(), flush=True)
+                    reload_result = await reload_plugin_components()
+                    print(reload_result.summary, flush=True)
+                    _print_mcp_reload_errors(reload_result.mcp_errors)
                 except (OSError, ValueError, json.JSONDecodeError) as exc:
-                    print(f"Error reloading plugins: {exc}", file=sys.stderr)
+                    print(
+                        f"Error reloading plugins: {safe_mcp_diagnostic(exc)}",
+                        file=sys.stderr,
+                    )
                 continue
             if command.name == "hooks":
                 from ash.commands.extensions import (
@@ -1524,7 +1560,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         try:
                             credentials_removed = oauth_store.remove()
                         except (MCPOAuthError, OSError, ValueError) as exc:
-                            print(f"Error: {exc}", file=sys.stderr)
+                            print(
+                                f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
+                            )
                             continue
                         print(
                             f"Removed OAuth credentials for MCP server {server_name}."
@@ -1542,7 +1580,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                                 manual_paste=True,
                             )
                         except (MCPOAuthError, OSError, ValueError) as exc:
-                            print(f"Error: {exc}", file=sys.stderr)
+                            print(
+                                f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
+                            )
                             continue
                         print(f"Authorized MCP server {server_name}.")
                     await reload_plugin_components()
@@ -1593,13 +1633,20 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             )
                             print(f"{refresh_target}: {transition}")
                         else:
-                            await reload_plugin_components()
-                            print("MCP configuration reloaded.")
-                    except (OSError, RuntimeError, ValueError) as exc:
-                        print(f"Error: {exc}", file=sys.stderr)
+                            reload_result = await reload_plugin_components()
+                            print(_mcp_reload_message(reload_result))
+                            _print_mcp_reload_errors(reload_result.mcp_errors)
+                    except Exception as exc:
+                        print(
+                            f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
+                        )
                         continue
                     for name, error in sorted(errors.items()):
-                        print(f"{name}: {error}", file=sys.stderr)
+                        print(
+                            f"{safe_mcp_diagnostic(name)}: "
+                            f"{safe_mcp_diagnostic(error)}",
+                            file=sys.stderr,
+                        )
                     continue
                 elif action == "tools":
                     for name in sorted(
@@ -1612,17 +1659,30 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         print("No MCP tasks.")
                     for task in tasks:
                         message = task.get("statusMessage")
-                        suffix = f": {message}" if message else ""
+                        suffix = (
+                            f": {safe_mcp_diagnostic(message)}" if message else ""
+                        )
                         print(
-                            f"{task['server']}: {task['taskId']} "
+                            f"{safe_mcp_diagnostic(task['server'])}: "
+                            f"{safe_mcp_diagnostic(task['taskId'])} "
                             f"{task['status']}{suffix}"
                         )
                 elif action == "cancel":
-                    task = await runtime.cancel_task(arguments[1], arguments[2])
+                    try:
+                        task = await runtime.cancel_task(arguments[1], arguments[2])
+                    except Exception as exc:
+                        print(
+                            f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
+                        )
+                        continue
                     message = task.get("statusMessage")
-                    suffix = f": {message}" if message else ""
+                    suffix = (
+                        f": {safe_mcp_diagnostic(message)}" if message else ""
+                    )
                     print(
-                        f"{task['server']}: {task['taskId']} {task['status']}{suffix}"
+                        f"{safe_mcp_diagnostic(task['server'])}: "
+                        f"{safe_mcp_diagnostic(task['taskId'])} "
+                        f"{task['status']}{suffix}"
                     )
                 else:
                     items = (
@@ -3631,7 +3691,9 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     credentials_removed = oauth_store.remove()
                 except MCPOAuthError as exc:
-                    print(f"Error: {exc}", file=sys.stderr)
+                    print(
+                        f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
+                    )
                     return 2
                 print(
                     f"Removed OAuth credentials for MCP server {args.server_name}."
@@ -3664,7 +3726,9 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
             except (MCPOAuthError, OSError, ValueError) as exc:
-                print(f"Error: {exc}", file=sys.stderr)
+                print(
+                    f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
+                )
                 return 2
             print(f"Authorized MCP server {args.server_name}.")
             return 0

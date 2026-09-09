@@ -17,6 +17,11 @@ from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from pydantic import BaseModel, Field
 
 from ash.mcp.client import MCPClient, MCPProtocolError
+from ash.mcp.diagnostics import (
+    MAX_MCP_DIAGNOSTICS,
+    safe_mcp_diagnostic,
+    safe_mcp_error_payload,
+)
 from ash.mcp.server import MCPServerConfig
 from ash.core.redaction import redact_text
 from ash.safety.environment import build_scrubbed_environment
@@ -535,7 +540,9 @@ class MCPTool(BaseTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=f"invalid MCP tool arguments: not JSON-serializable: {exc}",
+                error=safe_mcp_diagnostic(
+                    f"invalid MCP tool arguments: not JSON-serializable: {exc}"
+                ),
             )
         if not input_validation["valid"]:
             message = str(input_validation.get("message", "validation failed"))
@@ -551,7 +558,7 @@ class MCPTool(BaseTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=error,
+                error=safe_mcp_diagnostic(error),
             )
 
         try:
@@ -572,24 +579,26 @@ class MCPTool(BaseTool):
                 header_annotations=self._header_annotations,
             )
         except MCPProtocolError as exc:
+            message = safe_mcp_diagnostic(exc)
             error_payload: dict[str, Any] = {
                 "type": "mcp_protocol_error",
-                "message": str(exc),
+                "message": message,
             }
             if exc.code is not None:
                 error_payload["code"] = exc.code
             if exc.has_data:
-                error_payload["data"] = exc.data
+                error_payload["data"] = safe_mcp_error_payload(exc.data)
             output = _json_dump({"error": error_payload})
+            output = safe_mcp_diagnostic(output)
             return ToolResult(
                 success=False,
                 output=output,
-                error=str(exc),
+                error=message,
                 token_count=count_output_tokens(output),
                 outcome=ToolExecutionOutcome.UNKNOWN,
             )
         except Exception as exc:  # noqa: BLE001 - prevent unsafe automatic replay
-            message = str(exc).strip() or type(exc).__name__
+            message = safe_mcp_diagnostic(exc)
             output = _json_dump(
                 {
                     "error": {
@@ -598,6 +607,7 @@ class MCPTool(BaseTool):
                     }
                 }
             )
+            output = safe_mcp_diagnostic(output)
             return ToolResult(
                 success=False,
                 output=output,
@@ -610,26 +620,30 @@ class MCPTool(BaseTool):
                 raw_result = _json_dump(result)
             except (TypeError, ValueError):
                 raw_result = ""
+            safe_result = safe_mcp_diagnostic(raw_result)
             return ToolResult(
                 success=False,
-                output=raw_result,
+                output=safe_result,
                 error="invalid MCP tool result: result must be an object",
-                token_count=count_output_tokens(raw_result),
+                token_count=count_output_tokens(safe_result),
             )
         try:
-            raw_result = _json_dump(result)
+            raw_result = redact_text(_json_dump(result))
         except (TypeError, ValueError) as exc:
             return ToolResult(
                 success=False,
                 output="",
-                error=f"invalid MCP tool result: not JSON-serializable: {exc}",
+                error=safe_mcp_diagnostic(
+                    f"invalid MCP tool result: not JSON-serializable: {exc}"
+                ),
             )
+        safe_raw_result = safe_mcp_diagnostic(raw_result)
         if "content" not in result:
             return ToolResult(
                 success=False,
-                output=raw_result,
+                output=safe_raw_result,
                 error="invalid MCP tool result: content is required",
-                token_count=count_output_tokens(raw_result),
+                token_count=count_output_tokens(safe_raw_result),
             )
         raw_content = result["content"]
         if not isinstance(raw_content, list) or not all(
@@ -637,9 +651,9 @@ class MCPTool(BaseTool):
         ):
             return ToolResult(
                 success=False,
-                output=raw_result,
+                output=safe_raw_result,
                 error="invalid MCP tool result: content must be an array of objects",
-                token_count=count_output_tokens(raw_result),
+                token_count=count_output_tokens(safe_raw_result),
             )
         content = [dict(item) for item in raw_content]
         for index, item in enumerate(content):
@@ -647,48 +661,53 @@ class MCPTool(BaseTool):
             if content_error is not None:
                 return ToolResult(
                     success=False,
-                    output=raw_result,
+                    output=safe_raw_result,
                     error=(
                         f"invalid MCP tool result: content[{index}] {content_error}"
                     ),
-                    token_count=count_output_tokens(raw_result),
+                    token_count=count_output_tokens(safe_raw_result),
                 )
         if "structuredContent" in result and not isinstance(
             result["structuredContent"], dict
         ):
             return ToolResult(
                 success=False,
-                output=raw_result,
+                output=safe_raw_result,
                 error="invalid MCP tool result: structuredContent must be an object",
-                token_count=count_output_tokens(raw_result),
+                token_count=count_output_tokens(safe_raw_result),
             )
         structured_content = result.get("structuredContent")
         if "_meta" in result and not isinstance(result["_meta"], dict):
             return ToolResult(
                 success=False,
-                output=raw_result,
+                output=safe_raw_result,
                 error="invalid MCP tool result: _meta must be an object",
-                token_count=count_output_tokens(raw_result),
+                token_count=count_output_tokens(safe_raw_result),
             )
         raw_is_error = result.get("isError", False)
         if not isinstance(raw_is_error, bool):
             return ToolResult(
                 success=False,
-                output=raw_result,
+                output=safe_raw_result,
                 error="invalid MCP tool result: isError must be a boolean",
-                token_count=count_output_tokens(raw_result),
+                token_count=count_output_tokens(safe_raw_result),
             )
         is_error = raw_is_error
         normalized_result = deepcopy(result)
         normalized_result["content"] = content
         normalized_result["isError"] = is_error
-        output = _render_tool_result(normalized_result, is_error=is_error)
+        rendered_output = _render_tool_result(normalized_result, is_error=is_error)
+        output = (
+            safe_mcp_diagnostic(rendered_output)
+            if is_error
+            else redact_text(rendered_output)
+        )
 
         if self._output_schema is not None:
             if structured_content is None:
                 return ToolResult(
                     success=False,
-                    output=output,
+                    output=safe_mcp_diagnostic(output),
                     error=(
                         "invalid MCP tool result: outputSchema requires "
                         "structuredContent"
@@ -705,8 +724,10 @@ class MCPTool(BaseTool):
             except (TypeError, ValueError) as exc:
                 return ToolResult(
                     success=False,
-                    output=output,
-                    error=f"invalid MCP structured result: {exc}",
+                    output=safe_mcp_diagnostic(output),
+                    error=safe_mcp_diagnostic(
+                        f"invalid MCP structured result: {exc}"
+                    ),
                     token_count=count_output_tokens(output),
                 )
             if not output_validation["valid"]:
@@ -723,15 +744,17 @@ class MCPTool(BaseTool):
                 )
                 return ToolResult(
                     success=False,
-                    output=output,
-                    error=error,
+                    output=safe_mcp_diagnostic(output),
+                    error=safe_mcp_diagnostic(error),
                     token_count=count_output_tokens(output),
                 )
 
         return ToolResult(
             success=not is_error,
             output=output,
-            error=_tool_error_text(content) if is_error else None,
+            error=safe_mcp_diagnostic(_tool_error_text(content))
+            if is_error
+            else None,
             token_count=count_output_tokens(output),
         )
 
@@ -751,12 +774,18 @@ class MCPReadResourceTool(BaseTool):
         self.runtime = runtime
 
     async def run(self, **kwargs: Any) -> ToolResult:
-        args = MCPReadResourceArgs(**kwargs)
+        try:
+            args = MCPReadResourceArgs(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - safe MCP boundary
+            return ToolResult(success=False, output="", error=safe_mcp_diagnostic(exc))
         client = self.runtime.clients.get(args.server)
         if client is None:
             return ToolResult(success=False, output="", error="Unknown MCP server")
-        result = await client.read_resource(args.uri)
-        output = json.dumps(result, ensure_ascii=False)
+        try:
+            result = await client.read_resource(args.uri)
+        except Exception as exc:  # noqa: BLE001 - safe MCP boundary
+            return ToolResult(success=False, output="", error=safe_mcp_diagnostic(exc))
+        output = redact_text(json.dumps(result, ensure_ascii=False))
         return ToolResult(
             success=True, output=output, token_count=count_output_tokens(output)
         )
@@ -778,12 +807,18 @@ class MCPGetPromptTool(BaseTool):
         self.runtime = runtime
 
     async def run(self, **kwargs: Any) -> ToolResult:
-        args = MCPGetPromptArgs(**kwargs)
+        try:
+            args = MCPGetPromptArgs(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - safe MCP boundary
+            return ToolResult(success=False, output="", error=safe_mcp_diagnostic(exc))
         client = self.runtime.clients.get(args.server)
         if client is None:
             return ToolResult(success=False, output="", error="Unknown MCP server")
-        result = await client.get_prompt(args.name, args.arguments)
-        output = json.dumps(result, ensure_ascii=False)
+        try:
+            result = await client.get_prompt(args.name, args.arguments)
+        except Exception as exc:  # noqa: BLE001 - safe MCP boundary
+            return ToolResult(success=False, output="", error=safe_mcp_diagnostic(exc))
+        output = redact_text(json.dumps(result, ensure_ascii=False))
         return ToolResult(
             success=True, output=output, token_count=count_output_tokens(output)
         )
@@ -801,15 +836,15 @@ class _MCPListCapabilityTool(BaseTool):
         self.runtime = runtime
 
     async def run(self, **kwargs: Any) -> ToolResult:
-        args = MCPListCapabilitiesArgs(**kwargs)
         try:
+            args = MCPListCapabilitiesArgs(**kwargs)
             items = await self.runtime.list_capability(
                 self.capability_method,
                 server=args.server or None,
             )
-        except ValueError as exc:
-            return ToolResult(success=False, output="", error=str(exc))
-        output = json.dumps(items, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001 - safe MCP boundary
+            return ToolResult(success=False, output="", error=safe_mcp_diagnostic(exc))
+        output = redact_text(json.dumps(items, ensure_ascii=False))
         return ToolResult(
             success=True,
             output=output,
@@ -868,11 +903,43 @@ class MCPRuntime:
         self._validated_tool_catalog_epochs: dict[str, int] = {}
         self._refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._refresh_requested: set[str] = set()
+        self._replacement_clients: dict[str, MCPClient] = {}
+        self._pending_replacement_notifications: set[str] = set()
+        self._retired_clients: set[MCPClient] = set()
+        self._retired_clients_lock = asyncio.Lock()
         self._startup_notifications: set[str] = set()
         self._catalog_revisions: dict[str, int] = {}
         self._started = False
         self._notifications_active = False
         self._closed = False
+
+    def _configure_client(
+        self, server_name: str, config: MCPServerConfig
+    ) -> MCPClient:
+        client = MCPClient(
+            config,
+            roots=(self.safety_guard.project_root,),
+        )
+        client.notification_handler = (
+            lambda method, params, server=server_name, source=client: (
+                self._handle_notification(server, source, method, params)
+            )
+        )
+        client.session_reinitialized_handler = (
+            lambda generation, method, params, server=server_name, source=client: (
+                self._handle_session_reinitialized(
+                    server, source, generation, method, params
+                )
+            )
+        )
+        client.tool_contract_validator = (
+            lambda remote_name, fingerprint, generation, server=server_name: (
+                self._validate_tool_contract(
+                    server, remote_name, fingerprint, generation
+                )
+            )
+        )
+        return client
 
     async def start(self) -> dict[str, BaseTool]:
         if self._started:
@@ -880,29 +947,7 @@ class MCPRuntime:
         self._closed = False
         tools: dict[str, BaseTool] = {}
         for name, config in self.configs.items():
-            client = MCPClient(
-                config,
-                roots=(self.safety_guard.project_root,),
-            )
-            client.notification_handler = (
-                lambda method, params, server=name, source=client: (
-                    self._handle_notification(server, source, method, params)
-                )
-            )
-            client.session_reinitialized_handler = (
-                lambda generation, method, params, server=name, source=client: (
-                    self._handle_session_reinitialized(
-                        server, source, generation, method, params
-                    )
-                )
-            )
-            client.tool_contract_validator = (
-                lambda remote_name, fingerprint, generation, server=name: (
-                    self._validate_tool_contract(
-                        server, remote_name, fingerprint, generation
-                    )
-                )
-            )
+            client = self._configure_client(name, config)
             self.clients[name] = client
             self._refresh_locks[name] = asyncio.Lock()
             self._recovery_reconcile_locks[name] = asyncio.Lock()
@@ -963,6 +1008,211 @@ class MCPRuntime:
             self.activate_notifications()
         return tools
 
+    async def replace_server(
+        self,
+        server_name: str,
+        config: MCPServerConfig,
+        *,
+        defer_client_cleanup: bool = False,
+    ) -> None:
+        """Prepare and atomically replace one server in this live runtime.
+
+        The existing client and catalog remain authoritative until the
+        replacement has connected, validated its catalog, passed the owning
+        loop's collision checks, and started its tools.  The replacement
+        client is configured against this runtime so all post-publication
+        callbacks retain the live owner.
+        """
+
+        if self._closed:
+            raise RuntimeError("cannot replace an MCP server after runtime shutdown")
+        if not self._started:
+            raise RuntimeError("cannot replace an MCP server before runtime start")
+        if server_name not in self.configs:
+            raise ValueError(f"unknown MCP server: {server_name}")
+        lock = self._refresh_locks.setdefault(server_name, asyncio.Lock())
+        self._recovery_reconcile_locks.setdefault(server_name, asyncio.Lock())
+        candidate = self._configure_client(server_name, config)
+        previous_client: MCPClient | None = None
+        previous_tools: dict[str, BaseTool] = {}
+        previous_errors: dict[str, str] = {}
+        snapshot_taken = False
+        candidate_tools: dict[str, BaseTool] = {}
+        current_task = asyncio.current_task()
+        self._replacement_clients[server_name] = candidate
+        try:
+            async with lock:
+                previous_client = self.clients.get(server_name)
+                previous_tools = dict(self._server_tools.get(server_name, {}))
+                previous_errors = {
+                    key: value
+                    for key, value in self.errors.items()
+                    if key == server_name or key.startswith(f"{server_name}:")
+                }
+                snapshot_taken = True
+                catalog_epoch = self._tool_catalog_epochs.get(server_name, 0) + 1
+                if current_task is not None:
+                    self._refresh_owners[server_name] = current_task
+                try:
+                    await candidate.connect()
+                    definitions = (
+                        await candidate.list_tools()
+                        if candidate.supports_server_capability("tools")
+                        else []
+                    )
+                    candidate_tools = self._build_server_tools(
+                        server_name,
+                        candidate,
+                        definitions,
+                        strict=True,
+                    )
+                    other_tools = {
+                        name
+                        for other_server, server_tools in self._server_tools.items()
+                        if other_server != server_name
+                        for name in server_tools
+                    }
+                    duplicates = other_tools & candidate_tools.keys()
+                    if duplicates:
+                        raise ValueError(
+                            "MCP tool collides with an existing tool: "
+                            + ", ".join(sorted(duplicates))
+                        )
+                    if self._tool_change_handler is not None:
+                        await self._tool_change_handler(
+                            server_name,
+                            previous_tools,
+                            candidate_tools,
+                        )
+                    else:
+                        for tool in candidate_tools.values():
+                            await tool.start()
+                    self.clients[server_name] = candidate
+                    self.configs[server_name] = config
+                    self._server_tools[server_name] = candidate_tools
+                    self._tool_catalog_epochs[server_name] = catalog_epoch
+                    self._validated_generations[server_name] = int(
+                        getattr(candidate, "session_generation", 0)
+                    )
+                    self._validated_tool_catalog_epochs[server_name] = catalog_epoch
+                    self._refresh_requested.discard(server_name)
+                    self._startup_notifications.discard(server_name)
+                    self._recovery_results = {
+                        key: result
+                        for key, result in self._recovery_results.items()
+                        if key[0] != server_name
+                    }
+                    for key in tuple(self.errors):
+                        if key == server_name or key.startswith(f"{server_name}:"):
+                            self.errors.pop(key, None)
+                    if previous_client is not None:
+                        self._retired_clients.add(previous_client)
+                    if server_name in self._pending_replacement_notifications:
+                        self._pending_replacement_notifications.discard(server_name)
+                        self._tool_catalog_epochs[server_name] += 1
+                        if self._notifications_active:
+                            self._schedule_tool_refresh(server_name)
+                finally:
+                    if self._refresh_owners.get(server_name) is current_task:
+                        self._refresh_owners.pop(server_name, None)
+        except asyncio.CancelledError:
+            self._replacement_clients.pop(server_name, None)
+            self._pending_replacement_notifications.discard(server_name)
+            if snapshot_taken:
+                self._restore_server_errors(server_name, previous_errors)
+            await self._close_candidate(candidate, candidate_tools)
+            raise
+        except BaseException:
+            self._replacement_clients.pop(server_name, None)
+            self._pending_replacement_notifications.discard(server_name)
+            if snapshot_taken:
+                self._restore_server_errors(server_name, previous_errors)
+            await self._close_candidate(candidate, candidate_tools)
+            raise
+        self._replacement_clients.pop(server_name, None)
+        if not defer_client_cleanup:
+            await self.close_retired_clients()
+
+    def _restore_server_errors(
+        self, server_name: str, previous_errors: dict[str, str]
+    ) -> None:
+        for key in tuple(self.errors):
+            if key == server_name or key.startswith(f"{server_name}:"):
+                self.errors.pop(key, None)
+        self.errors.update(previous_errors)
+
+    async def _close_candidate(
+        self,
+        candidate: MCPClient,
+        candidate_tools: dict[str, BaseTool],
+    ) -> None:
+        await asyncio.gather(
+            *(tool.aclose() for tool in candidate_tools.values()),
+            return_exceptions=True,
+        )
+        outcomes, cancelled = await self._await_retired_disconnects((candidate,))
+        if outcomes[0] is not None:
+            self._retired_clients.add(candidate)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def close_retired_clients(self) -> None:
+        """Disconnect clients replaced during an in-flight turn."""
+
+        async with self._retired_clients_lock:
+            if not self._retired_clients:
+                return
+            clients = tuple(self._retired_clients)
+            outcomes, cancelled = await self._await_retired_disconnects(clients)
+            failed = {
+                client
+                for client, outcome in zip(clients, outcomes, strict=True)
+                if outcome is not None
+            }
+            if failed:
+                retry_clients = tuple(failed)
+                retry_outcomes, retry_cancelled = await (
+                    self._await_retired_disconnects(retry_clients)
+                )
+                cancelled = cancelled or retry_cancelled
+                failed = {
+                    client
+                    for client, outcome in zip(
+                        retry_clients, retry_outcomes, strict=True
+                    )
+                    if outcome is not None
+                }
+            self._retired_clients.difference_update(set(clients) - failed)
+            if cancelled:
+                raise asyncio.CancelledError
+            if failed:
+                raise RuntimeError(
+                    f"failed to disconnect {len(failed)} retired MCP client(s)"
+                )
+
+    async def _await_retired_disconnects(
+        self, clients: tuple[MCPClient, ...]
+    ) -> tuple[tuple[BaseException | None, ...], bool]:
+        cleanup = asyncio.create_task(self._disconnect_clients(clients))
+        cancelled = False
+        while True:
+            try:
+                return await asyncio.shield(cleanup), cancelled
+            except asyncio.CancelledError:
+                cancelled = True
+
+    async def _disconnect_clients(
+        self, clients: tuple[MCPClient, ...]
+    ) -> tuple[BaseException | None, ...]:
+        outcomes = await asyncio.gather(
+            *(client.disconnect() for client in clients),
+            return_exceptions=True,
+        )
+        return tuple(
+            outcome if isinstance(outcome, BaseException) else None
+            for outcome in outcomes
+        )
+
     def activate_notifications(self) -> None:
         if not self._started or self._closed:
             raise RuntimeError("MCP runtime is not active")
@@ -977,8 +1227,6 @@ class MCPRuntime:
     def status_snapshot(self) -> list[dict[str, Any]]:
         """Return safe, bounded live status for every configured server."""
 
-        max_error_chars = 512
-        max_errors = 16
         output: list[dict[str, Any]] = []
         for name in self.configs:
             config = self.configs[name]
@@ -990,18 +1238,16 @@ class MCPRuntime:
             }
             errors = []
             error_keys = sorted(server_errors)
-            for key in error_keys[:max_errors]:
-                error = redact_text(server_errors[key]).strip()
-                if len(error) > max_error_chars:
-                    error = error[: max_error_chars - 3] + "..."
-                errors.append(error)
-            if len(error_keys) > max_errors:
+            for key in error_keys[:MAX_MCP_DIAGNOSTICS]:
+                errors.append(safe_mcp_diagnostic(server_errors[key]))
+            if len(error_keys) > MAX_MCP_DIAGNOSTICS:
                 errors.append(
-                    f"... {len(error_keys) - max_errors} additional errors omitted"
+                    f"... {len(error_keys) - MAX_MCP_DIAGNOSTICS} "
+                    "additional errors omitted"
                 )
             output.append(
                 {
-                    "name": name,
+                    "name": safe_mcp_diagnostic(name),
                     "transport": config.transport,
                     "auth": config.auth,
                     "state": "connected" if connected else "failed",
@@ -1063,7 +1309,11 @@ class MCPRuntime:
         params: dict[str, Any],
     ) -> None:
         del params
-        if self._closed or self.clients.get(server_name) is not client:
+        if self._closed:
+            return
+        active_client = self.clients.get(server_name)
+        replacement_client = self._replacement_clients.get(server_name)
+        if active_client is not client and replacement_client is not client:
             return
         capability_by_notification = {
             "notifications/tools/list_changed": "tools",
@@ -1072,6 +1322,10 @@ class MCPRuntime:
         }
         capability = capability_by_notification.get(method)
         if capability is None:
+            return
+        if replacement_client is client and active_client is not client:
+            if capability == "tools":
+                self._pending_replacement_notifications.add(server_name)
             return
         advertised = client.server_capabilities.get(capability)
         if (
@@ -1317,14 +1571,18 @@ class MCPRuntime:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._refresh_tasks.clear()
-        await asyncio.gather(
-            *(client.disconnect() for client in self.clients.values()),
-            return_exceptions=True,
-        )
+        self._retired_clients.update(self.clients.values())
+        retired_cleanup_error: BaseException | None = None
+        try:
+            await self.close_retired_clients()
+        except BaseException as exc:
+            retired_cleanup_error = exc
         self.clients.clear()
         self._server_tools.clear()
         self._refresh_locks.clear()
         self._recovery_reconcile_locks.clear()
+        self._replacement_clients.clear()
+        self._pending_replacement_notifications.clear()
         self._refresh_owners.clear()
         self._recovery_results.clear()
         self._validated_generations.clear()
@@ -1332,6 +1590,8 @@ class MCPRuntime:
         self._validated_tool_catalog_epochs.clear()
         self._started = False
         self._notifications_active = False
+        if retired_cleanup_error is not None:
+            raise retired_cleanup_error
 
     async def list_resources(self) -> list[dict[str, Any]]:
         return await self._list_capability("list_resources")

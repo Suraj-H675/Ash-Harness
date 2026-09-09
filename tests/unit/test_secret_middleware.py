@@ -17,6 +17,24 @@ def test_redaction_handles_common_secret_shapes() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("assignment", "marker"),
+    [
+        ('password="synthetic quoted marker"', "synthetic quoted marker"),
+        ("password='synthetic quoted marker'", "synthetic quoted marker"),
+        ("password=synthetic-unquoted-marker", "synthetic-unquoted-marker"),
+    ],
+)
+def test_redaction_removes_complete_assigned_secret_values(
+    assignment: str, marker: str
+) -> None:
+    rendered = redact_text(f"before {assignment} after")
+
+    assert marker not in rendered
+    assert rendered.endswith(" after")
+    assert "[REDACTED]" in rendered
+
+
 @pytest.mark.asyncio
 async def test_tool_result_redaction() -> None:
     result = ToolResult(
@@ -39,6 +57,72 @@ def test_streaming_redactor_retains_chunk_split_secrets() -> None:
     assert "supersecretvalue" not in emitted
     assert "[REDACTED]" in emitted
     assert tail == "next"
+
+
+def test_streaming_redactor_never_emits_chunk_split_quoted_secret() -> None:
+    marker = "synthetic quoted marker"
+
+    for quote in ('"', "'"):
+        value = f"prefix password={quote}{marker}{quote} suffix\n"
+        for split in range(len(value) + 1):
+            redactor = StreamingRedactor()
+            emitted = (
+                redactor.feed(value[:split])
+                + redactor.feed(value[split:])
+                + redactor.finish()
+            )
+
+            assert marker not in emitted
+            assert f"password={quote}[REDACTED]{quote}" in emitted
+            assert emitted.endswith(" suffix\n")
+
+
+def test_redaction_handles_nested_escaped_and_multiline_assignments() -> None:
+    escaped = r'payload={\"password\": \"synthetic escaped marker\"}'
+    multiline = 'payload={"password": "line one\nline two synthetic marker"}'
+
+    assert "synthetic escaped marker" not in redact_text(escaped)
+    assert "line two synthetic marker" not in redact_text(multiline)
+
+
+def test_redaction_handles_escaped_quotes_without_consuming_following_fields() -> None:
+    value = (
+        r'payload={\"password\": \"secret with \\\"quote\\\" '
+        r'synthetic escaped marker\", \"other\": \"safe\"}'
+    )
+
+    rendered = redact_text(value)
+
+    assert "synthetic escaped marker" not in rendered
+    assert r'\"password\": \"[REDACTED]\"' in rendered
+    assert r'\"other\": \"safe\"' in rendered
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        r'prefix payload={\"password\": \"synthetic escaped marker\"} suffix\n',
+        (
+            r'prefix payload={\"password\": \"secret with \\\"quote\\\" '
+            r'synthetic escaped marker\", \"other\": \"safe\"} suffix\n'
+        ),
+        'prefix payload={"password": "line one\nline two synthetic marker"} suffix\n',
+    ],
+)
+def test_streaming_redactor_never_emits_nested_or_multiline_secret(
+    value: str,
+) -> None:
+    marker = "synthetic escaped marker" if "escaped" in value else "synthetic marker"
+
+    for split in range(len(value) + 1):
+        redactor = StreamingRedactor()
+        emitted = (
+            redactor.feed(value[:split])
+            + redactor.feed(value[split:])
+            + redactor.finish()
+        )
+
+        assert marker not in emitted
 
 
 def test_streaming_redactor_withholds_unbounded_tokens() -> None:

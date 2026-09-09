@@ -7,8 +7,40 @@ from dataclasses import dataclass
 from typing import Any
 
 
+_SECRET_VALUE_ASSIGNMENT = re.compile(
+    r"""(?ix)
+    (?P<field_quote>(?:\\?["'])?)
+    (?P<field>(?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|token))\b
+    (?P=field_quote)
+    (?P<separator>\s*[=:]\s*)
+    (?:
+        (?P<escaped_double>\\"(?:\\.|[^"\\])*?(?<!\\)\\")
+        |
+        (?P<double>"(?:\\.|[^"\\])*")
+        |
+        (?P<single>'(?:\\.|[^'\\])*')
+        |
+        (?P<unquoted>(?!\\?["'])[^\s,;"']+)
+    )
+    """
+)
+_UNTERMINATED_SECRET_VALUE_ASSIGNMENT = re.compile(
+    r"""(?ix)
+    (?P<field_quote>(?:\\?["'])?)
+    (?P<field>(?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|token))\b
+    (?P=field_quote)
+    (?P<separator>\s*[=:]\s*)
+    (?:
+        (?P<escaped_double>\\"(?:\\.|[^"\\])*)
+        |
+        (?P<double>"(?:\\.|[^"\\])*)
+        |
+        (?P<single>'(?:\\.|[^'\\])*)
+    )$
+    """
+)
 _SECRET_PATTERNS = (
-    re.compile(r"(?i)(api[_-]?key|token|secret|password)(\s*[=:]\s*)([^\s,;]+)"),
+    _SECRET_VALUE_ASSIGNMENT,
     re.compile(r"\b(sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,})\b"),
     re.compile(r"\b(gsk_[A-Za-z0-9_-]{12,})\b"),
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"),
@@ -66,11 +98,78 @@ class SecretFinding:
 
 
 def redact_text(value: str) -> str:
-    redacted = value
-    redacted = _SECRET_PATTERNS[0].sub(r"\1\2[REDACTED]", redacted)
+    redacted = _UNTERMINATED_SECRET_VALUE_ASSIGNMENT.sub(
+        lambda match: _redact_unterminated_if_incomplete(match, value),
+        value,
+    )
+    redacted = _SECRET_PATTERNS[0].sub(
+        _redact_secret_assignment,
+        redacted,
+    )
     for pattern in _SECRET_PATTERNS[1:]:
         redacted = pattern.sub("[REDACTED]", redacted)
     return redacted
+
+
+def _redact_unterminated_if_incomplete(
+    match: re.Match[str],
+    source: str,
+) -> str:
+    if _SECRET_VALUE_ASSIGNMENT.match(source, match.start()) is not None:
+        return match.group(0)
+    return _redact_unterminated_secret_assignment(match)
+
+
+def _redact_secret_assignment(match: re.Match[str]) -> str:
+    value = (
+        match.group("escaped_double")
+        or match.group("double")
+        or match.group("single")
+        or match.group("unquoted")
+        or ""
+    )
+    field_quote = match.group("field_quote")
+    if field_quote.startswith("\\"):
+        return (
+            f"{field_quote}{match.group('field')}{field_quote}"
+            f"{match.group('separator')}"
+            r'\"[REDACTED]\"'
+        )
+    if value.startswith('\\"') and value.endswith('\\"'):
+        return (
+            f"{match.group('field_quote')}{match.group('field')}"
+            f"{match.group('field_quote')}{match.group('separator')}"
+            r'\"[REDACTED]\"'
+        )
+    quote = value[0] if value[:1] in {'"', "'"} else ""
+    closing_quote = quote if quote else ""
+    return (
+        f"{match.group('field_quote')}{match.group('field')}"
+        f"{match.group('field_quote')}{match.group('separator')}"
+        f"{quote}[REDACTED]{closing_quote}"
+    )
+
+
+def _redact_unterminated_secret_assignment(match: re.Match[str]) -> str:
+    value = (
+        match.group("escaped_double")
+        or match.group("double")
+        or match.group("single")
+        or ""
+    )
+    quote = value[:1]
+    field_quote = match.group("field_quote")
+    if value.startswith("\\"):
+        return (
+            f"{field_quote}{match.group('field')}{field_quote}"
+            f"{match.group('separator')}"
+            r'\"[REDACTED]'
+        )
+    return (
+        f"{field_quote}{match.group('field')}"
+        f"{field_quote}{match.group('separator')}"
+        f"{quote}[REDACTED]"
+    )
 
 
 def find_secret_candidates(value: str) -> tuple[SecretFinding, ...]:
@@ -122,7 +221,21 @@ class StreamingRedactor:
             self._buffer = self._buffer[boundary:]
             return ""
 
+        incomplete_start = _incomplete_secret_assignment_start(self._buffer)
+        if incomplete_start is not None:
+            if incomplete_start:
+                complete = self._buffer[:incomplete_start]
+                self._buffer = self._buffer[incomplete_start:]
+                return redact_text(complete)
+            if len(self._buffer) > self.max_token_characters:
+                self._buffer = ""
+                self._withholding_long_token = True
+                return "[long unbroken output token withheld]"
+            return ""
+
         boundary = _last_whitespace_boundary(self._buffer)
+        if boundary is not None:
+            boundary = _boundary_before_quoted_secret(self._buffer, boundary)
         if boundary is not None:
             complete = self._buffer[:boundary]
             self._buffer = self._buffer[boundary:]
@@ -147,6 +260,93 @@ def _last_whitespace_boundary(value: str) -> int | None:
     for index in range(len(value) - 1, -1, -1):
         if value[index].isspace():
             return index + 1
+    return None
+
+
+_SECRET_ASSIGNMENT_START = re.compile(
+    r"""(?ix)
+    (?P<field_quote>(?:\\?["'])?)
+    (?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|token)\b
+    (?P=field_quote)
+    \s*[=:]\s*
+    (?P<value_escape>\\?)(?P<value_quote>["'])
+    """
+)
+_SECRET_ASSIGNMENT_PREFIX = re.compile(
+    r"""(?ix)
+    (?P<field_quote>(?:\\?["'])?)
+    (?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|token)\b
+    (?P=field_quote)
+    (?:\s*[=:]\s*\\?)?
+    $
+    """
+)
+_SECRET_FIELD_PREFIX = re.compile(
+    r"""(?ix)
+    (?P<field_quote>\\?["']?)
+    (?P<field>[a-z0-9_-]+)
+    $
+    """
+)
+_SECRET_FIELD_COMPONENTS = (
+    "apikey",
+    "access",
+    "authtoken",
+    "secret",
+    "password",
+    "token",
+)
+
+
+def _incomplete_secret_assignment_start(value: str) -> int | None:
+    starts: list[int] = []
+    for match in _SECRET_ASSIGNMENT_START.finditer(value):
+        if _quoted_secret_end(value, match) is None:
+            starts.append(match.start())
+    prefix = _SECRET_ASSIGNMENT_PREFIX.search(value)
+    if prefix is not None:
+        starts.append(prefix.start())
+    field_prefix = _SECRET_FIELD_PREFIX.search(value)
+    if field_prefix is not None:
+        field = field_prefix.group("field").replace("_", "").replace("-", "")
+        if len(field) >= 3 and any(
+            component.startswith(field) or field.endswith(component)
+            for component in _SECRET_FIELD_COMPONENTS
+        ):
+            starts.append(field_prefix.start())
+    return min(starts) if starts else None
+
+
+def _boundary_before_quoted_secret(value: str, boundary: int) -> int | None:
+    for match in _SECRET_ASSIGNMENT_START.finditer(value):
+        end = _quoted_secret_end(value, match)
+        if end is not None and match.start() < boundary <= end:
+            return _last_whitespace_boundary(value[: match.start()])
+    return boundary
+
+
+def _quoted_secret_end(value: str, match: re.Match[str]) -> int | None:
+    quote = match.group("value_quote")
+    if match.group("value_escape"):
+        for offset in range(match.end(), len(value)):
+            if value[offset] != quote:
+                continue
+            slash_count = 0
+            preceding = offset - 1
+            while preceding >= match.end() - 1 and value[preceding] == "\\":
+                slash_count += 1
+                preceding -= 1
+            if slash_count == 1:
+                return offset + 1
+        return None
+    escaped = False
+    for offset, character in enumerate(value[match.end() :], start=match.end()):
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == quote:
+            return offset
     return None
 
 
