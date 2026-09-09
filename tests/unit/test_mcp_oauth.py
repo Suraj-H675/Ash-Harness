@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
+import stat
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -11,10 +14,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import httpx
 import pytest
 
+import ash.safety.private_store as private_store
 from ash.mcp.client import MCPClient
 from ash.mcp.oauth import (
     MCPAuthorizationRequired,
     MCPOAuthError,
+    MCPOAuthStoreUnavailable,
     MCPOAuthSession,
     MCPOAuthTokenStore,
     OAuthBundle,
@@ -88,6 +93,28 @@ def _bundle(resource: str, *, expired: bool = False) -> OAuthBundle:
     )
 
 
+def _redirect_visible_store_after_open(
+    store: MCPOAuthTokenStore,
+    outside: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_opened = private_store.PrivateStore.opened
+
+    @contextmanager
+    def redirected(instance: private_store.PrivateStore, *, create: bool = True):
+        with original_opened(instance, create=create) as descriptor:
+            if instance is store._private_store:
+                displaced = store.directory.with_name(
+                    f"{store.directory.name}-displaced"
+                )
+                store.directory.rename(displaced)
+                outside.mkdir(parents=True, exist_ok=True)
+                store.directory.symlink_to(outside, target_is_directory=True)
+            yield descriptor
+
+    monkeypatch.setattr(private_store.PrivateStore, "opened", redirected)
+
+
 def test_oauth_store_is_private_resource_bound_and_rejects_symlinks(
     tmp_path: Path,
 ) -> None:
@@ -99,8 +126,8 @@ def test_oauth_store_is_private_resource_bound_and_rejects_symlinks(
     assert store.path.name == "docs_server.json"
     assert store.load(bundle.resource) == bundle
     if os.name != "nt":
-        assert store.path.stat().st_mode & 0o077 == 0
-        assert store.directory.stat().st_mode & 0o077 == 0
+        assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(store.directory.stat().st_mode) == 0o700
     with pytest.raises(MCPOAuthError, match="different MCP resource"):
         store.load("https://mcp.example.test/rpc?tenant=two")
 
@@ -165,6 +192,225 @@ def test_oauth_store_rejects_symlinked_user_state_root(
     with pytest.raises(MCPOAuthError, match="linked MCP OAuth credential path"):
         store.remove()
     assert redirected.exists()
+    assert store.credential_state(resource) == "invalid"
+
+
+def test_oauth_store_rejects_symlinked_trusted_anchor_ancestor(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base"
+    outside = tmp_path / "outside"
+    base.mkdir()
+    outside.mkdir()
+    linked = base / "linked"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    store = MCPOAuthTokenStore("remote", linked / "tokens")
+
+    with pytest.raises(MCPOAuthError, match="linked MCP OAuth credential path"):
+        store.save(_bundle("https://mcp.example.test/rpc"))
+    assert not (outside / "tokens").exists()
+
+
+def test_oauth_store_creates_missing_custom_parent_directories(
+    tmp_path: Path,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore(
+        "remote",
+        tmp_path / "new" / "nested" / "tokens",
+    )
+
+    store.save(_bundle(resource))
+
+    assert store.load(resource) == _bundle(resource)
+    assert stat.S_IMODE(store.directory.stat().st_mode) == 0o700
+
+
+def test_oauth_store_save_stays_on_open_directory_after_visible_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource))
+    assert store.remove() is True
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_record = outside / store.path.name
+    outside_record.write_bytes(b"outside-record-must-not-change")
+    _redirect_visible_store_after_open(store, outside, monkeypatch)
+
+    store.save(_bundle(resource))
+
+    assert outside_record.read_bytes() == b"outside-record-must-not-change"
+    displaced_record = tmp_path / "tokens-displaced" / store.path.name
+    assert json.loads(displaced_record.read_text(encoding="utf-8"))["tokens"][
+        "access_token"
+    ] == "old-access"
+
+
+def test_oauth_store_load_stays_on_open_directory_after_visible_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_record = outside / store.path.name
+    outside_record.write_bytes(
+        store.path.read_bytes().replace(b"old-access", b"outside-access")
+    )
+    _redirect_visible_store_after_open(store, outside, monkeypatch)
+
+    loaded = store.load(resource)
+
+    assert loaded == _bundle(resource)
+    assert b"outside-access" in outside_record.read_bytes()
+
+
+def test_oauth_store_remove_stays_on_open_directory_after_visible_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_record = outside / store.path.name
+    outside_record.write_bytes(b"outside-record-must-survive")
+    _redirect_visible_store_after_open(store, outside, monkeypatch)
+
+    assert store.remove() is True
+
+    assert outside_record.read_bytes() == b"outside-record-must-survive"
+    assert not (tmp_path / "tokens-displaced" / store.path.name).exists()
+
+
+def test_oauth_store_fails_closed_when_secure_store_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource))
+    before = store.path.read_bytes()
+
+    def forbidden_open(*args: Any, **kwargs: Any) -> int:
+        raise AssertionError("unsupported private store used a pathname fallback")
+
+    with monkeypatch.context() as isolated:
+        isolated.setattr(
+            private_store,
+            "secure_private_store_available",
+            lambda: False,
+        )
+        isolated.setattr(private_store.os, "open", forbidden_open)
+        with pytest.raises(
+            MCPOAuthError,
+            match="secure MCP OAuth credential persistence is unavailable",
+        ):
+            store.save(_bundle(resource))
+        with pytest.raises(
+            MCPOAuthError,
+            match="secure MCP OAuth credential persistence is unavailable",
+        ):
+            store.load(resource)
+        with pytest.raises(
+            MCPOAuthError,
+            match="secure MCP OAuth credential persistence is unavailable",
+        ):
+            store.remove()
+        assert store.credential_state(resource) == "unavailable"
+
+    assert store.path.read_bytes() == before
+
+
+def test_oauth_store_cleans_staged_file_after_failed_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+
+    def fail_write(descriptor: int, payload: bytes) -> None:
+        raise private_store.PrivateStoreError("forced private-store write failure")
+
+    monkeypatch.setattr(private_store, "_write_all", fail_write)
+    with pytest.raises(MCPOAuthError, match="forced private-store write failure"):
+        store.save(_bundle(resource))
+
+    assert list(store.directory.iterdir()) == []
+
+
+def test_oauth_store_preserves_preexisting_temp_on_name_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.directory.mkdir()
+    monkeypatch.setattr(private_store.secrets, "token_hex", lambda length: "collision")
+    temporary = store.directory / f".{store.path.name}.collision.tmp"
+    temporary.write_bytes(b"preexisting temporary entry")
+
+    with pytest.raises(MCPOAuthError, match="unable to write"):
+        store.save(_bundle(resource))
+
+    assert temporary.read_bytes() == b"preexisting temporary entry"
+
+
+def test_secure_store_capability_requires_fstat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(private_store.os, "fstat", raising=False)
+
+    assert private_store.secure_private_store_available() is False
+
+
+def test_oauth_store_runtime_unsupported_is_reported_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource))
+
+    def unsupported_open(*args: Any, **kwargs: Any) -> int:
+        raise OSError(errno.ENOTSUP, "unsupported")
+
+    monkeypatch.setattr(
+        private_store,
+        "secure_private_store_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(private_store.os, "open", unsupported_open)
+
+    assert store.credential_state(resource) == "unavailable"
+
+
+def test_oauth_store_read_io_failure_is_reported_without_path_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource))
+
+    def fail_read(*args: Any, **kwargs: Any) -> bytes:
+        raise OSError("forced read failure")
+
+    monkeypatch.setattr(private_store.os, "read", fail_read)
+
+    with pytest.raises(MCPOAuthError, match="unable to read"):
+        store.load(resource)
     assert store.credential_state(resource) == "invalid"
 
 
@@ -622,6 +868,60 @@ async def test_oauth_session_refreshes_rotates_and_persists(tmp_path: Path) -> N
     assert persisted is not None
     assert persisted.tokens.refresh_token == "rotated-refresh"
     assert persisted.tokens.expires_at > 0
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_oauth_refresh_surfaces_secure_persistence_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource, expired=True))
+    refresh_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal refresh_count
+        refresh_count += 1
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "token_type": "Bearer",
+                "expires_in": 1200,
+            },
+        )
+
+    capability_calls = 0
+
+    def available_once() -> bool:
+        nonlocal capability_calls
+        capability_calls += 1
+        return capability_calls == 1
+
+    monkeypatch.setattr(
+        private_store,
+        "secure_private_store_available",
+        available_once,
+    )
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    session = MCPOAuthSession("remote", resource, store=store, http_client=http)
+
+    with pytest.raises(
+        MCPOAuthStoreUnavailable,
+        match="secure MCP OAuth credential persistence is unavailable",
+    ):
+        await session.authorization_header()
+
+    assert refresh_count == 1
+    monkeypatch.setattr(
+        private_store,
+        "secure_private_store_available",
+        lambda: True,
+    )
+    assert store.load(resource) == _bundle(resource, expired=True)
     await http.aclose()
 
 

@@ -1513,11 +1513,19 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             file=sys.stderr,
                         )
                         continue
-                    from ash.mcp.oauth import MCPOAuthTokenStore, authorize_mcp_server
+                    from ash.mcp.oauth import (
+                        MCPOAuthError,
+                        MCPOAuthTokenStore,
+                        authorize_mcp_server,
+                    )
 
                     oauth_store = MCPOAuthTokenStore(server_name)
                     if action == "logout":
-                        credentials_removed = oauth_store.remove()
+                        try:
+                            credentials_removed = oauth_store.remove()
+                        except (MCPOAuthError, OSError, ValueError) as exc:
+                            print(f"Error: {exc}", file=sys.stderr)
+                            continue
                         print(
                             f"Removed OAuth credentials for MCP server {server_name}."
                             if credentials_removed
@@ -1533,7 +1541,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                                 timeout_seconds=300.0,
                                 manual_paste=True,
                             )
-                        except (OSError, ValueError) as exc:
+                        except (MCPOAuthError, OSError, ValueError) as exc:
                             print(f"Error: {exc}", file=sys.stderr)
                             continue
                         print(f"Authorized MCP server {server_name}.")

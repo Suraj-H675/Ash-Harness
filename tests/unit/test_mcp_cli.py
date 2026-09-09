@@ -280,7 +280,9 @@ def test_mcp_cli_status_reports_safe_oauth_credential_state(
     capsys,
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
     assert (
         main(
             [
@@ -309,4 +311,13 @@ def test_mcp_cli_status_reports_safe_oauth_credential_state(
     assert main(["mcp", "status"]) == 0
     output = capsys.readouterr().out
     assert "credentials=usable" in output
+    assert "access-token" not in output
+
+    monkeypatch.setattr(
+        "ash.safety.private_store.secure_private_store_available",
+        lambda: False,
+    )
+    assert main(["mcp", "status"]) == 0
+    output = capsys.readouterr().out
+    assert "credentials=unavailable" in output
     assert "access-token" not in output

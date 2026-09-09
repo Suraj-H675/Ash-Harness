@@ -10,8 +10,6 @@ import math
 import os
 import re
 import secrets
-import stat
-import tempfile
 import threading
 import time
 import webbrowser
@@ -25,6 +23,11 @@ from urllib.request import parse_http_list, parse_keqv_list
 import httpx
 
 from ash.safe_io import strict_json_loads
+from ash.safety.private_store import (
+    PrivateStore,
+    PrivateStoreError,
+    PrivateStoreUnavailable,
+)
 
 
 MAX_OAUTH_RESPONSE_BYTES = 1_000_000
@@ -40,6 +43,10 @@ SCOPE = re.compile(r"[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*")
 
 class MCPOAuthError(RuntimeError):
     """A bounded OAuth protocol, persistence, or discovery failure."""
+
+
+class MCPOAuthStoreUnavailable(MCPOAuthError):
+    """Secure local OAuth credential persistence is unavailable."""
 
 
 class MCPAuthorizationRequired(MCPOAuthError):
@@ -93,34 +100,37 @@ class MCPOAuthTokenStore:
     def __init__(self, server_name: str, directory: Path | None = None) -> None:
         safe_name = SAFE_SERVER_NAME.sub("_", server_name).strip("._")[:128]
         self.server_name = safe_name or "server"
-        self.directory = directory or (Path.home() / ".ash" / "mcp-oauth")
+        trusted_root: str | Path
+        if directory is None:
+            home = Path.home()
+            requested_directory = home / ".ash" / "mcp-oauth"
+            trusted_root = home
+        else:
+            requested_directory = Path(directory).expanduser()
+            # A custom location is captured lexically and traversed from the
+            # filesystem root so every ancestor is checked with no-follow I/O.
+            trusted_root = Path(os.path.abspath(requested_directory)).anchor
+        self._private_store = PrivateStore(
+            requested_directory,
+            trusted_root=trusted_root,
+        )
+        self.directory = self._private_store.directory
         self.path = self.directory / f"{self.server_name}.json"
 
-    @staticmethod
-    def _is_link(path: Path) -> bool:
-        return path.is_symlink() or (
-            hasattr(path, "is_junction") and path.is_junction()
-        )
-
-    def _validate_storage_path(self) -> None:
-        for candidate in (self.path, self.directory, self.directory.parent):
-            if self._is_link(candidate):
-                if candidate == self.path:
-                    raise MCPOAuthError(
-                        f"refusing to use symlinked MCP OAuth credential file: {candidate}"
-                    )
-                if candidate == self.directory:
-                    raise MCPOAuthError("refusing to use a symlinked MCP OAuth directory")
-                raise MCPOAuthError(
-                    f"refusing to use linked MCP OAuth credential path: {candidate}"
-                )
-
     def load(self, resource: str) -> OAuthBundle | None:
-        self._validate_storage_path()
-        if not self.path.exists():
+        try:
+            record = self._private_store.read(
+                self.path.name,
+                max_bytes=MAX_OAUTH_RECORD_BYTES,
+            )
+        except PrivateStoreUnavailable as exc:
+            raise MCPOAuthStoreUnavailable(str(exc)) from exc
+        except PrivateStoreError as exc:
+            raise MCPOAuthError(str(exc)) from exc
+        if record is None:
             return None
         try:
-            raw = strict_json_loads(self._read_record())
+            raw = strict_json_loads(record)
             if (
                 not isinstance(raw, dict)
                 or isinstance(raw.get("version"), bool)
@@ -199,87 +209,36 @@ class MCPOAuthTokenStore:
                 "expires_at": bundle.tokens.expires_at,
             },
         }
-        self._validate_storage_path()
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self._validate_storage_path()
-        if not self.directory.is_dir():
-            raise MCPOAuthError("MCP OAuth credential path is not a private directory")
-        if os.name != "nt":
-            self.directory.chmod(0o700)
-        descriptor, temporary = tempfile.mkstemp(
-            dir=self.directory,
-            prefix=f".{self.server_name}.",
-            suffix=".tmp",
-        )
+        payload_bytes = (
+            json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"
+        ).encode("utf-8")
         try:
-            fchmod = getattr(os, "fchmod", None)
-            if os.name != "nt" and fchmod is not None:
-                fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
-            if os.name != "nt":
-                self.path.chmod(0o600)
-        except Exception:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-            raise
+            self._private_store.write(self.path.name, payload_bytes)
+        except PrivateStoreUnavailable as exc:
+            raise MCPOAuthStoreUnavailable(str(exc)) from exc
+        except PrivateStoreError as exc:
+            raise MCPOAuthError(str(exc)) from exc
 
     def remove(self) -> bool:
-        self._validate_storage_path()
         try:
-            self.path.unlink()
-        except FileNotFoundError:
-            return False
-        return True
+            return self._private_store.remove(self.path.name)
+        except PrivateStoreUnavailable as exc:
+            raise MCPOAuthStoreUnavailable(str(exc)) from exc
+        except PrivateStoreError as exc:
+            raise MCPOAuthError(str(exc)) from exc
 
     def credential_state(self, resource: str) -> str:
         """Report bounded, non-secret credential health for diagnostics."""
 
         try:
-            self._validate_storage_path()
-        except MCPOAuthError:
-            return "invalid"
-        if not self.path.exists():
-            return "missing"
-        try:
             bundle = self.load(canonical_resource_uri(resource))
+        except MCPOAuthStoreUnavailable:
+            return "unavailable"
         except MCPOAuthError:
             return "invalid"
         if bundle is None:
             return "missing"
         return "usable" if bundle.tokens.usable() else "expired"
-
-    def _read_record(self) -> str:
-        if self.path.is_symlink():
-            raise MCPOAuthError("refusing to read a symlinked MCP OAuth token record")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(self.path, flags)
-        except OSError as exc:
-            raise MCPOAuthError(
-                "refusing to read an unsafe MCP OAuth token record"
-            ) from exc
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise MCPOAuthError("MCP OAuth token record is not a regular file")
-            if metadata.st_size > MAX_OAUTH_RECORD_BYTES:
-                raise MCPOAuthError("MCP OAuth token record exceeded 1 MB")
-            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-                descriptor = -1
-                content = handle.read(MAX_OAUTH_RECORD_BYTES + 1)
-            if len(content.encode("utf-8")) > MAX_OAUTH_RECORD_BYTES:
-                raise MCPOAuthError("MCP OAuth token record exceeded 1 MB")
-            return content
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
 
 
 class MCPOAuthSession:

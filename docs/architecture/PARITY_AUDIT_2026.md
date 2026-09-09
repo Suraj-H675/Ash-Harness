@@ -137,14 +137,44 @@ instead of guessing. Targeted checkpoint/scoped-I/O tests pass, including
 created-file deletion, mode restoration, stale-state refusal, rollback, and
 fallback coverage.
 
+### MCP OAuth private-store race
+
+The MCP OAuth token store had a confirmed filesystem-confinement defect: its
+path-based save, load, and remove operations separated path validation from
+the security-sensitive filesystem mutation. A deterministic synchronized
+directory-substitution harness confirmed that a pathname swap could redirect
+the pre-fix path-based operation outside the intended store.
+
+The repair adds the small `ash.safety.private_store.PrivateStore`
+abstraction. On supported POSIX systems it opens the trusted anchor and every
+store component with descriptor-relative, no-follow operations, retains the
+store descriptor for the complete operation, uses private modes (`0700`
+directory and `0600` records), bounds reads at 1 MB, and stages/fsyncs/renames
+writes through the held directory descriptor. Save, load, and remove
+directory-substitution regressions now prove that an outside replacement
+directory cannot receive, be read by, or lose a credential record.
+Final-record and intermediate-link rejection, ancestor-link rejection,
+malformed/duplicate JSON, resource binding, temporary cleanup, refresh
+persistence failure, and exact private modes are also covered.
+
+On Windows and other platforms without the required descriptor-relative
+primitives, the store fails closed before credential material is touched;
+there is no pathname fallback, automatic migration, or unsafe override.
+Diagnostics report `credentials=unavailable` rather than `missing`.
+Unsupported-platform behavior was forced and tested locally; this CI matrix
+has no Windows job, so no native Windows secure-store guarantee is claimed.
+The OAuth schema, POSIX location, resource binding, refresh behavior, CLI
+login/logout semantics, and dependency range were preserved.
+
 ### Verification checkpoint
 
-- `uv run pytest -q --timeout=120 --timeout-method=thread`: **2095 passed,
-  3 skipped** before the ACP continuation fix; after that fix and the focused
-  ACP lifecycle regression the same full suite reports **2097 passed, 3
-  skipped**.
+- `uv run pytest -q --timeout=120 --timeout-method=thread`: **2109 passed,
+  3 skipped** after the ACP lifecycle and MCP OAuth private-store fixes.
+- The focused MCP OAuth/CLI regression run reports **49 passed**, including
+  synchronized save/load/remove directory-substitution cases and the
+  fail-closed unsupported-store path.
 - `uv run ruff check src tests`: passed.
-- `uv run mypy src/ash`: passed with no issues in 170 source files.
+- `uv run mypy src/ash`: passed with no issues in 171 source files.
 - `uv build` and the clean installed-wheel smoke
   (`.smoke-venv/bin/python tests/packaging/smoke_minimal_install.py`) passed
   after the ACP fix.
