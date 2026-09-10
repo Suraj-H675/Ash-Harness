@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import mimetypes
 import os
 import re
 from pathlib import Path
@@ -285,11 +286,21 @@ class BrowserSession:
             validated_path,
             safety_guard.project_root,
         )
+        mime_type = (
+            mimetypes.guess_type(validated_path.name, strict=False)[0]
+            or "application/octet-stream"
+        )
+        file_payload = {
+            "name": validated_path.name,
+            "mimeType": mime_type,
+            "buffer": payload,
+        }
         async with page.expect_file_chooser(
             timeout=self.timeout_ms,
         ) as chooser_info:
             await locator.click(timeout=self.timeout_ms)
-        await chooser_info.value.set_files(str(validated_path))
+        file_chooser = await chooser_info.value
+        await file_chooser.set_files(file_payload)
         await self._settle(page)
         return await self.snapshot()
 

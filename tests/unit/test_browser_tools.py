@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -99,6 +101,58 @@ class FakeBrowserSession:
 
     async def close(self) -> None:
         self.closed += 1
+
+
+class _UploadLocator:
+    async def get_attribute(self, name: str) -> str | None:
+        return "file" if name == "type" else None
+
+    async def click(self, *, timeout: int) -> None:
+        assert timeout == 1_000
+
+
+class _UploadChooser:
+    def __init__(self) -> None:
+        self.files: Any = None
+
+    async def set_files(self, files: Any) -> None:
+        self.files = files
+
+
+class _UploadChooserContext:
+    def __init__(self, chooser: _UploadChooser) -> None:
+        self.value = self._resolve_chooser(chooser)
+
+    async def _resolve_chooser(self, chooser: _UploadChooser) -> _UploadChooser:
+        return chooser
+
+    async def __aenter__(self) -> "_UploadChooserContext":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+
+class _UploadPage:
+    def __init__(self, chooser: _UploadChooser) -> None:
+        self.chooser = chooser
+
+    def expect_file_chooser(self, *, timeout: int) -> _UploadChooserContext:
+        assert timeout == 1_000
+        return _UploadChooserContext(self.chooser)
+
+
+def _upload_session(chooser: _UploadChooser) -> BrowserSession:
+    session = BrowserSession(timeout_seconds=1)
+    session.ensure_started = AsyncMock(  # type: ignore[method-assign]
+        return_value=_UploadPage(chooser)
+    )
+    session._locator = AsyncMock(  # type: ignore[method-assign]
+        return_value=_UploadLocator()
+    )
+    session._settle = AsyncMock()  # type: ignore[method-assign]
+    session.snapshot = AsyncMock(return_value="snapshot")  # type: ignore[method-assign]
+    return session
 
 
 @pytest.mark.asyncio
@@ -222,6 +276,190 @@ async def test_browser_session_download_uses_workspace_scope_and_no_overwrite(
     assert (tmp_path / "downloads/report.txt").read_bytes() == b"safe payload"
     assert "Downloaded 12 bytes" in result
     await session.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_session_upload_retains_approved_bytes_after_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.safety import scoped_io
+
+    approved = tmp_path / "approved.txt"
+    approved.write_bytes(b"approved-content")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-upload-sentinel"
+    outside.write_bytes(b"outside-content")
+    try:
+        probe = tmp_path / "symlink-probe"
+        probe.symlink_to(outside)
+        probe.unlink()
+    except OSError as exc:
+        outside.unlink(missing_ok=True)
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    read_complete = threading.Event()
+    release_read = threading.Event()
+    real_read = scoped_io.read_scoped_bytes
+
+    def gated_read(path: str | Path, guard: SafetyGuard, **kwargs: Any):
+        result = real_read(path, guard, **kwargs)
+        read_complete.set()
+        if not release_read.wait(5):
+            raise AssertionError("upload read was not released")
+        return result
+
+    monkeypatch.setattr(scoped_io, "read_scoped_bytes", gated_read)
+    chooser = _UploadChooser()
+    session = _upload_session(chooser)
+    upload = asyncio.create_task(
+        session.upload_file(
+            "e1",
+            str(approved),
+            safety_guard=SafetyGuard(tmp_path),
+            max_bytes=100,
+        )
+    )
+
+    try:
+        assert await asyncio.to_thread(read_complete.wait, 5)
+        displaced = tmp_path / "approved.original.txt"
+        approved.rename(displaced)
+        approved.symlink_to(outside)
+        release_read.set()
+        assert await upload == "snapshot"
+    finally:
+        release_read.set()
+        await asyncio.gather(upload, return_exceptions=True)
+        approved.unlink(missing_ok=True)
+        outside.unlink(missing_ok=True)
+
+    assert isinstance(chooser.files, dict)
+    assert not isinstance(chooser.files, (str, Path))
+    assert chooser.files["name"] == "approved.txt"
+    assert chooser.files["mimeType"] == "text/plain"
+    assert chooser.files["buffer"] == b"approved-content"
+    assert chooser.files["buffer"] != b"outside-content"
+
+
+@pytest.mark.asyncio
+async def test_browser_session_upload_does_not_follow_sensitive_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.safety import scoped_io
+
+    approved = tmp_path / "notes.txt"
+    approved.write_bytes(b"approved-notes")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-id-ed25519"
+    outside.write_bytes(b"outside-sensitive-sentinel")
+    try:
+        probe = tmp_path / "symlink-probe"
+        probe.symlink_to(outside)
+        probe.unlink()
+    except OSError as exc:
+        outside.unlink(missing_ok=True)
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    real_read = scoped_io.read_scoped_bytes
+
+    def read_then_swap(path: str | Path, guard: SafetyGuard, **kwargs: Any):
+        result = real_read(path, guard, **kwargs)
+        target = Path(path)
+        displaced = target.with_name("notes.original.txt")
+        target.rename(displaced)
+        target.symlink_to(outside)
+        return result
+
+    monkeypatch.setattr(scoped_io, "read_scoped_bytes", read_then_swap)
+    chooser = _UploadChooser()
+    session = _upload_session(chooser)
+
+    try:
+        assert (
+            await session.upload_file(
+                "e1",
+                str(approved),
+                safety_guard=SafetyGuard(tmp_path),
+                max_bytes=100,
+            )
+            == "snapshot"
+        )
+    finally:
+        approved.unlink(missing_ok=True)
+        outside.unlink(missing_ok=True)
+
+    assert isinstance(chooser.files, dict)
+    assert chooser.files["name"] == "notes.txt"
+    assert chooser.files["buffer"] == b"approved-notes"
+    assert chooser.files["buffer"] != b"outside-sensitive-sentinel"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("relative_path", "expected_name", "expected_mime"),
+    (
+        ("nested/report.txt", "report.txt", "text/plain"),
+        ("payload.unknown", "payload.unknown", "application/octet-stream"),
+        ("no_extension", "no_extension", "application/octet-stream"),
+    ),
+)
+async def test_browser_session_upload_uses_basename_and_filename_mime(
+    tmp_path: Path,
+    relative_path: str,
+    expected_name: str,
+    expected_mime: str,
+) -> None:
+    source = tmp_path / relative_path
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"approved")
+    chooser = _UploadChooser()
+    session = _upload_session(chooser)
+
+    assert (
+        await session.upload_file(
+            "e1",
+            str(source),
+            safety_guard=SafetyGuard(tmp_path),
+            max_bytes=100,
+        )
+        == "snapshot"
+    )
+
+    assert chooser.files == {
+        "name": expected_name,
+        "mimeType": expected_mime,
+        "buffer": b"approved",
+    }
+
+
+@pytest.mark.asyncio
+async def test_browser_session_upload_preserves_size_limit_and_sensitive_rejection(
+    tmp_path: Path,
+) -> None:
+    oversized = tmp_path / "oversized.txt"
+    oversized.write_bytes(b"0123456789")
+    chooser = _UploadChooser()
+    session = _upload_session(chooser)
+
+    with pytest.raises(ValueError, match="upload exceeds 5 bytes"):
+        await session.upload_file(
+            "e1",
+            str(oversized),
+            safety_guard=SafetyGuard(tmp_path),
+            max_bytes=5,
+        )
+    assert chooser.files is None
+
+    sensitive = tmp_path / ".env"
+    sensitive.write_text("TOKEN=not-a-real-secret", encoding="utf-8")
+    with pytest.raises(ValueError, match="Refusing to attach sensitive path"):
+        await session.upload_file(
+            "e1",
+            str(sensitive),
+            safety_guard=SafetyGuard(tmp_path),
+            max_bytes=100,
+        )
+    assert chooser.files is None
 
 
 def test_browser_url_policy_blocks_private_non_http_and_disallowed_hosts(

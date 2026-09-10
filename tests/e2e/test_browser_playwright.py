@@ -4,6 +4,7 @@ import os
 
 import pytest
 
+from ash.safety.guard import SafetyGuard
 from ash.tools.browser import BrowserSession
 
 
@@ -48,5 +49,47 @@ async def test_real_chromium_snapshot_fill_click_and_private_fetch_block() -> No
             }"""
         )
         assert blocked is True
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_real_chromium_upload_uses_approved_in_memory_payload(tmp_path) -> None:
+    session = BrowserSession(timeout_seconds=15)
+    approved = tmp_path / "approved.txt"
+    approved.write_bytes(b"approved-content")
+    page = await session.ensure_started()
+    try:
+        await page.set_content(
+            """
+            <main>
+              <label>Attachment <input type="file" aria-label="Attachment"></label>
+            </main>
+            """
+        )
+        initial = await session.snapshot()
+        assert "[e1] input 'Attachment'" in initial
+
+        await session.upload_file(
+            "e1",
+            str(approved),
+            safety_guard=SafetyGuard(tmp_path),
+            max_bytes=1_000,
+        )
+        observed = await page.evaluate(
+            """async () => {
+              const file = document.querySelector('input[type=file]').files[0];
+              return {
+                name: file.name,
+                type: file.type,
+                content: await file.text(),
+              };
+            }"""
+        )
+        assert observed == {
+            "name": "approved.txt",
+            "type": "text/plain",
+            "content": "approved-content",
+        }
     finally:
         await session.close()

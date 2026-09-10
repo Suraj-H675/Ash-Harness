@@ -330,6 +330,33 @@ login/logout semantics, and dependency range were preserved.
   remain recorded baseline evidence; the PTY check remains unavailable because
   `tmux` is not installed.
 
+### Browser upload confinement and Playwright compatibility
+
+Browser upload had a confirmed TOCTOU defect: `BrowserSession.upload_file()`
+read and approved workspace bytes with `read_scoped_bytes()`, then passed the
+pathname to Playwright, which could reopen it after a symlink replacement. A
+deterministic synchronized regression reproduced the leak by making the fake
+chooser observe `outside-content` after the approved file was swapped.
+
+The repair preserves scoped bounded reads, the size limit, and sensitive-file
+policy, then passes Playwright an in-memory `FilePayload` containing the exact
+approved bytes, basename-only filename, and filename-derived MIME type. It
+does not pass a filesystem pathname to the browser. Synchronized regressions
+cover ordinary and sensitive-path swaps, MIME fallback, basename handling,
+size limits, and sensitive-name rejection.
+
+The first real Playwright 1.61.0 BrowserSession run then exposed a separate
+async API compatibility defect: `expect_file_chooser().value` is awaitable.
+The production path now awaits that value before calling `set_files()`. The
+real Chromium workflow observes `approved.txt`, `text/plain`, and the exact
+`approved-content` bytes. The test is gated by `ASH_RUN_BROWSER_TESTS=1` when
+the optional browser dependency or binary is unavailable.
+
+Verification for this batch: focused browser and real Chromium tests passed
+(**18 tests**), related browser/scoped-I-O/attachment tests passed (**44**),
+the full suite with browser tests enabled passed (**2202 passed, 2 skipped**),
+repository Ruff and mypy passed, and `uv build` passed.
+
 ### Protocol and real-workflow continuation
 
 - ACP had one confirmed integration defect. The real official-client wire probe
