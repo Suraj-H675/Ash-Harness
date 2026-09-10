@@ -30,6 +30,31 @@ A2A_AGENT_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 A2A_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+async def _settle_cleanup_task_after_cancellation(
+    task: asyncio.Task[Any],
+) -> BaseException | None:
+    """Wait for a shielded A2A cleanup task despite repeated cancellation."""
+
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        except BaseException:
+            # The cleanup task has normally reached a terminal state when its
+            # exception is observed.  Read the result below without allowing a
+            # cleanup failure to replace caller cancellation.
+            if not task.done():
+                raise
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc
+    return None
+
+
 @dataclass(frozen=True)
 class RemoteAgentConfig:
     name: str
@@ -262,6 +287,7 @@ async def send_remote_agent(
         chunks: list[str] = []
         output_bytes = 0
         event_count = 0
+        client_closed = False
         try:
             message = Message(
                 message_id=str(uuid4()),
@@ -299,15 +325,17 @@ async def send_remote_agent(
                     )
         except asyncio.CancelledError:
             if task_id:
-                try:
-                    await asyncio.shield(
-                        client.cancel_task(CancelTaskRequest(id=task_id))
-                    )
-                except Exception:  # noqa: BLE001 - cancellation remains primary
-                    pass
+                cancel_task = asyncio.create_task(
+                    client.cancel_task(CancelTaskRequest(id=task_id))
+                )
+                await _settle_cleanup_task_after_cancellation(cancel_task)
+            close_task = asyncio.create_task(client.close())
+            await _settle_cleanup_task_after_cancellation(close_task)
+            client_closed = True
             raise
         finally:
-            await client.close()
+            if not client_closed:
+                await client.close()
     return RemoteAgentResult(
         response="".join(chunks),
         task_id=task_id,

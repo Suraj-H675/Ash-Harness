@@ -53,7 +53,7 @@ gateway/channel model, provider/auth adapters, remote worker execution, and
 client/media surfaces. Those are not safe to claim complete from unit tests or
 to implement piecemeal without a product decision.
 
-## Audit continuation checkpoint — 2026-09-09
+## Audit continuation checkpoint — 2026-09-10
 
 This section records the current continuation evidence without reopening the
 completed audit work above.
@@ -305,10 +305,10 @@ login/logout semantics, and dependency range were preserved.
 
 ### Verification checkpoint
 
-- `uv run pytest -q --timeout=120 --timeout-method=thread`: **2190 passed,
+- `uv run pytest -q --timeout=120 --timeout-method=thread`: **2194 passed,
   3 skipped** after the ACP lifecycle, MCP OAuth private-store, F-03
   cancellation, F-04/F-05 CLI persistence, and F-07 managed-process cleanup
-  fixes.
+  fixes plus the A2A cancellation lifecycle repair.
 - The focused F-07 process/caller regression run passed **525 tests** with
   **1 platform-dependent skip**.
 - The focused F-04/F-05 persistence/CLI regression run passed **144 tests**;
@@ -316,9 +316,14 @@ login/logout semantics, and dependency range were preserved.
 - The focused MCP OAuth/CLI regression run reports **49 passed**, including
   synchronized save/load/remove directory-substitution cases and the
   fail-closed unsupported-store path.
+- The focused A2A remote/CLI suite passed **31 tests**; the related A2A,
+  agents, runtime, and subagent integration suite passed **87 tests**. These
+  include deterministic repeated-cancellation, cancellation-request failure,
+  client-close cancellation, and pre-task-ID cleanup cases, plus the official
+  client/server workflows.
 - `uv run ruff check src tests`: passed.
 - `uv run mypy src/ash`: passed with no issues in 173 source files.
-- `uv build` passed for the F-07 candidate; the clean installed-wheel smoke
+- `uv build` passed for the current A2A batch; the clean installed-wheel smoke
   (`.smoke-venv/bin/python tests/packaging/smoke_minimal_install.py`) remains
   passing from the preceding verification batch.
 - The earlier CLI help/doctor, integration, E2E, and optional browser checks
@@ -342,6 +347,19 @@ login/logout semantics, and dependency range were preserved.
   bearer-auth rejection, official JSON-RPC task execution, official REST task
   execution, and two provider-backed streaming turns. Both tasks reached the
   completed state and used the expected model route.
+- Outbound A2A delegation also had a confirmed cancellation/lifecycle
+  ownership defect: after a remote task ID was observed, repeated local
+  cancellation could leave the shielded `cancel_task()` request running while
+  `client.close()` had already started. The fix keeps exactly one explicit
+  cancellation task strongly referenced, settles it despite repeated caller
+  cancellation, then settles client closure before re-raising
+  `CancelledError`. Cancellation-request failure remains secondary, and
+  settlement only proves a client-side request result—not that the remote task
+  entered a cancelled state. Deterministic regressions cover repeated
+  cancellation, cancellation-request failure, repeated cancellation during
+  client close, and cancellation before a task ID exists. The focused A2A
+  suite passes; no public result schema or cross-subsystem cancellation helper
+  was changed.
 - A real automation CLI workflow passed trust setup, job creation, manual
   isolated-worker execution, provider-backed streaming, durable success/history
   reporting, and worker cleanup. A real LSP CLI workflow passed trusted project

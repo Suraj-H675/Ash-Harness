@@ -27,6 +27,8 @@ from a2a.types.a2a_pb2 import (
     Part,
     Role,
     SendMessageRequest,
+    Task,
+    TaskStatus,
     TaskState,
 )
 from a2a.utils.constants import TransportProtocol
@@ -72,6 +74,227 @@ class FakeAshClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class _RemoteTaskEvent:
+    def __init__(self, observed: asyncio.Event) -> None:
+        self._observed = observed
+        self._task = Task(
+            id="remote-task",
+            context_id="remote-context",
+            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+        )
+
+    def HasField(self, field: str) -> bool:
+        return field == "task"
+
+    @property
+    def task(self) -> Task:
+        self._observed.set()
+        return self._task
+
+
+class _BlockingRemoteClient:
+    def __init__(
+        self,
+        *,
+        emit_task: bool = True,
+        cancel_error: BaseException | None = None,
+    ) -> None:
+        self.emit_task = emit_task
+        self.cancel_error = cancel_error
+        self.send_started = asyncio.Event()
+        self.task_observed = asyncio.Event()
+        self.cancel_started = asyncio.Event()
+        self.cancel_finished = asyncio.Event()
+        self.cancel_release = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.close_finished = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.cancel_calls: list[str] = []
+        self.cancel_task_instance: asyncio.Task[Any] | None = None
+        self.close_task_instance: asyncio.Task[Any] | None = None
+
+    async def send_message(self, _request: SendMessageRequest):
+        self.send_started.set()
+        if self.emit_task:
+            yield _RemoteTaskEvent(self.task_observed)
+        await self.cancel_release.wait()
+
+    async def cancel_task(self, request: CancelTaskRequest) -> None:
+        self.cancel_task_instance = asyncio.current_task()
+        self.cancel_calls.append(request.id)
+        self.cancel_started.set()
+        await self.cancel_release.wait()
+        self.cancel_finished.set()
+        if self.cancel_error is not None:
+            raise self.cancel_error
+
+    async def close(self) -> None:
+        self.close_task_instance = asyncio.current_task()
+        self.close_started.set()
+        await self.close_release.wait()
+        self.close_finished.set()
+
+
+def _patch_remote_client(monkeypatch, client: _BlockingRemoteClient) -> None:
+    from a2a import client as a2a_client
+
+    class FakeResolver:
+        def __init__(self, _http: Any, _url: str) -> None:
+            pass
+
+        async def get_agent_card(self) -> Any:
+            return SimpleNamespace(
+                supported_interfaces=[
+                    AgentInterface(
+                        url="https://example.test", protocol_binding="JSONRPC"
+                    )
+                ]
+            )
+
+    class FakeConfig:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+    class FakeFactory:
+        def __init__(self, _config: Any) -> None:
+            pass
+
+        def create(self, _card: Any) -> _BlockingRemoteClient:
+            return client
+
+    monkeypatch.setattr(a2a_client, "A2ACardResolver", FakeResolver)
+    monkeypatch.setattr(a2a_client, "ClientConfig", FakeConfig)
+    monkeypatch.setattr(a2a_client, "ClientFactory", FakeFactory)
+
+
+async def _start_blocking_remote_call(
+    client: _BlockingRemoteClient,
+) -> asyncio.Task[Any]:
+    call = asyncio.create_task(
+        send_remote_agent(
+            RemoteAgentConfig(name="remote", url="https://example.test"),
+            "prompt",
+        )
+    )
+    await asyncio.wait_for(client.task_observed.wait(), timeout=1)
+    return call
+
+
+@pytest.mark.asyncio
+async def test_a2a_remote_repeated_cancellation_owns_remote_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _BlockingRemoteClient()
+    _patch_remote_client(monkeypatch, client)
+    call = await _start_blocking_remote_call(client)
+
+    call.cancel()
+    await asyncio.wait_for(client.cancel_started.wait(), timeout=1)
+    call.cancel()
+    await asyncio.sleep(0)
+
+    assert not client.close_started.is_set()
+    assert not client.close_finished.is_set()
+    assert client.cancel_calls == ["remote-task"]
+
+    client.cancel_release.set()
+    await asyncio.wait_for(client.cancel_finished.wait(), timeout=1)
+    await asyncio.wait_for(client.close_started.wait(), timeout=1)
+    assert client.cancel_task_instance is not None
+    assert client.cancel_task_instance.done()
+
+    client.close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(call, timeout=1)
+
+    assert client.close_finished.is_set()
+    assert client.close_task_instance is not None
+    assert client.close_task_instance.done()
+
+
+@pytest.mark.asyncio
+async def test_a2a_remote_cancellation_failure_still_closes_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _BlockingRemoteClient(cancel_error=RuntimeError("remote cancellation failed"))
+    _patch_remote_client(monkeypatch, client)
+    call = await _start_blocking_remote_call(client)
+
+    call.cancel()
+    await asyncio.wait_for(client.cancel_started.wait(), timeout=1)
+    client.cancel_release.set()
+    await asyncio.wait_for(client.cancel_finished.wait(), timeout=1)
+    await asyncio.wait_for(client.close_started.wait(), timeout=1)
+    assert client.cancel_task_instance is not None
+    assert client.cancel_task_instance.done()
+
+    client.close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(call, timeout=1)
+
+    assert client.close_finished.is_set()
+    assert client.close_task_instance is not None
+    assert client.close_task_instance.done()
+
+
+@pytest.mark.asyncio
+async def test_a2a_remote_repeated_cancellation_owns_client_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _BlockingRemoteClient()
+    _patch_remote_client(monkeypatch, client)
+    call = await _start_blocking_remote_call(client)
+
+    call.cancel()
+    await asyncio.wait_for(client.cancel_started.wait(), timeout=1)
+    client.cancel_release.set()
+    await asyncio.wait_for(client.cancel_finished.wait(), timeout=1)
+    await asyncio.wait_for(client.close_started.wait(), timeout=1)
+
+    call.cancel()
+    call.cancel()
+    await asyncio.sleep(0)
+    assert not client.close_finished.is_set()
+
+    client.close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(call, timeout=1)
+
+    assert client.close_finished.is_set()
+    assert client.close_task_instance is not None
+    assert client.close_task_instance.done()
+
+
+@pytest.mark.asyncio
+async def test_a2a_remote_cancellation_before_task_id_only_closes_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _BlockingRemoteClient(emit_task=False)
+    _patch_remote_client(monkeypatch, client)
+    call = asyncio.create_task(
+        send_remote_agent(
+            RemoteAgentConfig(name="remote", url="https://example.test"),
+            "prompt",
+        )
+    )
+    await asyncio.wait_for(client.send_started.wait(), timeout=1)
+
+    call.cancel()
+    await asyncio.wait_for(client.close_started.wait(), timeout=1)
+    call.cancel()
+    await asyncio.sleep(0)
+    assert client.cancel_calls == []
+    assert not client.close_finished.is_set()
+
+    client.close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(call, timeout=1)
+
+    assert client.close_finished.is_set()
+    assert client.close_task_instance is not None
+    assert client.close_task_instance.done()
 
 
 def test_a2a_registry_rejects_linked_database_file_and_parent(tmp_path: Path) -> None:
