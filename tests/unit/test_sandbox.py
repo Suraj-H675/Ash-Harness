@@ -665,6 +665,35 @@ def test_run_with_scoped_tier_executes_directly(tmp_path: Path) -> None:
     assert "scoped" in result.stdout
 
 
+def test_run_does_not_spawn_without_tree_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox.process_utils import ProcessTreeUnavailable
+
+    with (
+        patch("ash.sandbox.manager.has_docker", return_value=False),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_sandbox_exec", return_value=False),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="direct",
+        )
+
+    def unavailable(*args: object, **kwargs: object) -> object:
+        raise ProcessTreeUnavailable("taskkill unavailable")
+
+    monkeypatch.setattr("ash.sandbox.manager.prepare_process_tree", unavailable)
+    monkeypatch.setattr(
+        "ash.sandbox.manager.asyncio.create_subprocess_exec",
+        lambda *args, **kwargs: pytest.fail("sandbox command must not launch"),
+    )
+
+    with pytest.raises(SandboxBackendUnavailable, match="taskkill unavailable"):
+        asyncio.run(manager.run(["echo", "unsafe"], cwd=tmp_path))
+
+
 def test_run_rejects_empty_command(tmp_path: Path) -> None:
     mgr = SandboxManager(workspace_root=tmp_path)
     with pytest.raises(ValueError):

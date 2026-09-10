@@ -14,8 +14,11 @@ from pydantic import BaseModel, Field
 from ash.safety.environment import resolve_host_executable
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
+    ProcessTreeError,
+    ProcessTreeUnavailable,
     communicate_process,
-    process_group_options,
+    prepare_process_tree,
+    settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
@@ -215,40 +218,73 @@ class SearchTextTool(BaseTool):
         if args.glob:
             command.extend(("--glob", args.glob))
         command.extend(("--", args.pattern, "."))
+        try:
+            process_tree_plan = prepare_process_tree(
+                workspace_root=self.safety_guard.project_root
+            )
+        except ProcessTreeUnavailable as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Search was not started: {exc}",
+            )
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=root,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **process_group_options(),
+            **process_tree_plan.spawn_options,
         )
         output_limited = False
+        cleanup_error: str | None = None
         try:
             stdout, stderr = await asyncio.wait_for(
                 communicate_process(
                     process,
                     max_output_bytes=MAX_SEARCH_CAPTURE_BYTES,
+                    process_tree_plan=process_tree_plan,
                 ),
                 timeout=SEARCH_TIMEOUT_SECONDS,
             )
         except ProcessOutputLimitExceeded as exc:
             stdout, stderr = exc.stdout, exc.stderr
             output_limited = True
+            if exc.cleanup_error is not None:
+                cleanup_error = f"Process-tree cleanup failed: {exc.cleanup_error}"
         except asyncio.TimeoutError:
-            await terminate_process_tree(process)
+            try:
+                await terminate_process_tree(process, plan=process_tree_plan)
+            except ProcessTreeError as exc:
+                cleanup_error = f"Process-tree cleanup failed: {exc}"
             return ToolResult(
                 success=False,
                 output="",
-                error=f"search timed out after {SEARCH_TIMEOUT_SECONDS} seconds",
+                error=(
+                    f"search timed out after {SEARCH_TIMEOUT_SECONDS} seconds"
+                    + (f". {cleanup_error}" if cleanup_error else "")
+                ),
             )
-        except asyncio.CancelledError:
-            await terminate_process_tree(process)
+        except asyncio.CancelledError as cancellation:
+            cleanup_failure, cleanup_cancelled = (
+                await settle_process_tree_after_cancellation(
+                    process, plan=process_tree_plan
+                )
+            )
+            if cleanup_failure is not None:
+                cancellation.add_note(
+                    f"Process-tree cleanup failed: {cleanup_failure}"
+                )
+            if cleanup_cancelled:
+                cancellation.add_note("Process-tree cleanup was cancelled")
             raise
         if process.returncode not in (0, 1):
+            error = stderr.decode("utf-8", errors="replace").strip()
+            if cleanup_error:
+                error = f"{error}; {cleanup_error}" if error else cleanup_error
             return ToolResult(
                 success=False,
                 output="",
-                error=stderr.decode("utf-8", errors="replace").strip(),
+                error=error,
             )
         matches: list[str] = []
         match_truncated = False
@@ -291,8 +327,9 @@ class SearchTextTool(BaseTool):
             )
             output += suffix
         return ToolResult(
-            success=True,
+            success=cleanup_error is None,
             output=output,
+            error=cleanup_error,
             token_count=count_output_tokens(output),
             truncated=truncated or output_limited,
         )

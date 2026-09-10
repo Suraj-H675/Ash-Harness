@@ -15,9 +15,16 @@ from ash.safety.environment import build_scrubbed_environment, resolve_host_exec
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.sandbox._base import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable
 from ash.sandbox.manager import SandboxManager, SandboxResult
-from ash.sandbox.process_utils import ProcessOutputLimitExceeded, communicate_process
+from ash.sandbox.process_utils import (
+    ProcessOutputLimitExceeded,
+    ProcessTreeError,
+    ProcessTreeUnavailable,
+    communicate_process,
+    prepare_process_tree,
+    settle_process_tree_after_cancellation,
+)
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
-from ash.sandbox.process_utils import process_group_options, terminate_process_tree
+from ash.sandbox.process_utils import terminate_process_tree
 
 
 DEFAULT_TIMEOUT_SECONDS = 300
@@ -305,8 +312,18 @@ class RunCommandTool(BaseTool):
         stream_callback: "_CommandEventStreamer",
     ) -> ToolResult:
         try:
+            workspace = self.project_root or (
+                Path(cwd) if cwd is not None else Path.cwd()
+            )
+            try:
+                process_tree_plan = prepare_process_tree(workspace_root=workspace)
+            except ProcessTreeUnavailable as exc:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Error: command was not started: {exc}",
+                )
             if platform.system() == "Windows":
-                workspace = self.project_root or (Path(cwd) if cwd is not None else Path.cwd())
                 powershell = resolve_host_executable(
                     "powershell.exe",
                     workspace_root=workspace,
@@ -331,7 +348,7 @@ class RunCommandTool(BaseTool):
                     env=env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    **process_group_options(),
+                    **process_tree_plan.spawn_options,
                 )
             else:
                 process = await asyncio.create_subprocess_shell(
@@ -340,27 +357,48 @@ class RunCommandTool(BaseTool):
                     env=env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    **process_group_options(),
+                    **process_tree_plan.spawn_options,
                 )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 communicate_process(
                     process,
                     stream_callback=stream_callback,
                     max_output_bytes=MAX_COMMAND_OUTPUT_CHARS,
+                    process_tree_plan=process_tree_plan,
                 ),
                 timeout=timeout_seconds,
             )
         except asyncio.TimeoutError:
             if "process" in locals():
-                await terminate_process_tree(process)
+                try:
+                    await terminate_process_tree(process, plan=process_tree_plan)
+                except ProcessTreeError as exc:
+                    cleanup = f" Process-tree cleanup failed: {exc}."
+                else:
+                    cleanup = ""
+            else:
+                cleanup = ""
             return ToolResult(
                 success=False,
                 output="",
-                error=f"Error: Command timed out after {timeout_seconds} seconds.",
+                error=(
+                    f"Error: Command timed out after {timeout_seconds} seconds."
+                    f"{cleanup}"
+                ),
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             if "process" in locals():
-                await terminate_process_tree(process)
+                cleanup_error, cleanup_cancelled = (
+                    await settle_process_tree_after_cancellation(
+                        process, plan=process_tree_plan
+                    )
+                )
+                if cleanup_error is not None:
+                    cancellation.add_note(
+                        f"Process-tree cleanup failed: {cleanup_error}"
+                    )
+                if cleanup_cancelled:
+                    cancellation.add_note("Process-tree cleanup was cancelled")
             raise
         except ProcessOutputLimitExceeded as exc:
             stdout = decode_stream(exc.stdout)
@@ -371,8 +409,11 @@ class RunCommandTool(BaseTool):
                 notice=OUTPUT_CAPTURE_LIMIT_NOTICE,
             )
             error = _truncate_command_output(stderr)[0] if stderr else None
+            if exc.cleanup_error is not None:
+                cleanup = f"Process-tree cleanup failed: {exc.cleanup_error}"
+                error = f"{error}; {cleanup}" if error else cleanup
             return ToolResult(
-                success=process.returncode == 0,
+                success=process.returncode == 0 and exc.cleanup_error is None,
                 output=output,
                 error=error,
                 token_count=count_output_tokens(output),

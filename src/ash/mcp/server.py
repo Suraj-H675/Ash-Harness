@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -14,16 +13,26 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ash.safe_io import strict_json_loads
-from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
+from ash.safety.environment import build_scrubbed_environment
 from ash.safe_io import read_bounded_bytes
 from ash.mcp.oauth import MCPOAuthError, canonical_resource_uri
-from ash.sandbox.process_utils import process_group_options
+from ash.sandbox.process_utils import (
+    ProcessTreeError,
+    ProcessTreePlan,
+    ProcessTreeUnavailable,
+    prepare_process_tree,
+    terminate_process_tree_sync,
+)
 
 MAX_MCP_CONFIG_BYTES = 256 * 1024
 MCP_SERVER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 MCP_OAUTH_SCOPE = re.compile(
     r"[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*"
 )
+
+
+class MCPServerLifecycleError(RuntimeError):
+    """A local MCP server could not satisfy its lifecycle contract."""
 
 
 @dataclass(frozen=True)
@@ -163,6 +172,7 @@ class MCPServerInstance:
     config: MCPServerConfig
     process: subprocess.Popen[bytes] | None
     transport: str = "stdio"
+    process_tree_plan: ProcessTreePlan | None = None
 
 
 class MCPServerManager:
@@ -191,6 +201,14 @@ class MCPServerManager:
             raise ValueError(f"Unknown MCP transport: {config.transport}")
 
         env = build_scrubbed_environment(overrides=config.resolved_env)
+        try:
+            process_tree_plan = prepare_process_tree(
+                workspace_root=config.resolved_cwd
+            )
+        except ProcessTreeUnavailable as exc:
+            raise MCPServerLifecycleError(
+                f"MCP stdio server was not started: {exc}"
+            ) from exc
 
         # Spawn subprocess. stderr=DEVNULL avoids deadlock when the subprocess
         # writes to stderr — we never read it, so PIPE would fill and block.
@@ -201,7 +219,7 @@ class MCPServerManager:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             cwd=config.resolved_cwd,
-            **process_group_options(),
+            **process_tree_plan.spawn_options,
         )
 
         instance = MCPServerInstance(
@@ -209,12 +227,13 @@ class MCPServerManager:
             config=config,
             process=proc,
             transport=config.transport,
+            process_tree_plan=process_tree_plan,
         )
         try:
             self._servers[config.name] = instance
         except Exception:
             # Defensive: if dict insertion fails, reap the subprocess immediately.
-            _terminate_server_process(proc)
+            _terminate_server_process(proc, plan=process_tree_plan)
             raise
 
         return instance
@@ -225,14 +244,31 @@ class MCPServerManager:
         if instance is None:
             return
         proc = instance.process
-        if proc is not None and proc.poll() is None:
-            _terminate_server_process(proc)
+        if proc is not None:
+            try:
+                _terminate_server_process(proc, plan=instance.process_tree_plan)
+            except ProcessTreeError as exc:
+                raise MCPServerLifecycleError(
+                    f"MCP server {name!r} process cleanup failed: {exc}"
+                ) from exc
         del self._servers[name]
 
     def stop_all(self) -> None:
         """Stop all running MCP servers."""
+        failures: list[tuple[str, MCPServerLifecycleError]] = []
         for name in list(self._servers.keys()):
-            self.stop_server(name)
+            try:
+                self.stop_server(name)
+            except MCPServerLifecycleError as exc:
+                failures.append((name, exc))
+        if failures:
+            name, error = failures[0]
+            if len(failures) == 1:
+                raise error
+            raise MCPServerLifecycleError(
+                f"failed to stop {len(failures)} MCP servers; "
+                f"first failure ({name}): {error}"
+            ) from error
 
     def get_server(self, name: str) -> MCPServerInstance | None:
         return self._servers.get(name)
@@ -241,61 +277,13 @@ class MCPServerManager:
         return list(self._servers.values())
 
 
-def _terminate_server_process(process: subprocess.Popen[bytes]) -> None:
+def _terminate_server_process(
+    process: subprocess.Popen[bytes],
+    *,
+    plan: ProcessTreePlan | None = None,
+) -> None:
     """Terminate a managed MCP stdio server and its descendants."""
-
-    if process.poll() is not None:
-        return
-    if os.name == "nt":
-        workspace = Path.cwd().resolve()
-        taskkill = resolve_host_executable(
-            "taskkill", workspace_root=workspace, cwd=workspace
-        )
-        if taskkill is not None:
-            try:
-                subprocess.run(
-                    [taskkill, "/PID", str(process.pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=5,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-    else:
-        try:
-            child_group = os.getpgid(process.pid)
-        except (OSError, ProcessLookupError):
-            child_group = None
-        if child_group is not None and child_group != os.getpgrp():
-            try:
-                os.killpg(child_group, signal.SIGTERM)
-            except (OSError, ProcessLookupError):
-                pass
-        else:
-            process.terminate()
-
-    try:
-        process.wait(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-
-    if os.name != "nt":
-        try:
-            child_group = os.getpgid(process.pid)
-        except (OSError, ProcessLookupError):
-            child_group = None
-        if child_group is not None and child_group != os.getpgrp():
-            try:
-                os.killpg(child_group, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                process.kill()
-        else:
-            process.kill()
-    else:
-        process.kill()
-    process.wait()
+    terminate_process_tree_sync(process, plan=plan)
 
 
 def load_mcp_servers(

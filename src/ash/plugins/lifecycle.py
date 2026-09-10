@@ -24,7 +24,13 @@ from ash.plugins.registry import (
     _validate_manifest,
 )
 from ash.safety.environment import resolve_host_executable
-from ash.sandbox.process_utils import process_group_options
+from ash.sandbox.process_utils import (
+    ProcessTreeError,
+    ProcessTreeUnavailable,
+    ProcessTreePlan,
+    prepare_process_tree,
+    terminate_process_tree_sync,
+)
 
 MAX_PLUGIN_FILES = 10_000
 MAX_PLUGIN_BYTES = 256 * 1024 * 1024
@@ -298,12 +304,17 @@ def install_git_plugin(
     )
     if git_path is None:
         raise PluginLifecycleError("git is unavailable outside the workspace")
+    try:
+        process_tree_plan = prepare_process_tree(workspace_root=workspace)
+    except ProcessTreeUnavailable as exc:
+        raise PluginLifecycleError(
+            f"plugin Git clone was not started: {exc}"
+        ) from exc
 
     temporary_root = Path(tempfile.mkdtemp(prefix="ash-plugin-git-"))
     checkout = temporary_root / "plugin"
     try:
         with tempfile.TemporaryFile() as error_output:
-            group_options = process_group_options()
             process = subprocess.Popen(
                 [
                     git_path,
@@ -319,30 +330,52 @@ def install_git_plugin(
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=error_output,
-                **group_options,
+                **process_tree_plan.spawn_options,
             )
             deadline = time.monotonic() + MAX_GIT_CLONE_SECONDS
+            cleanup_done = False
             try:
                 while True:
                     if _tree_exceeds_bytes(temporary_root, MAX_GIT_CLONE_BYTES):
-                        _terminate_git_clone(process, group_options)
+                        try:
+                            _terminate_git_clone(process, process_tree_plan)
+                        except ProcessTreeError as exc:
+                            cleanup_done = True
+                            raise PluginLifecycleError(
+                                "plugin Git clone exceeded "
+                                f"{MAX_GIT_CLONE_BYTES} bytes; process-tree "
+                                f"cleanup failed: {exc}"
+                            ) from exc
+                        cleanup_done = True
                         raise PluginLifecycleError(
-                            "plugin Git clone exceeds "
-                            f"{MAX_GIT_CLONE_BYTES} bytes"
+                            f"plugin Git clone exceeds {MAX_GIT_CLONE_BYTES} bytes"
                         )
                     returncode = process.poll()
                     if returncode is not None:
                         break
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        _terminate_git_clone(process, group_options)
+                        try:
+                            _terminate_git_clone(process, process_tree_plan)
+                        except ProcessTreeError as exc:
+                            cleanup_done = True
+                            raise PluginLifecycleError(
+                                "plugin Git clone timed out after "
+                                f"{MAX_GIT_CLONE_SECONDS} seconds; process-tree "
+                                f"cleanup failed: {exc}"
+                            ) from exc
+                        cleanup_done = True
                         raise PluginLifecycleError(
                             "plugin Git clone timed out after "
                             f"{MAX_GIT_CLONE_SECONDS} seconds"
                         )
                     time.sleep(min(_GIT_CLONE_POLL_SECONDS, remaining))
-            except BaseException:
-                _terminate_git_clone(process, group_options)
+            except BaseException as primary:
+                if not cleanup_done:
+                    try:
+                        _terminate_git_clone(process, process_tree_plan)
+                    except ProcessTreeError as exc:
+                        primary.add_note(f"Process-tree cleanup failed: {exc}")
                 raise
             error_output.seek(0)
             detail = error_output.read(MAX_GIT_ERROR_BYTES + 1)
@@ -394,33 +427,9 @@ def _tree_exceeds_bytes(root: Path, limit: int) -> bool:
 
 def _terminate_git_clone(
     process: subprocess.Popen[Any],
-    group_options: dict[str, Any],
+    plan: ProcessTreePlan,
 ) -> None:
-    if process.poll() is not None:
-        return
-    if os.name != "nt" and group_options.get("start_new_session"):
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            process.terminate()
-    else:
-        process.terminate()
-    try:
-        process.wait(timeout=1)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    if os.name != "nt" and group_options.get("start_new_session"):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            process.kill()
-    else:
-        process.kill()
-    try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        pass
+    terminate_process_tree_sync(process, plan=plan, timeout_seconds=1.0)
 
 
 def _verify_catalog_checkout(

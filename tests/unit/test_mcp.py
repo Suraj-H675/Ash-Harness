@@ -16,6 +16,7 @@ from ash.core.session import SessionStore
 from ash.core.secret_middleware import SecretRedactionMiddleware
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.guard import SafetyGuard
+from ash.sandbox.process_utils import ProcessTreeTerminationError
 from ash.mcp.client import (
     MCPClient,
     MCPProtocolError,
@@ -34,6 +35,7 @@ from ash.mcp.runtime import (
 from ash.mcp.server import (
     MCPServerConfig,
     MCPServerInstance,
+    MCPServerLifecycleError,
     MCPServerManager,
     MCPConfigSource,
     MAX_MCP_CONFIG_BYTES,
@@ -465,6 +467,56 @@ def test_manager_starts_and_stops_server() -> None:
     assert manager.get_server("test-server") is None
 
 
+def test_stdio_manager_preflights_tree_cleanup_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = MCPServerManager()
+    config = MCPServerConfig(
+        name="preflight-server",
+        command="server",
+        args=[],
+        env={},
+        transport="stdio",
+    )
+
+    def unavailable(*args: object, **kwargs: object) -> object:
+        from ash.sandbox.process_utils import ProcessTreeUnavailable
+
+        raise ProcessTreeUnavailable("taskkill unavailable")
+
+    monkeypatch.setattr("ash.mcp.server.prepare_process_tree", unavailable)
+    monkeypatch.setattr(
+        "ash.mcp.server.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("MCP stdio must not launch"),
+    )
+
+    with pytest.raises(MCPServerLifecycleError, match="not started"):
+        manager.start_server(config)
+    assert manager.list_servers() == []
+
+
+def test_http_manager_does_not_require_local_tree_cleanup_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = MCPServerManager()
+    config = MCPServerConfig(
+        name="http-server",
+        command="",
+        args=[],
+        env={},
+        transport="http",
+        url="https://mcp.example.test/rpc",
+    )
+    preflight = Mock(side_effect=AssertionError("HTTP must not preflight taskkill"))
+    monkeypatch.setattr("ash.mcp.server.prepare_process_tree", preflight)
+
+    instance = manager.start_server(config)
+
+    assert instance.process is None
+    preflight.assert_not_called()
+    manager.stop_server("http-server")
+
+
 def test_manager_stop_server_terminates_descendants(tmp_path: Path) -> None:
     if os.name == "nt":
         pytest.skip("descendant survival probe is POSIX-only")
@@ -554,6 +606,34 @@ def test_manager_stop_all() -> None:
     assert len(manager.list_servers()) == 3
     manager.stop_all()
     assert len(manager.list_servers()) == 0
+
+
+def test_manager_retains_failed_tree_owner_and_continues_stop_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = MCPServerManager()
+    config = MCPServerConfig(name="unused", command="server", args=[], env={})
+    first_process = Mock()
+    second_process = Mock()
+    manager._servers = {
+        "first": MCPServerInstance("first", config, first_process),
+        "second": MCPServerInstance("second", config, second_process),
+    }
+    calls: list[Mock] = []
+
+    def stop(process: Mock, *, plan: object = None) -> None:
+        calls.append(process)
+        if process is first_process:
+            raise ProcessTreeTerminationError("cleanup unconfirmed")
+
+    monkeypatch.setattr("ash.mcp.server._terminate_server_process", stop)
+
+    with pytest.raises(MCPServerLifecycleError, match="process cleanup failed"):
+        manager.stop_all()
+
+    assert calls == [first_process, second_process]
+    assert manager.get_server("first") is not None
+    assert manager.get_server("second") is None
 
 
 FAKE_MCP_SERVER = r"""
@@ -3634,6 +3714,60 @@ async def test_cancelled_stdio_connect_cleans_process_and_reader_tasks() -> None
     assert client._reader_task is None
     assert client._stderr_task is None
     assert process.returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_mcp_disconnect_waits_for_process_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MCPClient(MCPServerConfig(name="blocked", command="server", args=[], env={}))
+    process = Mock()
+    client._process = process
+    cleanup_started = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def cleanup(*args: object, **kwargs: object) -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+        cleanup_finished.set()
+
+    monkeypatch.setattr(mcp_client_module, "terminate_process_tree", cleanup)
+    task = asyncio.create_task(client.disconnect())
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not cleanup_finished.is_set()
+
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert cleanup_finished.is_set()
+    assert client._process is None
+    assert client._reader_task is None
+    assert client._stderr_task is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_disconnect_retains_process_when_tree_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MCPClient(MCPServerConfig(name="broken", command="server", args=[], env={}))
+    process = Mock()
+    client._process = process
+    monkeypatch.setattr(
+        mcp_client_module,
+        "terminate_process_tree",
+        AsyncMock(side_effect=ProcessTreeTerminationError("unconfirmed")),
+    )
+
+    with pytest.raises(MCPProtocolError, match="process cleanup failed"):
+        await client.disconnect()
+
+    assert client._process is process
+    assert client._disconnect_cleanup_task is None
 
 
 @pytest.mark.asyncio

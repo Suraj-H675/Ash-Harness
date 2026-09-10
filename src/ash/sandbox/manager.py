@@ -34,8 +34,11 @@ from ash.sandbox.docker import DEFAULT_IMAGE, DockerSandbox, probe_docker
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
     ProcessStreamCallback,
+    ProcessTreeError,
+    ProcessTreeUnavailable,
     communicate_process,
-    process_group_options,
+    prepare_process_tree,
+    settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
 from ash.safety.environment import resolve_host_executable
@@ -515,13 +518,17 @@ async def _run_scoped(
     """Execute the command directly via asyncio.create_subprocess_exec."""
 
     start = time.monotonic()
+    try:
+        process_tree_plan = prepare_process_tree(workspace_root=cwd)
+    except ProcessTreeUnavailable as exc:
+        raise SandboxBackendUnavailable(str(exc)) from exc
     process = await asyncio.create_subprocess_exec(
         *command,
         cwd=str(cwd) if cwd is not None else None,
         env=env if env is not None else {"PATH": os.defpath},
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        **process_group_options(),
+        **process_tree_plan.spawn_options,
     )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -529,28 +536,50 @@ async def _run_scoped(
                 process,
                 stream_callback=stream_callback,
                 max_output_bytes=100_000,
+                process_tree_plan=process_tree_plan,
             ),
             timeout=deadline,
         )
     except asyncio.TimeoutError:
-        await terminate_process_tree(process)
+        try:
+            await terminate_process_tree(process, plan=process_tree_plan)
+        except ProcessTreeError as exc:
+            cleanup = f" Process-tree cleanup failed: {exc}."
+        else:
+            cleanup = ""
         return SandboxResult(
             exit_code=-1,
             stdout="",
-            stderr=f"Command timed out after {deadline} seconds.",
+            stderr=f"Command timed out after {deadline} seconds.{cleanup}",
             tier=SANDBOX_TIER_SCOPED,
             backend_name=backend.name,
             fallback_used=fallback,
             duration_seconds=time.monotonic() - start,
         )
-    except asyncio.CancelledError:
-        await terminate_process_tree(process)
+    except asyncio.CancelledError as cancellation:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process, plan=process_tree_plan
+            )
+        )
+        if cleanup_error is not None:
+            cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        if cleanup_cancelled:
+            cancellation.add_note("Process-tree cleanup was cancelled")
         raise
     except ProcessOutputLimitExceeded as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace")
+        if exc.cleanup_error is not None:
+            detail = f"process-tree cleanup failed: {exc.cleanup_error}"
+            stderr = f"{stderr}; {detail}" if stderr else detail
         return SandboxResult(
-            exit_code=process.returncode if process.returncode is not None else -1,
+            exit_code=(
+                process.returncode
+                if process.returncode is not None and exc.cleanup_error is None
+                else -1
+            ),
             stdout=exc.stdout.decode("utf-8", errors="replace"),
-            stderr=exc.stderr.decode("utf-8", errors="replace"),
+            stderr=stderr,
             tier=SANDBOX_TIER_SCOPED,
             backend_name=backend.name,
             fallback_used=fallback,
@@ -581,13 +610,17 @@ async def _run_subprocess(
     """Execute a pre-wrapped argv (e.g. bwrap or docker run) directly."""
 
     start = time.monotonic()
+    try:
+        process_tree_plan = prepare_process_tree(workspace_root=cwd)
+    except ProcessTreeUnavailable as exc:
+        raise SandboxBackendUnavailable(str(exc)) from exc
     process = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(cwd) if cwd is not None else None,
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        **process_group_options(),
+        **process_tree_plan.spawn_options,
     )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -595,28 +628,50 @@ async def _run_subprocess(
                 process,
                 stream_callback=stream_callback,
                 max_output_bytes=100_000,
+                process_tree_plan=process_tree_plan,
             ),
             timeout=deadline,
         )
     except asyncio.TimeoutError:
-        await terminate_process_tree(process)
+        try:
+            await terminate_process_tree(process, plan=process_tree_plan)
+        except ProcessTreeError as exc:
+            cleanup = f" Process-tree cleanup failed: {exc}."
+        else:
+            cleanup = ""
         return SandboxResult(
             exit_code=-1,
             stdout="",
-            stderr=f"Command timed out after {deadline} seconds.",
+            stderr=f"Command timed out after {deadline} seconds.{cleanup}",
             tier=tier,
             backend_name=backend_name,
             fallback_used=False,
             duration_seconds=time.monotonic() - start,
         )
-    except asyncio.CancelledError:
-        await terminate_process_tree(process)
+    except asyncio.CancelledError as cancellation:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process, plan=process_tree_plan
+            )
+        )
+        if cleanup_error is not None:
+            cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        if cleanup_cancelled:
+            cancellation.add_note("Process-tree cleanup was cancelled")
         raise
     except ProcessOutputLimitExceeded as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace")
+        if exc.cleanup_error is not None:
+            detail = f"process-tree cleanup failed: {exc.cleanup_error}"
+            stderr = f"{stderr}; {detail}" if stderr else detail
         return SandboxResult(
-            exit_code=process.returncode if process.returncode is not None else -1,
+            exit_code=(
+                process.returncode
+                if process.returncode is not None and exc.cleanup_error is None
+                else -1
+            ),
             stdout=exc.stdout.decode("utf-8", errors="replace"),
-            stderr=exc.stderr.decode("utf-8", errors="replace"),
+            stderr=stderr,
             tier=tier,
             backend_name=backend_name,
             fallback_used=False,

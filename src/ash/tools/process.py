@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import platform
 import uuid
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -12,7 +13,13 @@ from typing import Any, Iterable
 from pydantic import BaseModel, Field
 
 from ash.safety.guard import SafetyGuard
-from ash.sandbox.process_utils import process_group_options, terminate_process_tree
+from ash.sandbox.process_utils import (
+    ProcessTreeError,
+    ProcessTreePlan,
+    ProcessTreeUnavailable,
+    prepare_process_tree,
+    terminate_process_tree,
+)
 from ash.sandbox import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable, SandboxManager
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.tools.command import build_scrubbed_command_env
@@ -30,11 +37,33 @@ BACKGROUND_OUTPUT_TRUNCATION_MARKER = (
 )
 
 
+async def _settle_cleanup(
+    awaitable: Awaitable[Any],
+) -> tuple[Any, BaseException | None, bool]:
+    """Finish cleanup despite caller cancellation, then report its outcome."""
+
+    task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    try:
+        return task.result(), None, cancelled
+    except BaseException as exc:
+        return None, exc, cancelled
+
+
 @dataclass
 class Job:
     job_id: str
     command: str
     process: asyncio.subprocess.Process
+    process_tree_plan: ProcessTreePlan
     output: list[str] = field(default_factory=list)
     cursor: int = 0
     output_size: int = 0
@@ -95,8 +124,37 @@ class BackgroundProcessTool(BaseTool):
             job.process.stdin.write(args.input.encode())
             await job.process.stdin.drain()
             return self._result(f"Wrote {len(args.input)} bytes to {job.job_id}.")
-        await terminate_process_tree(job.process)
-        await asyncio.gather(*job.readers, return_exceptions=True)
+        _, cleanup_error, cancelled = await _settle_cleanup(
+            terminate_process_tree(job.process, plan=job.process_tree_plan)
+        )
+        if cancelled:
+            cancellation = asyncio.CancelledError()
+            if cleanup_error is not None:
+                cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+            raise cancellation from cleanup_error
+        if cleanup_error is not None:
+            for reader in job.readers:
+                if not reader.done():
+                    reader.cancel()
+            _, reader_error, reader_cancelled = await _settle_cleanup(
+                asyncio.gather(*job.readers, return_exceptions=True)
+            )
+            if reader_cancelled:
+                cancellation = asyncio.CancelledError()
+                cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+                if reader_error is not None:
+                    cancellation.add_note(f"reader cleanup failed: {reader_error}")
+                raise cancellation from cleanup_error
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Could not stop {job.job_id}: {cleanup_error}",
+            )
+        _, reader_error, reader_cancelled = await _settle_cleanup(
+            asyncio.gather(*job.readers, return_exceptions=True)
+        )
+        if reader_cancelled:
+            raise asyncio.CancelledError from reader_error
         return self._result(f"Stopped {job.job_id}.")
 
     async def _start(self, args: BackgroundProcessArgs) -> ToolResult:
@@ -139,6 +197,16 @@ class BackgroundProcessTool(BaseTool):
                 )
             argv = list(invocation.argv)
             backend_name = invocation.backend_name
+        try:
+            process_tree_plan = prepare_process_tree(
+                workspace_root=self.safety_guard.project_root
+            )
+        except ProcessTreeUnavailable as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Command was not started: {exc}",
+            )
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd,
@@ -148,12 +216,13 @@ class BackgroundProcessTool(BaseTool):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **process_group_options(),
+            **process_tree_plan.spawn_options,
         )
         job = Job(
             uuid.uuid4().hex[:12],
             args.command,
             process,
+            process_tree_plan,
             sandbox_backend=backend_name,
         )
         assert process.stdout is not None and process.stderr is not None
@@ -207,11 +276,47 @@ class BackgroundProcessTool(BaseTool):
         )
 
     async def aclose(self) -> None:
-        await asyncio.gather(
-            *(terminate_process_tree(job.process) for job in self.jobs.values()),
-            return_exceptions=True,
+        jobs = tuple(self.jobs.values())
+        cleanup_results, cleanup_error, cleanup_cancelled = await _settle_cleanup(
+            asyncio.gather(
+                *(
+                    terminate_process_tree(
+                        job.process,
+                        plan=job.process_tree_plan,
+                    )
+                    for job in jobs
+                ),
+                return_exceptions=True,
+            )
         )
-        await asyncio.gather(
-            *(reader for job in self.jobs.values() for reader in job.readers),
-            return_exceptions=True,
+        failures: list[BaseException] = []
+        if cleanup_error is not None:
+            failures.append(cleanup_error)
+        elif isinstance(cleanup_results, list):
+            failures.extend(
+                result
+                for result in cleanup_results
+                if isinstance(result, BaseException)
+            )
+        if failures:
+            for job in jobs:
+                for reader in job.readers:
+                    if not reader.done():
+                        reader.cancel()
+        _, reader_error, reader_cancelled = await _settle_cleanup(
+            asyncio.gather(
+                *(reader for job in jobs for reader in job.readers),
+                return_exceptions=True,
+            )
         )
+        if cleanup_cancelled or reader_cancelled:
+            cancellation = asyncio.CancelledError()
+            for failure in failures:
+                cancellation.add_note(f"Process-tree cleanup failed: {failure}")
+            if reader_error is not None:
+                cancellation.add_note(f"reader cleanup failed: {reader_error}")
+            raise cancellation
+        if failures:
+            raise ProcessTreeError(
+                f"background process cleanup failed: {failures[0]}"
+            ) from failures[0]

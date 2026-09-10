@@ -27,9 +27,10 @@ from ash.hooks.registry import (
 from ash.safe_io import read_bounded_bytes
 from ash.safety.path_scope import lexical_target_path, path_has_link_component
 from ash.sandbox.process_utils import (
+    ProcessTreeUnavailable,
     communicate_process,
-    process_group_options,
-    terminate_process_tree,
+    prepare_process_tree,
+    settle_process_tree_after_cancellation,
 )
 
 
@@ -209,6 +210,10 @@ async def _run(
     encoded_payload = json.dumps(payload).encode()
     if len(encoded_payload) > MAX_HOOK_PAYLOAD_BYTES:
         raise ValueError("hook payload exceeds 1 MiB")
+    try:
+        process_tree_plan = prepare_process_tree(workspace_root=source.cwd)
+    except ProcessTreeUnavailable as exc:
+        raise RuntimeError(f"hook process was not started: {exc}") from exc
     process = await asyncio.create_subprocess_exec(
         *expanded_command,
         stdin=asyncio.subprocess.PIPE,
@@ -216,16 +221,25 @@ async def _run(
         stderr=asyncio.subprocess.PIPE,
         env=environment,
         cwd=source.cwd,
-        **process_group_options(),
+        **process_tree_plan.spawn_options,
     )
     try:
         stdout, stderr = await communicate_process(
             process,
             input_data=encoded_payload,
             max_output_bytes=MAX_HOOK_OUTPUT_BYTES,
+            process_tree_plan=process_tree_plan,
         )
-    except asyncio.CancelledError:
-        await terminate_process_tree(process)
+    except asyncio.CancelledError as cancellation:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process, plan=process_tree_plan
+            )
+        )
+        if cleanup_error is not None:
+            cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        if cleanup_cancelled:
+            cancellation.add_note("Process-tree cleanup was cancelled")
         raise
     if process.returncode != 0:
         raise RuntimeError(

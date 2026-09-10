@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -967,6 +968,83 @@ def test_installer_translates_backend_timeout_to_actionable_error() -> None:
             which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
             environ={"PATH": "/usr/bin"},
         )
+
+
+def test_installer_does_not_spawn_without_managed_tree_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.installer import _run_captured
+
+    monkeypatch.setattr("ash.installer.os.name", "nt")
+    monkeypatch.delenv("SystemRoot", raising=False)
+    monkeypatch.delenv("WINDIR", raising=False)
+    popen = monkeypatch.setattr(
+        "ash.installer.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("installer must not launch"),
+    )
+
+    with pytest.raises(InstallError, match="taskkill was not found"):
+        _run_captured(
+            ["installer-command"],
+            runner=subprocess.run,
+            environment={},
+            timeout=1,
+            max_bytes=1024,
+            description="installer query",
+        )
+    assert popen is None
+
+
+def test_installer_ignores_ambient_taskkill_and_uses_system_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    system_root = tmp_path / "windows"
+    system_taskkill = system_root / "System32" / "taskkill.exe"
+    system_taskkill.parent.mkdir(parents=True)
+    system_taskkill.write_text("system", encoding="utf-8")
+    shadow = tmp_path / "shadow" / "taskkill.exe"
+    shadow.parent.mkdir()
+    shadow.write_text("shadow", encoding="utf-8")
+
+    monkeypatch.setattr("ash.installer.os.name", "nt")
+    monkeypatch.setenv("SystemRoot", str(system_root))
+    monkeypatch.setenv("PATH", str(shadow.parent))
+
+    from ash.installer import _prepare_process_tree
+
+    plan = _prepare_process_tree()
+
+    assert plan.taskkill_path == str(system_taskkill)
+    assert plan.taskkill_path != str(shadow)
+
+
+def test_installer_rejects_shadowed_taskkill_without_system_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shadow = tmp_path / "taskkill.exe"
+    shadow.write_text("shadow", encoding="utf-8")
+    monkeypatch.setattr("ash.installer.os.name", "nt")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.delenv("SystemRoot", raising=False)
+    monkeypatch.delenv("WINDIR", raising=False)
+
+    from ash.installer import _prepare_process_tree
+
+    with pytest.raises(InstallError, match="taskkill was not found"):
+        _prepare_process_tree()
+
+
+def test_standalone_installer_help_does_not_import_ash_package() -> None:
+    installer = Path(__file__).parents[2] / "src" / "ash" / "installer.py"
+    result = subprocess.run(
+        [sys.executable, "-I", str(installer), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "usage:" in result.stdout.lower()
 
 
 def test_installer_rejects_oversized_manager_state_before_json_parsing() -> None:

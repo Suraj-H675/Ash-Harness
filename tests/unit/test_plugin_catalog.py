@@ -11,6 +11,7 @@ import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+import ash.plugins.lifecycle as plugin_lifecycle
 from ash.plugins.catalog import (
     MAX_CATALOG_BYTES,
     PluginCatalogError,
@@ -22,6 +23,7 @@ from ash.plugins.catalog import (
     sign_catalog,
 )
 from ash.plugins.lifecycle import PluginLifecycleError, install_git_plugin
+from ash.sandbox.process_utils import ProcessTreeUnavailable
 
 
 def _write_catalog(
@@ -490,6 +492,33 @@ def test_git_install_rejects_embedded_url_credentials_before_clone(
         )
 
     assert popen is None
+
+
+def test_git_install_does_not_spawn_without_managed_tree_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        plugin_lifecycle,
+        "resolve_host_executable",
+        lambda *args, **kwargs: "/usr/bin/git",
+    )
+
+    def unavailable(*args: object, **kwargs: object) -> object:
+        raise ProcessTreeUnavailable("taskkill unavailable")
+
+    monkeypatch.setattr(plugin_lifecycle, "prepare_process_tree", unavailable)
+    monkeypatch.setattr(
+        plugin_lifecycle.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("git clone must not launch"),
+    )
+
+    with pytest.raises(PluginLifecycleError, match="clone was not started"):
+        install_git_plugin(
+            "https://plugins.example/demo.git",
+            ref="main",
+            destination_root=tmp_path / "installed",
+        )
 
 
 @pytest.mark.parametrize(

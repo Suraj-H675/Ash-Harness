@@ -9,7 +9,13 @@ import re
 import sys
 from pathlib import Path
 
-from ash.sandbox.process_utils import terminate_process_tree
+from ash.sandbox.process_utils import (
+    ProcessTreeError,
+    ProcessTreeUnavailable,
+    prepare_process_tree,
+    settle_process_tree_after_cancellation,
+    terminate_process_tree,
+)
 from ash.safety.environment import resolve_host_executable
 
 
@@ -60,6 +66,11 @@ async def pull_model(
         )
         return 2
     try:
+        process_tree_plan = prepare_process_tree(workspace_root=workspace)
+    except ProcessTreeUnavailable as exc:
+        print(f"Error: could not start ollama pull: {exc}", file=sys.stderr)
+        return 2
+    try:
         process = await asyncio.create_subprocess_exec(
             executable,
             "pull",
@@ -67,6 +78,7 @@ async def pull_model(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=_scrubbed_environment(),
+            **process_tree_plan.spawn_options,
         )
     except OSError as exc:
         print(f"Error: could not start ollama pull: {exc}", file=sys.stderr)
@@ -97,11 +109,27 @@ async def pull_model(
     try:
         await asyncio.wait_for(drain_output(), timeout_seconds)
     except asyncio.TimeoutError:
-        await terminate_process_tree(process)
+        try:
+            await terminate_process_tree(process, plan=process_tree_plan)
+        except ProcessTreeError as exc:
+            print(
+                "\nError: ollama pull timed out after "
+                f"{timeout_seconds} seconds; process-tree cleanup failed: {exc}",
+                file=sys.stderr,
+            )
+            return 125
         print(f"\nError: ollama pull timed out after {timeout_seconds} seconds.", file=sys.stderr)
         return 124
-    except asyncio.CancelledError:
-        await terminate_process_tree(process)
+    except asyncio.CancelledError as cancellation:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process, plan=process_tree_plan
+            )
+        )
+        if cleanup_error is not None:
+            cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        if cleanup_cancelled:
+            cancellation.add_note("Process-tree cleanup was cancelled")
         raise
     if process.returncode == 0:
         print(f"Pulled {normalized}.")

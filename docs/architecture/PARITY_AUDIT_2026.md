@@ -220,6 +220,60 @@ omitted/null/zero/string IDs, method-not-found with null, invalid and
 non-finite IDs, cancellation behavior, and HTTP notification/response status
 semantics. No public cancellation-map redesign was introduced.
 
+### F-07 — Windows managed process-tree cleanup
+
+The pre-fix fallback was reproduced with deterministic platform-mocked
+processes. When `taskkill` was unavailable, the old helper launched the
+managed child and root-killed it without reporting that descendant cleanup
+was not guaranteed (`missing_backend_root_kills_without_error 1`). It also
+ignored a nonzero `taskkill` status (`nonzero_taskkill_returns (1, 1)`) and
+treated an already-exited root as successful cleanup without invoking the
+tree backend (`exited_root_taskkill_invocations 0`). The stale-PID probe is
+classified more narrowly: it confirmed a root-exit check/use timing gap, but
+did not model Windows process-object handle pinning and therefore did not
+prove PID reuse or unrelated-process termination.
+
+The repair adds a shared immutable `ProcessTreePlan` preflight/controller.
+Every active production launcher whose lifecycle contract promises descendant
+cleanup now obtains the plan before spawning and passes that same plan to
+cleanup. The plan resolves and retains the Windows `taskkill` executable;
+missing preflight fails before launch. Async cleanup obtains and strongly
+retains the original CPython asyncio transport's underlying `Popen` owner;
+synchronous cleanup retains its `Popen` owner directly, across the liveness
+inspection, taskkill process creation, bounded status wait, root reap, and
+final classification. Thus a root transition to exited while taskkill is
+being launched does not release the identity pin. Async and synchronous
+cleanup invoke the retained backend with `/PID <pid> /T /F`, enforce bounded
+waits, inspect the exit status, reap the root, and report a typed cleanup
+failure when the tree cannot be confirmed. Failure paths make bounded
+best-effort root cleanup without claiming descendant success. An already-
+exited Windows root is reported as unconfirmed and is never targeted merely
+because its PID remains pinned. Cancellation remains primary and cleanup
+tasks are awaited to terminal state before cancellation propagates; cleanup
+failures are retained as diagnostics.
+
+The audited scope includes sandbox execution, command/process/search/git/
+patch tools, automation, hooks, worktree Git, Ollama model pulls, LSP,
+stdio MCP, executable plugins, plugin Git clone cleanup, and installer
+subprocesses. HTTP/SSE MCP, one-shot probes, user-owned subprocesses, and the
+unused `SubprocessAgent.spawn_subprocess()` path remain outside F-07 because
+Ash does not promise descendant-tree cleanup for them. The standalone
+installer retains a dependency-free equivalent so downloaded installation
+continues to work without importing the installed package.
+
+Deterministic regressions cover preflight/no-launch behavior, intended
+Windows creation flags, taskkill arguments and nonzero/timeout/exec failures,
+best-effort root cleanup, root-exit timing with retained process owners,
+unsupported async transports, root-reap failures, caller-specific error
+contracts, cancellation-safe MCP disconnect and long-lived ownership,
+Ollama/MCP/plugin/installer launch gates, HTTP/SSE exemption, the installer
+system-directory resolver, and installer standalone execution. One-shot
+cleanup uses no orphan registry; long-lived owners retain failed cleanup
+state. The focused F-07 suite passes on the development host. Windows
+fail-closed/taskkill lifecycle behavior was covered by deterministic
+platform-mocked tests; native Windows process-tree behavior has not yet been
+verified.
+
 ### MCP OAuth private-store race
 
 The MCP OAuth token store had a confirmed filesystem-confinement defect: its
@@ -251,19 +305,22 @@ login/logout semantics, and dependency range were preserved.
 
 ### Verification checkpoint
 
-- `uv run pytest -q --timeout=120 --timeout-method=thread`: **2165 passed,
+- `uv run pytest -q --timeout=120 --timeout-method=thread`: **2190 passed,
   3 skipped** after the ACP lifecycle, MCP OAuth private-store, F-03
-  cancellation, and F-04/F-05 CLI persistence fixes.
+  cancellation, F-04/F-05 CLI persistence, and F-07 managed-process cleanup
+  fixes.
+- The focused F-07 process/caller regression run passed **525 tests** with
+  **1 platform-dependent skip**.
 - The focused F-04/F-05 persistence/CLI regression run passed **144 tests**;
   the real subprocess workflow also passed.
 - The focused MCP OAuth/CLI regression run reports **49 passed**, including
   synchronized save/load/remove directory-substitution cases and the
   fail-closed unsupported-store path.
 - `uv run ruff check src tests`: passed.
-- `uv run mypy src/ash`: passed with no issues in 171 source files.
-- `uv build` and the clean installed-wheel smoke
-  (`.smoke-venv/bin/python tests/packaging/smoke_minimal_install.py`) passed
-  after the ACP fix.
+- `uv run mypy src/ash`: passed with no issues in 173 source files.
+- `uv build` passed for the F-07 candidate; the clean installed-wheel smoke
+  (`.smoke-venv/bin/python tests/packaging/smoke_minimal_install.py`) remains
+  passing from the preceding verification batch.
 - The earlier CLI help/doctor, integration, E2E, and optional browser checks
   remain recorded baseline evidence; the PTY check remains unavailable because
   `tmux` is not installed.

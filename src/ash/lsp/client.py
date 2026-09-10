@@ -17,7 +17,13 @@ from ash.core.redaction import redact_text
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
 from ash.safety.scoped_io import ScopedIOError, read_scoped_bytes
-from ash.sandbox.process_utils import process_group_options, terminate_process_tree
+from ash.sandbox.process_utils import (
+    ProcessTreeError,
+    ProcessTreePlan,
+    ProcessTreeUnavailable,
+    prepare_process_tree,
+    terminate_process_tree,
+)
 
 
 MAX_LSP_HEADER_BYTES = 8 * 1024
@@ -67,6 +73,7 @@ class LSPClient:
         self._guard = SafetyGuard(self.root)
         self._diagnostics_callback = diagnostics_callback
         self.process: asyncio.subprocess.Process | None = None
+        self._process_tree_plan: ProcessTreePlan | None = None
         self.capabilities: dict[str, Any] = {}
         self.position_encoding = "utf-16"
         self._next_id = 1
@@ -78,6 +85,7 @@ class LSPClient:
         self._pending_documents: dict[str, tuple[int, str]] = {}
         self._document_lock = asyncio.Lock()
         self._closed = False
+        self._cleanup_failed = False
         self._close_task: asyncio.Task[None] | None = None
         self._channel_error: LSPError | None = None
         self.stderr = ""
@@ -87,6 +95,13 @@ class LSPClient:
             return
         environment = build_scrubbed_environment(overrides=self.config.env)
         try:
+            process_tree_plan = prepare_process_tree(workspace_root=self.root)
+        except ProcessTreeUnavailable as exc:
+            raise LSPError(
+                f"failed to start LSP server {self.config.name}: {exc}"
+            ) from exc
+        self._process_tree_plan = process_tree_plan
+        try:
             self.process = await asyncio.create_subprocess_exec(
                 *self.config.command,
                 cwd=self.root,
@@ -95,9 +110,10 @@ class LSPClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=MAX_LSP_HEADER_BYTES + 4,
-                **process_group_options(),
+                **process_tree_plan.spawn_options,
             )
         except OSError as exc:
+            self._process_tree_plan = None
             raise LSPError(
                 f"failed to start LSP server {self.config.name}: {exc}"
             ) from exc
@@ -151,8 +167,10 @@ class LSPClient:
                 except asyncio.CancelledError:
                     if current is not None:
                         current.uncancel()
-            with contextlib.suppress(Exception):
+            try:
                 cleanup.result()
+            except BaseException as cleanup_error:
+                exc.add_note(f"Process-tree cleanup failed: {cleanup_error}")
             if isinstance(exc, LSPError):
                 detail = self._with_stderr(str(exc))
                 if detail != str(exc):
@@ -330,7 +348,11 @@ class LSPClient:
         )
 
     async def aclose(self) -> None:
-        await _await_task_cancellation_safe(self._ensure_close_task())
+        if self._close_task is None or (
+            self._close_task.done() and self._cleanup_failed
+        ):
+            self._close_task = asyncio.create_task(self._close())
+        await _await_task_cancellation_safe(self._close_task)
 
     def _ensure_close_task(self) -> asyncio.Task[None]:
         if self._close_task is None:
@@ -338,12 +360,14 @@ class LSPClient:
         return self._close_task
 
     async def _close(self) -> None:
-        if self._closed:
+        if self._closed and not self._cleanup_failed:
             return
         process = self.process
         if process is None:
             self._closed = True
+            self._cleanup_failed = False
             return
+        cleanup_error: ProcessTreeError | None = None
         if (
             process.returncode is None
             and self._reader_task is not asyncio.current_task()
@@ -360,10 +384,26 @@ class LSPClient:
                 await self.notify("exit", None)
                 await asyncio.wait_for(process.wait(), timeout=2.0)
             except (LSPError, OSError, asyncio.TimeoutError):
-                await terminate_process_tree(process)
+                try:
+                    await terminate_process_tree(
+                        process,
+                        plan=self._process_tree_plan,
+                    )
+                except ProcessTreeError as exc:
+                    cleanup_error = exc
         self._closed = True
-        if process.returncode is None:
-            await terminate_process_tree(process)
+        cleanup_needed = process.returncode is None or (
+            self._process_tree_plan is not None
+            and self._process_tree_plan.is_windows
+        )
+        if cleanup_needed and cleanup_error is None:
+            try:
+                await terminate_process_tree(
+                    process,
+                    plan=self._process_tree_plan,
+                )
+            except ProcessTreeError as exc:
+                cleanup_error = exc
         await self._wait_for_stderr()
         current = asyncio.current_task()
         tasks = [
@@ -374,7 +414,18 @@ class LSPClient:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        self._fail_pending(LSPError(f"LSP server {self.config.name} closed"))
+        closed_error = LSPError(f"LSP server {self.config.name} closed")
+        if cleanup_error is not None:
+            self._cleanup_failed = True
+            closed_error.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+            self._channel_error = closed_error
+        self._fail_pending(closed_error)
+        if cleanup_error is not None:
+            raise LSPError(
+                f"LSP server {self.config.name} process cleanup failed: "
+                f"{cleanup_error}"
+            ) from cleanup_error
+        self._cleanup_failed = False
 
     async def _write_message(self, payload: dict[str, Any]) -> None:
         process = self.process
@@ -416,9 +467,23 @@ class LSPClient:
             failure = exc if isinstance(exc, LSPError) else LSPError(str(exc))
         finally:
             if failure is not None:
-                if self.process.returncode is None:
-                    await terminate_process_tree(self.process)
+                cleanup_error: ProcessTreeError | None = None
+                if self.process.returncode is None or (
+                    self._process_tree_plan is not None
+                    and self._process_tree_plan.is_windows
+                ):
+                    try:
+                        await terminate_process_tree(
+                            self.process,
+                            plan=self._process_tree_plan,
+                        )
+                    except ProcessTreeError as exc:
+                        cleanup_error = exc
                 await self._wait_for_stderr()
+                if cleanup_error is not None:
+                    failure = LSPError(
+                        f"{failure}; process-tree cleanup failed: {cleanup_error}"
+                    )
                 detailed = LSPError(self._with_stderr(str(failure)))
                 self._channel_error = detailed
                 self._fail_pending(detailed)
@@ -809,6 +874,17 @@ async def _await_task_cancellation_safe(task: asyncio.Task[None]) -> None:
             current = asyncio.current_task()
             if current is not None:
                 current.uncancel()
-    task.result()
+    try:
+        task.result()
+    except BaseException as exc:
+        if cancelled:
+            cancellation = asyncio.CancelledError()
+            detail = str(exc).strip() or type(exc).__name__
+            cancellation.add_note(
+                f"LSP cleanup failed while cancellation was in progress: "
+                f"{detail[:500]}"
+            )
+            raise cancellation from exc
+        raise
     if cancelled:
         raise asyncio.CancelledError

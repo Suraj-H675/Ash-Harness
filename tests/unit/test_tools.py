@@ -871,6 +871,32 @@ async def test_run_command_enforces_timeout(guard: SafetyGuard) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_command_does_not_spawn_without_tree_preflight(
+    project_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.tools import command as command_module
+    from ash.sandbox.process_utils import ProcessTreeUnavailable
+
+    def unavailable(*args: object, **kwargs: object) -> object:
+        raise ProcessTreeUnavailable("taskkill unavailable")
+
+    monkeypatch.setattr(command_module, "prepare_process_tree", unavailable)
+    monkeypatch.setattr(
+        command_module.asyncio,
+        "create_subprocess_shell",
+        lambda *args, **kwargs: pytest.fail("command must not launch"),
+    )
+
+    result = await RunCommandTool(SafetyGuard(project_root)).run(
+        command_line="printf unsafe",
+    )
+
+    assert result.success is False
+    assert "command was not started" in (result.error or "")
+
+
+@pytest.mark.asyncio
 async def test_run_command_blocks_unsafe_commands(guard: SafetyGuard) -> None:
     with pytest.raises(SafetyViolation):
         await RunCommandTool(guard).run(command_line="rm -rf /")

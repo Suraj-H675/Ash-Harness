@@ -13,8 +13,11 @@ from ash.safety.environment import resolve_host_executable
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
+    ProcessTreeError,
+    ProcessTreeUnavailable,
     communicate_process,
-    process_group_options,
+    prepare_process_tree,
+    settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
 from ash.tools.base import BaseTool, ToolResult
@@ -124,6 +127,10 @@ async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, s
     git = resolve_host_executable("git", workspace_root=cwd, cwd=cwd)
     if git is None:
         return 127, "", "git is unavailable outside the workspace"
+    try:
+        process_tree_plan = prepare_process_tree(workspace_root=cwd)
+    except ProcessTreeUnavailable as exc:
+        return 126, "", f"git apply was not started: {exc}"
     command = [git, "apply", "--whitespace=nowarn"]
     if check:
         command.append("--check")
@@ -134,7 +141,7 @@ async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, s
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        **process_group_options(),
+        **process_tree_plan.spawn_options,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -142,6 +149,7 @@ async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, s
                 process,
                 input_data=patch.encode("utf-8"),
                 max_output_bytes=MAX_PATCH_OUTPUT_BYTES,
+                process_tree_plan=process_tree_plan,
             ),
             timeout=30,
         )
@@ -150,10 +158,31 @@ async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, s
         return (
             PATCH_OUTPUT_LIMIT_EXIT,
             exc.stdout.decode("utf-8", errors="replace"),
-            detail or f"git apply output exceeded {MAX_PATCH_OUTPUT_BYTES} bytes",
+            (
+                detail or f"git apply output exceeded {MAX_PATCH_OUTPUT_BYTES} bytes"
+            )
+            + (
+                f"; process-tree cleanup failed: {exc.cleanup_error}"
+                if exc.cleanup_error is not None
+                else ""
+            ),
         )
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        await terminate_process_tree(process)
+    except asyncio.TimeoutError as timeout_error:
+        try:
+            await terminate_process_tree(process, plan=process_tree_plan)
+        except ProcessTreeError as exc:
+            timeout_error.add_note(f"Process-tree cleanup failed: {exc}")
+        raise
+    except asyncio.CancelledError as cancellation:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process, plan=process_tree_plan
+            )
+        )
+        if cleanup_error is not None:
+            cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        if cleanup_cancelled:
+            cancellation.add_note("Process-tree cleanup was cancelled")
         raise
     return (
         process.returncode if process.returncode is not None else -1,

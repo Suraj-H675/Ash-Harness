@@ -298,25 +298,39 @@ class LanguageServerManager:
         return values
 
     async def aclose(self) -> None:
-        if self._close_task is None:
+        if self._close_task is None or (
+            self._close_task.done() and self._clients
+        ):
             self._close_task = asyncio.create_task(self._close())
         await _await_task_cancellation_safe(self._close_task)
 
     async def _close(self) -> None:
         async with self._lock:
-            if self._closed:
+            if self._closed and not self._clients and not self._starting:
                 return
             self._closed = True
             starting = list(self._starting.values())
             clients = list(self._clients.values())
             self._starting.clear()
-            self._clients.clear()
         for task in starting:
             task.cancel()
         await asyncio.gather(*starting, return_exceptions=True)
-        await asyncio.gather(
+        outcomes = await asyncio.gather(
             *(client.aclose() for client in clients), return_exceptions=True
         )
+        failed = {
+            client
+            for client, outcome in zip(clients, outcomes, strict=True)
+            if isinstance(outcome, BaseException)
+        }
+        async with self._lock:
+            for client, outcome in zip(clients, outcomes, strict=True):
+                if not isinstance(outcome, BaseException):
+                    key = (client.config.name, client.root)
+                    if self._clients.get(key) is client:
+                        self._clients.pop(key, None)
+        if failed:
+            raise LSPError(f"failed to close {len(failed)} language server(s)")
 
     async def _workspace_symbols(self, query: str) -> list[Any]:
         if len(query) > 512:
@@ -368,15 +382,26 @@ class LanguageServerManager:
             if self._closed:
                 raise LSPError("language-server manager is closed")
             failure = self._broken.get(key)
+            existing = self._clients.get(key)
             if failure is not None:
                 if (
                     failure.failures > MAX_LSP_RESTART_ATTEMPTS
                     or time.monotonic() < failure.retry_at
                 ):
                     raise LSPError(failure.detail)
+                if existing is not None and not existing.healthy:
+                    # A client retained after failed process cleanup still owns
+                    # its process.  Never hand it back as a fresh, usable client.
+                    raise LSPError(failure.detail)
                 self._broken.pop(key, None)
-            existing = self._clients.get(key)
             if existing is not None:
+                if not existing.healthy:
+                    detail = getattr(existing, "_channel_error", None)
+                    raise LSPError(
+                        str(detail)[:2000]
+                        if detail is not None
+                        else f"language server {config.name!r} is not healthy"
+                    )
                 return existing
             task = self._starting.get(key)
             if task is None:
@@ -419,9 +444,21 @@ class LanguageServerManager:
     async def _mark_broken(self, client: LSPClient, detail: str) -> None:
         key = (client.config.name, client.root)
         async with self._lock:
-            self._clients.pop(key, None)
             self._record_failure(key, detail)
-        await client.aclose()
+        try:
+            await client.aclose()
+        except BaseException as exc:
+            async with self._lock:
+                if self._clients.get(key) is not client:
+                    self._clients[key] = client
+                self._record_failure(
+                    key,
+                    f"{detail}; process-tree cleanup failed: {exc}",
+                )
+            raise
+        async with self._lock:
+            if self._clients.get(key) is client:
+                self._clients.pop(key, None)
 
     def _record_failure(self, key: tuple[str, Path], detail: str) -> None:
         failures = self._failure_counts.get(key, 0) + 1

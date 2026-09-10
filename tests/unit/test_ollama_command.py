@@ -28,6 +28,29 @@ def test_pull_requires_executable(monkeypatch):
     assert asyncio.run(ollama.pull_model("test-model")) == 2
 
 
+def test_pull_does_not_spawn_without_managed_tree_preflight(monkeypatch, capsys):
+    from ash.commands import ollama
+
+    monkeypatch.setattr(
+        ollama,
+        "resolve_host_executable",
+        lambda *args, **kwargs: "/usr/bin/ollama",
+    )
+
+    def unavailable(*args, **kwargs):
+        raise ollama.ProcessTreeUnavailable("taskkill unavailable")
+
+    monkeypatch.setattr(ollama, "prepare_process_tree", unavailable)
+
+    async def spawn(*args, **kwargs):
+        pytest.fail("ollama pull must not launch before tree preflight")
+
+    monkeypatch.setattr(ollama.asyncio, "create_subprocess_exec", spawn)
+
+    assert asyncio.run(ollama.pull_model("test-model")) == 2
+    assert "could not start ollama pull" in capsys.readouterr().err
+
+
 def test_pull_drains_noisy_output_in_bounded_chunks(monkeypatch, capsys):
     from ash.commands import ollama
 

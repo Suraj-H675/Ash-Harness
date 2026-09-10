@@ -27,8 +27,13 @@ from ash.core.redaction import redact_text
 from ash.safety.trust import is_workspace_trusted
 from ash.sandbox.process_utils import (
     INHERIT_PROCESS_GROUP_ENV,
+    ProcessOutputLimitExceeded,
+    ProcessTreeError,
+    ProcessTreePlan,
+    ProcessTreeUnavailable,
     communicate_process,
-    process_group_options,
+    prepare_process_tree,
+    settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
 from ash.sdk import AshResult
@@ -70,6 +75,7 @@ class _SubprocessAutomationClient:
         self._config = config
         self._workspace = workspace
         self._process: asyncio.subprocess.Process | None = None
+        self._process_tree_plan: ProcessTreePlan | None = None
 
     async def prompt(
         self,
@@ -88,6 +94,12 @@ class _SubprocessAutomationClient:
         environment = dict(os.environ)
         environment["PYTHONUNBUFFERED"] = "1"
         environment[INHERIT_PROCESS_GROUP_ENV] = "1"
+        try:
+            process_tree_plan = prepare_process_tree(workspace_root=self._workspace)
+        except ProcessTreeUnavailable as exc:
+            raise AutomationError(
+                f"automation subprocess was not started: {exc}"
+            ) from exc
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-I",
@@ -98,20 +110,47 @@ class _SubprocessAutomationClient:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **process_group_options(),
+            **process_tree_plan.spawn_options,
         )
         self._process = process
+        self._process_tree_plan = process_tree_plan
+        cleanup_error: ProcessTreeError | None = None
         try:
             stdout, stderr = await communicate_process(
                 process,
                 input_data=json.dumps(request, allow_nan=False).encode("utf-8"),
                 max_output_bytes=self._MAX_OUTPUT_BYTES,
+                process_tree_plan=process_tree_plan,
             )
-        except BaseException:
-            await asyncio.shield(terminate_process_tree(process))
+        except ProcessOutputLimitExceeded as primary:
+            cleanup_error = primary.cleanup_error
+            raise
+        except asyncio.CancelledError as cancellation:
+            cleanup_error, cleanup_cancelled = (
+                await settle_process_tree_after_cancellation(
+                    process, plan=process_tree_plan
+                )
+            )
+            if cleanup_error is not None:
+                cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+            if cleanup_cancelled:
+                cancellation.add_note("Process-tree cleanup was cancelled")
+            raise
+        except BaseException as primary:
+            cleanup_error, cleanup_cancelled = (
+                await settle_process_tree_after_cancellation(
+                    process, plan=process_tree_plan
+                )
+            )
+            if cleanup_error is not None:
+                primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+            if cleanup_cancelled:
+                primary.add_note("Process-tree cleanup was cancelled")
             raise
         finally:
-            self._process = None
+            if cleanup_error is None:
+                self._process = None
+                self._process_tree_plan = None
 
         payload = self._parse_payload(stdout)
         if process.returncode != 0 or not payload.get("ok"):
@@ -127,8 +166,16 @@ class _SubprocessAutomationClient:
     async def close(self) -> None:
         process = self._process
         if process is not None:
-            await terminate_process_tree(process)
-            self._process = None
+            plan = self._process_tree_plan
+            try:
+                await terminate_process_tree(process, plan=plan)
+            except ProcessTreeError as exc:
+                raise AutomationError(
+                    f"automation process cleanup failed: {exc}"
+                ) from exc
+            else:
+                self._process = None
+                self._process_tree_plan = None
 
     def _parse_payload(self, stdout: bytes) -> dict[str, Any]:
         for line in reversed(stdout.decode("utf-8", errors="replace").splitlines()):
@@ -416,13 +463,26 @@ class AutomationWorkerService:
             if monitor_task is not None:
                 await self._cancel_task(monitor_task)
             if client is not None:
-                try:
-                    close_task = asyncio.create_task(
-                        client.close(), name=f"ash-automation-close-{claim.run.run_id}"
+                close_task = asyncio.create_task(
+                    client.close(), name=f"ash-automation-close-{claim.run.run_id}"
+                )
+                settled = await self._cancel_task(
+                    close_task, cancel_first=False, timeout=2.0
+                )
+                if not settled:
+                    _log.warning(
+                        "automation client cleanup did not settle for {}",
+                        claim.run.run_id,
                     )
-                    await self._cancel_task(close_task, cancel_first=False, timeout=2.0)
-                except Exception:  # noqa: BLE001 - cleanup cannot change persisted outcome
-                    pass
+                else:
+                    try:
+                        close_task.result()
+                    except BaseException as cleanup_error:
+                        _log.warning(
+                            "automation client cleanup failed for {}: {}",
+                            claim.run.run_id,
+                            redact_text(str(cleanup_error))[:500],
+                        )
 
     async def _monitor_lease(
         self,
@@ -634,6 +694,12 @@ class AutomationWorkerService:
             ),
             "now": self.store._clock(),
         }
+        try:
+            process_tree_plan = prepare_process_tree(workspace_root=self.workspace)
+        except ProcessTreeUnavailable as exc:
+            raise AutomationError(
+                f"automation maintenance was not started: {exc}"
+            ) from exc
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-I",
@@ -642,7 +708,7 @@ class AutomationWorkerService:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **process_group_options(),
+            **process_tree_plan.spawn_options,
         )
         try:
             async with asyncio.timeout(600):
@@ -650,9 +716,33 @@ class AutomationWorkerService:
                     process,
                     input_data=json.dumps(request, allow_nan=False).encode("utf-8"),
                     max_output_bytes=64 * 1024,
+                    process_tree_plan=process_tree_plan,
                 )
-        except BaseException:
-            await asyncio.shield(terminate_process_tree(process))
+        except asyncio.CancelledError as cancellation:
+            cleanup_error, cleanup_cancelled = (
+                await settle_process_tree_after_cancellation(
+                    process, plan=process_tree_plan
+                )
+            )
+            if cleanup_error is not None:
+                cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+            if cleanup_cancelled:
+                cancellation.add_note("Process-tree cleanup was cancelled")
+            raise
+        except ProcessOutputLimitExceeded:
+            # communicate_process already attempted managed-tree cleanup when
+            # it detected the output limit; do not target the root a second time.
+            raise
+        except BaseException as primary:
+            cleanup_error, cleanup_cancelled = (
+                await settle_process_tree_after_cancellation(
+                    process, plan=process_tree_plan
+                )
+            )
+            if cleanup_error is not None:
+                primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+            if cleanup_cancelled:
+                primary.add_note("Process-tree cleanup was cancelled")
             raise
         if process.returncode != 0:
             detail = stderr.decode("utf-8", errors="replace")[-4000:].strip()

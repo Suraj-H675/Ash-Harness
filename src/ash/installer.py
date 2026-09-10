@@ -43,10 +43,66 @@ _MAX_VERSION_OUTPUT_BYTES = 16 * 1024
 _MAX_METADATA_BYTES = 1024 * 1024
 _CAPTURE_CHUNK_BYTES = 8192
 _CAPTURE_QUEUE_SIZE = 8
+_WINDOWS_TASKKILL_TIMEOUT_SECONDS = 5.0
 
 
 class InstallError(RuntimeError):
     """A concise, user-actionable installation failure."""
+
+
+@dataclass(frozen=True)
+class _InstallerProcessTreePlan:
+    """Dependency-free preflight for installer-managed subprocesses."""
+
+    spawn_options: dict[str, Any]
+    taskkill_path: str | None
+    is_windows: bool
+
+
+def _prepare_process_tree() -> _InstallerProcessTreePlan:
+    if os.name == "nt":
+        taskkill_path = _resolve_system_taskkill()
+        if taskkill_path is None:
+            raise InstallError(
+                "reliable Windows descendant cleanup is unavailable: "
+                "taskkill was not found"
+            )
+        return _InstallerProcessTreePlan(
+            spawn_options={
+                "creationflags": getattr(
+                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+                )
+            },
+            taskkill_path=taskkill_path,
+            is_windows=True,
+        )
+    return _InstallerProcessTreePlan(
+        spawn_options={"start_new_session": True},
+        taskkill_path=None,
+        is_windows=False,
+    )
+
+
+def _resolve_system_taskkill() -> str | None:
+    """Resolve taskkill from Windows' system directory, never ambient PATH."""
+
+    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+    if not system_root:
+        return None
+    candidate = os.path.join(system_root, "System32", "taskkill.exe")
+    try:
+        resolved_root = os.path.realpath(system_root)
+        resolved_candidate = os.path.realpath(candidate)
+        common_root = os.path.commonpath((resolved_root, resolved_candidate))
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if os.path.normcase(common_root) != os.path.normcase(resolved_root):
+        return None
+    if os.path.basename(os.path.dirname(resolved_candidate)).casefold() != "system32":
+        return None
+    if not os.path.isfile(resolved_candidate):
+        return None
+    return resolved_candidate
 
 
 @dataclass(frozen=True)
@@ -601,21 +657,40 @@ def _run_streaming(
     """Run a user-visible installer command with a hard upper time limit."""
 
     if runner is subprocess.run:
+        process_tree_plan = _prepare_process_tree()
         popen_kwargs: dict[str, Any] = {"env": dict(environment)}
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = getattr(
-                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-            )
-        else:
-            popen_kwargs["start_new_session"] = True
+        popen_kwargs.update(process_tree_plan.spawn_options)
         process = subprocess.Popen(list(command), **popen_kwargs)
         try:
             returncode = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            _terminate_process(process)
+            try:
+                _terminate_process(process, plan=process_tree_plan)
+            except InstallError as cleanup_error:
+                raise InstallError(
+                    f"{description} timed out after {timeout:g} seconds; "
+                    f"process-tree cleanup failed: {cleanup_error}"
+                ) from exc
             raise InstallError(
                 f"{description} timed out after {timeout:g} seconds."
             ) from exc
+        except OSError as exc:
+            try:
+                _terminate_process(process, plan=process_tree_plan)
+            except InstallError as cleanup_error:
+                raise InstallError(
+                    f"{description} failed while waiting; "
+                    f"process-tree cleanup failed: {cleanup_error}"
+                ) from exc
+            raise InstallError(
+                f"{description} failed while waiting: {type(exc).__name__}"
+            ) from exc
+        except BaseException as primary:
+            try:
+                _terminate_process(process, plan=process_tree_plan)
+            except InstallError as cleanup_error:
+                primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+            raise
         completed = _CapturedResult(returncode=returncode)
         if returncode != 0:
             raise InstallError(failure_message)
@@ -710,12 +785,8 @@ def _run_bounded_subprocess(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
     }
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-        )
-    else:
-        popen_kwargs["start_new_session"] = True
+    process_tree_plan = _prepare_process_tree()
+    popen_kwargs.update(process_tree_plan.spawn_options)
     process = subprocess.Popen(list(command), **popen_kwargs)
     events: queue.Queue[tuple[str, bytes | None]] = queue.Queue(
         maxsize=_CAPTURE_QUEUE_SIZE
@@ -755,11 +826,19 @@ def _run_bounded_subprocess(
     captured = {"stdout": bytearray(), "stderr": bytearray()}
     finished_streams: set[str] = set()
     deadline = time.monotonic() + timeout
+    cleanup_done = False
     try:
         while len(finished_streams) < 2:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                _terminate_process(process)
+                cleanup_done = True
+                try:
+                    _terminate_process(process, plan=process_tree_plan)
+                except InstallError as cleanup_error:
+                    raise InstallError(
+                        f"{description.capitalize()} timed out after {timeout:g} "
+                        f"seconds; process-tree cleanup failed: {cleanup_error}"
+                    )
                 raise InstallError(
                     f"{description.capitalize()} timed out after {timeout:g} seconds."
                 )
@@ -772,19 +851,39 @@ def _run_bounded_subprocess(
                 continue
             target = captured[name]
             if len(target) + len(chunk) > max_bytes:
-                _terminate_process(process)
+                try:
+                    _terminate_process(process, plan=process_tree_plan)
+                except InstallError as cleanup_error:
+                    cleanup_done = True
+                    raise InstallError(
+                        f"{description.capitalize()} returned more than {max_bytes} "
+                        "bytes; process-tree cleanup failed: "
+                        f"{cleanup_error}"
+                    )
+                cleanup_done = True
                 raise InstallError(
                     f"{description.capitalize()} returned more than {max_bytes} bytes."
                 )
             target.extend(chunk)
         returncode = process.wait(timeout=max(1.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired as exc:
-        _terminate_process(process)
+        if not cleanup_done:
+            try:
+                _terminate_process(process, plan=process_tree_plan)
+            except InstallError as cleanup_error:
+                raise InstallError(
+                    f"{description.capitalize()} timed out after {timeout:g} seconds; "
+                    f"process-tree cleanup failed: {cleanup_error}"
+                ) from exc
         raise InstallError(
             f"{description.capitalize()} timed out after {timeout:g} seconds."
         ) from exc
-    except BaseException:
-        _terminate_process(process)
+    except BaseException as primary:
+        if not cleanup_done:
+            try:
+                _terminate_process(process, plan=process_tree_plan)
+            except InstallError as cleanup_error:
+                primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
         raise
     finally:
         stop_readers.set()
@@ -802,10 +901,62 @@ def _run_bounded_subprocess(
     )
 
 
-def _terminate_process(process: subprocess.Popen[Any]) -> None:
+def _terminate_process(
+    process: subprocess.Popen[Any],
+    *,
+    plan: _InstallerProcessTreePlan | None = None,
+) -> None:
+    windows = plan.is_windows if plan is not None else os.name == "nt"
+    if windows:
+        if plan is None or plan.taskkill_path is None:
+            raise InstallError(
+                "managed Windows process-tree cleanup requires successful preflight"
+            )
+        if process.poll() is not None:
+            raise InstallError(
+                "managed root already exited; descendant cleanup is unconfirmed"
+            )
+        failure: str | None = None
+        try:
+            completed = subprocess.run(
+                [plan.taskkill_path, "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=_WINDOWS_TASKKILL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            failure = "taskkill timed out"
+        except OSError as exc:
+            failure = f"taskkill could not execute ({type(exc).__name__})"
+        else:
+            if completed.returncode != 0:
+                failure = f"taskkill exited with status {completed.returncode}"
+        if failure is not None:
+            _best_effort_root_kill(process)
+            raise InstallError(
+                f"Windows descendant cleanup could not be confirmed: {failure}"
+            )
+        try:
+            process.wait(timeout=_WINDOWS_TASKKILL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            _best_effort_root_kill(process)
+            raise InstallError(
+                "Windows descendant cleanup could not be confirmed: "
+                "managed root did not exit"
+            )
+        except OSError as exc:
+            _best_effort_root_kill(process)
+            raise InstallError(
+                "Windows descendant cleanup could not be confirmed: "
+                "managed root could not be reaped"
+            ) from exc
+        return
+
     if process.poll() is not None:
         return
-    if os.name != "nt":
+    options = plan.spawn_options if plan is not None else {"start_new_session": True}
+    if options.get("start_new_session"):
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
@@ -813,9 +964,9 @@ def _terminate_process(process: subprocess.Popen[Any]) -> None:
     else:
         process.terminate()
     try:
-        process.wait(timeout=2)
+        process.wait(timeout=_WINDOWS_TASKKILL_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        if os.name != "nt":
+        if options.get("start_new_session"):
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except (OSError, ProcessLookupError):
@@ -823,9 +974,21 @@ def _terminate_process(process: subprocess.Popen[Any]) -> None:
         else:
             process.kill()
         try:
-            process.wait(timeout=2)
+            process.wait(timeout=_WINDOWS_TASKKILL_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             pass
+
+
+def _best_effort_root_kill(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is None:
+        try:
+            process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        process.wait(timeout=_WINDOWS_TASKKILL_TIMEOUT_SECONDS)
+    except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+        pass
 
 
 def _read_bounded_file(path: Path, *, max_bytes: int) -> bytes:

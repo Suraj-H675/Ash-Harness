@@ -13,8 +13,11 @@ from ash.safe_io import validate_unlinked_directory_path, validate_unlinked_path
 from ash.safety.environment import resolve_host_executable
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
+    ProcessTreeError,
+    ProcessTreeUnavailable,
     communicate_process,
-    process_group_options,
+    prepare_process_tree,
+    settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
 
@@ -371,19 +374,27 @@ async def _run_git(
         if check:
             raise WorktreeError(result.stderr)
         return result
+    try:
+        process_tree_plan = prepare_process_tree(workspace_root=cwd)
+    except ProcessTreeUnavailable as exc:
+        result = GitResult(126, "", f"git command was not started: {exc}")
+        if check:
+            raise WorktreeError(result.stderr) from exc
+        return result
     process = await asyncio.create_subprocess_exec(
         git,
         *args,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        **process_group_options(),
+        **process_tree_plan.spawn_options,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
             communicate_process(
                 process,
                 max_output_bytes=MAX_WORKTREE_GIT_OUTPUT_BYTES,
+                process_tree_plan=process_tree_plan,
             ),
             timeout=30,
         )
@@ -395,11 +406,32 @@ async def _run_git(
             detail
             or f"git output exceeded {MAX_WORKTREE_GIT_OUTPUT_BYTES} bytes",
         )
+        if exc.cleanup_error is not None:
+            result = GitResult(
+                result.returncode,
+                result.stdout,
+                result.stderr
+                + f"; process-tree cleanup failed: {exc.cleanup_error}",
+            )
         if check:
             raise WorktreeError(result.stderr) from exc
         return result
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        await terminate_process_tree(process)
+    except asyncio.TimeoutError as timeout_error:
+        try:
+            await terminate_process_tree(process, plan=process_tree_plan)
+        except ProcessTreeError as exc:
+            timeout_error.add_note(f"Process-tree cleanup failed: {exc}")
+        raise
+    except asyncio.CancelledError as cancellation:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process, plan=process_tree_plan
+            )
+        )
+        if cleanup_error is not None:
+            cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        if cleanup_cancelled:
+            cancellation.add_note("Process-tree cleanup was cancelled")
         raise
     result = GitResult(
         process.returncode if process.returncode is not None else -1,

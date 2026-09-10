@@ -28,8 +28,11 @@ from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
+    ProcessTreeError,
+    ProcessTreeUnavailable,
     communicate_process,
-    process_group_options,
+    prepare_process_tree,
+    settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
 from ash.tools.base import (
@@ -53,6 +56,27 @@ MAX_WORKER_OUTPUT_BYTES = 64 * 1024
 MAX_CONSECUTIVE_TOOL_REFRESHES = 3
 TOOL_REFRESH_DEBOUNCE_SECONDS = 0.05
 TOOL_REFRESH_QUIET_PERIOD_SECONDS = TOOL_REFRESH_DEBOUNCE_SECONDS * 2
+
+
+async def _settle_task_after_cancellation(
+    task: asyncio.Task[Any],
+) -> tuple[BaseException | None, bool]:
+    """Finish runtime cleanup while preserving the caller's cancellation."""
+
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, cancelled
+    return None, cancelled
 
 
 def _default_schema_dialect(protocol_version: str) -> str:
@@ -374,6 +398,7 @@ async def _validate_schema_instance(
             "message": f"validation payload exceeds {MAX_VALIDATION_PAYLOAD_BYTES} bytes",
         }
     try:
+        process_tree_plan = prepare_process_tree()
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-I",
@@ -383,8 +408,14 @@ async def _validate_schema_instance(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=build_scrubbed_environment(),
-            **process_group_options(),
+            **process_tree_plan.spawn_options,
         )
+    except ProcessTreeUnavailable as exc:
+        return {
+            "valid": False,
+            "internal": True,
+            "message": f"could not start isolated schema validator: {exc}",
+        }
     except OSError as exc:
         return {
             "valid": False,
@@ -397,28 +428,75 @@ async def _validate_schema_instance(
                 process,
                 input_data=request,
                 max_output_bytes=MAX_WORKER_OUTPUT_BYTES,
+                process_tree_plan=process_tree_plan,
             ),
             timeout=SCHEMA_VALIDATION_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
-        await terminate_process_tree(process, grace_seconds=0.1)
+        try:
+            await terminate_process_tree(
+                process,
+                grace_seconds=0.1,
+                plan=process_tree_plan,
+            )
+        except ProcessTreeError as exc:
+            cleanup = f"; process-tree cleanup failed: {exc}"
+        else:
+            cleanup = ""
         return {
             "valid": False,
             "internal": True,
-            "message": "schema validation exceeded its isolated deadline",
+            "message": (
+                "schema validation exceeded its isolated deadline" + cleanup
+            ),
         }
-    except ProcessOutputLimitExceeded:
-        await terminate_process_tree(process, grace_seconds=0.1)
+    except ProcessOutputLimitExceeded as exc:
         return {
             "valid": False,
             "internal": True,
-            "message": "schema validator exceeded its output limit",
+            "message": (
+                "schema validator exceeded its output limit"
+                + (
+                    f"; process-tree cleanup failed: {exc.cleanup_error}"
+                    if exc.cleanup_error is not None
+                    else ""
+                )
+            ),
         }
-    except asyncio.CancelledError:
-        await terminate_process_tree(process, grace_seconds=0.1)
+    except asyncio.CancelledError as cancellation:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process,
+                grace_seconds=0.1,
+                plan=process_tree_plan,
+            )
+        )
+        if cleanup_error is not None:
+            cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        if cleanup_cancelled:
+            cancellation.add_note("Process-tree cleanup was cancelled")
         raise
     except Exception as exc:  # noqa: BLE001 - contain validator infrastructure
-        await terminate_process_tree(process, grace_seconds=0.1)
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process,
+                grace_seconds=0.1,
+                plan=process_tree_plan,
+            )
+        )
+        if cleanup_cancelled:
+            cancelled = asyncio.CancelledError()
+            cancelled.add_note("Process-tree cleanup was cancelled")
+            raise cancelled from exc
+        if cleanup_error is not None:
+            return {
+                "valid": False,
+                "internal": True,
+                "message": (
+                    str(exc).strip() or type(exc).__name__
+                )
+                + f"; process-tree cleanup failed: {cleanup_error}",
+            }
         return {
             "valid": False,
             "internal": True,
@@ -976,15 +1054,39 @@ class MCPRuntime:
                     finally:
                         if self._refresh_owners.get(name) is task:
                             self._refresh_owners.pop(name, None)
-            except asyncio.CancelledError:
-                await asyncio.shield(self.close())
+            except asyncio.CancelledError as cancellation:
+                cleanup_task = asyncio.create_task(self.close())
+                cleanup_error, cleanup_cancelled = (
+                    await _settle_task_after_cancellation(cleanup_task)
+                )
+                if cleanup_error is not None:
+                    cancellation.add_note(
+                        f"MCP cleanup failed during cancellation: "
+                        f"{str(cleanup_error)[:500]}"
+                    )
+                if cleanup_cancelled:
+                    cancellation.add_note("MCP cleanup was also cancelled")
                 raise
             except Exception as exc:  # noqa: BLE001
                 self.errors[name] = str(exc)
                 self.clients.pop(name, None)
-                self._refresh_locks.pop(name, None)
-                self._recovery_reconcile_locks.pop(name, None)
-                await client.disconnect()
+                try:
+                    await client.disconnect()
+                except asyncio.CancelledError:
+                    self.errors[name] = (
+                        f"{self.errors[name]}; MCP client cleanup was cancelled"
+                    )
+                    self._retired_clients.add(client)
+                    raise
+                except BaseException as cleanup_error:
+                    self.errors[name] = (
+                        f"{self.errors[name]}; MCP client cleanup failed: "
+                        f"{cleanup_error}"
+                    )
+                    self._retired_clients.add(client)
+                else:
+                    self._refresh_locks.pop(name, None)
+                    self._recovery_reconcile_locks.pop(name, None)
                 continue
             self._server_tools[name] = server_tools
             self._validated_generations[name] = int(
@@ -1200,6 +1302,9 @@ class MCPRuntime:
                 return await asyncio.shield(cleanup), cancelled
             except asyncio.CancelledError:
                 cancelled = True
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
 
     async def _disconnect_clients(
         self, clients: tuple[MCPClient, ...]

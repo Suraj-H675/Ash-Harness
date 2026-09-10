@@ -628,11 +628,32 @@ class AshLoop:
                     )
             self._mcp_tool_names.clear()
             self._mcp_tools_by_server.clear()
-            await asyncio.gather(
+            tool_outcomes = await asyncio.gather(
                 *(tool.aclose() for tool in self.tools.values()),
                 return_exceptions=True,
             )
-            await self.provider.aclose()
+            tool_failures = [
+                (tool.name, outcome)
+                for tool, outcome in zip(
+                    self.tools.values(), tool_outcomes, strict=True
+                )
+                if isinstance(outcome, BaseException)
+            ]
+            provider_error: BaseException | None = None
+            try:
+                await self.provider.aclose()
+            except BaseException as exc:
+                provider_error = exc
+            if tool_failures:
+                details = "; ".join(
+                    f"{name}: {str(error)[:500]}"
+                    for name, error in tool_failures[:8]
+                )
+                raise RuntimeError(
+                    f"failed to close {len(tool_failures)} tool(s): {details}"
+                ) from tool_failures[0][1]
+            if provider_error is not None:
+                raise provider_error
             self._closed = True
 
     async def _fire_session_end(self, reason: str) -> None:
@@ -885,14 +906,42 @@ class AshLoop:
                 + ", ".join(sorted(duplicates))
             )
         old_tools = [
-            self.tools.pop(name)
+            self.tools[name]
             for name in self._plugin_tool_names
             if name in self.tools
         ]
-        await asyncio.gather(
+        close_outcomes = await asyncio.gather(
             *(tool.aclose() for tool in old_tools),
             return_exceptions=True,
         )
+        failures = [
+            outcome
+            for outcome in close_outcomes
+            if isinstance(outcome, BaseException)
+        ]
+        if failures:
+            # Keep the old tool objects as the owners of any process whose
+            # cleanup could not be confirmed.  Do not publish a replacement
+            # while the old lifecycle is still unresolved.
+            candidate_outcomes = await asyncio.gather(
+                *(tool.aclose() for tool in next_tools.values()),
+                return_exceptions=True,
+            )
+            cancellation = next(
+                (
+                    outcome
+                    for outcome in (*failures, *candidate_outcomes)
+                    if isinstance(outcome, asyncio.CancelledError)
+                ),
+                None,
+            )
+            if cancellation is not None:
+                raise cancellation
+            raise RuntimeError(
+                f"failed to close {len(failures)} executable plugin tool(s)"
+            ) from failures[0]
+        for name in self._plugin_tool_names:
+            self.tools.pop(name, None)
         for tool in next_tools.values():
             tool.set_event_sink(self._emit_event)
         self.tools.update(next_tools)
@@ -907,7 +956,7 @@ class AshLoop:
     async def _publish_mcp_runtime(
         self, configs: dict[str, MCPServerConfig]
     ) -> dict[str, str]:
-        from ash.mcp.runtime import MCPRuntime
+        from ash.mcp.runtime import MCPRuntime, _settle_task_after_cancellation
 
         runtime: MCPRuntime
 
@@ -929,8 +978,15 @@ class AshLoop:
         )
         try:
             tools = await runtime.start()
-        except BaseException:
-            await asyncio.shield(runtime.close())
+        except BaseException as primary:
+            cleanup_task = asyncio.create_task(runtime.close())
+            cleanup_error, cleanup_cancelled = await _settle_task_after_cancellation(
+                cleanup_task
+            )
+            if cleanup_error is not None:
+                primary.add_note(f"MCP runtime cleanup failed: {cleanup_error}")
+            if cleanup_cancelled:
+                primary.add_note("MCP runtime cleanup was cancelled")
             raise
         if (
             configs
@@ -954,8 +1010,15 @@ class AshLoop:
                 tool.set_event_sink(self._emit_event)
                 await tool.start()
                 self._started_tool_ids.add(id(tool))
-        except BaseException:
-            await asyncio.shield(runtime.close())
+        except BaseException as primary:
+            cleanup_task = asyncio.create_task(runtime.close())
+            cleanup_error, cleanup_cancelled = await _settle_task_after_cancellation(
+                cleanup_task
+            )
+            if cleanup_error is not None:
+                primary.add_note(f"MCP runtime cleanup failed: {cleanup_error}")
+            if cleanup_cancelled:
+                primary.add_note("MCP runtime cleanup was cancelled")
             raise
         old_runtime = self._mcp_runtime
         for name in self._mcp_tool_names:

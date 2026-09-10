@@ -23,7 +23,13 @@ from ash.plugins.manifest import (
 from ash.plugins.registry import DiscoveredPlugin
 from ash.safety.guard import SafetyGuard
 from ash.sandbox import SandboxBackendUnavailable, SandboxManager
-from ash.sandbox.process_utils import process_group_options, terminate_process_tree
+from ash.sandbox.process_utils import (
+    ProcessTreeError,
+    ProcessTreePlan,
+    ProcessTreeUnavailable,
+    prepare_process_tree,
+    terminate_process_tree,
+)
 from ash.tools.base import (
     BaseTool,
     ToolExecutionOutcome,
@@ -38,6 +44,27 @@ MAX_PLUGIN_RESULT_TEXT_BYTES = 768 * 1024
 
 class PluginRuntimeError(RuntimeError):
     """An executable plugin violated or could not fulfill the runtime contract."""
+
+
+async def _settle_task_after_cancellation(
+    task: asyncio.Task[Any],
+) -> tuple[BaseException | None, bool]:
+    """Wait for a cleanup task while preserving caller cancellation semantics."""
+
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, cancelled
+    return None, cancelled
 
 
 def plugin_tool_name(plugin_name: str, tool_name: str) -> str:
@@ -63,6 +90,7 @@ class PluginHostClient:
         self.sandbox_manager = sandbox_manager
         self.allow_unisolated = allow_unisolated
         self._process: asyncio.subprocess.Process | None = None
+        self._process_tree_plan: ProcessTreePlan | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._stderr_chunks: deque[bytes] = deque()
         self._stderr_size = 0
@@ -92,28 +120,62 @@ class PluginHostClient:
                     timeout=self.runtime.timeout_seconds,
                 )
                 return _parse_tool_result(raw)
-            except asyncio.CancelledError:
-                await self._discard_process()
+            except asyncio.CancelledError as cancellation:
+                cleanup_task = asyncio.create_task(self._discard_process())
+                cleanup_error, _ = await _settle_task_after_cancellation(cleanup_task)
+                if cleanup_error is not None:
+                    cancellation.add_note(
+                        f"Process-tree cleanup failed: {cleanup_error}"
+                    )
                 raise
-            except PluginRuntimeError:
-                await self._discard_process()
+            except PluginRuntimeError as primary:
+                try:
+                    await self._discard_process()
+                except PluginRuntimeError as cleanup_error:
+                    primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
                 raise
-            except Exception as exc:  # noqa: BLE001
-                await self._discard_process()
-                raise PluginRuntimeError(str(exc)) from exc
+            except Exception as primary:  # noqa: BLE001
+                try:
+                    await self._discard_process()
+                except PluginRuntimeError as cleanup_error:
+                    primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+                raise PluginRuntimeError(str(primary)) from primary
 
     async def aclose(self) -> None:
         """Stop the shared host and all of its descendants, idempotently."""
 
         async with self._lock:
-            if self._closed:
+            if self._closed and self._process is None:
                 return
+            was_closed = self._closed
             self._closed = True
             process = self._process
-            if process is not None and process.returncode is None:
-                with suppress(Exception):
+            cancelled = False
+            if not was_closed and process is not None and process.returncode is None:
+                try:
                     await self._exchange("shutdown", {}, timeout=1.0)
-            await self._discard_process()
+                except asyncio.CancelledError:
+                    cancelled = True
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.uncancel()
+                except Exception:
+                    pass
+            cleanup_task = asyncio.create_task(self._discard_process())
+            cleanup_error, cleanup_cancelled = await _settle_task_after_cancellation(
+                cleanup_task
+            )
+            cancelled = cancelled or cleanup_cancelled
+            if cleanup_error is not None:
+                if cancelled:
+                    cancellation = asyncio.CancelledError()
+                    cancellation.add_note(
+                        f"Process-tree cleanup failed: {cleanup_error}"
+                    )
+                    raise cancellation from cleanup_error
+                raise cleanup_error
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _ensure_started(self) -> None:
         if self.running:
@@ -131,9 +193,16 @@ class PluginHostClient:
             )
         except SandboxBackendUnavailable as exc:
             raise PluginRuntimeError(f"plugin sandbox unavailable: {exc}") from exc
+        try:
+            process_tree_plan = prepare_process_tree(workspace_root=self.plugin.root)
+        except ProcessTreeUnavailable as exc:
+            raise PluginRuntimeError(
+                f"plugin process was not started: {exc}"
+            ) from exc
         self._stderr_chunks.clear()
         self._stderr_size = 0
         env = _plugin_environment()
+        self._process_tree_plan = process_tree_plan
         try:
             self._process = await asyncio.create_subprocess_exec(
                 *invocation.argv,
@@ -143,10 +212,11 @@ class PluginHostClient:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 limit=MAX_PLUGIN_MESSAGE_BYTES + 1,
-                **process_group_options(),
+                **process_tree_plan.spawn_options,
             )
         except OSError as exc:
             self._process = None
+            self._process_tree_plan = None
             raise PluginRuntimeError(f"cannot start plugin runtime: {exc}") from exc
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         try:
@@ -291,14 +361,25 @@ class PluginHostClient:
 
     async def _discard_process(self) -> None:
         process = self._process
-        self._process = None
+        plan = self._process_tree_plan
+        cleanup_error: ProcessTreeError | None = None
         if process is not None:
             if process.stdin is not None:
                 process.stdin.close()
-            await terminate_process_tree(process)
+            try:
+                await terminate_process_tree(process, plan=plan)
+            except ProcessTreeError as exc:
+                cleanup_error = exc
             if process.stdin is not None:
                 with suppress(BrokenPipeError, ConnectionResetError):
                     await process.stdin.wait_closed()
+        if cleanup_error is not None:
+            self._closed = True
+            raise PluginRuntimeError(
+                f"plugin process cleanup failed: {cleanup_error}"
+            ) from cleanup_error
+        self._process = None
+        self._process_tree_plan = None
         task = self._stderr_task
         self._stderr_task = None
         if task is not None:
@@ -347,7 +428,7 @@ class PluginRuntimeTool(BaseTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=str(exc),
+                error=_plugin_error_text(exc),
                 outcome=ToolExecutionOutcome.UNKNOWN,
             )
 
@@ -391,6 +472,12 @@ def build_plugin_runtime_tools(
             seen.add(tool.name)
             tools.append(tool)
     return tools
+
+
+def _plugin_error_text(error: BaseException) -> str:
+    parts = [str(error)]
+    parts.extend(str(note) for note in getattr(error, "__notes__", ()))
+    return "; ".join(part for part in parts if part)[:MAX_PLUGIN_RESULT_TEXT_BYTES]
 
 
 def _parse_tool_result(value: Any) -> ToolResult:

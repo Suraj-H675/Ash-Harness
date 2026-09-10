@@ -25,7 +25,13 @@ from ash.mcp.oauth import (
     normalize_oauth_scope,
 )
 from ash.safety.environment import build_scrubbed_environment
-from ash.sandbox.process_utils import process_group_options, terminate_process_tree
+from ash.sandbox.process_utils import (
+    ProcessTreeError,
+    ProcessTreeUnavailable,
+    ProcessTreePlan,
+    prepare_process_tree,
+    terminate_process_tree,
+)
 
 
 LATEST_PROTOCOL_VERSION = "2025-11-25"
@@ -59,6 +65,28 @@ MAX_TASK_POLL_INTERVAL_SECONDS = 30.0
 TASK_STATUS_NOTIFICATION = "notifications/tasks/status"
 TASK_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 TASK_STATUSES = TASK_TERMINAL_STATUSES | {"working", "input_required"}
+
+
+async def _settle_task_after_cancellation(
+    task: asyncio.Task[Any],
+) -> tuple[BaseException | None, bool]:
+    """Finish a shielded cleanup task before returning cancellation."""
+
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, cancelled
+    return None, cancelled
+
 
 RequestHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 NotificationHandler = Callable[[str, dict[str, Any]], Awaitable[None] | None]
@@ -188,6 +216,8 @@ class MCPClient:
         self.server_info: dict[str, Any] = {}
         self.server_instructions = ""
         self._process: asyncio.subprocess.Process | None = None
+        self._process_tree_plan: ProcessTreePlan | None = None
+        self._disconnect_cleanup_task: asyncio.Task[None] | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._server_tasks: set[asyncio.Task[None]] = set()
@@ -278,8 +308,15 @@ class MCPClient:
                 elif self.config.transport == "http":
                     await self._probe_modern_http()
                 await self._initialize_protocol()
-            except BaseException:
-                await asyncio.shield(self.disconnect())
+            except BaseException as primary:
+                cleanup_task = asyncio.create_task(self.disconnect())
+                cleanup_error, cleanup_cancelled = (
+                    await _settle_task_after_cancellation(cleanup_task)
+                )
+                if cleanup_error is not None:
+                    primary.add_note(f"MCP disconnect cleanup failed: {cleanup_error}")
+                if cleanup_cancelled:
+                    primary.add_note("MCP disconnect cleanup was cancelled")
                 raise
 
     async def _initialize_protocol(self) -> None:
@@ -443,17 +480,30 @@ class MCPClient:
 
     async def _connect_stdio(self) -> None:
         env = build_scrubbed_environment(overrides=self.config.resolved_env)
-        self._process = await asyncio.create_subprocess_exec(
-            self.config.resolved_command,
-            *self.config.resolved_args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            cwd=self.config.resolved_cwd,
-            limit=MAX_STDIO_MESSAGE_BYTES + 1,
-            **process_group_options(),
-        )
+        try:
+            process_tree_plan = prepare_process_tree(
+                workspace_root=self.config.resolved_cwd
+            )
+        except ProcessTreeUnavailable as exc:
+            raise MCPProtocolError(
+                f"MCP stdio server was not started: {exc}"
+            ) from exc
+        self._process_tree_plan = process_tree_plan
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                self.config.resolved_command,
+                *self.config.resolved_args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=self.config.resolved_cwd,
+                limit=MAX_STDIO_MESSAGE_BYTES + 1,
+                **process_tree_plan.spawn_options,
+            )
+        except BaseException:
+            self._process_tree_plan = None
+            raise
         self._reader_task = asyncio.create_task(self._read_stdio(self._process))
         self._stderr_task = asyncio.create_task(self._drain_stderr(self._process))
 
@@ -495,11 +545,30 @@ class MCPClient:
             if isinstance(message, dict):
                 self._dispatch_incoming(message)
         assert error is not None
-        self._fail_pending(error)
         self._initialized = False
-        if self._process is process:
+        process_is_current = self._process is process
+        plan = self._process_tree_plan
+        cleanup_error: ProcessTreeError | None = None
+        try:
+            await terminate_process_tree(
+                process,
+                grace_seconds=0.1,
+                plan=plan,
+            )
+        except ProcessTreeError as exc:
+            cleanup_error = exc
+        if process_is_current and cleanup_error is None:
             self._process = None
-        await terminate_process_tree(process, grace_seconds=0.1)
+            self._process_tree_plan = None
+        elif process_is_current:
+            self._process = process
+        if cleanup_error is not None:
+            error = MCPProtocolError(
+                f"{error}; process-tree cleanup failed: {cleanup_error}"
+            )
+        self._fail_pending(error)
+        if cleanup_error is not None:
+            raise error
 
     def _fail_pending(self, error: MCPProtocolError) -> None:
         for future in self._pending.values():
@@ -1645,6 +1714,50 @@ class MCPClient:
             await self.notify("notifications/roots/list_changed")
 
     async def disconnect(self) -> None:
+        """Disconnect without abandoning an in-flight process cleanup."""
+
+        try:
+            await self._disconnect_impl()
+        except asyncio.CancelledError as cancellation:
+            process = self._process
+            plan = self._process_tree_plan
+            cleanup_task = self._disconnect_cleanup_task
+            if cleanup_task is None and process is not None:
+                cleanup_task = asyncio.create_task(
+                    terminate_process_tree(process, plan=plan)
+                )
+                self._disconnect_cleanup_task = cleanup_task
+            cleanup_error: BaseException | None = None
+            cleanup_cancelled = False
+            if cleanup_task is not None:
+                cleanup_error, cleanup_cancelled = (
+                    await _settle_task_after_cancellation(cleanup_task)
+                )
+                if self._disconnect_cleanup_task is cleanup_task:
+                    self._disconnect_cleanup_task = None
+                if cleanup_error is None and process is not None:
+                    if self._process is process:
+                        self._process = None
+                        self._process_tree_plan = None
+
+            task_cleanup = asyncio.create_task(self._cancel_disconnect_tasks())
+            task_error, task_cancelled = await _settle_task_after_cancellation(
+                task_cleanup
+            )
+            self._clear_disconnect_state()
+            if cleanup_error is not None:
+                cancellation.add_note(
+                    f"MCP process-tree cleanup failed: {cleanup_error}"
+                )
+            if cleanup_cancelled:
+                cancellation.add_note("MCP process cleanup task was cancelled")
+            if task_error is not None:
+                cancellation.add_note(f"MCP task cleanup failed: {task_error}")
+            if task_cancelled:
+                cancellation.add_note("MCP task cleanup was cancelled")
+            raise
+
+    async def _disconnect_impl(self) -> None:
         self._initialized = False
         self._stop_http_events()
         if self._legacy_sse_discovery and not self._legacy_sse_discovery.done():
@@ -1663,20 +1776,56 @@ class MCPClient:
         if self._http is not None and self._owns_http:
             await self._http.aclose()
             self._http = None
-        if self._process is not None:
-            await terminate_process_tree(self._process)
-            self._process = None
-        for task in (self._reader_task, self._stderr_task, *self._server_tasks):
-            if task is not None:
+        cleanup_error: ProcessTreeError | None = None
+        process = self._process
+        if process is not None:
+            try:
+                cleanup_task = asyncio.create_task(
+                    terminate_process_tree(
+                        process,
+                        plan=self._process_tree_plan,
+                    )
+                )
+                self._disconnect_cleanup_task = cleanup_task
+                interrupted = False
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    interrupted = True
+                    await _settle_task_after_cancellation(cleanup_task)
+                    raise
+                finally:
+                    if (
+                        not interrupted
+                        and self._disconnect_cleanup_task is cleanup_task
+                    ):
+                        self._disconnect_cleanup_task = None
+            except ProcessTreeError as exc:
+                cleanup_error = exc
+            else:
+                self._process = None
+                self._process_tree_plan = None
+        await self._cancel_disconnect_tasks()
+        self._clear_disconnect_state()
+        if cleanup_error is not None:
+            raise MCPProtocolError(
+                f"MCP server {self.config.name!r} process cleanup failed: "
+                f"{cleanup_error}"
+            ) from cleanup_error
+
+    async def _cancel_disconnect_tasks(self) -> None:
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in (self._reader_task, self._stderr_task, *self._server_tasks)
+            if task is not None and task is not current
+        ]
+        for task in tasks:
+            if not task.done():
                 task.cancel()
-        await asyncio.gather(
-            *(
-                task
-                for task in (self._reader_task, self._stderr_task, *self._server_tasks)
-                if task
-            ),
-            return_exceptions=True,
-        )
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _clear_disconnect_state(self) -> None:
         self._reader_task = None
         self._stderr_task = None
         self._server_tasks.clear()
