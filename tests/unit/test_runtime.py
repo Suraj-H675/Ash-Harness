@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 
@@ -24,6 +25,43 @@ class RuntimeProvider(ProviderABC):
     async def stream_chat(self, messages, temperature=0.0, tools=None):
         if False:
             yield
+
+
+def test_runtime_defers_auto_memory_index_until_async_session_start(tmp_path) -> None:
+    note = tmp_path / "memory-note.py"
+    note.write_text("runtime memory startup sentinel\n", encoding="utf-8")
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="fts5",
+        chroma_persist_dir=tmp_path / "memory",
+        memory_auto_index=True,
+        memory_auto_index_max_files=10,
+        memory_auto_index_max_bytes_per_file=4096,
+        repo_map_enabled=False,
+    )
+
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+
+    assert runtime.loop._memory_auto_index_task is None
+
+    async def exercise() -> None:
+        await runtime.loop.start_session()
+        task = runtime.loop._memory_auto_index_task
+        assert task is not None
+        assert await task == 1
+        hits = await runtime.loop.semantic_search("startup sentinel")
+        assert hits and hits[0].file_path.endswith("memory-note.py")
+        await runtime.loop.aclose()
+
+    asyncio.run(exercise())
 
 
 def test_runtime_keeps_critical_blocklist_with_user_patterns(tmp_path) -> None:

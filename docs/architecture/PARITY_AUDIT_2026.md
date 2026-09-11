@@ -370,6 +370,9 @@ login/logout semantics, and dependency range were preserved.
   fixes plus the A2A cancellation lifecycle repair.
 - A later complete gate, `uv run pytest -v --timeout=120
   --timeout-method=thread`, passed **2222 tests with 4 skips** in 64.38s.
+- After the automatic-memory runtime-wiring repair, the complete gate
+  `uv run pytest -q --timeout=120 --timeout-method=thread` passed **2223 tests
+  with 4 skips** in 61.94s.
 - An isolated temporary-home CLI smoke matrix also passed the read-only
   `--version`, help, config, provider, sandbox, storage, metrics, sessions,
   plans, cron, permissions, extensions, agents, MCP, LSP, and profile status
@@ -549,3 +552,20 @@ fails on the old behavior and passes after the repair. A follow-up real CLI
 backup/restore workflow completed without leaving any temporary restore
 artifacts; the established backup, restore, preservation, and storage error
 semantics remain unchanged.
+
+### Candidate F-15 — automatic memory indexing crashed CLI startup
+
+An isolated real CLI run with trusted project memory auto-indexing enabled
+reproduced a startup failure before the fix: `build_runtime()` called
+`asyncio.create_task()` synchronously, so the CLI raised `RuntimeError: no
+running event loop` and emitted an unawaited `index_project_memory` coroutine
+warning. This was a confirmed runtime-wiring defect, not a provider failure.
+
+The repair carries the auto-index configuration into `AshLoop` and schedules
+the one background indexing task only after `start_session()` is running in an
+async event loop. A focused regression verifies runtime construction outside an
+event loop, session-start scheduling, indexing, and searchable content. A real
+loopback-provider CLI run now exits successfully and leaves the expected FTS5
+workspace record. Existing shutdown ownership still cancels the bounded
+background task during loop closure; no new persistence or public API semantics
+were introduced.

@@ -439,6 +439,9 @@ class AshLoop:
         openai_api_key: str = "",
         onnx_model_path: Path | None = None,
         chroma_persist_dir: Path | None = None,
+        auto_index_memory: bool = False,
+        auto_index_max_files: int = 100,
+        auto_index_max_bytes_per_file: int = DEFAULT_MEMORY_MAX_BYTES_PER_FILE,
         mcp_config_path: Path | None = None,
         mcp_configs: dict[str, MCPServerConfig] | None = None,
         config: "AshConfig | None" = None,
@@ -546,6 +549,9 @@ class AshLoop:
         self.enable_semantic_memory = enable_semantic_memory
         self._vector_pipeline: "VectorSearchPipeline | None" = None
         self._memory_auto_index_task: asyncio.Task[int] | None = None
+        self._auto_index_memory = auto_index_memory
+        self._auto_index_max_files = auto_index_max_files
+        self._auto_index_max_bytes_per_file = auto_index_max_bytes_per_file
         self._pending_memory_context: str = ""
         self._pending_plan_context: str = ""
         if enable_semantic_memory:
@@ -797,6 +803,7 @@ class AshLoop:
                 if injected:
                     self.system_prompt = f"{self.system_prompt}\n\n{injected}"
             await self._start_runtime_tools()
+            self._start_memory_auto_index()
             return self.current_session
 
         # New session: optionally recall recent context from prior sessions
@@ -829,6 +836,7 @@ class AshLoop:
             if injected:
                 self.system_prompt = f"{self.system_prompt}\n\n{injected}"
         await self._start_runtime_tools()
+        self._start_memory_auto_index()
         return session
 
     async def _start_runtime_tools(self) -> None:
@@ -2776,6 +2784,22 @@ class AshLoop:
         return "[Skill nudge] Consider using:\n" + "\n".join(suggestions)
 
     # --- semantic memory -----------------------------------------------------
+
+    def _start_memory_auto_index(self) -> None:
+        """Start configured project indexing once an async session is live."""
+
+        if (
+            not self._auto_index_memory
+            or self._vector_pipeline is None
+            or self._memory_auto_index_task is not None
+        ):
+            return
+        self._memory_auto_index_task = asyncio.create_task(
+            self.index_project_memory(
+                max_files=self._auto_index_max_files,
+                max_bytes_per_file=self._auto_index_max_bytes_per_file,
+            )
+        )
 
     def _init_vector_pipeline(
         self,
