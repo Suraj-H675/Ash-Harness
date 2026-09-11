@@ -212,7 +212,11 @@ def main() -> None:
     assert console_version.stdout.strip().startswith("ash ")
 
     with tempfile.TemporaryDirectory(prefix="ash-wheel-smoke-") as temporary:
-        root = Path(temporary)
+        # macOS commonly spells the temporary directory through the /var
+        # system alias.  Use the canonical test root so the anchored
+        # filesystem checks do not mistake that stable OS alias for an
+        # attacker-controlled path component.
+        root = Path(temporary).resolve()
         home = root / "home"
         workspace = root / "workspace"
         home.mkdir()
