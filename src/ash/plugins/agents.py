@@ -66,7 +66,23 @@ def parse_agent_definition(path: Path, *, namespace: str = "") -> AgentDefinitio
         raw = handle.read(MAX_AGENT_BYTES + 1)
     if len(raw) > MAX_AGENT_BYTES:
         raise ValueError("agent definition exceeds 256 KiB")
-    text = raw.decode("utf-8")
+    return parse_agent_definition_bytes(raw, path, namespace=namespace)
+
+
+def parse_agent_definition_bytes(
+    raw: bytes,
+    path: Path,
+    *,
+    namespace: str = "",
+) -> AgentDefinition:
+    """Parse one bounded agent definition from immutable bytes."""
+
+    if len(raw) > MAX_AGENT_BYTES:
+        raise ValueError("agent definition exceeds 256 KiB")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("agent definition is not valid UTF-8") from exc
     metadata: dict[str, str] = {}
     body = text
     if text.startswith("---\n"):

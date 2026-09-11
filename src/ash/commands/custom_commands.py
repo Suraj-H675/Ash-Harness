@@ -137,9 +137,31 @@ def _parse(
         raise ValueError("command file cannot be a link")
     with path.open("rb") as handle:
         raw = handle.read(MAX_COMMAND_BYTES + 1)
+    return parse_custom_command_bytes(
+        raw,
+        path,
+        root,
+        source,
+        namespace=namespace,
+    )
+
+
+def parse_custom_command_bytes(
+    raw: bytes,
+    path: Path,
+    root: Path,
+    source: str,
+    *,
+    namespace: str = "",
+) -> CustomCommand:
+    """Parse one bounded custom command from immutable bytes."""
+
     if len(raw) > MAX_COMMAND_BYTES:
         raise ValueError("command file exceeds 128 KiB")
-    text = raw.decode("utf-8")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("command file is not valid UTF-8") from exc
     metadata: dict[str, str] = {}
     body = text
     if text.startswith("---\n"):

@@ -197,6 +197,23 @@ def _parse(
     return re.compile(pattern), command
 
 
+def validate_command_hooks_payload(payload: Any, path: Path) -> None:
+    """Validate a hook configuration already obtained from immutable bytes."""
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"Hook config must be an object: {path}")
+    unknown_events = set(payload) - HOOK_CONFIG_EVENTS
+    if unknown_events:
+        raise ValueError(
+            f"Hook config contains unknown events in {path}: "
+            + ", ".join(sorted(str(event) for event in unknown_events))
+        )
+    ordered_events = ("pre_tool", "post_tool", "session_start", *LIFECYCLE_EVENTS)
+    for event in ordered_events:
+        for item in _entries(payload, event, path):
+            _parse(item, path, matcher_required=event == "tool_error")
+
+
 async def _run(
     command: list[str],
     payload: dict[str, Any],

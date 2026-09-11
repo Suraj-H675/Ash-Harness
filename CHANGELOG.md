@@ -58,6 +58,12 @@ All notable changes to Ash are documented here. The format follows
   installs without a signed catalog retain existing HTTPS Git behavior.
 
 ### Fixed
+- Hardened plugin lifecycle installation and replacement with bounded immutable
+  snapshot validation/publication, descriptor-relative no-follow traversal,
+  anchored Git temporary checkout setup, bounded tree traversal descriptors,
+  and fail-closed extension-state reads. Documented the trusted host and
+  OS-account boundary for hostile same-principal host mutation while retaining
+  normal POSIX plugin lifecycle support.
 - Restored interactive `/reload-plugins`, which now performs its atomic
   component refresh instead of returning before the reload call.
 - Fixed interactive MCP status/refresh dispatch so the handler is reachable,

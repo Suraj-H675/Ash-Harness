@@ -196,9 +196,60 @@ default/alternate agent databases. The focused CLI/persistence set passed
 human/JSON paths and verified alternate-database agent listing and message
 mutation without touching the default database.
 
-F-09 plugin lifecycle confinement remains a separate confirmed finding and is
-paused at the existing Sol decision boundary; no F-09 production changes were
-made in this batch.
+### F-09 — plugin lifecycle confinement and immutable validation boundary
+
+F-09 is resolved under the explicit trusted-host and OS-account boundary now
+documented in `SECURITY.md`. The authorized implementation work in this batch
+added a bounded, disk-backed `PluginSnapshot`: an anchored source tree is
+captured once, manifest parsing and semantic validation of skills, commands,
+agents, hooks, and MCP configuration consume the snapshot bytes, and
+stage/publication writes consume only those same bytes. `InstalledPlugin.root`
+remains an ordinary `Path`, and destination identity visibility is checked
+before success is returned. The snapshot is the semantic authority; destination
+digest checks remain defense in depth and are not treated as the binding
+guarantee.
+
+Plugin packages, manifests, Git checkouts, generated content, links, and
+filesystem layouts remain untrusted. Ash's application-level filesystem
+guarantee assumes that the Ash OS account and Ash-managed host state are not
+concurrently controlled by a hostile process with equivalent OS-user write
+authority. Ash does not claim to defeat arbitrary same-principal mutation of
+the POSIX namespace or post-publication changes to the installed tree. Such
+environments require an actual host boundary such as separate OS users,
+containers/VMs, or hosts. This is a threat-model boundary, not a claim that
+POSIX descriptors solve those races.
+
+The two mechanical Hume repairs also landed: Git now acquires the selected
+temporary parent before creating an `ash-plugin-git-*` directory and cleans
+the checkout through held descriptors; `_tree_exceeds_bytes_at()` closes
+completed child descriptors promptly, so live descriptors scale with traversal
+depth rather than directory count. Deterministic regressions cover source
+substitution, snapshot-only semantic publication, staged/destination content
+replacement, Git temporary-root setup failure without a leaked directory, and
+a 1,400-directory descriptor-stress traversal.
+
+The current descriptor-relative POSIX backend explicitly reports
+`strict_identity_mutation` unavailable. Strict create and regular-file/tree
+cleanup entry points therefore fail closed before mutation, and deterministic
+tests verify that replacements remain untouched. The ordinary Linux/macOS
+descriptor-relative lifecycle remains available for uncontended behavior, but
+the implementation does not claim that repeated `stat`/`fstat`, locking,
+quarantine, or rename closes the impossible POSIX same-principal create/delete
+namespace races. `strict_identity_mutation` is an internal capability fact for
+optional future hardening, not a prerequisite for ordinary plugin lifecycle
+support. No Linux/macOS mutation disablement or speculative native Windows
+backend was introduced.
+
+The focused lifecycle suite passed **52 tests**; the related plugin,
+catalog, extension, manifest, registry, runtime, and agent suites passed
+**179 tests**; related skill, hook, and MCP suites passed **338 tests**; the
+full repository suite passed **2,221 tests with 4 skips**. Ruff, mypy, the
+wheel build, built-wheel installation, and packaging smoke passed. The
+deterministic same-principal race evidence is retained as the platform and
+threat-model boundary; it is not recorded as a POSIX race fixed by descriptor
+rechecks. Native Windows identity semantics remain unverified, and no native
+Windows strict backend is claimed. Normal Linux/macOS plugin install,
+replacement, and uninstall remain supported under the documented boundary.
 
 ### F-06 — JSON-RPC explicit-null request IDs
 

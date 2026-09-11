@@ -181,6 +181,32 @@ def parse_instruction_skill(path: Path, *, namespace: str = "") -> InstructionSk
     if path.name != "SKILL.md" or not path.is_file():
         raise ValueError("skill path must point to a SKILL.md file")
     text = _read_limited_text(path, MAX_SKILL_BYTES, "skill file exceeds 512 KiB")
+    return _parse_instruction_skill_text(text, path, namespace=namespace)
+
+
+def parse_instruction_skill_bytes(
+    raw: bytes,
+    path: Path,
+    *,
+    namespace: str = "",
+) -> InstructionSkill:
+    """Parse one bounded skill from immutable bytes."""
+
+    if len(raw) > MAX_SKILL_BYTES:
+        raise ValueError("skill file exceeds 512 KiB")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("skill file is not valid UTF-8") from exc
+    return _parse_instruction_skill_text(text, path, namespace=namespace)
+
+
+def _parse_instruction_skill_text(
+    text: str,
+    path: Path,
+    *,
+    namespace: str = "",
+) -> InstructionSkill:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     frontmatter_text, instructions = _split_frontmatter(text)
     try:

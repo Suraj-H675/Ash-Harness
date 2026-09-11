@@ -309,6 +309,24 @@ def load_mcp_servers(
             raise ValueError(f"MCP config exceeds 256 KiB: {config_path}") from exc
         raise ValueError(f"MCP config is not readable: {config_path}: {exc}") from exc
     raw: Any = strict_json_loads(raw_bytes)
+    return parse_mcp_servers_payload(
+        raw,
+        config_path,
+        namespace=namespace,
+        cwd=cwd,
+        environment=environment,
+    )
+
+
+def parse_mcp_servers_payload(
+    raw: Any,
+    config_path: Path,
+    *,
+    namespace: str = "",
+    cwd: Path | None = None,
+    environment: dict[str, str] | None = None,
+) -> dict[str, MCPServerConfig]:
+    """Validate MCP server data that was already read from immutable bytes."""
 
     if not isinstance(raw, dict):
         raise ValueError(f"MCP config must be an object: {config_path}")

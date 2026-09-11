@@ -20,4 +20,30 @@ not equivalent to trusted generated content. Reports involving path escape,
 command-policy bypass, credential exposure, origin confusion, sandbox escape,
 or cross-session data access are especially important.
 
+### Trusted host and OS-account boundary
+
+Ash treats plugin packages, manifests, Git checkouts, workspace and generated
+content, filesystem metadata, links, and other external inputs as untrusted.
+Security-sensitive lifecycle operations use anchored and no-follow filesystem
+handling, bounded immutable snapshots, validation before publication, private
+state roots, and transactional replacement to prevent untrusted input from
+redirecting Ash outside its intended filesystem scope.
+
+Ash's local filesystem security model assumes that the operating-system
+account running Ash and Ash-managed host state are not concurrently controlled
+by an adversarial process with equivalent host write authority. Ash does not
+provide an application-level isolation boundary against another hostile
+process that can arbitrarily modify Ash-managed files or directories using the
+same OS credentials as the Ash process. Such an attacker can interfere with
+substantially more than plugin lifecycle operations and is outside this local
+application boundary.
+
+This boundary does not make plugin code or plugin inputs trusted. Malicious
+plugin sources, remote Git repositories, generated content, manifests,
+symlinks, path tricks, malformed metadata, oversized files, and dependency
+configuration remain untrusted and are validated and confined accordingly.
+Environments requiring isolation between mutually adversarial local principals
+must separate them using distinct OS users, appropriately isolated
+containers/VMs, or separate hosts.
+
 Only the latest repository version is currently supported for security fixes.
