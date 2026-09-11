@@ -183,40 +183,48 @@ class AnchoredDirectory:
             self._descriptor = -1
 
     def validation_path(self) -> Path:
-        """Return a stable path view of this held directory for legacy validators."""
+        """Return the held directory's visible path for legacy validators.
 
-        held = os.fstat(self.descriptor)
-        for prefix in ("/proc/self/fd", "/dev/fd"):
-            descriptor_path = f"{prefix}/{self.descriptor}"
-            try:
-                target = os.readlink(descriptor_path)
-                candidate = Path(target)
-                current = os.stat(candidate, follow_symlinks=False)
-            except (OSError, ValueError):
-                continue
-            if _same_identity(held, current) and stat.S_ISDIR(current.st_mode):
-                return candidate
-        # A held descriptor remains usable after its visible name is removed.
-        # This view is only for internal validation; public InstalledPlugin.root
-        # remains the ordinary caller-visible Path.
-        for prefix in ("/proc/self/fd", "/dev/fd"):
-            descriptor_view = Path(f"{prefix}/{self.descriptor}")
-            if descriptor_view.exists():
-                return descriptor_view
-        raise AnchoredFilesystemError(
-            "no stable path view is available for anchored plugin validation"
-        )
+        A descriptor pseudo-path is not portable as a directory pathname:
+        macOS exposes ``/dev/fd`` entries, but child lookups such as
+        ``/dev/fd/12/component`` do not provide the Linux ``/proc`` behavior
+        that the old fallback relied on.  Legacy validators are therefore
+        given the ordinary path only while it still identifies the held
+        directory.  If that name has been displaced, failing closed is safer
+        than handing the validator a path that may not address the descriptor.
+        """
+
+        return self._visible_path()
 
     def descriptor_path(self) -> Path:
-        """Return the procfs path for this descriptor when available."""
+        """Return a pathname usable by an external process while held.
 
-        for prefix in ("/proc/self/fd", "/dev/fd"):
-            candidate = Path(f"{prefix}/{self.descriptor}")
-            if candidate.exists():
-                return candidate
-        raise AnchoredFilesystemUnavailable(
-            "descriptor-relative filesystem path is unavailable"
-        )
+        External tools such as Git need a normal directory pathname.  Keep
+        the descriptor as the authority for Ash's own operations, and only
+        expose the visible pathname after confirming that it still identifies
+        the held directory.  Descriptor pseudo-paths are intentionally not
+        used because their child-path semantics differ across POSIX systems.
+        """
+
+        try:
+            return self._visible_path()
+        except OSError as exc:
+            raise AnchoredFilesystemUnavailable(
+                "the anchored directory has no usable visible pathname"
+            ) from exc
+
+    def _visible_path(self) -> Path:
+        held = os.fstat(self.descriptor)
+        try:
+            current = os.stat(self.path, follow_symlinks=False)
+        except OSError:
+            raise
+        if not stat.S_ISDIR(current.st_mode) or not _same_identity(held, current):
+            raise AnchoredFilesystemError(
+                f"anchored directory path no longer identifies the held directory: "
+                f"{self.path}"
+            )
+        return self.path
 
     def __enter__(self) -> AnchoredDirectory:
         return self

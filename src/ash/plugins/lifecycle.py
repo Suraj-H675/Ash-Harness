@@ -762,7 +762,7 @@ def install_git_plugin(
             # creating any Ash-owned checkout entry.  In particular, do not
             # let a symlinked TMPDIR select a pathname outside the anchor.
             temporary_parent = AnchoredDirectory.open(
-                Path(tempfile.gettempdir()),
+                _temporary_parent_path(),
                 create=False,
                 private=False,
             )
@@ -1073,6 +1073,27 @@ def _verify_catalog_checkout(
 
 def _is_link(path: Path) -> bool:
     return path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
+
+
+def _temporary_parent_path() -> Path:
+    """Return the lexical temporary parent with macOS's stable /var alias fixed.
+
+    macOS commonly exposes the temporary directory below ``/var`` while
+    ``/var`` itself is the system alias for ``/private/var``.  The anchored
+    walker intentionally rejects replaceable symlink components, so normalize
+    this one documented system alias before opening it.  User-controlled links
+    below the alias remain visible to and rejected by ``AnchoredDirectory``.
+    """
+
+    temporary = Path(os.path.abspath(Path(tempfile.gettempdir())))
+    var_alias = Path("/var")
+    try:
+        relative = temporary.relative_to(var_alias)
+        if Path(os.path.realpath(var_alias)) == Path("/private/var"):
+            return Path("/private/var").joinpath(*relative.parts)
+    except (OSError, ValueError):
+        pass
+    return temporary
 
 
 def _validate_plugin_name(name: str) -> None:

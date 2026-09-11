@@ -422,23 +422,21 @@ def test_install_ancestor_swap_cannot_redirect_staged_tree(
 
     monkeypatch.setattr(AnchoredDirectory, "create_child", swap_before_staging)
 
-    observed: list[Path] = []
+    observed: list[object] = []
 
-    def validate_staged(root: Path, manifest: object) -> None:
-        del manifest
-        observed.append(root)
-        assert (root / "README.md").read_text(encoding="utf-8") == "plugin contents"
+    def validate_staged(snapshot: object, manifest: object) -> None:
+        observed.append(snapshot)
+        extensions._validate_plugin_contents_at(snapshot, manifest)
 
     with pytest.raises(PluginLifecycleError, match="displaced"):
         install_local_plugin(
             source,
             destination_root=destination_root,
-            validator=validate_staged,
+            _validator_at=validate_staged,
         )
 
     assert swapped
     assert observed
-    assert observed[0].is_relative_to(displaced_parent)
     assert not (outside_parent / "plugins" / "example").exists()
     assert not (displaced_parent / "plugins" / "example").exists()
 
@@ -1259,10 +1257,17 @@ def test_changed_destination_content_cannot_be_published_after_snapshot_copy(
         nonlocal swapped
         original_fsync(descriptor)
         try:
-            visible = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            visible_metadata = os.stat(
+                tmp_path / "installed" / "example" / "commands" / "review.md",
+                follow_symlinks=False,
+            )
         except OSError:
             return
-        if visible.parent.name == "commands" and visible.parent.parent.name == "example":
+        opened_metadata = os.fstat(descriptor)
+        if (
+            opened_metadata.st_dev == visible_metadata.st_dev
+            and opened_metadata.st_ino == visible_metadata.st_ino
+        ):
             os.lseek(descriptor, 0, os.SEEK_SET)
             os.write(descriptor, replacement)
             swapped = True
@@ -1380,14 +1385,15 @@ def test_cleanup_failure_preserves_primary_error_and_closes_descriptors(
         raise ValueError("primary validation failure")
 
     monkeypatch.setattr(AnchoredDirectory, "remove_tree", fail_stage_cleanup)
-    before = set(os.listdir("/proc/self/fd"))
+    fd_directory = "/proc/self/fd" if Path("/proc/self/fd").is_dir() else "/dev/fd"
+    before = set(os.listdir(fd_directory))
     with pytest.raises(PluginLifecycleError, match="primary validation failure") as error:
         install_local_plugin(
             source,
             destination_root=destination_root,
             validator=fail_validation,
         )
-    after = set(os.listdir("/proc/self/fd"))
+    after = set(os.listdir(fd_directory))
 
     assert before == after
     assert any("cleanup failure" in note for note in error.value.__notes__)
