@@ -150,7 +150,12 @@ def restore_database(
         os.replace(temporary, database)
         _restrict(database)
     finally:
-        temporary.unlink(missing_ok=True)
+        for artifact in (
+            temporary,
+            Path(f"{temporary}-wal"),
+            Path(f"{temporary}-shm"),
+        ):
+            artifact.unlink(missing_ok=True)
     return database, tuple(preserved)
 
 

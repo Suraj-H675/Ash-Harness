@@ -69,6 +69,17 @@ def test_backup_and_restore_preserve_current_database(tmp_path: Path) -> None:
     assert all(item.exists() for item in preserved)
 
 
+def test_restore_cleans_temporary_sqlite_sidecars(tmp_path: Path) -> None:
+    path = tmp_path / "sessions.db"
+    store = SessionStore(path)
+    store.create_session("/original")
+    backup = backup_database(path, tmp_path / "known-good.db")
+
+    restore_database(path, backup, confirmed=True)
+
+    assert not list(tmp_path.glob(".sessions.db.restore-*.tmp*"))
+
+
 def test_backup_rejects_symlinked_destination(tmp_path: Path) -> None:
     path = tmp_path / "sessions.db"
     SessionStore(path).create_session("/workspace")

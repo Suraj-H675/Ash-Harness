@@ -83,6 +83,14 @@ completed audit work above.
 - Direct source review, the bounded security specialist pass, deterministic
   adversarial tests, and the behavior gates below remain the authoritative
   available evidence while that scan is pending.
+- A later read-only status lookup for the same registered scan also failed in
+  the external Codex connector with:
+
+  > `Codex Security could not start its Python 3 helper. Reinstall or update Codex to restore its bundled Python runtime, or set the PYTHON environment variable to a working Python 3 executable, then restart Codex.`
+
+  This is a second external tooling limitation; no Ash configuration or global
+  Codex permission/orchestration setting was changed, and the scan was not
+  restarted.
 
 ### F-01 — Bubblewrap host-read probe
 
@@ -360,6 +368,16 @@ login/logout semantics, and dependency range were preserved.
   3 skipped** after the ACP lifecycle, MCP OAuth private-store, F-03
   cancellation, F-04/F-05 CLI persistence, and F-07 managed-process cleanup
   fixes plus the A2A cancellation lifecycle repair.
+- A later complete gate, `uv run pytest -v --timeout=120
+  --timeout-method=thread`, passed **2222 tests with 4 skips** in 64.38s.
+- An isolated temporary-home CLI smoke matrix also passed the read-only
+  `--version`, help, config, provider, sandbox, storage, metrics, sessions,
+  plans, cron, permissions, extensions, agents, MCP, LSP, and profile status
+  workflows with valid JSON where requested. `doctor --json` correctly
+  returned its classified nonzero result for the intentionally credential-free
+  environment (missing Anthropic credentials, optional search, and Chromium),
+  without a traceback or secret output. A fresh `storage check --json` did not
+  create a missing database.
 - The focused F-07 process/caller regression run passed **525 tests** with
   **1 platform-dependent skip**.
 - The focused F-04/F-05 persistence/CLI regression run passed **144 tests**;
@@ -479,3 +497,55 @@ MCP checkpoint, the complete repository gate passed **2137 tests with 3
 skips**; Ruff and mypy passed, and `uv build` produced the source distribution
 and wheel successfully. The later full gate, including the CLI persistence
 batch, is recorded in the verification checkpoint above.
+
+### Candidate F-12 — WebFetch accepts non-global shared address space
+
+Direct adversarial review found that `ash.tools.web._resolve_public_addresses`
+rejects several private/special address categories but does not reject an
+address whose standard-library `ipaddress` value is non-global when it does
+not fall into one of those categories. RFC 6598's `100.64.0.0/10` Shared
+Address Space is one such case: a direct probe accepted both
+`100.64.0.1` and `100.127.255.254`, and `_validate_public_url` accepted the
+corresponding HTTP URLs. A controlled `WebFetchTool` transport consequently
+returned success for `http://100.64.0.1/internal`.
+
+This is retained as a security-policy decision pending external Sol review:
+whether the public-fetch boundary should require `address.is_global` for all
+resolved addresses, or use a narrower explicit special-range policy. No
+production behavior has been changed for this candidate.
+
+### Candidate F-13 — Browser public-host validation is not connection-pinned
+
+Direct browser adversarial testing found a separate validation/use gap in the
+browser network boundary. `BrowserSession` validates each request URL through
+`_validate_browser_url`, which resolves and approves the hostname in Ash, then
+calls Playwright `route.continue_()`. Chromium performs its own hostname
+resolution for the continued request; Ash does not pass the approved address
+to Chromium or otherwise pin that connection.
+
+A real Chromium probe used a deterministic host-resolver rule mapping
+`rebind.test` to a local HTTP server while Ash's resolver interposition
+reported the hostname as the public address `93.184.216.34`. The browser
+passed Ash's public-host check and the local server received the request,
+showing that URL validation alone does not bind the browser connection to the
+address that was approved. This is controlled evidence of the DNS
+validation/use boundary, not a claim that a public DNS provider was modified.
+No production behavior has been changed for this candidate. A separate Sol
+decision is required for the browser's public-network contract and an
+appropriate Playwright/Chromium enforcement design.
+
+### F-14 — session restore left temporary SQLite sidecars
+
+An isolated real `ash storage backup` / `ash storage restore --yes` workflow
+found that a successful restore removed the temporary database file but left
+hidden `.sessions.db.restore-*.tmp-wal` and `.tmp-shm` artifacts in the
+database directory. The residue was reproducible on the local WAL-enabled
+SQLite runtime and could accumulate after repeated restores.
+
+The cleanup now removes the temporary main file and its SQLite WAL/SHM
+sidecars in the existing `finally` block. The focused regression
+`tests/unit/test_storage.py::test_restore_cleans_temporary_sqlite_sidecars`
+fails on the old behavior and passes after the repair. A follow-up real CLI
+backup/restore workflow completed without leaving any temporary restore
+artifacts; the established backup, restore, preservation, and storage error
+semantics remain unchanged.
