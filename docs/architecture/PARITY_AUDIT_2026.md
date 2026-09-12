@@ -373,6 +373,11 @@ login/logout semantics, and dependency range were preserved.
 - After the automatic-memory runtime-wiring repair, the complete gate
   `uv run pytest -q --timeout=120 --timeout-method=thread` passed **2223 tests
   with 4 skips** in 61.94s.
+- After the Phase 1 A–I hardening batch and its independent review, the
+  complete gate `uv run pytest -q --timeout=120 --timeout-method=thread`
+  passed **2237 tests with 4 skips** in 78.61s. The focused Phase 1 set passed
+  **420 tests**; the independent read-only Luna xhigh review found and the
+  batch corrected four concrete regressions before this gate.
 - An isolated temporary-home CLI smoke matrix also passed the read-only
   `--version`, help, config, provider, sandbox, storage, metrics, sessions,
   plans, cron, permissions, extensions, agents, MCP, LSP, and profile status
@@ -393,11 +398,11 @@ login/logout semantics, and dependency range were preserved.
   include deterministic repeated-cancellation, cancellation-request failure,
   client-close cancellation, and pre-task-ID cleanup cases, plus the official
   client/server workflows.
-- `uv run ruff check src tests`: passed.
-- `uv run mypy src/ash`: passed with no issues in 173 source files.
-- `uv build` passed for the current A2A batch; the clean installed-wheel smoke
-  (`.smoke-venv/bin/python tests/packaging/smoke_minimal_install.py`) remains
-  passing from the preceding verification batch.
+- `uv run ruff check src tests`: passed after the Phase 1 changes, and
+  `uv run mypy src/ash` passed with no issues in **174 source files**.
+- `uv build` passed after the Phase 1 changes. The installed-wheel smoke,
+  `.smoke-venv/bin/python tests/packaging/smoke_minimal_install.py`, also
+  passed.
 - The earlier CLI help/doctor, integration, E2E, and optional browser checks
   remain recorded baseline evidence; the PTY check remains unavailable because
   `tmux` is not installed.
@@ -512,10 +517,13 @@ Address Space is one such case: a direct probe accepted both
 corresponding HTTP URLs. A controlled `WebFetchTool` transport consequently
 returned success for `http://100.64.0.1/internal`.
 
-This is retained as a security-policy decision pending external Sol review:
-whether the public-fetch boundary should require `address.is_global` for all
-resolved addresses, or use a narrower explicit special-range policy. No
-production behavior has been changed for this candidate.
+The subsequent Sol decision confirmed the public-fetch contract: every
+resolved address must satisfy `address.is_global`, in addition to the existing
+explicit special-address checks. The production predicate now rejects both
+RFC6598 examples and mixed public/non-global DNS answers while continuing to
+accept representative public IPv4 and IPv6 addresses. The pinned exact-address
+transport and DNS-rebinding regression remain intact; this finding is fixed in
+the Phase 1 batch.
 
 ### Candidate F-13 — Browser public-host validation is not connection-pinned
 
@@ -536,6 +544,42 @@ validation/use boundary, not a claim that a public DNS provider was modified.
 No production behavior has been changed for this candidate. A separate Sol
 decision is required for the browser's public-network contract and an
 appropriate Playwright/Chromium enforcement design.
+
+The subsequent Sol decision authorized the connection-enforcing browser proxy
+architecture as a separate Phase 2 batch. This Phase 1 batch does not claim to
+resolve the browser connection gap; the production change and real Chromium
+bypass regressions remain pending in that separate batch.
+
+### Phase 1 — cancellation, CLI, logging, and WebFetch hardening (A–I)
+
+The current Phase 1 repair batch addresses the confirmed A–F lifecycle
+ownership defects and G–I CLI/output/network-policy defects. MCP request and
+task cancellation, failed HTTP-session recovery deletion, A2A server-client
+closure, and SpawnAgent worker cleanup now create explicitly owned cleanup
+tasks and settle them through repeated caller cancellation before propagating
+the primary cancellation. Automation keeps the worker bounded for arbitrary
+injected clients: a cancellation-resistant operation transfers ownership to a
+strongly retained deferred cleanup that waits for the operation before closing
+the client. The default subprocess client remains on its bounded prompt and
+process-tree cleanup path; the injected-client finding is not overstated as a
+default-subprocess leak.
+
+The CLI paths now classify configuration and session-store failures through
+the stable human/JSON error boundary, including malformed user/project and
+MCP configuration. No-color logging is reconfigured after effective
+configuration is resolved, and the `--ci`, `NO_COLOR`, and truthy
+`ASH_NO_COLOR` paths are covered by real log emission. Classified diagnostics
+redact secret-like values. WebFetch now requires every resolved address to be
+globally reachable while retaining its explicit special-address checks and
+pinned-address transport.
+
+Focused Phase 1 regressions currently pass **420 tests**. Full repository and
+packaging gates remain the completion criteria for this batch; the exact final
+counts are recorded below after they complete.
+
+The external Codex Security Deep Scan and standard scan limitations recorded
+above remain tooling limitations and are not interpreted as clean security
+results.
 
 ### F-14 — session restore left temporary SQLite sidecars
 

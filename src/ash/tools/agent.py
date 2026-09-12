@@ -31,6 +31,29 @@ if TYPE_CHECKING:
     from ash.plugins.agents import AgentDefinition
 
 
+async def _settle_spawn_cleanup_task(
+    task: asyncio.Task[Any],
+) -> tuple[BaseException | None, bool]:
+    """Finish an owned worker cleanup task despite repeated cancellation."""
+
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                continue
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, interrupted
+    return None, interrupted
+
+
 class SpawnAgentArgs(BaseModel):
     role: str = Field(
         "general",
@@ -823,6 +846,9 @@ class SpawnAgentTool(BaseTool):
             config=worker_config,
             enable_semantic_memory=False,
         )
+        turn: asyncio.Task[str] | None = None
+        inbox: asyncio.Task[None] | None = None
+        loop_closed = False
         try:
             await loop.start_session()
             turn = asyncio.create_task(loop.run_turn(task))
@@ -848,15 +874,80 @@ class SpawnAgentTool(BaseTool):
                 return response[: self._max_return_chars], completion_tokens, cost_usd
             except asyncio.TimeoutError as exc:
                 turn.cancel()
-                await asyncio.gather(turn, return_exceptions=True)
+                _, turn_interrupted = await _settle_spawn_cleanup_task(turn)
+                if turn_interrupted:
+                    raise asyncio.CancelledError
                 raise TimeoutError(
                     f"subagent exceeded {time_budget_seconds:g}s time budget"
                 ) from exc
-            finally:
-                inbox.cancel()
-                await asyncio.gather(inbox, return_exceptions=True)
+        except asyncio.CancelledError as cancellation:
+            cleanup_errors: list[BaseException] = []
+            if turn is not None:
+                if not turn.done():
+                    turn.cancel()
+                turn_error, turn_interrupted = await _settle_spawn_cleanup_task(turn)
+                if turn_error is not None and not isinstance(
+                    turn_error, asyncio.CancelledError
+                ):
+                    cleanup_errors.append(turn_error)
+                if turn_interrupted:
+                    cancellation.add_note("subagent turn cleanup was interrupted")
+            if inbox is not None:
+                if not inbox.done():
+                    inbox.cancel()
+                inbox_error, inbox_interrupted = await _settle_spawn_cleanup_task(
+                    inbox
+                )
+                if inbox_error is not None and not isinstance(
+                    inbox_error, asyncio.CancelledError
+                ):
+                    cleanup_errors.append(inbox_error)
+                if inbox_interrupted:
+                    cancellation.add_note("subagent inbox cleanup was interrupted")
+            close_task = asyncio.create_task(
+                loop.aclose(), name=f"ash-subagent-loop-close-{agent_id}"
+            )
+            close_error, close_interrupted = await _settle_spawn_cleanup_task(
+                close_task
+            )
+            loop_closed = True
+            cleanup_errors.extend(
+                error
+                for error in (close_error,)
+                if error is not None and not isinstance(error, asyncio.CancelledError)
+            )
+            if close_interrupted:
+                cancellation.add_note("subagent loop cleanup was interrupted")
+            if cleanup_errors:
+                cancellation.add_note("subagent cleanup encountered an error")
+            raise
         finally:
-            await loop.aclose()
+            if not loop_closed:
+                if inbox is not None:
+                    if not inbox.done():
+                        inbox.cancel()
+                    inbox_error, inbox_interrupted = await _settle_spawn_cleanup_task(
+                        inbox
+                    )
+                    if inbox_error is not None and not isinstance(
+                        inbox_error, asyncio.CancelledError
+                    ):
+                        raise inbox_error
+                    if inbox_interrupted:
+                        raise asyncio.CancelledError
+                close_task = asyncio.create_task(
+                    loop.aclose(), name=f"ash-subagent-loop-close-{agent_id}"
+                )
+                close_error, close_interrupted = await _settle_spawn_cleanup_task(
+                    close_task
+                )
+                loop_closed = True
+                if close_error is not None and not isinstance(
+                    close_error, asyncio.CancelledError
+                ):
+                    raise close_error
+                if close_interrupted:
+                    raise asyncio.CancelledError
 
     async def _consume_worker_messages(
         self,

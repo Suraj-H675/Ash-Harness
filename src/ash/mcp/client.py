@@ -793,11 +793,23 @@ class MCPClient:
             if method != "initialize":
                 await self._cancel_request(request_id, f"{method} timed out")
             raise
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             if method != "initialize":
-                await asyncio.shield(
-                    self._cancel_request(request_id, f"{method} was cancelled")
+                cancel_task = asyncio.create_task(
+                    self._cancel_request(request_id, f"{method} was cancelled"),
+                    name=f"ash-mcp-cancel-request-{request_id}",
                 )
+                cancel_error, cancel_interrupted = (
+                    await _settle_task_after_cancellation(cancel_task)
+                )
+                if cancel_error is not None:
+                    cancellation.add_note(
+                        "MCP cancellation notification could not be sent"
+                    )
+                if cancel_interrupted:
+                    cancellation.add_note(
+                        "MCP cancellation notification cleanup was interrupted"
+                    )
             raise
         if "error" in response:
             error = response["error"]
@@ -1285,19 +1297,31 @@ class MCPClient:
                 self._stop_http_events()
                 try:
                     await self._initialize_protocol()
-                except BaseException:
+                except BaseException as primary:
                     session_to_close = (
                         self._http_session_id or self._pending_initialize_session_id
                     )
                     self._http_session_id = ""
                     self._pending_initialize_session_id = ""
+                    cleanup_error: BaseException | None = None
+                    cleanup_interrupted = False
                     try:
                         if session_to_close:
-                            await asyncio.shield(
-                                self._delete_http_session(session_to_close)
+                            cleanup_task = asyncio.create_task(
+                                self._delete_http_session(session_to_close),
+                                name="ash-mcp-delete-recovery-session",
+                            )
+                            cleanup_error, cleanup_interrupted = (
+                                await _settle_task_after_cancellation(cleanup_task)
                             )
                     finally:
                         self._session_ready.set()
+                    if cleanup_error is not None:
+                        primary.add_note("MCP HTTP session cleanup failed")
+                    if cleanup_interrupted:
+                        primary.add_note(
+                            "MCP HTTP session cleanup was interrupted"
+                        )
                     raise
                 if (
                     self.config.transport in {"http", "sse"}
@@ -1470,8 +1494,18 @@ class MCPClient:
             raise MCPTaskTimeout(
                 f"MCP tool task timed out after {wait_timeout} seconds"
             ) from exc
-        except asyncio.CancelledError:
-            await asyncio.shield(self._cancel_mcp_task(task_id))
+        except asyncio.CancelledError as cancellation:
+            cancel_task = asyncio.create_task(
+                self._cancel_mcp_task(task_id),
+                name=f"ash-mcp-cancel-task-{task_id}",
+            )
+            cancel_error, cancel_interrupted = (
+                await _settle_task_after_cancellation(cancel_task)
+            )
+            if cancel_error is not None:
+                cancellation.add_note("MCP task cancellation could not be sent")
+            if cancel_interrupted:
+                cancellation.add_note("MCP task cancellation was interrupted")
             raise
         finally:
             if self._task_waiters.get(task_id) is waiter:

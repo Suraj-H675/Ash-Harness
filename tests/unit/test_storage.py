@@ -249,6 +249,42 @@ def test_session_cli_reports_corrupt_database_without_traceback(
     assert "file is not a database" in payload["error"]["message"]
 
 
+def test_storage_cli_classifies_malformed_user_config_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    ash_dir = tmp_path / ".ash"
+    ash_dir.mkdir()
+    (ash_dir / "ash.toml").write_text("model = [", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert main(["storage", "check", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["error"]["category"] == "config"
+    assert "Traceback" not in captured.out
+
+
+def test_storage_cli_redacts_secret_like_config_validation_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    secret = "sk-proj-" + "a" * 24
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("ASH_MAX_CONTEXT_TOKENS", secret)
+
+    assert main(["storage", "check", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    payload = json.loads(captured.out)
+    assert payload["error"]["category"] == "config"
+    assert "[REDACTED]" in payload["error"]["message"]
+
+
 def test_metrics_cli_classifies_store_operation_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

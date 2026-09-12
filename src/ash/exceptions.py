@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from ash.core.redaction import redact_text
+
 
 class ErrorCategory(str, Enum):
     """Stable top-level categories exposed to CLI and automation callers."""
@@ -96,7 +98,13 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
     message = _message(exc)
     lowered = message.casefold()
 
-    if _is_pydantic_validation_error(exc) or module == "ash.config":
+    if (
+        _is_pydantic_validation_error(exc)
+        or module == "ash.config"
+        or module == "tomllib"
+        or name == "TOMLDecodeError"
+        or "cannot load project config" in lowered
+    ):
         return ErrorInfo(
             ErrorCategory.CONFIG,
             message,
@@ -203,7 +211,7 @@ def format_error(info: ErrorInfo) -> str:
 
 def _message(exc: BaseException) -> str:
     message = str(exc).strip()
-    return message or type(exc).__name__
+    return redact_text(message or type(exc).__name__)
 
 
 def _is_pydantic_validation_error(exc: BaseException) -> bool:

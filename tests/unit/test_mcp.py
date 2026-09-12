@@ -1965,6 +1965,99 @@ async def test_mcp_task_cancellation_sends_tasks_cancel() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mcp_request_cancellation_owns_one_notification_until_settled() -> None:
+    client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
+    request_started = asyncio.Event()
+    cancel_started = asyncio.Event()
+    cancel_release = asyncio.Event()
+    cancel_finished = asyncio.Event()
+    cancel_calls = 0
+
+    async def blocked_request(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        request_started.set()
+        await asyncio.Event().wait()
+        return {}
+
+    async def blocked_cancel(request_id: int, reason: str) -> None:
+        nonlocal cancel_calls
+        assert request_id == 1
+        assert reason == "tools/call was cancelled"
+        cancel_calls += 1
+        cancel_started.set()
+        await cancel_release.wait()
+        cancel_finished.set()
+
+    client._request_stdio = blocked_request  # type: ignore[method-assign]
+    client._cancel_request = blocked_cancel  # type: ignore[method-assign]
+    request_task = asyncio.create_task(client.request("tools/call"))
+    await request_started.wait()
+
+    request_task.cancel()
+    await cancel_started.wait()
+    request_task.cancel()
+    await asyncio.sleep(0)
+    assert not request_task.done()
+    assert cancel_calls == 1
+    assert not cancel_finished.is_set()
+
+    cancel_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+    assert cancel_finished.is_set()
+    assert not any(
+        task.get_name().startswith("ash-mcp-cancel-request-")
+        and not task.done()
+        for task in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_task_cancellation_owns_one_cancel_request_until_settled() -> None:
+    client, request = _task_client(
+        [
+            {
+                "task": {
+                    "taskId": "stop-once",
+                    "status": "working",
+                    "ttl": None,
+                    "pollInterval": 100000,
+                }
+            }
+        ]
+    )
+    cancel_started = asyncio.Event()
+    cancel_release = asyncio.Event()
+    cancel_finished = asyncio.Event()
+    cancel_calls = 0
+
+    async def blocked_cancel(task_id: str) -> None:
+        nonlocal cancel_calls
+        assert task_id == "stop-once"
+        cancel_calls += 1
+        cancel_started.set()
+        await cancel_release.wait()
+        cancel_finished.set()
+
+    client._cancel_mcp_task = blocked_cancel  # type: ignore[method-assign]
+    call = asyncio.create_task(client.call_tool("slow", {}, as_task=True))
+    await asyncio.sleep(0)
+    call.cancel()
+    await cancel_started.wait()
+    call.cancel()
+    await asyncio.sleep(0)
+    assert not call.done()
+    assert cancel_calls == 1
+    assert not cancel_finished.is_set()
+
+    cancel_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert cancel_finished.is_set()
+    assert request.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_mcp_runtime_isolates_invalid_tool_schema(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -3311,6 +3404,60 @@ async def test_cancelled_session_recovery_restores_readiness() -> None:
             await asyncio.gather(task, return_exceptions=True)
         await client.disconnect()
         await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_http_recovery_owns_one_session_delete_until_settled() -> None:
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(204))),
+    )
+    initialize_started = asyncio.Event()
+    delete_started = asyncio.Event()
+    delete_release = asyncio.Event()
+    delete_finished = asyncio.Event()
+    delete_calls = 0
+
+    async def blocked_initialize() -> None:
+        client._http_session_id = "recovery-session"
+        initialize_started.set()
+        await asyncio.Event().wait()
+
+    async def blocked_delete(session_id: str) -> None:
+        nonlocal delete_calls
+        assert session_id == "recovery-session"
+        delete_calls += 1
+        delete_started.set()
+        await delete_release.wait()
+        delete_finished.set()
+
+    client._initialize_protocol = blocked_initialize  # type: ignore[method-assign]
+    client._delete_http_session = blocked_delete  # type: ignore[method-assign]
+    recovery = asyncio.create_task(
+        client._recover_http_session(mcp_client_module.MCPSessionExpired("old", 0))
+    )
+    await initialize_started.wait()
+    recovery.cancel()
+    await delete_started.wait()
+    recovery.cancel()
+    await asyncio.sleep(0)
+    assert not recovery.done()
+    assert delete_calls == 1
+    assert not delete_finished.is_set()
+
+    delete_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await recovery
+    assert delete_finished.is_set()
+    assert client._session_ready.is_set()
+    await client._http.aclose()  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio

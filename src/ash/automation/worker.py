@@ -43,6 +43,26 @@ from ash.logging import get_logger
 _log = get_logger(__name__)
 
 
+async def _settle_worker_task_after_cancellation(
+    task: asyncio.Task[Any],
+) -> tuple[Any | None, BaseException | None, bool]:
+    """Settle one owned worker task while preserving its caller's cancellation."""
+
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    try:
+        return task.result(), None, interrupted
+    except BaseException as exc:
+        return None, exc, interrupted
+
+
 class AutomationClient(Protocol):
     async def prompt(
         self,
@@ -248,6 +268,7 @@ class AutomationWorkerService:
         self._tasks: dict[str, asyncio.Task[AutomationRun]] = {}
         self._claims: dict[str, AutomationRunLease] = {}
         self._detached_tasks: set[asyncio.Task[Any]] = set()
+        self._deferred_cleanup_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def active_run_ids(self) -> tuple[str, ...]:
@@ -347,16 +368,25 @@ class AutomationWorkerService:
         """Execute one owned lease and always finalize its durable outcome."""
 
         client: AutomationClient | None = None
+        client_holder: list[AutomationClient] = []
+        client_close_started = False
         operation_task: asyncio.Task[AshResult] | None = None
         monitor_task: asyncio.Task[None] | None = None
+        operation_settled = True
+        deferred_cleanup_task: asyncio.Task[None] | None = None
+        cancellation_requested = False
 
         async def run_operation() -> AshResult:
             nonlocal client
             self._validate_job_runtime(claim)
             config = self._load_runtime_config()
             config = _apply_token_budget(config, claim.job.token_budget)
-            client = await self._client_factory(config, self.workspace)
-            return await client.prompt(
+            candidate = await self._client_factory(config, self.workspace)
+            client = candidate
+            client_holder.append(candidate)
+            if cancellation_requested:
+                raise asyncio.CancelledError
+            return await candidate.prompt(
                 claim.job.prompt,
                 user_metadata={
                     "source": "automation",
@@ -366,6 +396,71 @@ class AutomationWorkerService:
                     "trigger": claim.run.trigger,
                 },
             )
+
+        async def close_client_after_operation() -> None:
+            nonlocal client_close_started
+            if client_close_started or not client_holder:
+                return
+            client_close_started = True
+            try:
+                await client_holder[0].close()
+            except BaseException as cleanup_error:
+                _log.warning(
+                    "automation client cleanup failed for {}: {}",
+                    claim.run.run_id,
+                    redact_text(str(cleanup_error))[:500],
+                )
+
+        def retain_deferred_cleanup(task: asyncio.Task[None]) -> None:
+            """Keep cleanup owned until an unbounded client operation settles."""
+
+            self._deferred_cleanup_tasks.add(task)
+
+            def finish_deferred_cleanup(done: asyncio.Task[None]) -> None:
+                self._deferred_cleanup_tasks.discard(done)
+                try:
+                    done.result()
+                except BaseException as cleanup_error:
+                    _log.warning(
+                        "automation deferred cleanup failed for {}: {}",
+                        claim.run.run_id,
+                        redact_text(str(cleanup_error))[:500],
+                    )
+
+            task.add_done_callback(finish_deferred_cleanup)
+
+        async def cancel_operation() -> tuple[bool, bool]:
+            if operation_task is None:
+                return True, False
+            cancel_task = asyncio.create_task(
+                self._cancel_task(operation_task, detach=False),
+                name=f"ash-automation-cancel-{claim.run.run_id}",
+            )
+            result, error, interrupted = (
+                await _settle_worker_task_after_cancellation(cancel_task)
+            )
+            if error is not None:
+                return False, interrupted
+            return bool(result), interrupted
+
+        def schedule_deferred_cleanup() -> None:
+            nonlocal deferred_cleanup_task
+            if deferred_cleanup_task is not None or operation_task is None:
+                return
+            owned_operation = operation_task
+
+            async def defer_cleanup() -> None:
+                try:
+                    await owned_operation
+                except BaseException:
+                    pass
+                await close_client_after_operation()
+
+            deferred_cleanup_task = asyncio.create_task(
+                defer_cleanup(),
+                name=f"ash-automation-deferred-cleanup-{claim.run.run_id}",
+            )
+            retain_deferred_cleanup(deferred_cleanup_task)
 
         try:
             operation_task = asyncio.create_task(
@@ -386,16 +481,28 @@ class AutomationWorkerService:
                         if monitor_error is not None:
                             raise monitor_error
                     result = await operation_task
+                    operation_settled = True
             except TimeoutError:
-                await self._cancel_task(operation_task)
+                cancellation_requested = True
+                operation_settled, cleanup_interrupted = await cancel_operation()
+                if not operation_settled:
+                    schedule_deferred_cleanup()
+                if cleanup_interrupted:
+                    raise asyncio.CancelledError
+                timeout_error = (
+                    f"automation exceeded its {claim.job.timeout_seconds:g}s "
+                    "wall-clock timeout"
+                )
+                if not operation_settled:
+                    timeout_error += (
+                        "; operation cancellation remains unsettled and client "
+                        "cleanup is deferred"
+                    )
                 return self.store.finish_run(
                     claim.run.run_id,
                     claim.token,
                     status="failed",
-                    error=(
-                        f"automation exceeded its {claim.job.timeout_seconds:g}s "
-                        "wall-clock timeout"
-                    ),
+                    error=timeout_error,
                 )
             used_tokens = result.prompt_tokens + result.completion_tokens
             if result.budget_exhausted or used_tokens > claim.job.token_budget:
@@ -435,54 +542,87 @@ class AutomationWorkerService:
                 estimated_completion_tokens=result.estimated_completion_tokens,
                 estimated_cost_usd=result.estimated_cost_usd,
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
+            cancellation_requested = True
             if operation_task is not None and not operation_task.done():
-                await self._cancel_task(operation_task)
+                operation_settled, cleanup_interrupted = await cancel_operation()
+                if cleanup_interrupted:
+                    cancellation.add_note("automation operation cleanup was interrupted")
+            if not operation_settled:
+                schedule_deferred_cleanup()
             try:
-                return self.store.finish_run(
+                if operation_settled:
+                    return self.store.finish_run(
+                        claim.run.run_id,
+                        claim.token,
+                        status="cancelled",
+                        error="automation worker stopped or cancellation was requested",
+                    )
+                return self.store.interrupt_run(
                     claim.run.run_id,
                     claim.token,
-                    status="cancelled",
-                    error="automation worker stopped or cancellation was requested",
+                    error=(
+                        "automation cancellation could not establish a terminal "
+                        "operation outcome; client cleanup is deferred"
+                    ),
                 )
             except AutomationError:
                 raise
         except Exception as exc:  # noqa: BLE001 - persist one bounded failure
+            cancellation_requested = True
             if operation_task is not None and not operation_task.done():
-                await self._cancel_task(operation_task)
+                operation_settled, cleanup_interrupted = await cancel_operation()
+                if cleanup_interrupted:
+                    raise asyncio.CancelledError from exc
+            if not operation_settled:
+                schedule_deferred_cleanup()
             try:
-                return self.store.finish_run(
+                if operation_settled:
+                    return self.store.finish_run(
+                        claim.run.run_id,
+                        claim.token,
+                        status="failed",
+                        error=redact_text(str(exc)),
+                    )
+                return self.store.interrupt_run(
                     claim.run.run_id,
                     claim.token,
-                    status="failed",
-                    error=redact_text(str(exc)),
+                    error=(
+                        "automation execution failed with an unsettled operation; "
+                        "client cleanup is deferred: " + redact_text(str(exc))
+                    ),
                 )
             except AutomationError as finish_error:
                 raise finish_error from exc
         finally:
             if monitor_task is not None:
                 await self._cancel_task(monitor_task)
-            if client is not None:
+            if (
+                client is not None
+                and operation_task is not None
+                and operation_task.done()
+                and deferred_cleanup_task is None
+            ):
                 close_task = asyncio.create_task(
-                    client.close(), name=f"ash-automation-close-{claim.run.run_id}"
+                    close_client_after_operation(),
+                    name=f"ash-automation-close-{claim.run.run_id}",
                 )
-                settled = await self._cancel_task(
-                    close_task, cancel_first=False, timeout=2.0
-                )
-                if not settled:
+                try:
+                    done, _ = await asyncio.wait({close_task}, timeout=2.0)
+                except asyncio.CancelledError:
+                    retain_deferred_cleanup(close_task)
                     _log.warning(
-                        "automation client cleanup did not settle for {}",
+                        "automation client cleanup deferred for {}",
                         claim.run.run_id,
                     )
-                else:
-                    try:
-                        close_task.result()
-                    except BaseException as cleanup_error:
-                        _log.warning(
-                            "automation client cleanup failed for {}: {}",
-                            claim.run.run_id,
-                            redact_text(str(cleanup_error))[:500],
-                        )
+                    raise
+                if not done:
+                    close_task.cancel()
+                    retain_deferred_cleanup(close_task)
+                    _log.warning(
+                        "automation client cleanup did not settle for {}; cleanup deferred",
+                        claim.run.run_id,
+                    )
 
     async def _monitor_lease(
         self,
@@ -650,6 +790,7 @@ class AutomationWorkerService:
         *,
         cancel_first: bool = True,
         timeout: float = 0.5,
+        detach: bool = True,
     ) -> bool:
         if cancel_first and not task.done():
             task.cancel()
@@ -658,7 +799,8 @@ class AutomationWorkerService:
             if not done:
                 if not cancel_first:
                     task.cancel()
-                self._detach_task(task)
+                if detach:
+                    self._detach_task(task)
                 return False
         try:
             task.result()

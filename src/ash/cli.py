@@ -84,23 +84,32 @@ def _emit_config_diagnostics(config: AshConfig) -> None:
         print(f"Warning: {diagnostic}", file=sys.stderr)
 
 
-def _load_config_or_report(**overrides: Any) -> tuple[AshConfig | None, int]:
+def _load_config_or_report(
+    *,
+    json_output: bool = False,
+    event_output: bool = False,
+    **overrides: Any,
+) -> tuple[AshConfig | None, int]:
     from ash.config import AshConfig
-    from ash.exceptions import classify_exception, format_error
+    from ash.logging import configure_logging
 
     try:
-        return (
-            AshConfig.load(
-                _override_source="cli",
-                _override_detail="command-line option",
-                **overrides,
-            ),
-            0,
+        config = AshConfig.load(
+            _override_source="cli",
+            _override_detail="command-line option",
+            **overrides,
         )
+        configure_logging(no_color=config.no_color)
+        return config, 0
     except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
-        error = classify_exception(exc)
-        print(format_error(error), file=sys.stderr)
-    return None, error.exit_code
+        return (
+            None,
+            _report_cli_error(
+                exc,
+                json_output=json_output,
+                event_output=event_output,
+            ),
+        )
 
 
 def _print_classified_error(exc: BaseException) -> None:
@@ -148,6 +157,10 @@ def _config_overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
         overrides["safety_tier"] = args.mode
     if getattr(args, "ci", False):
         overrides.update({"no_color": True, "reduced_motion": True})
+    elif "NO_COLOR" in os.environ or os.environ.get(
+        "ASH_NO_COLOR", ""
+    ).strip().casefold() in {"1", "true", "yes", "on"}:
+        overrides["no_color"] = True
     if getattr(args, "db_directory", None) is not None:
         overrides["db_directory"] = args.db_directory
     if getattr(args, "command", "") == "diff-mode" and getattr(args, "mode", None):
@@ -2585,6 +2598,15 @@ def main(argv: list[str] | None = None) -> int:
     from ash.config import AshConfig
     from ash.core.session import SessionStore
     from ash.exceptions import classify_exception, format_error
+    from ash.logging import configure_logging
+
+    if (
+        args.ci
+        or "NO_COLOR" in os.environ
+        or os.environ.get("ASH_NO_COLOR", "").strip().casefold()
+        in {"1", "true", "yes", "on"}
+    ):
+        configure_logging(no_color=True)
 
     if args.command == "setup":
         from ash.commands.setup import cmd_setup
@@ -2634,7 +2656,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.providers_action == "list":
             print(render_provider_catalog(json_output=args.json))
             return 0
-        config, exit_code = _load_config_or_report()
+        config, exit_code = _load_config_or_report(json_output=args.json)
         if config is None:
             return exit_code
         try:
@@ -2675,7 +2697,10 @@ def main(argv: list[str] | None = None) -> int:
         from ash.commands.lsp import inspect_lsp, render_lsp
         from ash.core.redaction import redact_text
 
-        config, exit_code = _load_config_or_report(**_config_overrides_from_args(args))
+        config, exit_code = _load_config_or_report(
+            json_output=args.json,
+            **_config_overrides_from_args(args),
+        )
         if config is None:
             return exit_code
         if args.lsp_action == "query":
@@ -2708,13 +2733,19 @@ def main(argv: list[str] | None = None) -> int:
             sandbox_status,
         )
 
+        json_output = bool(getattr(args, "json", False))
+        sandbox_config, exit_code = _load_config_or_report(
+            json_output=json_output,
+            **_config_overrides_from_args(args)
+        )
+        if sandbox_config is None:
+            return exit_code
         try:
-            sandbox_config = AshConfig.load()
             if args.sandbox_action == "status":
                 print(
                     render_sandbox_status(
                         sandbox_status(sandbox_config),
-                        json_output=args.json,
+                        json_output=json_output,
                     )
                 )
                 return 0
@@ -2722,25 +2753,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Building local sandbox image {image}...")
             return build_sandbox_image(image)
         except (OSError, RuntimeError, ValueError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
+            return _report_cli_error(exc, json_output=json_output)
 
     if args.command == "config":
         from ash.commands.config import explain_config, render_config_explain
 
-        try:
-            config = AshConfig.load(
-                _override_source="cli",
-                _override_detail="command-line option",
-                **_config_overrides_from_args(args),
-            )
-        except Exception as exc:  # noqa: BLE001
-            error = classify_exception(exc)
-            if args.json:
-                print(json.dumps({"error": error.to_dict()}, sort_keys=True))
-            else:
-                print(format_error(error), file=sys.stderr)
-            return error.exit_code
+        config, exit_code = _load_config_or_report(
+            json_output=args.json,
+            **_config_overrides_from_args(args)
+        )
+        if config is None:
+            return exit_code
         _emit_config_diagnostics(config)
         print(
             render_config_explain(
@@ -2868,9 +2891,12 @@ def main(argv: list[str] | None = None) -> int:
             restore_database,
         )
 
-        storage_config = AshConfig.load(
-            **({"db_directory": args.db_directory} if args.db_directory else {})
+        storage_config, exit_code = _load_config_or_report(
+            json_output=bool(getattr(args, "json", False)),
+            **_config_overrides_from_args(args)
         )
+        if storage_config is None:
+            return exit_code
         database = storage_config.db_directory / "sessions.db"
         if args.storage_action == "check":
             check = check_database(database)
@@ -2969,7 +2995,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         from ash.safety.trust import is_workspace_trusted
 
-        config, exit_code = _load_config_or_report(**_config_overrides_from_args(args))
+        config, exit_code = _load_config_or_report(
+            json_output=args.json,
+            **_config_overrides_from_args(args),
+        )
         if config is None:
             return exit_code
         json_output = bool(getattr(args, "json", False))
@@ -3322,7 +3351,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         from ash.safety.grants import load_permission_rules
 
-        permissions_config = AshConfig.load()
+        permissions_config, exit_code = _load_config_or_report(
+            json_output=getattr(args, "json", False),
+            **_config_overrides_from_args(args)
+        )
+        if permissions_config is None:
+            return exit_code
         workspace = permissions_config.workspace_root
         action = args.permissions_action or "status"
         try:
@@ -3399,7 +3433,9 @@ def main(argv: list[str] | None = None) -> int:
             send_agent_message,
         )
 
+        json_output = bool(getattr(args, "json", False))
         agents_config, exit_code = _load_config_or_report(
+            json_output=json_output,
             **_config_overrides_from_args(args)
         )
         if agents_config is None:
@@ -3411,14 +3447,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     render_agent_statuses(
                         list_agent_statuses(database),
-                        json_output=args.json,
+                        json_output=json_output,
                     )
                 )
             elif args.agents_action == "reports":
                 print(
                     render_agent_reports(
                         list_agent_reports(database, limit=args.limit),
-                        json_output=args.json,
+                        json_output=json_output,
                     )
                 )
             elif args.agents_action == "tasks":
@@ -3431,7 +3467,7 @@ def main(argv: list[str] | None = None) -> int:
                             graph_id=args.graph_id,
                             limit=args.limit,
                         ),
-                        json_output=args.json,
+                        json_output=json_output,
                     )
                 )
             elif args.agents_action == "cancel":
@@ -3448,7 +3484,7 @@ def main(argv: list[str] | None = None) -> int:
                             graph_id=args.graph_id,
                             reason=args.reason,
                         ),
-                        json_output=args.json,
+                        json_output=json_output,
                     )
                 )
             elif args.agents_action == "events":
@@ -3461,7 +3497,7 @@ def main(argv: list[str] | None = None) -> int:
                             after_sequence=args.after_sequence,
                             limit=args.limit,
                         ),
-                        json_output=args.json,
+                        json_output=json_output,
                     )
                 )
             elif args.agents_action == "branches":
@@ -3471,7 +3507,7 @@ def main(argv: list[str] | None = None) -> int:
                         worktree_storage,
                     )
                 )
-                if args.json:
+                if json_output:
                     print(
                         json.dumps(
                             {
@@ -3519,7 +3555,7 @@ def main(argv: list[str] | None = None) -> int:
                                 undelivered_only=not args.all_messages,
                                 limit=args.limit,
                             ),
-                            json_output=args.json,
+                            json_output=json_output,
                         )
                     )
                 else:
@@ -3534,7 +3570,7 @@ def main(argv: list[str] | None = None) -> int:
                                 json_content=args.json_content,
                                 require_registered=not args.force,
                             ),
-                            json_output=args.json,
+                            json_output=json_output,
                         )
                     )
         except (AgentTaskError, ValueError, WorktreeError) as exc:
@@ -3612,7 +3648,12 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
-            extension_config = AshConfig.load()
+            extension_config, exit_code = _load_config_or_report(
+                json_output=args.json,
+                **_config_overrides_from_args(args)
+            )
+            if extension_config is None:
+                return exit_code
             inventory = discover_extensions(extension_config.workspace_root)
             print(
                 render_extension_inventory(
@@ -3701,7 +3742,16 @@ def main(argv: list[str] | None = None) -> int:
         from ash.mcp.server import MCPServerConfig, load_mcp_servers, save_mcp_servers
 
         path = Path.cwd() / ".mcp.json"
-        servers = load_mcp_servers(path)
+        json_output = bool(getattr(args, "json", False))
+        try:
+            servers = load_mcp_servers(path)
+        except (OSError, ValueError) as exc:
+            from ash.exceptions import AshConfigError
+
+            return _report_cli_error(
+                AshConfigError(f"invalid MCP configuration: {exc}"),
+                json_output=json_output,
+            )
         if args.action in {"list", "status"}:
             print(render_mcp_servers(servers, json_output=args.json))
             return 0
@@ -3842,7 +3892,14 @@ def main(argv: list[str] | None = None) -> int:
 
     runtime_overrides = _config_overrides_from_args(args)
 
-    loaded_config, config_exit_code = _load_config_or_report(**runtime_overrides)
+    runtime_event_output = (
+        args.prompt is not None
+        and args.output_format in {"json", "stream-json"}
+    )
+    loaded_config, config_exit_code = _load_config_or_report(
+        event_output=runtime_event_output,
+        **runtime_overrides,
+    )
     if loaded_config is None:
         return config_exit_code
     config = loaded_config
@@ -3868,6 +3925,7 @@ def main(argv: list[str] | None = None) -> int:
             set_workspace_trusted(config.workspace_root, True)
             workspace_trusted = True
             loaded_config, config_exit_code = _load_config_or_report(
+                event_output=runtime_event_output,
                 **runtime_overrides
             )
             if loaded_config is None:
@@ -3904,6 +3962,7 @@ def main(argv: list[str] | None = None) -> int:
             if setup_code != 0:
                 return setup_code
             loaded_config, config_exit_code = _load_config_or_report(
+                event_output=runtime_event_output,
                 **runtime_overrides
             )
             if loaded_config is None:

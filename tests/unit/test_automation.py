@@ -1134,6 +1134,18 @@ class _CancellationResistantClient(_FakeClient):
         return self.result
 
 
+class _CloseResistantClient(_FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+
+    async def close(self) -> None:
+        self.close_started.set()
+        await self.release_close.wait()
+        self.closed = True
+
+
 @pytest.mark.asyncio
 async def test_worker_executes_due_prompt_through_client(
     tmp_path: Path,
@@ -1396,10 +1408,112 @@ async def test_worker_timeout_does_not_wait_forever_for_ignored_cancellation(
 
     assert result.status == "failed"
     assert "wall-clock timeout" in (result.error or "")
+    assert client.closed is False
     assert elapsed < 2.0
     assert client.cancel_seen.is_set()
     client.release.set()
+    for _ in range(20):
+        if client.closed:
+            break
+        await asyncio.sleep(0)
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_worker_defers_late_client_close_until_factory_operation_settles(
+    tmp_path: Path,
+    clock: list[float],
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    now = datetime.fromtimestamp(clock[0], tz=timezone.utc)
+    job = store.create_job(
+        name="late client",
+        prompt="Must not start after cancellation",
+        workspace=workspace,
+        schedule=build_schedule(every="1h", now=now),
+        enabled=False,
+        timeout_seconds=1,
+    )
+    factory_started = asyncio.Event()
+    release_factory = asyncio.Event()
+    client = _FakeClient()
+
+    async def factory(config, root):
+        del config, root
+        factory_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release_factory.wait()
+            return client
+        raise AssertionError("factory unexpectedly returned without cancellation")
+
+    monkeypatch.setattr("ash.automation.worker.is_workspace_trusted", lambda path: True)
+    worker = AutomationWorkerService(store, workspace, client_factory=factory)
+    execution = asyncio.create_task(worker.run_manual(job.job_id))
+    await factory_started.wait()
+    result = await asyncio.wait_for(execution, timeout=2)
+
+    assert result.status == "failed"
+    assert "cleanup is deferred" in (result.error or "")
+    assert client.closed is False
+    assert client.started.is_set() is False
+
+    release_factory.set()
+    for _ in range(20):
+        if client.closed:
+            break
+        await asyncio.sleep(0)
+    assert client.closed is True
     await asyncio.sleep(0)
+    assert worker._deferred_cleanup_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_worker_retains_client_close_after_repeated_cancellation(
+    tmp_path: Path,
+    clock: list[float],
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    now = datetime.fromtimestamp(clock[0], tz=timezone.utc)
+    job = store.create_job(
+        name="close cancellation",
+        prompt="Complete promptly",
+        workspace=workspace,
+        schedule=build_schedule(every="1h", now=now),
+        enabled=False,
+    )
+    client = _CloseResistantClient()
+
+    async def factory(config, root):
+        del config, root
+        return client
+
+    monkeypatch.setattr("ash.automation.worker.is_workspace_trusted", lambda path: True)
+    claim = store.claim_manual(job.job_id, workspace=workspace, worker_id="close-worker")
+    worker = AutomationWorkerService(store, workspace, client_factory=factory)
+    execution = asyncio.create_task(worker.execute(claim))
+    await client.close_started.wait()
+
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    assert client.closed is False
+    assert len(worker._deferred_cleanup_tasks) == 1
+    client.release_close.set()
+    for _ in range(20):
+        if client.closed and not worker._deferred_cleanup_tasks:
+            break
+        await asyncio.sleep(0)
+    assert client.closed is True
+    assert worker._deferred_cleanup_tasks == set()
 
 
 @pytest.mark.asyncio

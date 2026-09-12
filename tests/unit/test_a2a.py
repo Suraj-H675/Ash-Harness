@@ -1022,6 +1022,8 @@ async def test_a2a_cancel_preempts_active_ash_turn(tmp_path: Path, monkeypatch) 
     )
     started = asyncio.Event()
     closed = asyncio.Event()
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
 
     class BlockingAshClient:
         loop = SimpleNamespace(
@@ -1036,6 +1038,8 @@ async def test_a2a_cancel_preempts_active_ash_turn(tmp_path: Path, monkeypatch) 
             await asyncio.Event().wait()
 
         async def close(self) -> None:
+            close_started.set()
+            await close_release.wait()
             closed.set()
 
     async def create_client(**kwargs: Any) -> BlockingAshClient:
@@ -1078,7 +1082,13 @@ async def test_a2a_cancel_preempts_active_ash_turn(tmp_path: Path, monkeypatch) 
             ][0]
             assert response.HasField("task")
             await asyncio.wait_for(started.wait(), timeout=2)
-            cancelled = await client.cancel_task(CancelTaskRequest(id=response.task.id))
+            cancel_request = asyncio.create_task(
+                client.cancel_task(CancelTaskRequest(id=response.task.id))
+            )
+            await asyncio.wait_for(close_started.wait(), timeout=2)
+            assert not cancel_request.done()
+            close_release.set()
+            cancelled = await asyncio.wait_for(cancel_request, timeout=2)
             assert cancelled.status.state == TaskState.TASK_STATE_CANCELED
             await asyncio.wait_for(closed.wait(), timeout=2)
             await client.close()

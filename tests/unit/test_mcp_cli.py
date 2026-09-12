@@ -113,6 +113,22 @@ def test_mcp_cli_rejects_invalid_env_option(
     assert "--env must use KEY=VALUE syntax" in capsys.readouterr().err
 
 
+def test_mcp_cli_classifies_malformed_config_without_traceback(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".mcp.json").write_text("{", encoding="utf-8")
+
+    assert main(["mcp", "list", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["error"]["category"] == "config"
+    assert "Traceback" not in captured.out
+
+
 def test_mcp_cli_rejects_oauth_options_without_oauth_mode(
     tmp_path: Path,
     monkeypatch,

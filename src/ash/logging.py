@@ -18,7 +18,7 @@ from loguru import logger as _loguru_logger
 _logger: Any = None
 
 
-def _configure() -> Any:
+def _configure(*, no_color: bool = False) -> Any:
     """Configure loguru with Ash's preferred defaults."""
 
     _loguru_logger.remove()
@@ -29,10 +29,18 @@ def _configure() -> Any:
         sys.stderr,
         format="<level>{time:YYYY-MM-DD HH:mm:ss}</level> | <level>{level: <8}</level> | <level>{name}</level>:<level>{function}</level> — <level>{message}</level>",
         level="INFO",
-        colorize=True,
+        colorize=not no_color,
     )
 
     return _loguru_logger
+
+
+def configure_logging(*, no_color: bool) -> Any:
+    """Apply the resolved Ash color policy without duplicating handlers."""
+
+    global _logger
+    _logger = _configure(no_color=no_color)
+    return _logger
 
 
 def get_logger(name: str) -> Any:

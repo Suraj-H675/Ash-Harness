@@ -7,7 +7,7 @@ import pytest
 
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy, PolicyAction
-from ash.tools.web import WebFetchTool, _validate_public_url
+from ash.tools.web import WebFetchTool, _resolve_public_addresses, _validate_public_url
 
 
 @pytest.fixture
@@ -150,6 +150,34 @@ def test_web_fetch_rejects_private_and_non_http_hosts(monkeypatch) -> None:
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
     with pytest.raises(ValueError, match="non-public"):
         _validate_public_url("https://private.example")
+
+
+@pytest.mark.parametrize("literal", ["100.64.0.1", "100.127.255.254"])
+def test_web_fetch_rejects_shared_address_space(literal: str) -> None:
+    with pytest.raises(ValueError, match="non-public"):
+        _resolve_public_addresses(literal)
+
+
+def test_web_fetch_accepts_global_ipv4_and_ipv6() -> None:
+    assert _resolve_public_addresses("93.184.216.34") == ("93.184.216.34",)
+    assert _resolve_public_addresses("2001:4860:4860::8888") == (
+        "2001:4860:4860::8888",
+    )
+
+
+def test_web_fetch_rejects_mixed_public_and_non_global_dns_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def mixed_getaddrinfo(host, port, type=0):
+        del host, port
+        return [
+            (socket.AF_INET, type or socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0)),
+            (socket.AF_INET, type or socket.SOCK_STREAM, 0, "", ("100.64.0.1", 0)),
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", mixed_getaddrinfo)
+    with pytest.raises(ValueError, match="non-public"):
+        _resolve_public_addresses("mixed.example")
 
 
 @pytest.mark.asyncio

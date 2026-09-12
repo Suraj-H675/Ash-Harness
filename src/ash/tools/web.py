@@ -253,6 +253,7 @@ def _resolve_public_addresses(hostname: str) -> tuple[str, ...]:
                 address.is_multicast,
                 address.is_reserved,
                 address.is_unspecified,
+                not address.is_global,
             )
         ):
             raise ValueError(f"Refusing to fetch non-public address: {address}")

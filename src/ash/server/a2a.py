@@ -325,6 +325,27 @@ def _create_a2a_task_engine(db_path: Path) -> AsyncEngine:
     )
 
 
+async def _settle_a2a_cleanup_task(
+    task: asyncio.Task[object],
+) -> tuple[BaseException | None, bool]:
+    """Finish owned A2A cleanup despite repeated caller cancellation."""
+
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, interrupted
+    return None, interrupted
+
+
 class AshA2AExecutor(AgentExecutor):
     """Translate A2A tasks into cancellation-safe Ash SDK turns."""
 
@@ -368,6 +389,7 @@ class AshA2AExecutor(AgentExecutor):
             return
 
         client: AshClient | None = None
+        cancellation: asyncio.CancelledError | None = None
         try:
             session_id = await self.registry.get(context_id)
             client = await AshClient.create(
@@ -423,7 +445,8 @@ class AshA2AExecutor(AgentExecutor):
                 await updater.failed(_agent_message(updater, failure))
             else:
                 await updater.complete()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            cancellation = exc
             raise
         except Exception as exc:  # noqa: BLE001 - stable remote failure boundary
             await updater.failed(
@@ -431,7 +454,22 @@ class AshA2AExecutor(AgentExecutor):
             )
         finally:
             if client is not None:
-                await client.close()
+                close_task = asyncio.create_task(
+                    client.close(), name=f"ash-a2a-client-close-{task_id}"
+                )
+                close_error, close_interrupted = await _settle_a2a_cleanup_task(
+                    close_task
+                )
+                if close_error is not None:
+                    if cancellation is not None:
+                        cancellation.add_note("A2A client closure failed")
+                    else:
+                        raise close_error
+                if close_interrupted:
+                    if cancellation is not None:
+                        cancellation.add_note("A2A client closure was interrupted")
+                    else:
+                        raise asyncio.CancelledError
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         updater = TaskUpdater(
