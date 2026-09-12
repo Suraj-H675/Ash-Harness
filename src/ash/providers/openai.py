@@ -47,7 +47,7 @@ class _PartialToolCall:
         self.arguments = ""
 
 
-def _strip_authorization_header(request: httpx.Request) -> None:
+async def _strip_authorization_header(request: httpx.Request) -> None:
     """Keep explicit anonymous OpenAI-compatible calls free of bearer auth."""
 
     request.headers.pop("Authorization", None)

@@ -839,6 +839,53 @@ async def test_openai_prompt_cache_and_usage_only_chunk() -> None:
     assert client.closed is False
 
 
+@pytest.mark.parametrize(
+    "provider_name",
+    [
+        "deepseek",
+        "groq",
+    ],
+)
+@pytest.mark.asyncio
+async def test_openai_compatible_providers_handle_usage_only_terminal_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_name: str,
+) -> None:
+    from ash.providers.deepseek import DeepSeekProvider
+    from ash.providers.groq import GroqProvider
+
+    usage = SimpleNamespace(prompt_tokens=1200, completion_tokens=10)
+    client = _FakeOpenAIClient(
+        [
+            _openai_chunk(content="hello"),
+            _openai_chunk(finish_reason="stop"),
+            _openai_chunk(usage=usage),
+        ]
+    )
+    if provider_name == "deepseek":
+        monkeypatch.setattr(
+            "ash.providers.deepseek.openai.AsyncOpenAI", lambda **_: client
+        )
+        provider = DeepSeekProvider("test", "key")
+    else:
+        monkeypatch.setattr("ash.providers.groq.openai.AsyncOpenAI", lambda **_: client)
+        provider = GroqProvider("test", "key")
+
+    chunks = [
+        chunk
+        async for chunk in provider.stream_chat([{"role": "user", "content": "hi"}])
+    ]
+
+    assert "".join(chunk.content for chunk in chunks) == "hello"
+    assert chunks[-1].is_done is True
+    assert chunks[-1].prompt_tokens == 1200
+    assert chunks[-1].completion_tokens == 10
+    assert chunks[-1].usage_source == "provider"
+
+    await provider.aclose()
+    assert client.closed is True
+
+
 @pytest.mark.asyncio
 async def test_openai_compatible_endpoint_omits_openai_cache_options() -> None:
     from ash.providers.openai import OpenAIProvider

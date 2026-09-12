@@ -188,12 +188,32 @@ async def test_custom_anonymous_openai_compatible_provider_builds_without_bearer
     provider = create_default_provider_registry().build(config)
 
     assert provider.model_name == "local-model"
-    request = httpx.Request("POST", "http://127.0.0.1:8000/v1/chat/completions")
-    request.headers["Authorization"] = "Bearer should-not-be-sent"
-    hooks = provider._client._client.event_hooks["request"]
-    assert len(hooks) == 1
-    hooks[0](request)
-    assert "Authorization" not in request.headers
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/chat/completions"
+        assert "Authorization" not in request.headers
+        body = (
+            b'data: {"id":"local","object":"chat.completion.chunk",'
+            b'"choices":[{"index":0,"delta":{"content":"works"},'
+            b'"finish_reason":"stop"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body,
+            request=request,
+        )
+
+    # Keep the provider's real AsyncClient and request-hook path, replacing
+    # only the network transport with a deterministic local response.
+    provider._client._client._transport = httpx.MockTransport(handler)
+    chunks = [
+        chunk
+        async for chunk in provider.stream_chat(
+            [{"role": "user", "content": "hello"}]
+        )
+    ]
+    assert [chunk.content for chunk in chunks] == ["works"]
     await provider.aclose()
 
 
