@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ash.lsp.config import LSPServerConfig
+from ash.lsp.config import LSPServerConfig, resolve_lsp_command
 from ash.core.redaction import redact_text
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
@@ -95,6 +95,16 @@ class LSPClient:
             return
         environment = build_scrubbed_environment(overrides=self.config.env)
         try:
+            launch_command = resolve_lsp_command(
+                self.config.command,
+                self.root,
+                search_path=environment.get("PATH"),
+            )
+        except ValueError as exc:
+            raise LSPError(
+                f"failed to start LSP server {self.config.name}: {exc}"
+            ) from exc
+        try:
             process_tree_plan = prepare_process_tree(workspace_root=self.root)
         except ProcessTreeUnavailable as exc:
             raise LSPError(
@@ -103,7 +113,7 @@ class LSPClient:
         self._process_tree_plan = process_tree_plan
         try:
             self.process = await asyncio.create_subprocess_exec(
-                *self.config.command,
+                *launch_command,
                 cwd=self.root,
                 env=environment,
                 stdin=asyncio.subprocess.PIPE,

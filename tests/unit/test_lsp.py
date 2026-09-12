@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -20,7 +21,12 @@ from ash.lsp.client import (
     _read_document_text,
     _read_message,
 )
-from ash.lsp.config import LSPServerConfig, load_lsp_server_configs
+from ash.lsp.config import (
+    LSPServerConfig,
+    load_lsp_server_configs,
+    lsp_command_available,
+    resolve_lsp_command,
+)
 from ash.lsp.manager import LanguageServerManager, _has_capability
 from ash.lsp.middleware import LSPDiagnosticsMiddleware
 from ash.safety.guard import SafetyGuard
@@ -167,7 +173,10 @@ def test_workspace_server_detection_requires_trust_and_executable_bit(
     executable.parent.mkdir(parents=True)
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(0o644)
-    monkeypatch.setattr("ash.lsp.config.shutil.which", lambda command: None)
+    monkeypatch.setattr(
+        "ash.lsp.config.resolve_host_executable",
+        lambda *args, **kwargs: None,
+    )
 
     assert load_lsp_server_configs(tmp_path, include_project=False) == {}
     assert load_lsp_server_configs(tmp_path, include_project=True) == {}
@@ -187,7 +196,8 @@ def test_disabling_basedpyright_preserves_detected_pyright_fallback(
         '{"servers":{"basedpyright":{"disabled":true}}}', encoding="utf-8"
     )
     monkeypatch.setattr(
-        "ash.lsp.config.shutil.which", lambda command: f"/installed/{command}"
+        "ash.lsp.config.resolve_host_executable",
+        lambda command, **kwargs: f"/installed/{command}",
     )
 
     configs = load_lsp_server_configs(tmp_path, include_project=True)
@@ -202,6 +212,102 @@ def test_disabling_basedpyright_preserves_detected_pyright_fallback(
     configs = load_lsp_server_configs(tmp_path, include_project=True)
     assert "basedpyright" not in configs
     assert configs["pyright"].extensions[".py"] == "python"
+
+
+def test_builtin_lsp_excludes_workspace_shadow_and_uses_trusted_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    host_bin = tmp_path / "host-bin"
+    workspace.mkdir()
+    host_bin.mkdir()
+    workspace_binary = workspace / "rust-analyzer"
+    host_binary = host_bin / "rust-analyzer"
+    for binary in (workspace_binary, host_binary):
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        binary.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{workspace}{os.pathsep}{host_bin}")
+
+    configs = load_lsp_server_configs(workspace, include_project=False)
+
+    assert configs["rust-analyzer"].command[0] == str(host_binary.resolve())
+    assert configs["rust-analyzer"].command[0] != str(workspace_binary)
+    assert lsp_command_available(configs["rust-analyzer"], workspace)
+
+
+def test_bare_lsp_runtime_command_resolves_without_workspace_shadow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    host_bin = tmp_path / "host-bin"
+    workspace.mkdir()
+    host_bin.mkdir()
+    (workspace / "server").write_text("shadowed", encoding="utf-8")
+    host_server = host_bin / "server"
+    host_server.write_text("trusted", encoding="utf-8")
+    host_server.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{workspace}{os.pathsep}{host_bin}")
+    config = LSPServerConfig(
+        name="custom",
+        command=("server", "--stdio"),
+        extensions={".py": "python"},
+        source="user",
+    )
+
+    assert lsp_command_available(config, workspace) is True
+    assert resolve_lsp_command(config.command, workspace)[0] == str(
+        host_server.resolve()
+    )
+
+
+@pytest.mark.asyncio
+async def test_lsp_client_launches_resolved_host_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    host_bin = tmp_path / "host-bin"
+    workspace.mkdir()
+    host_bin.mkdir()
+    marker = tmp_path / "workspace-shadow-ran"
+    workspace_shadow = workspace / "server"
+    workspace_shadow.write_text(
+        f"#!{sys.executable}\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('shadowed', encoding='utf-8')\n"
+        "raise SystemExit(99)\n",
+        encoding="utf-8",
+    )
+    workspace_shadow.chmod(0o755)
+    host_server = host_bin / "server"
+    host_server.write_text(
+        f"#!{sys.executable}\n"
+        "import runpy\n"
+        f"runpy.run_path({str(FIXTURE_SERVER)!r}, run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    host_server.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{workspace}{os.pathsep}{host_bin}")
+
+    config = replace(
+        fake_config(tmp_path / "lsp.jsonl"),
+        command=("server",),
+    )
+    client = LSPClient(
+        config,
+        workspace,
+        diagnostics_callback=AsyncMock(return_value=None),
+    )
+    try:
+        await client.start()
+        assert client.process is not None
+        assert client.process.returncode is None
+    finally:
+        await client.aclose()
+
+    assert not marker.exists()
 
 
 def test_position_encoding_uses_negotiated_units() -> None:

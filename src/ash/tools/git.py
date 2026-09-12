@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from ash.core.redaction import find_secret_candidates
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
+from ash.safety.git import read_only_git_args, read_only_git_environment
 from ash.safety.guard import SafetyGuard
 from ash.sandbox import SandboxBackendUnavailable, SandboxManager
 from ash.sandbox.process_utils import (
@@ -67,7 +68,11 @@ class GitStatusTool(BaseTool):
         command = ["status", "--short", "--branch"]
         if not args.include_untracked:
             command.append("--untracked-files=no")
-        return await _git_result(self.safety_guard.project_root, command)
+        return await _git_result(
+            self.safety_guard.project_root,
+            command,
+            read_only=True,
+        )
 
 
 class GitDiffTool(BaseTool):
@@ -84,7 +89,11 @@ class GitDiffTool(BaseTool):
         if args.path:
             path = self.safety_guard.validate_path(args.path)
             command.append(str(path.relative_to(self.safety_guard.project_root)))
-        return await _git_result(self.safety_guard.project_root, command)
+        return await _git_result(
+            self.safety_guard.project_root,
+            command,
+            read_only=True,
+        )
 
 
 class GitLogTool(BaseTool):
@@ -102,6 +111,7 @@ class GitLogTool(BaseTool):
                 "--date=iso-strict",
                 "--pretty=format:%h%x09%ad%x09%an%x09%s",
             ],
+            read_only=True,
         )
 
 
@@ -262,6 +272,7 @@ class AutoCommitTool(BaseTool):
             ],
             self.environment_allowlist,
             sandbox_manager=self.sandbox_manager,
+            read_only=True,
         )
         if scan_code != 0:
             return ToolResult(
@@ -329,17 +340,25 @@ async def _run_git(
     environment_allowlist: Iterable[str] = (),
     *,
     sandbox_manager: SandboxManager | None = None,
+    read_only: bool = False,
 ) -> tuple[int, str, str]:
     """Run ``git <args>`` in ``cwd`` and return (exit, stdout, stderr)."""
 
     git = resolve_host_executable("git", workspace_root=cwd, cwd=cwd)
     if git is None:
         return 127, "", "git is unavailable outside the workspace"
-    cmd = [git, *args]
     allowlist = tuple(environment_allowlist)
-    environment = build_scrubbed_environment(allowlist)
+    git_args = read_only_git_args(args) if read_only else list(args)
+    cmd = [git, *git_args]
+    environment = (
+        read_only_git_environment(allowlist)
+        if read_only
+        else build_scrubbed_environment(allowlist)
+    )
     if sandbox_manager is not None:
-        sandbox_command = ["git", *args] if sandbox_manager.backend_name == "docker" else cmd
+        sandbox_command = (
+            ["git", *git_args] if sandbox_manager.backend_name == "docker" else cmd
+        )
         try:
             result = await sandbox_manager.run(
                 sandbox_command,
@@ -436,6 +455,7 @@ async def _cached_paths(
         ["diff", "--cached", "--name-only", "-z"],
         environment_allowlist,
         sandbox_manager=sandbox_manager,
+        read_only=True,
     )
     if code != 0:
         return None
@@ -497,8 +517,13 @@ def _scan_added_secret_findings(diff: str) -> list[tuple[str, str]]:
     return findings
 
 
-async def _git_result(cwd: Path, args: Sequence[str]) -> ToolResult:
-    code, stdout, stderr = await _run_git(cwd, args)
+async def _git_result(
+    cwd: Path,
+    args: Sequence[str],
+    *,
+    read_only: bool = False,
+) -> ToolResult:
+    code, stdout, stderr = await _run_git(cwd, args, read_only=read_only)
     output = stdout
     truncated = code == GIT_OUTPUT_LIMIT_EXIT or len(output) > DEFAULT_GIT_OUTPUT_LIMIT
     if truncated:

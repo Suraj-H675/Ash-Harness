@@ -640,6 +640,7 @@ class TestProbeModels:
     def test_probe_models_http_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_probe_models returns [] on HTTP error."""
         monkeypatch.setenv("HOME", "/tmp")
+
         def fail_client(*, timeout: float) -> object:
             raise RuntimeError("network error")
 
@@ -1270,6 +1271,13 @@ class TestSetupNavigation:
 
 class TestLegacyConfigMigration:
     @pytest.fixture(autouse=True)
+    def _trusted_workspace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "ash.commands.setup.is_workspace_trusted",
+            lambda workspace: True,
+        )
+
+    @pytest.fixture(autouse=True)
     def _clear_destination_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for key in (
             "ASH_MODEL",
@@ -1292,6 +1300,7 @@ class TestLegacyConfigMigration:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         from ash.commands import config as cli_config
         from ash.commands.setup import _migrate_old_ash_toml
@@ -1325,7 +1334,7 @@ class TestLegacyConfigMigration:
         _migrate_old_ash_toml()
 
         env = cli_config.load_env()
-        assert env["OPENAI_API_KEY"] == "legacy-secret"
+        assert "OPENAI_API_KEY" not in env
         assert env["ASH_MODEL"] == "openai/gpt-test"
         assert "ANTHROPIC_API_KEY" not in env
         user = cli_config.load_config(strict=True)
@@ -1334,14 +1343,19 @@ class TestLegacyConfigMigration:
         assert user["max_context_tokens"] == 64000
         assert user["max_completion_tokens"] == 2048
         assert user["max_tool_result_tokens"] == 9000
-        assert user["safety_tier"] == "dry_run"
-        assert user["workspace_root"] == str(project.resolve())
-        assert user["db_directory"] == str((project / ".ash-db").resolve())
-        assert user["command_blocklist"] == ["danger"]
+        assert "safety_tier" not in user
+        assert "workspace_root" not in user
+        assert "db_directory" not in user
+        assert "command_blocklist" not in user
         backups = list((cli_config.ASH_DIR / "backups").glob("legacy-*.bak"))
         assert len(backups) == 1
         assert backups[0].read_bytes() == legacy.read_bytes()
         assert cli_config.is_config_migration_recorded(legacy) is True
+        output = capsys.readouterr().out
+        assert "api_key" in output
+        assert "safety_tier" in output
+        assert "db_directory" in output
+        assert "legacy-secret" not in output
 
         repeated_prompt = MagicMock(side_effect=AssertionError("prompted twice"))
         monkeypatch.setattr("builtins.input", repeated_prompt)
@@ -1425,6 +1439,73 @@ class TestLegacyConfigMigration:
         monkeypatch.setattr("builtins.input", _fake_input(["y"]))
         _migrate_old_ash_toml()
         assert "ANTHROPIC_API_KEY" not in cli_config.load_env()
+
+    def test_untrusted_workspace_is_not_offered_migration(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from ash.commands import config as cli_config
+        from ash.commands.setup import _migrate_old_ash_toml
+
+        self._configure_paths(tmp_path)
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "ash.toml").write_text(
+            'model_name = "legacy"\nsafety_tier = "auto_approve"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(project)
+        prompt = MagicMock(side_effect=AssertionError("migration was offered"))
+        monkeypatch.setattr("builtins.input", prompt)
+        monkeypatch.setattr("ash.commands.setup.is_workspace_trusted", lambda _: False)
+
+        _migrate_old_ash_toml()
+
+        prompt.assert_not_called()
+        assert not cli_config.CONFIG_FILE.exists()
+        assert not cli_config.ENV_FILE.exists()
+        assert "not trusted" in capsys.readouterr().out
+
+    def test_trusted_workspace_still_excludes_sensitive_legacy_fields(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from ash.commands import config as cli_config
+        from ash.commands.setup import _migrate_old_ash_toml
+
+        self._configure_paths(tmp_path)
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "ash.toml").write_text(
+            'model_name = "legacy"\n'
+            'provider = "custom"\n'
+            "temperature = 0.25\n"
+            'safety_tier = "auto_approve"\n'
+            'sandbox_backend = "direct"\n'
+            'db_directory = "outside"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(project)
+        monkeypatch.setattr("builtins.input", _fake_input(["y"]))
+
+        _migrate_old_ash_toml()
+
+        user = cli_config.load_config(strict=True)
+        assert user["temperature"] == 0.25
+        assert "safety_tier" not in user
+        assert "sandbox_backend" not in user
+        assert "db_directory" not in user
+        assert "ASH_MODEL" not in cli_config.load_env()
+        output = capsys.readouterr().out
+        assert "model_name" in output
+        assert "provider" in output
+        assert "safety_tier" in output
+        assert "sandbox_backend" in output
+        assert "db_directory" in output
 
     def test_refuses_to_overwrite_malformed_user_config(
         self,

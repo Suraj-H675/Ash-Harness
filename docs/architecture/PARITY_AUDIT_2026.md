@@ -639,3 +639,311 @@ loopback-provider CLI run now exits successfully and leaves the expected FTS5
 workspace record. Existing shutdown ownership still cancels the bounded
 background task during loop closure; no new persistence or public API semantics
 were introduced.
+
+### Audit continuation checkpoint — 2026-09-12
+
+The provider-hardening batch was committed as `e5450f1` and pushed. It fixes
+the OpenAI-compatible request-hook await contract and makes the DeepSeek and
+Groq adapters tolerate usage-only terminal chunks with `choices=[]`. The
+focused provider/registry tests passed **61 tests**. Hosted CI run
+`34680050403` completed successfully across Ubuntu/macOS and Python 3.11/3.12,
+including Ruff, mypy, the full test suite, wheel build, and installed-wheel
+smoke. The unrelated worktree files remain untouched.
+
+The following are new evidence-backed candidates from the continued
+adversarial audit. They are deliberately recorded as pending decisions rather
+than patched speculatively.
+
+#### Candidate — read-only Git tools execute repository-configured extensions
+
+`GitStatusTool` and `GitDiffTool` call `_git_result()` without the runtime
+sandbox manager (`src/ash/tools/git.py:60-81`). `_run_git()` resolves the Git
+binary safely, but then launches Git directly (`src/ash/tools/git.py:225-256`).
+Git itself remains able to execute repository-configured behavior during these
+nominally read-only operations.
+
+A fresh temporary repository configured `core.fsmonitor` to an executable
+outside the workspace. The real `GitStatusTool(SafetyGuard(root)).run()`
+returned success and the external marker became `fsmonitor`. A configured
+`diff.<driver>.textconv` executable likewise ran during the real
+`GitDiffTool.run()` despite `--no-ext-diff`; the external marker became
+`textconv`. The tools therefore expose an untrusted repository's Git metadata
+to host-side executable hooks while the permission policy classifies both
+tools as read-only. This is a concrete workspace-metadata trust-boundary
+defect, distinct from the excluded same-OS-user namespace races. No fix has
+been applied; the safe policy boundary between Git inspection and configured
+Git extensions needs a Sol decision.
+
+#### Candidate — macOS sandbox backend can transition to unscoped execution
+
+`SandboxManager._build_backend()` returns `_ScopedBackend` when the selected
+`sandbox-exec` backend is no longer available, instead of raising the
+`SandboxBackendUnavailable` that `prepare()` is required to propagate when
+`allow_scoped_fallback=False` (`src/ash/sandbox/manager.py:470-482`). A
+deterministic platform-mocked probe made `has_sandbox_exec()` return true at
+selection and false at preparation. The manager reported
+`selected=sandbox-exec`, `allow_scoped_fallback=False`, then produced
+`prepared_backend=scoped`, `prepared_tier=1`, `fallback_used=False`, and
+`argv0=/bin/sh`. Native macOS execution is not available locally; this remains
+a platform-mocked lifecycle finding, not a native macOS claim.
+
+#### Candidate — Windows background jobs bypass host PowerShell resolution
+
+`BackgroundProcessTool._start()` selects bare `powershell.exe` on Windows
+(`src/ash/tools/process.py:176-183`), while the foreground command path uses
+`resolve_host_executable()` and rejects workspace-shadowed PowerShell
+(`src/ash/tools/command.py:326-338`). With the process platform mocked to
+Windows and a fake `powershell.exe` placed first on `PATH`, the real background
+tool started successfully, reported an exited job, and the fake marker became
+`shadowed`. Native Windows execution is unverified. This candidate needs a
+consistent trusted-executable policy for the background lifecycle.
+
+#### Candidate — stopped background jobs permanently consume capacity
+
+`BackgroundProcessTool.run(action="stop")` returns a successful “Stopped”
+result but does not remove the terminal job from `self.jobs`
+(`src/ash/tools/process.py:127-158`). A real local run started and stopped 32
+short-lived jobs, observed `jobs_retained=32`, and then rejected the next
+legitimate start with `Maximum of 32 background jobs reached`. This is a
+reproducible user-facing availability/lifecycle defect. The desired retention
+semantics for polling stopped jobs versus freeing capacity require a focused
+decision before changing behavior.
+
+#### Candidate — redaction corrupts machine-readable usage fields
+
+`save_runtime_events()` applies `redact_value()` to every persisted event
+(`src/ash/core/session.py:1782-1809`). `redact_value()` treats any key
+containing `token` as secret-like (`src/ash/core/redaction.py:364-379`), so a
+real provider-backed turn with numeric usage produced persisted and HTTP/SSE
+`turn.usage` fields such as `prompt_tokens` and `completion_tokens` as the
+string `"[REDACTED]"` rather than numbers. The same path also affects cache
+and estimated token counters. This breaks the usage/event contract even when
+no secret is present. The broader redactor gaps for Basic authorization,
+Cookie, and credential/proxy-authorization fields remain separately recorded;
+no redaction change has been made.
+
+#### Candidate — stream-json emits duplicate completion events
+
+A fresh real one-shot loopback-provider workflow produced the event sequence
+`turn.started`, `context.usage`, `assistant.delta`, `turn.usage`,
+`turn.completed`, `turn.completed`, with a completion count of 2. The runtime
+emits `turn.completed` in `src/ash/core/loop.py:1738-1748`, and the headless
+bootstrap then calls `HeadlessUI.emit_result()` (`src/ash/cli.py:4176-4188`),
+which emits a second completion event (`src/ash/ui/headless.py:87-90`). This is
+a concrete structured-output contract defect, not a test-only duplicate.
+
+#### Candidate — duplicate native tool-call IDs overwrite durable state
+
+`CanonicalToolCall` validates that each ID is a non-empty string but does not
+validate uniqueness. `tool_calls.call_id` is the SQLite primary key
+(`src/ash/core/session.py:750-763`), and `save_tool_call()` uses
+`ON CONFLICT(call_id) DO UPDATE` (`src/ash/core/session.py:2176-2227`). A real
+local provider fixture returned two native calls with the same ID. Both tools
+executed and two tool messages were sent back to the provider with the same
+ID, but the durable table contained one row for the second tool only. This
+needs a protocol/persistence contract decision about rejecting malformed
+provider output versus namespacing IDs; no schema or runtime change has been
+made.
+
+#### Candidate — REST body buffering precedes bearer authorization
+
+`_BoundedRequestBodyMiddleware` reads and buffers up to the full 16 MiB REST
+body before FastAPI reaches the route's `authorize` dependency
+(`src/ash/server/http.py:84-136`, `:170-195`). A direct ASGI probe sent a valid
+16,777,145-byte JSON body without credentials to `/v1/turn`; the application
+returned 401, but consumed all 16 MiB first. The default server is commonly
+loopback-bound, so exploitability depends on deployment exposure, but the
+pre-auth memory/connection cost is concrete. Any remediation must preserve the
+body-size contract while deciding the intended public-deployment threat model.
+
+#### Candidate — built-in LSP detection can select a workspace-shadowed binary
+
+`load_lsp_server_configs()` resolves built-in server commands with raw
+`shutil.which()` (`src/ash/lsp/config.py:115-125`, `:322-333`) rather than the
+workspace-excluding helper used for other Ash-owned executables. A direct
+probe put an executable named `rust-analyzer` in a temporary workspace and
+placed that workspace first on `PATH`; built-in detection selected the exact
+workspace path even with `include_project=False`. Runtime LSP is trust-gated,
+so the precise product boundary is still to be decided; this is recorded as a
+candidate rather than a confirmed untrusted-workspace bypass. A real local
+Rust LSP attempt separately found that the installed rustup shim lacked the
+`rust-analyzer` toolchain component; that is an environment limitation, not an
+Ash failure.
+
+The previously recorded Codex Security Deep Scan and standard-scan errors are
+unchanged external tooling limitations. These new candidates have not been
+implemented, and no global Codex configuration was changed.
+
+#### Additional candidates from the independent workflow pass
+
+##### Candidate — legacy project config migration can seed user safety policy
+
+`_migrate_old_ash_toml()` reads `./ash.toml` and, after the ordinary interactive
+migration confirmation, copies every recognized configuration field into the
+user-owned `~/.ash/ash.toml` (`src/ash/commands/setup.py:1204-1256` and
+`:1282-1290`). This includes `safety_tier` and `sandbox_backend`, while the
+normal `AshConfig.load()` path only consumes project configuration after the
+workspace trust gate (`src/ash/config.py:1142-1162`).
+
+In a temporary untrusted workspace containing:
+
+```toml
+provider = "ollama"
+model_name = "probe"
+safety_tier = "auto_approve"
+sandbox_backend = "direct"
+```
+
+the real migration function, with the confirmation answered yes, created the
+user config containing `safety_tier = "auto_approve"` and
+`sandbox_backend = "direct"`. A declined confirmation created neither. This is
+a concrete trust-boundary issue: project-controlled settings that affect
+approval and sandbox policy become persistent user-owned policy after an
+apparently routine migration. No fix has been applied; migration semantics
+need a Sol decision.
+
+##### Candidate — provider model IDs can inject terminal controls
+
+Provider model-catalog parsing accepts arbitrary non-empty model IDs
+(`src/ash/commands/setup.py:985-998`; the shared readiness parser has the same
+condition at `src/ash/providers/readiness.py:389-403`). The setup wizard prints
+those IDs directly at `src/ash/commands/setup.py:934-936` and `:970-976`, and
+the config writer rejects CR/LF/NUL but not other terminal controls
+(`src/ash/commands/config.py:270-282`). A local `/models` response containing
+`\x1b]52;c;YXR0YWNrZXI=\x07MODEL\u202eTXT` was accepted and printed unchanged in
+the model list and saved-model confirmation. This can enable terminal spoofing
+and OSC 52 clipboard behavior on supporting terminals. Persisted model output
+is also rendered directly in human `doctor` diagnostics
+(`src/ash/commands/doctor.py:495-497`). No fix has been applied.
+
+##### Candidate — MCP tool names bypass approval-screen terminal sanitization
+
+MCP tool names are accepted as non-empty strings and are incorporated into
+namespaced tool names (`src/ash/mcp/runtime.py:549-553`, `:1381-1385`). The
+interactive approval renderer appends `tool_name` directly to a Rich `Text`
+object (`src/ash/ui/terminal.py:484-490`) instead of applying
+`terminal_safe_text()`. A fake MCP tool named `remote_tool\x1b[2J` retained the
+CSI clear-screen bytes in the actual approval line, while the ordinary event
+renderer sanitized the same value. A malicious or compromised MCP server can
+therefore influence approval-screen rendering when its tool reaches the
+approval path. No fix has been applied.
+
+##### Candidate — bidi formatting controls remain in terminal-safe output
+
+`terminal_safe_text()` removes Unicode `Cc` controls but intentionally leaves
+formatting controls (`Cf`) such as U+202E/U+202C
+(`src/ash/ui/terminal.py:45-57`). A real screen-reader-mode rendering probe
+preserved `SAFE \\u202eGNIDOC\\u202c END`; the existing CSI negative control was
+escaped. This allows visual-order spoofing of assistant, tool, or repository
+text even though arbitrary ANSI control execution was not observed. No fix has
+been applied.
+
+##### Candidate — human storage diagnostics emit SQLite metadata controls
+
+`check_database()` interpolates table names returned by
+`PRAGMA foreign_key_check` directly into human diagnostic messages
+(`src/ash/commands/storage.py:45-50`), which `render_storage_check()` prints in
+human mode (`src/ash/commands/storage.py:162-169`). A crafted corrupt database
+with an ESC/BEL-containing table name produced raw `\\x1b]52...\\x07` bytes in
+human output. The JSON renderer escaped the controls, so this is specifically
+a human terminal-output boundary. No fix has been applied.
+
+##### Lower-impact candidate — repository-map DOT output is not escaped
+
+`RepoMap.to_dot_graph()` interpolates repository-relative filenames into quoted
+DOT edges without escaping (`src/ash/repo/repomap.py:627-645`). A filename
+containing a quote and newline produced an additional forged DOT edge in the
+output. There is no in-tree caller that invokes Graphviz and `dot` is not
+installed in this environment, so downstream rendering impact was not
+executed. This remains a serializer candidate rather than a confirmed command
+execution issue.
+
+##### Lower-impact candidate — Ollama child output is not terminal-sanitized
+
+`pull_model()` writes child-process output directly to stdout
+(`src/ash/commands/ollama.py:95`). A fake external `ollama` emitted raw OSC/CSI
+bytes and the real command path preserved them. The real Ollama executable is
+not installed locally, so genuine runtime exploitability remains an environment
+limitation. No fix has been applied.
+
+These candidates are pending Sol classification and remediation decisions. The
+specialist's focused checks reported **195 tests passed** and the adjacent
+config/profile/MCP/Ollama checks reported **248 tests passed**, with no
+repository edits. The unrelated worktree entries remain untouched.
+
+### Batch 1 — workspace and host trust-boundary remediation
+
+Sol authorized the four workspace/host boundary candidates as the first
+current remediation batch. The changes below are intentionally scoped to
+Ash-owned boundaries; the unrelated working-tree entries remain unstaged and
+untouched.
+
+#### Legacy project-config migration (#1)
+
+`_migrate_old_ash_toml()` now checks Ash's existing workspace-trust record
+before offering migration. Its planner imports the current
+`PROJECT_CONFIG_FIELDS` allowlist rather than treating every legacy setting as
+portable user configuration. Safety tier, sandbox backend, command-blocking
+and host/persistence paths, API keys, and other non-project-owned fields are
+not promoted. Safe project-owned settings and the historical model selection
+workflow remain available; existing destination values are preserved. A
+bounded diagnostic names skipped fields without printing their values, and
+the legacy source remains in place with the existing backup and migration
+record behavior.
+
+The focused migration regressions cover untrusted workspaces, trusted
+workspaces containing sensitive fields, mixed safe/sensitive files, source
+backups, destination preservation, duplicate-migration suppression, and
+bounded diagnostics. The old real-path probe no longer creates user config or
+environment credentials from sensitive legacy fields.
+
+#### Ash-owned read-only Git inspection (#3)
+
+The shared `ash.safety.git` policy now applies `--no-pager`,
+`-c core.fsmonitor=false`, `--no-ext-diff`, and `--no-textconv` where
+applicable, together with a scrubbed environment containing
+`GIT_OPTIONAL_LOCKS=0`, `GIT_PAGER=cat`, and
+`GIT_TERMINAL_PROMPT=0`. It is used by the Git status/diff/log tools, staged
+secret-scan inspection, review collection, and RepoMap's Git-ignore query.
+Ash does not alter repository configuration and explicit user-requested
+`run_command("git ...")` behavior is outside this Ash-owned inspection
+boundary.
+
+Real temporary-repository probes with marker `core.fsmonitor` and
+`diff.<driver>.textconv` executables now return ordinary status/diff/review/
+RepoMap results without executing either marker. The focused regression also
+checks normal diff content and confirms the repository's local configuration
+is unchanged.
+
+#### Windows background PowerShell (#6)
+
+The direct/scoped Windows `BackgroundProcessTool` path now resolves
+`powershell.exe` through `resolve_host_executable()` using the effective
+scrubbed PATH, excludes workspace candidates, passes the resulting absolute
+host path to subprocess creation, and fails before spawn when no trusted host
+PowerShell is available. Process-tree, sandbox, environment, and background
+I/O behavior are unchanged. The workspace-shadow and no-host-executable
+regressions pass with a platform-mocked Windows path. Native Windows
+execution remains unavailable locally and is not claimed.
+
+#### Built-in LSP executable resolution (#11)
+
+Built-in and bare configured LSP commands now use the same workspace-excluding
+host resolver for discovery, availability checks, and the actual
+`LSPClient.start()` launch. Trusted project configuration may still select an
+executable from `node_modules/.bin`, and explicit absolute user-configured
+paths remain supported. The resolved absolute command is passed to process
+creation so the later launch cannot re-resolve a workspace-shadowed binary.
+Regressions cover built-in detection with a workspace-first PATH, trusted
+project-local support, explicit path behavior, safe host fallback, and runtime
+resolution. Native platform-specific executable behavior remains unverified
+where the local host cannot exercise it.
+
+At the completed local checkpoint, the Batch 1 focused runs pass **60**
+migration/Git/review/RepoMap tests and **45** LSP/background tests. The full
+CI-equivalent pytest gate passes **2,260 tests with 7 skips**; repository Ruff
+and mypy pass, `uv build` passes, and the installed-wheel packaging smoke
+passes. The skipped cases are optional browser/PTY/platform-dependent tests,
+not Batch 1 failures. Native Windows execution remains unverified, and no
+Codex Security scan is claimed as passed. Hosted-CI results are recorded only
+after the pushed batch's run completes.

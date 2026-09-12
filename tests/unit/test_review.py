@@ -46,6 +46,22 @@ def test_collect_worktree_includes_tracked_and_untracked_text(repository: Path) 
     assert "+added = True" in patch
 
 
+def test_collect_review_does_not_execute_repository_extensions(
+    repository: Path,
+) -> None:
+    marker = repository / "fsmonitor-ran"
+    hook = repository / "fsmonitor.sh"
+    hook.write_text(f"#!/bin/sh\nprintf ran >> {marker}\n", encoding="utf-8")
+    hook.chmod(0o755)
+    git(repository, "config", "core.fsmonitor", str(hook))
+    (repository / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+
+    _, patch = asyncio.run(collect_review_changes(repository, []))
+
+    assert "+value = 2" in patch
+    assert not marker.exists()
+
+
 def test_collect_worktree_omits_oversized_untracked_file(repository: Path) -> None:
     (repository / "large.txt").write_bytes(b"x" * (MAX_UNTRACKED_FILE_BYTES + 1))
 

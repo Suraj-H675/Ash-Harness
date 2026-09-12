@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ash.safety.environment import resolve_host_executable
+from ash.safety.git import read_only_git_args, read_only_git_environment
 from ash.repo.parser import (
     MAX_SOURCE_FILE_BYTES,
     SOURCE_SUFFIXES,
@@ -184,13 +185,15 @@ def _git_ignored_files(project_root: Path, paths: Iterable[Path]) -> set[Path]:
         return set()
     payload = "\0".join(relative_paths).encode("utf-8") + b"\0"
     try:
+        environment = read_only_git_environment()
         completed = subprocess.run(
-            [git, "check-ignore", "--stdin", "-z"],
+            [git, *read_only_git_args(["check-ignore", "--stdin", "-z"])],
             cwd=project_root,
             input=payload,
             capture_output=True,
             check=False,
             timeout=10,
+            env=environment,
         )
     except (OSError, subprocess.TimeoutExpired):
         return set()

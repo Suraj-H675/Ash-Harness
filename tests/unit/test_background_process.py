@@ -1,7 +1,9 @@
 import asyncio
+import os
 import shlex
 import sys
-from unittest.mock import Mock
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -153,3 +155,76 @@ async def test_background_process_fails_closed_when_sandbox_disappears(
     assert result.success is False
     assert "command was not started" in (result.error or "")
     assert not tool.jobs
+
+
+@pytest.mark.asyncio
+async def test_windows_background_resolves_powershell_outside_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    host_bin = tmp_path / "host-bin"
+    workspace.mkdir()
+    host_bin.mkdir()
+    workspace_powershell = workspace / "powershell.exe"
+    host_powershell = host_bin / "powershell.exe"
+    workspace_powershell.write_text("shadowed", encoding="utf-8")
+    host_powershell.write_text("trusted", encoding="utf-8")
+    workspace_powershell.chmod(0o755)
+    host_powershell.chmod(0o755)
+    monkeypatch.setenv(
+        "PATH",
+        f"{workspace}{os.pathsep}{host_bin}",
+    )
+
+    stdout = asyncio.StreamReader()
+    stderr = asyncio.StreamReader()
+    stdout.feed_eof()
+    stderr.feed_eof()
+    process = Mock(pid=1234, returncode=0, stdin=None, stdout=stdout, stderr=stderr)
+    process.wait = AsyncMock(return_value=0)
+    with (
+        patch("ash.tools.process.platform.system", return_value="Windows"),
+        patch(
+            "ash.tools.process.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ) as spawn,
+        patch(
+            "ash.tools.process.terminate_process_tree",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        tool = BackgroundProcessTool(SafetyGuard(workspace))
+        result = await tool.run(action="start", command="Write-Output intended")
+        await asyncio.gather(*tool.jobs[next(iter(tool.jobs))].readers)
+
+    assert result.success is True
+    assert spawn.await_args.args[0] == str(host_powershell.resolve())
+    assert spawn.await_args.args[0] != str(workspace_powershell)
+
+
+@pytest.mark.asyncio
+async def test_windows_background_fails_before_spawn_without_host_powershell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fake = workspace / "powershell.exe"
+    fake.write_text("shadowed", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(workspace))
+
+    with (
+        patch("ash.tools.process.platform.system", return_value="Windows"),
+        patch(
+            "ash.tools.process.asyncio.create_subprocess_exec",
+            new=AsyncMock(),
+        ) as spawn,
+    ):
+        tool = BackgroundProcessTool(SafetyGuard(workspace))
+        result = await tool.run(action="start", command="Write-Output unsafe")
+
+    assert result.success is False
+    assert "was not started" in (result.error or "")
+    spawn.assert_not_awaited()

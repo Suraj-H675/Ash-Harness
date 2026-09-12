@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from ash.safe_io import read_bounded_bytes
+from ash.safety.environment import resolve_host_executable
 
 
 MAX_LSP_CONFIG_BYTES = 256 * 1024
@@ -138,6 +138,17 @@ def load_lsp_server_configs(
             if parsed.disabled:
                 servers.pop(name, None)
                 continue
+            executable = _resolve_executable(
+                parsed.command[0],
+                workspace,
+                allow_workspace=trusted_root is not None,
+                search_path=parsed.env.get("PATH"),
+            )
+            if executable is not None:
+                parsed = replace(
+                    parsed,
+                    command=(executable, *parsed.command[1:]),
+                )
             servers[name] = parsed
     if "basedpyright" in servers and "pyright" in servers:
         based = servers["basedpyright"]
@@ -154,17 +165,37 @@ def load_lsp_server_configs(
 def lsp_command_available(config: LSPServerConfig, workspace: Path) -> bool:
     """Return whether a configured executable resolves without running it."""
 
-    command = Path(config.command[0]).expanduser()
-    if (
-        command.is_absolute()
-        or len(command.parts) > 1
-        or config.command[0] != command.name
-    ):
-        candidate = command if command.is_absolute() else workspace / command
-        return candidate.is_file() and (
-            os.name == "nt" or os.access(candidate, os.X_OK)
+    return (
+        _resolve_lsp_executable(
+            config.command[0],
+            workspace,
+            search_path=config.env.get("PATH"),
         )
-    return shutil.which(config.command[0]) is not None
+        is not None
+    )
+
+
+def resolve_lsp_command(
+    command: tuple[str, ...],
+    workspace: Path,
+    *,
+    search_path: str | None = None,
+) -> tuple[str, ...]:
+    """Resolve a bare LSP command once, without allowing workspace shadowing."""
+
+    if not command or not command[0].strip():
+        raise ValueError("LSP command cannot be empty")
+    executable = _resolve_lsp_executable(command[0], workspace, search_path=search_path)
+    if executable is None:
+        raise ValueError(f"LSP executable is unavailable: {command[0]!r}")
+    command_path = Path(command[0]).expanduser()
+    if (
+        command_path.is_absolute()
+        or len(command_path.parts) > 1
+        or command[0] != command_path.name
+    ):
+        return command
+    return (executable, *command[1:])
 
 
 def _read_config(
@@ -320,7 +351,11 @@ def _validate_string_list(
 
 
 def _resolve_executable(
-    command: str, workspace: Path, *, allow_workspace: bool
+    command: str,
+    workspace: Path,
+    *,
+    allow_workspace: bool,
+    search_path: str | None = None,
 ) -> str | None:
     suffix = ".cmd" if os.name == "nt" else ""
     local = workspace / "node_modules" / ".bin" / f"{command}{suffix}"
@@ -330,7 +365,40 @@ def _resolve_executable(
         and (os.name == "nt" or os.access(local, os.X_OK))
     ):
         return str(local.resolve())
-    return shutil.which(command)
+    return resolve_host_executable(
+        command,
+        workspace_root=workspace,
+        cwd=workspace,
+        search_path=search_path,
+    )
+
+
+def _resolve_lsp_executable(
+    command: str,
+    workspace: Path,
+    *,
+    search_path: str | None = None,
+) -> str | None:
+    command_path = Path(command).expanduser()
+    if (
+        command_path.is_absolute()
+        or len(command_path.parts) > 1
+        or command != command_path.name
+    ):
+        candidate = (
+            command_path if command_path.is_absolute() else workspace / command_path
+        )
+        if not candidate.is_file() or (
+            os.name != "nt" and not os.access(candidate, os.X_OK)
+        ):
+            return None
+        return str(candidate)
+    return resolve_host_executable(
+        command,
+        workspace_root=workspace,
+        cwd=workspace,
+        search_path=search_path,
+    )
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

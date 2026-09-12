@@ -24,6 +24,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from ash.config import (
+    CURRENT_CONFIG_SCHEMA_VERSION,
+    PROJECT_CONFIG_FIELDS,
+    PROJECT_MODEL_PROVIDERS,
+)
 from ash.commands.config import (
     backup_config_file,
     get_env_value,
@@ -43,6 +48,7 @@ from ash.provider_catalog import (
     get_provider_descriptor,
 )
 from ash.safe_io import read_bounded_bytes
+from ash.safety.trust import is_workspace_trusted
 
 
 class SetupOutcome(IntEnum):
@@ -1195,10 +1201,6 @@ _LEGACY_PROVIDER_KEYS = {
 }
 _LEGACY_MARKERS = frozenset({"api_key", "model_name"})
 _LEGACY_RESERVED = frozenset({"api_key", "provider", "model_name"})
-_LEGACY_PATH_FIELDS = frozenset(
-    {"workspace_root", "db_directory", "chroma_persist_dir", "onnx_model_path"}
-)
-_PLACEHOLDER_KEYS = frozenset({"replace-with-your-api-key", "your-api-key", "changeme"})
 
 
 def _migrate_old_ash_toml() -> None:
@@ -1227,6 +1229,12 @@ def _migrate_old_ash_toml() -> None:
         return
     if is_config_migration_recorded(old_path):
         return
+    if not is_workspace_trusted(old_path.parent):
+        print(
+            "  Legacy ash.toml migration skipped because the workspace is not trusted. "
+            "Review it and run `ash trust add` before migrating safe settings."
+        )
+        return
 
     _print_header("Old Configuration Found")
     print(f"  Found ash.toml in {old_path.parent}")
@@ -1236,7 +1244,7 @@ def _migrate_old_ash_toml() -> None:
         return
 
     user_config = load_config(strict=True)
-    config_updates, env_updates, preserved = _plan_legacy_config_migration(
+    config_updates, env_updates, preserved, skipped = _plan_legacy_config_migration(
         old_config,
         old_path=old_path,
         user_config=user_config,
@@ -1261,6 +1269,14 @@ def _migrate_old_ash_toml() -> None:
         print(f"  Previous user config backup: {destination_backup}")
     if preserved:
         print("  Preserved existing destination values: " + ", ".join(preserved))
+    if skipped:
+        shown = ", ".join(skipped[:20])
+        suffix = f", and {len(skipped) - 20} more" if len(skipped) > 20 else ""
+        print(
+            "  Not migrated (user-owned or unsupported legacy fields): "
+            + shown
+            + suffix
+        )
     print(
         "  Old ash.toml was left in place and will not be prompted again unless changed."
     )
@@ -1271,19 +1287,22 @@ def _plan_legacy_config_migration(
     *,
     old_path: Path,
     user_config: dict[str, object],
-) -> tuple[dict[str, object], dict[str, str], list[str]]:
+) -> tuple[dict[str, object], dict[str, str], list[str], list[str]]:
     """Map legacy values without replacing newer destination settings."""
-
-    from ash.config import AshConfig, CURRENT_CONFIG_SCHEMA_VERSION
 
     merged = dict(user_config)
     env_updates: dict[str, str] = {}
     preserved: list[str] = []
-    known_fields = set(AshConfig.model_fields)
+    skipped: list[str] = []
     for field, value in old_config.items():
-        if field in _LEGACY_RESERVED or field not in known_fields:
+        if field in _LEGACY_RESERVED:
+            if field == "api_key":
+                skipped.append(field)
             continue
-        normalized = _normalize_legacy_config_value(field, value, old_path.parent)
+        if field not in PROJECT_CONFIG_FIELDS:
+            skipped.append(field)
+            continue
+        normalized = value
         if field in merged:
             preserved.append(field)
         else:
@@ -1292,23 +1311,27 @@ def _plan_legacy_config_migration(
 
     provider = str(old_config.get("provider") or "anthropic").strip().casefold()
     model_name = str(old_config.get("model_name") or "").strip()
-    if model_name:
+    if model_name and provider in PROJECT_MODEL_PROVIDERS:
         _preserve_or_stage_env(
             "ASH_MODEL",
             f"{provider}/{model_name}",
             env_updates,
             preserved,
         )
+    elif model_name:
+        skipped.append("model_name")
+        if "provider" in old_config:
+            skipped.append("provider")
     api_key = str(old_config.get("api_key") or "").strip()
     key_name = _LEGACY_PROVIDER_KEYS.get(provider)
-    if api_key and api_key.casefold() not in _PLACEHOLDER_KEYS and key_name:
-        _preserve_or_stage_env(
-            key_name,
-            api_key,
-            env_updates,
-            preserved,
-        )
-    return merged, env_updates, sorted(set(preserved))
+    if api_key and key_name and get_env_value(key_name) is not None:
+        preserved.append(key_name)
+    return (
+        merged,
+        env_updates,
+        sorted(set(preserved)),
+        sorted(set(skipped)),
+    )
 
 
 def _preserve_or_stage_env(
@@ -1321,15 +1344,6 @@ def _preserve_or_stage_env(
         preserved.append(key)
     else:
         updates[key] = value
-
-
-def _normalize_legacy_config_value(field: str, value: object, base: Path) -> object:
-    if field not in _LEGACY_PATH_FIELDS or not isinstance(value, str):
-        return value
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = base / path
-    return str(path.resolve())
 
 
 # ---------------------------------------------------------------------------

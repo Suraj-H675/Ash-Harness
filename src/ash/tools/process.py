@@ -12,6 +12,7 @@ from typing import Any, Iterable
 
 from pydantic import BaseModel, Field
 
+from ash.safety.environment import resolve_host_executable
 from ash.safety.guard import SafetyGuard
 from ash.sandbox.process_utils import (
     ProcessTreeError,
@@ -173,6 +174,9 @@ class BackgroundProcessTool(BaseTool):
         cwd = self.safety_guard.validate_path(
             args.cwd or self.safety_guard.project_root
         )
+        environment = build_scrubbed_command_env(
+            self.safety_guard.project_root, self.environment_allowlist
+        )
         isolated = (
             self.sandbox_manager is not None
             and self.sandbox_manager.tier >= SANDBOX_TIER_BWRAP
@@ -180,7 +184,22 @@ class BackgroundProcessTool(BaseTool):
         if isolated or platform.system() != "Windows":
             argv = ["/bin/sh", "-c", args.command]
         else:
-            argv = ["powershell.exe", "-NoProfile", "-Command", args.command]
+            powershell = resolve_host_executable(
+                "powershell.exe",
+                workspace_root=self.safety_guard.project_root,
+                cwd=cwd,
+                search_path=environment.get("PATH"),
+            )
+            if powershell is None:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(
+                        "PowerShell executable is unavailable outside the workspace; "
+                        "background command was not started."
+                    ),
+                )
+            argv = [powershell, "-NoProfile", "-Command", args.command]
         backend_name = "scoped"
         if self.sandbox_manager is not None:
             try:
@@ -210,9 +229,7 @@ class BackgroundProcessTool(BaseTool):
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd,
-            env=build_scrubbed_command_env(
-                self.safety_guard.project_root, self.environment_allowlist
-            ),
+            env=environment,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

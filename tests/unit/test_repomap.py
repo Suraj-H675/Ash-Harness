@@ -187,6 +187,41 @@ def test_repomap_honors_gitignore_for_untracked_files(tmp_path: Path) -> None:
     assert [node.path.name for node in repo_map.files] == ["kept.py"]
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_repomap_does_not_execute_repository_fsmonitor(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    source = tmp_path / "source.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "source.py"], cwd=tmp_path, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+    marker = tmp_path / "fsmonitor-ran"
+    hook = tmp_path / "fsmonitor.sh"
+    hook.write_text(f"#!/bin/sh\nprintf ran >> {marker}\n", encoding="utf-8")
+    hook.chmod(0o755)
+    subprocess.run(
+        ["git", "config", "core.fsmonitor", str(hook)],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    RepoMap(tmp_path)
+
+    assert not marker.exists()
+
+
 def test_repomap_refresh_reuses_unchanged_parse_results(tmp_path: Path) -> None:
     first = tmp_path / "first.py"
     second = tmp_path / "second.py"

@@ -90,6 +90,50 @@ async def test_git_tools_do_not_execute_workspace_shadowed_git(
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
 @pytest.mark.asyncio
+async def test_read_only_git_disables_repository_extensions(tmp_path: Path) -> None:
+    await _init_repo(tmp_path)
+    tracked = tmp_path / "hello.txt"
+    tracked.write_text("old\n", encoding="utf-8")
+    await _git(tmp_path, "add", "hello.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+
+    marker = tmp_path / "git-extension-ran"
+    extension = tmp_path / "git-extension.sh"
+    extension.write_text(
+        f"#!/bin/sh\nprintf ran >> {marker}\nprintf converted\n",
+        encoding="utf-8",
+    )
+    extension.chmod(0o755)
+    await _git(tmp_path, "config", "core.fsmonitor", str(extension))
+
+    status = await GitStatusTool(SafetyGuard(tmp_path)).run()
+    assert status.success is True
+    assert not marker.exists()
+
+    await _git(tmp_path, "config", "diff.leak.textconv", str(extension))
+    (tmp_path / ".gitattributes").write_text("hello.txt diff=leak\n", encoding="utf-8")
+    tracked.write_text("new\n", encoding="utf-8")
+    diff = await GitDiffTool(SafetyGuard(tmp_path)).run()
+
+    assert diff.success is True
+    assert "+new" in diff.output
+    assert "converted" not in diff.output
+    assert not marker.exists()
+    local_config = await asyncio.create_subprocess_exec(
+        "git",
+        "config",
+        "--local",
+        "--get",
+        "core.fsmonitor",
+        cwd=tmp_path,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await local_config.communicate()
+    assert stdout.decode().strip() == str(extension)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
+@pytest.mark.asyncio
 async def test_patch_tool_does_not_execute_workspace_shadowed_git(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

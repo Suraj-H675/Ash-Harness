@@ -140,7 +140,7 @@ async def _untracked_patches(root: Path) -> str:
 
 
 async def _git(root: Path, arguments: list[str], action: str) -> str:
-    code, stdout, stderr = await _run_git(root, arguments)
+    code, stdout, stderr = await _run_git(root, arguments, read_only=True)
     if code == GIT_OUTPUT_LIMIT_EXIT:
         return stdout.rstrip() + "\n[git output truncated]"
     if code != 0:
