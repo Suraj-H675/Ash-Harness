@@ -169,6 +169,47 @@ def test_manager_reports_sandbox_exec_as_partial_isolation(tmp_path: Path) -> No
     assert "full filesystem isolation" in status["remediation"]
 
 
+def test_sandbox_exec_disappearance_fails_closed_without_fallback(
+    tmp_path: Path,
+) -> None:
+    availability = iter((True, False))
+    with (
+        patch("ash.sandbox.manager.sys.platform", "darwin"),
+        patch(
+            "ash.sandbox.manager.has_sandbox_exec",
+            side_effect=lambda *args, **kwargs: next(availability),
+        ),
+        patch("ash.sandbox.manager.has_docker", return_value=False),
+    ):
+        manager = SandboxManager(workspace_root=tmp_path)
+        with pytest.raises(SandboxBackendUnavailable, match="sandbox-exec"):
+            manager.prepare(["echo", "must-not-run"], cwd=tmp_path)
+
+
+def test_sandbox_exec_disappearance_uses_only_explicit_scoped_fallback(
+    tmp_path: Path,
+) -> None:
+    availability = iter((True, False))
+    with (
+        patch("ash.sandbox.manager.sys.platform", "darwin"),
+        patch(
+            "ash.sandbox.manager.has_sandbox_exec",
+            side_effect=lambda *args, **kwargs: next(availability),
+        ),
+        patch("ash.sandbox.manager.has_docker", return_value=False),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            allow_scoped_fallback=True,
+        )
+        invocation = manager.prepare(["echo", "explicit-fallback"], cwd=tmp_path)
+
+    assert invocation.argv == ("echo", "explicit-fallback")
+    assert invocation.backend_name == "scoped"
+    assert invocation.tier == SANDBOX_TIER_SCOPED
+    assert invocation.fallback_used is True
+
+
 def test_manager_reports_unisolated_windows_without_docker(tmp_path: Path) -> None:
     with (
         patch("ash.sandbox.manager.sys.platform", "win32"),

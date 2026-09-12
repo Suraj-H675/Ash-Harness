@@ -467,9 +467,11 @@ class SandboxManager:
                 if not bwrap_backend.is_available():
                     raise SandboxBackendUnavailable("bwrap backend unavailable")
                 return bwrap_backend
-            if self._selected_backend == "sandbox-exec" and has_sandbox_exec(
-                self.workspace_root
-            ):
+            if self._selected_backend == "sandbox-exec":
+                if not has_sandbox_exec(self.workspace_root):
+                    raise SandboxBackendUnavailable(
+                        "sandbox-exec backend unavailable"
+                    )
                 if self.require_read_isolation:
                     raise SandboxBackendUnavailable(
                         "sandbox-exec does not isolate host file reads"

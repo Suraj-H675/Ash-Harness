@@ -946,4 +946,34 @@ and mypy pass, `uv build` passes, and the installed-wheel packaging smoke
 passes. The skipped cases are optional browser/PTY/platform-dependent tests,
 not Batch 1 failures. Native Windows execution remains unverified, and no
 Codex Security scan is claimed as passed. Hosted-CI results are recorded only
-after the pushed batch's run completes.
+after the pushed batch's run completes. Hosted CI run `34701770836` then
+completed successfully across Ubuntu/macOS and Python 3.11/3.12, including
+Ruff, mypy, the full test suite, wheel build, and installed-CLI smoke.
+
+### Batch 2 — sandbox backend fail-closed remediation (#5)
+
+The confirmed macOS sandbox transition defect was reproduced with a
+deterministic platform-mocked probe: `sandbox-exec` was selected as the
+isolation backend, disappeared before `prepare()`, and the old implementation
+silently returned a scoped invocation even when scoped fallback was disabled.
+That path falsely reported a lower enforcement tier without recording an
+explicit fallback.
+
+`SandboxManager._build_backend()` now treats disappearance of the selected
+`sandbox-exec` backend as `SandboxBackendUnavailable`. `prepare()` therefore
+fails closed unless the caller explicitly enabled scoped fallback. When that
+fallback is enabled, the returned invocation truthfully reports
+`backend=scoped`, the scoped tier, and `fallback_used=True`. The existing
+Docker, Bubblewrap, and read-isolation behavior remains fail-closed.
+
+The focused sandbox regressions cover both disabled and explicitly enabled
+fallback after backend disappearance, alongside selected-backend, partial
+isolation, and read-isolation behavior. The complete local gate passes
+**2,262 tests with 7 skips**; Ruff and mypy pass; `uv build` passes; and the
+installed-wheel packaging smoke passes. Native macOS `sandbox-exec` execution
+was not available locally, so the new transition coverage is explicitly
+platform-mocked rather than native verification. No Codex Security scan is
+claimed as passed; its recorded external tooling limitations remain in force.
+
+Hosted-CI results for Batch 2 will be recorded after the pushed batch's run
+completes.
