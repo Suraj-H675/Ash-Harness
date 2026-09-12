@@ -46,4 +46,18 @@ Environments requiring isolation between mutually adversarial local principals
 must separate them using distinct OS users, appropriately isolated
 containers/VMs, or separate hosts.
 
+### Browser network boundary
+
+Browser sessions route HTTP(S) and WebSocket traffic through an Ash-owned
+loopback policy proxy for the lifetime of that session. The proxy applies
+allowed-domain and globally-public-address checks at connection time and
+connects to the vetted address without terminating TLS. Chromium's implicit
+loopback bypass is disabled for this proxy path. Existing browser URL and
+route checks remain defense in depth.
+
+This is a destination-policy boundary for browser HTTP(S)/WS(S) traffic, not a
+claim that Chromium is a complete network sandbox. Environments requiring
+broader browser network isolation should use an operating-system or container
+network boundary in addition to Ash's browser policy.
+
 Only the latest repository version is currently supported for security fixes.

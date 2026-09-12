@@ -546,9 +546,35 @@ decision is required for the browser's public-network contract and an
 appropriate Playwright/Chromium enforcement design.
 
 The subsequent Sol decision authorized the connection-enforcing browser proxy
-architecture as a separate Phase 2 batch. This Phase 1 batch does not claim to
-resolve the browser connection gap; the production change and real Chromium
-bypass regressions remain pending in that separate batch.
+architecture as a separate Phase 2 batch. `BrowserSession` now owns one
+loopback-only `BrowserPolicyProxy` for each browser lifetime and passes its
+explicit proxy settings to both persistent and ephemeral Chromium launches.
+The proxy applies the allowlist and globally-public-address policy at
+connection time, resolves each target once, and connects upstream to the
+vetted numeric address. HTTP forwarding, CONNECT tunneling for HTTPS/WSS, and
+plain WebSocket forwarding preserve the original host authority without TLS
+termination. Existing Playwright route checks remain defense in depth.
+
+Chromium's implicit loopback bypass is explicitly neutralized with the
+`<-loopback>` proxy-bypass rule. Real Chromium regressions with the installed
+Playwright runtime verify that loopback, link-local, private WebSocket,
+redirect, and subresource targets reach the policy proxy and do not reach
+controlled local victim servers; a permitted browser response works through
+the same proxy. Startup fails closed when the proxy cannot start, and browser
+startup/restart/close paths settle proxy ownership without orphaned listeners
+or connection tasks. The proxy CONNECT path is covered by deterministic
+unit-level tunneling tests; native Windows networking and complete browser
+network sandboxing are not claimed.
+
+As a normal-user compatibility check, a real `BrowserSession` navigation to
+`https://example.com` completed through the configured proxy with HTTP 200 and
+the expected page title. This verifies permitted HTTPS usability in the local
+runtime without treating it as a complete network-isolation claim.
+
+F-13 is therefore fixed at Ash's HTTP(S)/WS(S) browser connection policy
+boundary. The original resolver-mismatch evidence remains retained above, and
+the proxy's connection-time enforcement—not URL validation alone—is the
+authoritative repair.
 
 ### Phase 1 — cancellation, CLI, logging, and WebFetch hardening (A–I)
 

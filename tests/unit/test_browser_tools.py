@@ -26,6 +26,7 @@ from ash.tools.browser import (
     _validate_browser_url,
     build_browser_tools,
 )
+from ash.tools.browser_proxy import BrowserProxyError
 
 
 class FakeBrowserSession:
@@ -557,6 +558,9 @@ async def test_browser_profile_is_ephemeral_by_default() -> None:
         await session.ensure_started()
 
     playwright.chromium.launch_persistent_context.assert_not_called()
+    launch_kwargs = playwright.chromium.launch.await_args.kwargs
+    assert launch_kwargs["proxy"]["bypass"] == "<-loopback>"
+    assert launch_kwargs["proxy"]["server"].startswith("http://127.0.0.1:")
     kwargs = playwright.chromium.launch.return_value.new_context.await_args.kwargs
     assert "user_data_dir" not in kwargs
     assert kwargs["accept_downloads"] is True
@@ -602,7 +606,184 @@ async def test_browser_optin_profile_creates_private_directory(tmp_path: Path) -
         assert profile.stat().st_mode & 0o077 == 0
     kwargs = playwright.chromium.launch_persistent_context.await_args.kwargs
     assert kwargs["user_data_dir"] == str(profile)
+    assert kwargs["proxy"]["bypass"] == "<-loopback>"
+    assert kwargs["proxy"]["server"].startswith("http://127.0.0.1:")
     await session.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_session_fails_closed_if_policy_proxy_cannot_start() -> None:
+    session = BrowserSession()
+    proxy = MagicMock()
+    proxy.start = AsyncMock(
+        side_effect=BrowserProxyError("browser policy proxy could not start")
+    )
+    proxy.close = AsyncMock()
+
+    with patch("ash.tools.browser.BrowserPolicyProxy", return_value=proxy):
+        with pytest.raises(BrowserUnavailableError, match="policy proxy"):
+            await session.ensure_started()
+
+    proxy.close.assert_awaited_once()
+    assert session._page is None
+    assert session._proxy is None
+
+
+@pytest.mark.asyncio
+async def test_browser_session_startup_cancellation_closes_started_proxy() -> None:
+    class FakeProxy:
+        instances: list["FakeProxy"] = []
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.closed = False
+            self.started = asyncio.Event()
+            type(self).instances.append(self)
+
+        async def start(self) -> None:
+            self.started.set()
+
+        @property
+        def playwright_settings(self) -> dict[str, str]:
+            return {"server": "http://127.0.0.1:1", "bypass": "<-loopback>"}
+
+        async def close(self) -> None:
+            self.closed = True
+
+    playwright = MagicMock()
+    playwright.chromium.launch = AsyncMock()
+    playwright_factory = MagicMock()
+    playwright_factory.start = AsyncMock(
+        side_effect=asyncio.CancelledError()
+    )
+    session = BrowserSession()
+
+    with patch("ash.tools.browser.BrowserPolicyProxy", FakeProxy):
+        with patch("playwright.async_api.async_playwright", return_value=playwright_factory):
+            startup = asyncio.create_task(session.ensure_started())
+            await asyncio.sleep(0)
+            await FakeProxy.instances[-1].started.wait()
+            with pytest.raises(asyncio.CancelledError):
+                await startup
+
+    assert FakeProxy.instances[-1].closed is True
+    assert session._proxy is None
+    assert playwright.chromium.launch.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_browser_session_retires_proxy_before_restarting_after_page_closes() -> None:
+    class FakeProxy:
+        instances: list["FakeProxy"] = []
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.closed = False
+            type(self).instances.append(self)
+
+        async def start(self) -> None:
+            return None
+
+        @property
+        def playwright_settings(self) -> dict[str, str]:
+            return {"server": "http://127.0.0.1:1", "bypass": "<-loopback>"}
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+    class FakeContext:
+        def __init__(self, page: FakePage) -> None:
+            self.pages = [page]
+            self.close_calls = 0
+
+        def set_default_timeout(self, _value: int) -> None:
+            return None
+
+        def set_default_navigation_timeout(self, _value: int) -> None:
+            return None
+
+        async def route(self, *_args) -> None:
+            return None
+
+        async def route_web_socket(self, *_args) -> None:
+            return None
+
+        async def new_page(self) -> FakePage:
+            return self.pages[0]
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    page_one = FakePage()
+    page_two = FakePage()
+    context_one = FakeContext(page_one)
+    context_two = FakeContext(page_two)
+    browser = MagicMock()
+    browser.new_context = AsyncMock(side_effect=[context_one, context_two])
+    playwright = MagicMock()
+    playwright.chromium.launch = AsyncMock(return_value=browser)
+    playwright.stop = AsyncMock()
+    playwright_factory = MagicMock()
+    playwright_factory.start = AsyncMock(return_value=playwright)
+    session = BrowserSession()
+
+    with patch("ash.tools.browser.BrowserPolicyProxy", FakeProxy):
+        with patch("playwright.async_api.async_playwright", return_value=playwright_factory):
+            first_page = await session.ensure_started()
+            page_one.closed = True
+            second_page = await session.ensure_started()
+            await session.close()
+
+    assert first_page is page_one
+    assert second_page is page_two
+    assert FakeProxy.instances[0].closed is True
+    assert len(FakeProxy.instances) == 2
+    assert context_one.close_calls == 1
+    assert context_two.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_session_close_settles_proxy_after_repeated_cancellation() -> None:
+    context_close_started = asyncio.Event()
+    release_context_close = asyncio.Event()
+    proxy_closed = asyncio.Event()
+
+    class BlockingContext:
+        async def close(self) -> None:
+            context_close_started.set()
+            await release_context_close.wait()
+
+    class FakeProxy:
+        async def close(self) -> None:
+            assert release_context_close.is_set()
+            proxy_closed.set()
+
+    session = BrowserSession()
+    session._context = BlockingContext()
+    session._proxy = FakeProxy()  # type: ignore[assignment]
+    closing = asyncio.create_task(session.close())
+
+    await asyncio.wait_for(context_close_started.wait(), timeout=1)
+    closing.cancel()
+    await asyncio.sleep(0)
+    closing.cancel()
+    await asyncio.sleep(0)
+    assert not proxy_closed.is_set()
+
+    release_context_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert proxy_closed.is_set()
+    assert session._proxy is None
+    assert not any(
+        task.get_name() == "ash-browser-close" and not task.done()
+        for task in asyncio.all_tasks()
+    )
 
 
 def test_browser_profile_rejects_symlinked_state_path(tmp_path: Path) -> None:

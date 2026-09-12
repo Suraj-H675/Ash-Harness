@@ -20,6 +20,7 @@ from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
 from ash.safety.scoped_io import atomic_write_scoped_bytes
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
+from ash.tools.browser_proxy import BrowserPolicyProxy
 from ash.tools.web import _normalize_allowed_domains, _validate_public_url
 
 
@@ -71,6 +72,7 @@ class BrowserSession:
         if not 1.0 <= timeout_seconds <= 120.0:
             raise ValueError("browser timeout must be between 1 and 120 seconds")
         self.headless = headless
+        self._timeout_seconds = timeout_seconds
         self.timeout_ms = int(timeout_seconds * 1000)
         self.allowed_domains = _normalize_allowed_domains(allowed_domains or ())
         self.profile_path = (
@@ -85,11 +87,16 @@ class BrowserSession:
         self._browser: Any | None = None
         self._context: Any | None = None
         self._page: Any | None = None
+        self._proxy: BrowserPolicyProxy | None = None
 
     async def ensure_started(self) -> Any:
         async with self._lock:
             if self._page is not None and not self._page.is_closed():
                 return self._page
+            if self._context is not None:
+                self._page = self._latest_page()
+                if self._page is not None and not self._page.is_closed():
+                    return self._page
             try:
                 from playwright.async_api import async_playwright
             except ImportError as exc:
@@ -100,10 +107,30 @@ class BrowserSession:
                     "`ash setup browser` to enable browser tools."
                 ) from exc
             try:
+                if any(
+                    resource is not None
+                    for resource in (
+                        self._proxy,
+                        self._playwright,
+                        self._browser,
+                        self._context,
+                    )
+                ):
+                    cleanup_task = asyncio.create_task(
+                        self._close_unlocked(),
+                        name="ash-browser-startup-cleanup",
+                    )
+                    await _settle_browser_cleanup_task(cleanup_task)
                 if self.profile_path is not None:
                     validate_unlinked_directory_path(
                         self.profile_path, label="browser profile directory"
                     )
+                self._proxy = BrowserPolicyProxy(
+                    self.allowed_domains,
+                    timeout_seconds=self._timeout_seconds,
+                )
+                await self._proxy.start()
+                proxy_settings: Any = self._proxy.playwright_settings
                 self._playwright = await async_playwright().start()
                 if self.profile_path is not None:
                     self.profile_path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -134,6 +161,7 @@ class BrowserSession:
                             user_data_dir=str(self.profile_path),
                             headless=self.headless,
                             env=browser_environment,
+                            proxy=proxy_settings,
                             accept_downloads=True,
                             service_workers="block",
                             viewport={"width": 1280, "height": 800},
@@ -143,6 +171,7 @@ class BrowserSession:
                     self._browser = await self._playwright.chromium.launch(
                         headless=self.headless,
                         env=browser_environment,
+                        proxy=proxy_settings,
                     )
                     self._context = await self._browser.new_context(
                         accept_downloads=True,
@@ -155,8 +184,19 @@ class BrowserSession:
                 await self._context.route_web_socket("**/*", self._route_websocket)
                 self._page = await self._context.new_page()
                 return self._page
+            except asyncio.CancelledError:
+                cleanup_task = asyncio.create_task(
+                    self._close_unlocked(),
+                    name="ash-browser-startup-cleanup",
+                )
+                await _settle_browser_cleanup_task(cleanup_task)
+                raise
             except Exception as exc:
-                await self._close_unlocked()
+                cleanup_task = asyncio.create_task(
+                    self._close_unlocked(),
+                    name="ash-browser-startup-cleanup",
+                )
+                await _settle_browser_cleanup_task(cleanup_task)
                 message = redact_text(str(exc))[:500]
                 if "Executable doesn't exist" in message:
                     raise BrowserUnavailableError(
@@ -415,7 +455,17 @@ class BrowserSession:
 
     async def close(self) -> None:
         async with self._lock:
-            await self._close_unlocked()
+            cleanup_task = asyncio.create_task(
+                self._close_unlocked(),
+                name="ash-browser-close",
+            )
+            cleanup_error, interrupted = await _settle_browser_cleanup_task(
+                cleanup_task
+            )
+            if cleanup_error is not None:
+                raise cleanup_error
+            if interrupted:
+                raise asyncio.CancelledError
 
     async def _close_unlocked(self) -> None:
         for resource in (self._context, self._browser):
@@ -429,10 +479,37 @@ class BrowserSession:
                 await self._playwright.stop()
             except Exception:
                 pass
+        if self._proxy is not None:
+            try:
+                await self._proxy.close()
+            except Exception:
+                pass
         self._page = None
         self._context = None
         self._browser = None
         self._playwright = None
+        self._proxy = None
+
+
+async def _settle_browser_cleanup_task(
+    task: asyncio.Task[None],
+) -> tuple[BaseException | None, bool]:
+    """Settle browser cleanup despite repeated cancellation of its caller."""
+
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, interrupted
+    return None, interrupted
 
 
 def _validate_browser_url(url: str, allowed_domains: tuple[str, ...]) -> str:
