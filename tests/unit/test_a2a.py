@@ -17,6 +17,9 @@ pytestmark = pytest.mark.filterwarnings(
 )
 
 from a2a.client import ClientConfig, ClientFactory
+from a2a.server.agent_execution import RequestContext
+from a2a.server.context import ServerCallContext
+from a2a.server.events.event_queue_v2 import EventQueueSource
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.types.a2a_pb2 import (
     CancelTaskRequest,
@@ -48,6 +51,7 @@ from ash.server.a2a import (
     MAX_A2A_BODY_BYTES,
     MAX_A2A_INPUT_BYTES,
     A2ASessionRegistry,
+    AshA2AExecutor,
     _create_a2a_task_engine,
     _request_text,
     create_a2a_app,
@@ -1011,6 +1015,84 @@ async def test_a2a_default_task_store_isolates_workspaces(
 
 
 @pytest.mark.asyncio
+async def test_a2a_executor_settles_client_close_before_cancelled_execute_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+
+    class BlockingAshClient:
+        loop = SimpleNamespace(
+            current_session=SimpleNamespace(session_id="blocking-session")
+        )
+
+        async def stream_prompt(
+            self, *args: Any, **kwargs: Any
+        ) -> AsyncIterator[AshEvent]:
+            started.set()
+            yield AshEvent("assistant.delta", {"text": "partial"})
+            await asyncio.Event().wait()
+
+        async def close(self) -> None:
+            close_started.set()
+            await close_release.wait()
+            closed.set()
+
+    client = BlockingAshClient()
+
+    async def create_client(**kwargs: Any) -> BlockingAshClient:
+        return client
+
+    class Registry:
+        async def get(self, context_id: str) -> None:
+            return None
+
+        async def bind(self, context_id: str, session_id: str) -> None:
+            return None
+
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
+    executor = AshA2AExecutor(config, Registry())
+    request = SendMessageRequest(
+        message=Message(
+            message_id="blocking-message",
+            role=Role.ROLE_USER,
+            parts=[Part(text="wait")],
+        )
+    )
+    context = RequestContext(
+        call_context=ServerCallContext(),
+        request=request,
+        task_id="blocking-task",
+        context_id="blocking-context",
+    )
+    event_queue = EventQueueSource()
+    execution = asyncio.create_task(executor.execute(context, event_queue))
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    execution.cancel()
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+    execution.cancel()
+    await asyncio.sleep(0)
+    assert not execution.done()
+    assert not closed.is_set()
+
+    close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(execution, timeout=1)
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
 async def test_a2a_cancel_preempts_active_ash_turn(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -1086,7 +1168,11 @@ async def test_a2a_cancel_preempts_active_ash_turn(tmp_path: Path, monkeypatch) 
                 client.cancel_task(CancelTaskRequest(id=response.task.id))
             )
             await asyncio.wait_for(close_started.wait(), timeout=2)
-            assert not cancel_request.done()
+            # The A2A SDK can publish the cancelled task from its consumer
+            # before the executor's owned client-close task has settled.  The
+            # executor must still retain and finish that close operation; the
+            # wire-level cancellation response is not its lifecycle barrier.
+            assert not closed.is_set()
             close_release.set()
             cancelled = await asyncio.wait_for(cancel_request, timeout=2)
             assert cancelled.status.state == TaskState.TASK_STATE_CANCELED
