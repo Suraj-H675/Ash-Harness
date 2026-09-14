@@ -141,6 +141,30 @@ class NativeToolProvider(ProviderABC):
             yield StreamChunk(content="done", is_done=True)
 
 
+class DuplicateNativeToolIdProvider(ProviderABC):
+    model_name = "duplicate-native-tool-id"
+    _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+    def __init__(self):
+        self.calls = 0
+
+    def count_tokens(self, text):
+        return len(text)
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        self.calls += 1
+        if self.calls == 1:
+            yield StreamChunk(
+                is_done=True,
+                native_tool_calls=[
+                    {"id": "duplicate-call", "name": "capture", "arguments": {"text": "first"}},
+                    {"id": "duplicate-call", "name": "capture", "arguments": {"text": "second"}},
+                ],
+            )
+        else:
+            yield StreamChunk(content="done", is_done=True)
+
+
 class NativePlainTextProvider(ProviderABC):
     model_name = "native-plain-text"
     _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
@@ -1263,6 +1287,33 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
             (loop.current_session.session_id,),
         ).fetchone()
     assert tool_turn["turn_id"] == loop.turn_context.turn_id
+
+
+@pytest.mark.asyncio
+async def test_duplicate_native_tool_call_ids_fail_before_tool_dispatch(tmp_path):
+    provider = DuplicateNativeToolIdProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    store = SessionStore(tmp_path / "duplicate-native.db")
+    loop = AshLoop(
+        store,
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+    )
+
+    with pytest.raises(ProviderCompletionError, match="duplicate tool call IDs"):
+        await loop.run_turn("use capture twice")
+
+    assert tool.arguments is None
+    assert loop.current_session is not None
+    with get_db_connection(store.db_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM tool_calls WHERE session_id = ?",
+            (loop.current_session.session_id,),
+        ).fetchone()[0]
+    assert count == 0
 
 
 @pytest.mark.asyncio

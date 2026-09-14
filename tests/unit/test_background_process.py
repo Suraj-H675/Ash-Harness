@@ -90,15 +90,16 @@ async def test_background_process_handles_long_lines_and_bounds_output(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_background_process_limits_job_count_and_argument_size(tmp_path) -> None:
+async def test_background_process_limits_running_job_count_and_argument_size(tmp_path) -> None:
     tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote('import time; time.sleep(60)')}"
     for _ in range(MAX_BACKGROUND_JOBS):
-        started = await tool.run(action="start", command="true")
+        started = await tool.run(action="start", command=command)
         assert started.success is True
 
-    rejected = await tool.run(action="start", command="true")
+    rejected = await tool.run(action="start", command=command)
     assert rejected.success is False
-    assert f"{MAX_BACKGROUND_JOBS} background jobs" in (rejected.error or "")
+    assert f"{MAX_BACKGROUND_JOBS} running background jobs" in (rejected.error or "")
 
     with pytest.raises(ValueError):
         await tool.run(
@@ -111,6 +112,72 @@ async def test_background_process_limits_job_count_and_argument_size(tmp_path) -
             job_id="missing",
             input="x" * (MAX_BACKGROUND_INPUT_CHARS + 1),
         )
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_finished_background_jobs_remain_pollable_without_consuming_capacity(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("ash.tools.process.MAX_BACKGROUND_JOBS", 2)
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+
+    for _ in range(2):
+        started = await tool.run(action="start", command="true")
+        job = tool.jobs[started.output.split()[1]]
+        await job.process.wait()
+        await asyncio.gather(*job.readers)
+
+    retained_ids = tuple(tool.jobs)
+    assert len(retained_ids) == 2
+    polled = await tool.run(action="poll", job_id=retained_ids[-1])
+    assert "exited(0)" in polled.output
+
+    replacement = await tool.run(action="start", command="true")
+    assert replacement.success is True
+    assert retained_ids[-1] in tool.jobs
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_process_prunes_oldest_terminal_history(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("ash.tools.process.MAX_BACKGROUND_HISTORY_JOBS", 2)
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    job_ids: list[str] = []
+
+    for _ in range(3):
+        started = await tool.run(action="start", command="true")
+        job_id = started.output.split()[1]
+        job_ids.append(job_id)
+        job = tool.jobs[job_id]
+        await job.process.wait()
+        await asyncio.gather(*job.readers)
+
+    assert job_ids[0] not in tool.jobs
+    assert tuple(tool.jobs) == tuple(job_ids[1:])
+    latest = await tool.run(action="poll", job_id=job_ids[-1])
+    assert "exited(0)" in latest.output
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stopped_background_job_does_not_consume_running_capacity(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("ash.tools.process.MAX_BACKGROUND_JOBS", 1)
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote('import time; time.sleep(60)')}"
+
+    started = await tool.run(action="start", command=command)
+    job_id = started.output.split()[1]
+    stopped = await tool.run(action="stop", job_id=job_id)
+    assert stopped.success is True
+    assert job_id in tool.jobs
+
+    replacement = await tool.run(action="start", command=command)
+    assert replacement.success is True
     await tool.aclose()
 
 

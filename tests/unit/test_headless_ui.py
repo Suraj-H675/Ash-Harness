@@ -1,6 +1,8 @@
 import io
 import json
 
+import pytest
+
 from ash.ui.headless import HeadlessUI
 
 
@@ -33,6 +35,74 @@ def test_stream_json_emits_deltas_and_completion() -> None:
         "assistant.delta",
         "turn.completed",
     ]
+
+
+def test_runtime_bound_stream_json_does_not_duplicate_turn_completion() -> None:
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="stream-json", stream=stream)
+    ui.set_event_enricher(lambda payload: dict(payload))
+
+    ui.emit_event({"type": "turn.completed", "response": "done", "session_id": "s1"})
+    ui.emit_result({"response": "done", "session_id": "s1"})
+
+    events = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert [event["type"] for event in events] == ["turn.completed"]
+
+
+@pytest.mark.asyncio
+async def test_one_shot_stream_json_has_one_authoritative_completion(tmp_path) -> None:
+    from ash.cli import _bootstrap_and_headless
+    from ash.config import AshConfig
+    from ash.core.loop import AshLoop
+    from ash.core.session import SessionStore
+    from ash.providers.base import ProviderABC, StreamChunk
+    from ash.safety.guard import SafetyGuard
+
+    class PlainProvider(ProviderABC):
+        model_name = "plain-test"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(
+                content="done",
+                is_done=True,
+                prompt_tokens=1,
+                completion_tokens=1,
+                usage_source="provider",
+            )
+
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="stream-json", stream=stream)
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/plain-test",
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        PlainProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+        config=config,
+    )
+
+    try:
+        assert (
+            await _bootstrap_and_headless(
+                loop, config, prompt="hello", session_id=None, ui=ui
+            )
+            == 0
+        )
+    finally:
+        await loop.aclose()
+
+    events = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert sum(event["type"] == "turn.completed" for event in events) == 1
+    assert events[-1]["type"] == "turn.completed"
+    assert events[-1]["response"] == "done"
 
 
 def test_json_error_is_structured_machine_readable_event() -> None:

@@ -28,6 +28,7 @@ from ash.tools.command import build_scrubbed_command_env
 
 MAX_BACKGROUND_OUTPUT_CHARS = 100_000
 MAX_BACKGROUND_JOBS = 32
+MAX_BACKGROUND_HISTORY_JOBS = 32
 MAX_BACKGROUND_COMMAND_CHARS = 100_000
 MAX_BACKGROUND_INPUT_CHARS = 1_000_000
 MAX_BACKGROUND_JOB_ID_CHARS = 128
@@ -161,15 +162,19 @@ class BackgroundProcessTool(BaseTool):
     async def _start(self, args: BackgroundProcessArgs) -> ToolResult:
         if not args.command:
             return ToolResult(success=False, output="", error="start requires command")
-        if len(self.jobs) >= MAX_BACKGROUND_JOBS:
+        running_jobs = sum(
+            1 for job in self.jobs.values() if job.process.returncode is None
+        )
+        if running_jobs >= MAX_BACKGROUND_JOBS:
             return ToolResult(
                 success=False,
                 output="",
                 error=(
-                    f"Maximum of {MAX_BACKGROUND_JOBS} background jobs reached; "
-                    "stop or finish existing jobs before starting another."
+                    f"Maximum of {MAX_BACKGROUND_JOBS} running background jobs reached; "
+                    "stop or finish an existing job before starting another."
                 ),
             )
+        self._prune_terminal_history()
         self.safety_guard.validate_command(args.command)
         cwd = self.safety_guard.validate_path(
             args.cwd or self.safety_guard.project_root
@@ -249,6 +254,18 @@ class BackgroundProcessTool(BaseTool):
         ]
         self.jobs[job.job_id] = job
         return self._result(f"Started {job.job_id} (pid {process.pid}).")
+
+    def _prune_terminal_history(self) -> None:
+        """Bound retained terminal-job history without consuming live capacity."""
+
+        terminal_ids = [
+            job_id
+            for job_id, job in self.jobs.items()
+            if job.process.returncode is not None
+        ]
+        excess = len(terminal_ids) - MAX_BACKGROUND_HISTORY_JOBS + 1
+        for job_id in terminal_ids[: max(0, excess)]:
+            self.jobs.pop(job_id, None)
 
     async def _read(self, stream: asyncio.StreamReader, job: Job, prefix: str) -> None:
         while chunk := await stream.read(4096):

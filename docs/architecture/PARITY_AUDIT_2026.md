@@ -1026,8 +1026,9 @@ by a source-tree build, so clean hosted CI remains the authoritative packaging
 proof for the committed batch. The unrelated untracked development/reference
 files remain unstaged and untouched.
 
-Hosted-CI results for Batch 3 are recorded only after the explicit Batch 3
-commit is pushed and all required jobs complete.
+Hosted CI run `34872502590` completed successfully for Batch 3 across
+Ubuntu/macOS and Python 3.11/3.12, including Ruff, mypy, the full test suite,
+clean-tree wheel build, and installed-CLI smoke.
 ### Batch 3 real-provider workflow evidence
 
 A temporary isolated user HOME/workspace exercised the changed boundaries against
@@ -1052,3 +1053,39 @@ The same real session independently reproduced the already-recorded duplicate
 plain OpenRouter run also surfaced a separate provider/model identity-labeling
 oddity for later investigation; neither issue is folded into this output/
 redaction batch.
+
+### Batch 4 — runtime lifecycle and durable tool identity
+
+Three previously confirmed runtime defects were treated as one lifecycle and
+persistence batch. Background-process capacity now counts only live children;
+stopped and naturally exited jobs remain available for recent list/poll use
+without permanently consuming one of the 32 running slots. To avoid turning
+that availability fix into unbounded memory growth, accepted starts prune the
+oldest terminal history beyond a bounded recent window while never pruning a
+running job. This follows the same broad mature-harness pattern seen in Hermes,
+which separates running processes from bounded finished history.
+
+`stream-json` completion ownership is now singular when HeadlessUI is bound to
+the runtime event stream. The core loop remains the authoritative emitter of
+`turn.completed`; the one-shot wrapper no longer synthesizes a second terminal
+event in that runtime-bound mode. Plain JSON still emits its one final document,
+and standalone/unbound HeadlessUI behavior remains supported. Codex's streamed
+SDK likewise treats the turn-completed event as the authoritative terminal turn
+signal rather than a duplicated wrapper result.
+
+Provider-native tool calls are now rejected before persistence or dispatch when
+one completion contains duplicate call IDs. The pre-fix reproduction executed
+both same-ID calls and SQLite's primary-key upsert retained only the latter
+record. The new boundary raises `ProviderCompletionError` before either tool can
+run, preserving provider correlation identity and Ash's durable exactly-once/
+ambiguous-outcome model instead of inventing synthetic IDs or migrating storage.
+Reference harnesses similarly use provider call IDs as correlation keys for
+pending tool state and results.
+
+Regression probes first failed on all three defects, then passed after the
+minimal fixes. Focused lifecycle/persistence verification passes **132 tests**.
+Repository Ruff and mypy pass. The complete local pytest gate passes **2,300
+tests with 7 skips**; `uv build` passes; and the installed-wheel smoke passes on
+Python 3.12. Unrelated tracked/untracked development files remain untouched and
+will not be included in this batch. Hosted CI is recorded after the grouped
+Batch 4 commit is pushed and all required jobs resolve.

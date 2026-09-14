@@ -85,6 +85,10 @@ class HeadlessUI:
         return False
 
     def emit_result(self, payload: dict[str, Any]) -> None:
+        if self.output_format == "stream-json" and self._runtime_events_bound:
+            # The runtime already emitted the authoritative turn.completed event.
+            # Do not synthesize a second terminal event for the one-shot wrapper.
+            return
         if self.output_format in {"json", "stream-json"}:
             event = self._prepare({"type": "turn.completed", **payload})
             self._emit(event)

@@ -2121,6 +2121,15 @@ class AshLoop:
                         ) from exc
                     for event in final_events:
                         self._handle_event(event, text_chunks, tool_calls)
+                call_ids = (
+                    [call.call_id for call in native_tool_calls_from_api]
+                    if native_tool_calls_from_api
+                    else [str(call.get("call_id", "")) for call in tool_calls]
+                )
+                if len(call_ids) != len(set(call_ids)):
+                    raise ProviderCompletionError(
+                        "provider returned duplicate tool call IDs in one completion"
+                    )
                 self.provider_circuit_breaker.record_success(self._provider_circuit_key)
         finally:
             self.ui.finalize_turn()
