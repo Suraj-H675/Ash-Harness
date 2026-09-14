@@ -10,7 +10,7 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, StrictInt
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -81,31 +81,76 @@ MAX_EVENT_LIST_LIMIT = 10_000
 MAX_HTTP_BODY_BYTES = 16 * 1024 * 1024
 
 
-class _BoundedRequestBodyMiddleware:
-    """Bound inbound REST bodies before framework parsing allocates them."""
+class _HTTPBoundaryMiddleware:
+    """Authenticate and rate-limit before buffering protected REST bodies."""
 
-    def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        bearer_token: str,
+        requests_per_minute: int,
+        max_bytes: int,
+    ) -> None:
         self.app = app
+        self._token = bearer_token
+        self._limiter = SlidingWindowLimiter(requests_per_minute)
         self.max_bytes = max_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = str(scope.get("path", ""))
+        if scope["type"] != "http" or not (path == "/rpc" or path.startswith("/v1/")):
+            await self.app(scope, receive, send)
+            return
+
+        authorization_values = [
+            value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+            if key.lower() == b"authorization"
+        ]
+        scheme, _, supplied = (
+            authorization_values[0] if len(authorization_values) == 1 else ""
+        ).partition(" ")
         if (
-            scope["type"] != "http"
-            or scope.get("path") == "/rpc"
+            len(authorization_values) != 1
+            or scheme.casefold() != "bearer"
+            or not hmac.compare_digest(supplied, self._token)
+        ):
+            response = JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid bearer token"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+
+        client = scope.get("client")
+        key = str(client[0]) if client else "unknown"
+        if not await self._limiter.allow(key):
+            response = JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded"},
+                headers={"Retry-After": "60"},
+            )
+            await response(scope, receive, send)
+            return
+
+        if (
+            scope.get("path") == "/rpc"
             or scope.get("method") not in {"POST", "PUT", "PATCH"}
         ):
             await self.app(scope, receive, send)
             return
 
-        for key, value in scope.get("headers", []):
-            if key.lower() != b"content-length":
+        for header_name, value in scope.get("headers", []):
+            if header_name.lower() != b"content-length":
                 continue
             try:
                 content_length = int(value)
             except ValueError:
                 break
             if content_length > self.max_bytes:
-                await self._reject(scope, receive, send)
+                await self._reject_oversized_body(scope, receive, send)
                 return
             break
 
@@ -118,7 +163,7 @@ class _BoundedRequestBodyMiddleware:
                 break
             total += len(message.get("body", b""))
             if total > self.max_bytes:
-                await self._reject(scope, receive, send)
+                await self._reject_oversized_body(scope, receive, send)
                 return
             if not message.get("more_body", False):
                 break
@@ -136,7 +181,9 @@ class _BoundedRequestBodyMiddleware:
         await self.app(scope, replay, send)
 
     @staticmethod
-    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+    async def _reject_oversized_body(
+        scope: Scope, receive: Receive, send: Send
+    ) -> None:
         response = JSONResponse(
             status_code=413,
             content={"detail": "Request body exceeds the server limit"},
@@ -153,7 +200,6 @@ def create_app(
 ) -> FastAPI:
     if len(bearer_token) < 16:
         raise ValueError("HTTP bearer token must contain at least 16 characters")
-    limiter = SlidingWindowLimiter(requests_per_minute)
     rpc = JSONRPCServer(client)
 
     @asynccontextmanager
@@ -165,34 +211,12 @@ def create_app(
             await rpc.close(close_client=close_client_on_shutdown)
 
     app = FastAPI(title="Ash API", version="1", lifespan=lifespan)
-    app.add_middleware(_BoundedRequestBodyMiddleware, max_bytes=MAX_HTTP_BODY_BYTES)
-
-    async def authorize(request: Request) -> None:
-        authorization_values = [
-            value.decode("latin-1")
-            for key, value in request.scope.get("headers", [])
-            if key.lower() == b"authorization"
-        ]
-        scheme, _, supplied = (
-            authorization_values[0] if len(authorization_values) == 1 else ""
-        ).partition(" ")
-        if (
-            len(authorization_values) != 1
-            or scheme.casefold() != "bearer"
-            or not hmac.compare_digest(supplied, bearer_token)
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid bearer token",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        key = request.client.host if request.client else "unknown"
-        if not await limiter.allow(key):
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Rate limit exceeded",
-                headers={"Retry-After": "60"},
-            )
+    app.add_middleware(
+        _HTTPBoundaryMiddleware,
+        bearer_token=bearer_token,
+        requests_per_minute=requests_per_minute,
+        max_bytes=MAX_HTTP_BODY_BYTES,
+    )
 
     @app.get("/health")
     async def health() -> dict[str, str | int]:
@@ -202,7 +226,7 @@ def create_app(
             "event_schema_version": EVENT_SCHEMA_VERSION,
         }
 
-    @app.post("/rpc", dependencies=[Depends(authorize)])
+    @app.post("/rpc")
     async def json_rpc(request: Request) -> Response:
         content_type = request.headers.get("content-type", "").partition(";")[0]
         if content_type.casefold() != "application/json":
@@ -263,7 +287,7 @@ def create_app(
             return Response(status_code=204)
         return JSONResponse(content=handled)
 
-    @app.post("/v1/turn", dependencies=[Depends(authorize)])
+    @app.post("/v1/turn")
     async def run_turn(payload: TurnRequest) -> dict:
         result = await client.prompt(payload.input)
         return {
@@ -274,7 +298,7 @@ def create_app(
             "usage": result.usage,
         }
 
-    @app.post("/v1/turn/stream", dependencies=[Depends(authorize)])
+    @app.post("/v1/turn/stream")
     async def stream_turn(payload: TurnRequest) -> StreamingResponse:
         async def events() -> AsyncIterator[str]:
             async for event in client.stream_prompt(payload.input):
@@ -282,7 +306,7 @@ def create_app(
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
-    @app.post("/v1/turn/steer", dependencies=[Depends(authorize)])
+    @app.post("/v1/turn/steer")
     async def steer_turn(payload: SteeringRequest) -> dict[str, int]:
         try:
             pending = await client.steer(payload.input)
@@ -292,7 +316,7 @@ def create_app(
             raise HTTPException(status_code=429, detail=redact_text(str(exc))) from exc
         return {"pending": pending}
 
-    @app.get("/v1/sessions", dependencies=[Depends(authorize)])
+    @app.get("/v1/sessions")
     async def sessions(query: str = "", limit: int = 20) -> dict:
         if not 1 <= limit <= 100:
             raise HTTPException(status_code=422, detail="limit must be 1..100")
@@ -303,7 +327,7 @@ def create_app(
             ]
         }
 
-    @app.get("/v1/sessions/{session_id}/events", dependencies=[Depends(authorize)])
+    @app.get("/v1/sessions/{session_id}/events")
     async def session_events(
         session_id: str,
         after_sequence: int = 0,
@@ -337,7 +361,7 @@ def create_app(
             "next_sequence": records[-1].sequence if records else after_sequence,
         }
 
-    @app.get("/v1/sessions/{session_id}/tree", dependencies=[Depends(authorize)])
+    @app.get("/v1/sessions/{session_id}/tree")
     async def session_tree(session_id: str) -> dict:
         try:
             tree = client.session_tree(session_id)
@@ -347,7 +371,7 @@ def create_app(
             raise HTTPException(status_code=422, detail=redact_text(str(exc))) from exc
         return {"sessions": [item.model_dump(mode="json") for item in tree]}
 
-    @app.post("/v1/sessions/{session_id}/fork", dependencies=[Depends(authorize)])
+    @app.post("/v1/sessions/{session_id}/fork")
     async def fork_session(
         session_id: str, payload: ForkSessionRequest
     ) -> dict[str, str]:
@@ -366,11 +390,11 @@ def create_app(
             raise HTTPException(status_code=409, detail=redact_text(str(exc))) from exc
         return {"session_id": forked_id}
 
-    @app.post("/v1/sessions", dependencies=[Depends(authorize)])
+    @app.post("/v1/sessions")
     async def new_session() -> dict[str, str]:
         return {"session_id": await client.new_session()}
 
-    @app.post("/v1/sessions/resume", dependencies=[Depends(authorize)])
+    @app.post("/v1/sessions/resume")
     async def resume_session(payload: ResumeRequest) -> dict[str, str]:
         try:
             session_id = await client.resume(payload.session_id)

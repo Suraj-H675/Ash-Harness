@@ -157,6 +157,143 @@ async def test_http_server_rejects_duplicate_authorization_headers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_rejects_unauthenticated_rest_before_reading_body() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    consumed: list[int] = []
+
+    async def body():
+        for index in range(3):
+            consumed.append(index)
+            yield b"x" * 1024
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/v1/turn",
+            content=body(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert consumed == []
+
+
+@pytest.mark.asyncio
+async def test_http_auth_precedes_rest_content_length_rejection() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    consumed = False
+
+    async def body():
+        nonlocal consumed
+        consumed = True
+        yield b"should-not-be-read"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/v1/turn",
+            content=body(),
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(MAX_HTTP_BODY_BYTES + 1),
+            },
+        )
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert consumed is False
+
+
+@pytest.mark.asyncio
+async def test_http_rejects_unauthenticated_jsonrpc_before_reading_body() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    consumed: list[int] = []
+
+    async def body():
+        for index in range(3):
+            consumed.append(index)
+            yield b"x" * 1024
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/rpc",
+            content=body(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert consumed == []
+
+
+@pytest.mark.asyncio
+async def test_http_rate_limit_precedes_rest_body_reading() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+        requests_per_minute=1,
+    )
+    headers = {
+        "Authorization": "Bearer 0123456789abcdef",
+        "Content-Type": "application/json",
+    }
+    consumed = False
+
+    async def body():
+        nonlocal consumed
+        consumed = True
+        yield b"x" * 1024
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        first = await http.get("/v1/sessions", headers=headers)
+        limited = await http.post("/v1/turn", content=body(), headers=headers)
+
+    assert first.status_code == 200
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == "60"
+    assert consumed is False
+
+
+@pytest.mark.asyncio
+async def test_http_public_framework_routes_remain_public() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        docs = await http.get("/docs")
+        schema = await http.get("/openapi.json")
+        missing = await http.get("/not-an-ash-route")
+
+    assert docs.status_code == 200
+    assert schema.status_code == 200
+    assert missing.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_http_rest_stops_reading_after_payload_limit() -> None:
     app = create_app(
         FakeClient(),  # type: ignore[arg-type]

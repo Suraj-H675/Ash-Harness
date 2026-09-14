@@ -745,16 +745,19 @@ needs a protocol/persistence contract decision about rejecting malformed
 provider output versus namespacing IDs; no schema or runtime change has been
 made.
 
-#### Candidate — REST body buffering precedes bearer authorization
+#### Resolved in Batch 5 — REST body buffering preceded bearer authorization
 
-`_BoundedRequestBodyMiddleware` reads and buffers up to the full 16 MiB REST
-body before FastAPI reaches the route's `authorize` dependency
-(`src/ash/server/http.py:84-136`, `:170-195`). A direct ASGI probe sent a valid
-16,777,145-byte JSON body without credentials to `/v1/turn`; the application
-returned 401, but consumed all 16 MiB first. The default server is commonly
-loopback-bound, so exploitability depends on deployment exposure, but the
-pre-auth memory/connection cost is concrete. Any remediation must preserve the
-body-size contract while deciding the intended public-deployment threat model.
+The original `_BoundedRequestBodyMiddleware` read and buffered up to the full
+16 MiB REST body before FastAPI reached the route's `authorize` dependency. A
+direct ASGI reproduction consumed the unauthenticated streamed body before
+returning 422 for malformed JSON, and an unauthenticated request advertising an
+oversized `Content-Length` returned 413 before authentication. This was a
+concrete ordering and resource-consumption defect, not only a deployment-hardening
+preference. Batch 5 moves bearer authentication and per-client rate limiting to
+the protected HTTP boundary before any REST body buffering or route parsing.
+`/rpc` retains its stricter 1 MiB bounded reader after authentication, while
+framework docs/OpenAPI and unrelated routes preserve their previous public/404
+behavior. See the Batch 5 evidence below.
 
 #### Candidate — built-in LSP detection can select a workspace-shadowed binary
 
@@ -1087,5 +1090,44 @@ minimal fixes. Focused lifecycle/persistence verification passes **132 tests**.
 Repository Ruff and mypy pass. The complete local pytest gate passes **2,300
 tests with 7 skips**; `uv build` passes; and the installed-wheel smoke passes on
 Python 3.12. Unrelated tracked/untracked development files remain untouched and
-will not be included in this batch. Hosted CI is recorded after the grouped
-Batch 4 commit is pushed and all required jobs resolve.
+will not be included in this batch. Hosted CI run `34882256898` completed
+successfully for commit `001cd66` across Ubuntu/macOS and Python 3.11/3.12,
+including Ruff, mypy, the full test suite, clean-tree wheel build, and
+installed-CLI smoke.
+
+### Batch 5 — HTTP authentication and request-resource ordering
+
+The authenticated HTTP/SSE adapter now enforces its protected boundary in the
+order **bearer authentication → per-client rate limit → REST body-size bound →
+route parsing/dispatch**. Previously, body-bearing FastAPI routes could consume
+and validate request data before the route dependency performed authentication;
+this allowed unauthenticated clients to spend the server's body budget and even
+observe 413/422 responses before a 401 decision.
+
+Regression tests were written against the pre-fix behavior first. They proved
+that an unauthenticated streamed `/v1/turn` body was consumed and returned 422,
+and that an unauthenticated oversized `Content-Length` received 413. After the
+fix, protected REST and `/rpc` requests reject invalid/missing bearer credentials
+without consuming the request body. Authenticated requests that have already
+exhausted their rate-limit bucket likewise receive 429 before the body is read.
+Duplicate Authorization headers remain rejected and token comparison remains
+constant-time.
+
+The middleware is intentionally scoped to Ash's protected namespaces (`/rpc`
+and `/v1/...`) rather than every FastAPI route, preserving the prior public
+`/health`, `/docs`, `/openapi.json`, and unrelated 404 behavior. `/rpc` continues
+to use its separate 1 MiB streaming body cap after the common auth/rate boundary;
+other protected REST writes retain the 16 MiB cap. The design follows Ash's
+existing A2A edge pattern, which also authenticates before bounded body intake.
+
+A live Uvicorn loopback probe independently verified the boundary outside the
+in-process ASGI test transport: an unauthenticated POST with an advertised
+99,999,999-byte body and no body bytes returned 401 immediately; a valid
+authenticated session-list request returned 200; a subsequent rate-limited POST
+with an incomplete advertised body returned 429 immediately; and `/docs`
+remained 200. The complete HTTP unit suite passes **28 tests**, and the broader
+HTTP/JSON-RPC/serve/SDK/CI-mode set passes **66 tests**. Repository Ruff and
+mypy pass. The complete local pytest gate passes **2,305 tests with 7 skips**;
+`uv build` passes; and the installed-wheel smoke passes on Python 3.12. Hosted
+CI is recorded after the grouped Batch 5 commit is pushed and all required jobs
+resolve.
