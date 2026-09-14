@@ -60,6 +60,7 @@ from ash.providers.base import (
     completion_stop_category,
 )
 from ash.providers.capabilities import ProviderCapabilities
+from ash.providers.identifiers import parse_model_string
 from ash.providers.messages import CanonicalToolCall, normalize_messages
 from ash.providers.retry import (
     ProviderCircuitBreaker,
@@ -188,6 +189,24 @@ def _provider_circuit_key(provider: ProviderABC) -> str:
         ]
         return "failover:" + ",".join(identities)
     return f"{getattr(provider, 'provider_family', 'custom')}/{provider.model_name}"
+
+
+def _provider_model_id(
+    provider: ProviderABC, configured_model: str | None = None
+) -> str:
+    """Return the canonical identity of the provider currently serving work."""
+
+    family = str(getattr(provider, "provider_family", "custom") or "custom")
+    model_name = provider.model_name
+    if family == "custom" and configured_model:
+        try:
+            configured_family, configured_name = parse_model_string(configured_model)
+        except ValueError:
+            pass
+        else:
+            if configured_name == model_name:
+                family = configured_family
+    return f"{family}/{model_name}"
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are Ash, a terminal-native AI coding harness. You are pairing with a developer to write, edit, test, and debug code in the local workspace.
@@ -818,7 +837,7 @@ class AshLoop:
                 )
 
         session = self.session_store.create_session(
-            str(self.project_root), model=self.provider.model_name
+            str(self.project_root), model=self.active_model_id
         )
         self.current_session = session
         hooks = self._active_hooks()
@@ -1296,6 +1315,7 @@ class AshLoop:
                             "type": "turn.completed",
                             "response": response,
                             "model": self.provider.model_name,
+                            "model_id": self.active_model_id,
                             "context_tokens": self._last_context_tokens,
                             "usage": self.last_turn_usage,
                         }
@@ -1642,10 +1662,7 @@ class AshLoop:
         config_pricing = (
             self._config.model_pricing_usd_per_million if self._config else {}
         )
-        provider_model = (
-            f"{getattr(self.provider, 'provider_family', 'custom')}/"
-            f"{self.provider.model_name}"
-        )
+        provider_model = self.active_model_id
         configured_model = (
             self._config.model
             if self._config is not None
@@ -1742,6 +1759,7 @@ class AshLoop:
                 "type": "turn.completed",
                 "response": final_text,
                 "model": self.provider.model_name,
+                "model_id": self.active_model_id,
                 "context_tokens": self._last_context_tokens,
                 "usage": self.last_turn_usage,
             }
@@ -1757,6 +1775,11 @@ class AshLoop:
             },
         )
         return final_text
+
+    @property
+    def active_model_id(self) -> str:
+        configured_model = self._config.model if self._config is not None else None
+        return _provider_model_id(self.provider, configured_model)
 
     @property
     def pending_steering_count(self) -> int:

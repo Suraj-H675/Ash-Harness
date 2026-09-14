@@ -8,6 +8,7 @@ from ash.agents.shared_state import SharedState
 from ash.sdk import AshClient
 from ash.config import AshConfig
 from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.failover import FailoverProvider
 from ash.sandbox import SandboxBackendUnavailable
 
 
@@ -153,9 +154,52 @@ async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
         assert result.usage_source == "provider"
         assert result.usage["has_estimates"] is False
         assert result.usage["cache_hit_rate"] == 0.8
+        assert result.model == "ollama/sdk-model"
         assert client.sessions()[0].session_id == result.session_id
+        assert client.sessions()[0].model == "ollama/sdk-model"
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_reports_actual_failover_model_identity(tmp_path) -> None:
+    class FailingPrimary(SDKProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            raise RuntimeError("primary unavailable")
+            yield  # pragma: no cover
+
+    primary = FailingPrimary()
+    primary.provider_family = "primary"
+    class BackupProvider(SDKProvider):
+        @property
+        def model_name(self) -> str:
+            return "backup-model"
+
+    backup = BackupProvider()
+    backup.provider_family = "backup"
+    provider = FailoverProvider([primary, backup])
+    config = AshConfig(
+        model="primary/sdk-model",
+        fallback_models=["backup/backup-model"],
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        model_pricing_usd_per_million={
+            "backup/backup-model": {"input": 2.0, "output": 10.0}
+        },
+    )
+
+    async with await AshClient.create(config=config, provider=provider) as client:
+        result = await client.prompt("hello")
+        events = client.events(result.session_id, limit=100)
+
+    assert result.model == "backup/backup-model"
+    assert result.cost_usd == pytest.approx(0.0003)
+    completion = next(item.event for item in events if item.event.type == "turn.completed")
+    assert completion.data["model"] == "backup-model"
+    assert completion.data["model_id"] == "backup/backup-model"
+
 
 
 @pytest.mark.asyncio
@@ -473,6 +517,8 @@ async def test_async_sdk_streams_real_turn_events(tmp_path) -> None:
     assert events[-1].type == "turn.completed"
     assert events[-1].session_id == events[-1].data["session_id"]
     assert events[-1].data["response"] == "sdk response"
+    assert events[-1].data["model"] == "sdk-model"
+    assert events[-1].data["model_id"] == "ollama/sdk-model"
     assert events[-1].data["usage"]["cache_read_tokens"] == 80
     replay = client.loop.session_store.list_runtime_events(events[-1].session_id or "")
     replay_types = [item.event["type"] for item in replay]

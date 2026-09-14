@@ -257,7 +257,7 @@ class AshClient:
         return AshResult(
             response=response,
             session_id=self.loop.current_session.session_id,
-            model=self.config.model,
+            model=self.loop.active_model_id,
             context_tokens=self.loop._last_context_tokens,
             prompt_tokens=int(usage["prompt_tokens"]),
             completion_tokens=int(usage["completion_tokens"]),

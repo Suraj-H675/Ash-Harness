@@ -147,6 +147,9 @@ def test_openai_compatible_catalog_providers_build_with_their_route(
     result = create_default_provider_registry().build(config)
 
     assert result.model_name == "test-model"
+    assert result.provider_family == provider
+    assert result.capabilities.native_tools is True
+    assert result.capabilities.vision is True
     assert result._base_url == base_url
 
 
@@ -166,6 +169,9 @@ def test_local_openai_compatible_catalog_providers_are_anonymous(
     )
 
     assert result.model_name == "local-model"
+    assert result.provider_family == provider
+    assert result.capabilities.native_tools is True
+    assert result.capabilities.vision is True
     assert result._base_url == base_url
     assert result._api_key == ""
     assert result._client.api_key == "ash-anonymous"
@@ -188,6 +194,8 @@ async def test_custom_anonymous_openai_compatible_provider_builds_without_bearer
     provider = create_default_provider_registry().build(config)
 
     assert provider.model_name == "local-model"
+    assert provider.provider_family == "local"
+
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/chat/completions"
         assert "Authorization" not in request.headers

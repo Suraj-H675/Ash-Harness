@@ -159,6 +159,7 @@ def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderAB
         base_url=connection.base_url,
         allow_anonymous=connection.auth_mode == "none",
     )
+    _assign_openai_wire_route_identity(provider, connection.provider)
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider
 
@@ -219,9 +220,18 @@ def _build_custom_openai_provider(
         base_url=connection.base_url,
         allow_anonymous=connection.auth_mode == "none",
     )
+    _assign_openai_wire_route_identity(provider, provider_name)
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider
 
+
+
+def _assign_openai_wire_route_identity(provider: ProviderABC, family: str) -> None:
+    """Keep adapter capabilities while exposing the route that owns the request."""
+
+    capabilities = provider.capabilities
+    provider.provider_family = family
+    provider._ash_declared_capabilities = capabilities
 
 def create_default_provider_registry() -> ProviderRegistry:
     registry = ProviderRegistry()

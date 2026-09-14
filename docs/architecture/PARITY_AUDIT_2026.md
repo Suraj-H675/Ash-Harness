@@ -1129,5 +1129,57 @@ remained 200. The complete HTTP unit suite passes **28 tests**, and the broader
 HTTP/JSON-RPC/serve/SDK/CI-mode set passes **66 tests**. Repository Ruff and
 mypy pass. The complete local pytest gate passes **2,305 tests with 7 skips**;
 `uv build` passes; and the installed-wheel smoke passes on Python 3.12. Hosted
-CI is recorded after the grouped Batch 5 commit is pushed and all required jobs
-resolve.
+CI run `34884569384` completed successfully for commit `190b87c` across
+Ubuntu/macOS and Python 3.11/3.12, including Ruff, mypy, the full test suite,
+clean-tree wheel build, and installed-CLI smoke.
+
+### Batch 6 — provider-route identity and one-shot completion ownership
+
+A real OpenRouter workflow had previously surfaced inconsistent provider/model
+labels. Focused reproduction showed that the issue affected every route using
+the shared OpenAI-wire adapter: OpenRouter, Mistral, xAI, Together, Fireworks,
+Cerebras, LM Studio, vLLM, and custom OpenAI-compatible routes all exposed
+`provider_family="openai"` regardless of the route that actually owned the
+request. `FailoverProvider` separately retained `provider_family="custom"`
+after a backup provider served a turn. This was execution-identity corruption,
+not just display text: provider family participates in pricing lookup, circuit
+identity, capability lookup, diagnostics, events, and result attribution.
+
+The repair assigns shared OpenAI-wire adapters their real route family while
+freezing the adapter's previously resolved OpenAI-wire capability object, so
+this identity fix does not silently alter tool/vision behavior. Failover keeps a
+writable family identity synchronized with the active provider. `AshLoop` now
+exposes one canonical active `provider/model` identity, uses it for new session
+metadata and active pricing lookup, and adds `model_id` to `turn.completed` as
+an additive event-schema-v1 field while preserving the existing model-only
+`model` field. SDK and one-shot JSON results report the provider/model that
+actually served the turn, including after failover.
+
+The same end-to-end JSON CLI probe exposed a related completion-ownership gap:
+one runtime turn produced two durable `turn.completed` rows because JSON-mode
+`HeadlessUI.emit_result()` invoked the runtime event enricher a second time.
+The earlier Batch 4 fix covered `stream-json` only. JSON mode now reuses the
+already authoritative runtime completion envelope for its final document,
+merging result-only fields without re-enriching or re-persisting it. This keeps
+the runtime event ID and turn ID identical between the one-shot JSON document
+and durable replay.
+
+Pre-fix regressions failed across all probed shared routes, failover family, SDK
+failover result identity, and additive event identity. A deterministic real CLI
+journey then exercised the OpenRouter route through a loopback OpenAI-compatible
+HTTP endpoint. It completed successfully with `result.model` and session metadata
+set to `openrouter/identity-model`, exactly one durable completion, legacy
+`event.model=identity-model`, additive
+`event.model_id=openrouter/identity-model`, identical JSON/durable event IDs and
+turn IDs, and integer provider usage counters. A fresh live OpenRouter rerun was
+not attempted after the remote-command platform rejected transmitting the
+user-supplied credential; earlier Batch 3 live OpenRouter evidence remains the
+external-provider proof.
+
+The broader provider/loop/session/SDK/headless/API verification set passes
+**246 tests**. Repository Ruff and mypy pass. The complete local pytest gate
+passes **2,307 tests with 7 skips**; `uv build` passes; and the installed-wheel
+smoke passes on Python 3.12. The dirty local source-tree build still includes
+intentional unrelated untracked Python files, so clean hosted CI remains the
+authoritative packaging proof. Hosted CI is recorded after the grouped Batch 6
+commit is pushed and all required jobs resolve.

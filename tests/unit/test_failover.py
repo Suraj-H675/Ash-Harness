@@ -39,12 +39,15 @@ class NativeFakeProvider(FakeProvider):
 
 @pytest.mark.asyncio
 async def test_failover_switches_only_before_output() -> None:
-    provider = FailoverProvider(
-        [FakeProvider("primary", error=RuntimeError("offline")), FakeProvider("backup")]
-    )
+    primary = FakeProvider("primary", error=RuntimeError("offline"))
+    primary.provider_family = "primary-route"
+    backup = FakeProvider("backup")
+    backup.provider_family = "backup-route"
+    provider = FailoverProvider([primary, backup])
     chunks = [chunk async for chunk in provider.stream_chat([])]
     assert chunks[0].content == "backup"
     assert provider.model_name == "backup"
+    assert provider.provider_family == "backup-route"
     assert provider.failures == ["primary: offline"]
 
 

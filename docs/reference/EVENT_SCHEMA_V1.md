@@ -63,6 +63,15 @@ Recovery emits one terminal `tool.error` per unfinished call before the
 aggregate `session.recovery` event. A recovered record with `dispatched: false`
 is a confirmed unstarted call and therefore has `ambiguous: false`.
 
+## Turn completion identity
+
+`turn.completed` preserves the legacy model-only `model` field and may also
+include `model_id`, the canonical `provider/model` identity of the provider that
+actually served the turn. Consumers that need route-aware attribution should
+prefer `model_id` when present and fall back to `model` for older producers.
+For failover turns, `model_id` identifies the provider/model that produced the
+successful completion rather than the originally configured primary route.
+
 ## Compatibility
 
 Within schema version 1, Ash may add event types or optional event-specific

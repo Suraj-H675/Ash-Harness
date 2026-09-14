@@ -4197,7 +4197,7 @@ async def _bootstrap_and_headless(
         payload = {
             "response": response,
             "session_id": session.session_id,
-            "model": config.model,
+            "model": loop.active_model_id,
             "context_tokens": loop._last_context_tokens,
             "usage": loop.last_turn_usage,
         }

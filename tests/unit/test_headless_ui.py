@@ -103,6 +103,64 @@ async def test_one_shot_stream_json_has_one_authoritative_completion(tmp_path) -
     assert sum(event["type"] == "turn.completed" for event in events) == 1
     assert events[-1]["type"] == "turn.completed"
     assert events[-1]["response"] == "done"
+    assert events[-1]["model"] == "plain-test"
+    assert events[-1]["model_id"] == "openai/plain-test"
+
+
+@pytest.mark.asyncio
+async def test_one_shot_json_reports_canonical_active_model(tmp_path) -> None:
+    from ash.cli import _bootstrap_and_headless
+    from ash.config import AshConfig
+    from ash.core.loop import AshLoop
+    from ash.core.session import SessionStore
+    from ash.providers.base import ProviderABC, StreamChunk
+    from ash.safety.guard import SafetyGuard
+
+    class PlainProvider(ProviderABC):
+        model_name = "plain-test"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="done", is_done=True)
+
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="json", stream=stream)
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/plain-test",
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        PlainProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+        config=config,
+    )
+
+    try:
+        assert (
+            await _bootstrap_and_headless(
+                loop, config, prompt="hello", session_id=None, ui=ui
+            )
+            == 0
+        )
+    finally:
+        await loop.aclose()
+
+    payload = json.loads(stream.getvalue())
+    assert payload["type"] == "turn.completed"
+    assert payload["model"] == "openai/plain-test"
+    assert payload["model_id"] == "openai/plain-test"
+    persisted = loop.session_store.list_runtime_events(payload["session_id"], limit=100)
+    completions = [item.event for item in persisted if item.event["type"] == "turn.completed"]
+    assert len(completions) == 1
+    assert payload["event_id"] == completions[0]["event_id"]
+    assert payload["turn_id"] == completions[0]["turn_id"]
+
 
 
 def test_json_error_is_structured_machine_readable_event() -> None:

@@ -30,6 +30,7 @@ class FailoverProvider(ProviderABC):
             )
         self.providers = providers
         self.active_index = 0
+        self.provider_family = providers[0].provider_family
         self.failures: list[str] = []
 
     @property
@@ -76,6 +77,7 @@ class FailoverProvider(ProviderABC):
                     saw_terminal = saw_terminal or chunk.is_done
                     exposed_terminal = exposed_terminal or chunk.is_done
                     self.active_index = index
+                    self.provider_family = provider.provider_family
                     yield chunk
                 if not saw_terminal:
                     raise ProviderCompletionError(
