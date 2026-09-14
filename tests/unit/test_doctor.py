@@ -31,6 +31,25 @@ def test_render_doctor_json_has_stable_schema() -> None:
     assert payload["checks"][0]["name"] == "config"
 
 
+def test_render_doctor_human_output_sanitizes_untrusted_fields() -> None:
+    rendered = render_doctor(
+        [
+            DoctorCheck(
+                "model\nname",
+                "fail",
+                "bad\x1b[2J\u202ehidden\u202c",
+                "[bold]repair\tme",
+            )
+        ]
+    )
+
+    assert "model\\x0aname" in rendered
+    assert "bad\\x1b[2J\\u202ehidden\\u202c" in rendered
+    assert "repair\\x09me" in rendered
+    assert "\x1b[2J" not in rendered
+    assert "\u202e" not in rendered
+
+
 @pytest.mark.asyncio
 async def test_run_doctor_connect_uses_shared_provider_verification(
     tmp_path, monkeypatch: pytest.MonkeyPatch

@@ -47,6 +47,27 @@ def test_status_line_includes_runtime_git_cost_and_sandbox(tmp_path: Path) -> No
     assert f"s:{session.session_id[:8]}" in rendered
 
 
+def test_status_line_sanitizes_persisted_model_controls(tmp_path: Path) -> None:
+    loop = SimpleNamespace(
+        current_session=None,
+        session_store=SimpleNamespace(),
+        permission_policy=PermissionPolicy("interactive"),
+        project_root=tmp_path,
+        _last_context_tokens=0,
+    )
+    config = AshConfig(
+        workspace_root=tmp_path,
+        model="openrouter/model\x1b[2J\u202ehidden\u202c",
+    )
+    sandbox = SimpleNamespace(backend_name="scoped", is_fully_isolated=lambda: False)
+
+    rendered = StatusLine(loop, config, sandbox, refresh_seconds=60)()
+
+    assert "openrouter/model\\x1b[2J\\u202ehidden\\u202c" in rendered
+    assert "\x1b[2J" not in rendered
+    assert "\u202e" not in rendered
+
+
 def test_git_branch_reports_branch_and_handles_non_repository(
     tmp_path: Path,
 ) -> None:

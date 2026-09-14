@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ash.safety.environment import resolve_host_executable
+from ash.ui.safe_text import terminal_safe_text
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
@@ -60,8 +61,9 @@ class StatusLine:
         sandbox_label = self.sandbox.backend_name
         if not self.sandbox.is_fully_isolated():
             sandbox_label += "!"
+        display_model = terminal_safe_text(self.config.model, single_line=True)
         self._cached = (
-            f" {self.config.model} | {self.loop.permission_policy.mode.value} | "
+            f" {display_model} | {self.loop.permission_policy.mode.value} | "
             f"git:{git_branch(self.loop.project_root)} | "
             f"ctx ~{self.loop._last_context_tokens}/{maximum} | "
             f"cache:{cache_read}r/{cache_write}w | "

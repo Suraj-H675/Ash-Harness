@@ -372,6 +372,53 @@ def test_terminal_ui_neutralizes_controls_in_live_assistant_and_tool_output() ->
     assert all("\x1b" not in entry.content for entry in ui.transcript.snapshot())
 
 
+def test_terminal_ui_renders_bidi_and_single_line_identifier_controls() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        console=Console(
+            file=output,
+            force_terminal=True,
+            color_system="standard",
+            width=80,
+        )
+    )
+
+    ui.emit_event(
+        {
+            "type": "tool.completed",
+            "tool": "remote\nname\u202ehidden\u202c",
+            "call_id": "call-1",
+            "success": True,
+        }
+    )
+
+    rendered = output.getvalue()
+    assert "remote\\x0aname\\u202ehidden\\u202c" in rendered
+    assert "remote\nname" not in rendered
+    assert "\u202e" not in rendered
+    assert "\u202c" not in rendered
+
+
+def test_terminal_ui_sanitizes_approval_labels_and_arguments() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        console=Console(file=output, force_terminal=True, color_system="standard")
+    )
+
+    ui.show_tool_approval(
+        "[bold red]tool\nname\u202e",
+        {"arg\tname": "value\x1b[2J\u202e"},
+        auto=False,
+    )
+
+    rendered = output.getvalue()
+    assert "\x1b[2J" not in rendered
+    assert "\u202e" not in rendered
+    assert "tool\\x0aname\\u202e" in rendered
+    assert "arg\\x09name" in rendered
+    assert "value\\x1b[2J\\u202e" in rendered
+
+
 def test_terminal_ui_status_does_not_interpret_rich_markup() -> None:
     output = StringIO()
     ui = TerminalUI(

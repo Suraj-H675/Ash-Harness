@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, cast
 from ash.safe_io import read_bounded_bytes, read_bounded_text, strict_json_loads
 from ash.mcp.diagnostics import safe_mcp_diagnostic
 from ash.safety.scoped_io import atomic_write_scoped_text
+from ash.ui.safe_text import terminal_safe_text
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
@@ -269,7 +270,8 @@ def _render_model_list(
     lines = ["Available models:"]
     number = 0
     for prov, models in grouped.items():
-        lines.append(f"\n{prov.capitalize()}:")
+        display_provider = terminal_safe_text(prov.capitalize(), single_line=True)
+        lines.append(f"\n{display_provider}:")
         for model in models:
             number += 1
             marker = (
@@ -289,7 +291,8 @@ def _render_model_list(
                 if enabled
             ]
             prefix = f"[{number}] " if numbered else ""
-            lines.append(f"  {prefix}{model} [{', '.join(labels)}]{marker}")
+            display_model = terminal_safe_text(model, single_line=True)
+            lines.append(f"  {prefix}{display_model} [{', '.join(labels)}]{marker}")
     return "\n".join(lines)
 
 
@@ -351,7 +354,8 @@ def _render_model_capabilities(model_string: str) -> str:
     if capabilities.max_output_tokens is not None:
         budgets.append(f"output {capabilities.max_output_tokens:,}")
     suffix = f"; {'; '.join(budgets)}" if budgets else ""
-    return f"{model_string}: [{', '.join(labels) or 'unknown'}]{suffix}"
+    display_model = terminal_safe_text(model_string, single_line=True)
+    return f"{display_model}: [{', '.join(labels) or 'unknown'}]{suffix}"
 
 
 def _render_runtime_capabilities(loop: AshLoop, config: AshConfig) -> str:
@@ -362,8 +366,9 @@ def _render_runtime_capabilities(loop: AshLoop, config: AshConfig) -> str:
     model = (
         f"{getattr(provider, 'provider_family', config.provider)}/{provider.model_name}"
     )
+    display_model = terminal_safe_text(model, single_line=True)
     lines = [
-        f"Runtime capabilities for {model}:",
+        f"Runtime capabilities for {display_model}:",
         "  source: dynamic manifest"
         if getattr(
             provider,
@@ -403,9 +408,10 @@ async def _refresh_runtime_capabilities(loop: AshLoop, config: AshConfig) -> str
             setattr(provider, "_dynamic_capabilities", None)
             await detect()
     except Exception as exc:  # noqa: BLE001 - refresh must not break the REPL
+        error = terminal_safe_text(str(exc), single_line=True)
         return (
             _render_runtime_capabilities(loop, config)
-            + f"\n  refresh failed: {type(exc).__name__}: {exc}"
+            + f"\n  refresh failed: {type(exc).__name__}: {error}"
         )
     refreshed = _render_runtime_capabilities(loop, config)
     return refreshed + "\n  source refreshed"
@@ -461,13 +467,15 @@ def render_model_catalog_refresh(
 
     lines = ["Available models:"]
     if error:
-        lines.append(f"Live discovery unavailable: {error}")
+        safe_error = terminal_safe_text(error, single_line=True)
+        lines.append(f"Live discovery unavailable: {safe_error}")
     if discovered:
         lines.append("\nLive:")
         current = config.model
         for model in sorted(set(discovered)):
             marker = " (current)" if model == current else ""
-            lines.append(f"  {model}{marker}")
+            display_model = terminal_safe_text(model, single_line=True)
+            lines.append(f"  {display_model}{marker}")
     lines.extend(["", _render_model_list(config)])
     return "\n".join(lines)
 
@@ -494,7 +502,9 @@ async def _interactive_model_picker(
     try:
         loop.switch_model(model_str)
         config.model = model_str
-        write_output(f"Switched to {model_str}")
+        write_output(
+            "Switched to " + terminal_safe_text(model_str, single_line=True)
+        )
     except Exception as exc:
         write_output(f"Error: {exc}", file=sys.stderr)
 
@@ -811,7 +821,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 print(
                     "\n".join(
                         (
-                            f"Model: {config.model}",
+                            "Model: "
+                            + terminal_safe_text(config.model, single_line=True),
                             f"Workspace: {config.workspace_root}",
                             f"Mode: {loop.safety_tier}",
                             f"Session: {session.session_id if session else '(none)'}",
@@ -837,7 +848,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                                 if enabled
                             ),
                             "Fallbacks: "
-                            + (", ".join(config.fallback_models) or "(none)"),
+                            + (
+                                ", ".join(
+                                    terminal_safe_text(model, single_line=True)
+                                    for model in config.fallback_models
+                                )
+                                or "(none)"
+                            ),
                             "Provider circuit: "
                             + (
                                 f"open ({provider_circuit['retry_after']:.1f}s cooldown)"
@@ -1835,7 +1852,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             try:
                 loop.switch_model(model_str)
                 config.model = model_str
-                print(f"Switched to {model_str}", flush=True)
+                print(
+                    "Switched to "
+                    + terminal_safe_text(model_str, single_line=True),
+                    flush=True,
+                )
             except Exception as exc:
                 _print_classified_error(exc)
             continue

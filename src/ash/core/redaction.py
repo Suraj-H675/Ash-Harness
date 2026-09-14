@@ -39,6 +39,18 @@ _UNTERMINATED_SECRET_VALUE_ASSIGNMENT = re.compile(
     )$
     """
 )
+_SENSITIVE_HEADER_VALUE = re.compile(
+    r"""(?ixm)
+    (?P<prefix>
+        (?<![a-z0-9_-])
+        (?P<field_quote>[\"']?)
+        (?P<field>authorization|proxy-authorization|cookie|set-cookie)
+        (?P=field_quote)
+        [ \t]*:[ \t]*
+    )
+    (?:(?P<value_quote>[\"'])(?P<quoted_value>[^\"\r\n]*)(?P=value_quote)|(?P<unquoted_value>[^\r\n]*))
+    """
+)
 _SECRET_PATTERNS = (
     _SECRET_VALUE_ASSIGNMENT,
     re.compile(r"\b(sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,})\b"),
@@ -98,9 +110,10 @@ class SecretFinding:
 
 
 def redact_text(value: str) -> str:
+    redacted = _SENSITIVE_HEADER_VALUE.sub(_redact_sensitive_header, value)
     redacted = _UNTERMINATED_SECRET_VALUE_ASSIGNMENT.sub(
         lambda match: _redact_unterminated_if_incomplete(match, value),
-        value,
+        redacted,
     )
     redacted = _SECRET_PATTERNS[0].sub(
         _redact_secret_assignment,
@@ -109,6 +122,26 @@ def redact_text(value: str) -> str:
     for pattern in _SECRET_PATTERNS[1:]:
         redacted = pattern.sub("[REDACTED]", redacted)
     return redacted
+
+
+def _redact_sensitive_header(match: re.Match[str]) -> str:
+    field = match.group("field").casefold()
+    raw_value = match.group("quoted_value")
+    if raw_value is None:
+        raw_value = match.group("unquoted_value") or ""
+
+    if field in {"authorization", "proxy-authorization"}:
+        scheme_match = re.match(r"(?is)(basic|bearer)(?:[ \t]+|$)", raw_value)
+        replacement = (
+            f"{scheme_match.group(1)} [REDACTED]"
+            if scheme_match is not None
+            else "[REDACTED]"
+        )
+    else:
+        replacement = "[REDACTED]"
+
+    quote = match.group("value_quote") or ""
+    return f"{match.group('prefix')}{quote}{replacement}{quote}"
 
 
 def _redact_unterminated_if_incomplete(
@@ -222,6 +255,13 @@ class StreamingRedactor:
             return ""
 
         incomplete_start = _incomplete_secret_assignment_start(self._buffer)
+        header_start = _incomplete_sensitive_header_start(self._buffer)
+        if header_start is not None:
+            incomplete_start = (
+                header_start
+                if incomplete_start is None
+                else min(incomplete_start, header_start)
+            )
         if incomplete_start is not None:
             if incomplete_start:
                 complete = self._buffer[:incomplete_start]
@@ -297,6 +337,14 @@ _SECRET_FIELD_COMPONENTS = (
     "token",
 )
 
+_SENSITIVE_HEADER_PREFIX = re.compile(
+    r"""(?ixm)
+    (?<![a-z0-9_-])
+    [\"']?(?:authorization|proxy-authorization|cookie|set-cookie)[\"']?
+    [ \t]*:[ \t]*
+    """
+)
+
 
 def _incomplete_secret_assignment_start(value: str) -> int | None:
     starts: list[int] = []
@@ -314,6 +362,17 @@ def _incomplete_secret_assignment_start(value: str) -> int | None:
             for component in _SECRET_FIELD_COMPONENTS
         ):
             starts.append(field_prefix.start())
+    return min(starts) if starts else None
+
+
+def _incomplete_sensitive_header_start(value: str) -> int | None:
+    """Withhold a sensitive header until its line is complete."""
+
+    starts: list[int] = []
+    for match in _SENSITIVE_HEADER_PREFIX.finditer(value):
+        remainder = value[match.end() :]
+        if "\n" not in remainder and "\r" not in remainder:
+            starts.append(match.start())
     return min(starts) if starts else None
 
 
@@ -367,13 +426,85 @@ def redact_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             key: "[REDACTED]"
-            if any(
-                term in str(key).casefold()
-                for term in ("key", "token", "secret", "password")
-            )
+            if _is_secret_field(key, item)
             else redact_value(item)
             for key, item in value.items()
         }
     if isinstance(value, list):
         return [redact_value(item) for item in value]
     return value
+
+
+_NON_SECRET_USAGE_FIELDS = frozenset(
+    {
+        "prompt_tokens",
+        "completion_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "estimated_prompt_tokens",
+        "estimated_completion_tokens",
+        "total_tokens",
+        "total_prompt_tokens",
+        "total_completion_tokens",
+        "max_tokens",
+        "max_context_tokens",
+        "max_completion_tokens",
+        "max_turn_total_tokens",
+        "max_tool_result_tokens",
+        "max_attachment_tokens",
+        "agent_token_budget",
+    }
+)
+_USAGE_TOKEN_FIELD = re.compile(
+    r"^(?:(?:prompt|completion|input|output|total|estimated|cached|cache|"
+    r"context|max|agent|reasoning|turn|attachment|tool|used|added|before|after|"
+    r"current|remaining|reserved|original|minimum|candidate|uncached|graph|"
+    r"record|marker|usage)(?:_[a-z0-9]+)*)_"
+    r"(?:tokens?|token_count|token_budget|token_limit|token_total|token_used|"
+    r"tokens_used)$|^token_count$"
+)
+_ADDITIONAL_SECRET_FIELD_COMPONENTS = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "cookies",
+    }
+)
+
+
+def _normalize_field_name(key: object) -> str:
+    raw = str(key)
+    raw = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", raw)
+    raw = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", raw)
+    return re.sub(r"[^a-z0-9]+", "_", raw.casefold()).strip("_")
+
+
+def _is_secret_field(key: object, value: Any) -> bool:
+    normalized = _normalize_field_name(key)
+    is_numeric_usage = (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and (
+            normalized in _NON_SECRET_USAGE_FIELDS
+            or _USAGE_TOKEN_FIELD.fullmatch(normalized) is not None
+        )
+    )
+    if is_numeric_usage:
+        return False
+
+    # Preserve the pre-existing fail-closed structured-field behavior for
+    # key/token/secret/password names.  The usage exemption above is deliberately
+    # narrow so machine accounting stays typed without opening credential fields.
+    if any(
+        term in str(key).casefold()
+        for term in ("key", "token", "secret", "password")
+    ):
+        return True
+
+    components = normalized.split("_")
+    if any(
+        component in _ADDITIONAL_SECRET_FIELD_COMPONENTS
+        for component in components
+    ):
+        return True
+    return normalized in {"credential", "credentials"}

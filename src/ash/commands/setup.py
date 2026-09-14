@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from ash.config import (
     CURRENT_CONFIG_SCHEMA_VERSION,
@@ -49,6 +50,7 @@ from ash.provider_catalog import (
 )
 from ash.safe_io import read_bounded_bytes
 from ash.safety.trust import is_workspace_trusted
+from ash.ui.safe_text import terminal_safe_text
 
 
 class SetupOutcome(IntEnum):
@@ -212,19 +214,32 @@ def _render_setup_status(
         ("Memory", str(capabilities["memory"]["backend"])),
         ("Sandbox", str(capabilities["sandbox"]["backend"])),
     ]
-    console.print(Panel(
-        f"[bold]{provider_name}[/bold]  [dim]{model}[/dim]\n"
-        f"Profile: {profile}  •  Provider route: {provider_state}  •  "
-        f"Fallbacks: {fallback_count}",
-        title=title,
-        border_style="cyan",
-        padding=(0, 1),
-    ))
+    summary = Text()
+    summary.append(terminal_safe_text(provider_name, single_line=True), style="bold")
+    summary.append("  ")
+    summary.append(terminal_safe_text(model, single_line=True), style="dim")
+    summary.append("\nProfile: ")
+    summary.append(terminal_safe_text(profile, single_line=True))
+    summary.append("  •  Provider route: ")
+    summary.append(terminal_safe_text(provider_state, single_line=True))
+    summary.append("  •  Fallbacks: ")
+    summary.append(str(fallback_count))
+    console.print(
+        Panel(
+            summary,
+            title=terminal_safe_text(title, single_line=True),
+            border_style="cyan",
+            padding=(0, 1),
+        )
+    )
     table = Table(show_header=True, header_style="bold cyan", box=None, pad_edge=False)
     table.add_column("Capability", style="bold")
     table.add_column("Status")
     for capability, status in optional:
-        table.add_row(capability, status)
+        table.add_row(
+            Text(terminal_safe_text(capability, single_line=True), style="bold"),
+            Text(terminal_safe_text(status, single_line=True)),
+        )
     console.print(table)
 
 
@@ -274,7 +289,10 @@ def run_setup_wizard(args) -> SetupOutcome:
             return SetupOutcome.ERROR
         if section == "web":
             if _has_web_search_configured(config):
-                print(f"Web search is configured for {config.web_search_provider}.")
+                print(
+                    "Web search is configured for "
+                    f"{terminal_safe_text(str(config.web_search_provider), single_line=True)}."
+                )
                 return SetupOutcome.SUCCESS
             print(
                 "Error: web search needs BRAVE_SEARCH_API_KEY or TAVILY_API_KEY.",
@@ -282,7 +300,10 @@ def run_setup_wizard(args) -> SetupOutcome:
             )
             return SetupOutcome.ERROR
         if _has_provider_configured(config):
-            print(f"Ash is configured for {config.model}.")
+            print(
+                "Ash is configured for "
+                f"{terminal_safe_text(str(config.model), single_line=True)}."
+            )
             print("Run 'ash doctor --connect' to verify endpoint connectivity.")
             return SetupOutcome.SUCCESS
         print("Error: ash setup requires an interactive terminal.", file=sys.stderr)
@@ -403,11 +424,14 @@ def setup_providers(config, *, quick: bool = False) -> SetupOutcome:
     fallbacks = list(getattr(config, "fallback_models", []) or [])
     while True:
         _print_header("Provider Fallbacks")
-        print(f"Primary: {config.model}")
+        print(
+            "Primary: "
+            f"{terminal_safe_text(str(config.model), single_line=True)}"
+        )
         if fallbacks:
             print("Fallback chain (tried in order):")
             for index, model in enumerate(fallbacks, 1):
-                print(f"  {index}. {model}")
+                print(f"  {index}. {terminal_safe_text(model, single_line=True)}")
         else:
             print("No fallback models configured.")
         print("\nChanges are saved after each successful action.\n")
@@ -487,7 +511,13 @@ def _prompt_fallback_model(config) -> str:
     print("  " + ", ".join(descriptor.id for descriptor in PROVIDERS))
     custom = getattr(config, "custom_providers", {})
     if isinstance(custom, dict) and custom:
-        print("  Custom: " + ", ".join(sorted(custom, key=str.casefold)))
+        print(
+            "  Custom: "
+            + ", ".join(
+                terminal_safe_text(str(provider), single_line=True)
+                for provider in sorted(custom, key=str.casefold)
+            )
+        )
     raw = _prompt_setup_text(
         "  Fallback model (provider/model, 'b' back, 'c' cancel): "
     )
@@ -897,7 +927,10 @@ def _flow_ollama(current: str) -> SetupOutcome:
             "ASH_MODEL": f"ollama/{model}",
         }
     )
-    print(f"  Configured Ollama with model: {model}")
+    print(
+        "  Configured Ollama with model: "
+        f"{terminal_safe_text(model, single_line=True)}"
+    )
     _print_verification_status(verified)
     return SetupOutcome.SUCCESS
 
@@ -939,7 +972,7 @@ def _flow_openai_compatible() -> SetupOutcome:
 
     print("\n  Available models from endpoint:")
     for i, m in enumerate(models, 1):
-        print(f"    [{i}] {m}")
+        print(f"    [{i}] {terminal_safe_text(m, single_line=True)}")
 
     model = _prompt_setup_text("\n  Select or type a model name: ")
 
@@ -977,8 +1010,12 @@ def _flow_openai_compatible() -> SetupOutcome:
     if api_key:
         settings[key_env] = api_key
     save_env_values(settings)
-    print(f"\n  Saved custom provider '{name}' to {get_config_path()}")
-    print(f"  Model: {model}")
+    print(
+        "\n  Saved custom provider "
+        f"'{terminal_safe_text(name, single_line=True)}' to "
+        f"{terminal_safe_text(str(get_config_path()), single_line=True)}"
+    )
+    print(f"  Model: {terminal_safe_text(model, single_line=True)}")
     _print_verification_status(verified)
     return SetupOutcome.SUCCESS
 
@@ -1102,12 +1139,18 @@ def _discover_models(
         result = probe()
         if result.models:
             print(
-                f"  Verified {provider_name}; discovered {len(result.models)} model(s)."
+                "  Verified "
+                f"{terminal_safe_text(provider_name, single_line=True)}; discovered "
+                f"{len(result.models)} model(s)."
             )
             return list(result.models), True
-        print(f"  Could not verify {provider_name}: {result.error or 'unknown error'}")
+        print(
+            "  Could not verify "
+            f"{terminal_safe_text(provider_name, single_line=True)}: "
+            f"{terminal_safe_text(result.error or 'unknown error')}"
+        )
         if guidance:
-            print(f"  {guidance}")
+            print(f"  {terminal_safe_text(guidance)}")
         action = (
             input(
                 "  Retry [r], continue unverified [s], go back [b], or cancel [c]? [r] "
@@ -1437,7 +1480,9 @@ def _prompt_model_list(models: list[str], current: str) -> str:
     print("\n  Available models:")
     for i, m in enumerate(models, 1):
         marker = " (current)" if m == current else ""
-        print(f"    [{i}] {m}{marker}")
+        print(
+            f"    [{i}] {terminal_safe_text(m, single_line=True)}{marker}"
+        )
 
     while True:
         val = input(
@@ -1501,7 +1546,7 @@ def _prompt_setup_text(prompt: str, *, allow_empty: bool = False) -> str:
 def _print_header(title: str) -> None:
     _setup_console().print(
         Panel(
-            title,
+            Text(terminal_safe_text(title, single_line=True)),
             border_style="cyan",
             padding=(0, 1),
         )
@@ -1509,4 +1554,6 @@ def _print_header(title: str) -> None:
 
 
 def _print_info(msg: str) -> None:
-    _setup_console().print(f"[green]✓[/green] {msg}")
+    line = Text("✓ ", style="green")
+    line.append(terminal_safe_text(msg))
+    _setup_console().print(line)

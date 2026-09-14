@@ -17,6 +17,7 @@ from ash.sandbox.process_utils import (
     terminate_process_tree,
 )
 from ash.safety.environment import resolve_host_executable
+from ash.ui.safe_text import terminal_safe_text
 
 
 MAX_PULL_OUTPUT_CHARS = 20_000
@@ -95,15 +96,17 @@ async def pull_model(
             text = decoder.decode(chunk)
             remaining = MAX_PULL_OUTPUT_CHARS - emitted
             if remaining > 0 and text:
-                visible = text[:remaining]
+                visible = terminal_safe_text(text)[:remaining]
                 sys.stdout.write(visible)
                 sys.stdout.flush()
                 emitted += len(visible)
         trailing = decoder.decode(b"", final=True)
         remaining = MAX_PULL_OUTPUT_CHARS - emitted
         if remaining > 0 and trailing:
-            sys.stdout.write(trailing[:remaining])
+            visible = terminal_safe_text(trailing)[:remaining]
+            sys.stdout.write(visible)
             sys.stdout.flush()
+            emitted += len(visible)
         await process.wait()
 
     try:

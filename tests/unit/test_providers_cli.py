@@ -59,6 +59,20 @@ def test_provider_test_error_redacts_credentials(json_output: bool) -> None:
     assert "[REDACTED]" in rendered
 
 
+def test_provider_test_error_sanitizes_human_terminal_controls() -> None:
+    from ash.commands.providers import provider_test_error
+
+    rendered = provider_test_error(
+        RuntimeError("bad\nerror\x1b[2J\u202ehidden\u202c"),
+        json_output=False,
+    )
+
+    assert "bad\\x0aerror\\x1b[2J\\u202ehidden\\u202c" in rendered
+    assert "bad\nerror" not in rendered
+    assert "\x1b[2J" not in rendered
+    assert "\u202e" not in rendered
+
+
 def test_main_lists_provider_catalog_without_loading_runtime_config(capsys) -> None:
     from ash.cli import main
 

@@ -649,6 +649,33 @@ def test_model_catalog_includes_configured_custom_models() -> None:
     assert rendered.count("MiniMax-M2.7") >= 1
 
 
+def test_model_human_renderers_sanitize_provider_control_characters() -> None:
+    from ash.cli import _render_model_capabilities, _render_model_list, render_model_catalog_refresh
+    from ash.config import AshConfig
+
+    malicious = "MODEL\x1b[2J\u202ehidden\u202c"
+    config = AshConfig(
+        model=f"custom/{malicious}",
+        custom_providers={
+            "custom": {
+                "base_url": "https://api.example.test/v1",
+                "models": [malicious],
+            }
+        },
+    )
+
+    outputs = (
+        _render_model_list(config),
+        _render_model_capabilities(f"custom/{malicious}"),
+        render_model_catalog_refresh(config, [f"custom/{malicious}"]),
+    )
+
+    for rendered in outputs:
+        assert "MODEL\\x1b[2J\\u202ehidden\\u202c" in rendered
+        assert "\x1b[2J" not in rendered
+        assert "\u202e" not in rendered
+
+
 def test_model_capability_display_covers_budgets_and_custom_models() -> None:
     from ash.cli import _render_model_capabilities, _render_model_list
     from ash.config import AshConfig

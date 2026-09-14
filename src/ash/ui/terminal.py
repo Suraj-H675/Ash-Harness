@@ -17,7 +17,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import unicodedata
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +30,7 @@ from rich.progress import BarColumn, Progress, TaskID, TextColumn
 from rich.text import Text
 
 from ash.safe_io import read_bounded_bytes
+from ash.ui.safe_text import terminal_safe_text
 from ash.ui.transcript import Transcript
 from ash.ui.theme import get_theme
 
@@ -40,21 +40,6 @@ MAX_EDIT_PREVIEW_FILE_BYTES = 1_000_000
 MAX_EDIT_PREVIEW_TEXT_CHARS = 128_000
 MAX_EDIT_PREVIEW_LINES = 400
 DIFF_PREVIEW_TRUNCATED = "[diff preview truncated]"
-
-
-def terminal_safe_text(value: str) -> str:
-    """Render terminal controls visibly instead of allowing them to control a TTY."""
-
-    parts: list[str] = []
-    for character in value:
-        if character in {"\n", "\t"} or unicodedata.category(character) != "Cc":
-            parts.append(character)
-            continue
-        codepoint = ord(character)
-        parts.append(
-            f"\\x{codepoint:02x}" if codepoint <= 0xFF else f"\\u{codepoint:04x}"
-        )
-    return "".join(parts)
 
 
 @dataclass
@@ -351,8 +336,12 @@ class TerminalUI:
             "tool.error",
         }:
             return
-        tool = terminal_safe_text(str(payload.get("tool", "unknown")))
-        call_id = terminal_safe_text(str(payload.get("call_id", "")))
+        tool = terminal_safe_text(
+            str(payload.get("tool", "unknown")), single_line=True
+        )
+        # Keep the provider/runtime call identity exact for internal lookup and
+        # metadata.  Only the human-facing title/content is sanitized.
+        call_id = str(payload.get("call_id", ""))
         if event_type == "tool.output":
             delta = terminal_safe_text(str(payload.get("delta", "")))
             if not delta:
@@ -483,11 +472,15 @@ class TerminalUI:
 
         body = Text()
         body.append("Tool: ", style="bold")
-        body.append(tool_name, style=self.theme.prompt)
+        display_tool_name = terminal_safe_text(tool_name, single_line=True)
+        body.append(display_tool_name, style=self.theme.prompt)
         body.append("\nArgs:\n")
         for key, value in arguments.items():
-            body.append(f"  {key} = ", style="dim")
-            body.append(repr(value))
+            body.append(
+                f"  {terminal_safe_text(str(key), single_line=True)} = ",
+                style="dim",
+            )
+            body.append(terminal_safe_text(repr(value)))
             body.append("\n")
         preview = self._edit_preview(
             tool_name,
@@ -521,7 +514,7 @@ class TerminalUI:
         self.transcript.append(
             "approval",
             body.plain,
-            title=tool_name,
+            title=display_tool_name,
             metadata={"auto": auto},
         )
         if not self.viewport_mode:

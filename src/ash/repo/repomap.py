@@ -34,6 +34,19 @@ from ash.repo.parser import (
 MAX_REPO_DISCOVERY_ENTRIES = 100_000
 MAX_REPO_DISCOVERY_DEPTH = 32
 
+
+def _dot_quote(value: str) -> str:
+    """Quote a repository-derived value as one safe DOT string literal."""
+
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
+
 # Folders that should never be descended into when building a repo map.
 DEFAULT_IGNORED_DIRS = frozenset(
     {
@@ -637,17 +650,16 @@ class RepoMap:
             src_idx = self._index.get(src_path.resolve())
             if src_idx is None:
                 continue
-            src_label = str(src_path.relative_to(self.project_root))
+            src_label = _dot_quote(str(src_path.relative_to(self.project_root)))
             if self._adjacency is None:
                 continue
             for dep_idx in range(len(self._adjacency)):
                 if self._adjacency[dep_idx][src_idx] > 0:
                     dep_path = self._files[dep_idx].path
-                    dep_label = str(dep_path.relative_to(self.project_root))
-                    lines.append(f'  "{src_label}" -> "{dep_label}";')
+                    dep_label = _dot_quote(str(dep_path.relative_to(self.project_root)))
+                    lines.append(f"  {src_label} -> {dep_label};")
         lines.append("}")
         return "\n".join(lines)
-
     # --- internal -------------------------------------------------------
 
     def _node_for_path(self, path: Path) -> FileNode | None:

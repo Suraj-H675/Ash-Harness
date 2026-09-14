@@ -27,6 +27,7 @@ from ash.providers.readiness import (
 from ash.safe_io import validate_unlinked_file_path
 from ash.sandbox import SandboxManager
 from ash.safety.environment import resolve_host_executable
+from ash.ui.safe_text import terminal_safe_text
 
 
 @dataclass(frozen=True)
@@ -552,7 +553,13 @@ def render_doctor(checks: list[DoctorCheck], *, json_output: bool = False) -> st
         return json.dumps(payload, indent=2)
     lines = ["Ash doctor"]
     for check in checks:
-        lines.append(f"[{check.status.upper():4}] {check.name}: {check.message}")
+        status = terminal_safe_text(check.status.upper(), single_line=True)
+        name = terminal_safe_text(check.name, single_line=True)
+        message = terminal_safe_text(check.message, single_line=True)
+        lines.append(f"[{status:4}] {name}: {message}")
         if check.remedy:
-            lines.append(f"       remedy: {check.remedy}")
+            lines.append(
+                "       remedy: "
+                + terminal_safe_text(check.remedy, single_line=True)
+            )
     return "\n".join(lines)

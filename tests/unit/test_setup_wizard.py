@@ -525,6 +525,12 @@ def test_setup_numbered_prompts_reject_unbounded_numeric_input(
     monkeypatch.setattr("builtins.input", _fake_input([huge_number, "1"]))
     assert _prompt_model_list(["model-1"], "") == "model-1"
 
+    monkeypatch.setattr("builtins.input", _fake_input(["1"]))
+    assert (
+        _prompt_model_list(["model\nname\x1b[2J\u202ehidden\u202c"], "")
+        == "model\nname\x1b[2J\u202ehidden\u202c"
+    )
+
     monkeypatch.setattr("builtins.input", _fake_input([huge_number, "1"]))
     assert _prompt_choice("Pick", ["one"], 0) == 0
 
@@ -532,6 +538,10 @@ def test_setup_numbered_prompts_reject_unbounded_numeric_input(
     assert "Position must be a number" in output
     assert "Invalid number." in output
     assert "Invalid choice." in output
+    assert "model\\x0aname\\x1b[2J\\u202ehidden\\u202c" in output
+    assert "model\nname" not in output
+    assert "\x1b[2J" not in output
+    assert "\u202e" not in output
 
 
 class TestProbeModels:
@@ -838,6 +848,31 @@ class TestCmdSetup:
         assert payload["fallback_models"] == ["ollama/local"]
         assert payload["capabilities"]["memory"]["backend"] == "fts5"
         assert "sk-status-secret" not in json.dumps(payload)
+
+    def test_status_human_output_sanitizes_untrusted_model_identifier(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from ash.commands.setup import _render_setup_status
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr("ash.commands.setup._browser_is_installed", lambda: False)
+        monkeypatch.setattr("ash.commands.setup._has_provider_configured", lambda _: False)
+        config = SimpleNamespace(
+            model="openai/model\nname\u202ehidden\u202c",
+            fallback_models=[],
+            custom_providers={},
+            web_search_provider="auto",
+            memory_backend="fts5",
+            sandbox_backend="auto",
+            workspace_root=tmp_path,
+        )
+
+        _render_setup_status(config)
+
+        rendered = capsys.readouterr().out
+        assert "model\\x0aname\\u202ehidden\\u202c" in rendered
+        assert "model\nname" not in rendered
+        assert "\u202e" not in rendered
 
 
 class TestWebSearchSetup:

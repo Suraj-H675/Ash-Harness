@@ -87,6 +87,28 @@ def test_profile_commands_keep_credentials_out_of_inventory(
     assert "secret-value" not in rendered
 
 
+def test_profile_human_rendering_sanitizes_model_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from ash.commands.profile import add_profile, render_profile_list, render_profile_show
+    from ash.profiles import profile_directory
+
+    assert add_profile("work") == "work"
+    profile_directory("work").joinpath(".env").write_text(
+        "ASH_MODEL=openrouter/model\x1b[2J\u202ehidden\u202c\n",
+        encoding="utf-8",
+    )
+
+    rendered = render_profile_list()
+    shown = render_profile_show("work")
+
+    for output in (rendered, shown):
+        assert "openrouter/model\\x1b[2J\\u202ehidden\\u202c" in output
+        assert "\x1b[2J" not in output
+        assert "\u202e" not in output
+
+
 def test_profile_state_is_used_by_config_loader(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -17,6 +17,7 @@ from ash.profiles import (
     validate_profile_name,
 )
 from ash.safe_io import read_bounded_bytes
+from ash.ui.safe_text import terminal_safe_text
 
 
 def _base_ash_directory() -> Path:
@@ -71,7 +72,11 @@ def render_profile_list(*, json_output: bool = False) -> str:
     lines = [f"Active profile: {payload['active']}", ""]
     for item in payload["profiles"]:
         marker = " *" if item["active"] else ""
-        model = f" model={item['model']}" if item["model"] else ""
+        model = (
+            " model=" + terminal_safe_text(str(item["model"]), single_line=True)
+            if item["model"]
+            else ""
+        )
         lines.append(
             f"{item['name']}{marker}:{model} "
             f"config={'yes' if item['config_present'] else 'no'} "
@@ -88,11 +93,14 @@ def render_profile_show(name: str, *, json_output: bool = False) -> str:
     payload = _profile_metadata(normalized, base_directory=base_directory)
     if json_output:
         return json.dumps(payload, indent=2, sort_keys=True)
+    display_model = terminal_safe_text(
+        str(payload["model"] or "not configured"), single_line=True
+    )
     return "\n".join(
         [
             f"Profile: {payload['name']}",
             f"Active: {'yes' if payload['active'] else 'no'}",
-            f"Model: {payload['model'] or 'not configured'}",
+            f"Model: {display_model}",
             f"Config: {payload['config_file']}",
             f"Credentials: {payload['credentials_file']}",
         ]

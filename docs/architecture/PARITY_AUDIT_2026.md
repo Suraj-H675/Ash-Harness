@@ -975,5 +975,80 @@ was not available locally, so the new transition coverage is explicitly
 platform-mocked rather than native verification. No Codex Security scan is
 claimed as passed; its recorded external tooling limitations remain in force.
 
-Hosted-CI results for Batch 2 will be recorded after the pushed batch's run
-completes.
+Hosted CI run `34702347950` completed successfully across Ubuntu/macOS and
+Python 3.11/3.12, including Ruff, mypy, the full test suite, wheel build, and
+installed-CLI smoke.
+### Batch 3 — output, redaction, and serialization integrity
+
+The output-integrity candidates were rechecked as one coherent human-output and
+machine-data boundary. `terminal_safe_text()` is now the shared human-terminal
+sanitizer: C0/C1-style control characters are rendered visibly, Unicode bidi
+formatting controls are escaped, and single-line labels additionally neutralize
+newlines and tabs. MCP approval names, provider/model setup output, provider
+connectivity output, doctor/storage diagnostics, the main model catalog and
+capability renderers, persisted-profile model displays, prompt status-line model
+text, and Ollama child output now cross that boundary before human rendering.
+Machine-oriented JSON values and stored model identities remain exact.
+
+The provider-model finding was broader than the setup wizard alone. A model ID
+accepted from a provider can be persisted and later displayed through `/models`,
+live catalog refresh, model-capability output, profile output, the status line,
+and model-switch confirmations. Regression coverage now exercises these
+alternate sinks so fixing setup does not leave a later terminal-spoofing path.
+Ollama output is sanitized before applying the visible-output cap, preventing
+control-character expansion from exceeding the documented bound.
+
+Structured redaction now distinguishes numeric usage accounting from secret
+fields. Prompt/completion/cache/reasoning and related numeric token counters
+remain numbers in persisted/event payloads, while credential-like structured
+keys remain fail-closed, including camelCase and compound forms such as
+`apiToken`, `accessToken`, `privateKey`, and credential/token-bearing names.
+Sensitive Authorization/Proxy-Authorization/Cookie/Set-Cookie text and nested or
+escaped secret assignments are covered by the shared redactor without changing
+ordinary non-secret strings.
+
+RepoMap DOT serialization now escapes backslashes, quotes, CR/LF, and other
+control bytes in repository-relative filenames before inserting them into
+quoted DOT strings. This prevents repository filenames from forging additional
+DOT statements. Storage diagnostics likewise escape SQLite-controlled metadata
+before human terminal rendering.
+
+Reference review found mature harnesses independently treating terminal escape
+handling and user-facing secret redaction as explicit boundaries; the Ash fix
+keeps Ash's own centralized renderer/redactor contracts rather than copying a
+reference implementation.
+
+The focused Batch 3 gate passes **264 tests**. Repository Ruff and mypy pass.
+The complete local pytest gate passes **2,294 tests with 7 skips**; `uv build`
+passes; and the installed-wheel smoke passes on Python 3.12. The dirty local
+build also demonstrates that unrelated untracked Python files can be included
+by a source-tree build, so clean hosted CI remains the authoritative packaging
+proof for the committed batch. The unrelated untracked development/reference
+files remain unstaged and untouched.
+
+Hosted-CI results for Batch 3 are recorded only after the explicit Batch 3
+commit is pushed and all required jobs complete.
+### Batch 3 real-provider workflow evidence
+
+A temporary isolated user HOME/workspace exercised the changed boundaries against
+real OpenRouter service using an ephemeral credential that was not written to
+repository or Ash configuration. `ash providers test --json` discovered 447
+models and verified `openrouter/free` as catalog-available. A real plain turn
+completed successfully with provider-reported usage persisted as numeric
+`prompt_tokens=3342` and `completion_tokens=34`, with zero reported cost.
+
+A separate real coding journey used the current OpenRouter catalog metadata to
+select `cohere/north-mini-code:free`, which advertised tool support. In headless
+`auto_edit`, Ash completed repository listing/reads and the requested
+`replace_file_content` edit, changing the intentionally broken `add()` function
+to addition; the external project test then passed. Four requested
+`run_command` calls were correctly denied by the non-interactive permission
+boundary, after which the weak free model exhausted the turn iteration limit
+without a final prose response. This is recorded as permission/model behavior,
+not an Ash defect.
+
+The same real session independently reproduced the already-recorded duplicate
+`turn.completed` candidate (two persisted completion events for one turn). A
+plain OpenRouter run also surfaced a separate provider/model identity-labeling
+oddity for later investigation; neither issue is folded into this output/
+redaction batch.

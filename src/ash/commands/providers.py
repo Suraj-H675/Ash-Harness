@@ -19,6 +19,7 @@ from ash.providers.readiness import (
     ProviderVerificationError,
     verify_provider_connection,
 )
+from ash.ui.safe_text import terminal_safe_text
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
@@ -107,9 +108,16 @@ def render_provider_test(
     connection = verification.connection
     return "\n".join(
         [
-            f"Provider: {connection.provider}/{connection.model_name}",
-            f"Endpoint: {connection.base_url}",
-            f"Authentication: {connection.credential_description}",
+            "Provider: "
+            + terminal_safe_text(
+                f"{connection.provider}/{connection.model_name}", single_line=True
+            ),
+            "Endpoint: "
+            + terminal_safe_text(connection.base_url, single_line=True),
+            "Authentication: "
+            + terminal_safe_text(
+                connection.credential_description, single_line=True
+            ),
             f"Catalog: {len(verification.models)} model(s); selected model {selected}",
             (
                 "Result: ready to use"
@@ -144,7 +152,7 @@ def provider_test_error(exc: Exception, *, json_output: bool = False) -> str:
     message = redact_text(str(exc))
     if json_output:
         return json.dumps({"ok": False, "error": message}, sort_keys=True)
-    return f"Provider test failed: {message}"
+    return "Provider test failed: " + terminal_safe_text(message, single_line=True)
 
 
 __all__ = [

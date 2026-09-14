@@ -17,6 +17,7 @@ from ash.core.session import CURRENT_SCHEMA_VERSION, SessionStorageError, Sessio
 from ash.core.redaction import redact_text
 from ash.safe_io import validate_unlinked_file_path
 from ash.safety.environment import resolve_host_executable
+from ash.ui.safe_text import terminal_safe_text
 
 
 @dataclass(frozen=True)
@@ -164,9 +165,11 @@ def render_storage_check(check: StorageCheck, *, json_output: bool = False) -> s
         return json.dumps(check.as_dict(), sort_keys=True)
     state = "ok" if check.ok else "failed"
     version = "unknown" if check.schema_version is None else str(check.schema_version)
-    return f"Storage check {state}: {check.path} (schema {version})\n" + "\n".join(
-        check.messages
+    path = terminal_safe_text(check.path, single_line=True)
+    messages = "\n".join(
+        terminal_safe_text(message, single_line=True) for message in check.messages
     )
+    return f"Storage check {state}: {path} (schema {version})\n" + messages
 
 
 def create_debug_bundle(config, destination: str | Path | None = None) -> Path:

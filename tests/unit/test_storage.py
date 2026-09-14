@@ -25,6 +25,27 @@ def test_storage_check_does_not_create_missing_database(tmp_path: Path) -> None:
     assert '"ok": false' in render_storage_check(check, json_output=True)
 
 
+def test_storage_human_output_sanitizes_database_diagnostics() -> None:
+    from ash.commands.storage import StorageCheck
+
+    check = StorageCheck(
+        path="/tmp/db\nname\u202ehidden\u202c",
+        exists=True,
+        ok=False,
+        schema_version=1,
+        messages=("foreign key violation: bad\x1b[2J",),
+    )
+
+    rendered = render_storage_check(check)
+    machine = json.loads(render_storage_check(check, json_output=True))
+
+    assert "/tmp/db\\x0aname\\u202ehidden\\u202c" in rendered
+    assert "foreign key violation: bad\\x1b[2J" in rendered
+    assert "\x1b[2J" not in rendered
+    assert "\u202e" not in rendered
+    assert machine["path"] == "/tmp/db\nname\u202ehidden\u202c"
+
+
 def test_storage_cli_honors_database_directory_override(tmp_path: Path, capsys) -> None:
     assert (
         main(

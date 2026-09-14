@@ -342,6 +342,26 @@ def test_repomap_dot_graph_follows_import_direction(tmp_path: Path) -> None:
     assert '"helper.ts" -> "main.ts";' not in graph
 
 
+def test_repomap_dot_graph_quotes_untrusted_filenames(tmp_path: Path) -> None:
+    from ash.repo.repomap import FileNode
+
+    source = tmp_path / 'bad"; evil -> forged\nnode.py'
+    dependency = tmp_path / "dependency.py"
+    repo_map = RepoMap.__new__(RepoMap)
+    repo_map.project_root = tmp_path.resolve()
+    repo_map._files = [
+        FileNode(source, (), ()),
+        FileNode(dependency, (), ()),
+    ]
+    repo_map._index = {source.resolve(): 0, dependency.resolve(): 1}
+    repo_map._adjacency = [[0.0, 0.0], [1.0, 0.0]]
+
+    graph = repo_map.to_dot_graph([source])
+
+    assert r'"bad\"; evil -> forged\nnode.py" -> "dependency.py";' in graph
+    assert '"bad"; evil -> forged' not in graph
+
+
 def test_repomap_finds_definitions_and_references_across_languages(
     tmp_path: Path,
 ) -> None:

@@ -89,6 +89,89 @@ def test_pull_drains_noisy_output_in_bounded_chunks(monkeypatch, capsys):
     assert "Pulled test-model." in output
 
 
+def test_pull_sanitizes_untrusted_child_terminal_output(monkeypatch, capsys):
+    from ash.commands import ollama
+
+    class FakeStdout:
+        def __init__(self):
+            self.calls = 0
+
+        async def read(self, size):
+            del size
+            self.calls += 1
+            if self.calls == 1:
+                return (
+                    "progress\x1b[2J\x1b]52;c;SEVMTE8=\x07\u202ehidden\u202c\n"
+                ).encode()
+            return b""
+
+    class FakeProcess:
+        stdout = FakeStdout()
+        returncode = 0
+
+        async def wait(self):
+            return self.returncode
+
+    process = FakeProcess()
+
+    async def spawn(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr(
+        ollama, "resolve_host_executable", lambda *args, **kwargs: "/usr/bin/ollama"
+    )
+    monkeypatch.setattr(ollama.asyncio, "create_subprocess_exec", spawn)
+
+    assert asyncio.run(ollama.pull_model("test-model")) == 0
+    output = capsys.readouterr().out
+    assert (
+        "progress\\x1b[2J\\x1b]52;c;SEVMTE8=\\x07\\u202ehidden\\u202c"
+        in output
+    )
+    assert "\x1b[2J" not in output
+    assert "\x1b]52;" not in output
+    assert "\x07" not in output
+    assert "\u202e" not in output
+    assert "Pulled test-model." in output
+
+
+def test_pull_sanitization_preserves_visible_output_bound(monkeypatch, capsys):
+    from ash.commands import ollama
+
+    class FakeStdout:
+        def __init__(self):
+            self.calls = 0
+
+        async def read(self, size):
+            del size
+            self.calls += 1
+            if self.calls == 1:
+                return b"\x1b" * ollama.MAX_PULL_OUTPUT_CHARS
+            return b""
+
+    class FakeProcess:
+        stdout = FakeStdout()
+        returncode = 0
+
+        async def wait(self):
+            return self.returncode
+
+    async def spawn(*args, **kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        ollama, "resolve_host_executable", lambda *args, **kwargs: "/usr/bin/ollama"
+    )
+    monkeypatch.setattr(ollama.asyncio, "create_subprocess_exec", spawn)
+
+    assert asyncio.run(ollama.pull_model("test-model")) == 0
+    output = capsys.readouterr().out
+    streamed, suffix = output.split("Pulled test-model.\n", 1)
+    assert suffix == ""
+    assert len(streamed) == ollama.MAX_PULL_OUTPUT_CHARS
+    assert "\x1b" not in streamed
+
+
 def test_pull_reports_spawn_failure_without_traceback(monkeypatch, capsys):
     from ash.commands import ollama
 
