@@ -148,9 +148,113 @@ def test_openai_compatible_catalog_providers_build_with_their_route(
 
     assert result.model_name == "test-model"
     assert result.provider_family == provider
-    assert result.capabilities.native_tools is True
-    assert result.capabilities.vision is True
+    if provider != "openrouter":
+        # These routes have not yet gained provider-owned dynamic capability
+        # negotiation; preserve their existing OpenAI-wire compatibility behavior.
+        assert result.capabilities.native_tools is True
+        assert result.capabilities.vision is True
     assert result._base_url == base_url
+
+
+def test_openrouter_capabilities_are_not_assumed_from_openai_wire_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    provider = create_default_provider_registry().build(
+        AshConfig(model="openrouter/inference-net/schematron-v2-turbo")
+    )
+
+    assert provider.provider_family == "openrouter"
+    assert provider.capabilities.native_tools is False
+    assert provider.capabilities.vision is False
+    assert callable(getattr(provider, "detect_capabilities", None))
+
+
+@pytest.mark.asyncio
+async def test_openrouter_negotiates_model_capabilities_from_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    provider = create_default_provider_registry().build(
+        AshConfig(model="openrouter/vendor/agent")
+    )
+    snapshots = [
+        (
+            ProviderModelMetadata(
+                model_id="vendor/agent",
+                supported_parameters=frozenset({"tools", "reasoning"}),
+                input_modalities=frozenset({"text", "image"}),
+                context_window=200_000,
+                max_output_tokens=8192,
+            ),
+        ),
+        (
+            ProviderModelMetadata(
+                model_id="vendor/agent",
+                supported_parameters=frozenset({"temperature"}),
+                input_modalities=frozenset({"text"}),
+                context_window=128_000,
+                max_output_tokens=4096,
+            ),
+        ),
+    ]
+    calls = 0
+
+    def probe(*args, **kwargs):
+        nonlocal calls
+        del args, kwargs
+        result = snapshots[min(calls, len(snapshots) - 1)]
+        calls += 1
+        return result
+
+    monkeypatch.setattr("ash.providers.openrouter.probe_model_catalog_metadata", probe)
+
+    first = await provider.detect_capabilities()
+    cached = await provider.detect_capabilities()
+    refreshed = await provider.detect_capabilities(refresh=True)
+
+    assert first == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=200_000,
+        max_output_tokens=8192,
+    )
+    assert cached == first
+    assert refreshed == ProviderCapabilities(
+        context_window=128_000,
+        max_output_tokens=4096,
+    )
+    assert calls == 2
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_capability_probe_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderVerificationError
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    provider = create_default_provider_registry().build(
+        AshConfig(model="openrouter/vendor/unknown")
+    )
+
+    def fail(*args, **kwargs):
+        del args, kwargs
+        raise ProviderVerificationError("catalog offline")
+
+    monkeypatch.setattr("ash.providers.openrouter.probe_model_catalog_metadata", fail)
+
+    with pytest.raises(ProviderVerificationError, match="catalog offline"):
+        await provider.detect_capabilities()
+    assert provider.capabilities == ProviderCapabilities()
+    await provider.aclose()
 
 
 @pytest.mark.parametrize(

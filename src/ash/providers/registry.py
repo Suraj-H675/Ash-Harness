@@ -153,13 +153,25 @@ def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderAB
     from ash.providers.readiness import resolve_provider_connection
 
     connection = resolve_provider_connection(config)
-    provider = OpenAIProvider(
-        model_name=model_name,
-        api_key=connection.api_key,
-        base_url=connection.base_url,
-        allow_anonymous=connection.auth_mode == "none",
-    )
-    _assign_openai_wire_route_identity(provider, connection.provider)
+    provider: ProviderABC
+    if connection.provider == "openrouter":
+        from ash.providers.openrouter import OpenRouterProvider
+
+        provider = OpenRouterProvider(
+            model_name=model_name,
+            api_key=connection.api_key,
+            base_url=connection.base_url,
+            catalog_endpoint=connection.catalog_endpoint,
+            catalog_headers=connection.headers,
+        )
+    else:
+        provider = OpenAIProvider(
+            model_name=model_name,
+            api_key=connection.api_key,
+            base_url=connection.base_url,
+            allow_anonymous=connection.auth_mode == "none",
+        )
+        _assign_openai_wire_route_identity(provider, connection.provider)
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider
 

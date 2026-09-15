@@ -777,15 +777,31 @@ def test_runtime_capabilities_render_dynamic_and_static_sources() -> None:
             _dynamic_capabilities=None,
         ),
     )
+    nested_dynamic = SimpleNamespace(
+        provider=SimpleNamespace(
+            provider_family="failover",
+            model_name="primary",
+            capabilities=ProviderCapabilities(True, context_window=16384),
+            providers=[
+                SimpleNamespace(
+                    _dynamic_capabilities=ProviderCapabilities(True),
+                    providers=None,
+                ),
+                SimpleNamespace(_dynamic_capabilities=None, providers=None),
+            ],
+        ),
+    )
 
     dynamic_rendered = _render_runtime_capabilities(dynamic, config)  # type: ignore[arg-type]
     static_rendered = _render_runtime_capabilities(static, config)  # type: ignore[arg-type]
+    nested_rendered = _render_runtime_capabilities(nested_dynamic, config)  # type: ignore[arg-type]
 
     assert "Runtime capabilities for ollama/tool-model:" in dynamic_rendered
     assert "source: dynamic manifest" in dynamic_rendered
     assert "context_window=32,768" in dynamic_rendered
     assert "Runtime capabilities for openai/gpt-test:" in static_rendered
     assert "source: static/default registry" in static_rendered
+    assert "source: dynamic manifest" in nested_rendered
 
 
 def test_explain_config_reports_sources_and_masks_secrets(

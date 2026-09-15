@@ -130,3 +130,172 @@ def test_capabilities_are_conservative_for_local_models() -> None:
 def test_failover_rejects_mixed_native_and_fallback_protocols() -> None:
     with pytest.raises(ValueError, match="must agree on native tool support"):
         FailoverProvider([NativeFakeProvider("native"), FakeProvider("fallback")])
+
+
+@pytest.mark.asyncio
+async def test_failover_revalidates_tool_protocol_after_dynamic_capability_probe() -> None:
+    class DynamicProvider(FakeProvider):
+        def __init__(self, name: str, *, native_tools: bool) -> None:
+            super().__init__(name)
+            self._native_tools = native_tools
+            self._probed = False
+
+        @property
+        def capabilities(self):
+            from ash.providers.capabilities import ProviderCapabilities
+
+            return ProviderCapabilities(native_tools=self._native_tools if self._probed else False)
+
+        async def detect_capabilities(self, *, refresh: bool = False):
+            del refresh
+            self._probed = True
+            return self.capabilities
+
+    primary = DynamicProvider("primary", native_tools=False)
+    backup = DynamicProvider("backup", native_tools=True)
+    provider = FailoverProvider([primary, backup])
+
+    with pytest.raises(RuntimeError, match="must agree on native tool support"):
+        await provider.detect_capabilities()
+
+
+@pytest.mark.asyncio
+async def test_failover_dynamic_capability_probe_accepts_matching_protocols() -> None:
+    class DynamicProvider(FakeProvider):
+        def __init__(self, name: str) -> None:
+            super().__init__(name)
+            self.probes = 0
+
+        async def detect_capabilities(self, *, refresh: bool = False):
+            from ash.providers.capabilities import ProviderCapabilities
+
+            self.probes += 1
+            return ProviderCapabilities(native_tools=True)
+
+        @property
+        def capabilities(self):
+            from ash.providers.capabilities import ProviderCapabilities
+
+            return ProviderCapabilities(native_tools=self.probes > 0)
+
+    primary = DynamicProvider("primary")
+    backup = DynamicProvider("backup")
+    provider = FailoverProvider([primary, backup])
+
+    capabilities = await provider.detect_capabilities()
+
+    assert primary.probes == 1
+    assert backup.probes == 1
+    assert capabilities.native_tools is True
+
+
+@pytest.mark.asyncio
+async def test_failover_probe_failure_still_enforces_protocol_compatibility() -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+
+    class FailingDynamicProvider(FakeProvider):
+        @property
+        def capabilities(self):
+            return ProviderCapabilities(native_tools=False)
+
+        async def detect_capabilities(self, *, refresh: bool = False):
+            del refresh
+            raise RuntimeError("catalog unavailable")
+
+    class StaticNativeProvider(FakeProvider):
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+    provider = FailoverProvider(
+        [FailingDynamicProvider("dynamic"), StaticNativeProvider("native")]
+    )
+
+    with pytest.raises(RuntimeError, match="must agree on native tool support"):
+        await provider.detect_capabilities()
+
+
+def test_failover_rejects_known_static_protocol_mismatch_even_with_dynamic_child() -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+
+    class StaticFallback(FakeProvider):
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=False)
+
+    class StaticNative(FakeProvider):
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+    class DynamicUnknown(FakeProvider):
+        async def detect_capabilities(self, *, refresh: bool = False):
+            del refresh
+            return self.capabilities
+
+    with pytest.raises(ValueError, match="must agree on native tool support"):
+        FailoverProvider(
+            [StaticFallback("fallback"), StaticNative("native"), DynamicUnknown("dynamic")]
+        )
+
+
+def test_failover_capabilities_are_conservative_across_entire_chain() -> None:
+    class CapProvider(FakeProvider):
+        def __init__(self, name: str, caps: ProviderCapabilities) -> None:
+            super().__init__(name)
+            self._caps = caps
+
+        @property
+        def capabilities(self):
+            return self._caps
+
+    first = CapProvider(
+        "first",
+        ProviderCapabilities(
+            native_tools=True, vision=True, reasoning=True, local=False,
+            context_window=200_000, max_output_tokens=16_000,
+        ),
+    )
+    second = CapProvider(
+        "second",
+        ProviderCapabilities(
+            native_tools=True, vision=False, reasoning=False, local=False,
+            context_window=64_000, max_output_tokens=4_000,
+        ),
+    )
+    provider = FailoverProvider([first, second])
+
+    assert provider.capabilities == ProviderCapabilities(
+        native_tools=True, vision=False, reasoning=False, local=False,
+        context_window=64_000, max_output_tokens=4_000,
+    )
+
+
+def test_failover_token_count_uses_conservative_maximum_across_chain() -> None:
+    class TokenProvider(FakeProvider):
+        def __init__(self, name: str, multiplier: int) -> None:
+            super().__init__(name)
+            self.multiplier = multiplier
+
+        def count_tokens(self, text: str) -> int:
+            return len(text) * self.multiplier
+
+    provider = FailoverProvider([TokenProvider("a", 1), TokenProvider("b", 3)])
+    provider.active_index = 0
+    assert provider.count_tokens("abcd") == 12
+    provider.active_index = 1
+    assert provider.count_tokens("abcd") == 12
+
+
+def test_failover_forwards_completion_ceiling_to_every_child() -> None:
+    class LimitProvider(FakeProvider):
+        def __init__(self, name: str) -> None:
+            super().__init__(name)
+            self.limits = []
+
+        def configure_max_tokens(self, max_tokens: int) -> None:
+            super().configure_max_tokens(max_tokens)
+            self.limits.append(max_tokens)
+
+    first = LimitProvider("first")
+    second = LimitProvider("second")
+    provider = FailoverProvider([first, second])
+
+    provider.configure_max_tokens(321)
+
+    assert first.limits == [321]
+    assert second.limits == [321]

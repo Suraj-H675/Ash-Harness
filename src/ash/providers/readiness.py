@@ -76,6 +76,17 @@ class ProviderVerification:
     selected_model_available: bool
 
 
+@dataclass(frozen=True)
+class ProviderModelMetadata:
+    """Validated model capability metadata from a provider catalog."""
+
+    model_id: str
+    supported_parameters: frozenset[str] = frozenset()
+    input_modalities: frozenset[str] = frozenset()
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+
+
 _BUILTIN_CONNECTIONS: dict[str, tuple[str, str, CatalogFormat, AuthMode]] = {
     "anthropic": (
         "https://api.anthropic.com",
@@ -348,7 +359,27 @@ def probe_model_catalog(
     catalog_format: CatalogFormat,
     timeout: float = 10.0,
 ) -> tuple[str, ...]:
-    """Fetch and validate a provider model catalog without exposing secrets."""
+    """Fetch and validate provider model identifiers without exposing secrets."""
+
+    return tuple(
+        item.model_id
+        for item in probe_model_catalog_metadata(
+            endpoint,
+            headers=headers,
+            catalog_format=catalog_format,
+            timeout=timeout,
+        )
+    )
+
+
+def probe_model_catalog_metadata(
+    endpoint: str,
+    *,
+    headers: Mapping[str, str],
+    catalog_format: CatalogFormat,
+    timeout: float = 10.0,
+) -> tuple[ProviderModelMetadata, ...]:
+    """Fetch bounded model metadata while treating unknown fields conservatively."""
 
     credentialed = any(
         name.casefold() in {"authorization", "x-api-key"} and bool(value)
@@ -391,16 +422,56 @@ def probe_model_catalog(
     if not isinstance(payload, dict) or not isinstance(payload.get(collection), list):
         raise ProviderVerificationError("provider returned an invalid model catalog")
 
-    models: list[str] = []
+    models: list[ProviderModelMetadata] = []
+    seen: set[str] = set()
     for item in payload[collection]:
         if not isinstance(item, dict):
             continue
         model_id = item.get(identifier)
-        if isinstance(model_id, str) and model_id and model_id not in models:
-            models.append(model_id)
+        if not isinstance(model_id, str) or not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        supported = item.get("supported_parameters")
+        parameters = frozenset(
+            value for value in supported if isinstance(value, str) and value
+        ) if isinstance(supported, list) else frozenset()
+        architecture = item.get("architecture")
+        raw_modalities = (
+            architecture.get("input_modalities")
+            if isinstance(architecture, dict)
+            else None
+        )
+        modalities = frozenset(
+            value for value in raw_modalities if isinstance(value, str) and value
+        ) if isinstance(raw_modalities, list) else frozenset()
+        top_provider = item.get("top_provider")
+        top_provider_data = top_provider if isinstance(top_provider, dict) else {}
+        context_window = _positive_catalog_integer(
+            top_provider_data.get("context_length")
+        ) or _positive_catalog_integer(item.get("context_length"))
+        max_output = (
+            _positive_catalog_integer(top_provider_data.get("max_completion_tokens"))
+            or _positive_catalog_integer(item.get("max_completion_tokens"))
+            or _positive_catalog_integer(item.get("max_output_tokens"))
+        )
+        models.append(
+            ProviderModelMetadata(
+                model_id=model_id,
+                supported_parameters=parameters,
+                input_modalities=modalities,
+                context_window=context_window,
+                max_output_tokens=max_output,
+            )
+        )
     if not models:
         raise ProviderVerificationError("provider returned no model IDs")
     return tuple(models)
+
+
+def _positive_catalog_integer(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
 
 
 def _read_bounded_catalog(response: httpx.Response) -> bytes:

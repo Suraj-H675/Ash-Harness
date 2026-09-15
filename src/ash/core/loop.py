@@ -54,6 +54,7 @@ from ash.providers.base import (
     CompletionOutcome,
     CompletionStopCategory,
     ProviderABC,
+    ProviderCapabilityError,
     ProviderCompletionError,
     ProviderTerminalError,
     TokenCounterLike,
@@ -757,17 +758,26 @@ class AshLoop:
             return
         try:
             await detect()
-        except Exception:  # noqa: BLE001 - capability negotiation is best-effort
+        except ProviderCapabilityError:
+            raise
+        except Exception:  # noqa: BLE001 - ordinary capability probes are best-effort
+            self._sync_generated_tool_protocol()
             return
+        self._sync_generated_tool_protocol()
+
+    def _sync_generated_tool_protocol(self) -> None:
+        """Update only Ash's generated tool protocol, preserving injected context."""
+
         if not self._generated_system_prompt:
             return
-        base_prompt = _default_system_prompt(
-            self.project_root,
-            native_tools=_provider_capabilities(self.provider).native_tools,
+        desired = (
+            NATIVE_TOOL_PROTOCOL
+            if _provider_capabilities(self.provider).native_tools
+            else XML_TOOL_PROTOCOL
         )
-        if self._additional_instructions:
-            base_prompt = f"{base_prompt}\n\n{self._additional_instructions}"
-        self._base_system_prompt = base_prompt
+        previous = XML_TOOL_PROTOCOL if desired == NATIVE_TOOL_PROTOCOL else NATIVE_TOOL_PROTOCOL
+        self._base_system_prompt = self._base_system_prompt.replace(previous, desired)
+        self.system_prompt = self.system_prompt.replace(previous, desired)
 
     async def start_session(self, session_id: str | None = None) -> Session:
         """Create a new session or restore one by id."""
@@ -1184,6 +1194,7 @@ class AshLoop:
         previous_turn_id = self.turn_context.turn_id if self.turn_context else None
         self._turn_running = True
         try:
+            await self._negotiate_provider_capabilities()
             return await self._run_turn(user_input, user_metadata=user_metadata)
         except asyncio.CancelledError:
             current_turn_id = self.turn_context.turn_id if self.turn_context else None
@@ -3362,6 +3373,8 @@ class AshLoop:
         new_config = self._config.model_copy(update={"model": model_str})
         self.provider = _build_provider(new_config)
         self._config = new_config
+        self._provider_circuit_key = _provider_circuit_key(self.provider)
+        self._sync_generated_tool_protocol()
         self._fire_config_changed("switch_provider", {"model": model_str})
         # Re-configure skills runtime with new provider.
         if self.tools_registry is not None:
@@ -3396,6 +3409,8 @@ class AshLoop:
         old_provider = self.provider
         self.provider = _build_provider(new_config)
         self._config = new_config
+        self._provider_circuit_key = _provider_circuit_key(self.provider)
+        self._sync_generated_tool_protocol()
         self._fire_config_changed("switch_model", {"model": self._config.model})
         if isinstance(old_provider, ProviderABC):
             asyncio.create_task(_close_old_provider(old_provider))

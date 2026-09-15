@@ -829,6 +829,87 @@ async def test_runtime_tools_start_once_after_session_is_available(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_loop_negotiates_openrouter_capabilities_before_session_prompt(
+    tmp_path, monkeypatch
+):
+    from ash.config import AshConfig
+    from ash.providers.readiness import ProviderModelMetadata
+    from ash.providers.registry import create_default_provider_registry
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    config = AshConfig(
+        model="openrouter/vendor/agent",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+    provider = create_default_provider_registry().build(config)
+    monkeypatch.setattr(
+        "ash.providers.openrouter.probe_model_catalog_metadata",
+        lambda *args, **kwargs: (
+            ProviderModelMetadata(
+                model_id="vendor/agent",
+                supported_parameters=frozenset({"tools"}),
+                input_modalities=frozenset({"text", "image"}),
+                context_window=64_000,
+            ),
+        ),
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "openrouter-capabilities.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=config,
+    )
+
+    assert "provider's native tool-calling interface" not in loop.system_prompt
+    await loop.start_session()
+    assert "provider's native tool-calling interface" in loop.system_prompt
+    assert provider.capabilities.vision is True
+    assert provider.capabilities.context_window == 64_000
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_capability_probe_failure_resynchronizes_conservative_tool_protocol(tmp_path):
+    from ash.providers.capabilities import ProviderCapabilities
+
+    class FailingRefreshProvider(MockProvider):
+        provider_family = "dynamic-failure"
+
+        def __init__(self):
+            self._caps = ProviderCapabilities(native_tools=True)
+
+        @property
+        def capabilities(self):
+            return self._caps
+
+        async def detect_capabilities(self, *, refresh: bool = False):
+            del refresh
+            self._caps = ProviderCapabilities()
+            raise RuntimeError("catalog unavailable")
+
+    provider = FailingRefreshProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "capability-failure-sync.db"),
+        provider,
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+    assert "provider's native tool-calling interface" in loop.system_prompt
+
+    await loop._negotiate_provider_capabilities()
+
+    assert "provider's native tool-calling interface" not in loop.system_prompt
+    assert "<call_tool" in loop.system_prompt
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_loop_negotiates_ollama_capabilities_before_session_prompt(tmp_path):
     from contextlib import asynccontextmanager
 
@@ -1536,6 +1617,63 @@ async def test_extended_lifecycle_observers_fire_at_runtime_boundaries(tmp_path)
     assert observed[0]["session_id"] == session.session_id
     assert observed[1]["changes"]["model"] == "ollama/test"
     assert observed[2]["persistent_rule_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_switch_model_negotiates_dynamic_protocol_before_next_turn(
+    tmp_path, monkeypatch
+):
+    from ash.providers.capabilities import ProviderCapabilities
+
+    class DynamicSwitchProvider(MockProvider):
+        provider_family = "dynamic-route"
+
+        def __init__(self):
+            self.probed = False
+
+        @property
+        def capabilities(self):
+            return ProviderCapabilities(native_tools=self.probed)
+
+        async def detect_capabilities(self, *, refresh: bool = False):
+            del refresh
+            self.probed = True
+            return self.capabilities
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="done", is_done=True)
+
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "dynamic-switch.db"),
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        config=config,
+    )
+    await loop.start_session()
+    injected = "PRESERVE_SESSION_INSTRUCTION"
+    loop.system_prompt = f"{loop.system_prompt}\n\n{injected}"
+    replacement = DynamicSwitchProvider()
+    monkeypatch.setattr("ash.cli._build_provider", lambda _config: replacement)
+
+    loop.switch_model("dynamic-route/model")
+
+    assert loop._provider_circuit_key == "dynamic-route/test"
+    assert "provider's native tool-calling interface" not in loop.system_prompt
+    assert injected in loop.system_prompt
+
+    assert await loop.run_turn("continue") == "done"
+    assert replacement.probed is True
+    assert "provider's native tool-calling interface" in loop.system_prompt
+    assert injected in loop.system_prompt
+    await loop.aclose()
 
 
 @pytest.mark.asyncio

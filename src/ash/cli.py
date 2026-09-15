@@ -366,6 +366,17 @@ def _render_model_capabilities(model_string: str) -> str:
     return f"{display_model}: [{', '.join(labels) or 'unknown'}]{suffix}"
 
 
+def _provider_has_dynamic_capability_evidence(provider: Any) -> bool:
+    """Return whether this provider or a nested failover child was dynamically probed."""
+
+    if getattr(provider, "_dynamic_capabilities", None) is not None:
+        return True
+    nested = getattr(provider, "providers", None)
+    if not isinstance(nested, list):
+        return False
+    return any(_provider_has_dynamic_capability_evidence(item) for item in nested)
+
+
 def _render_runtime_capabilities(loop: AshLoop, config: AshConfig) -> str:
     """Render the active provider/model's negotiated capability manifest."""
 
@@ -378,12 +389,7 @@ def _render_runtime_capabilities(loop: AshLoop, config: AshConfig) -> str:
     lines = [
         f"Runtime capabilities for {display_model}:",
         "  source: dynamic manifest"
-        if getattr(
-            provider,
-            "_dynamic_capabilities",
-            None,
-        )
-        is not None
+        if _provider_has_dynamic_capability_evidence(provider)
         else "  source: static/default registry",
         f"  tools={str(capabilities.native_tools).lower()}",
         f"  vision={str(capabilities.vision).lower()}",

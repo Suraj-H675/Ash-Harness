@@ -132,6 +132,10 @@ class TokenCounterLike(Protocol):
     def count(self, text: str) -> int: ...
 
 
+class ProviderCapabilityError(RuntimeError):
+    """Raised when runtime capability negotiation cannot preserve protocol safety."""
+
+
 class ProviderABC(ABC):
     """Common contract every LLM provider adapter must implement.
 

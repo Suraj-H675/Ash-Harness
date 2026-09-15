@@ -61,6 +61,83 @@ def test_verify_provider_connection_reports_missing_selected_model(
     assert result.selected_model_available is False
 
 
+def test_probe_model_catalog_metadata_preserves_openrouter_capability_fields(
+    monkeypatch,
+) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "vendor/text-only",
+                        "supported_parameters": ["temperature", "max_tokens"],
+                        "architecture": {"input_modalities": ["text"]},
+                        "context_length": 128_000,
+                        "top_provider": {"max_completion_tokens": 4096},
+                    },
+                    {
+                        "id": "vendor/agent",
+                        "supported_parameters": ["tools", "reasoning"],
+                        "architecture": {"input_modalities": ["text", "image"]},
+                        "context_length": 200_000,
+                        "top_provider": {"max_completion_tokens": 8192},
+                    },
+                ]
+            },
+            request=request,
+        ),
+    )
+
+    entries = readiness.probe_model_catalog_metadata(
+        "https://openrouter.example/v1/models",
+        headers={},
+        catalog_format="openai",
+    )
+
+    assert entries[0].model_id == "vendor/text-only"
+    assert entries[0].supported_parameters == frozenset({"temperature", "max_tokens"})
+    assert entries[0].input_modalities == frozenset({"text"})
+    assert entries[0].context_window == 128_000
+    assert entries[0].max_output_tokens == 4096
+    assert entries[1].supported_parameters == frozenset({"tools", "reasoning"})
+    assert entries[1].input_modalities == frozenset({"text", "image"})
+
+
+
+def test_probe_model_catalog_metadata_prefers_serving_provider_context_limit(
+    monkeypatch,
+) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "vendor/limited",
+                        "context_length": 1_310_720,
+                        "top_provider": {
+                            "context_length": 262_144,
+                            "max_completion_tokens": 8192,
+                        },
+                    }
+                ]
+            },
+            request=request,
+        ),
+    )
+
+    (entry,) = readiness.probe_model_catalog_metadata(
+        "https://openrouter.example/v1/models",
+        headers={},
+        catalog_format="openai",
+    )
+
+    assert entry.context_window == 262_144
+    assert entry.max_output_tokens == 8192
+
 def test_probe_model_catalog_rejects_oversized_stream(
     monkeypatch,
 ) -> None:

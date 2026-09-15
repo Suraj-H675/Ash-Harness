@@ -45,8 +45,8 @@ Research is clean-room: proprietary or leaked source is not used.
 | `python -m ash` | Verified locally | Keep as supported fallback |
 | Dependency separation | Verified locally | Lean default runtime/provider install, standardized dev group, published vector/server extras, actionable missing-extra errors, and lockfile/artifact checks |
 | First-run wizard | Verified locally | No-key detection, deterministic cancel/back, endpoint retry/save-unverified choices, non-billable model discovery, secret input, atomic related settings, non-TTY guidance, secret-free JSON status, and fresh-process API/local checks |
-| API-key providers | Partial | Anthropic, OpenAI, Groq, DeepSeek and custom endpoints tested from fresh process; runtime model switches now close the previous provider deterministically |
-| Local models | Partial | Ollama URL validation, installed-model discovery, health failure detail, fresh-process configuration checks, safe bounded pull execution, dynamic tool/context capability probing with fail-closed fallback, and forced `/capabilities --refresh` re-probing are wired; broader runtime capability refresh remains |
+| API-key providers | Partial | Anthropic, OpenAI, Groq, DeepSeek and custom endpoints tested from fresh process; OpenRouter uses live per-model catalog metadata for tool, vision, reasoning, context, and output capability negotiation; runtime model switches close the previous provider deterministically |
+| Local models | Partial | Ollama URL validation, installed-model discovery, health failure detail, fresh-process configuration checks, safe bounded pull execution, dynamic tool/context capability probing with fail-closed fallback, and forced `/capabilities --refresh` re-probing are wired |
 | Custom endpoints | Verified locally | Per-provider credentials are stored in mode-0600 env storage, not TOML |
 | Config precedence | Verified locally | CLI > process env > trusted hierarchical project TOML > user TOML > user dotenv > defaults, with exact masked provenance and project security restrictions |
 | Config migration | Verified locally | Complete legacy mapping, conflict preservation, strict destination parsing, verified private source/destination backups, exact-content migration records, and future-version refusal |
@@ -69,8 +69,8 @@ Research is clean-room: proprietary or leaked source is not used.
 | Circuit breaker | Verified locally | Exhausted transient requests open provider-keyed state, fail fast during cooldown, expose `/status` and events, allow a half-open probe, and reset on success |
 | Long-running process control | Verified locally | Managed start/list/poll/stdin/stop with process-tree cleanup |
 | Structured output mode | Verified locally | One-shot JSON Schema injection, parsing, validation, and machine output |
-| Model capability negotiation | Verified locally | Tools, vision, reasoning, local status, and known context/output limits; active sessions expose the negotiated manifest through `/capabilities`, with dynamic Ollama evidence distinguished from static/default registry metadata |
-| Provider failover | Verified locally | Ordered fallback before first emitted chunk with visible configured models/failures |
+| Model capability negotiation | Verified locally | Tools, vision, reasoning, local status, and known context/output limits; Ollama and OpenRouter negotiate provider-owned live metadata before provider use, OpenRouter honors serving-provider limits, and `/capabilities` distinguishes dynamic evidence even inside failover chains |
+| Provider failover | Verified locally | Ordered fallback only before first emitted chunk; static/dynamic chains enforce tool-protocol parity, expose a conservative whole-chain capability envelope, use the maximum child token estimate, forward per-turn output ceilings to every child, and keep configured models/failures visible |
 
 ## 3. Context And Memory
 
