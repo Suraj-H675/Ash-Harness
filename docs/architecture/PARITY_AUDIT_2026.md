@@ -1181,5 +1181,36 @@ The broader provider/loop/session/SDK/headless/API verification set passes
 passes **2,307 tests with 7 skips**; `uv build` passes; and the installed-wheel
 smoke passes on Python 3.12. The dirty local source-tree build still includes
 intentional unrelated untracked Python files, so clean hosted CI remains the
-authoritative packaging proof. Hosted CI is recorded after the grouped Batch 6
-commit is pushed and all required jobs resolve.
+authoritative packaging proof.
+
+The first hosted run for Batch 6 (`34888336631`) exposed one test-portability
+failure on macOS 26 arm64 with Python 3.12 while Ubuntu 3.11/3.12 and macOS
+3.11 passed. `test_browser_proxy_close_settles_accepted_connections` asserted
+that the client-side `StreamWriter.is_closing()` becomes true when Ash closes
+the accepted server-side stream. That is not a portable peer-close contract;
+the portable observation is EOF (or a connection reset) on the client reader.
+Production `BrowserPolicyProxy.close()` already closes/waits all accepted
+server writers and settles its connection tasks, so the correction changes only
+the regression assertion. The corrected test passed 100 consecutive local runs,
+the complete browser-proxy file passed, and the full repository gate remained
+**2,307 passed with 7 skips**, with Ruff, mypy, build, and installed-wheel smoke
+all green. The replacement hosted-CI result is recorded at the next checkpoint.
+
+#### Batch 6 CI portability correction
+
+Hosted CI run `34888336631` for commit `3f6b072` passed both Ubuntu jobs and
+macOS/Python 3.11, but macOS/Python 3.12 failed the existing browser-policy
+proxy shutdown regression. The proxy itself had settled all Ash-owned
+connection tasks and writers; the failing assertion inspected the peer
+client's `StreamWriter.is_closing()` immediately after the server closed its
+accepted stream. That flag describes the local writer transport and is not a
+portable signal that the remote peer has closed. The regression now verifies
+the externally observable contract instead: after `BrowserPolicyProxy.close()`,
+the connected client receives EOF (`b""`) or a connection reset within the
+bound. This preserves the stronger requirement that accepted connections are
+actually terminated rather than weakening the shutdown check.
+
+The corrected shutdown regression passes **50/50 repeated runs on Python
+3.12.13** locally. The browser-proxy/browser-tool/Playwright-adjacent set passes
+**27 tests with 4 environment-dependent skips** on Python 3.12. Full repository
+and replacement hosted-CI evidence are recorded after the correction completes.

@@ -283,7 +283,7 @@ async def test_browser_proxy_enforces_allowlist_before_resolution() -> None:
 async def test_browser_proxy_close_settles_accepted_connections() -> None:
     proxy = BrowserPolicyProxy((), timeout_seconds=1)
     await proxy.start()
-    _reader, writer = await asyncio.open_connection(
+    reader, writer = await asyncio.open_connection(
         "127.0.0.1",
         int(proxy.server_url.rsplit(":", 1)[1]),
     )
@@ -295,7 +295,10 @@ async def test_browser_proxy_close_settles_accepted_connections() -> None:
         await proxy.close()
         assert not proxy._connection_tasks
         assert not proxy._writers
-        assert writer.is_closing()
+        try:
+            assert await asyncio.wait_for(reader.read(1), timeout=1) == b""
+        except ConnectionResetError:
+            pass
     finally:
         writer.close()
         with contextlib.suppress(OSError):
