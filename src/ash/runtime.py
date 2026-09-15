@@ -214,6 +214,14 @@ def build_tools(
                 and runtime_config.browser_persistent_profile
                 else None
             ),
+            cdp_url=(
+                runtime_config.browser_cdp_url if runtime_config is not None else None
+            ),
+            cdp_reuse_storage_state=(
+                runtime_config.browser_cdp_reuse_storage_state
+                if runtime_config is not None
+                else False
+            ),
         )
     )
     from ash.agents.a2a_remote import (

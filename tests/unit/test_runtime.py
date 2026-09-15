@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from ash.runtime import build_runtime
+from ash.runtime import build_runtime, build_tools
 from ash.config import AshConfig
 from ash.mcp.server import MCPServerConfig
 from ash.providers.base import ProviderABC
@@ -25,6 +25,36 @@ class RuntimeProvider(ProviderABC):
     async def stream_chat(self, messages, temperature=0.0, tools=None):
         if False:
             yield
+
+
+def test_runtime_passes_user_owned_cdp_settings_to_browser_tools(tmp_path, monkeypatch) -> None:
+    captured = {}
+
+    def fake_build_browser_tools(_guard, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr("ash.tools.browser.build_browser_tools", fake_build_browser_tools)
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        automation_enabled=False,
+        browser_cdp_url="http://127.0.0.1:9222",
+        browser_cdp_reuse_storage_state=True,
+    )
+
+    build_tools(
+        __import__("ash.safety.guard", fromlist=["SafetyGuard"]).SafetyGuard(tmp_path),
+        tmp_path,
+        runtime_config=config,
+        active_plugins=[],
+    )
+
+    assert captured["cdp_url"] == "http://127.0.0.1:9222"
+    assert captured["cdp_reuse_storage_state"] is True
+    assert captured["profile_path"] is None
 
 
 def test_runtime_defers_auto_memory_index_until_async_session_start(tmp_path) -> None:

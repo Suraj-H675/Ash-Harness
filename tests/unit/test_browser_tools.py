@@ -24,6 +24,7 @@ from ash.tools.browser import (
     BrowserSnapshotTool,
     BrowserTypeTool,
     _validate_browser_url,
+    _validate_cdp_url,
     build_browser_tools,
 )
 from ash.tools.browser_proxy import BrowserProxyError
@@ -522,6 +523,211 @@ async def test_browser_tool_reports_stale_refs_without_raising(tmp_path) -> None
 
     assert result.success is False
     assert "stale or missing" in (result.error or "")
+
+
+def test_browser_cdp_url_is_loopback_only_and_credential_free() -> None:
+    assert _validate_cdp_url("http://127.0.0.1:9222") == "http://127.0.0.1:9222"
+    assert _validate_cdp_url("ws://[::1]:9222/devtools/browser/id") == (
+        "ws://[::1]:9222/devtools/browser/id"
+    )
+    assert _validate_cdp_url("https://localhost:9443") == "https://localhost:9443"
+
+    for value in (
+        "https://example.com:9222",
+        "http://10.0.0.2:9222",
+        "http://user:secret@127.0.0.1:9222",
+        "http://127.0.0.1:9222/?token=secret",
+        "http://127.0.0.1:9222/#fragment",
+        "file:///tmp/chrome",
+        "http://127.0.0.1:0",
+    ):
+        with pytest.raises(ValueError):
+            _validate_cdp_url(value)
+
+
+def test_browser_cdp_rejects_persistent_profile_and_orphaned_storage_reuse(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="persistent profile"):
+        BrowserSession(
+            cdp_url="http://127.0.0.1:9222",
+            profile_path=tmp_path / "profile",
+        )
+    with pytest.raises(ValueError, match="requires browser_cdp_url"):
+        BrowserSession(cdp_reuse_storage_state=True)
+
+
+@pytest.mark.asyncio
+async def test_browser_cdp_attach_failure_cleans_started_resources() -> None:
+    proxy = MagicMock()
+    proxy.start = AsyncMock()
+    proxy.close = AsyncMock()
+    proxy.playwright_settings = {"server": "http://127.0.0.1:1", "bypass": "<-loopback>"}
+    playwright = MagicMock()
+    playwright.chromium.connect_over_cdp = AsyncMock(side_effect=RuntimeError("attach failed"))
+    playwright.stop = AsyncMock()
+    factory = MagicMock()
+    factory.start = AsyncMock(return_value=playwright)
+    session = BrowserSession(cdp_url="http://127.0.0.1:9222")
+
+    with patch("ash.tools.browser.BrowserPolicyProxy", return_value=proxy):
+        with patch("playwright.async_api.async_playwright", return_value=factory):
+            with pytest.raises(BrowserUnavailableError, match="browser session"):
+                await session.ensure_started()
+
+    proxy.close.assert_awaited_once()
+    playwright.stop.assert_awaited_once()
+    assert session._proxy is None
+    assert session._playwright is None
+    assert session._browser is None
+    assert session._context is None
+
+
+@pytest.mark.asyncio
+async def test_browser_cdp_uses_isolated_policy_context_and_optional_storage() -> None:
+    class FakeContext:
+        def set_default_timeout(self, value):
+            pass
+
+        def set_default_navigation_timeout(self, value):
+            pass
+
+        async def route(self, *args):
+            return None
+
+        async def route_web_socket(self, *args):
+            return None
+
+        async def new_page(self):
+            return object()
+
+        async def close(self):
+            return None
+
+    source_context = MagicMock()
+    source_context.storage_state = AsyncMock(
+        return_value={
+            "cookies": [{"name": "session", "value": "ok", "domain": ".example.com", "path": "/", "expires": -1, "httpOnly": True, "secure": True, "sameSite": "Lax"}],
+            "origins": [],
+        }
+    )
+    isolated = FakeContext()
+    attached = MagicMock()
+    attached.contexts = [source_context]
+    attached.new_context = AsyncMock(return_value=isolated)
+    attached.close = AsyncMock()
+    playwright = MagicMock()
+    playwright.chromium.connect_over_cdp = AsyncMock(return_value=attached)
+    playwright.chromium.launch = AsyncMock()
+    playwright.stop = AsyncMock()
+    factory = MagicMock()
+    factory.start = AsyncMock(return_value=playwright)
+    session = BrowserSession(
+        cdp_url="http://127.0.0.1:9222",
+        cdp_reuse_storage_state=True,
+    )
+
+    with patch("playwright.async_api.async_playwright", return_value=factory):
+        await session.ensure_started()
+        await session.close()
+
+    kwargs = playwright.chromium.connect_over_cdp.await_args.kwargs
+    assert kwargs["timeout"] == 30_000
+    playwright.chromium.launch.assert_not_awaited()
+    source_context.storage_state.assert_awaited_once_with()
+    context_kwargs = attached.new_context.await_args.kwargs
+    assert context_kwargs["service_workers"] == "block"
+    assert context_kwargs["accept_downloads"] is True
+    assert context_kwargs["storage_state"]["cookies"][0]["name"] == "session"
+    assert context_kwargs["proxy"]["bypass"] == "<-loopback>"
+    assert context_kwargs["proxy"]["server"].startswith("http://127.0.0.1:")
+    attached.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_browser_cdp_rejects_non_object_storage_state() -> None:
+    source_context = MagicMock()
+    source_context.storage_state = AsyncMock(return_value=["not", "an", "object"])
+    attached = MagicMock()
+    attached.contexts = [source_context]
+    attached.close = AsyncMock()
+    playwright = MagicMock()
+    playwright.chromium.connect_over_cdp = AsyncMock(return_value=attached)
+    playwright.stop = AsyncMock()
+    factory = MagicMock()
+    factory.start = AsyncMock(return_value=playwright)
+    session = BrowserSession(
+        cdp_url="http://127.0.0.1:9222",
+        cdp_reuse_storage_state=True,
+    )
+
+    with patch("playwright.async_api.async_playwright", return_value=factory):
+        with pytest.raises(BrowserUnavailableError, match="invalid storage state"):
+            await session.ensure_started()
+
+    attached.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_browser_cdp_storage_import_timeout_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocker = asyncio.Event()
+    source_context = MagicMock()
+
+    async def blocked_storage_state():
+        await blocker.wait()
+        return {"cookies": [], "origins": []}
+
+    source_context.storage_state = AsyncMock(side_effect=blocked_storage_state)
+    attached = MagicMock()
+    attached.contexts = [source_context]
+    attached.close = AsyncMock()
+    playwright = MagicMock()
+    playwright.chromium.connect_over_cdp = AsyncMock(return_value=attached)
+    playwright.stop = AsyncMock()
+    factory = MagicMock()
+    factory.start = AsyncMock(return_value=playwright)
+    session = BrowserSession(
+        timeout_seconds=1,
+        cdp_url="http://127.0.0.1:9222",
+        cdp_reuse_storage_state=True,
+    )
+
+    with patch("playwright.async_api.async_playwright", return_value=factory):
+        with pytest.raises(BrowserUnavailableError, match="storage-state copy timed out"):
+            await session.ensure_started()
+
+    attached.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_browser_cdp_storage_import_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_context = MagicMock()
+    source_context.storage_state = AsyncMock(
+        return_value={"cookies": [], "origins": [{"origin": "https://example.com", "localStorage": [{"name": "x", "value": "y" * 100}]}]}
+    )
+    attached = MagicMock()
+    attached.contexts = [source_context]
+    attached.close = AsyncMock()
+    playwright = MagicMock()
+    playwright.chromium.connect_over_cdp = AsyncMock(return_value=attached)
+    playwright.stop = AsyncMock()
+    factory = MagicMock()
+    factory.start = AsyncMock(return_value=playwright)
+    monkeypatch.setattr("ash.tools.browser.MAX_CDP_STORAGE_STATE_BYTES", 32)
+    session = BrowserSession(
+        cdp_url="http://127.0.0.1:9222",
+        cdp_reuse_storage_state=True,
+    )
+
+    with patch("playwright.async_api.async_playwright", return_value=factory):
+        with pytest.raises(BrowserUnavailableError, match="storage state exceeded"):
+            await session.ensure_started()
+
+    attached.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio

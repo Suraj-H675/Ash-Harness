@@ -492,6 +492,50 @@ def test_browser_doctor_distinguishes_missing_extra_and_binary(
     ]
 
 
+def test_browser_doctor_probes_configured_cdp_without_requiring_local_chromium(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ash.commands.doctor.importlib.util.find_spec", lambda name: object()
+    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("ash.commands.doctor.subprocess.run", fake_run)
+    check = _check_browser(AshConfig(browser_cdp_url="http://127.0.0.1:9222"))
+
+    assert check.status == "pass"
+    assert "CDP endpoint is reachable" in check.message
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert command[:3] == [__import__("ash.commands.doctor", fromlist=["sys"]).sys.executable, "-I", "-c"]
+    assert command[-1] == "http://127.0.0.1:9222"
+    assert kwargs["timeout"] == 5
+
+
+def test_browser_doctor_reports_unreachable_configured_cdp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ash.commands.doctor.importlib.util.find_spec", lambda name: object()
+    )
+    monkeypatch.setattr(
+        "ash.commands.doctor.subprocess.run",
+        lambda *args, **kwargs: type(
+            "Completed", (), {"returncode": 1, "stdout": "", "stderr": "failed"}
+        )(),
+    )
+
+    check = _check_browser(AshConfig(browser_cdp_url="http://127.0.0.1:9222"))
+
+    assert check.status == "warn"
+    assert "not reachable" in check.message
+    assert "remote debugging" in check.remedy
+
+
 def test_a2a_doctor_reports_unset_remote_credentials(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

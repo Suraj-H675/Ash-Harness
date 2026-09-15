@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
+import json
 import mimetypes
 import os
 import re
@@ -26,6 +28,7 @@ from ash.tools.web import _normalize_allowed_domains, _validate_public_url
 
 MAX_SNAPSHOT_CHARS = 30_000
 MAX_INTERACTIVE_ELEMENTS = 150
+MAX_CDP_STORAGE_STATE_BYTES = 4 * 1024 * 1024
 ELEMENT_REF = re.compile(r"^e[1-9][0-9]{0,3}$")
 INTERACTIVE_SELECTOR = ",".join(
     (
@@ -68,6 +71,8 @@ class BrowserSession:
         timeout_seconds: float = 30.0,
         allowed_domains: list[str] | tuple[str, ...] | None = None,
         profile_path: Path | None = None,
+        cdp_url: str | None = None,
+        cdp_reuse_storage_state: bool = False,
     ) -> None:
         if not 1.0 <= timeout_seconds <= 120.0:
             raise ValueError("browser timeout must be between 1 and 120 seconds")
@@ -75,6 +80,13 @@ class BrowserSession:
         self._timeout_seconds = timeout_seconds
         self.timeout_ms = int(timeout_seconds * 1000)
         self.allowed_domains = _normalize_allowed_domains(allowed_domains or ())
+        normalized_cdp = _validate_cdp_url(cdp_url) if cdp_url else ""
+        if normalized_cdp and profile_path is not None:
+            raise ValueError("browser CDP attachment cannot use an Ash persistent profile")
+        if cdp_reuse_storage_state and not normalized_cdp:
+            raise ValueError("browser_cdp_reuse_storage_state requires browser_cdp_url")
+        self.cdp_url = normalized_cdp
+        self.cdp_reuse_storage_state = bool(cdp_reuse_storage_state)
         self.profile_path = (
             validate_unlinked_directory_path(
                 profile_path, label="browser profile directory"
@@ -155,7 +167,43 @@ class BrowserSession:
                 browser_environment: dict[str, str | float | bool] = dict(
                     build_scrubbed_environment(browser_environment_names)
                 )
-                if self.profile_path is not None:
+                if self.cdp_url:
+                    self._browser = await self._playwright.chromium.connect_over_cdp(
+                        self.cdp_url,
+                        timeout=self.timeout_ms,
+                    )
+                    storage_state: dict[str, Any] | None = None
+                    if self.cdp_reuse_storage_state:
+                        contexts = list(self._browser.contexts)
+                        if not contexts:
+                            raise BrowserUnavailableError(
+                                "CDP browser has no default context to copy storage state from"
+                            )
+                        try:
+                            raw_storage_state: Any = await asyncio.wait_for(
+                                contexts[0].storage_state(),
+                                timeout=self._timeout_seconds,
+                            )
+                        except asyncio.TimeoutError as exc:
+                            raise BrowserUnavailableError(
+                                "CDP browser storage-state copy timed out"
+                            ) from exc
+                        if not isinstance(raw_storage_state, dict):
+                            raise BrowserUnavailableError(
+                                "CDP browser returned invalid storage state"
+                            )
+                        storage_state = raw_storage_state
+                        _validate_cdp_storage_state(storage_state)
+                    context_kwargs: dict[str, Any] = {
+                        "accept_downloads": True,
+                        "service_workers": "block",
+                        "viewport": {"width": 1280, "height": 800},
+                        "proxy": proxy_settings,
+                    }
+                    if storage_state is not None:
+                        context_kwargs["storage_state"] = storage_state
+                    self._context = await self._browser.new_context(**context_kwargs)
+                elif self.profile_path is not None:
                     self._context = await (
                         self._playwright.chromium.launch_persistent_context(
                             user_data_dir=str(self.profile_path),
@@ -203,7 +251,7 @@ class BrowserSession:
                         "Chromium is not installed; run `ash setup browser`."
                     ) from exc
                 raise BrowserUnavailableError(
-                    f"Could not start the isolated browser: {message}"
+                    f"Could not start the browser session: {message}"
                 ) from exc
 
     async def _route_request(self, route: Any, request: Any) -> None:
@@ -510,6 +558,51 @@ async def _settle_browser_cleanup_task(
     except BaseException as exc:
         return exc, interrupted
     return None, interrupted
+
+
+def _validate_cdp_url(url: str) -> str:
+    normalized = url.strip()
+    if not normalized:
+        raise ValueError("browser CDP URL must not be empty")
+    try:
+        parsed = urlparse(normalized)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("browser CDP URL has an invalid port") from exc
+    if parsed.port == 0:
+        raise ValueError("browser CDP URL port must be between 1 and 65535")
+    if parsed.scheme.casefold() not in {"http", "https", "ws", "wss"}:
+        raise ValueError("browser CDP URL must use http, https, ws, or wss")
+    if parsed.username or parsed.password:
+        raise ValueError("browser CDP URL cannot contain embedded credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("browser CDP URL cannot contain query parameters or fragments")
+    host = (parsed.hostname or "").casefold()
+    if not host:
+        raise ValueError("browser CDP URL must include a host")
+    if host != "localhost":
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValueError("browser CDP URL must target loopback") from exc
+        if not address.is_loopback:
+            raise ValueError("browser CDP URL must target loopback")
+    return normalized
+
+
+def _validate_cdp_storage_state(state: dict[str, Any]) -> None:
+    try:
+        encoded = json.dumps(
+            state,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise BrowserUnavailableError("CDP browser returned invalid storage state") from exc
+    if len(encoded) > MAX_CDP_STORAGE_STATE_BYTES:
+        raise BrowserUnavailableError(
+            f"CDP storage state exceeded {MAX_CDP_STORAGE_STATE_BYTES} bytes"
+        )
 
 
 def _validate_browser_url(url: str, allowed_domains: tuple[str, ...]) -> str:
@@ -823,12 +916,16 @@ def build_browser_tools(
     timeout_seconds: float = 30.0,
     allowed_domains: list[str] | tuple[str, ...] | None = None,
     profile_path: Path | None = None,
+    cdp_url: str | None = None,
+    cdp_reuse_storage_state: bool = False,
 ) -> list[BaseTool]:
     session = BrowserSession(
         headless=headless,
         timeout_seconds=timeout_seconds,
         allowed_domains=allowed_domains,
         profile_path=profile_path,
+        cdp_url=cdp_url,
+        cdp_reuse_storage_state=cdp_reuse_storage_state,
     )
     return [
         BrowserNavigateTool(safety_guard, session),

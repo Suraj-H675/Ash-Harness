@@ -90,15 +90,72 @@ def _check_web_search(config: AshConfig) -> DoctorCheck:
     )
 
 
-def _check_browser() -> DoctorCheck:
+def _check_browser(config: AshConfig | None = None) -> DoctorCheck:
     from ash.install import pipx_install_command
 
+    cdp_url = config.browser_cdp_url if config is not None else ""
     if importlib.util.find_spec("playwright") is None:
+        remedy = f"Run `{pipx_install_command('browser')}`."
+        if not cdp_url:
+            remedy += " Then run `ash setup browser`."
         return DoctorCheck(
             "browser",
             "warn",
             "optional Playwright package is not installed",
-            f"Run `{pipx_install_command('browser')}`, then `ash setup browser`.",
+            remedy,
+        )
+    if cdp_url:
+        probe = """
+import asyncio
+import sys
+
+from playwright.async_api import async_playwright
+
+
+async def main() -> None:
+    playwright = await async_playwright().start()
+    browser = None
+    deadline = asyncio.get_running_loop().time() + 3.0
+    try:
+        while True:
+            try:
+                browser = await playwright.chromium.connect_over_cdp(
+                    sys.argv[1], timeout=1000
+                )
+                break
+            except Exception:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise
+                await asyncio.sleep(0.1)
+    finally:
+        if browser is not None:
+            await browser.close()
+        await playwright.stop()
+
+
+asyncio.run(main())
+"""
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-I", "-c", probe, cdp_url],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+        if completed is not None and completed.returncode == 0:
+            return DoctorCheck(
+                "browser",
+                "pass",
+                "Playwright is installed and the configured loopback CDP endpoint is reachable",
+            )
+        return DoctorCheck(
+            "browser",
+            "warn",
+            "Playwright is installed but the configured loopback CDP endpoint is not reachable",
+            "Start the configured Chromium-family browser with remote debugging, or clear browser_cdp_url.",
         )
     try:
         completed = subprocess.run(
@@ -498,7 +555,7 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
             ),
             _check_credentials(config),
             _check_web_search(config),
-            _check_browser(),
+            _check_browser(config),
             _check_workspace(config),
             _check_storage(config),
             _check_automation(config),

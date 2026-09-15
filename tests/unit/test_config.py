@@ -489,12 +489,28 @@ def test_web_search_configuration_is_user_owned_and_validated() -> None:
 
 
 def test_browser_configuration_is_user_owned_and_bounded() -> None:
-    config = AshConfig(browser_headless=False, browser_timeout_seconds=45)
+    config = AshConfig(
+        browser_headless=False,
+        browser_timeout_seconds=45,
+        browser_cdp_url="http://127.0.0.1:9222",
+        browser_cdp_reuse_storage_state=True,
+    )
 
     assert config.browser_headless is False
     assert config.browser_timeout_seconds == 45
+    assert config.browser_cdp_url == "http://127.0.0.1:9222"
+    assert config.browser_cdp_reuse_storage_state is True
     with pytest.raises(ValueError, match="less than or equal to 120"):
         AshConfig(browser_timeout_seconds=121)
+    with pytest.raises(ValueError, match="requires browser_cdp_url"):
+        AshConfig(browser_cdp_reuse_storage_state=True)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        AshConfig(
+            browser_cdp_url="http://127.0.0.1:9222",
+            browser_persistent_profile=True,
+        )
+    with pytest.raises(ValueError, match="must target loopback"):
+        AshConfig(browser_cdp_url="https://browser.example.com:9222")
 
 
 def test_sprint_planning_can_be_enabled_from_config() -> None:
@@ -731,6 +747,8 @@ def test_project_config_cannot_override_user_owned_controls(
                 "web_search_timeout_seconds = 120",
                 "browser_headless = false",
                 "browser_timeout_seconds = 120",
+                'browser_cdp_url = "http://127.0.0.1:9222"',
+                "browser_cdp_reuse_storage_state = true",
                 "lsp_enabled = true",
                 "automation_enabled = true",
                 "automation_max_concurrent_runs = 32",
@@ -771,6 +789,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.web_search_timeout_seconds == 20
     assert config.browser_headless is True
     assert config.browser_timeout_seconds == 30
+    assert config.browser_cdp_url == ""
+    assert config.browser_cdp_reuse_storage_state is False
     assert config.lsp_enabled is False
     assert config.automation_enabled is False
     assert config.automation_max_concurrent_runs == 2
@@ -794,6 +814,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "web_search_timeout_seconds" in diagnostics
     assert "browser_headless" in diagnostics
     assert "browser_timeout_seconds" in diagnostics
+    assert "browser_cdp_url" in diagnostics
+    assert "browser_cdp_reuse_storage_state" in diagnostics
     assert "lsp_enabled" in diagnostics
     assert "automation_enabled" in diagnostics
     assert "automation_max_concurrent_runs" in diagnostics

@@ -611,6 +611,20 @@ class AshConfig(BaseSettings):
             "directory. Disabled always starts a clean ephemeral profile."
         ),
     )
+    browser_cdp_url: str = Field(
+        "",
+        description=(
+            "Optional loopback Chrome DevTools Protocol endpoint for an existing "
+            "Chromium-family browser. Ash still creates its own isolated context."
+        ),
+    )
+    browser_cdp_reuse_storage_state: bool = Field(
+        False,
+        description=(
+            "When browser_cdp_url is configured, copy bounded cookies/local storage "
+            "from the existing default context into Ash's isolated context."
+        ),
+    )
 
     db_directory: Path = Field(
         default=Path.home() / ".ash" / "db",
@@ -901,6 +915,16 @@ class AshConfig(BaseSettings):
             normalized.append(item)
         return sorted(set(normalized))
 
+    @field_validator("browser_cdp_url")
+    @classmethod
+    def normalize_browser_cdp_url(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            return ""
+        from ash.tools.browser import _validate_cdp_url
+
+        return _validate_cdp_url(normalized)
+
     @field_validator("web_search_provider")
     @classmethod
     def validate_web_search_provider(cls, value: str) -> str:
@@ -1028,6 +1052,16 @@ class AshConfig(BaseSettings):
         if self.max_attachment_tokens > usable:
             raise ValueError(
                 "max_attachment_tokens must not exceed the usable input context"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_browser_cdp_configuration(self) -> "AshConfig":
+        if self.browser_cdp_reuse_storage_state and not self.browser_cdp_url:
+            raise ValueError("browser_cdp_reuse_storage_state requires browser_cdp_url")
+        if self.browser_cdp_url and self.browser_persistent_profile:
+            raise ValueError(
+                "browser_cdp_url cannot be combined with browser_persistent_profile"
             )
         return self
 

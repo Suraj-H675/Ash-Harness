@@ -271,3 +271,62 @@ async def test_real_chromium_proxy_blocks_redirect_and_subresource_targets(
     assert page_response.status == 200
     assert len(origin_requests) >= 2
     assert victim_requests == []
+
+
+@pytest.mark.asyncio
+async def test_real_chromium_cdp_attach_uses_isolated_context_and_preserves_owner(tmp_path) -> None:
+    import socket
+    from playwright.async_api import async_playwright
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+
+    owner_playwright = await async_playwright().start()
+    owner_context = None
+    session = None
+    try:
+        owner_context = await owner_playwright.chromium.launch_persistent_context(
+            user_data_dir=str(tmp_path / "owner-profile"),
+            headless=True,
+            args=[f"--remote-debugging-port={port}"],
+        )
+        owner_page = (
+            owner_context.pages[0]
+            if owner_context.pages
+            else await owner_context.new_page()
+        )
+        await owner_page.set_content("<title>owner-alive</title><main>owner</main>")
+        await owner_context.add_cookies(
+            [{
+                "name": "ash_login_probe",
+                "value": "present",
+                "url": "https://example.com/",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "Lax",
+            }]
+        )
+
+        session = BrowserSession(
+            timeout_seconds=15,
+            cdp_url=f"http://127.0.0.1:{port}",
+            cdp_reuse_storage_state=True,
+        )
+        ash_page = await session.ensure_started()
+        assert ash_page is not owner_page
+        assert session._context is not owner_context
+        copied = await session._context.cookies("https://example.com/")
+        assert [(item["name"], item["value"]) for item in copied] == [
+            ("ash_login_probe", "present")
+        ]
+
+        await session.close()
+        session = None
+        assert await owner_page.title() == "owner-alive"
+    finally:
+        if session is not None:
+            await session.close()
+        if owner_context is not None:
+            await owner_context.close()
+        await owner_playwright.stop()
