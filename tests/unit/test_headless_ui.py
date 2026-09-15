@@ -108,6 +108,70 @@ async def test_one_shot_stream_json_has_one_authoritative_completion(tmp_path) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "expected_code", "terminal_type"),
+    [('{"ok":true}', 0, "turn.completed"), ("not-json", 1, "error")],
+)
+async def test_stream_json_schema_has_one_validated_terminal_event(
+    tmp_path, response, expected_code, terminal_type
+) -> None:
+    from ash.cli import _bootstrap_and_headless
+    from ash.config import AshConfig
+    from ash.core.loop import AshLoop
+    from ash.core.session import SessionStore
+    from ash.providers.base import ProviderABC, StreamChunk
+    from ash.safety.guard import SafetyGuard
+
+    class StructuredProvider(ProviderABC):
+        model_name = "structured-test"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content=response, is_done=True)
+
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(
+        '{"type":"object","properties":{"ok":{"type":"boolean"}},'
+        '"required":["ok"],"additionalProperties":false}'
+    )
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="stream-json", stream=stream)
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/structured-test",
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        StructuredProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+        config=config,
+    )
+
+    code = await _bootstrap_and_headless(
+        loop,
+        config,
+        prompt="structured",
+        session_id=None,
+        ui=ui,
+        json_schema_path=schema_path,
+    )
+
+    assert code == expected_code
+    events = [json.loads(line) for line in stream.getvalue().splitlines()]
+    terminals = [event for event in events if event["type"] in {"turn.completed", "error"}]
+    assert [event["type"] for event in terminals] == [terminal_type]
+    if terminal_type == "turn.completed":
+        assert terminals[0]["structured_output"] == {"ok": True}
+    else:
+        assert terminals[0]["error"]["category"] == "output"
+
+
+@pytest.mark.asyncio
 async def test_one_shot_json_reports_canonical_active_model(tmp_path) -> None:
     from ash.cli import _bootstrap_and_headless
     from ash.config import AshConfig

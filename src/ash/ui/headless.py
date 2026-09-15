@@ -32,6 +32,7 @@ class HeadlessUI:
         )
         self._runtime_events_bound = False
         self._last_runtime_completion: dict[str, Any] | None = None
+        self._defer_runtime_completion = False
 
     @property
     def has_approval_callback(self) -> bool:
@@ -104,8 +105,21 @@ class HeadlessUI:
     def emit_result(self, payload: dict[str, Any]) -> None:
         if self._runtime_events_bound:
             if self.output_format == "stream-json":
-                # The runtime already streamed the authoritative completion.
-                return
+                if (
+                    self._defer_runtime_completion
+                    and self._last_runtime_completion is not None
+                ):
+                    event = {
+                        **self._last_runtime_completion,
+                        **payload,
+                        "type": "turn.completed",
+                    }
+                    self._notify(event)
+                    self._emit(event)
+                    return
+                if not self._defer_runtime_completion:
+                    # The runtime already streamed the authoritative completion.
+                    return
             if self.output_format == "json" and self._last_runtime_completion is not None:
                 # Reuse the authoritative runtime envelope. Calling the runtime
                 # enricher here would queue a second durable turn.completed event.
@@ -135,9 +149,16 @@ class HeadlessUI:
         event = self._prepare(payload)
         if self._runtime_events_bound and event.get("type") == "turn.completed":
             self._last_runtime_completion = dict(event)
+            if self.output_format == "stream-json" and self._defer_runtime_completion:
+                return
         self._notify(event)
         if self.output_format == "stream-json":
             self._emit(event)
+
+    def set_defer_runtime_completion(self, enabled: bool) -> None:
+        """Delay stream-JSON completion until one-shot post-processing succeeds."""
+
+        self._defer_runtime_completion = bool(enabled)
 
     def set_event_enricher(
         self, enricher: Callable[[dict[str, Any]], dict[str, Any]]

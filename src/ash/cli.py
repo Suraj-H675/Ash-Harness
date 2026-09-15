@@ -4225,6 +4225,9 @@ async def _bootstrap_and_headless(
         schema = None
         if json_schema_path is not None:
             schema = _load_json_schema(json_schema_path)
+            defer_completion = getattr(ui, "set_defer_runtime_completion", None)
+            if callable(defer_completion):
+                defer_completion(True)
             prompt = (
                 f"{prompt}\n\nReturn only JSON matching this schema:\n"
                 f"{json.dumps(schema, ensure_ascii=False)}"
@@ -4280,14 +4283,16 @@ def _load_json_schema(path: Path) -> dict[str, Any]:
 def validate_structured_output(response: str, schema: dict[str, Any]) -> Any:
     import jsonschema  # type: ignore[import-untyped]
 
+    from ash.exceptions import StructuredOutputError
+
     try:
         value = strict_json_loads(response)
     except (json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(f"Model output is not valid JSON: {exc}") from exc
+        raise StructuredOutputError(f"Model output is not valid JSON: {exc}") from exc
     try:
         jsonschema.validate(value, schema)
     except jsonschema.ValidationError as exc:
-        raise ValueError(
+        raise StructuredOutputError(
             f"Model output failed schema validation: {exc.message}"
         ) from exc
     return value

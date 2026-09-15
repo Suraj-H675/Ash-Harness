@@ -73,6 +73,10 @@ class AshError(Exception):
             self.retriable = retriable
 
 
+class StructuredOutputError(ValueError):
+    """Model output could not satisfy the requested structured-output contract."""
+
+
 class AshConfigError(AshError):
     """Raised when Ash configuration cannot be loaded or validated."""
 
@@ -97,6 +101,13 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
     name = type(exc).__name__
     message = _message(exc)
     lowered = message.casefold()
+
+    if isinstance(exc, StructuredOutputError):
+        return ErrorInfo(
+            ErrorCategory.OUTPUT,
+            message,
+            "Ask the model to regenerate output that matches the requested JSON schema.",
+        )
 
     if (
         _is_pydantic_validation_error(exc)

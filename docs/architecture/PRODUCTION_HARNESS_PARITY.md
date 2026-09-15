@@ -68,7 +68,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Retry policy | Verified locally | One harness-owned policy retries only classified pre-output transient failures, honors bounded Retry-After, adds jittered exponential backoff, preserves cancellation, emits redacted events, and disables nested SDK retries |
 | Circuit breaker | Verified locally | Exhausted transient requests open provider-keyed state, fail fast during cooldown, expose `/status` and events, allow a half-open probe, and reset on success |
 | Long-running process control | Verified locally | Managed start/list/poll/stdin/stop with process-tree cleanup |
-| Structured output mode | Verified locally | One-shot JSON Schema injection, parsing, validation, and machine output |
+| Structured output mode | Verified locally | One-shot JSON Schema injection with strict JSON parsing/validation; JSON and stream-JSON terminal output is released only after validation, successful completions include parsed `structured_output`, and invalid model output is a stable `output` error rather than an internal failure |
 | Model capability negotiation | Verified locally | Tools, vision, reasoning, local status, and known context/output limits; Ollama and OpenRouter negotiate provider-owned live metadata before provider use, OpenRouter honors serving-provider limits, and `/capabilities` distinguishes dynamic evidence even inside failover chains |
 | Provider failover | Verified locally | Ordered fallback only before first emitted chunk; static/dynamic chains enforce tool-protocol parity, expose a conservative whole-chain capability envelope, use the maximum child token estimate, forward per-turn output ceilings to every child, and keep configured models/failures visible |
 
@@ -231,8 +231,8 @@ Research is clean-room: proprietary or leaked source is not used.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | One-shot prompt (`ash -p`) | Verified locally | Session-aware one-shot mode with meaningful exit codes |
-| JSON output | Verified locally | Machine-clean completion objects with normalized usage and structured error objects |
-| Streaming JSONL | Verified locally | Typed token, reasoning, context, usage, tool lifecycle, completion, and structured error events |
+| JSON output | Verified locally | Machine-clean single terminal completion objects with normalized usage and structured error objects; schema failures emit only the structured error |
+| Streaming JSONL | Verified locally | Typed token, reasoning, context, usage, tool lifecycle, completion, and structured error events; schema-gated turns defer `turn.completed` until validation so a failed contract cannot publish a premature success terminal |
 | Stdin prompts | Verified locally | Piped stdin and `-p -` enter machine-clean one-shot mode |
 | CI mode | Verified locally | `--ci` disables interactive prompts/ANSI and defaults one-shot output to stream-json |
 | SDK/library API | Verified locally | Async create/prompt/steer/session/lifecycle/delegation API with explicit subagent provider injection and normalized usage independent of the TUI |
@@ -249,7 +249,7 @@ Research is clean-room: proprietary or leaked source is not used.
 |---|---|---|
 | Structured logging | Verified locally | Rotation, redaction, correlation IDs, and bounded redacted structured debug bundles |
 | Telemetry | Verified locally | No outbound telemetry; `ash metrics` exposes aggregate local-only token, cache, session, and cost metrics |
-| Error taxonomy | Verified locally | Shared config/provider/tool/policy/sandbox/context/storage classifier is wired into headless/CI errors, interactive slash commands, imports, model switches, and normal turn failures |
+| Error taxonomy | Verified locally | Shared config/provider/tool/policy/sandbox/context/storage/output classifier is wired into headless/CI errors, structured-output validation, interactive slash commands, imports, model switches, and normal turn failures |
 | Graceful shutdown | Verified locally | Providers, MCP clients, command trees, background agents, SDK, and servers close deterministically |
 | Database migrations | Verified locally | Schema version table, transactional ordered migration, future-version refusal, and backups |
 | Corruption recovery | Verified locally | Read-only integrity diagnostics plus validated backup and pre-restore preservation |

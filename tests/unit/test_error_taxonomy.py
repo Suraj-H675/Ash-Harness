@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ash.cli import _bootstrap_and_headless, _bootstrap_and_repl
+from ash.cli import _bootstrap_and_headless, _bootstrap_and_repl, validate_structured_output
 from ash.config import AshConfig
 from ash.core.planner import PlannerError
 from ash.core.session import SessionStorageError
@@ -54,6 +54,17 @@ def test_classify_provider_error_is_retriable_for_transient_failures() -> None:
     assert error.category == ErrorCategory.PROVIDER
     assert error.retriable is True
     assert "API key" in error.remedy
+
+
+def test_classify_structured_output_failure_as_output() -> None:
+    schema = {"type": "object", "required": ["ok"]}
+    with pytest.raises(ValueError) as caught:
+        validate_structured_output("not-json", schema)
+
+    error = classify_exception(caught.value)
+
+    assert error.category == ErrorCategory.OUTPUT
+    assert "regenerate" in error.remedy
 
 
 def test_format_error_includes_category_and_remedy() -> None:
