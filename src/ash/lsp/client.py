@@ -741,6 +741,12 @@ def _client_capabilities() -> dict[str, Any]:
         "workspace": {
             "configuration": True,
             "workspaceFolders": True,
+            "applyEdit": False,
+            "workspaceEdit": {
+                "documentChanges": True,
+                "resourceOperations": ["create", "rename", "delete"],
+                "failureHandling": "abort",
+            },
             "symbol": {"dynamicRegistration": False},
             "diagnostics": {"refreshSupport": False},
         },
@@ -755,6 +761,13 @@ def _client_capabilities() -> dict[str, Any]:
             "definition": {"linkSupport": True},
             "implementation": {"linkSupport": True},
             "references": {"dynamicRegistration": False},
+            "rename": {"dynamicRegistration": False, "prepareSupport": True},
+            "codeAction": {
+                "dynamicRegistration": False,
+                "isPreferredSupport": True,
+                "disabledSupport": True,
+                "dataSupport": False,
+            },
             "hover": {"contentFormat": ["markdown", "plaintext"]},
             "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
             "callHierarchy": {"dynamicRegistration": False},

@@ -22,6 +22,9 @@ LSPOperation = Literal[
     "implementation",
     "documentSymbol",
     "workspaceSymbol",
+    "prepareRename",
+    "rename",
+    "codeAction",
     "prepareCallHierarchy",
     "incomingCalls",
     "outgoingCalls",
@@ -34,11 +37,27 @@ class LSPQueryArgs(BaseModel):
     line: int = Field(default=1, ge=1, le=10_000_000)
     character: int = Field(default=1, ge=1, le=10_000_000)
     query: str = Field(default="", max_length=512)
+    new_name: str = Field(default="", max_length=512)
+    end_line: int | None = Field(default=None, ge=1, le=10_000_000)
+    end_character: int | None = Field(default=None, ge=1, le=10_000_000)
+    code_action_kind: str = Field(default="", max_length=256)
 
     @model_validator(mode="after")
     def validate_operation_fields(self) -> "LSPQueryArgs":
         if self.operation not in {"status", "workspaceSymbol"} and not self.file_path:
             raise ValueError("file_path is required for this LSP operation")
+        if self.operation == "rename" and not self.new_name.strip():
+            raise ValueError("new_name is required for rename")
+        if self.operation != "rename" and self.new_name:
+            raise ValueError("new_name is only valid for rename")
+        if (self.end_line is None) != (self.end_character is None):
+            raise ValueError("end_line and end_character must be provided together")
+        if self.operation != "codeAction" and (
+            self.end_line is not None
+            or self.end_character is not None
+            or self.code_action_kind
+        ):
+            raise ValueError("code-action range and kind are only valid for codeAction")
         return self
 
 
@@ -46,8 +65,9 @@ class LSPTool(BaseTool):
     name = "lsp"
     description = (
         "Query installed language servers for diagnostics, hover, definitions, "
-        "references, implementations, symbols, and call hierarchy. Coordinates are "
-        "1-based as shown in editors."
+        "references, implementations, symbols, advisory rename/code actions, and "
+        "call hierarchy. LSP edits and commands are never executed directly. "
+        "Coordinates are 1-based as shown in editors."
     )
     args_schema = LSPQueryArgs
 
@@ -67,6 +87,10 @@ class LSPTool(BaseTool):
                 line=args.line,
                 character=args.character,
                 query=args.query,
+                new_name=args.new_name,
+                end_line=args.end_line,
+                end_character=args.end_character,
+                code_action_kind=args.code_action_kind,
             )
         except (LSPError, OSError, ValueError) as exc:
             return ToolResult(success=False, output="", error=str(exc))

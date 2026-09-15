@@ -40,6 +40,10 @@ class LSPFailure:
     retry_at: float
 
 
+class _UnsafeWorkspaceEdit(LSPError):
+    """A server proposed an edit outside Ash's advisory safety contract."""
+
+
 class LanguageServerManager:
     def __init__(
         self,
@@ -67,11 +71,25 @@ class LanguageServerManager:
         line: int = 1,
         character: int = 1,
         query: str = "",
+        new_name: str = "",
+        end_line: int | None = None,
+        end_character: int | None = None,
+        code_action_kind: str = "",
     ) -> Any:
         if operation == "status":
             return [status.__dict__ for status in self.status()]
         if operation == "workspaceSymbol":
             return await self._workspace_symbols(query)
+        if operation == "rename":
+            if not new_name.strip():
+                raise ValueError("new_name is required for rename")
+        elif new_name:
+            raise ValueError("new_name is only valid for rename")
+        if operation == "codeAction":
+            if (end_line is None) != (end_character is None):
+                raise ValueError("end_line and end_character must be provided together")
+        elif end_line is not None or end_character is not None or code_action_kind:
+            raise ValueError("code-action range and kind are only valid for codeAction")
         path = self.resolve_file(file_path)
         if operation == "diagnostics":
             return await self.diagnostics_for(path)
@@ -87,6 +105,9 @@ class LanguageServerManager:
             "references": "textDocument/references",
             "implementation": "textDocument/implementation",
             "documentSymbol": "textDocument/documentSymbol",
+            "prepareRename": "textDocument/prepareRename",
+            "rename": "textDocument/rename",
+            "codeAction": "textDocument/codeAction",
             "prepareCallHierarchy": "textDocument/prepareCallHierarchy",
         }.get(operation)
         if method is None and operation not in {"incomingCalls", "outgoingCalls"}:
@@ -105,6 +126,50 @@ class LanguageServerManager:
                     assert method is not None
                     request_params = {**params, "context": {"includeDeclaration": True}}
                     value = await client.request(method, request_params)
+                elif operation == "rename":
+                    assert method is not None
+                    value = await client.request(method, {**params, "newName": new_name})
+                    if value is None:
+                        continue
+                    edit = _normalize_workspace_edit(value, self.workspace)
+                    if edit is None:
+                        raise _UnsafeWorkspaceEdit(
+                            "unsafe workspace edit returned by rename"
+                        )
+                    results.append({"server": client.config.name, "edit": edit})
+                    continue
+                elif operation == "codeAction":
+                    assert method is not None
+                    end_position = client.position(
+                        uri,
+                        end_line if end_line is not None else line,
+                        end_character if end_character is not None else character,
+                    )
+                    context: dict[str, Any] = {"diagnostics": []}
+                    if code_action_kind:
+                        context["only"] = [code_action_kind]
+                    value = await client.request(
+                        method,
+                        {
+                            "textDocument": {"uri": uri},
+                            "range": {
+                                "start": params["position"],
+                                "end": end_position,
+                            },
+                            "context": context,
+                        },
+                    )
+                    if value is None:
+                        continue
+                    if not isinstance(value, list):
+                        raise LSPError("codeAction returned a non-list result")
+                    for action in value[: max(0, MAX_LSP_RESULTS - len(results))]:
+                        normalized = _normalize_code_action(
+                            action, self.workspace, client.config.name
+                        )
+                        if normalized is not None:
+                            results.append(normalized)
+                    continue
                 elif operation == "documentSymbol":
                     assert method is not None
                     value = await client.request(method, {"textDocument": {"uri": uri}})
@@ -138,11 +203,15 @@ class LanguageServerManager:
             except (OSError, ValueError, asyncio.TimeoutError) as exc:
                 errors.append(f"{client.config.name}: {exc}")
             except LSPError as exc:
+                if isinstance(exc, _UnsafeWorkspaceEdit):
+                    raise
                 errors.append(f"{client.config.name}: {exc}")
                 if not client.healthy:
                     await self._mark_broken(client, str(exc))
         if not results and errors:
             raise LSPError("; ".join(errors))
+        if operation in {"rename", "codeAction"}:
+            return _bound_advisory_results(results)
         return self._bounded_results(results)
 
     async def diagnostics_for(self, path: Path) -> list[dict[str, Any]]:
@@ -526,6 +595,9 @@ def _file_uri_in_workspace(uri: str, workspace: Path) -> bool:
 
 
 def _has_capability(client: LSPClient, operation: str) -> bool:
+    if operation == "prepareRename":
+        value = client.capabilities.get("renameProvider")
+        return isinstance(value, dict) and value.get("prepareProvider") is True
     capability = {
         "hover": "hoverProvider",
         "definition": "definitionProvider",
@@ -533,6 +605,8 @@ def _has_capability(client: LSPClient, operation: str) -> bool:
         "implementation": "implementationProvider",
         "documentSymbol": "documentSymbolProvider",
         "workspaceSymbol": "workspaceSymbolProvider",
+        "rename": "renameProvider",
+        "codeAction": "codeActionProvider",
         "prepareCallHierarchy": "callHierarchyProvider",
         "incomingCalls": "callHierarchyProvider",
         "outgoingCalls": "callHierarchyProvider",
@@ -584,7 +658,7 @@ def _sanitize_value(value: Any, workspace: Path, *, depth: int) -> Any:
         )
     result: dict[str, Any] = {}
     for key, raw in value.items():
-        if key in {"uri", "targetUri"} and isinstance(raw, str):
+        if key in {"uri", "targetUri", "oldUri", "newUri"} and isinstance(raw, str):
             path = _path_from_file_uri(raw)
             if path is None or not is_relative_to(path, workspace):
                 return _DROP
@@ -594,6 +668,266 @@ def _sanitize_value(value: Any, workspace: Path, *, depth: int) -> Any:
         if item is _DROP:
             return _DROP
         result[str(key)[:128]] = item
+    return result
+
+
+def _bound_advisory_results(values: list[Any]) -> list[Any]:
+    """Bound already-normalized advisory LSP results without rewriting path keys."""
+
+    bounded: list[Any] = []
+    encoded = 2
+    for value in values[:MAX_LSP_RESULTS]:
+        try:
+            item_bytes = len(
+                json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            )
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            continue
+        if encoded + item_bytes > MAX_LSP_RESULT_BYTES:
+            break
+        bounded.append(value)
+        encoded += item_bytes
+    return bounded
+
+
+def _workspace_relative_uri(uri: Any, workspace: Path) -> str | None:
+    if not isinstance(uri, str):
+        return None
+    path = _path_from_file_uri(uri)
+    if path is None or not is_relative_to(path, workspace):
+        return None
+    return path.relative_to(workspace).as_posix()
+
+
+def _strict_position(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    line = value.get("line")
+    character = value.get("character")
+    if (
+        isinstance(line, bool)
+        or not isinstance(line, int)
+        or isinstance(character, bool)
+        or not isinstance(character, int)
+        or not 0 <= line <= 10_000_000
+        or not 0 <= character <= 10_000_000
+    ):
+        return None
+    return {"line": line, "character": character}
+
+
+def _strict_range(value: Any) -> dict[str, dict[str, int]] | None:
+    if not isinstance(value, dict):
+        return None
+    start = _strict_position(value.get("start"))
+    end = _strict_position(value.get("end"))
+    if start is None or end is None:
+        return None
+    return {"start": start, "end": end}
+
+
+def _normalize_text_edit(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    new_text = value.get("newText")
+    if not isinstance(new_text, str) or len(new_text) > MAX_LSP_STRING_CHARS:
+        return None
+    result: dict[str, Any] = {"newText": new_text}
+    if "range" in value:
+        edit_range = _strict_range(value.get("range"))
+        if edit_range is None:
+            return None
+        result["range"] = edit_range
+    elif "insert" in value and "replace" in value:
+        insert = _strict_range(value.get("insert"))
+        replace = _strict_range(value.get("replace"))
+        if insert is None or replace is None:
+            return None
+        result["insert"] = insert
+        result["replace"] = replace
+    else:
+        return None
+    annotation_id = value.get("annotationId")
+    if annotation_id is not None:
+        if not isinstance(annotation_id, str) or len(annotation_id) > 512:
+            return None
+        result["annotationId"] = annotation_id
+    return result
+
+
+def _normalize_text_edits(value: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(value, list) or len(value) > MAX_LSP_RESULTS:
+        return None
+    edits: list[dict[str, Any]] = []
+    for raw in value:
+        edit = _normalize_text_edit(raw)
+        if edit is None:
+            return None
+        edits.append(edit)
+    return edits
+
+
+def _normalize_workspace_edit(value: Any, workspace: Path) -> dict[str, Any] | None:
+    """Normalize an LSP WorkspaceEdit into workspace-relative advisory data."""
+
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, Any] = {}
+    if "changes" in value:
+        raw_changes = value.get("changes")
+        if not isinstance(raw_changes, dict) or len(raw_changes) > MAX_LSP_RESULTS:
+            return None
+        changes: dict[str, list[dict[str, Any]]] = {}
+        for uri, raw_edits in raw_changes.items():
+            path = _workspace_relative_uri(uri, workspace)
+            edits = _normalize_text_edits(raw_edits)
+            if path is None or edits is None or path in changes:
+                return None
+            changes[path] = edits
+        result["changes"] = changes
+    if "documentChanges" in value:
+        raw_changes = value.get("documentChanges")
+        if not isinstance(raw_changes, list) or len(raw_changes) > MAX_LSP_RESULTS:
+            return None
+        document_changes: list[dict[str, Any]] = []
+        for raw in raw_changes:
+            normalized = _normalize_document_change(raw, workspace)
+            if normalized is None:
+                return None
+            document_changes.append(normalized)
+        result["documentChanges"] = document_changes
+    if "changeAnnotations" in value:
+        raw_annotations = value.get("changeAnnotations")
+        if not isinstance(raw_annotations, dict) or len(raw_annotations) > MAX_LSP_RESULTS:
+            return None
+        annotations: dict[str, Any] = {}
+        for raw_key, raw_annotation in raw_annotations.items():
+            if not isinstance(raw_key, str) or len(raw_key) > 512:
+                return None
+            sanitized = _sanitize_value(raw_annotation, workspace, depth=0)
+            if sanitized is _DROP:
+                return None
+            annotations[raw_key] = sanitized
+        result["changeAnnotations"] = annotations
+    if not result and value:
+        return None
+    try:
+        if len(json.dumps(result, ensure_ascii=True).encode("utf-8")) > MAX_LSP_RESULT_BYTES:
+            return None
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return None
+    return result
+
+
+def _normalize_document_change(value: Any, workspace: Path) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    text_document = value.get("textDocument")
+    if isinstance(text_document, dict):
+        path = _workspace_relative_uri(text_document.get("uri"), workspace)
+        edits = _normalize_text_edits(value.get("edits"))
+        if path is None or edits is None:
+            return None
+        result: dict[str, Any] = {"textDocument": {"path": path}, "edits": edits}
+        version = text_document.get("version")
+        if version is not None:
+            if isinstance(version, bool) or not isinstance(version, int):
+                return None
+            result["textDocument"]["version"] = version
+        return result
+    kind = value.get("kind")
+    if kind == "create":
+        path = _workspace_relative_uri(value.get("uri"), workspace)
+        if path is None:
+            return None
+        result = {"kind": "create", "path": path}
+    elif kind == "rename":
+        old_path = _workspace_relative_uri(value.get("oldUri"), workspace)
+        new_path = _workspace_relative_uri(value.get("newUri"), workspace)
+        if old_path is None or new_path is None:
+            return None
+        result = {"kind": "rename", "oldPath": old_path, "newPath": new_path}
+    elif kind == "delete":
+        path = _workspace_relative_uri(value.get("uri"), workspace)
+        if path is None:
+            return None
+        result = {"kind": "delete", "path": path}
+    else:
+        return None
+    if "options" in value:
+        options = _sanitize_value(value.get("options"), workspace, depth=0)
+        if options is _DROP:
+            return None
+        result["options"] = options
+    if "annotationId" in value:
+        annotation_id = value.get("annotationId")
+        if not isinstance(annotation_id, str) or len(annotation_id) > 512:
+            return None
+        result["annotationId"] = annotation_id
+    return result
+
+
+def _normalize_code_action(
+    value: Any, workspace: Path, server_name: str
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    title = value.get("title")
+    if not isinstance(title, str) or not title or len(title) > 4096:
+        return None
+    result: dict[str, Any] = {"server": server_name, "title": title}
+    kind = value.get("kind")
+    if kind is not None:
+        if not isinstance(kind, str) or len(kind) > 512:
+            return None
+        result["kind"] = kind
+    preferred = value.get("isPreferred")
+    if preferred is not None:
+        if not isinstance(preferred, bool):
+            return None
+        result["isPreferred"] = preferred
+    disabled = value.get("disabled")
+    if disabled is not None:
+        if not isinstance(disabled, dict) or not isinstance(disabled.get("reason"), str):
+            return None
+        result["disabled"] = {"reason": disabled["reason"][:4096]}
+    if "edit" in value:
+        edit = _normalize_workspace_edit(value.get("edit"), workspace)
+        if edit is None:
+            return None
+        result["edit"] = edit
+    command = value.get("command")
+    if isinstance(command, dict):
+        command_title = command.get("title")
+        command_name = command.get("command")
+        if (
+            not isinstance(command_title, str)
+            or not command_title
+            or len(command_title) > 4096
+            or not isinstance(command_name, str)
+            or not command_name
+            or len(command_name) > 1024
+        ):
+            return None
+        result["command"] = {
+            "title": command_title,
+            "command": command_name,
+            "execution": "not_performed",
+        }
+    elif isinstance(command, str):
+        if not command or len(command) > 1024:
+            return None
+        result["command"] = {
+            "title": title,
+            "command": command,
+            "execution": "not_performed",
+        }
+    elif command is not None:
+        return None
+    if "edit" not in result and "command" not in result and "disabled" not in result:
+        return None
     return result
 
 

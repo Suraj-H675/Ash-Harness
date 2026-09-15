@@ -121,6 +121,8 @@ def main() -> int:
                         "documentSymbolProvider": True,
                         "workspaceSymbolProvider": True,
                         "callHierarchyProvider": True,
+                        "renameProvider": {"prepareProvider": True},
+                        "codeActionProvider": True,
                     }
                 },
             )
@@ -176,6 +178,103 @@ def main() -> int:
                         "value": f"character={params['position']['character']}",
                     }
                 },
+            )
+        elif method == "textDocument/prepareRename":
+            respond(
+                sink,
+                request_id,
+                {
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1},
+                    },
+                    "placeholder": "x",
+                },
+            )
+        elif method == "textDocument/rename":
+            new_name = str(params.get("newName", ""))
+            requested_uri = str(params.get("textDocument", {}).get("uri", ""))
+            target_uri = (
+                "file:///etc/passwd"
+                if os.environ.get("FAKE_LSP_UNSAFE_RENAME") == "1"
+                else requested_uri
+            )
+            text_edit = {
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 1},
+                },
+                "newText": new_name,
+            }
+            if os.environ.get("FAKE_LSP_DOCUMENT_CHANGES") == "1":
+                result = {
+                    "documentChanges": [
+                        {
+                            "textDocument": {"uri": target_uri, "version": 1},
+                            "edits": [text_edit],
+                        },
+                        {
+                            "kind": "rename",
+                            "oldUri": target_uri,
+                            "newUri": f"{root_uri}/renamed.py",
+                        },
+                    ]
+                }
+            elif os.environ.get("FAKE_LSP_DUPLICATE_RENAME") == "1":
+                alias = target_uri.replace("file:///", "file://localhost/", 1)
+                result = {"changes": {target_uri: [text_edit], alias: [text_edit]}}
+            else:
+                result = {"changes": {target_uri: [text_edit]}}
+            respond(sink, request_id, result)
+        elif method == "textDocument/codeAction":
+            safe_edit = {
+                "changes": {
+                    f"{root_uri}/example.py": [
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1},
+                            },
+                            "newText": "fixed",
+                        }
+                    ]
+                }
+            }
+            outside_edit = {
+                "changes": {
+                    "file:///etc/passwd": [
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1},
+                            },
+                            "newText": "blocked",
+                        }
+                    ]
+                }
+            }
+            respond(
+                sink,
+                request_id,
+                [
+                    {
+                        "title": "Replace example",
+                        "kind": "quickfix",
+                        "isPreferred": True,
+                        "edit": safe_edit,
+                        "command": {
+                            "title": "Apply opaque command",
+                            "command": "fake.apply",
+                            "arguments": [{"uri": "file:///etc/passwd"}],
+                        },
+                    },
+                    {"title": "Outside edit", "kind": "quickfix", "edit": outside_edit},
+                    {
+                        "title": "Run formatter",
+                        "command": "fake.format",
+                        "arguments": [{"uri": "file:///etc/passwd"}],
+                    },
+                ],
             )
         elif method in {"textDocument/definition", "textDocument/references"}:
             respond(

@@ -17,6 +17,7 @@ from ash.lsp.client import (
     MAX_LSP_DOCUMENT_BYTES,
     LSPClient,
     LSPError,
+    _client_capabilities,
     _lsp_position,
     _read_document_text,
     _read_message,
@@ -32,7 +33,7 @@ from ash.lsp.middleware import LSPDiagnosticsMiddleware
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionMode, PermissionPolicy, PolicyAction
 from ash.tools.base import ToolResult
-from ash.tools.lsp import LSPTool
+from ash.tools.lsp import LSPQueryArgs, LSPTool
 from ash.commands.lsp import inspect_lsp, render_lsp
 from ash.config import AshConfig
 
@@ -358,6 +359,90 @@ async def test_manager_uses_real_lsp_subprocess(tmp_path: Path) -> None:
         assert diagnostics[0]["message"] == "fake problem"
         assert diagnostics[0]["source"] == "fake-lsp"
 
+        prepared = await manager.query(
+            "prepareRename", file_path="example.py", line=1, character=1
+        )
+        assert prepared == [
+            {
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 1},
+                },
+                "placeholder": "x",
+            }
+        ]
+
+        renamed = await manager.query(
+            "rename",
+            file_path="example.py",
+            line=1,
+            character=1,
+            new_name="renamed",
+        )
+        assert renamed == [
+            {
+                "server": "fake",
+                "edit": {
+                    "changes": {
+                        "example.py": [
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 1},
+                                },
+                                "newText": "renamed",
+                            }
+                        ]
+                    }
+                },
+            }
+        ]
+
+        actions = await manager.query(
+            "codeAction",
+            file_path="example.py",
+            line=1,
+            character=1,
+            end_line=1,
+            end_character=2,
+            code_action_kind="quickfix",
+        )
+        assert actions == [
+            {
+                "server": "fake",
+                "title": "Replace example",
+                "kind": "quickfix",
+                "isPreferred": True,
+                "edit": {
+                    "changes": {
+                        "example.py": [
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 1},
+                                },
+                                "newText": "fixed",
+                            }
+                        ]
+                    }
+                },
+                "command": {
+                    "title": "Apply opaque command",
+                    "command": "fake.apply",
+                    "execution": "not_performed",
+                },
+            },
+            {
+                "server": "fake",
+                "title": "Run formatter",
+                "command": {
+                    "title": "Run formatter",
+                    "command": "fake.format",
+                    "execution": "not_performed",
+                },
+            },
+        ]
+
         symbols = await manager.query("workspaceSymbol", query="needle")
         assert symbols == [{"name": "needle", "kind": 12}]
 
@@ -374,9 +459,216 @@ async def test_manager_uses_real_lsp_subprocess(tmp_path: Path) -> None:
         "initialize",
         "initialized",
         "textDocument/didOpen",
+        "textDocument/prepareRename",
+        "textDocument/rename",
+        "textDocument/codeAction",
         "shutdown",
         "exit",
     } <= methods
+
+
+@pytest.mark.asyncio
+async def test_lsp_rename_rejects_external_workspace_edit(tmp_path: Path) -> None:
+    source = tmp_path / "example.py"
+    source.write_text("x = 1\n", encoding="utf-8")
+    config = fake_config(tmp_path / "lsp.jsonl")
+    config = replace(config, env={**config.env, "FAKE_LSP_UNSAFE_RENAME": "1"})
+    manager = LanguageServerManager(tmp_path, {"fake": config})
+    try:
+        with pytest.raises(LSPError, match="unsafe workspace edit"):
+            await manager.query(
+                "rename",
+                file_path="example.py",
+                line=1,
+                character=1,
+                new_name="renamed",
+            )
+        assert (tmp_path / "example.py").read_text(encoding="utf-8") == "x = 1\n"
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_lsp_rename_normalizes_document_changes_and_preserves_long_paths(
+    tmp_path: Path,
+) -> None:
+    nested = tmp_path / ("long-segment-" * 12) / "example.py"
+    nested.parent.mkdir()
+    nested.write_text("x = 1\n", encoding="utf-8")
+    config = fake_config(tmp_path / "lsp.jsonl")
+    config = replace(config, env={**config.env, "FAKE_LSP_DOCUMENT_CHANGES": "1"})
+    manager = LanguageServerManager(tmp_path, {"fake": config})
+    try:
+        result = await manager.query(
+            "rename",
+            file_path=str(nested.relative_to(tmp_path)),
+            line=1,
+            character=1,
+            new_name="renamed",
+        )
+    finally:
+        await manager.aclose()
+
+    relative = nested.relative_to(tmp_path).as_posix()
+    edit = result[0]["edit"]
+    assert edit["documentChanges"][0]["textDocument"] == {
+        "path": relative,
+        "version": 1,
+    }
+    assert edit["documentChanges"][1] == {
+        "kind": "rename",
+        "oldPath": relative,
+        "newPath": "renamed.py",
+    }
+    assert len(relative) > 128
+
+
+@pytest.mark.asyncio
+async def test_lsp_rename_rejects_duplicate_normalized_targets(tmp_path: Path) -> None:
+    source = tmp_path / "example.py"
+    source.write_text("x = 1\n", encoding="utf-8")
+    config = fake_config(tmp_path / "lsp.jsonl")
+    config = replace(config, env={**config.env, "FAKE_LSP_DUPLICATE_RENAME": "1"})
+    manager = LanguageServerManager(tmp_path, {"fake": config})
+    try:
+        with pytest.raises(LSPError, match="unsafe workspace edit"):
+            await manager.query(
+                "rename",
+                file_path="example.py",
+                line=1,
+                character=1,
+                new_name="renamed",
+            )
+    finally:
+        await manager.aclose()
+
+
+def test_lsp_refactor_client_capabilities_and_argument_ownership() -> None:
+    client_capabilities = _client_capabilities()
+    capabilities = client_capabilities["textDocument"]
+    assert capabilities["rename"]["prepareSupport"] is True
+    assert capabilities["codeAction"]["isPreferredSupport"] is True
+    assert client_capabilities["workspace"]["applyEdit"] is False
+    assert client_capabilities["workspace"]["workspaceEdit"] == {
+        "documentChanges": True,
+        "resourceOperations": ["create", "rename", "delete"],
+        "failureHandling": "abort",
+    }
+
+    rename = LSPQueryArgs(
+        operation="rename", file_path="example.py", new_name="next_name"
+    )
+    assert rename.new_name == "next_name"
+    with pytest.raises(ValueError, match="only valid for rename"):
+        LSPQueryArgs(
+            operation="definition", file_path="example.py", new_name="unexpected"
+        )
+    with pytest.raises(ValueError, match="provided together"):
+        LSPQueryArgs(operation="codeAction", file_path="example.py", end_line=2)
+    with pytest.raises(ValueError, match="only valid for codeAction"):
+        LSPQueryArgs(
+            operation="definition",
+            file_path="example.py",
+            code_action_kind="quickfix",
+        )
+
+
+@pytest.mark.asyncio
+async def test_lsp_rename_fails_closed_across_multiple_servers(tmp_path: Path) -> None:
+    source = tmp_path / "example.py"
+    source.write_text("x = 1\n", encoding="utf-8")
+    safe = replace(
+        fake_config(tmp_path / "safe.jsonl"),
+        name="safe",
+    )
+    unsafe = replace(
+        fake_config(tmp_path / "unsafe.jsonl"),
+        name="unsafe",
+        env={
+            **fake_config(tmp_path / "unsafe.jsonl").env,
+            "FAKE_LSP_UNSAFE_RENAME": "1",
+        },
+    )
+    manager = LanguageServerManager(tmp_path, {"safe": safe, "unsafe": unsafe})
+    try:
+        with pytest.raises(LSPError, match="unsafe workspace edit"):
+            await manager.query(
+                "rename",
+                file_path="example.py",
+                line=1,
+                character=1,
+                new_name="renamed",
+            )
+    finally:
+        await manager.aclose()
+
+    assert source.read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_lsp_cli_routes_refactor_arguments_and_rejects_cross_operation_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+    )
+    monkeypatch.setattr(
+        ash_cli, "_load_config_or_report", lambda **overrides: (config, 0)
+    )
+    observed: dict[str, object] = {}
+
+    async def fake_inspect(config, **kwargs):
+        observed.update(kwargs)
+        return {
+            "schema_version": 1,
+            "workspace": str(tmp_path),
+            "operation": kwargs["operation"],
+            "result": [],
+        }
+
+    monkeypatch.setattr(cli_lsp, "inspect_lsp", fake_inspect)
+
+    assert (
+        ash_cli.main(
+            [
+                "lsp",
+                "query",
+                "codeAction",
+                "example.py",
+                "--line",
+                "2",
+                "--character",
+                "3",
+                "--end-line",
+                "4",
+                "--end-character",
+                "5",
+                "--code-action-kind",
+                "quickfix",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    assert observed["end_line"] == 4
+    assert observed["end_character"] == 5
+    assert observed["code_action_kind"] == "quickfix"
+    assert '"operation": "codeAction"' in capsys.readouterr().out
+
+    with pytest.raises(SystemExit):
+        ash_cli.main(
+            [
+                "lsp",
+                "query",
+                "definition",
+                "example.py",
+                "--new-name",
+                "not-allowed",
+            ]
+        )
 
 
 @pytest.mark.asyncio

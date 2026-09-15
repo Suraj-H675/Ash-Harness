@@ -2467,6 +2467,9 @@ def main(argv: list[str] | None = None) -> int:
             "implementation",
             "documentSymbol",
             "workspaceSymbol",
+            "prepareRename",
+            "rename",
+            "codeAction",
             "prepareCallHierarchy",
             "incomingCalls",
             "outgoingCalls",
@@ -2476,6 +2479,10 @@ def main(argv: list[str] | None = None) -> int:
     lsp_query.add_argument("--line", type=int, default=1)
     lsp_query.add_argument("--character", type=int, default=1)
     lsp_query.add_argument("--query", default="")
+    lsp_query.add_argument("--new-name", default="")
+    lsp_query.add_argument("--end-line", type=int)
+    lsp_query.add_argument("--end-character", type=int)
+    lsp_query.add_argument("--code-action-kind", default="")
     lsp_query.add_argument("--json", action="store_true")
     mcp_subparser = subparsers.add_parser("mcp")
     mcp_action_subparsers = mcp_subparser.add_subparsers(dest="action", required=True)
@@ -2729,6 +2736,18 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("ash lsp query requires FILE except for workspaceSymbol")
             if args.line < 1 or args.character < 1:
                 parser.error("--line and --character must be positive")
+            if args.operation == "rename" and not args.new_name.strip():
+                parser.error("ash lsp query rename requires --new-name")
+            if args.operation != "rename" and args.new_name:
+                parser.error("--new-name is only valid for rename")
+            if (args.end_line is None) != (args.end_character is None):
+                parser.error("--end-line and --end-character must be provided together")
+            if args.end_line is not None and (args.end_line < 1 or args.end_character < 1):
+                parser.error("--end-line and --end-character must be positive")
+            if args.operation != "codeAction" and (
+                args.end_line is not None or args.code_action_kind
+            ):
+                parser.error("code-action range and kind are only valid for codeAction")
         try:
             payload = asyncio.run(
                 inspect_lsp(
@@ -2739,6 +2758,10 @@ def main(argv: list[str] | None = None) -> int:
                     line=getattr(args, "line", 1),
                     character=getattr(args, "character", 1),
                     query=getattr(args, "query", ""),
+                    new_name=getattr(args, "new_name", ""),
+                    end_line=getattr(args, "end_line", None),
+                    end_character=getattr(args, "end_character", None),
+                    code_action_kind=getattr(args, "code_action_kind", ""),
                 )
             )
         except (OSError, RuntimeError, ValueError) as exc:
