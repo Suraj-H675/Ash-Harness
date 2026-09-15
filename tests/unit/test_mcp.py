@@ -5332,38 +5332,289 @@ def test_runtime_mcp_tool_extracts_nested_header_annotations(
     assert captured["annotations"] == [(("options", "region"), "Region")]
 
 
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("probe_response", "expected"),
-    [
-        (
-            {
+async def test_stdio_negotiates_modern_protocol_without_initialize() -> None:
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    params = message.get("params", {})
+    if method == "server/discover":
+        meta = params.get("_meta", {})
+        caps = meta.get("io.modelcontextprotocol/clientCapabilities", {})
+        assert meta.get("io.modelcontextprotocol/protocolVersion") == "2026-07-28"
+        assert "tasks" not in caps
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {}},
+            "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "modern", "version": "1"}},
+        }
+    elif method == "initialize":
+        result = None
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32603, "message": "initialize forbidden"}}), flush=True)
+        continue
+    elif method == "tools/list":
+        meta = params.get("_meta", {})
+        assert meta.get("io.modelcontextprotocol/protocolVersion") == "2026-07-28"
+        result = {
+            "resultType": "complete",
+            "tools": [{"name": "echo", "description": "echo", "inputSchema": {"type": "object"}}],
+            "ttlMs": 1000,
+            "cacheScope": "private",
+        }
+    else:
+        result = {"resultType": "complete"}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"""
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern", command=sys.executable, args=["-u", "-c", server], env={}
+        )
+    )
+    await client.connect()
+
+    assert client.protocol_version == "2026-07-28"
+    assert client.server_info == {"name": "modern", "version": "1"}
+    tools = await client.list_tools()
+    assert [tool["name"] for tool in tools] == ["echo"]
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_http_modern_requests_use_stateless_routing_headers() -> None:
+    seen: list[tuple[str, httpx.Headers, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        seen.append((payload["method"], request.headers, payload))
+        assert request.headers["MCP-Protocol-Version"] == "2026-07-28"
+        assert request.headers["Mcp-Method"] == payload["method"]
+        assert "Mcp-Session-Id" not in request.headers
+        meta = payload["params"]["_meta"]
+        assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+        if payload["method"] == "server/discover":
+            result = {
                 "resultType": "complete",
-                "supportedVersions": ["2026-07-28"],
+                "supportedVersions": ["2026-07-28", "2025-11-25"],
                 "capabilities": {"tools": {}},
-                "_meta": {
-                    "io.modelcontextprotocol/serverInfo": {
-                        "name": "modern",
-                        "version": "1",
+            }
+        elif payload["method"] == "tools/call":
+            assert request.headers["Mcp-Name"] == "echo"
+            assert request.headers["Mcp-Param-Region"] == "us-east1"
+            result = {
+                "resultType": "complete",
+                "content": [{"type": "text", "text": "works"}],
+            }
+        else:
+            raise AssertionError(payload["method"])
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+            request=request,
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    result = await client.call_tool(
+        "echo",
+        {"region": "us-east1"},
+        header_annotations=[(("region",), "Region")],
+    )
+
+    assert result["content"][0]["text"] == "works"
+    assert [method for method, _, _ in seen] == ["server/discover", "tools/call"]
+    await client.disconnect()
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_modern_input_required_is_auto_fulfilled_and_retried() -> None:
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    params = message.get("params", {})
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {}},
+        }
+    elif method == "tools/call":
+        if "inputResponses" not in params:
+            result = {
+                "resultType": "input_required",
+                "inputRequests": {
+                    "confirm": {
+                        "method": "elicitation/create",
+                        "params": {
+                            "mode": "form",
+                            "message": "Continue?",
+                            "requestedSchema": {
+                                "type": "object",
+                                "properties": {"ok": {"type": "boolean"}},
+                                "required": ["ok"],
+                            },
+                        },
                     }
                 },
-            },
-            "MCP server is modern-only",
-        ),
-        (
-            {
+                "requestState": "opaque-state",
+            }
+        else:
+            assert params["requestState"] == "opaque-state"
+            assert params["inputResponses"] == {
+                "confirm": {"action": "accept", "content": {"ok": True}}
+            }
+            result = {
                 "resultType": "complete",
-                "supportedVersions": ["2026-08-01"],
-                "capabilities": {},
-            },
-            "MCP server is modern-only",
+                "content": [{"type": "text", "text": "confirmed"}],
+            }
+    else:
+        result = {"resultType": "complete"}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"""
+
+    async def elicit(params: dict) -> dict:
+        assert params["message"] == "Continue?"
+        return {"action": "accept", "content": {"ok": True}}
+
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern", command=sys.executable, args=["-u", "-c", server], env={}
         ),
-    ],
-)
-async def test_stdio_discover_rejects_modern_server_without_fallback(
-    probe_response: dict,
-    expected: str,
-) -> None:
+        elicitation_handler=elicit,
+    )
+    await client.connect()
+    result = await client.call_tool("confirm", {})
+
+    assert result == {"content": [{"type": "text", "text": "confirmed"}]}
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modern_result_requires_result_type() -> None:
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "server/discover":
+        result = {"resultType": "complete", "supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}}
+    else:
+        result = {"content": [{"type": "text", "text": "missing discriminator"}]}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"""
+    client = MCPClient(MCPServerConfig(name="modern", command=sys.executable, args=["-u", "-c", server], env={}))
+    await client.connect()
+    with pytest.raises(MCPProtocolError, match="missing resultType"):
+        await client.call_tool("broken", {})
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modern_input_required_round_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mcp_client_module, "INPUT_REQUIRED_RETRY_DELAY_SECONDS", 0)
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "server/discover":
+        result = {"resultType": "complete", "supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}}
+    else:
+        result = {"resultType": "input_required", "requestState": "retry"}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"""
+    client = MCPClient(MCPServerConfig(name="modern", command=sys.executable, args=["-u", "-c", server], env={}))
+    await client.connect()
+    with pytest.raises(MCPProtocolError, match="exceeded 10 input_required rounds"):
+        await client.call_tool("loop", {})
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modern_input_required_rejects_undeclared_client_capability() -> None:
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "server/discover":
+        result = {"resultType": "complete", "supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}}
+    else:
+        result = {"resultType": "input_required", "inputRequests": {"roots": {"method": "roots/list", "params": {}}}}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"""
+    client = MCPClient(MCPServerConfig(name="modern", command=sys.executable, args=["-u", "-c", server], env={}))
+    await client.connect()
+    with pytest.raises(MCPProtocolError, match="undeclared client capability"):
+        await client.call_tool("needs-roots", {})
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modern_http_400_jsonrpc_error_is_delivered_in_band() -> None:
+    methods: list[str] = []
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        methods.append(payload["method"])
+        if payload["method"] == "server/discover":
+            result = {"resultType": "complete", "supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}}
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": result}, request=request)
+        return httpx.Response(400, headers={"content-type": "application/json"}, json={"jsonrpc": "2.0", "id": payload["id"], "error": {"code": -32099, "message": "denied"}}, request=request)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(MCPServerConfig(name="modern", command="", args=[], env={}, transport="http", url="https://mcp.example.test/rpc"), http_client=http)
+    await client.connect()
+    with pytest.raises(MCPProtocolError, match=r"tools/call failed \(-32099\): denied") as exc_info:
+        await client.call_tool("blocked", {})
+    assert exc_info.value.code == -32099
+    assert methods == ["server/discover", "tools/call"]
+    await client.disconnect()
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_modern_http_timeout_does_not_post_cancel_notification() -> None:
+    methods: list[str] = []
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        methods.append(payload["method"])
+        if payload["method"] == "server/discover":
+            result = {"resultType": "complete", "supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}}
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": result}, request=request)
+        if payload["method"] == "tools/call":
+            raise httpx.ReadTimeout("slow", request=request)
+        raise AssertionError(payload["method"])
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(MCPServerConfig(name="modern", command="", args=[], env={}, transport="http", url="https://mcp.example.test/rpc"), http_client=http)
+    await client.connect()
+    with pytest.raises(httpx.ReadTimeout):
+        await client.call_tool("slow", {})
+    assert methods == ["server/discover", "tools/call"]
+    await client.disconnect()
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stdio_discover_rejects_unsupported_future_version() -> None:
+    probe_response = {
+        "resultType": "complete",
+        "supportedVersions": ["2026-08-01"],
+        "capabilities": {},
+    }
     server = f"""
 import json, sys
 for line in sys.stdin:
@@ -5373,10 +5624,12 @@ for line in sys.stdin:
 """
     client = MCPClient(
         MCPServerConfig(
-            name="modern", command=sys.executable, args=["-u", "-c", server], env={}
+            name="future", command=sys.executable, args=["-u", "-c", server], env={}
         )
     )
-    with pytest.raises(MCPProtocolError, match=expected):
+    with pytest.raises(
+        MCPProtocolError, match="no mutually supported protocol version"
+    ):
         await asyncio.wait_for(client.connect(), timeout=1)
 
 
@@ -5400,7 +5653,7 @@ for line in sys.stdin:
         )
     )
     with pytest.raises(
-        MCPProtocolError, match="Ash currently negotiates through 2025-11-25"
+        MCPProtocolError, match="no mutually supported protocol version"
     ):
         await asyncio.wait_for(client.connect(), timeout=1)
 
@@ -5511,7 +5764,7 @@ async def test_http_unrecognized_400_falls_back_to_legacy_initialize() -> None:
         for request in requests
         if request.method == "POST"
     ] == [
-        "ping",
+        "server/discover",
         "initialize",
         "notifications/initialized",
     ]
@@ -5552,11 +5805,11 @@ async def test_http_modern_unsupported_version_fails_without_fallback() -> None:
         http_client=http,
     )
     with pytest.raises(
-        MCPProtocolError, match="Ash currently negotiates through 2025-11-25"
+        MCPProtocolError, match="no mutually supported protocol version"
     ):
         await asyncio.wait_for(client.connect(), timeout=1)
 
-    assert methods == ["ping"]
+    assert methods == ["server/discover"]
     await http.aclose()
 
 
@@ -5591,10 +5844,10 @@ async def test_http_recognized_modern_error_fails_without_fallback(
         ),
         http_client=http,
     )
-    with pytest.raises(MCPProtocolError, match="modern HTTP probe"):
+    with pytest.raises(MCPProtocolError, match="modern discovery request"):
         await asyncio.wait_for(client.connect(), timeout=1)
 
-    assert methods == ["ping"]
+    assert methods == ["server/discover"]
     await http.aclose()
 
 

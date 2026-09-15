@@ -238,8 +238,9 @@ entries from different sessions are never combined.
 
 ### 3.2 Tool Schema Boundary
 
-After initialization, Ash paginates `tools/list` and namespaces each remote
-tool as `mcp__<server>__<tool>`. The declared `inputSchema` remains the
+After protocol negotiation, Ash paginates `tools/list` and namespaces each remote
+tool as `mcp__<server>__<tool>`. For MCP 2026-07-28, negotiation uses the
+stateless `server/discover` path rather than `initialize`. The declared `inputSchema` remains the
 authoritative provider-facing schema; Ash does not translate it into a smaller
 Pydantic type model.
 
@@ -270,13 +271,16 @@ fetch live data and do not cache stale entries.
   output, CPU, memory, and wall-clock limits so hostile schemas cannot block
   Ash's event loop.
 * `json_schema()` returns a defensive copy of the exact server declaration.
-* Tools that require the experimental MCP task lifecycle are isolated with a
-  catalog diagnostic until Ash implements task-augmented calls; optional-task
-  tools remain callable through the ordinary request path.
+* The 2025-11-25 experimental task lifecycle remains supported only on legacy
+  connections. Ash does not advertise or execute it on MCP 2026-07-28 because
+  Tasks moved to the separate `io.modelcontextprotocol/tasks` extension.
 
 ### 3.3 Tool Result Boundary
 
-MCP `tools/call` results require a `content` array. Ash preserves rich content,
+MCP `tools/call` results require a `content` array. On MCP 2026-07-28 Ash also
+requires and consumes the top-level `resultType`; bounded `input_required`
+rounds are fulfilled in-band through declared roots, sampling, or elicitation
+capabilities and retried with opaque `requestState` preserved. Ash preserves rich content,
 `structuredContent`, `_meta`, `isError`, and extension fields as one JSON
 envelope. Version-specific text, image, audio, resource-link, and embedded
 resource blocks are checked before model exposure. A successful text-only
@@ -291,8 +295,10 @@ failure and not a reason to replay the call. JSON-RPC failures similarly retain
 their numeric `code` and distinguish absent `data` from explicit `null`; Ash
 does not automatically repeat a potentially side-effecting call.
 
-See the [MCP tools specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
-and the [2025-11-25 schema](https://modelcontextprotocol.io/specification/2025-11-25/schema).
+See the [MCP 2026-07-28 release](https://blog.modelcontextprotocol.io/posts/2026-07-28/)
+and the [2025-11-25 tools specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
+for the legacy stateful path. `subscriptions/listen` and the redesigned Tasks
+extension are not yet implemented in Ash.
 
 ---
 

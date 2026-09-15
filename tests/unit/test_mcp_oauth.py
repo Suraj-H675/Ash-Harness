@@ -1083,9 +1083,9 @@ async def test_mcp_client_retries_one_401_with_refreshed_oauth() -> None:
     await client.disconnect()
     await http.aclose()
 
-    assert seen.count("Bearer stale") == 2
-    assert "Bearer fresh" in seen
-    assert oauth.calls == [False, False, True, False]
+    assert seen.count("Bearer stale") == 1
+    assert seen.count("Bearer fresh") >= 2
+    assert oauth.calls == [False, True, False, False]
 
 
 @pytest.mark.asyncio
@@ -1112,8 +1112,8 @@ async def test_mcp_tool_call_401_is_not_reposted_after_oauth_refresh() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal tool_posts
         payload = json.loads(request.content)
-        if payload["method"] == "ping":
-            return httpx.Response(401)
+        if payload["method"] == "server/discover":
+            return httpx.Response(400, text="legacy server")
         if payload["method"] == "initialize":
             return httpx.Response(
                 200,

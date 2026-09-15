@@ -70,6 +70,9 @@ TASK_STATUSES = TASK_TERMINAL_STATUSES | {"working", "input_required"}
 ASSOCIATED_SERVER_REQUEST_METHODS = frozenset(
     {"roots/list", "sampling/createMessage", "elicitation/create"}
 )
+MODERN_INPUT_REQUIRED_METHODS = frozenset({"tools/call", "prompts/get", "resources/read"})
+MAX_INPUT_REQUIRED_ROUNDS = 10
+INPUT_REQUIRED_RETRY_DELAY_SECONDS = 0.25
 
 
 async def _settle_task_after_cancellation(
@@ -260,9 +263,23 @@ class MCPClient:
 
     @property
     def client_capabilities(self) -> dict[str, Any]:
+        capabilities = self._base_client_capabilities()
+        # Tasks were part of the 2025-11-25 experimental core. The 2026-07-28
+        # revision moved them to an extension, so advertise this only during the
+        # legacy initialize handshake.
+        capabilities["tasks"] = {"cancel": {}, "list": {}}
+        return capabilities
+
+    @property
+    def modern_client_capabilities(self) -> dict[str, Any]:
+        """Capabilities safe to advertise in the 2026-07-28 request envelope."""
+
+        return self._base_client_capabilities()
+
+    def _base_client_capabilities(self) -> dict[str, Any]:
         capabilities: dict[str, Any] = {}
         if self.roots:
-            capabilities["roots"] = {"listChanged": False}
+            capabilities["roots"] = {}
         if self.sampling_handler is not None:
             sampling: dict[str, Any] = {}
             if self.sampling_supports_tools:
@@ -270,7 +287,6 @@ class MCPClient:
             capabilities["sampling"] = sampling
         if self.elicitation_handler is not None and self.elicitation_modes:
             capabilities["elicitation"] = {mode: {} for mode in self.elicitation_modes}
-        capabilities["tasks"] = {"cancel": {}, "list": {}}
         return capabilities
 
     def supports_server_capability(self, name: str) -> bool:
@@ -308,11 +324,15 @@ class MCPClient:
                     f"Unsupported MCP transport: {self.config.transport}"
                 )
             try:
+                modern_result: dict[str, Any] | None = None
                 if self.config.transport == "stdio":
-                    await self._probe_modern_stdio()
+                    modern_result = await self._probe_modern_stdio()
                 elif self.config.transport == "http":
-                    await self._probe_modern_http()
-                await self._initialize_protocol()
+                    modern_result = await self._probe_modern_http()
+                if modern_result is not None:
+                    self._activate_modern_protocol(modern_result)
+                else:
+                    await self._initialize_protocol()
             except BaseException as primary:
                 cleanup_task = asyncio.create_task(self.disconnect())
                 cleanup_error, cleanup_cancelled = (
@@ -387,10 +407,68 @@ class MCPClient:
                 "name": "ash",
                 "version": _client_version(),
             },
-            "io.modelcontextprotocol/clientCapabilities": self.client_capabilities,
+            "io.modelcontextprotocol/clientCapabilities": self.modern_client_capabilities,
         }
 
-    async def _probe_modern_stdio(self) -> None:
+    def _modernize_request_params(
+        self, params: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        prepared = dict(params or {})
+        raw_meta = prepared.get("_meta")
+        meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+        meta.update(self._modern_request_meta())
+        prepared["_meta"] = meta
+        return prepared
+
+    def _validate_modern_discover_result(self, result: dict[str, Any]) -> bool:
+        if result.get("resultType") != "complete":
+            raise MCPProtocolError("MCP server discovery returned an invalid resultType")
+        versions = result.get("supportedVersions")
+        capabilities = result.get("capabilities")
+        if not (
+            isinstance(versions, list)
+            and versions
+            and all(isinstance(version, str) for version in versions)
+            and isinstance(capabilities, dict)
+        ):
+            raise MCPProtocolError("MCP server discovery returned an invalid result")
+        malformed_capabilities = [
+            name for name, value in capabilities.items() if not isinstance(value, dict)
+        ]
+        if malformed_capabilities:
+            raise MCPProtocolError(
+                "MCP server capabilities must contain objects: "
+                + ", ".join(sorted(malformed_capabilities))
+            )
+        if MODERN_PROTOCOL_VERSION in versions:
+            return True
+        if any(version in SUPPORTED_PROTOCOL_VERSIONS for version in versions):
+            return False
+        raise MCPProtocolError(
+            "MCP server discovery found no mutually supported protocol version: "
+            + ", ".join(sorted(versions))
+        )
+
+    def _activate_modern_protocol(self, result: dict[str, Any]) -> None:
+        if not self._validate_modern_discover_result(result):
+            raise MCPProtocolError("MCP modern activation requires modern discovery")
+        self.protocol_version = MODERN_PROTOCOL_VERSION
+        self.server_capabilities = dict(result.get("capabilities", {}))
+        raw_meta = result.get("_meta")
+        meta = raw_meta if isinstance(raw_meta, dict) else {}
+        raw_server_info = meta.get("io.modelcontextprotocol/serverInfo")
+        self.server_info = (
+            dict(raw_server_info) if isinstance(raw_server_info, dict) else {}
+        )
+        instructions = result.get("instructions", "")
+        self.server_instructions = instructions if isinstance(instructions, str) else ""
+        self._http_session_id = ""
+        self._pending_initialize_session_id = ""
+        self._session_generation += 1
+        self._initialized = True
+        self._session_ready.set()
+
+    async def _probe_modern_stdio(self) -> dict[str, Any] | None:
         try:
             result = await self.request(
                 "server/discover",
@@ -403,85 +481,123 @@ class MCPClient:
             if exc.code == MODERN_UNSUPPORTED_VERSION_ERROR and isinstance(
                 supported, list
             ):
+                supported_versions = [
+                    version for version in supported if isinstance(version, str)
+                ]
+                if any(
+                    version in SUPPORTED_PROTOCOL_VERSIONS
+                    for version in supported_versions
+                ):
+                    return None
                 raise MCPProtocolError(
-                    f"MCP server supports modern protocol versions {supported}, "
-                    f"but Ash currently negotiates through {LATEST_PROTOCOL_VERSION}"
+                    "MCP server reported no mutually supported protocol version: "
+                    + ", ".join(sorted(supported_versions))
                 ) from exc
-            return
+            return None
         except (asyncio.TimeoutError, httpx.TimeoutException):
-            return
-        versions = result.get("supportedVersions")
-        capabilities = result.get("capabilities")
-        if not (
-            result.get("resultType") == "complete"
-            and isinstance(versions, list)
-            and all(isinstance(version, str) for version in versions)
-            and isinstance(capabilities, dict)
-        ):
-            raise MCPProtocolError("MCP server discovery returned an invalid result")
-        if MODERN_PROTOCOL_VERSION in versions or any(
-            version > LATEST_PROTOCOL_VERSION for version in versions
-        ):
-            raise MCPProtocolError(
-                f"MCP server is modern-only; Ash currently negotiates through "
-                f"{LATEST_PROTOCOL_VERSION}: {sorted(versions)}"
-            )
-        raise MCPProtocolError("MCP stdio discovery returned a legacy-era result")
+            return None
+        if not any(key in result for key in ("resultType", "supportedVersions")):
+            return None
+        return result if self._validate_modern_discover_result(result) else None
 
-    async def _probe_modern_http(self) -> None:
+    async def _probe_modern_http(self) -> dict[str, Any] | None:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": self._probe_id,
+            "method": "server/discover",
+            "params": {"_meta": self._modern_request_meta()},
+        }
+        previous_protocol = self.protocol_version
+        self.protocol_version = MODERN_PROTOCOL_VERSION
         try:
-            await self._post_http(
-                {
-                    "jsonrpc": "2.0",
-                    "id": self._probe_id,
-                    "method": "ping",
-                    "params": {"_meta": self._modern_request_meta()},
-                },
-                is_initialize=True,
+            response_http = await self._post_http(
+                payload,
                 bypass_session_readiness=True,
-                allow_oauth_refresh=False,
             )
-            return
+            if response_http.status_code == 400:
+                content_type = (
+                    response_http.headers.get("content-type", "")
+                    .split(";", 1)[0]
+                    .strip()
+                    .casefold()
+                )
+                if content_type != "application/json":
+                    return None
+                try:
+                    body = strict_json_loads(response_http.content)
+                except (
+                    json.JSONDecodeError,
+                    UnicodeDecodeError,
+                    ValueError,
+                    OverflowError,
+                    RecursionError,
+                ):
+                    return None
+                if not isinstance(body, dict) or not isinstance(body.get("error"), dict):
+                    return None
+                messages = [body]
+            else:
+                messages = list(_parse_http_messages(response_http))
         except MCPAuthorizationRequired:
-            return
+            raise
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code != 400:
-                raise
-            try:
-                body = exc.response.json()
-            except ValueError:
-                return
-            if not isinstance(body, dict):
-                return
-            error = body.get("error")
+            if exc.response.status_code in {400, 404, 405}:
+                return None
+            raise
+        except (asyncio.TimeoutError, httpx.TimeoutException, httpx.HTTPError):
+            return None
+        finally:
+            self.protocol_version = previous_protocol
+
+        matching = [
+            message
+            for message in messages
+            if message.get("id") == self._probe_id and "method" not in message
+        ]
+        if len(matching) != 1:
+            raise MCPProtocolError("MCP HTTP discovery returned an invalid response")
+        response = matching[0]
+        if "error" in response:
+            error = response.get("error")
             if not isinstance(error, dict):
-                return
+                raise MCPProtocolError("MCP HTTP discovery returned an invalid error")
             code = error.get("code")
             raw_data = error.get("data")
             data = raw_data if isinstance(raw_data, dict) else {}
-            if code == MODERN_UNSUPPORTED_VERSION_ERROR and isinstance(
-                data.get("supported"), list
-            ):
-                supported = [
-                    str(version)
-                    for version in data["supported"]
-                    if isinstance(version, str)
-                ]
+            if code == -32601:
+                return None
+            if code == MODERN_UNSUPPORTED_VERSION_ERROR:
+                supported = data.get("supported")
+                supported_versions = (
+                    [version for version in supported if isinstance(version, str)]
+                    if isinstance(supported, list)
+                    else []
+                )
+                if any(
+                    version in SUPPORTED_PROTOCOL_VERSIONS
+                    for version in supported_versions
+                ):
+                    return None
                 raise MCPProtocolError(
-                    f"MCP server supports modern protocol versions {supported}, "
-                    f"but Ash currently negotiates through {LATEST_PROTOCOL_VERSION}"
-                ) from exc
-            if code in {
-                MODERN_HEADER_MISMATCH_ERROR,
-                MODERN_MISSING_CAPABILITY_ERROR,
-            }:
+                    "MCP server reported no mutually supported protocol version: "
+                    + ", ".join(sorted(supported_versions)),
+                    code=code if isinstance(code, int) and not isinstance(code, bool) else None,
+                    data=data,
+                )
+            if code in {MODERN_HEADER_MISMATCH_ERROR, MODERN_MISSING_CAPABILITY_ERROR}:
                 raise MCPProtocolError(
-                    "MCP server rejected the modern HTTP probe: "
-                    + str(error.get("message", ""))
-                ) from exc
-            return
-        except (asyncio.TimeoutError, httpx.TimeoutException, httpx.HTTPError):
-            return
+                    "MCP server rejected the modern discovery request: "
+                    + str(error.get("message", "")),
+                    code=code,
+                    data=data,
+                )
+            return None
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return None
+        if not any(key in result for key in ("resultType", "supportedVersions")):
+            return None
+        return result if self._validate_modern_discover_result(result) else None
 
     async def _connect_stdio(self) -> None:
         env = build_scrubbed_environment(overrides=self.config.resolved_env)
@@ -769,6 +885,7 @@ class MCPClient:
         _allow_session_recovery: bool = True,
         _expected_tool_contract: tuple[str, str] | None = None,
         _header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
+        _input_required_round: int = 0,
     ) -> dict[str, Any]:
         if self.config.transport != "stdio" and _allow_session_recovery:
             async with self._session_recovery_lock:
@@ -795,11 +912,14 @@ class MCPClient:
             while True:
                 request_id = self._next_id
                 self._next_id += 1
+                request_params = dict(params or {})
+                if self.protocol_version == MODERN_PROTOCOL_VERSION:
+                    request_params = self._modernize_request_params(request_params)
                 payload = {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "method": method,
-                    "params": params or {},
+                    "params": request_params,
                 }
                 try:
                     if self.config.transport == "stdio":
@@ -886,7 +1006,140 @@ class MCPClient:
                 **error_data,
             )
         result = response.get("result", {})
+        if self.protocol_version == MODERN_PROTOCOL_VERSION:
+            if not isinstance(result, dict):
+                raise MCPProtocolError(
+                    f"{method} returned a non-object result for MCP {MODERN_PROTOCOL_VERSION}"
+                )
+            return await self._resolve_modern_result(
+                method,
+                dict(params or {}),
+                result,
+                input_required_round=_input_required_round,
+                expected_tool_contract=_expected_tool_contract,
+                header_annotations=_header_annotations or [],
+            )
         return result if isinstance(result, dict) else {"value": result}
+
+    async def _resolve_modern_result(
+        self,
+        method: str,
+        original_params: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        input_required_round: int,
+        expected_tool_contract: tuple[str, str] | None,
+        header_annotations: list[tuple[tuple[str, ...], str]],
+    ) -> dict[str, Any]:
+        result_type = result.get("resultType")
+        if not isinstance(result_type, str):
+            raise MCPProtocolError(
+                f"{method} result is missing resultType for MCP {MODERN_PROTOCOL_VERSION}"
+            )
+        if result_type == "complete":
+            completed = dict(result)
+            completed.pop("resultType", None)
+            return completed
+        if result_type != "input_required":
+            raise MCPProtocolError(
+                f"{method} returned unsupported resultType {result_type!r}"
+            )
+        if method not in MODERN_INPUT_REQUIRED_METHODS:
+            raise MCPProtocolError(
+                f"{method} cannot return input_required in MCP {MODERN_PROTOCOL_VERSION}"
+            )
+        if input_required_round >= MAX_INPUT_REQUIRED_ROUNDS:
+            raise MCPProtocolError(
+                f"{method} exceeded {MAX_INPUT_REQUIRED_ROUNDS} input_required rounds"
+            )
+
+        raw_requests = result.get("inputRequests")
+        request_state = result.get("requestState")
+        if raw_requests is not None and not isinstance(raw_requests, dict):
+            raise MCPProtocolError(f"{method} inputRequests must be an object")
+        if request_state is not None and not isinstance(request_state, str):
+            raise MCPProtocolError(f"{method} requestState must be a string")
+        input_requests = raw_requests if isinstance(raw_requests, dict) else {}
+        if not input_requests and request_state is None:
+            raise MCPProtocolError(
+                f"{method} input_required result needs inputRequests or requestState"
+            )
+
+        input_responses = await self._fulfill_modern_input_requests(input_requests)
+        if not input_requests and request_state is not None:
+            # requestState-only rounds are a load-shedding mechanism. Pace them
+            # so a server cannot induce a tight retry loop.
+            await asyncio.sleep(INPUT_REQUIRED_RETRY_DELAY_SECONDS)
+
+        retry_params = dict(original_params)
+        retry_params.pop("inputResponses", None)
+        retry_params.pop("requestState", None)
+        if input_requests:
+            retry_params["inputResponses"] = input_responses
+        if request_state is not None:
+            retry_params["requestState"] = request_state
+        return await self.request(
+            method,
+            retry_params,
+            _expected_tool_contract=expected_tool_contract,
+            _header_annotations=header_annotations,
+            _input_required_round=input_required_round + 1,
+        )
+
+    async def _fulfill_modern_input_requests(
+        self, input_requests: dict[str, Any]
+    ) -> dict[str, Any]:
+        responses: dict[str, Any] = {}
+        for key, embedded in input_requests.items():
+            if not isinstance(key, str) or not key:
+                raise MCPProtocolError("MCP inputRequests keys must be non-empty strings")
+            if not isinstance(embedded, dict):
+                raise MCPProtocolError(
+                    f"MCP inputRequests entry {key!r} must be an object"
+                )
+            embedded_method = embedded.get("method")
+            raw_params = embedded.get("params", {})
+            if embedded_method not in ASSOCIATED_SERVER_REQUEST_METHODS:
+                raise MCPProtocolError(
+                    f"MCP inputRequests entry {key!r} has unsupported method "
+                    f"{embedded_method!r}"
+                )
+            if not isinstance(raw_params, dict):
+                raise MCPProtocolError(
+                    f"MCP inputRequests entry {key!r} params must be an object"
+                )
+            self._require_modern_embedded_capability(embedded_method, raw_params)
+            response = await self._handle_server_request(
+                embedded_method, dict(raw_params), associated=True
+            )
+            if not isinstance(response, dict):
+                raise MCPProtocolError(
+                    f"MCP input response {key!r} must be an object"
+                )
+            responses[key] = response
+        return responses
+
+    def _require_modern_embedded_capability(
+        self, method: str, params: dict[str, Any]
+    ) -> None:
+        if method == "roots/list":
+            supported = bool(self.roots)
+        elif method == "sampling/createMessage":
+            supported = self.sampling_handler is not None
+            if supported and ("tools" in params or "toolChoice" in params):
+                supported = self.sampling_supports_tools
+        else:
+            mode = params.get("mode", "form")
+            supported = (
+                self.elicitation_handler is not None
+                and isinstance(mode, str)
+                and mode in self.elicitation_modes
+            )
+        if not supported:
+            raise MCPProtocolError(
+                f"MCP server requested undeclared client capability via {method}",
+                code=MODERN_MISSING_CAPABILITY_ERROR,
+            )
 
     async def _request_stdio(
         self,
@@ -1066,6 +1319,13 @@ class MCPClient:
         return headers
 
     async def _cancel_request(self, request_id: int, reason: str) -> None:
+        if (
+            self.protocol_version == MODERN_PROTOCOL_VERSION
+            and self.config.transport == "http"
+        ):
+            # Modern HTTP cancellation is represented by closing/cancelling the
+            # in-flight POST response, not by a follow-up cancellation POST.
+            return
         if self.config.transport != "stdio" and not self._initialized:
             return
         try:
@@ -1233,7 +1493,14 @@ class MCPClient:
             headers.pop("MCP-Protocol-Version", None)
         if self._oauth is not None:
             headers["Authorization"] = await self._oauth.authorization_header()
-        if header_annotations:
+        if sent_protocol_version == MODERN_PROTOCOL_VERSION:
+            headers.update(
+                self._tool_request_headers(
+                    payload,
+                    header_annotations or [],
+                )
+            )
+        elif header_annotations:
             headers.update(
                 self._tool_request_headers(
                     payload,
@@ -1297,7 +1564,11 @@ class MCPClient:
                 )
         if response.status_code == 404 and sent_session_id:
             raise MCPSessionExpired(sent_session_id, sent_generation)
-        response.raise_for_status()
+        if not (
+            response.status_code == 400
+            and sent_protocol_version == MODERN_PROTOCOL_VERSION
+        ):
+            response.raise_for_status()
         if is_initialize:
             session_id = response.headers.get("Mcp-Session-Id", "")
             if session_id:
@@ -1409,6 +1680,11 @@ class MCPClient:
         header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"name": name, "arguments": arguments}
+        if as_task and self.protocol_version == MODERN_PROTOCOL_VERSION:
+            raise MCPProtocolError(
+                "MCP 2026-07-28 Tasks require the io.modelcontextprotocol/tasks "
+                "extension, which is not enabled by this client yet"
+            )
         if not as_task:
             return await self.request(
                 "tools/call",
@@ -1795,6 +2071,10 @@ class MCPClient:
         raise AssertionError("unreachable pagination restart state")
 
     async def notify_roots_changed(self) -> None:
+        if self.protocol_version == MODERN_PROTOCOL_VERSION:
+            # 2026-07-28 replaces unsolicited list-changed notifications with
+            # subscriptions/listen. Do not leak the 2025 notification wire.
+            return
         if self.roots:
             await self.notify("notifications/roots/list_changed")
 
