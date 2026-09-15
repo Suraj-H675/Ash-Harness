@@ -280,6 +280,41 @@ async def test_browser_proxy_enforces_allowlist_before_resolution() -> None:
 
 
 @pytest.mark.asyncio
+async def test_browser_proxy_registers_accepted_connection_before_handler_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proxy = BrowserPolicyProxy((), timeout_seconds=1)
+    reader = asyncio.StreamReader()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Writer:
+        def close(self) -> None:
+            pass
+
+    async def blocked_handler(
+        _reader: asyncio.StreamReader, _writer: object
+    ) -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(proxy, "_handle_client", blocked_handler)
+    writer = Writer()
+    proxy._accept_client(reader, writer)  # type: ignore[arg-type]
+
+    assert len(proxy._connection_tasks) == 1
+    assert writer in proxy._writers
+    task = next(iter(proxy._connection_tasks))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+    assert not proxy._connection_tasks
+    assert not proxy._writers
+
+
+@pytest.mark.asyncio
 async def test_browser_proxy_close_settles_accepted_connections() -> None:
     proxy = BrowserPolicyProxy((), timeout_seconds=1)
     await proxy.start()
@@ -290,8 +325,12 @@ async def test_browser_proxy_close_settles_accepted_connections() -> None:
     try:
         writer.write(b"GET http://public.example/")
         await writer.drain()
-        await asyncio.sleep(0)
-        assert proxy._connection_tasks
+        for _ in range(100):
+            if proxy._connection_tasks:
+                break
+            await asyncio.sleep(0.001)
+        else:
+            pytest.fail("proxy did not register the accepted connection")
         await proxy.close()
         assert not proxy._connection_tasks
         assert not proxy._writers

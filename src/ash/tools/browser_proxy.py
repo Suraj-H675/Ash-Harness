@@ -84,7 +84,7 @@ class BrowserPolicyProxy:
         server: asyncio.AbstractServer | None = None
         try:
             server = await asyncio.start_server(
-                self._handle_client,
+                self._accept_client,
                 host="127.0.0.1",
                 port=0,
                 family=socket.AF_INET,
@@ -141,7 +141,8 @@ class BrowserPolicyProxy:
         if server is not None:
             server.close()
 
-        for writer in tuple(self._writers):
+        writers = tuple(self._writers)
+        for writer in writers:
             writer.close()
 
         while self._connection_tasks:
@@ -149,18 +150,45 @@ class BrowserPolicyProxy:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            self._connection_tasks.difference_update(tasks)
+
+        for writer in writers:
+            with contextlib.suppress(OSError, RuntimeError):
+                await writer.wait_closed()
+        self._writers.difference_update(writers)
         if server is not None:
             await server.wait_closed()
+
+    def _accept_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        if self._closed:
+            writer.close()
+            return
+        self._writers.add(writer)
+        task = asyncio.create_task(self._handle_client(reader, writer))
+        self._connection_tasks.add(task)
+        task.add_done_callback(
+            lambda completed: self._settle_connection(completed, writer)
+        )
+
+    def _settle_connection(
+        self,
+        task: asyncio.Task[None],
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        self._connection_tasks.discard(task)
+        self._writers.discard(writer)
+        with contextlib.suppress(OSError, RuntimeError):
+            writer.close()
 
     async def _handle_client(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        current = asyncio.current_task()
-        if current is not None:
-            self._connection_tasks.add(current)
-        self._writers.add(writer)
         try:
             if self._closed:
                 return
@@ -199,12 +227,9 @@ class BrowserPolicyProxy:
             except Exception:
                 await self._send_error(writer, 502, "Bad Gateway")
         finally:
-            self._writers.discard(writer)
             writer.close()
             with contextlib.suppress(OSError, RuntimeError):
                 await writer.wait_closed()
-            if current is not None:
-                self._connection_tasks.discard(current)
 
     async def _handle_connect(
         self,
