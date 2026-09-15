@@ -12,7 +12,7 @@ import asyncio
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Iterable, Sequence
+from typing import Annotated, Any, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -20,6 +20,7 @@ from ash.core.redaction import find_secret_candidates
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.safety.git import read_only_git_args, read_only_git_environment
 from ash.safety.guard import SafetyGuard
+from ash.safety.scoped_io import snapshot_scoped_file
 from ash.sandbox import SandboxBackendUnavailable, SandboxManager
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
@@ -41,6 +42,7 @@ MAX_GIT_PATH_CHARS = 4_096
 MAX_COMMIT_MESSAGE_CHARS = 65_536
 MAX_COMMIT_PATHS = 1_000
 MAX_COMMIT_AUTHOR_CHARS = 512
+MAX_AUTO_COMMIT_VERIFY_BYTES = 20 * 1024 * 1024
 _GitPath = Annotated[str, Field(min_length=1, max_length=MAX_GIT_PATH_CHARS)]
 _DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
@@ -154,6 +156,27 @@ class AutoCommitTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = AutoCommitArgs(**kwargs)
+        return await self._commit(args)
+
+    async def run_owned(
+        self,
+        *,
+        message: str,
+        paths: list[str],
+        expected_sha256: Mapping[str, str],
+        author: str = DEFAULT_COMMIT_AUTHOR,
+    ) -> ToolResult:
+        """Commit only paths that still match Ash's post-edit file digests."""
+
+        args = AutoCommitArgs(message=message, paths=paths, author=author)
+        return await self._commit(args, expected_sha256=expected_sha256)
+
+    async def _commit(
+        self,
+        args: AutoCommitArgs,
+        *,
+        expected_sha256: Mapping[str, str] | None = None,
+    ) -> ToolResult:
 
         try:
             workspace_root = self.safety_guard.project_root
@@ -204,14 +227,14 @@ class AutoCommitTool(BaseTool):
                 output="",
                 error="git diff --cached failed before staging",
             )
-        unrelated_before = _paths_outside_scope(staged_before, resolved_paths)
-        if unrelated_before:
+        if staged_before:
             return ToolResult(
                 success=False,
                 output="",
                 error=(
-                    "Refused to commit pre-staged paths outside explicit scope: "
-                    + ", ".join(unrelated_before[:20])
+                    "Refused to auto-commit while the Git index already contains "
+                    "staged paths; preserve existing user staging first: "
+                    + ", ".join(staged_before[:20])
                 ),
             )
         stage_cmd = ["add", "--", *resolved_paths]
@@ -253,6 +276,29 @@ class AutoCommitTool(BaseTool):
                     + ", ".join(unrelated_after[:20])
                 ),
             )
+        if expected_sha256 is not None:
+            changed_paths: list[str] = []
+            for relative_path in resolved_paths:
+                expected = expected_sha256.get(relative_path)
+                try:
+                    _, snapshot = snapshot_scoped_file(
+                        workspace_root / relative_path,
+                        self.safety_guard,
+                        max_bytes=MAX_AUTO_COMMIT_VERIFY_BYTES,
+                    )
+                except Exception:  # noqa: BLE001 - ownership check fails closed
+                    snapshot = None
+                if expected is None or snapshot is None or snapshot.sha256 != expected:
+                    changed_paths.append(relative_path)
+            if changed_paths:
+                return ToolResult(
+                    success=False,
+                    output="Changes remain staged for inspection.",
+                    error=(
+                        "Refused to auto-commit paths changed after Ash's last edit: "
+                        + ", ".join(changed_paths[:20])
+                    ),
+                )
         if not staged_after:
             return ToolResult(
                 success=True,
@@ -444,6 +490,34 @@ async def _run_git(
     )
 
 
+async def git_dirty_paths(
+    cwd: Path,
+    environment_allowlist: Iterable[str] = (),
+    *,
+    sandbox_manager: SandboxManager | None = None,
+) -> set[str] | None:
+    """Return tracked/index/untracked dirty paths without executing Git extensions."""
+
+    commands = (
+        ["diff", "--name-only", "--no-renames", "-z", "--"],
+        ["diff", "--cached", "--name-only", "--no-renames", "-z", "--"],
+        ["ls-files", "--others", "--exclude-standard", "-z", "--"],
+    )
+    dirty: set[str] = set()
+    for command in commands:
+        code, stdout, _ = await _run_git(
+            cwd,
+            command,
+            environment_allowlist,
+            sandbox_manager=sandbox_manager,
+            read_only=True,
+        )
+        if code != 0:
+            return None
+        dirty.update(path for path in stdout.split("\0") if path)
+    return dirty
+
+
 async def _cached_paths(
     cwd: Path,
     environment_allowlist: Iterable[str] = (),
@@ -557,6 +631,7 @@ async def auto_commit_turn(
     paths: list[Path] | None = None,
     safety_guard: SafetyGuard | None = None,
     environment_allowlist: Iterable[str] = (),
+    expected_sha256: Mapping[str, str] | None = None,
 ) -> ToolResult:
     """Convenience wrapper used by the loop to record a per-turn commit."""
 
@@ -566,10 +641,14 @@ async def auto_commit_turn(
     )
     guard = safety_guard or SafetyGuard(project_root=workspace_root)
     tool = AutoCommitTool(guard, environment_allowlist=environment_allowlist)
-    payload: dict[str, Any] = {"message": body}
-    if paths:
-        payload["paths"] = [str(p) for p in paths]
-    return await tool.run(**payload)
+    payload_paths = [str(p) for p in paths] if paths else []
+    if expected_sha256 is not None:
+        return await tool.run_owned(
+            message=body,
+            paths=payload_paths,
+            expected_sha256=expected_sha256,
+        )
+    return await tool.run(message=body, paths=payload_paths)
 
 
 # Provide a free function for use outside the tool registry.

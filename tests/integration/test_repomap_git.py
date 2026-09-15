@@ -15,7 +15,7 @@ from ash.providers.base import StreamChunk
 from ash.repo.repomap import RepoMap
 from ash.safety.guard import SafetyGuard
 from ash.tools.git import AutoCommitTool
-from ash.tools.filesystem import ReadFileTool, WriteFileTool
+from ash.tools.filesystem import ReadFileTool, ReplaceFileContentTool, WriteFileTool
 from ash.tools.symbols import FindReferencesTool, FindSymbolTool
 from ash.ui.terminal import TerminalUI
 
@@ -302,6 +302,226 @@ def test_auto_commit_skips_unrelated_preexisting_work_without_tool_edits(
         text=True,
     )
     assert "?? new_file.py" in status.stdout
+
+
+def test_auto_commit_preserves_preexisting_edits_on_modified_path(
+    git_workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
+) -> None:
+    target = git_workspace / "app.py"
+    target.write_text("user_line = 1\nash_line = 1\n")
+    subprocess.run(
+        ["git", "add", "app.py"], cwd=git_workspace, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "seed"],
+        cwd=git_workspace,
+        check=True,
+        capture_output=True,
+    )
+    target.write_text("user_line = 2\nash_line = 1\n")
+
+    provider = FakeProvider(
+        scripts=[
+            [
+                '<call_tool name="replace_file_content">',
+                '<arg name="file_path">app.py</arg>',
+                '<arg name="start_line">2</arg>',
+                '<arg name="end_line">2</arg>',
+                '<arg name="target_content">ash_line = 1</arg>',
+                '<arg name="replacement_content">ash_line = 2</arg>',
+                "</call_tool>",
+            ],
+            ["<response>done</response>"],
+        ]
+    )
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=git_workspace,
+        tools={
+            "replace_file_content": ReplaceFileContentTool(safety_guard),
+            "auto_commit": AutoCommitTool(safety_guard),
+        },
+        auto_commit=True,
+    )
+
+    asyncio.run(loop.run_turn("change only ash_line"))
+
+    assert target.read_text() == "user_line = 2\nash_line = 2\n"
+    log = subprocess.run(
+        ["git", "log", "--oneline"], cwd=git_workspace, capture_output=True, text=True
+    )
+    assert len(log.stdout.strip().splitlines()) == 1
+    assert "seed" in log.stdout
+    status = subprocess.run(
+        ["git", "status", "--short"], cwd=git_workspace, capture_output=True, text=True
+    )
+    assert " M app.py" in status.stdout
+
+
+def test_auto_commit_skips_path_changed_after_ash_edit(
+    git_workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
+) -> None:
+    target = git_workspace / "app.py"
+    target.write_text("user_line = 1\nash_line = 1\n")
+    subprocess.run(
+        ["git", "add", "app.py"], cwd=git_workspace, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "seed"],
+        cwd=git_workspace,
+        check=True,
+        capture_output=True,
+    )
+
+    class LateMutationProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature: float = 0.0, tools=None):
+            if self._call_count == 1:
+                target.write_text("user_line = 2\nash_line = 2\n")
+            async for chunk in super().stream_chat(
+                messages, temperature=temperature, tools=tools
+            ):
+                yield chunk
+
+    provider = LateMutationProvider(
+        scripts=[
+            [
+                '<call_tool name="replace_file_content">',
+                '<arg name="file_path">app.py</arg>',
+                '<arg name="start_line">2</arg>',
+                '<arg name="end_line">2</arg>',
+                '<arg name="target_content">ash_line = 1</arg>',
+                '<arg name="replacement_content">ash_line = 2</arg>',
+                "</call_tool>",
+            ],
+            ["<response>done</response>"],
+        ]
+    )
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=git_workspace,
+        tools={
+            "replace_file_content": ReplaceFileContentTool(safety_guard),
+            "auto_commit": AutoCommitTool(safety_guard),
+        },
+        auto_commit=True,
+    )
+
+    asyncio.run(loop.run_turn("change only ash_line"))
+
+    assert target.read_text() == "user_line = 2\nash_line = 2\n"
+    log = subprocess.run(
+        ["git", "log", "--oneline"], cwd=git_workspace, capture_output=True, text=True
+    )
+    assert len(log.stdout.strip().splitlines()) == 1
+    assert "seed" in log.stdout
+    status = subprocess.run(
+        ["git", "status", "--short"], cwd=git_workspace, capture_output=True, text=True
+    )
+    assert " M app.py" in status.stdout
+
+
+def test_auto_commit_paths_do_not_commit_unmodified_user_work(
+    git_workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
+) -> None:
+    target = git_workspace / "tracked.py"
+    target.write_text("value = 1\n")
+    subprocess.run(
+        ["git", "add", "tracked.py"], cwd=git_workspace, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "seed"],
+        cwd=git_workspace,
+        check=True,
+        capture_output=True,
+    )
+    target.write_text("value = 2\n")
+
+    provider = FakeProvider(scripts=[["<response>done</response>"]])
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=git_workspace,
+        auto_commit=True,
+        auto_commit_paths=[target],
+    )
+
+    asyncio.run(loop.run_turn("answer without editing"))
+
+    log = subprocess.run(
+        ["git", "log", "--oneline"], cwd=git_workspace, capture_output=True, text=True
+    )
+    assert len(log.stdout.strip().splitlines()) == 1
+    assert "seed" in log.stdout
+    status = subprocess.run(
+        ["git", "status", "--short"], cwd=git_workspace, capture_output=True, text=True
+    )
+    assert " M tracked.py" in status.stdout
+
+
+def test_auto_commit_paths_allow_clean_ash_modified_path(
+    git_workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
+) -> None:
+    target = git_workspace / "app.py"
+    target.write_text("user_line = 1\nash_line = 1\n")
+    subprocess.run(
+        ["git", "add", "app.py"], cwd=git_workspace, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "seed"],
+        cwd=git_workspace,
+        check=True,
+        capture_output=True,
+    )
+
+    provider = FakeProvider(
+        scripts=[
+            [
+                '<call_tool name="replace_file_content">',
+                '<arg name="file_path">app.py</arg>',
+                '<arg name="start_line">2</arg>',
+                '<arg name="end_line">2</arg>',
+                '<arg name="target_content">ash_line = 1</arg>',
+                '<arg name="replacement_content">ash_line = 2</arg>',
+                "</call_tool>",
+            ],
+            ["<response>done</response>"],
+        ]
+    )
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=git_workspace,
+        tools={
+            "replace_file_content": ReplaceFileContentTool(safety_guard),
+            "auto_commit": AutoCommitTool(safety_guard),
+        },
+        auto_commit=True,
+        auto_commit_paths=[target],
+    )
+
+    asyncio.run(loop.run_turn("change ash_line"))
+
+    assert target.read_text() == "user_line = 1\nash_line = 2\n"
+    log = subprocess.run(
+        ["git", "log", "--oneline"], cwd=git_workspace, capture_output=True, text=True
+    )
+    commits = log.stdout.strip().splitlines()
+    assert len(commits) == 2
+    assert "turn complete" in commits[0]
+    status = subprocess.run(
+        ["git", "status", "--short"], cwd=git_workspace, capture_output=True, text=True
+    )
+    assert "app.py" not in status.stdout
 
 
 def test_auto_commit_disabled_by_default(

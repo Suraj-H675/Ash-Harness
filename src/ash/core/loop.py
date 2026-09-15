@@ -71,7 +71,7 @@ from ash.providers.retry import (
 from ash.repo.repomap import RepoMap
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy, PolicyAction, READ_ONLY_TOOLS
-from ash.safety.scoped_io import read_scoped_bytes
+from ash.safety.scoped_io import read_scoped_bytes, snapshot_scoped_file
 from ash.tools.base import (
     BaseTool,
     ToolExecutionContract,
@@ -81,7 +81,7 @@ from ash.tools.base import (
     ToolReplayPolicy,
     ToolResult,
 )
-from ash.tools.git import auto_commit_turn
+from ash.tools.git import auto_commit_turn, git_dirty_paths
 from ash.ui.parser import Event, StreamingXMLParser
 from rich.console import Console
 
@@ -157,6 +157,7 @@ MAX_ACTIVE_REPO_FILES = 20
 DEFAULT_MEMORY_MAX_BYTES_PER_FILE = 128_000
 MAX_MEMORY_SCAN_ENTRIES = 100_000
 MAX_MEMORY_SCAN_DEPTH = 32
+MAX_AUTO_COMMIT_SNAPSHOT_BYTES = 20 * 1024 * 1024
 
 
 def _iter_project_paths(root: Path, *, max_depth: int) -> Iterator[Path]:
@@ -430,6 +431,21 @@ DEFAULT_MODEL_PRICING_USD_PER_MILLION: dict[str, dict[str, float]] = {
 }
 
 
+def _workspace_relative_path(path: Path, project_root: Path) -> str | None:
+    try:
+        return path.resolve().relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def _path_is_within_scope(path: Path, scope: Path) -> bool:
+    try:
+        path.resolve().relative_to(scope.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 class AshLoop:
     """V1 minimal agent loop."""
 
@@ -524,6 +540,8 @@ class AshLoop:
         self.auto_commit = auto_commit
         self.auto_commit_paths = list(auto_commit_paths or [])
         self._turn_modified_paths: set[Path] = set()
+        self._turn_modified_path_digests: dict[Path, str] = {}
+        self._turn_initial_dirty_paths: set[str] | None = None
         self._repo_map_active_files: list[Path] = []
         for path in self.auto_commit_paths:
             candidate = path if path.is_absolute() else self.project_root / path
@@ -1302,6 +1320,14 @@ class AshLoop:
         from ash.context.turn import TurnContext
 
         self._turn_modified_paths = set()
+        self._turn_modified_path_digests = {}
+        self._turn_initial_dirty_paths = None
+        if self.auto_commit:
+            auto_commit_tool = self.tools.get("auto_commit")
+            self._turn_initial_dirty_paths = await git_dirty_paths(
+                self.project_root,
+                sandbox_manager=getattr(auto_commit_tool, "sandbox_manager", None),
+            )
         self.turn_context = TurnContext(
             session_id=session.session_id,
             turn_id=str(uuid4()),
@@ -1766,10 +1792,86 @@ class AshLoop:
             )
 
         if self.auto_commit:
-            commit_paths = self.auto_commit_paths or sorted(self._turn_modified_paths)
+            commit_paths = sorted(self._turn_modified_paths)
+            if self.auto_commit_paths:
+                scopes = [
+                    path if path.is_absolute() else self.project_root / path
+                    for path in self.auto_commit_paths
+                ]
+                commit_paths = [
+                    path
+                    for path in commit_paths
+                    if any(_path_is_within_scope(path, scope) for scope in scopes)
+                ]
+            if commit_paths and self._turn_initial_dirty_paths is None:
+                self.ui.console.print(
+                    "auto_commit failed: could not verify the turn-start Git state; "
+                    "changes were left uncommitted."
+                )
+                commit_paths = []
             if commit_paths:
+                clean_paths: list[Path] = []
+                skipped_paths: list[str] = []
+                for path in commit_paths:
+                    relative = _workspace_relative_path(path, self.project_root)
+                    if (
+                        relative is None
+                        or relative in (self._turn_initial_dirty_paths or set())
+                    ):
+                        skipped_paths.append(relative or str(path))
+                    else:
+                        clean_paths.append(path)
+                commit_paths = clean_paths
+                if skipped_paths:
+                    self.ui.console.print(
+                        "auto_commit skipped paths dirty before this turn: "
+                        + ", ".join(skipped_paths[:20])
+                    )
+            if commit_paths:
+                unchanged_paths: list[Path] = []
+                changed_after_edit: list[str] = []
+                for path in commit_paths:
+                    expected_digest = self._turn_modified_path_digests.get(path)
+                    try:
+                        _, snapshot = snapshot_scoped_file(
+                            path,
+                            self.safety_guard,
+                            max_bytes=MAX_AUTO_COMMIT_SNAPSHOT_BYTES,
+                        )
+                    except Exception:  # noqa: BLE001 - ownership check fails closed
+                        snapshot = None
+                    if (
+                        expected_digest is None
+                        or snapshot is None
+                        or snapshot.sha256 != expected_digest
+                    ):
+                        changed_after_edit.append(
+                            _workspace_relative_path(path, self.project_root) or str(path)
+                        )
+                    else:
+                        unchanged_paths.append(path)
+                commit_paths = unchanged_paths
+                if changed_after_edit:
+                    self.ui.console.print(
+                        "auto_commit skipped paths changed after Ash's last edit: "
+                        + ", ".join(changed_after_edit[:20])
+                    )
+            if commit_paths:
+                expected_sha256 = {
+                    relative: self._turn_modified_path_digests[path]
+                    for path in commit_paths
+                    if (relative := _workspace_relative_path(path, self.project_root))
+                    is not None
+                }
                 registered_auto_commit = self.tools.get("auto_commit")
-                if registered_auto_commit is not None:
+                run_owned = getattr(registered_auto_commit, "run_owned", None)
+                if callable(run_owned):
+                    commit_result = await run_owned(
+                        message=f"ash: turn complete ({len(final_text)} chars)",
+                        paths=[str(path) for path in commit_paths],
+                        expected_sha256=expected_sha256,
+                    )
+                elif registered_auto_commit is not None:
                     commit_result = await registered_auto_commit.run(
                         message=f"ash: turn complete ({len(final_text)} chars)",
                         paths=[str(path) for path in commit_paths],
@@ -1783,6 +1885,7 @@ class AshLoop:
                         environment_allowlist=getattr(
                             self._config, "command_env_allowlist", ()
                         ),
+                        expected_sha256=expected_sha256,
                     )
                 if not commit_result.success and commit_result.error:
                     # Surface commit failures to the user but don't fail the turn.
@@ -2769,9 +2872,16 @@ class AshLoop:
             return
         for path in self._tool_paths(tool_name, arguments):
             try:
-                self._turn_modified_paths.add(self.safety_guard.validate_path(path))
+                resolved = self.safety_guard.validate_path(path)
+                _, snapshot = snapshot_scoped_file(
+                    resolved,
+                    self.safety_guard,
+                    max_bytes=MAX_AUTO_COMMIT_SNAPSHOT_BYTES,
+                )
             except Exception:  # noqa: BLE001 - auto-commit capture is best-effort
                 continue
+            self._turn_modified_paths.add(resolved)
+            self._turn_modified_path_digests[resolved] = snapshot.sha256
 
     def _tool_paths(self, tool_name: str, arguments: dict[str, Any]) -> set[str]:
         if tool_name == "apply_patch":

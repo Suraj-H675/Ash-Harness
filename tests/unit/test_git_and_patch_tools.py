@@ -17,6 +17,7 @@ from ash.tools.git import (
     GitStatusTool,
     _git_result,
     _run_git,
+    git_dirty_paths,
 )
 from ash.tools.patch import ApplyPatchTool
 
@@ -33,6 +34,26 @@ async def _init_repo(root: Path) -> None:
     await _git(root, "init", "-q")
     await _git(root, "config", "user.email", "test@example.com")
     await _git(root, "config", "user.name", "Test")
+
+
+@pytest.mark.asyncio
+async def test_git_dirty_paths_covers_index_worktree_and_untracked(tmp_path: Path) -> None:
+    await _init_repo(tmp_path)
+    staged = tmp_path / "staged.txt"
+    unstaged = tmp_path / "unstaged.txt"
+    staged.write_text("old staged\n")
+    unstaged.write_text("old unstaged\n")
+    await _git(tmp_path, "add", "staged.txt", "unstaged.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+
+    staged.write_text("new staged\n")
+    unstaged.write_text("new unstaged\n")
+    (tmp_path / "space name.txt").write_text("untracked\n")
+    await _git(tmp_path, "add", "staged.txt")
+
+    dirty = await git_dirty_paths(tmp_path)
+
+    assert dirty == {"staged.txt", "unstaged.txt", "space name.txt"}
 
 
 @pytest.mark.asyncio
@@ -407,7 +428,69 @@ async def test_auto_commit_refuses_unrelated_prestaged_paths(tmp_path: Path) -> 
     )
 
     assert result.success is False
-    assert "pre-staged paths outside explicit scope" in (result.error or "")
+    assert "Git index already contains staged paths" in (result.error or "")
+    log = await GitLogTool(SafetyGuard(tmp_path)).run(limit=1)
+    assert "initial" in log.output
+
+
+@pytest.mark.asyncio
+async def test_auto_commit_refuses_prestaged_path_inside_scope(tmp_path: Path) -> None:
+    await _init_repo(tmp_path)
+    target = tmp_path / "tracked.txt"
+    target.write_text("old\n")
+    await _git(tmp_path, "add", "tracked.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    target.write_text("user staged\n")
+    await _git(tmp_path, "add", "tracked.txt")
+
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run(
+        message="must preserve user staging",
+        paths=["tracked.txt"],
+    )
+
+    assert result.success is False
+    assert "Git index already contains staged paths" in (result.error or "")
+    status = await GitStatusTool(SafetyGuard(tmp_path)).run()
+    assert "M  tracked.txt" in status.output
+    log = await GitLogTool(SafetyGuard(tmp_path)).run(limit=1)
+    assert "initial" in log.output
+
+
+@pytest.mark.asyncio
+async def test_owned_auto_commit_refuses_change_racing_with_git_add(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+    import ash.tools.git as git_tools
+
+    await _init_repo(tmp_path)
+    target = tmp_path / "tracked.txt"
+    target.write_text("old\n")
+    await _git(tmp_path, "add", "tracked.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    target.write_text("ash edit\n")
+    expected = hashlib.sha256(target.read_bytes()).hexdigest()
+    original_run_git = git_tools._run_git
+    changed = False
+
+    async def mutate_before_add(cwd, args, *positional, **kwargs):
+        nonlocal changed
+        if list(args[:2]) == ["add", "--"] and not changed:
+            changed = True
+            target.write_text("late user edit\n")
+        return await original_run_git(cwd, args, *positional, **kwargs)
+
+    monkeypatch.setattr(git_tools, "_run_git", mutate_before_add)
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run_owned(
+        message="owned edit",
+        paths=["tracked.txt"],
+        expected_sha256={"tracked.txt": expected},
+    )
+
+    assert changed is True
+    assert result.success is False
+    assert "changed after Ash's last edit" in (result.error or "")
+    assert target.read_text() == "late user edit\n"
     log = await GitLogTool(SafetyGuard(tmp_path)).run(limit=1)
     assert "initial" in log.output
 
