@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from ash.runtime import build_runtime, build_tools
+from ash.context.turn import TurnContext
 from ash.config import AshConfig
 from ash.mcp.server import MCPServerConfig
 from ash.providers.base import ProviderABC
@@ -27,6 +28,55 @@ class RuntimeProvider(ProviderABC):
         if False:
             yield
 
+
+def test_runtime_file_checkpoint_owns_and_finalizes_provider_tool_call(tmp_path) -> None:
+    (tmp_path / "file.txt").write_text("before", encoding="utf-8")
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+    )
+
+    async def approve(_tool_name, _arguments):
+        return True
+
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=False,
+        approval_callback=approve,
+        run_maintenance=False,
+    )
+
+    async def exercise() -> None:
+        session = await runtime.loop.start_session()
+        turn_id = "runtime-checkpoint-turn"
+        runtime.loop.session_store.start_turn(session.session_id, turn_id, "edit file")
+        runtime.loop.turn_context = TurnContext(session.session_id, turn_id)
+        results = await runtime.loop._execute_tool_calls(
+            [
+                {
+                    "call_id": "runtime-edit-call",
+                    "name": "whole_edit",
+                    "arguments": {"file_path": "file.txt", "content": "after"},
+                }
+            ],
+            session,
+        )
+        assert results[0]["success"] is True
+        rows = runtime.loop.session_store.latest_file_checkpoints(session.session_id)
+        assert len(rows) == 1
+        assert rows[0]["call_id"] == "runtime-edit-call"
+        assert rows[0]["after_sha256"] is not None
+        assert (tmp_path / "file.txt").read_text(encoding="utf-8") == "after"
+        runtime.loop.session_store.complete_turn(turn_id)
+        await runtime.loop.aclose()
+
+    asyncio.run(exercise())
 
 def test_runtime_passes_user_owned_cdp_settings_to_browser_tools(tmp_path, monkeypatch) -> None:
     captured = {}

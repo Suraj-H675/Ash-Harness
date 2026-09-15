@@ -100,9 +100,9 @@ Research is clean-room: proprietary or leaked source is not used.
 | Session naming | Verified locally | Rename and stable persisted display names |
 | Fork session | Verified locally | New durable session from a selected message boundary |
 | Rewind conversation | Verified locally | Complete-turn transcript rewind plus optional conflict-preflighted multi-turn file restoration; usage totals are adjusted and filesystem changes roll forward if the database phase fails |
-| File checkpoints/undo | Verified locally | Direct edit tools capture per-turn bytes/hashes and refuse conflict overwrites |
+| File checkpoints/undo | Verified locally | Direct edit tools capture per-call pre-edit bytes and finalized hashes under the durable provider tool-call ID; provider call identity is available before checkpoint middleware runs, and undo refuses conflict overwrites |
 | Session export/import | Verified locally | Versioned redacted JSONL/Markdown export and validated JSONL import |
-| Crash recovery | Verified locally | Approved tool intent is persisted before execution; resume and cancellation compensate only hash-proven in-flight direct edits, preserve earlier completed edits, persist idempotent outcomes, and flag non-file or conflicting effects for inspection |
+| Crash recovery | Verified locally | Approved tool intent is persisted before dispatch. Real Linux SIGKILL/restart probes prove pre-dispatch calls remain not-run, dispatched non-file side effects are marked ambiguous without replay, hash-proven in-flight edits are compensated, pre-finalization or independently changed files are preserved for inspection, and a second resume is idempotent |
 | Session retention | Verified locally | Configurable automatic cleanup plus explicit project prune and vacuum |
 | Cost/token history | Verified locally | Built-in pricing defaults for current major Anthropic, OpenAI, DeepSeek, and Groq models; explicit user pricing overrides remain authoritative |
 

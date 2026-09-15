@@ -2492,6 +2492,8 @@ class AshLoop:
             try:
                 contract = _validated_tool_execution_contract(tool)
                 replay_policy = contract.replay_policy.value
+                if self.turn_context is not None:
+                    self.turn_context.set("tool_call_id", record.call_id)
                 try:
                     hooks = self._active_hooks()
                     if hooks is not None:
@@ -2514,8 +2516,6 @@ class AshLoop:
                         ),
                     )
                     self._emit_event({"type": "tool.started", **event_base})
-                    if self.turn_context is not None:
-                        self.turn_context.set("tool_call_id", record.call_id)
                     with tool.event_context(event_base):
                         dispatched = True
                         result_dict = await _execute_tool_once(tool, arguments)
