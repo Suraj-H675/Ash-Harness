@@ -57,6 +57,23 @@ header and does not inherit `OPENAI_API_KEY`. Older records without an
 `auth_mode` preserve bearer behavior when they declare a key and are otherwise
 treated as anonymous.
 
+Wire compatibility does not imply model capability. Custom routes therefore
+fail closed for native tools, vision, and reasoning unless the user declares
+capabilities for the exact model. Optional limits are positive integers:
+
+```toml
+[custom_providers.example.model_capabilities."agent-model"]
+native_tools = true
+vision = true
+reasoning = false
+context_window = 131072
+max_output_tokens = 8192
+```
+
+An undeclared model still works through the conservative text/XML-tool path;
+Ash does not send native tool schemas or image inputs merely because the server
+implements an OpenAI-compatible HTTP API.
+
 Connectivity diagnostics must receive a successful model catalog containing
 the selected model. A reachable endpoint with an empty catalog or a different
 model is reported as not ready; `ash setup` remains the remediation path.

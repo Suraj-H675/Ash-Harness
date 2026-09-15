@@ -690,6 +690,35 @@ def test_model_capability_display_covers_budgets_and_custom_models() -> None:
     assert "claude-opus-4-7 [tools, vision, reasoning]" in list_rendered
 
 
+def test_custom_model_capability_display_uses_configured_declaration() -> None:
+    from ash.cli import _render_model_capabilities
+    from ash.config import AshConfig
+
+    config = AshConfig(
+        model="custom/agent-model",
+        custom_providers={
+            "custom": {
+                "base_url": "http://127.0.0.1:8000/v1",
+                "auth_mode": "none",
+                "model_capabilities": {
+                    "agent-model": {
+                        "native_tools": True,
+                        "vision": True,
+                        "context_window": 32_768,
+                        "max_output_tokens": 4096,
+                    }
+                },
+            }
+        },
+    )
+
+    rendered = _render_model_capabilities("custom/agent-model", config)
+
+    assert "[tools, vision]" in rendered
+    assert "context 32,768" in rendered
+    assert "output 4,096" in rendered
+
+
 def test_live_catalog_refresh_renders_discovered_and_static_models() -> None:
     from ash.cli import render_model_catalog_refresh
     from ash.config import AshConfig

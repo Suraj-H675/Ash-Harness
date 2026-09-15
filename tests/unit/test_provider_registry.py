@@ -299,6 +299,8 @@ async def test_custom_anonymous_openai_compatible_provider_builds_without_bearer
 
     assert provider.model_name == "local-model"
     assert provider.provider_family == "local"
+    assert provider.capabilities.native_tools is False
+    assert provider.capabilities.vision is False
 
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/chat/completions"
@@ -327,6 +329,53 @@ async def test_custom_anonymous_openai_compatible_provider_builds_without_bearer
     ]
     assert [chunk.content for chunk in chunks] == ["works"]
     await provider.aclose()
+
+
+def test_custom_openai_compatible_provider_uses_explicit_model_capabilities() -> None:
+    config = AshConfig(
+        model="custom/agent-model",
+        custom_providers={
+            "custom": {
+                "base_url": "http://127.0.0.1:8000/v1",
+                "auth_mode": "none",
+                "model_capabilities": {
+                    "agent-model": {
+                        "native_tools": True,
+                        "vision": True,
+                        "reasoning": True,
+                        "context_window": 128_000,
+                        "max_output_tokens": 8192,
+                    }
+                },
+            }
+        },
+    )
+
+    provider = create_default_provider_registry().build(config)
+
+    assert provider.capabilities.native_tools is True
+    assert provider.capabilities.vision is True
+    assert provider.capabilities.reasoning is True
+    assert provider.capabilities.context_window == 128_000
+    assert provider.capabilities.max_output_tokens == 8192
+
+
+def test_custom_openai_compatible_provider_rejects_invalid_capability_claim() -> None:
+    config = AshConfig(
+        model="custom/agent-model",
+        custom_providers={
+            "custom": {
+                "base_url": "http://127.0.0.1:8000/v1",
+                "auth_mode": "none",
+                "model_capabilities": {
+                    "agent-model": {"native_tools": "yes"}
+                },
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="native_tools.*must be boolean"):
+        create_default_provider_registry().build(config)
 
 
 def test_custom_bearer_provider_without_its_key_is_not_configured(

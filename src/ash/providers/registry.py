@@ -10,6 +10,7 @@ from ash.providers.base import ProviderABC
 from ash.providers.capabilities import (
     CapabilityRegistry,
     CapabilityResolver,
+    ProviderCapabilities,
     get_capability_registry,
 )
 from ash.providers.identifiers import PROVIDER_NAME, parse_model_string
@@ -217,6 +218,87 @@ def _build_groq(config: "AshConfig", model_name: str) -> ProviderABC:
     return provider
 
 
+def _custom_model_capabilities(
+    config: "AshConfig",
+    provider_name: str,
+    model_name: str,
+) -> ProviderCapabilities:
+    """Resolve explicit per-model capabilities for a custom wire-compatible route."""
+
+    provider_config = config.custom_providers.get(provider_name, {})
+    raw_models = provider_config.get("model_capabilities")
+    if raw_models is None:
+        return ProviderCapabilities()
+    if not isinstance(raw_models, dict):
+        raise ValueError(
+            f"custom provider {provider_name!r} model_capabilities must be a table"
+        )
+    raw = raw_models.get(model_name)
+    if raw is None:
+        return ProviderCapabilities()
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"custom provider {provider_name!r} capabilities for {model_name!r} "
+            "must be a table"
+        )
+
+    allowed = {
+        "native_tools",
+        "vision",
+        "reasoning",
+        "context_window",
+        "max_output_tokens",
+    }
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ValueError(
+            f"custom provider {provider_name!r} capabilities for {model_name!r} "
+            "contain unknown field(s): " + ", ".join(sorted(unknown))
+        )
+
+    boolean_values: dict[str, bool] = {}
+    for field in ("native_tools", "vision", "reasoning"):
+        value = raw.get(field, False)
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"custom provider {provider_name!r} capability {field!r} for "
+                f"{model_name!r} must be boolean"
+            )
+        boolean_values[field] = value
+
+    integer_values: dict[str, int | None] = {}
+    for field in ("context_window", "max_output_tokens"):
+        value = raw.get(field)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            raise ValueError(
+                f"custom provider {provider_name!r} capability {field!r} for "
+                f"{model_name!r} must be a positive integer"
+            )
+        integer_values[field] = value
+
+    return ProviderCapabilities(
+        native_tools=boolean_values["native_tools"],
+        vision=boolean_values["vision"],
+        reasoning=boolean_values["reasoning"],
+        context_window=integer_values["context_window"],
+        max_output_tokens=integer_values["max_output_tokens"],
+    )
+
+
+def configured_model_capabilities(
+    config: "AshConfig",
+    model_string: str,
+) -> ProviderCapabilities:
+    """Resolve trusted static capability metadata without network I/O."""
+
+    provider_name, model_name = parse_model_string(model_string)
+    if provider_name in config.custom_providers:
+        return _custom_model_capabilities(config, provider_name, model_name)
+    return get_capability_registry().resolve(provider_name, model_name)
+
+
 def _build_custom_openai_provider(
     config: "AshConfig",
     provider_name: str,
@@ -232,7 +314,10 @@ def _build_custom_openai_provider(
         base_url=connection.base_url,
         allow_anonymous=connection.auth_mode == "none",
     )
-    _assign_openai_wire_route_identity(provider, provider_name)
+    provider.provider_family = provider_name
+    provider._ash_declared_capabilities = _custom_model_capabilities(
+        config, provider_name, model_name
+    )
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider
 

@@ -339,13 +339,18 @@ def _render_memory_hit(hit: Any) -> str:
     return f"{float(hit.score):.3f} {path}: {content}"
 
 
-def _render_model_capabilities(model_string: str) -> str:
+def _render_model_capabilities(model_string: str, config: AshConfig | None = None) -> str:
     """Render one model's capability and budget metadata without network I/O."""
 
-    from ash.providers.capabilities import infer_capabilities
+    if config is None:
+        from ash.providers.capabilities import infer_capabilities
 
-    provider, model_name = _parse_model_string(model_string)
-    capabilities = infer_capabilities(provider, model_name)
+        provider, model_name = _parse_model_string(model_string)
+        capabilities = infer_capabilities(provider, model_name)
+    else:
+        from ash.providers.registry import configured_model_capabilities
+
+        capabilities = configured_model_capabilities(config, model_string)
     labels = [
         label
         for label, enabled in (
@@ -1866,7 +1871,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     file=sys.stderr,
                 )
                 continue
-            print(_render_model_capabilities(model_str))
+            print(_render_model_capabilities(model_str, config))
             try:
                 loop.switch_model(model_str)
                 config.model = model_str
@@ -1890,7 +1895,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 not in {"anthropic", "openai", "deepseek", "groq", "ollama"}
             ]
             for model in custom_models:
-                lines.append(_render_model_capabilities(model))
+                lines.append(_render_model_capabilities(model, config))
             if refresh:
                 try:
                     live_models = await _discover_live_model_catalog(config)
