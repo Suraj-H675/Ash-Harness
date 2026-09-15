@@ -86,9 +86,9 @@ Research is clean-room: proprietary or leaked source is not used.
 | Project instructions | Verified locally | Trusted hierarchical `ASH.md` discovery, bounded `@import` expansion, diagnostics, and conservative conflict lint across user/project/imported instructions |
 | User instructions | Verified locally | Global `~/.ash/ASH.md` is loaded with a bounded size |
 | Session memory | Verified locally | Redacted summaries are searchable across title, ID, and persisted summary metadata without raw transcript concatenation |
-| Project memory | Verified locally | Explicit project-scoped index/search/clear controls plus opt-in trusted-workspace auto-indexing bounded by file count, file size, and configured exclusions |
-| Semantic memory | Verified locally | In-memory, Chroma, and FTS5 backend selection with index/search/delete lifecycle and bounded automatic project indexing |
-| Memory privacy | Verified locally | Project scope, explicit delete, bounded redacted semantic-memory export across in-memory and FTS-backed indexes |
+| Project memory | Verified locally | Explicit project-scoped index/search/export/clear controls plus opt-in trusted-workspace auto-indexing bounded by file count, file size, and configured exclusions; relative persistence is anchored to the selected workspace and workspace re-indexing prunes missing/unsafe indexed files |
+| Semantic memory | Verified locally | In-memory, Chroma, and FTS5 backends provide bounded document inventory plus replace/delete lifecycle; same-file re-index removes stale chunks, failed embedding replacement preserves the previous snapshot, natural-language FTS queries are converted to bounded literal terms, and real Chroma replacement/inventory is exercised with the optional vector dependencies |
+| Memory privacy | Verified locally | Recalled project memory is explicitly framed to the model as untrusted data rather than instructions/authorization; Chroma persistence rejects symlink/junction redirection, terminal search output is control-safe, and bounded redacted semantic-memory export remains available |
 
 ## 4. Sessions And Recovery
 

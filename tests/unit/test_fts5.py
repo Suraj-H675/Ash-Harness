@@ -279,6 +279,25 @@ def test_fts5_query_respects_limit(fts5_index: FTS5Index) -> None:
     assert len(results) == 3
 
 
+def test_fts5_query_treats_natural_language_punctuation_as_literal_terms(
+    fts5_index: FTS5Index,
+) -> None:
+    fts5_index.index_document(
+        "a.py", _chunks("a.py", "hello world authentication marker")
+    )
+
+    results = fts5_index.query('what is "hello? a:b OR')
+
+    assert results
+    assert results[0]["file_path"] == "a.py"
+
+
+def test_fts5_query_with_only_punctuation_is_empty(fts5_index: FTS5Index) -> None:
+    fts5_index.index_document("a.py", _chunks("a.py", "hello world"))
+
+    assert fts5_index.query('"?:-') == []
+
+
 def test_fts5_query_returns_empty_for_no_matches(fts5_index: FTS5Index) -> None:
     fts5_index.index_document("a.py", _chunks("a.py", "alpha content"))
 

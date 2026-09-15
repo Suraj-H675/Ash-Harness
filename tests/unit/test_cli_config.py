@@ -1094,3 +1094,23 @@ def test_cli_rejects_oversized_stdin_prompt_before_startup(
         f"stdin prompt exceeds {MAX_CLI_INPUT_BYTES} bytes"
         in capsys.readouterr().err
     )
+
+
+def test_memory_hit_rendering_sanitizes_workspace_terminal_controls() -> None:
+    from types import SimpleNamespace
+
+    from ash.cli import _render_memory_hit
+
+    rendered = _render_memory_hit(
+        SimpleNamespace(
+            score=0.5,
+            file_path="evil\x1b[2J.py\nforged",
+            content="line one\n\x1b]0;owned\x07line two\u202e",
+        )
+    )
+
+    assert "\x1b" not in rendered
+    assert "\n" not in rendered
+    assert "\u202e" not in rendered
+    assert "\\x1b" in rendered
+    assert "forged" in rendered

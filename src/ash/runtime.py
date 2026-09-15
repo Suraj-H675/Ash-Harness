@@ -315,6 +315,15 @@ def build_repo_map(config: AshConfig) -> Any | None:
         return None
 
 
+def _memory_persist_directory(config: AshConfig) -> Path:
+    """Anchor relative semantic-memory persistence to the selected workspace."""
+
+    path = config.chroma_persist_dir.expanduser()
+    if path.is_absolute():
+        return path
+    return config.workspace_root.expanduser().resolve() / path
+
+
 def build_runtime(
     config: AshConfig,
     ui: LoopUI,
@@ -484,7 +493,7 @@ def build_runtime(
         embedding_provider=config.embedding_provider,
         openai_api_key=config.openai_api_key,
         onnx_model_path=config.onnx_model_path,
-        chroma_persist_dir=config.chroma_persist_dir,
+        chroma_persist_dir=_memory_persist_directory(config),
         auto_index_memory=trusted and config.memory_auto_index,
         auto_index_max_files=config.memory_auto_index_max_files,
         auto_index_max_bytes_per_file=config.memory_auto_index_max_bytes_per_file,

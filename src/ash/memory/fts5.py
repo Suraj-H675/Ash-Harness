@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -14,6 +15,8 @@ from ash.safe_io import validate_unlinked_file_path
 
 
 DEFAULT_QUERY_LIMIT = 5
+MAX_QUERY_TERMS = 32
+MAX_QUERY_TERM_CHARS = 128
 CHUNK_TOKENIZE = "unicode61"
 
 
@@ -168,6 +171,27 @@ class FTS5Index:
         with closing(get_db_connection(self.db_path)) as conn:
             return query_lexical_fallback(conn, query_str, limit=limit)
 
+    def document_paths(self, *, limit: int = 10_000) -> set[str]:
+        """Return a bounded inventory of indexed document identities."""
+
+        if limit < 1 or limit > 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        with closing(get_db_connection(self.db_path)) as conn:
+            count = int(
+                conn.execute(
+                    "SELECT COUNT(DISTINCT file_path) FROM fts_index"
+                ).fetchone()[0]
+            )
+            if count > limit:
+                raise ValueError(
+                    f"memory index contains {count} documents; inventory limit is {limit}"
+                )
+            rows = conn.execute(
+                "SELECT DISTINCT file_path FROM fts_index ORDER BY file_path LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return {str(row[0]) for row in rows}
+
     def clear(self) -> None:
         with closing(get_db_connection(self.db_path)) as conn, conn:
             conn.execute("DELETE FROM fts_index")
@@ -186,6 +210,9 @@ def query_lexical_fallback(
     the default ``ORDER BY rank`` ascending puts the best matches first.
     """
 
+    literal_query = _literal_fts5_query(query_str)
+    if not literal_query:
+        return []
     cursor = db_conn.cursor()
     cursor.execute(
         """
@@ -195,6 +222,22 @@ def query_lexical_fallback(
         ORDER BY rank
         LIMIT ?
         """,
-        (query_str, limit),
+        (literal_query, limit),
     )
     return [dict(row) for row in cursor.fetchall()]
+
+
+def _literal_fts5_query(value: str) -> str:
+    """Convert natural-language input into a bounded literal FTS5 OR query."""
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for raw in re.findall(r"\w+", value, flags=re.UNICODE):
+        term = raw[:MAX_QUERY_TERM_CHARS]
+        if not term or term in seen:
+            continue
+        seen.add(term)
+        terms.append(term)
+        if len(terms) >= MAX_QUERY_TERMS:
+            break
+    return " OR ".join(f'"{term}"' for term in terms)

@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+from pathlib import Path
 
 import pytest
 
@@ -55,6 +56,37 @@ def test_runtime_passes_user_owned_cdp_settings_to_browser_tools(tmp_path, monke
     assert captured["cdp_url"] == "http://127.0.0.1:9222"
     assert captured["cdp_reuse_storage_state"] is True
     assert captured["profile_path"] is None
+
+
+def test_runtime_anchors_relative_memory_storage_to_workspace(tmp_path, monkeypatch) -> None:
+    launcher = tmp_path / "launcher"
+    workspace = tmp_path / "workspace"
+    launcher.mkdir()
+    workspace.mkdir()
+    monkeypatch.chdir(launcher)
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="fts5",
+        chroma_persist_dir=Path(".ash/chroma"),
+        repo_map_enabled=False,
+    )
+
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=False,
+        run_maintenance=False,
+    )
+    try:
+        lexical = runtime.loop._vector_pipeline.lexical_index
+        assert lexical is not None
+        assert Path(lexical._index.db_path) == workspace / ".ash" / "memory-fts5.db"
+        assert not (launcher / ".ash" / "memory-fts5.db").exists()
+    finally:
+        asyncio.run(runtime.loop.aclose())
 
 
 def test_runtime_defers_auto_memory_index_until_async_session_start(tmp_path) -> None:

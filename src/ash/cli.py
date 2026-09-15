@@ -331,6 +331,14 @@ def _render_context_provenance(report: Any | None) -> str:
     return "\n".join(lines)
 
 
+def _render_memory_hit(hit: Any) -> str:
+    """Render one semantic-memory hit without trusting workspace terminal text."""
+
+    path = terminal_safe_text(str(hit.file_path), single_line=True)
+    content = terminal_safe_text(str(hit.content)[:300], single_line=True)
+    return f"{float(hit.score):.3f} {path}: {content}"
+
+
 def _render_model_capabilities(model_string: str) -> str:
     """Render one model's capability and budget metadata without network I/O."""
 
@@ -1810,7 +1818,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     if not hits:
                         print("No memory matches.")
                     for hit in hits:
-                        print(f"{hit.score:.3f} {hit.file_path}: {hit.content[:300]}")
+                        print(_render_memory_hit(hit))
                     continue
                 if action == "export" and len(arguments) == 1:
                     if loop._vector_pipeline is None:

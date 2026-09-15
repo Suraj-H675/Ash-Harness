@@ -98,8 +98,8 @@ COMMANDS: tuple[SlashCommand, ...] = (
     ),
     SlashCommand(
         "memory",
-        "Inspect, index, search, or clear memory",
-        "/memory [status|index PATH|index-workspace [LIMIT]|search QUERY|clear]",
+        "Inspect, index, search, export, or clear memory",
+        "/memory [status|index PATH|index-workspace [LIMIT]|search QUERY|export|clear]",
     ),
     SlashCommand("exit", "Exit Ash", "/exit", aliases=("quit",)),
 )

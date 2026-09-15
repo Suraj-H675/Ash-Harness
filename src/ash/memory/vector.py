@@ -30,7 +30,10 @@ from typing import Any, Iterable, Sequence
 from ash.context.compaction import Chunk
 from ash.core.redaction import redact_text
 from ash.memory.fts5 import FTS5Index, query_lexical_fallback
-from ash.safe_io import validate_unlinked_file_path
+from ash.safe_io import validate_unlinked_directory_path, validate_unlinked_file_path
+
+
+MAX_DOCUMENT_INVENTORY_RECORDS = 100_000
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +347,16 @@ class VectorIndex(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def delete_document(self, file_path: str) -> int:
+        """Delete every indexed record belonging to ``file_path``."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def document_paths(self, *, limit: int = 10_000) -> set[str]:
+        """Return a bounded inventory of indexed document identities."""
+        raise NotImplementedError
+
+    @abstractmethod
     def clear(self) -> None:
         """Delete every indexed record."""
         raise NotImplementedError
@@ -416,6 +429,33 @@ class InMemoryVectorIndex(VectorIndex):
     def __len__(self) -> int:
         return len(self._records)
 
+    def delete_document(self, file_path: str) -> int:
+        before = len(self._records)
+        self._records = [
+            record
+            for record in self._records
+            if str(record.get("metadata", {}).get("file_path", "")) != file_path
+        ]
+        return before - len(self._records)
+
+    def document_paths(self, *, limit: int = 10_000) -> set[str]:
+        if limit < 1 or limit > 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        if len(self._records) > MAX_DOCUMENT_INVENTORY_RECORDS:
+            raise ValueError(
+                "memory index is too large for bounded document inventory"
+            )
+        paths = {
+            str(record.get("metadata", {}).get("file_path", ""))
+            for record in self._records
+            if record.get("metadata", {}).get("file_path")
+        }
+        if len(paths) > limit:
+            raise ValueError(
+                f"memory index contains more than {limit} documents"
+            )
+        return paths
+
     def clear(self) -> None:
         self._records.clear()
 
@@ -432,7 +472,15 @@ class ChromaIndex(VectorIndex):
         collection_name: str = DEFAULT_COLLECTION,
         client: Any | None = None,
     ) -> None:
-        self._persist_directory = str(persist_directory)
+        persist_path = validate_unlinked_directory_path(
+            persist_directory, label="Chroma memory directory"
+        )
+        persist_path.mkdir(parents=True, exist_ok=True)
+        self._persist_directory = str(
+            validate_unlinked_directory_path(
+                persist_path, label="Chroma memory directory"
+            )
+        )
         self._collection_name = collection_name
         self._owns_client = client is None
         self._client = client
@@ -445,13 +493,13 @@ class ChromaIndex(VectorIndex):
         if self._init_attempted and self._client is None:
             return
         self._init_attempted = True
-        try:
-            import chromadb  # type: ignore[import-not-found]
-        except ImportError as exc:
-            raise VectorBackendUnavailable(
-                "chromadb is not installed; install the 'vector' extra or use InMemoryVectorIndex."
-            ) from exc
         if self._client is None:
+            try:
+                import chromadb  # type: ignore[import-not-found]
+            except ImportError as exc:
+                raise VectorBackendUnavailable(
+                    "chromadb is not installed; install the 'vector' extra or use InMemoryVectorIndex."
+                ) from exc
             self._client = chromadb.PersistentClient(path=self._persist_directory)
         self._collection = self._client.get_or_create_collection(self._collection_name)
 
@@ -509,6 +557,43 @@ class ChromaIndex(VectorIndex):
                 )
             )
         return hits
+
+    def delete_document(self, file_path: str) -> int:
+        self._ensure_ready()
+        result = self._collection.get(where={"file_path": file_path}, include=[])
+        ids = result.get("ids") or []
+        self._collection.delete(where={"file_path": file_path})
+        return len(ids)
+
+    def document_paths(self, *, limit: int = 10_000) -> set[str]:
+        if limit < 1 or limit > 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        self._ensure_ready()
+        count = int(self._collection.count())
+        if count > MAX_DOCUMENT_INVENTORY_RECORDS:
+            raise ValueError(
+                "memory index is too large for bounded document inventory"
+            )
+        paths: set[str] = set()
+        page_size = 1000
+        for offset in range(0, count, page_size):
+            result = self._collection.get(
+                limit=min(page_size, count - offset),
+                offset=offset,
+                include=["metadatas"],
+            )
+            for metadata in result.get("metadatas") or []:
+                if not isinstance(metadata, dict):
+                    continue
+                file_path = metadata.get("file_path")
+                if not file_path:
+                    continue
+                paths.add(str(file_path))
+                if len(paths) > limit:
+                    raise ValueError(
+                        f"memory index contains more than {limit} documents"
+                    )
+        return paths
 
     def clear(self) -> None:
         self._ensure_ready()
@@ -576,6 +661,12 @@ class FTS5FallbackIndex:
             for row in rows
         ]
 
+    def delete_document(self, file_path: str) -> int:
+        return self._index.delete_document(file_path)
+
+    def document_paths(self, *, limit: int = 10_000) -> set[str]:
+        return self._index.document_paths(limit=limit)
+
     def clear(self) -> None:
         self._index.clear()
 
@@ -641,7 +732,7 @@ class VectorSearchPipeline:
         return self._lexical_index
 
     async def index_chunks(self, chunks: Sequence[Chunk], file_path: str) -> int:
-        """Embed every chunk and upsert into the vector index."""
+        """Replace one document's indexed chunks and return the new chunk count."""
 
         return await self.index_documents(((chunks, file_path),))
 
@@ -651,36 +742,47 @@ class VectorSearchPipeline:
         *,
         batch_size: int = 64,
     ) -> int:
-        """Index multiple files with bounded memory and transaction churn."""
+        """Replace multiple indexed documents with bounded batch processing."""
 
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
+        file_paths = [file_path for _, file_path in documents]
+        if len(file_paths) != len(set(file_paths)):
+            raise ValueError("documents must contain unique file paths")
 
         indexed_chunks = 0
         for offset in range(0, len(documents), batch_size):
-            batch = [
-                (chunks, file_path)
-                for chunks, file_path in documents[offset : offset + batch_size]
-                if chunks
-            ]
+            batch = list(documents[offset : offset + batch_size])
             if not batch:
                 continue
 
-            if self._lexical_index is not None:
-                self._lexical_index.add_documents(batch)
             batch_chunks = [chunk for chunks, _ in batch for chunk in chunks]
             indexed_chunks += len(batch_chunks)
+            if self._vector_enabled and batch_chunks:
+                texts = [chunk.content for chunk in batch_chunks]
+                embeddings = await self._adapter.get_embeddings(texts)
+            else:
+                texts = []
+                embeddings = []
+
+            if self._lexical_index is not None:
+                self._lexical_index.add_documents(batch)
             if not self._vector_enabled:
                 continue
 
-            texts = [chunk.content for chunk in batch_chunks]
-            embeddings = await self._adapter.get_embeddings(texts)
+            for _, file_path in batch:
+                self._vector_index.delete_document(file_path)
+            if not batch_chunks:
+                continue
+
             ids: list[str] = []
             metadatas: list[dict[str, Any]] = []
-            file_paths = [
+            file_paths_for_chunks = [
                 file_path for chunks, file_path in batch for _ in chunks
             ]
-            for chunk, file_path in zip(batch_chunks, file_paths, strict=True):
+            for chunk, file_path in zip(
+                batch_chunks, file_paths_for_chunks, strict=True
+            ):
                 chunk_key = chunk.chunk_key
                 ids.append(chunk_key)
                 metadatas.append(
@@ -698,6 +800,24 @@ class VectorSearchPipeline:
                 metadatas=metadatas,
             )
         return indexed_chunks
+
+    def delete_document(self, file_path: str) -> int:
+        """Forget one document across vector and lexical memory backends."""
+
+        deleted = self._vector_index.delete_document(file_path)
+        if self._lexical_index is not None:
+            deleted += self._lexical_index.delete_document(file_path)
+        return deleted
+
+    def document_paths(self, *, limit: int = 10_000) -> set[str]:
+        """Return bounded document identities known to any active backend."""
+
+        paths = self._vector_index.document_paths(limit=limit)
+        if self._lexical_index is not None:
+            paths.update(self._lexical_index.document_paths(limit=limit))
+        if len(paths) > limit:
+            raise ValueError(f"memory index contains more than {limit} documents")
+        return paths
 
     async def search(
         self,

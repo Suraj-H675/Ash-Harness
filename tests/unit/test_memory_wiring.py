@@ -159,3 +159,38 @@ async def test_large_repository_memory_indexing_is_bounded(tmp_path) -> None:
         assert not any(hit.file_path.endswith("module-99.py") for hit in hits)
     finally:
         await loop.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("memory_backend", ["auto", "fts5"])
+async def test_workspace_reindex_forgets_documents_deleted_from_disk(
+    tmp_path, memory_backend: str
+) -> None:
+    stale = tmp_path / "stale.py"
+    stale.write_text("deleted_workspace_memory_marker\n", encoding="utf-8")
+    config = AshConfig(
+        model="openai/memory-test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend=memory_backend,
+        chroma_persist_dir=tmp_path / "memory",
+    )
+    loop = AshLoop(
+        session_store=SessionStore(config.db_directory / "sessions.db"),
+        provider=MemoryTestProvider(),
+        ui=HeadlessUI(output_format="text"),
+        safety_guard=SafetyGuard(project_root=tmp_path),
+        project_root=tmp_path,
+        config=config,
+        enable_semantic_memory=True,
+        memory_backend=memory_backend,
+        chroma_persist_dir=tmp_path / "memory",
+    )
+    try:
+        assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 1
+        assert await loop.semantic_search("deleted_workspace_memory_marker")
+        stale.unlink()
+        assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 0
+        assert await loop.semantic_search("deleted_workspace_memory_marker") == []
+    finally:
+        await loop.aclose()

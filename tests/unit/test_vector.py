@@ -219,6 +219,93 @@ def test_chroma_index_round_trip(tmp_path: Path) -> None:
     assert hits[0].chunk_key == "f1:1-1"
 
 
+def test_chroma_document_inventory_and_replacement(tmp_path: Path) -> None:
+    if not vector_extras_available():
+        pytest.skip("chromadb not installed in this environment")
+    index = ChromaIndex(
+        persist_directory=tmp_path / "chroma-inventory",
+        collection_name="ash_inventory",
+    )
+    pipeline = VectorSearchPipeline(
+        adapter=DeterministicEmbedding(dimension=3),
+        vector_index=index,
+    )
+
+    async def runner() -> None:
+        await pipeline.index_chunks(
+            [
+                Chunk(file_path="a.py", start_line=1, end_line=1, content="alpha"),
+                Chunk(file_path="a.py", start_line=2, end_line=2, content="stale-marker"),
+            ],
+            file_path="a.py",
+        )
+        await pipeline.index_chunks(
+            [Chunk(file_path="a.py", start_line=1, end_line=1, content="replacement")],
+            file_path="a.py",
+        )
+        await pipeline.index_chunks(
+            [Chunk(file_path="b.py", start_line=1, end_line=1, content="beta")],
+            file_path="b.py",
+        )
+
+    asyncio.run(runner())
+
+    assert index.document_paths() == {"a.py", "b.py"}
+    assert index.delete_document("a.py") == 1
+    assert index.document_paths() == {"b.py"}
+
+
+def test_chroma_index_rejects_symlinked_persistence_parent(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked"
+    try:
+        linked_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    class FakeClient:
+        def get_or_create_collection(self, _name):
+            raise AssertionError("unsafe persistence path must be rejected first")
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        ChromaIndex(linked_parent / "chroma", client=FakeClient())
+
+    assert not (outside / "chroma").exists()
+
+
+def test_chroma_delete_document_uses_file_path_metadata_filter(tmp_path: Path) -> None:
+    class FakeCollection:
+        def __init__(self) -> None:
+            self.get_calls = []
+            self.delete_calls = []
+
+        def get(self, **kwargs):
+            self.get_calls.append(kwargs)
+            return {"ids": ["a:1", "a:2"]}
+
+        def delete(self, **kwargs):
+            self.delete_calls.append(kwargs)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.collection = FakeCollection()
+
+        def get_or_create_collection(self, _name):
+            return self.collection
+
+    client = FakeClient()
+    index = ChromaIndex(tmp_path / "unused", client=client)
+
+    assert index.delete_document("src/a.py") == 2
+    assert client.collection.get_calls == [
+        {"where": {"file_path": "src/a.py"}, "include": []}
+    ]
+    assert client.collection.delete_calls == [
+        {"where": {"file_path": "src/a.py"}}
+    ]
+
+
 # ---------------------------------------------------------------------------
 # FTS5 fallback
 # ---------------------------------------------------------------------------
@@ -407,6 +494,153 @@ def test_pipeline_index_documents_batches_files(tmp_path: Path) -> None:
     assert asyncio.run(runner()) == 2
     assert pipeline.lexical_index is not None
     assert len(pipeline.lexical_index.query("alpha")) == 1
+
+
+def test_pipeline_reindex_replaces_all_prior_vector_chunks_for_file() -> None:
+    index = InMemoryVectorIndex()
+    pipeline = VectorSearchPipeline(
+        adapter=DeterministicEmbedding(),
+        vector_index=index,
+    )
+
+    async def runner() -> None:
+        await pipeline.index_chunks(
+            [
+                Chunk(
+                    file_path="a.py",
+                    start_line=1,
+                    end_line=50,
+                    content="current marker",
+                ),
+                Chunk(
+                    file_path="a.py",
+                    start_line=51,
+                    end_line=100,
+                    content="stale_unique_marker",
+                ),
+            ],
+            file_path="a.py",
+        )
+        await pipeline.index_chunks(
+            [
+                Chunk(
+                    file_path="a.py",
+                    start_line=1,
+                    end_line=20,
+                    content="replacement marker",
+                )
+            ],
+            file_path="a.py",
+        )
+
+        assert len(index) == 1
+        assert index._records[0]["document"] == "replacement marker"
+        hits, _ = await pipeline.search("stale_unique_marker", top_k=5)
+        assert not any("stale_unique_marker" in hit.content for hit in hits)
+
+    asyncio.run(runner())
+
+
+def test_pipeline_delete_document_removes_vector_and_lexical_memory(
+    tmp_path: Path,
+) -> None:
+    index = InMemoryVectorIndex()
+    pipeline = VectorSearchPipeline(
+        adapter=DeterministicEmbedding(),
+        vector_index=index,
+        lexical_index=FTS5FallbackIndex(FTS5Index(tmp_path / "delete.db")),
+    )
+
+    async def runner() -> None:
+        await pipeline.index_chunks(
+            [
+                Chunk(
+                    file_path="a.py",
+                    start_line=1,
+                    end_line=1,
+                    content="delete_unique_marker",
+                )
+            ],
+            file_path="a.py",
+        )
+        assert pipeline.delete_document("a.py") >= 1
+        hits, _ = await pipeline.search("delete_unique_marker", top_k=5)
+        assert hits == []
+        assert pipeline.lexical_index is not None
+        assert pipeline.lexical_index.query("delete_unique_marker") == []
+
+    asyncio.run(runner())
+
+
+def test_pipeline_failed_embedding_reindex_preserves_previous_backends(
+    tmp_path: Path,
+) -> None:
+    class ToggleAdapter(DeterministicEmbedding):
+        fail = False
+
+        async def get_embeddings(self, texts):
+            if self.fail:
+                raise EmbeddingBackendUnavailable("simulated reindex failure")
+            return await super().get_embeddings(texts)
+
+    adapter = ToggleAdapter()
+    index = InMemoryVectorIndex()
+    pipeline = VectorSearchPipeline(
+        adapter=adapter,
+        vector_index=index,
+        lexical_index=FTS5FallbackIndex(FTS5Index(tmp_path / "atomic.db")),
+    )
+
+    async def runner() -> None:
+        await pipeline.index_chunks(
+            [Chunk(file_path="a.py", start_line=1, end_line=1, content="old_unique")],
+            file_path="a.py",
+        )
+        adapter.fail = True
+        with pytest.raises(EmbeddingBackendUnavailable, match="simulated"):
+            await pipeline.index_chunks(
+                [Chunk(file_path="a.py", start_line=1, end_line=1, content="new_unique")],
+                file_path="a.py",
+            )
+
+        assert any(record["document"] == "old_unique" for record in index._records)
+        assert pipeline.lexical_index is not None
+        assert pipeline.lexical_index.query("old_unique")
+        assert pipeline.lexical_index.query("new_unique") == []
+
+    asyncio.run(runner())
+
+
+def test_pipeline_empty_reindex_forgets_existing_document() -> None:
+    index = InMemoryVectorIndex()
+    pipeline = VectorSearchPipeline(
+        adapter=DeterministicEmbedding(),
+        vector_index=index,
+    )
+
+    async def runner() -> None:
+        await pipeline.index_chunks(
+            [Chunk(file_path="a.py", start_line=1, end_line=1, content="old marker")],
+            file_path="a.py",
+        )
+        assert await pipeline.index_chunks([], file_path="a.py") == 0
+        assert len(index) == 0
+
+    asyncio.run(runner())
+
+
+def test_pipeline_rejects_duplicate_document_paths_in_one_batch() -> None:
+    pipeline = VectorSearchPipeline(
+        adapter=DeterministicEmbedding(),
+        vector_index=InMemoryVectorIndex(),
+    )
+    documents = [
+        ([Chunk(file_path="a.py", start_line=1, end_line=1, content="one")], "a.py"),
+        ([Chunk(file_path="a.py", start_line=2, end_line=2, content="two")], "a.py"),
+    ]
+
+    with pytest.raises(ValueError, match="unique file paths"):
+        asyncio.run(pipeline.index_documents(documents))
 
 
 def test_pipeline_index_empty_chunks_is_noop() -> None:
