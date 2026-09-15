@@ -645,3 +645,53 @@ async def test_async_sdk_steers_running_turn_without_waiting_for_prompt_lock(
         message["role"] == "user" and message["content"] == "redirect now"
         for message in provider.received_messages[1]
     )
+
+
+@pytest.mark.asyncio
+async def test_sdk_mcp_interactions_require_explicit_headless_callbacks(tmp_path) -> None:
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        mcp_sampling_enabled=True,
+        mcp_elicitation_enabled=True,
+    )
+
+    without_callbacks = await AshClient.create(
+        config=config,
+        provider=SDKProvider(),
+        workspace_trusted=False,
+        run_maintenance=False,
+    )
+    try:
+        interactions = without_callbacks.loop._mcp_interactions
+        assert interactions is not None
+        assert interactions.supports_sampling is False
+        assert interactions.supports_elicitation is False
+    finally:
+        await without_callbacks.close()
+
+    async def review(_server: str, _stage: str, _payload: dict) -> bool:
+        return True
+
+    async def elicit(_server: str, _message: str, _schema: dict) -> dict:
+        return {"action": "decline"}
+
+    with_callbacks = await AshClient.create(
+        config=config,
+        provider=SDKProvider(),
+        agent_provider_factory=SDKProvider,
+        workspace_trusted=False,
+        mcp_sampling_review=review,
+        mcp_elicitation_callback=elicit,
+        run_maintenance=False,
+    )
+    try:
+        interactions = with_callbacks.loop._mcp_interactions
+        assert interactions is not None
+        assert interactions.supports_sampling is True
+        assert interactions.supports_elicitation is True
+    finally:
+        await with_callbacks.close()

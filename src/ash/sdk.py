@@ -24,6 +24,7 @@ from ash.core.events import EVENT_SCHEMA_VERSION, envelope_event, event_data
 from ash.core.loop import AshLoop
 from ash.core.redaction import redact_text
 from ash.core.session import SessionLineage, SessionSummary
+from ash.mcp.interactions import ElicitationCallback, SamplingReview
 from ash.mcp.server import MCPServerConfig
 from ash.providers.base import ProviderABC
 from ash.runtime import build_runtime
@@ -187,6 +188,8 @@ class AshClient:
         workspace_trusted: bool | None = None,
         session_id: str | None = None,
         additional_mcp_configs: dict[str, MCPServerConfig] | None = None,
+        mcp_sampling_review: SamplingReview | None = None,
+        mcp_elicitation_callback: ElicitationCallback | None = None,
         run_maintenance: bool = True,
     ) -> "AshClient":
         """Create a client, honoring persisted workspace trust unless overridden."""
@@ -204,6 +207,8 @@ class AshClient:
             workspace_trusted=workspace_trusted,
             approval_callback=approval_callback,
             additional_mcp_configs=additional_mcp_configs,
+            mcp_sampling_review=mcp_sampling_review,
+            mcp_elicitation_callback=mcp_elicitation_callback,
             run_maintenance=run_maintenance,
         )
         client = cls(runtime.loop, runtime_config)

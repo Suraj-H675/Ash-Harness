@@ -57,6 +57,8 @@ MAX_CONSECUTIVE_TOOL_REFRESHES = 3
 TOOL_REFRESH_DEBOUNCE_SECONDS = 0.05
 TOOL_REFRESH_QUIET_PERIOD_SECONDS = TOOL_REFRESH_DEBOUNCE_SECONDS * 2
 
+MCPInteractionHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+
 
 async def _settle_task_after_cancellation(
     task: asyncio.Task[Any],
@@ -963,6 +965,8 @@ class MCPRuntime:
         | None = None,
         event_sink: Callable[[dict[str, Any]], None] | None = None,
         defer_notifications: bool = False,
+        sampling_handler: MCPInteractionHandler | None = None,
+        elicitation_handler: MCPInteractionHandler | None = None,
     ) -> None:
         self.configs = configs
         self.safety_guard = safety_guard
@@ -972,6 +976,8 @@ class MCPRuntime:
         self._tool_change_handler = tool_change_handler
         self._event_sink = event_sink
         self._defer_notifications = defer_notifications
+        self._sampling_handler = sampling_handler
+        self._elicitation_handler = elicitation_handler
         self._refresh_locks: dict[str, asyncio.Lock] = {}
         self._recovery_reconcile_locks: dict[str, asyncio.Lock] = {}
         self._refresh_owners: dict[str, asyncio.Task[Any]] = {}
@@ -994,10 +1000,40 @@ class MCPRuntime:
     def _configure_client(
         self, server_name: str, config: MCPServerConfig
     ) -> MCPClient:
-        client = MCPClient(
-            config,
-            roots=(self.safety_guard.project_root,),
+        sampling_callback = self._sampling_handler
+        sampling_handler = (
+            (
+                lambda params, server=server_name, callback=sampling_callback: callback(
+                    server, params
+                )
+            )
+            if sampling_callback is not None
+            else None
         )
+        elicitation_callback = self._elicitation_handler
+        elicitation_handler = (
+            (
+                lambda params, server=server_name, callback=elicitation_callback: callback(
+                    server, params
+                )
+            )
+            if elicitation_callback is not None
+            else None
+        )
+        client_kwargs: dict[str, Any] = {
+            "roots": (self.safety_guard.project_root,),
+        }
+        if sampling_handler is not None:
+            client_kwargs.update(
+                sampling_handler=sampling_handler,
+                sampling_supports_tools=False,
+            )
+        if elicitation_handler is not None:
+            client_kwargs.update(
+                elicitation_handler=elicitation_handler,
+                elicitation_modes=("form",),
+            )
+        client = MCPClient(config, **client_kwargs)
         client.notification_handler = (
             lambda method, params, server=server_name, source=client: (
                 self._handle_notification(server, source, method, params)

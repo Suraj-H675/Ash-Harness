@@ -668,6 +668,26 @@ class AshConfig(BaseSettings):
         default_factory=dict,
         description="MCP server configurations loaded from .mcp.json.",
     )
+    mcp_sampling_enabled: bool = Field(
+        False,
+        description=(
+            "Allow explicitly reviewed MCP sampling/createMessage requests. "
+            "This is user-owned configuration and cannot be enabled by a project."
+        ),
+    )
+    mcp_elicitation_enabled: bool = Field(
+        False,
+        description=(
+            "Allow explicitly reviewed MCP form elicitation requests. "
+            "This is user-owned configuration and cannot be enabled by a project."
+        ),
+    )
+    mcp_sampling_max_tokens: int = Field(
+        4096,
+        ge=1,
+        le=32768,
+        description="Maximum output-token budget for one approved MCP sampling request.",
+    )
 
     custom_providers: dict[str, dict] = Field(
         default_factory=dict,

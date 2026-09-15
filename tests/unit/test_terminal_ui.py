@@ -435,3 +435,89 @@ def test_terminal_ui_status_does_not_interpret_rich_markup() -> None:
     rendered = output.getvalue()
     assert "\x1b]8;" not in rendered
     assert "[link=https://evil.test]click[/link]" in rendered
+
+
+def test_mcp_sampling_review_never_inherits_auto_approve() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        safety_tier="auto_approve",
+        input_stream=StringIO("n\n"),
+        console=Console(file=output, force_terminal=False, width=100),
+    )
+
+    approved = ui.review_mcp_sampling(
+        "docs\x1b[31m",
+        "request",
+        {
+            "maxTokens": 100,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+            ],
+        },
+    )
+
+    assert approved is False
+    rendered = output.getvalue()
+    assert "docs" in rendered
+    assert "MCP sampling request" in rendered
+    assert "\x1b[31m" not in rendered
+
+
+def test_mcp_sampling_review_displays_entire_bounded_payload() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        input_stream=StringIO("n\n"),
+        console=Console(file=output, force_terminal=False, width=120),
+    )
+    end_marker = "END_OF_REVIEW_PAYLOAD"
+    payload = {"response": "x" * 13_000 + end_marker}
+
+    approved = ui.review_mcp_sampling("docs", "response", payload)
+
+    assert approved is False
+    assert end_marker in output.getvalue()
+
+
+def test_mcp_form_elicitation_collects_reviews_and_submits_typed_values() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        input_stream=StringIO("Suraj\n3\ny\ny\n"),
+        console=Console(file=output, force_terminal=False, width=100),
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "title": "Name"},
+            "count": {"type": "integer", "title": "Count"},
+            "confirm": {"type": "boolean", "title": "Confirm"},
+        },
+        "required": ["name", "count", "confirm"],
+        "additionalProperties": False,
+    }
+
+    response = ui.request_mcp_elicitation("docs", "Provide values", schema)
+
+    assert response == {
+        "action": "accept",
+        "content": {"name": "Suraj", "count": 3, "confirm": True},
+    }
+    rendered = output.getvalue()
+    assert "Provide values" in rendered
+    assert "Review MCP form response" in rendered
+
+
+def test_mcp_form_elicitation_can_edit_before_submit() -> None:
+    ui = TerminalUI(
+        input_stream=StringIO("first\ne\nsecond\ny\n"),
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    schema = {
+        "type": "object",
+        "properties": {"value": {"type": "string"}},
+        "required": ["value"],
+        "additionalProperties": False,
+    }
+
+    response = ui.request_mcp_elicitation("docs", "Value", schema)
+
+    assert response == {"action": "accept", "content": {"value": "second"}}

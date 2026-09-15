@@ -11,6 +11,8 @@ automated tests and CI can drive the loop.
 from __future__ import annotations
 
 import difflib
+import json
+import math
 import os
 import shlex
 import subprocess
@@ -171,6 +173,241 @@ class TerminalUI:
         """Whether an embedding host supplied an explicit decision callback."""
 
         return self._approval_callback is not None
+
+    @property
+    def supports_mcp_interactions(self) -> bool:
+        """Interactive terminals can explicitly review MCP server requests."""
+
+        return True
+
+    def review_mcp_sampling(
+        self, server: str, stage: str, payload: dict[str, Any]
+    ) -> bool:
+        """Require an explicit one-shot decision for MCP sampling."""
+
+        live = getattr(self, "_active_live", None)
+        if live is not None:
+            live.stop()
+        try:
+            safe_server = terminal_safe_text(server, single_line=True)
+            label = "request" if stage == "request" else "response"
+            body = Text()
+            body.append(f"Server: {safe_server}\n", style="bold")
+            body.append(
+                terminal_safe_text(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        indent=2,
+                        allow_nan=False,
+                    )
+                )
+            )
+            body.append(
+                f"\n\nApprove this MCP sampling {label}? [y/N] ",
+                style=self.theme.approval_prompt,
+            )
+            self.transcript.append(
+                "approval",
+                f"MCP sampling {label} requested by {safe_server}",
+                title="MCP sampling",
+                metadata={"server": safe_server, "stage": label},
+            )
+            if self.screen_reader_mode:
+                self.console.print(
+                    f"MCP sampling {label} from {safe_server}:",
+                    markup=False,
+                    highlight=False,
+                )
+                self.console.print(body.plain, markup=False, highlight=False)
+            elif not self.viewport_mode:
+                self.console.print(
+                    Panel(
+                        body,
+                        title=f"MCP sampling {label}",
+                        border_style=self.theme.border_approval,
+                    )
+                )
+            raw = self._input_stream.readline()
+            if raw == "":
+                return False
+            return raw.strip().casefold() in {"y", "yes"}
+        except (EOFError, KeyboardInterrupt, ValueError, TypeError):
+            return False
+        finally:
+            if live is not None:
+                live.start()
+
+    @staticmethod
+    def _parse_mcp_form_value(raw: str, schema: dict[str, Any]) -> Any:
+        field_type = schema.get("type")
+        if field_type == "boolean":
+            normalized = raw.strip().casefold()
+            if normalized in {"y", "yes", "true", "1"}:
+                return True
+            if normalized in {"n", "no", "false", "0"}:
+                return False
+            raise ValueError("enter yes/no or true/false")
+        if field_type == "integer":
+            integer_value = int(raw.strip())
+            if "minimum" in schema and integer_value < schema["minimum"]:
+                raise ValueError(f"minimum is {schema['minimum']}")
+            if "maximum" in schema and integer_value > schema["maximum"]:
+                raise ValueError(f"maximum is {schema['maximum']}")
+            return integer_value
+        if field_type == "number":
+            number_value = float(raw.strip())
+            if not math.isfinite(number_value):
+                raise ValueError("number must be finite")
+            if "minimum" in schema and number_value < schema["minimum"]:
+                raise ValueError(f"minimum is {schema['minimum']}")
+            if "maximum" in schema and number_value > schema["maximum"]:
+                raise ValueError(f"maximum is {schema['maximum']}")
+            return number_value
+        if field_type == "array":
+            values = [item.strip() for item in raw.split(",") if item.strip()]
+            allowed = schema.get("items", {}).get("enum", [])
+            if allowed and any(item not in allowed for item in values):
+                raise ValueError("choose only the listed values")
+            if "minItems" in schema and len(values) < schema["minItems"]:
+                raise ValueError(f"select at least {schema['minItems']} value(s)")
+            if "maxItems" in schema and len(values) > schema["maxItems"]:
+                raise ValueError(f"select at most {schema['maxItems']} value(s)")
+            return list(dict.fromkeys(values))
+        if field_type != "string":
+            raise ValueError("unsupported field type")
+        text_value = raw.strip()
+        allowed = schema.get("enum")
+        if isinstance(allowed, list) and text_value not in allowed:
+            raise ValueError("choose one of the listed values")
+        if "minLength" in schema and len(text_value) < schema["minLength"]:
+            raise ValueError(f"minimum length is {schema['minLength']}")
+        if "maxLength" in schema and len(text_value) > schema["maxLength"]:
+            raise ValueError(f"maximum length is {schema['maxLength']}")
+        return text_value
+
+    def _collect_mcp_form(
+        self, schema: dict[str, Any], previous: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        properties = schema.get("properties", {})
+        required = set(schema.get("required", []))
+        output: dict[str, Any] = {}
+        for name, field_schema in properties.items():
+            if not isinstance(field_schema, dict):
+                return None
+            label = str(field_schema.get("title") or name)
+            description = str(field_schema.get("description") or "")
+            allowed = field_schema.get("enum")
+            if allowed is None and field_schema.get("type") == "array":
+                allowed = field_schema.get("items", {}).get("enum")
+            while True:
+                if description and not self.viewport_mode:
+                    self.console.print(
+                        terminal_safe_text(description),
+                        style="dim",
+                        markup=False,
+                        highlight=False,
+                    )
+                if isinstance(allowed, list) and allowed and not self.viewport_mode:
+                    options = ", ".join(terminal_safe_text(str(item)) for item in allowed)
+                    self.console.print(
+                        f"Options: {options}", markup=False, highlight=False
+                    )
+                default = previous.get(name, field_schema.get("default"))
+                suffix = f" [{terminal_safe_text(str(default))}]" if default is not None else ""
+                prompt = f"{terminal_safe_text(label, single_line=True)}{suffix}: "
+                if not self.viewport_mode:
+                    self.console.print(prompt, end="", markup=False, highlight=False)
+                raw_line = self._input_stream.readline()
+                if raw_line == "":
+                    return None
+                raw = raw_line.rstrip("\r\n")
+                if not raw:
+                    if default is not None:
+                        output[name] = default
+                        break
+                    if name not in required:
+                        break
+                    if not self.viewport_mode:
+                        self.console.print("A value is required.", style=self.theme.error)
+                    continue
+                try:
+                    output[name] = self._parse_mcp_form_value(raw, field_schema)
+                    break
+                except (TypeError, ValueError) as exc:
+                    if not self.viewport_mode:
+                        self.console.print(
+                            terminal_safe_text(f"Invalid value: {exc}"),
+                            style=self.theme.error,
+                            markup=False,
+                            highlight=False,
+                        )
+        return output
+
+    def request_mcp_elicitation(
+        self, server: str, message: str, schema: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Collect a reviewed non-sensitive MCP form response."""
+
+        live = getattr(self, "_active_live", None)
+        if live is not None:
+            live.stop()
+        try:
+            safe_server = terminal_safe_text(server, single_line=True)
+            if not self.viewport_mode:
+                self.console.print(
+                    Panel(
+                        terminal_safe_text(message),
+                        title=f"MCP form — {safe_server}",
+                        border_style=self.theme.border_approval,
+                    )
+                )
+            previous: dict[str, Any] = {}
+            while True:
+                values = self._collect_mcp_form(schema, previous)
+                if values is None:
+                    return {"action": "cancel"}
+                previous = values
+                if not self.viewport_mode:
+                    self.console.print("Review MCP form response:", style="bold")
+                    for key, value in values.items():
+                        self.console.print(
+                            f"  {terminal_safe_text(str(key), single_line=True)} = "
+                            f"{terminal_safe_text(repr(value))}",
+                            markup=False,
+                            highlight=False,
+                        )
+                    self.console.print(
+                        "Submit [y], edit [e], decline [n], or cancel [c]? ",
+                        end="",
+                        markup=False,
+                        highlight=False,
+                    )
+                raw = self._input_stream.readline()
+                if raw == "":
+                    return {"action": "cancel"}
+                action = raw.strip().casefold()
+                if action in {"y", "yes"}:
+                    self.transcript.append(
+                        "approval",
+                        f"Submitted MCP form for {safe_server} ({len(values)} field(s))",
+                        title="MCP elicitation",
+                        metadata={"server": safe_server, "action": "accept"},
+                    )
+                    return {"action": "accept", "content": values}
+                if action in {"e", "edit"}:
+                    continue
+                if action in {"n", "no", "decline"}:
+                    return {"action": "decline"}
+                if action in {"c", "cancel", ""}:
+                    return {"action": "cancel"}
+                if not self.viewport_mode:
+                    self.console.print("Choose y, e, n, or c.", style=self.theme.error)
+        except (EOFError, KeyboardInterrupt):
+            return {"action": "cancel"}
+        finally:
+            if live is not None:
+                live.start()
 
     # --- streaming surface ------------------------------------------------
 

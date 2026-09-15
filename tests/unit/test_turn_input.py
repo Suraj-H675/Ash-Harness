@@ -487,3 +487,93 @@ async def test_ambiguous_command_prefix_approval_fails_closed(
     assert approved is False
     assert load_permission_rules(tmp_path) == []
     assert statuses and statuses[0].startswith("Permission scope rejected:")
+
+
+class ScriptedPrompt:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = list(responses)
+        self.prompts: list[str] = []
+
+    async def read(self, prompt: str = "> ") -> str:
+        self.prompts.append(prompt)
+        if not self.responses:
+            return ""
+        return self.responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_interactive_controller_reviews_mcp_sampling_with_prompt_input(
+    tmp_path: Path,
+) -> None:
+    prompt = ScriptedPrompt(["y"])
+    statuses: list[str] = []
+    ui = make_ui()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        BlockingProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+        write_status=statuses.append,
+    )
+
+    approved = await controller.review_mcp_sampling(
+        "docs",
+        "request",
+        {"messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert approved is True
+    assert prompt.prompts == ["Approve MCP sampling request? [y/N] "]
+    assert controller._approval_active is False
+    assert controller._approval_complete.is_set()
+
+
+@pytest.mark.asyncio
+async def test_interactive_controller_collects_mcp_elicitation_with_prompt_input(
+    tmp_path: Path,
+) -> None:
+    prompt = ScriptedPrompt(["Suraj", "3", "yes", "y"])
+    statuses: list[str] = []
+    ui = make_ui()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        BlockingProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+        write_status=statuses.append,
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "title": "Name"},
+            "count": {"type": "integer", "title": "Count"},
+            "confirm": {"type": "boolean", "title": "Confirm"},
+        },
+        "required": ["name", "count", "confirm"],
+        "additionalProperties": False,
+    }
+
+    response = await controller.request_mcp_elicitation(
+        "docs", "Provide safe values", schema
+    )
+
+    assert response == {
+        "action": "accept",
+        "content": {"name": "Suraj", "count": 3, "confirm": True},
+    }
+    assert prompt.prompts[-1].startswith("Submit MCP form")
+    assert any("Provide safe values" in status for status in statuses)
+    assert controller._approval_active is False
+    assert controller._approval_complete.is_set()

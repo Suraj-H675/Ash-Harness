@@ -209,3 +209,13 @@ def test_stream_json_emits_tool_lifecycle_events() -> None:
     assert observed[0]["type"] == "tool.started"
     assert observed[0]["call_id"] == "c1"
     assert observed[0]["tool"] == "read_file"
+
+
+def test_headless_ui_never_claims_interactive_mcp_review() -> None:
+    ui = HeadlessUI(output_format="text")
+
+    assert ui.supports_mcp_interactions is False
+    assert ui.review_mcp_sampling("docs", "request", {}) is False
+    assert ui.request_mcp_elicitation("docs", "question", {}) == {
+        "action": "decline"
+    }

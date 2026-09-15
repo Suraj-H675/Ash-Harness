@@ -1023,3 +1023,37 @@ def test_setup_written_settings_keep_dotenv_provenance(
         "dotenv",
         f"ASH_MODEL in {cli_config.ENV_FILE}",
     )
+
+
+def test_mcp_interaction_controls_are_user_owned_project_config() -> None:
+    from ash.config import _filter_project_config
+
+    diagnostics: list[str] = []
+    filtered = _filter_project_config(
+        AshConfig,
+        Path("/tmp/project/.ash/config.toml"),
+        {
+            "mcp_sampling_enabled": True,
+            "mcp_elicitation_enabled": True,
+            "mcp_sampling_max_tokens": 9999,
+        },
+        diagnostics,
+    )
+
+    assert filtered == {}
+    assert len(diagnostics) == 3
+    assert all("user-owned" in item for item in diagnostics)
+
+
+def test_mcp_interaction_controls_validate_user_values() -> None:
+    config = AshConfig(
+        mcp_sampling_enabled=True,
+        mcp_elicitation_enabled=True,
+        mcp_sampling_max_tokens=2048,
+    )
+    assert config.mcp_sampling_enabled is True
+    assert config.mcp_elicitation_enabled is True
+    assert config.mcp_sampling_max_tokens == 2048
+
+    with pytest.raises(ValueError, match="mcp_sampling_max_tokens"):
+        AshConfig(mcp_sampling_max_tokens=0)

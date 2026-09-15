@@ -105,6 +105,7 @@ _log = get_logger(__name__)
 if TYPE_CHECKING:
     from ash.core.planner import Planner
     from ash.core.sprint import SprintExecution
+    from ash.mcp.interactions import MCPInteractionController
 
 
 ToolApprovalCallback = Callable[
@@ -119,6 +120,17 @@ class LoopUI(Protocol):
 
     @property
     def has_approval_callback(self) -> bool: ...
+
+    @property
+    def supports_mcp_interactions(self) -> bool: ...
+
+    def review_mcp_sampling(
+        self, server: str, stage: str, payload: dict[str, Any]
+    ) -> bool: ...
+
+    def request_mcp_elicitation(
+        self, server: str, message: str, schema: dict[str, Any]
+    ) -> dict[str, Any]: ...
 
     def begin_turn(self) -> ContextManager[Any]: ...
     def finalize_turn(self) -> None: ...
@@ -464,6 +476,7 @@ class AshLoop:
         auto_index_max_bytes_per_file: int = DEFAULT_MEMORY_MAX_BYTES_PER_FILE,
         mcp_config_path: Path | None = None,
         mcp_configs: dict[str, MCPServerConfig] | None = None,
+        mcp_interactions: "MCPInteractionController | None" = None,
         config: "AshConfig | None" = None,
         max_steering_messages: int = 20,
     ) -> None:
@@ -593,6 +606,7 @@ class AshLoop:
         self._closing = False
         self._closed = False
         self._mcp_configs = dict(mcp_configs or {})
+        self._mcp_interactions = mcp_interactions
         self._hook_session_open = False
         if mcp_config_path is not None and mcp_config_path.exists():
             loaded_mcp_configs = load_mcp_servers(mcp_config_path)
@@ -1006,12 +1020,23 @@ class AshLoop:
                 raise RuntimeError("stale MCP runtime attempted a catalog refresh")
             await self._replace_mcp_server_tools(server_name, previous, replacement)
 
+        interactions = self._mcp_interactions
         runtime = MCPRuntime(
             configs,
             self.safety_guard,
             tool_change_handler=replace_server_tools,
             event_sink=self._emit_event,
             defer_notifications=True,
+            sampling_handler=(
+                interactions.handle_sampling
+                if interactions is not None and interactions.supports_sampling
+                else None
+            ),
+            elicitation_handler=(
+                interactions.handle_elicitation
+                if interactions is not None and interactions.supports_elicitation
+                else None
+            ),
         )
         try:
             tools = await runtime.start()

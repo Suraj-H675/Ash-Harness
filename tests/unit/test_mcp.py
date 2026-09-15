@@ -4208,6 +4208,105 @@ async def test_mcp_duplicate_server_request_id_does_not_replace_owner() -> None:
     assert client._incoming_requests == {}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["roots/list", "sampling/createMessage", "elicitation/create"])
+async def test_mcp_rejects_unassociated_contextual_server_requests(method: str) -> None:
+    sampling = AsyncMock(return_value={"role": "assistant", "content": {"type": "text", "text": "ok"}, "model": "test"})
+    elicitation = AsyncMock(return_value={"action": "cancel"})
+    client = MCPClient(
+        MCPServerConfig(name="fake", command="fake", args=[], env={}),
+        roots=(Path.cwd(),),
+        sampling_handler=sampling,
+        elicitation_handler=elicitation,
+    )
+    client._send_message = AsyncMock()
+
+    client._dispatch_incoming(
+        {"jsonrpc": "2.0", "id": "server-1", "method": method, "params": {}}
+    )
+    await asyncio.sleep(0)
+    await asyncio.gather(*tuple(client._server_tasks))
+
+    sampling.assert_not_awaited()
+    elicitation.assert_not_awaited()
+    response = client._send_message.await_args.args[0]
+    assert response["id"] == "server-1"
+    assert response["error"]["code"] == -32600
+    assert "associated" in response["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_allows_sampling_nested_under_active_client_request() -> None:
+    sampling = AsyncMock(
+        return_value={
+            "role": "assistant",
+            "content": {"type": "text", "text": "ok"},
+            "model": "test-model",
+        }
+    )
+    client = MCPClient(
+        MCPServerConfig(name="fake", command="fake", args=[], env={}),
+        sampling_handler=sampling,
+    )
+    client._send_message = AsyncMock()
+    pending = asyncio.get_running_loop().create_future()
+    client._pending[41] = pending
+    try:
+        client._dispatch_incoming(
+            {
+                "jsonrpc": "2.0",
+                "id": "server-2",
+                "method": "sampling/createMessage",
+                "params": {"messages": [], "maxTokens": 1},
+            }
+        )
+        await asyncio.sleep(0)
+        await asyncio.gather(*tuple(client._server_tasks))
+    finally:
+        client._pending.pop(41, None)
+        pending.cancel()
+
+    sampling.assert_awaited_once()
+    response = client._send_message.await_args.args[0]
+    assert response["result"]["model"] == "test-model"
+
+
+@pytest.mark.asyncio
+async def test_mcp_server_request_preserves_protocol_error_code_and_data() -> None:
+    async def reject(params: dict) -> dict:
+        del params
+        raise MCPProtocolError("invalid sampling params", code=-32602, data={"field": "tools"})
+
+    client = MCPClient(
+        MCPServerConfig(name="fake", command="fake", args=[], env={}),
+        sampling_handler=reject,
+    )
+    client._send_message = AsyncMock()
+    pending = asyncio.get_running_loop().create_future()
+    client._pending[7] = pending
+    try:
+        client._dispatch_incoming(
+            {
+                "jsonrpc": "2.0",
+                "id": "server-3",
+                "method": "sampling/createMessage",
+                "params": {},
+            }
+        )
+        await asyncio.sleep(0)
+        await asyncio.gather(*tuple(client._server_tasks))
+    finally:
+        client._pending.pop(7, None)
+        pending.cancel()
+
+    response = client._send_message.await_args.args[0]
+    assert response["error"] == {
+        "code": -32602,
+        "message": "invalid sampling params",
+        "data": {"field": "tools"},
+    }
+
+
 DYNAMIC_MCP_SERVER = r"""
 import json, sys
 state = "old"
@@ -5541,3 +5640,27 @@ async def test_http_probe_network_failure_falls_back_to_initialize() -> None:
     assert calls >= 2
     assert protocol_version == "2025-06-18"
     await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_runtime_wires_opt_in_client_interaction_capabilities(
+    tmp_path: Path,
+) -> None:
+    sampling = AsyncMock(return_value={"role": "assistant"})
+    elicitation = AsyncMock(return_value={"action": "decline"})
+    runtime = MCPRuntime(
+        {},
+        SafetyGuard(tmp_path),
+        sampling_handler=sampling,
+        elicitation_handler=elicitation,
+    )
+    config = MCPServerConfig(name="fake", command="fake", args=[], env={})
+
+    client = runtime._configure_client("fake", config)
+
+    assert client.client_capabilities["sampling"] == {}
+    assert client.client_capabilities["elicitation"] == {"form": {}}
+    await client.sampling_handler({"maxTokens": 1})
+    await client.elicitation_handler({"message": "hello"})
+    sampling.assert_awaited_once_with("fake", {"maxTokens": 1})
+    elicitation.assert_awaited_once_with("fake", {"message": "hello"})

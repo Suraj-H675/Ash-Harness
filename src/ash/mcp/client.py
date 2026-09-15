@@ -67,6 +67,9 @@ MAX_TASK_POLL_INTERVAL_SECONDS = 30.0
 TASK_STATUS_NOTIFICATION = "notifications/tasks/status"
 TASK_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 TASK_STATUSES = TASK_TERMINAL_STATUSES | {"working", "input_required"}
+ASSOCIATED_SERVER_REQUEST_METHODS = frozenset(
+    {"roots/list", "sampling/createMessage", "elicitation/create"}
+)
 
 
 async def _settle_task_after_cancellation(
@@ -545,7 +548,9 @@ class MCPClient:
                 )
                 break
             if isinstance(message, dict):
-                self._dispatch_incoming(message)
+                self._dispatch_incoming(
+                    message, associated=bool(self._pending)
+                )
         assert error is not None
         self._initialized = False
         process_is_current = self._process is process
@@ -582,7 +587,9 @@ class MCPClient:
                 waiter.set_exception(error)
         self._task_waiters.clear()
 
-    def _dispatch_incoming(self, message: dict[str, Any]) -> None:
+    def _dispatch_incoming(
+        self, message: dict[str, Any], *, associated: bool | None = None
+    ) -> None:
         request_id = message.get("id")
         try:
             _validate_jsonrpc_message(message)
@@ -628,7 +635,11 @@ class MCPClient:
             # notification-handler work is shed under peer-induced pressure.
             self._handle_internal_notification(message)
             return
-        task = asyncio.create_task(self._handle_incoming(message))
+        if associated is None:
+            associated = bool(self._pending)
+        task = asyncio.create_task(
+            self._handle_incoming(message, associated=associated)
+        )
         self._server_tasks.add(task)
         incoming_id = message.get("id") if "method" in message else None
         if isinstance(incoming_id, (str, int)) and not isinstance(incoming_id, bool):
@@ -668,7 +679,9 @@ class MCPClient:
         if method == TASK_STATUS_NOTIFICATION:
             self._resolve_task_status_notification(params)
 
-    async def _handle_incoming(self, message: dict[str, Any]) -> None:
+    async def _handle_incoming(
+        self, message: dict[str, Any], *, associated: bool = False
+    ) -> None:
         method = message.get("method")
         if not isinstance(method, str):
             return
@@ -688,15 +701,23 @@ class MCPClient:
 
         request_id = message["id"]
         try:
-            result = await self._handle_server_request(method, params)
+            result = await self._handle_server_request(
+                method, params, associated=associated
+            )
             response = {"jsonrpc": "2.0", "id": request_id, "result": result}
         except asyncio.CancelledError:
             return
         except MCPProtocolError as exc:
+            error: dict[str, Any] = {
+                "code": exc.code if exc.code is not None else -32601,
+                "message": str(exc),
+            }
+            if exc.has_data:
+                error["data"] = exc.data
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": -32601, "message": str(exc)},
+                "error": error,
             }
         except Exception:
             response = {
@@ -707,8 +728,13 @@ class MCPClient:
         await self._send_message(response)
 
     async def _handle_server_request(
-        self, method: str, params: dict[str, Any]
+        self, method: str, params: dict[str, Any], *, associated: bool = False
     ) -> dict[str, Any]:
+        if method in ASSOCIATED_SERVER_REQUEST_METHODS and not associated:
+            raise MCPProtocolError(
+                f"MCP server request {method!r} must be associated with an active client request",
+                code=-32600,
+            )
         if method == "ping":
             return {}
         if method == "roots/list" and self.roots:
@@ -913,7 +939,7 @@ class MCPClient:
                     )
                 matching = message
             else:
-                self._dispatch_incoming(message)
+                self._dispatch_incoming(message, associated=True)
         if matching is None:
             raise MCPProtocolError(f"MCP HTTP response omitted request id {request_id}")
         return matching
@@ -1156,7 +1182,7 @@ class MCPClient:
         if response.status_code == 202 or not response.content:
             return
         for message in _parse_http_messages(response):
-            self._dispatch_incoming(message)
+            self._dispatch_incoming(message, associated=False)
 
     async def _post_http(
         self,
@@ -2014,7 +2040,9 @@ class MCPClient:
                                 return
                             pending.set_result(payload)
                     else:
-                        self._dispatch_incoming(payload)
+                        self._dispatch_incoming(
+                            payload, associated=bool(self._pending)
+                        )
 
                 async for line in _iter_bounded_sse_lines(
                     response, MAX_HTTP_SSE_EVENT_BYTES
@@ -2121,7 +2149,7 @@ class MCPClient:
                                     "MCP SSE data must contain a JSON-RPC object"
                                 )
                             _validate_jsonrpc_message(payload)
-                            self._dispatch_incoming(payload)
+                            self._dispatch_incoming(payload, associated=False)
                         data_lines.clear()
                         event_id = ""
             except (httpx.HTTPError, MCPProtocolError):

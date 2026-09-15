@@ -37,6 +37,22 @@ class HeadlessUI:
     def has_approval_callback(self) -> bool:
         return False
 
+    @property
+    def supports_mcp_interactions(self) -> bool:
+        return False
+
+    def review_mcp_sampling(
+        self, server: str, stage: str, payload: dict[str, Any]
+    ) -> bool:
+        del server, stage, payload
+        return False
+
+    def request_mcp_elicitation(
+        self, server: str, message: str, schema: dict[str, Any]
+    ) -> dict[str, Any]:
+        del server, message, schema
+        return {"action": "decline"}
+
     def begin_turn(self):
         return nullcontext()
 

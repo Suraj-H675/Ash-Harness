@@ -428,3 +428,42 @@ def test_runtime_preserves_explicit_managed_permission_rules(tmp_path) -> None:
     )
 
     assert runtime.loop.permission_policy.managed_rules == [managed_rule]
+
+
+def test_runtime_builds_user_opt_in_mcp_interaction_controller(tmp_path) -> None:
+    class InteractiveUI(HeadlessUI):
+        @property
+        def supports_mcp_interactions(self) -> bool:
+            return True
+
+        def review_mcp_sampling(self, server, stage, payload):
+            return True
+
+        def request_mcp_elicitation(self, server, message, schema):
+            return {"action": "decline"}
+
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        mcp_sampling_enabled=True,
+        mcp_elicitation_enabled=True,
+        mcp_sampling_max_tokens=321,
+    )
+    sampling_provider = RuntimeProvider()
+    runtime = build_runtime(
+        config,
+        InteractiveUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        agent_provider_factory=lambda: sampling_provider,
+        workspace_trusted=False,
+        run_maintenance=False,
+    )
+
+    controller = runtime.loop._mcp_interactions
+    assert controller is not None
+    assert controller.supports_sampling is True
+    assert controller.supports_elicitation is True
+    assert controller.sampling_max_tokens == 321

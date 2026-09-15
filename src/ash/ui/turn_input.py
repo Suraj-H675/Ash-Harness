@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -119,6 +120,115 @@ class InteractiveTurnController:
                 await self._cancel_turn(turn)
             self.loop.on_tool_approval = previous_approval
             self.loop.on_plan_approval = previous_plan_approval
+
+    async def review_mcp_sampling(
+        self, server: str, stage: str, payload: dict[str, Any]
+    ) -> bool:
+        """Review one MCP sampling request/response using the single prompt reader."""
+
+        self._approval_active = True
+        self._approval_complete.clear()
+        await self._cancel_steering_read()
+        self._notify(
+            NotificationEvent.APPROVAL_REQUIRED,
+            f"MCP server {server} requests sampling review",
+        )
+        try:
+            label = "request" if stage == "request" else "response"
+            rendered = json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
+            self.write_status(
+                f"MCP sampling {label} from {server}:\n{rendered}"
+            )
+            answer = (
+                await self.prompt_input.read(
+                    f"Approve MCP sampling {label}? [y/N] "
+                )
+            ).strip().casefold()
+            return answer in {"y", "yes"}
+        except (EOFError, KeyboardInterrupt, TypeError, ValueError):
+            return False
+        finally:
+            self._approval_active = False
+            self._approval_complete.set()
+
+    async def request_mcp_elicitation(
+        self, server: str, message: str, schema: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Collect and review one MCP form using the single prompt reader."""
+
+        self._approval_active = True
+        self._approval_complete.clear()
+        await self._cancel_steering_read()
+        self._notify(
+            NotificationEvent.APPROVAL_REQUIRED,
+            f"MCP server {server} requests information",
+        )
+        try:
+            self.write_status(f"MCP form from {server}: {message}")
+            properties = schema.get("properties", {})
+            required = set(schema.get("required", []))
+            previous: dict[str, Any] = {}
+            while True:
+                values: dict[str, Any] = {}
+                for name, field_schema in properties.items():
+                    if not isinstance(field_schema, dict):
+                        return {"action": "cancel"}
+                    label = str(field_schema.get("title") or name)
+                    allowed = field_schema.get("enum")
+                    if allowed is None and field_schema.get("type") == "array":
+                        allowed = field_schema.get("items", {}).get("enum")
+                    if isinstance(allowed, list) and allowed:
+                        self.write_status(
+                            f"{label} options: " + ", ".join(map(str, allowed))
+                        )
+                    while True:
+                        default = previous.get(name, field_schema.get("default"))
+                        suffix = f" [{default}]" if default is not None else ""
+                        raw = await self.prompt_input.read(f"{label}{suffix}: ")
+                        if not raw:
+                            if default is not None:
+                                values[name] = default
+                                break
+                            if name not in required:
+                                break
+                            self.write_status(f"{label} requires a value.")
+                            continue
+                        try:
+                            values[name] = self.ui._parse_mcp_form_value(
+                                raw, field_schema
+                            )
+                            break
+                        except (TypeError, ValueError) as exc:
+                            self.write_status(f"Invalid {label}: {exc}")
+                previous = values
+                summary = "\n".join(
+                    f"  {key} = {value!r}" for key, value in values.items()
+                )
+                self.write_status(
+                    "Review MCP form response:\n" + (summary or "  (no values)")
+                )
+                action = (
+                    await self.prompt_input.read(
+                        "Submit MCP form [y], edit [e], decline [n], cancel [c]? "
+                    )
+                ).strip().casefold()
+                if action in {"y", "yes"}:
+                    return {"action": "accept", "content": values}
+                if action in {"e", "edit"}:
+                    continue
+                if action in {"n", "no", "decline"}:
+                    return {"action": "decline"}
+                return {"action": "cancel"}
+        except (EOFError, KeyboardInterrupt):
+            return {"action": "cancel"}
+        finally:
+            self._approval_active = False
+            self._approval_complete.set()
 
     async def _request_approval(
         self, tool_name: str, arguments: dict[str, object]

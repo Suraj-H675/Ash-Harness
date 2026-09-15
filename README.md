@@ -282,11 +282,20 @@ Streamable HTTP, and the SSE configuration alias. MCP support includes:
 - session-expiry recovery without reposting the rejected tool call;
 - paginated capability listing and live catalog reconciliation;
 - atomic publication of validated tool-list changes;
-- catalog quarantine when refresh fails; and
+- catalog quarantine when refresh fails;
+- opt-in client-side sampling with explicit review before model execution and
+  again before the sampled response is released to the server;
+- opt-in form elicitation with typed review/edit/decline/cancel flows and
+  credential-like fields rejected in favor of future URL-mode handling; and
 - in-flight tool-snapshot and contract verification before sending a call.
 
-MCP configuration can be user-owned or enabled for a trusted workspace. MCP
-resource mentions can be selected directly from terminal completion.
+MCP configuration can be user-owned or enabled for a trusted workspace. The
+client-interaction controls `mcp_sampling_enabled`, `mcp_elicitation_enabled`,
+and `mcp_sampling_max_tokens` are user-owned only: project configuration cannot
+enable or widen them. Headless/SDK use requires explicit review callbacks. Ash
+does not currently advertise MCP sampling tools/context/task augmentation or URL
+elicitation. MCP resource mentions can be selected directly from terminal
+completion.
 
 ### Extensions, skills, and hooks
 

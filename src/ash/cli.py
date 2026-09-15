@@ -591,6 +591,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         ),
         notification_include_preview=config.notification_include_preview,
     )
+    interactions = getattr(loop, "_mcp_interactions", None)
+    if interactions is not None:
+        interactions.sampling_review = turn_controller.review_mcp_sampling
+        interactions.elicitation_callback = turn_controller.request_mcp_elicitation
 
     async def reload_plugin_components() -> PluginReloadResult:
         nonlocal custom_commands, discovered_commands

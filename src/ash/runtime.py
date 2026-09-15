@@ -18,6 +18,11 @@ from ash.core.planner import Planner
 from ash.core.secret_middleware import SecretRedactionMiddleware
 from ash.core.session import SessionStore
 from ash.hooks.config import HookConfigSource, load_command_hooks
+from ash.mcp.interactions import (
+    ElicitationCallback,
+    MCPInteractionController,
+    SamplingReview,
+)
 from ash.mcp.server import MCPConfigSource, MCPServerConfig, load_mcp_server_sources
 from ash.plugins.lifecycle import load_extension_state
 from ash.plugins.registry import DiscoveredPlugin, PluginCatalog
@@ -336,6 +341,8 @@ def build_runtime(
     workspace_trusted: bool | None = None,
     approval_callback: ApprovalCallback | None = None,
     additional_mcp_configs: dict[str, MCPServerConfig] | None = None,
+    mcp_sampling_review: SamplingReview | None = None,
+    mcp_elicitation_callback: ElicitationCallback | None = None,
     run_maintenance: bool = True,
 ) -> RuntimeComponents:
     """Assemble one runtime with identical extension and safety semantics."""
@@ -471,6 +478,32 @@ def build_runtime(
             raise ValueError(f"duplicate MCP server name: {name}")
         mcp_configs[name] = mcp_config
 
+    supports_interactions = bool(getattr(ui, "supports_mcp_interactions", False))
+    if mcp_sampling_review is None and supports_interactions:
+        candidate = getattr(ui, "review_mcp_sampling", None)
+        if callable(candidate):
+            mcp_sampling_review = candidate
+    if mcp_elicitation_callback is None and supports_interactions:
+        candidate = getattr(ui, "request_mcp_elicitation", None)
+        if callable(candidate):
+            mcp_elicitation_callback = candidate
+
+    sampling_provider_factory = (
+        agent_provider_factory
+        if agent_provider_factory is not None
+        else lambda: get_provider_registry().build(config)
+    )
+    mcp_interactions = MCPInteractionController(
+        sampling_enabled=config.mcp_sampling_enabled,
+        elicitation_enabled=config.mcp_elicitation_enabled,
+        provider_factory=(
+            sampling_provider_factory if config.mcp_sampling_enabled else None
+        ),
+        sampling_review=mcp_sampling_review,
+        elicitation_callback=mcp_elicitation_callback,
+        sampling_max_tokens=config.mcp_sampling_max_tokens,
+    )
+
     loop = AshLoop(
         session_store=store,
         provider=active_provider,
@@ -488,6 +521,7 @@ def build_runtime(
         safety_tier=config.safety_tier,
         on_tool_approval=approval_callback,
         mcp_configs=mcp_configs,
+        mcp_interactions=mcp_interactions,
         enable_semantic_memory=config.memory_backend != "off",
         memory_backend=config.memory_backend,
         embedding_provider=config.embedding_provider,
