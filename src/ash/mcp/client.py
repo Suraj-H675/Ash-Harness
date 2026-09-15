@@ -57,6 +57,8 @@ MAX_BUFFERED_LEGACY_SSE_RESPONSES = 1000
 SAFE_INTEGER_BOUND = 2**53 - 1
 MAX_HTTP_SESSION_ID_BYTES = 1024
 MAX_PENDING_MCP_NOTIFICATIONS = 64
+MAX_PENDING_MCP_SERVER_REQUESTS = 64
+MAX_PENDING_MCP_OVERLOAD_RESPONSES = 64
 # Keep reconnection sleeps representable on every event loop while preserving
 # arbitrarily large valid SSE retry values by waiting in multiple slices.
 MAX_SSE_RETRY_SLEEP_SLICE_MS = 2**31 - 1
@@ -595,6 +597,29 @@ class MCPClient:
             if future is not None and not future.done():
                 future.set_result(message)
             return
+        if "method" in message and "id" in message:
+            if request_id in self._incoming_requests:
+                return
+            if len(self._incoming_requests) >= MAX_PENDING_MCP_SERVER_REQUESTS:
+                if len(self._server_tasks) < (
+                    MAX_PENDING_MCP_SERVER_REQUESTS
+                    + MAX_PENDING_MCP_OVERLOAD_RESPONSES
+                ):
+                    overload = asyncio.create_task(
+                        self._send_message(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "error": {
+                                    "code": -32000,
+                                    "message": "MCP client request capacity exceeded",
+                                },
+                            }
+                        )
+                    )
+                    self._server_tasks.add(overload)
+                    overload.add_done_callback(self._finish_server_task)
+                return
         if (
             "id" not in message
             and len(self._server_tasks) >= MAX_PENDING_MCP_NOTIFICATIONS

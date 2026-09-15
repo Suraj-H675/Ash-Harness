@@ -4112,6 +4112,102 @@ async def test_mcp_bounds_pending_notification_handler_tasks(
     assert client._server_tasks == set()
 
 
+@pytest.mark.asyncio
+async def test_mcp_bounds_pending_server_request_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = asyncio.Event()
+    started = 0
+
+    async def handle_request(method: str, params: dict) -> dict:
+        nonlocal started
+        started += 1
+        await gate.wait()
+        return {}
+
+    monkeypatch.setattr(mcp_client_module, "MAX_PENDING_MCP_SERVER_REQUESTS", 2)
+    monkeypatch.setattr(mcp_client_module, "MAX_PENDING_MCP_OVERLOAD_RESPONSES", 3)
+    client = MCPClient(
+        MCPServerConfig(name="fake", command="fake", args=[], env={}),
+        server_request_handler=handle_request,
+    )
+    client._send_message = AsyncMock()
+
+    for index in range(100):
+        client._dispatch_incoming(
+            {
+                "jsonrpc": "2.0",
+                "id": f"server-{index}",
+                "method": "custom",
+                "params": {},
+            }
+        )
+    observed_tasks = len(client._server_tasks)
+    await asyncio.sleep(0)
+    observed_started = started
+    observed_requests = len(client._incoming_requests)
+    await asyncio.sleep(0)
+    overload_responses = [
+        call.args[0]
+        for call in client._send_message.await_args_list
+        if isinstance(call.args[0], dict) and "error" in call.args[0]
+    ]
+
+    gate.set()
+    await asyncio.gather(*tuple(client._server_tasks))
+    await asyncio.sleep(0)
+
+    assert observed_started == 2
+    assert observed_tasks == 5
+    assert observed_requests == 2
+    assert len(overload_responses) == 3
+    assert all(response["error"]["code"] == -32000 for response in overload_responses)
+    assert client._server_tasks == set()
+    assert client._incoming_requests == {}
+
+
+@pytest.mark.asyncio
+async def test_mcp_duplicate_server_request_id_does_not_replace_owner() -> None:
+    gate = asyncio.Event()
+    started = 0
+
+    async def handle_request(method: str, params: dict) -> dict:
+        nonlocal started
+        started += 1
+        await gate.wait()
+        return {}
+
+    client = MCPClient(
+        MCPServerConfig(name="fake", command="fake", args=[], env={}),
+        server_request_handler=handle_request,
+    )
+    client._send_message = AsyncMock()
+    message = {
+        "jsonrpc": "2.0",
+        "id": "same-id",
+        "method": "custom",
+        "params": {},
+    }
+
+    client._dispatch_incoming(message)
+    await asyncio.sleep(0)
+    owner = client._incoming_requests["same-id"]
+    client._dispatch_incoming(message)
+    await asyncio.sleep(0)
+    observed_started = started
+    observed_owner = client._incoming_requests.get("same-id")
+
+    gate.set()
+    await asyncio.gather(*tuple(client._server_tasks))
+    await asyncio.sleep(0)
+
+    assert observed_started == 1
+    assert observed_owner is owner
+    assert client._send_message.await_count == 1
+    assert client._server_tasks == set()
+    assert client._incoming_requests == {}
+
+
 DYNAMIC_MCP_SERVER = r"""
 import json, sys
 state = "old"
