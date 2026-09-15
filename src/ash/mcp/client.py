@@ -73,6 +73,13 @@ ASSOCIATED_SERVER_REQUEST_METHODS = frozenset(
 MODERN_INPUT_REQUIRED_METHODS = frozenset({"tools/call", "prompts/get", "resources/read"})
 MAX_INPUT_REQUIRED_ROUNDS = 10
 INPUT_REQUIRED_RETRY_DELAY_SECONDS = 0.25
+SUBSCRIPTION_ACK_METHOD = "notifications/subscriptions/acknowledged"
+SUBSCRIPTION_CHANGE_FILTERS = {
+    "notifications/tools/list_changed": "toolsListChanged",
+    "notifications/prompts/list_changed": "promptsListChanged",
+    "notifications/resources/list_changed": "resourcesListChanged",
+}
+SUBSCRIPTION_RESOURCE_UPDATED_METHOD = "notifications/resources/updated"
 
 
 async def _settle_task_after_cancellation(
@@ -103,6 +110,7 @@ SessionReinitializedHandler = Callable[
     [int, str, dict[str, Any]], Awaitable[bool] | bool
 ]
 ToolContractValidator = Callable[[str, str, int], bool]
+SubscriptionFailureHandler = Callable[[BaseException], Awaitable[None] | None]
 _MISSING = object()
 
 
@@ -196,6 +204,7 @@ class MCPClient:
         server_request_handler: ServerRequestHandler | None = None,
         session_reinitialized_handler: SessionReinitializedHandler | None = None,
         tool_contract_validator: ToolContractValidator | None = None,
+        subscription_failure_handler: SubscriptionFailureHandler | None = None,
         oauth_session: MCPOAuthSession | None = None,
     ) -> None:
         if (
@@ -219,6 +228,7 @@ class MCPClient:
         self.server_request_handler = server_request_handler
         self.session_reinitialized_handler = session_reinitialized_handler
         self.tool_contract_validator = tool_contract_validator
+        self.subscription_failure_handler = subscription_failure_handler
         self.protocol_version = ""
         self.server_capabilities: dict[str, Any] = {}
         self.server_info: dict[str, Any] = {}
@@ -246,6 +256,13 @@ class MCPClient:
         self._sse_last_event_id = ""
         self._sse_retry_ms = 1000
         self._sse_supported = True
+        self._subscription_task: asyncio.Task[None] | None = None
+        self._subscription_request_id: int | None = None
+        self._subscription_ack = asyncio.Event()
+        self._subscription_requested: dict[str, Any] = {}
+        self._subscription_honored: dict[str, Any] = {}
+        self._subscription_error: BaseException | None = None
+        self._subscription_stopping = False
         self._pending_initialize_session_id = ""
         self._session_generation = 0
         self._session_recovery_lock = asyncio.Lock()
@@ -331,6 +348,7 @@ class MCPClient:
                     modern_result = await self._probe_modern_http()
                 if modern_result is not None:
                     self._activate_modern_protocol(modern_result)
+                    await self._start_modern_list_subscription()
                 else:
                     await self._initialize_protocol()
             except BaseException as primary:
@@ -343,6 +361,324 @@ class MCPClient:
                 if cleanup_cancelled:
                     primary.add_note("MCP disconnect cleanup was cancelled")
                 raise
+
+    def _modern_list_subscription_filter(self) -> dict[str, bool]:
+        requested: dict[str, bool] = {}
+        for capability, field in (
+            ("tools", "toolsListChanged"),
+            ("prompts", "promptsListChanged"),
+            ("resources", "resourcesListChanged"),
+        ):
+            advertised = self.server_capabilities.get(capability)
+            if isinstance(advertised, dict) and advertised.get("listChanged") is True:
+                requested[field] = True
+        return requested
+
+    async def _start_modern_list_subscription(self) -> None:
+        if (
+            self.protocol_version != MODERN_PROTOCOL_VERSION
+            or self.notification_handler is None
+        ):
+            return
+        requested = self._modern_list_subscription_filter()
+        if not requested:
+            return
+        await self._stop_modern_subscription()
+        request_id = self._next_id
+        self._next_id += 1
+        self._subscription_request_id = request_id
+        self._subscription_requested = dict(requested)
+        self._subscription_honored = {}
+        self._subscription_error = None
+        self._subscription_ack = asyncio.Event()
+        task = asyncio.create_task(
+            self._run_modern_subscription(request_id, requested),
+            name=f"ash-mcp-subscription-{self.config.name}",
+        )
+        self._subscription_task = task
+        try:
+            await asyncio.wait_for(self._subscription_ack.wait(), timeout=self.timeout)
+        except BaseException:
+            await self._stop_modern_subscription()
+            raise
+        if self._subscription_error is not None:
+            error = self._subscription_error
+            await self._stop_modern_subscription()
+            if isinstance(error, BaseException):
+                raise MCPProtocolError(
+                    f"MCP subscription failed before acknowledgment: {error}"
+                ) from error
+
+    async def _run_modern_subscription(
+        self, request_id: int, requested: dict[str, bool]
+    ) -> None:
+        failure: BaseException | None = None
+        try:
+            if self.config.transport == "stdio":
+                await self._run_modern_stdio_subscription(request_id, requested)
+            elif self.config.transport == "http":
+                await self._run_modern_http_subscription(request_id, requested)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            failure = exc
+        else:
+            if not self._subscription_stopping:
+                failure = MCPProtocolError(
+                    "MCP subscription ended; live change notifications are no longer active"
+                )
+        if failure is None or self._subscription_stopping:
+            return
+        already_acknowledged = self._subscription_ack.is_set()
+        self._subscription_error = failure
+        self._subscription_ack.set()
+        if already_acknowledged and self.subscription_failure_handler is not None:
+            try:
+                outcome = self.subscription_failure_handler(failure)
+                if inspect.isawaitable(outcome):
+                    await outcome
+            except Exception:
+                return
+
+    async def _run_modern_stdio_subscription(
+        self, request_id: int, requested: dict[str, bool]
+    ) -> None:
+        if self._process is None or self._process.stdin is None:
+            raise MCPProtocolError("MCP stdio client is not connected")
+        future: asyncio.Future[dict[str, Any]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._pending[request_id] = future
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "subscriptions/listen",
+            "params": self._modernize_request_params(
+                {"notifications": dict(requested)}
+            ),
+        }
+        try:
+            await self._send_message(payload)
+            response = await future
+            self._validate_subscription_close(request_id, response)
+        finally:
+            if self._pending.get(request_id) is future:
+                self._pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+
+    async def _run_modern_http_subscription(
+        self, request_id: int, requested: dict[str, bool]
+    ) -> None:
+        if self._http is None:
+            raise MCPProtocolError("MCP HTTP client is not connected")
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "subscriptions/listen",
+            "params": self._modernize_request_params(
+                {"notifications": dict(requested)}
+            ),
+        }
+        headers = httpx.Headers(self.config.resolved_headers)
+        headers["Accept"] = "application/json, text/event-stream"
+        headers["Content-Type"] = "application/json"
+        headers["MCP-Protocol-Version"] = MODERN_PROTOCOL_VERSION
+        headers.update(self._tool_request_headers(payload, []))
+        if self._oauth is not None:
+            headers["Authorization"] = await self._oauth.authorization_header()
+        encoded = _encode_outbound_message(payload)
+        async with self._http.stream(
+            "POST",
+            self.config.resolved_url,
+            content=encoded,
+            headers=headers,
+            timeout=None,
+        ) as response:
+            response.raise_for_status()
+            content_type = (
+                response.headers.get("content-type", "")
+                .split(";", 1)[0]
+                .strip()
+                .casefold()
+            )
+            if content_type != "text/event-stream":
+                raise MCPProtocolError(
+                    "MCP subscriptions/listen must use text/event-stream over HTTP"
+                )
+            data_lines: list[str] = []
+            graceful = False
+            async for line in _iter_bounded_sse_lines(
+                response, MAX_HTTP_SSE_EVENT_BYTES
+            ):
+                if line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip())
+                    continue
+                if line:
+                    continue
+                if not data_lines or not any(data_lines):
+                    data_lines.clear()
+                    continue
+                try:
+                    message = strict_json_loads("\n".join(data_lines))
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                    raise MCPProtocolError(
+                        "MCP subscription SSE event contained invalid JSON"
+                    ) from exc
+                data_lines.clear()
+                if not isinstance(message, dict):
+                    raise MCPProtocolError(
+                        "MCP subscription SSE data must contain a JSON-RPC object"
+                    )
+                _validate_jsonrpc_message(message)
+                if message.get("id") == request_id and "method" not in message:
+                    self._validate_subscription_close(request_id, message)
+                    graceful = True
+                    break
+                self._dispatch_incoming(message, associated=False)
+            if not graceful:
+                raise MCPProtocolError(
+                    "MCP subscription HTTP stream ended without a graceful result"
+                )
+
+    def _validate_subscription_close(
+        self, request_id: int, response: dict[str, Any]
+    ) -> None:
+        if "error" in response:
+            error = response.get("error")
+            raise MCPProtocolError(f"subscriptions/listen failed: {error}")
+        result = response.get("result")
+        if not isinstance(result, dict) or result.get("resultType") != "complete":
+            raise MCPProtocolError(
+                "MCP subscriptions/listen ended with an invalid result"
+            )
+        meta = result.get("_meta")
+        if isinstance(meta, dict):
+            subscription_id = meta.get("io.modelcontextprotocol/subscriptionId")
+            if subscription_id is not None and subscription_id != request_id:
+                raise MCPProtocolError(
+                    "MCP subscription close result used the wrong subscription id"
+                )
+
+    def _handle_modern_subscription_notification(
+        self, message: dict[str, Any]
+    ) -> bool:
+        method = message.get("method")
+        if not isinstance(method, str):
+            return False
+        if (
+            method != SUBSCRIPTION_ACK_METHOD
+            and method not in SUBSCRIPTION_CHANGE_FILTERS
+            and method != SUBSCRIPTION_RESOURCE_UPDATED_METHOD
+        ):
+            return False
+        params = message.get("params")
+        if not isinstance(params, dict):
+            return True
+        meta = params.get("_meta")
+        if not isinstance(meta, dict):
+            return True
+        request_id = self._subscription_request_id
+        if request_id is None or meta.get("io.modelcontextprotocol/subscriptionId") != request_id:
+            return True
+        if method == SUBSCRIPTION_ACK_METHOD:
+            raw_honored = params.get("notifications")
+            if not isinstance(raw_honored, dict):
+                self._subscription_error = MCPProtocolError(
+                    "MCP subscription acknowledgment omitted its notification filter"
+                )
+                self._subscription_ack.set()
+                return True
+            honored: dict[str, Any] = {}
+            for field, value in raw_honored.items():
+                if field in {
+                    "toolsListChanged",
+                    "promptsListChanged",
+                    "resourcesListChanged",
+                }:
+                    if not isinstance(value, bool):
+                        self._subscription_error = MCPProtocolError(
+                            f"MCP subscription acknowledgment has invalid {field!r}"
+                        )
+                        self._subscription_ack.set()
+                        return True
+                    if not value:
+                        continue
+                    if self._subscription_requested.get(field) is not True:
+                        self._subscription_error = MCPProtocolError(
+                            f"MCP subscription acknowledged unrequested filter {field!r}"
+                        )
+                        self._subscription_ack.set()
+                        return True
+                    honored[field] = True
+                    continue
+                if field == "resourceSubscriptions":
+                    if not (
+                        isinstance(value, list)
+                        and all(isinstance(uri, str) for uri in value)
+                    ):
+                        self._subscription_error = MCPProtocolError(
+                            "MCP subscription acknowledgment has invalid resourceSubscriptions"
+                        )
+                        self._subscription_ack.set()
+                        return True
+                    if value:
+                        self._subscription_error = MCPProtocolError(
+                            "MCP subscription acknowledged unrequested resourceSubscriptions"
+                        )
+                        self._subscription_ack.set()
+                        return True
+                    continue
+                self._subscription_error = MCPProtocolError(
+                    f"MCP subscription acknowledgment has unknown filter {field!r}"
+                )
+                self._subscription_ack.set()
+                return True
+            self._subscription_honored = honored
+            self._subscription_ack.set()
+            return True
+        if method == SUBSCRIPTION_RESOURCE_UPDATED_METHOD:
+            # Ash does not request per-resource subscriptions yet. Modern
+            # resource-update notifications are therefore unsolicited and must
+            # not leak through merely because they carry this stream's id.
+            return True
+        field = SUBSCRIPTION_CHANGE_FILTERS[method]
+        return self._subscription_honored.get(field) is not True
+
+    async def _stop_modern_subscription(self) -> None:
+        task = self._subscription_task
+        request_id = self._subscription_request_id
+        self._subscription_stopping = True
+        if (
+            task is not None
+            and not task.done()
+            and request_id is not None
+            and self.config.transport == "stdio"
+            and self._process is not None
+        ):
+            try:
+                await self.notify(
+                    "notifications/cancelled",
+                    {
+                        "requestId": request_id,
+                        "reason": "Ash closed the MCP subscription",
+                    },
+                    _allow_session_recovery=False,
+                )
+            except (MCPProtocolError, OSError):
+                pass
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._subscription_task = None
+        self._subscription_request_id = None
+        self._subscription_requested = {}
+        self._subscription_honored = {}
+        self._subscription_error = None
+        self._subscription_ack = asyncio.Event()
+        self._subscription_stopping = False
 
     async def _initialize_protocol(self) -> None:
         self._pending_initialize_session_id = ""
@@ -714,6 +1050,11 @@ class MCPClient:
                 future = self._pending.pop(request_id, None)
                 if future is not None and not future.done():
                     future.set_exception(exc)
+            return
+        if (
+            self.protocol_version == MODERN_PROTOCOL_VERSION
+            and self._handle_modern_subscription_notification(message)
+        ):
             return
         if "method" not in message and isinstance(request_id, int):
             future = self._pending.pop(request_id, None)
@@ -2123,6 +2464,7 @@ class MCPClient:
             raise
 
     async def _disconnect_impl(self) -> None:
+        await self._stop_modern_subscription()
         self._initialized = False
         self._stop_http_events()
         if self._legacy_sse_discovery and not self._legacy_sse_discovery.done():
@@ -2195,6 +2537,13 @@ class MCPClient:
         self._stderr_task = None
         self._server_tasks.clear()
         self._incoming_requests.clear()
+        self._subscription_task = None
+        self._subscription_request_id = None
+        self._subscription_requested = {}
+        self._subscription_honored = {}
+        self._subscription_error = None
+        self._subscription_ack = asyncio.Event()
+        self._subscription_stopping = False
         self.protocol_version = ""
         self.server_capabilities = {}
         self.server_info = {}

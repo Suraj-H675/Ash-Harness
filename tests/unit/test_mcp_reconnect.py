@@ -77,6 +77,61 @@ for line in sys.stdin:
 """
 
 
+MODERN_SUBSCRIPTION_SERVER = r"""
+import json, sys
+listen_id = None
+state = "old"
+list_count = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {"listChanged": True}},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "subscriptions/listen":
+        listen_id = message["id"]
+        meta = {"io.modelcontextprotocol/subscriptionId": listen_id}
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {"notifications": {"toolsListChanged": True}, "_meta": meta},
+        }), flush=True)
+    elif method == "tools/list":
+        list_count += 1
+        result = {
+            "resultType": "complete",
+            "tools": [{
+                "name": state,
+                "description": state,
+                "inputSchema": {"type": "object", "additionalProperties": False},
+            }],
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+        if list_count == 1:
+            state = "new"
+            meta = {"io.modelcontextprotocol/subscriptionId": listen_id}
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed",
+                "params": {"_meta": meta},
+            }), flush=True)
+    elif method == "notifications/cancelled":
+        if message["params"].get("requestId") == listen_id:
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "id": listen_id,
+                "result": {
+                    "resultType": "complete",
+                    "_meta": {"io.modelcontextprotocol/subscriptionId": listen_id},
+                },
+            }), flush=True)
+"""
+
+
 class IdleProvider(ProviderABC):
     model_name = "idle"
 
@@ -596,3 +651,28 @@ async def test_mcp_reload_log_redacts_bounded_server_error(
     assert marker not in logged_error
     assert 'password="[REDACTED]"' in logged_error
     assert len(logged_error) == 512
+
+
+@pytest.mark.asyncio
+async def test_modern_subscription_refreshes_runtime_tool_catalog(tmp_path) -> None:
+    config = MCPServerConfig(
+        name="modern",
+        command=sys.executable,
+        args=["-u", "-c", MODERN_SUBSCRIPTION_SERVER],
+        env={},
+        transport="stdio",
+    )
+    runtime = MCPRuntime({"modern": config}, SafetyGuard(tmp_path))
+    await runtime.start()
+    try:
+        for _ in range(100):
+            snapshot = runtime.server_tools_snapshot().get("modern", {})
+            if "mcp__modern__new" in snapshot:
+                break
+            await asyncio.sleep(0.02)
+        snapshot = runtime.server_tools_snapshot()["modern"]
+        assert "mcp__modern__new" in snapshot
+        assert "mcp__modern__old" not in snapshot
+        assert runtime.errors == {}
+    finally:
+        await runtime.close()

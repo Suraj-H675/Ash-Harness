@@ -5917,3 +5917,256 @@ async def test_mcp_runtime_wires_opt_in_client_interaction_capabilities(
     await client.elicitation_handler({"message": "hello"})
     sampling.assert_awaited_once_with("fake", {"maxTokens": 1})
     elicitation.assert_awaited_once_with("fake", {"message": "hello"})
+
+
+@pytest.mark.asyncio
+async def test_modern_stdio_subscription_delivers_list_change_and_cancels() -> None:
+    server = r"""
+import json, sys
+listen_id = None
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {"listChanged": True}},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "subscriptions/listen":
+        listen_id = message["id"]
+        assert message["params"]["notifications"] == {"toolsListChanged": True}
+        meta = {"io.modelcontextprotocol/subscriptionId": listen_id}
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {"notifications": {"toolsListChanged": True}, "_meta": meta},
+        }), flush=True)
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+            "params": {"_meta": meta},
+        }), flush=True)
+    elif method == "notifications/cancelled":
+        assert message["params"]["requestId"] == listen_id
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": listen_id,
+            "result": {
+                "resultType": "complete",
+                "_meta": {"io.modelcontextprotocol/subscriptionId": listen_id},
+            },
+        }), flush=True)
+"""
+    changed = asyncio.Event()
+    seen: list[str] = []
+
+    async def on_notification(method: str, params: dict) -> None:
+        seen.append(method)
+        if method == "notifications/tools/list_changed":
+            changed.set()
+
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern", command=sys.executable, args=["-u", "-c", server], env={}
+        ),
+        notification_handler=on_notification,
+    )
+    await client.connect()
+    await asyncio.wait_for(changed.wait(), timeout=0.5)
+    assert seen == ["notifications/tools/list_changed"]
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modern_http_subscription_uses_listen_stream_without_cancel_post() -> None:
+    changed = asyncio.Event()
+    stream_closed = asyncio.Event()
+    methods: list[str] = []
+
+    class SubscriptionStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            listen_id = 1
+            meta = {"io.modelcontextprotocol/subscriptionId": listen_id}
+            ack = {
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "notifications": {"toolsListChanged": True},
+                    "_meta": meta,
+                },
+            }
+            change = {
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed",
+                "params": {"_meta": meta},
+            }
+            yield f"data: {json.dumps(ack)}\n\n".encode()
+            yield f"data: {json.dumps(change)}\n\n".encode()
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            stream_closed.set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        methods.append(payload["method"])
+        if payload["method"] == "server/discover":
+            result = {
+                "resultType": "complete",
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {"listChanged": True}},
+            }
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+                request=request,
+            )
+        assert payload["method"] == "subscriptions/listen"
+        assert request.headers["MCP-Protocol-Version"] == "2026-07-28"
+        assert request.headers["Mcp-Method"] == "subscriptions/listen"
+        assert payload["params"]["notifications"] == {"toolsListChanged": True}
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=SubscriptionStream(),
+            request=request,
+        )
+
+    async def on_notification(method: str, params: dict) -> None:
+        if method == "notifications/tools/list_changed":
+            changed.set()
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+        notification_handler=on_notification,
+    )
+    await client.connect()
+    await asyncio.wait_for(changed.wait(), timeout=0.5)
+    await client.disconnect()
+    await asyncio.wait_for(stream_closed.wait(), timeout=0.5)
+    await http.aclose()
+
+    assert methods == ["server/discover", "subscriptions/listen"]
+
+
+@pytest.mark.asyncio
+async def test_modern_subscription_rejects_unrequested_ack_filter() -> None:
+    server = r"""
+import json, sys
+listen_id = None
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {"listChanged": True}},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "subscriptions/listen":
+        listen_id = message["id"]
+        meta = {"io.modelcontextprotocol/subscriptionId": listen_id}
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {
+                "notifications": {
+                    "toolsListChanged": True,
+                    "promptsListChanged": True,
+                },
+                "_meta": meta,
+            },
+        }), flush=True)
+    elif method == "notifications/cancelled":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": listen_id,
+            "result": {"resultType": "complete"},
+        }), flush=True)
+"""
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern", command=sys.executable, args=["-u", "-c", server], env={}
+        ),
+        notification_handler=lambda _method, _params: None,
+    )
+    with pytest.raises(MCPProtocolError, match="acknowledged unrequested filter"):
+        await client.connect()
+
+
+@pytest.mark.asyncio
+async def test_modern_http_subscription_loss_is_reported_after_ack() -> None:
+    release = asyncio.Event()
+    lost = asyncio.Event()
+    errors: list[str] = []
+
+    class DroppingSubscriptionStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            meta = {"io.modelcontextprotocol/subscriptionId": 1}
+            ack = {
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "notifications": {"toolsListChanged": True},
+                    "_meta": meta,
+                },
+            }
+            yield f"data: {json.dumps(ack)}\n\n".encode()
+            await release.wait()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload["method"] == "server/discover":
+            result = {
+                "resultType": "complete",
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {"listChanged": True}},
+            }
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=DroppingSubscriptionStream(),
+            request=request,
+        )
+
+    async def on_failure(error: BaseException) -> None:
+        errors.append(str(error))
+        lost.set()
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+        notification_handler=lambda _method, _params: None,
+        subscription_failure_handler=on_failure,
+    )
+    await client.connect()
+    release.set()
+    await asyncio.wait_for(lost.wait(), timeout=0.5)
+    assert errors == ["MCP subscription HTTP stream ended without a graceful result"]
+    await client.disconnect()
+    await http.aclose()

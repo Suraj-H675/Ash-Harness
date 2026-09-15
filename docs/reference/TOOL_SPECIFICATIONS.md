@@ -297,8 +297,12 @@ does not automatically repeat a potentially side-effecting call.
 
 See the [MCP 2026-07-28 release](https://blog.modelcontextprotocol.io/posts/2026-07-28/)
 and the [2025-11-25 tools specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
-for the legacy stateful path. `subscriptions/listen` and the redesigned Tasks
-extension are not yet implemented in Ash.
+for the legacy stateful path. For MCP 2026-07-28, Ash automatically opens a
+`subscriptions/listen` stream for every advertised tools/prompts/resources
+`listChanged` capability, validates the acknowledged subset and subscription
+ID, and routes correlated list changes through the existing bounded refresh
+path. Abrupt subscription loss is surfaced as a runtime diagnostic. Per-resource
+`resourceSubscriptions` and the redesigned Tasks extension remain unimplemented.
 
 ---
 

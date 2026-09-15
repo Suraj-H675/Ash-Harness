@@ -1053,6 +1053,11 @@ class MCPRuntime:
                 )
             )
         )
+        client.subscription_failure_handler = (
+            lambda error, server=server_name, source=client: (
+                self._handle_subscription_failure(server, source, error)
+            )
+        )
         return client
 
     async def start(self) -> dict[str, BaseTool]:
@@ -1494,6 +1499,20 @@ class MCPRuntime:
                 "server": server_name,
                 "capability": capability,
                 "revision": revision,
+            }
+        )
+
+    async def _handle_subscription_failure(
+        self, server_name: str, client: MCPClient, error: BaseException
+    ) -> None:
+        if self._closed or self.clients.get(server_name) is not client:
+            return
+        self.errors[f"{server_name}:subscription"] = str(error)
+        self._emit_event(
+            {
+                "type": "mcp.subscription.lost",
+                "server": server_name,
+                "error": safe_mcp_diagnostic(error),
             }
         )
 
