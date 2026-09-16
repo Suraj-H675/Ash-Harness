@@ -165,6 +165,20 @@ def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderAB
             catalog_endpoint=connection.catalog_endpoint,
             catalog_headers=connection.headers,
         )
+    elif connection.provider in {"mistral", "lmstudio", "vllm", "openai-compatible"}:
+        from ash.providers.openai_compatible import CatalogOpenAIProvider
+
+        provider = CatalogOpenAIProvider(
+            model_name=model_name,
+            api_key=connection.api_key,
+            provider_family=connection.provider,
+            base_url=connection.base_url,
+            catalog_endpoint=connection.catalog_endpoint,
+            catalog_format=connection.catalog_format,
+            catalog_headers=connection.headers,
+            allow_anonymous=connection.auth_mode == "none",
+            local=connection.provider in {"lmstudio", "vllm"},
+        )
     else:
         provider = OpenAIProvider(
             model_name=model_name,

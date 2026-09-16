@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urlsplit
 
 from rich.console import Console
@@ -51,6 +51,9 @@ from ash.provider_catalog import (
 from ash.safe_io import read_bounded_bytes
 from ash.safety.trust import is_workspace_trusted
 from ash.ui.safe_text import terminal_safe_text
+
+if TYPE_CHECKING:
+    from ash.providers.readiness import CatalogFormat
 
 
 class SetupOutcome(IntEnum):
@@ -749,9 +752,14 @@ def _flow_openai_compatible_builtin(
     base_url_override = _prompt_optional_url(base_env, descriptor.base_url)
     base_url = base_url_override or descriptor.base_url
     _require_secure_provider_transport(base_url, descriptor.id, api_key)
+    catalog_format: CatalogFormat = (
+        "lmstudio" if descriptor.id == "lmstudio" else "openai"
+    )
     models, verified = _discover_models(
         descriptor.name,
-        lambda: _probe_models_detailed(base_url, api_key or None),
+        lambda: _probe_models_detailed(
+            base_url, api_key or None, catalog_format=catalog_format
+        ),
         fallback=[current] if current else [],
         guidance=(
             "Start the local runtime and load a model, then retry."
@@ -1072,19 +1080,25 @@ def _probe_anthropic_models(api_key: str) -> list[str]:
     return list(_probe_anthropic_models_detailed(api_key).models)
 
 
-def _probe_models_detailed(base_url: str, api_key: Optional[str]) -> ModelProbe:
+def _probe_models_detailed(
+    base_url: str,
+    api_key: Optional[str],
+    *,
+    catalog_format: CatalogFormat = "openai",
+) -> ModelProbe:
     from ash.providers.readiness import (
         ProviderVerificationError,
         probe_model_catalog,
+        provider_catalog_endpoint,
     )
 
-    endpoint = f"{base_url.rstrip('/')}/models"
+    endpoint = provider_catalog_endpoint(base_url.rstrip("/"), catalog_format)
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
         models = probe_model_catalog(
             endpoint,
             headers=headers,
-            catalog_format="openai",
+            catalog_format=catalog_format,
             timeout=10,
         )
     except ProviderVerificationError as exc:

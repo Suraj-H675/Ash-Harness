@@ -148,9 +148,11 @@ def test_openai_compatible_catalog_providers_build_with_their_route(
 
     assert result.model_name == "test-model"
     assert result.provider_family == provider
-    if provider != "openrouter":
-        # These routes have not yet gained provider-owned dynamic capability
-        # negotiation; preserve their existing OpenAI-wire compatibility behavior.
+    if provider == "mistral":
+        assert result.capabilities.native_tools is False
+        assert result.capabilities.vision is False
+        assert callable(getattr(result, "detect_capabilities", None))
+    elif provider != "openrouter":
         assert result.capabilities.native_tools is True
         assert result.capabilities.vision is True
     assert result._base_url == base_url
@@ -274,8 +276,10 @@ def test_local_openai_compatible_catalog_providers_are_anonymous(
 
     assert result.model_name == "local-model"
     assert result.provider_family == provider
-    assert result.capabilities.native_tools is True
-    assert result.capabilities.vision is True
+    assert result.capabilities.native_tools is False
+    assert result.capabilities.vision is False
+    assert result.capabilities.local is True
+    assert callable(getattr(result, "detect_capabilities", None))
     assert result._base_url == base_url
     assert result._api_key == ""
     assert result._client.api_key == "ash-anonymous"
@@ -396,3 +400,62 @@ def test_custom_bearer_provider_without_its_key_is_not_configured(
     )
 
     assert _has_provider_configured(config) is False
+
+
+@pytest.mark.asyncio
+async def test_mistral_negotiates_capabilities_from_provider_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    provider = create_default_provider_registry().build(
+        AshConfig(model="mistral/agent-model-latest")
+    )
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata",
+        lambda *args, **kwargs: (
+            ProviderModelMetadata(
+                model_id="agent-model-2609",
+                aliases=frozenset({"agent-model-latest"}),
+                native_tools=True,
+                vision=True,
+                context_window=131_072,
+            ),
+        ),
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        context_window=131_072,
+    )
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_catalog_capabilities_do_not_leak_from_another_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    provider = create_default_provider_registry().build(
+        AshConfig(model="mistral/selected-model")
+    )
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata",
+        lambda *args, **kwargs: (
+            ProviderModelMetadata(
+                model_id="different-model",
+                native_tools=True,
+                vision=True,
+            ),
+        ),
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities()
+    assert provider.capabilities == ProviderCapabilities()
+    await provider.aclose()

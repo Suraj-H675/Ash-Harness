@@ -294,3 +294,183 @@ def test_resolve_local_openai_compatible_provider_never_requires_a_key(
     assert result.auth_mode == "none"
     assert result.base_url == "http://localhost:1234/v1"
     assert result.headers == {}
+
+
+def test_probe_model_catalog_metadata_preserves_mistral_capabilities(monkeypatch) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"data": [{
+                "id": "mistral-agent-2609",
+                "aliases": ["mistral-agent", "mistral-agent-latest"],
+                "capabilities": {"function_calling": True, "vision": True},
+                "max_context_length": 262_144,
+            }]},
+            request=request,
+        ),
+    )
+
+    (entry,) = readiness.probe_model_catalog_metadata(
+        "https://api.mistral.ai/v1/models",
+        headers={},
+        catalog_format="openai",
+    )
+
+    assert entry.native_tools is True
+    assert entry.vision is True
+    assert entry.reasoning is None
+    assert entry.context_window == 262_144
+
+
+def test_probe_lmstudio_catalog_preserves_model_capabilities(monkeypatch) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"models": [
+                {
+                    "type": "llm",
+                    "key": "local-agent",
+                    "loaded_instances": [
+                        {"id": "a", "config": {"context_length": 8192}},
+                        {"id": "b", "config": {"context_length": 4096}},
+                    ],
+                    "max_context_length": 131_072,
+                    "capabilities": {
+                        "vision": True,
+                        "trained_for_tool_use": True,
+                        "reasoning": {
+                            "allowed_options": ["off", "low", "high"],
+                            "default": "low",
+                        },
+                    },
+                },
+                {
+                    "type": "embedding",
+                    "key": "embedding-model",
+                    "max_context_length": 2048,
+                },
+            ]},
+            request=request,
+        ),
+    )
+
+    (entry,) = readiness.probe_model_catalog_metadata(
+        "http://localhost:1234/api/v1/models",
+        headers={},
+        catalog_format="lmstudio",
+    )
+
+    assert entry.model_id == "local-agent"
+    assert entry.native_tools is True
+    assert entry.vision is True
+    assert entry.reasoning is True
+    assert entry.context_window == 4096
+
+
+def test_probe_vllm_catalog_keeps_tools_unknown_but_served_context(monkeypatch) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"data": [{"id": "served-model", "max_model_len": 32_768}]},
+            request=request,
+        ),
+    )
+
+    (entry,) = readiness.probe_model_catalog_metadata(
+        "http://localhost:8000/v1/models",
+        headers={},
+        catalog_format="openai",
+    )
+
+    assert entry.native_tools is None
+    assert entry.vision is None
+    assert entry.reasoning is None
+    assert entry.context_window == 32_768
+
+
+def test_lmstudio_connection_uses_native_capability_catalog() -> None:
+    connection = readiness.resolve_provider_connection(_config("lmstudio/local-model"))
+
+    assert connection.catalog_format == "lmstudio"
+    assert connection.catalog_endpoint == "http://localhost:1234/api/v1/models"
+
+
+def test_catalog_metadata_does_not_promote_malformed_capability_values(monkeypatch) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"data": [{
+                "id": "malformed",
+                "capabilities": {
+                    "function_calling": "true",
+                    "vision": 1,
+                    "reasoning": "yes",
+                },
+                "supported_parameters": {"tools": "yes", "temperature": True},
+            }]},
+            request=request,
+        ),
+    )
+
+    (entry,) = readiness.probe_model_catalog_metadata(
+        "https://provider.example/v1/models", headers={}, catalog_format="openai"
+    )
+    assert entry.native_tools is None
+    assert entry.vision is None
+    assert entry.reasoning is None
+    assert entry.supported_parameters == frozenset({"temperature"})
+
+
+
+def test_select_provider_model_metadata_prefers_exact_id_over_alias_collision() -> None:
+    exact = readiness.ProviderModelMetadata(model_id="model-a")
+    alias_collision = readiness.ProviderModelMetadata(
+        model_id="model-b",
+        aliases=frozenset({"model-a"}),
+    )
+
+    selected = readiness.select_provider_model_metadata(
+        (alias_collision, exact),
+        "model-a",
+    )
+
+    assert selected is exact
+
+
+def test_select_provider_model_metadata_rejects_ambiguous_alias() -> None:
+    catalog = (
+        readiness.ProviderModelMetadata(
+            model_id="model-a", aliases=frozenset({"latest"})
+        ),
+        readiness.ProviderModelMetadata(
+            model_id="model-b", aliases=frozenset({"latest"})
+        ),
+    )
+
+    assert readiness.select_provider_model_metadata(catalog, "latest") is None
+
+
+def test_verify_provider_connection_accepts_unique_model_alias(monkeypatch) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"data": [{
+                "id": "mistral-large-2609",
+                "aliases": ["mistral-large-latest"],
+            }]},
+            request=request,
+        ),
+    )
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+
+    result = readiness.verify_provider_connection(
+        _config("mistral/mistral-large-latest")
+    )
+
+    assert result.models == ("mistral-large-2609",)
+    assert result.selected_model_available is True

@@ -1566,3 +1566,36 @@ class TestLegacyConfigMigration:
 
         assert cli_config.CONFIG_FILE.read_bytes() == original
         assert cli_config.is_config_migration_recorded(legacy) is False
+
+
+
+def test_lmstudio_probe_uses_native_model_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import _probe_models_detailed
+
+    calls: list[tuple[str, dict[str, str], str, int]] = []
+
+    def shared_probe(
+        endpoint: str,
+        *,
+        headers: dict[str, str],
+        catalog_format: str,
+        timeout: int,
+    ) -> tuple[str, ...]:
+        calls.append((endpoint, headers, catalog_format, timeout))
+        return ("local-agent",)
+
+    monkeypatch.setattr("ash.providers.readiness.probe_model_catalog", shared_probe)
+
+    result = _probe_models_detailed(
+        "http://localhost:1234/v1",
+        None,
+        catalog_format="lmstudio",
+    )
+
+    assert result.models == ("local-agent",)
+    assert result.error is None
+    assert calls == [
+        ("http://localhost:1234/api/v1/models", {}, "lmstudio", 10)
+    ]

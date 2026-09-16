@@ -1159,3 +1159,14 @@ def test_memory_hit_rendering_sanitizes_workspace_terminal_controls() -> None:
     assert "\u202e" not in rendered
     assert "\\x1b" in rendered
     assert "forged" in rendered
+
+
+def test_dynamic_local_model_static_capabilities_are_conservative() -> None:
+    from ash.cli import _render_model_capabilities
+    from ash.config import AshConfig
+
+    config = AshConfig(model="vllm/local-model")
+
+    rendered = _render_model_capabilities("vllm/local-model", config=config)
+
+    assert rendered == "vllm/local-model: [local]"

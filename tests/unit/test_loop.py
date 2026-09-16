@@ -2676,3 +2676,96 @@ async def test_image_blocks_reach_provider_but_are_not_persisted(tmp_path):
     assert "image_blocks" not in persisted
     assert persisted["images"][0]["path"] == "image.png"
     await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_vllm_without_tool_evidence_uses_text_tool_protocol(tmp_path, monkeypatch):
+    import json
+    import httpx
+
+    from ash.providers.registry import create_default_provider_registry
+
+    monkeypatch.setenv("VLLM_API_BASE", "http://127.0.0.1:8000/v1")
+    config = AshConfig(model="vllm/local-model", provider_max_attempts=1)
+    provider = create_default_provider_registry().build(config)
+    seen_tools: list[bool] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        has_tools = bool(payload.get("tools"))
+        seen_tools.append(has_tools)
+        if has_tools:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "tools unsupported"}},
+                request=request,
+            )
+        body = (
+            b'data: {"id":"local","object":"chat.completion.chunk",'
+            b'"choices":[{"index":0,"delta":{"content":"works"},'
+            b'"finish_reason":"stop"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body,
+            request=request,
+        )
+
+    provider._client._client._transport = httpx.MockTransport(handler)
+    guard = SafetyGuard(project_root=tmp_path)
+    loop = AshLoop(
+        SessionStore(tmp_path / "vllm-capabilities.db"),
+        provider,
+        guard,
+        EventUI(),
+        tmp_path,
+        tools={"read_file": ReadFileTool(guard)},
+        config=config,
+    )
+    try:
+        outcome = await loop._stream_one_completion(
+            [{"role": "user", "content": "hello"}]
+        )
+        assert outcome.text == "works"
+        assert seen_tools == [False]
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_loop_negotiates_mistral_catalog_before_native_tool_prompt(
+    tmp_path, monkeypatch
+):
+    from ash.providers.readiness import ProviderModelMetadata
+    from ash.providers.registry import create_default_provider_registry
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    config = AshConfig(
+        model="mistral/agent-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+    provider = create_default_provider_registry().build(config)
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata",
+        lambda *args, **kwargs: (
+            ProviderModelMetadata(model_id="agent-model", native_tools=True),
+        ),
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "mistral-capabilities.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=config,
+    )
+
+    assert "provider's native tool-calling interface" not in loop.system_prompt
+    await loop.start_session()
+    assert "provider's native tool-calling interface" in loop.system_prompt
+    await loop.aclose()

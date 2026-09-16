@@ -74,6 +74,17 @@ An undeclared model still works through the conservative text/XML-tool path;
 Ash does not send native tool schemas or image inputs merely because the server
 implements an OpenAI-compatible HTTP API.
 
+The same wire/capability separation applies to built-in routes where Ash can
+inspect provider-owned metadata. Mistral starts conservative and reads the
+selected `/v1/models` entry for explicit function-calling, vision, and context
+support. LM Studio uses its native `/api/v1/models` metadata for tool training,
+vision, reasoning, and the conservative loaded-instance context. vLLM reads
+served model limits from `/v1/models`, but its catalog does not prove that
+`--enable-auto-tool-choice` plus a compatible tool parser were enabled, so Ash
+does not activate native auto-tool calling from wire compatibility or model name
+alone. Generic `openai-compatible` routes likewise require catalog evidence.
+Exact model IDs take precedence; provider aliases are accepted only when they map to exactly one catalog entry. Missing, malformed, ambiguous-alias, or different-model metadata keeps the conservative path.
+
 Connectivity diagnostics must receive a successful model catalog containing
 the selected model. A reachable endpoint with an empty catalog or a different
 model is reported as not ready; `ash setup` remains the remediation path.

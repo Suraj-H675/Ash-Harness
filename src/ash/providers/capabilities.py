@@ -92,7 +92,7 @@ def _reasoning_by_name(model: str) -> ProviderCapabilities:
     )
 
 
-def _ollama(model: str) -> ProviderCapabilities:
+def _local_conservative(model: str) -> ProviderCapabilities:
     del model
     return ProviderCapabilities(native_tools=False, local=True)
 
@@ -103,7 +103,9 @@ def create_default_capability_registry() -> CapabilityRegistry:
     registry.register("openai", _openai)
     registry.register("deepseek", _reasoning_by_name)
     registry.register("groq", _reasoning_by_name)
-    registry.register("ollama", _ollama)
+    registry.register("ollama", _local_conservative)
+    registry.register("lmstudio", _local_conservative)
+    registry.register("vllm", _local_conservative)
     return registry
 
 

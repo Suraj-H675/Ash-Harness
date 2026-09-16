@@ -28,7 +28,7 @@ class ProviderConfigurationError(ValueError):
     """Raised when the selected provider cannot be constructed safely."""
 
 
-CatalogFormat = Literal["openai", "anthropic", "ollama"]
+CatalogFormat = Literal["openai", "anthropic", "ollama", "lmstudio"]
 AuthMode = Literal["bearer", "anthropic", "none"]
 MAX_PROVIDER_CATALOG_BYTES = 2_000_000
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
@@ -81,10 +81,29 @@ class ProviderModelMetadata:
     """Validated model capability metadata from a provider catalog."""
 
     model_id: str
+    aliases: frozenset[str] = frozenset()
     supported_parameters: frozenset[str] = frozenset()
     input_modalities: frozenset[str] = frozenset()
+    native_tools: bool | None = None
+    vision: bool | None = None
+    reasoning: bool | None = None
     context_window: int | None = None
     max_output_tokens: int | None = None
+
+
+def select_provider_model_metadata(
+    catalog: tuple[ProviderModelMetadata, ...],
+    model_name: str,
+) -> ProviderModelMetadata | None:
+    """Resolve one exact model or one unambiguous provider-owned alias."""
+
+    exact = [item for item in catalog if item.model_id == model_name]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        return None
+    aliases = [item for item in catalog if model_name in item.aliases]
+    return aliases[0] if len(aliases) == 1 else None
 
 
 _BUILTIN_CONNECTIONS: dict[str, tuple[str, str, CatalogFormat, AuthMode]] = {
@@ -157,7 +176,7 @@ _BUILTIN_CONNECTIONS: dict[str, tuple[str, str, CatalogFormat, AuthMode]] = {
     "lmstudio": (
         "http://localhost:1234/v1",
         "LMSTUDIO_API_BASE",
-        "openai",
+        "lmstudio",
         "none",
     ),
     "vllm": (
@@ -236,6 +255,9 @@ def provider_catalog_endpoint(base_url: str, catalog_format: CatalogFormat) -> s
 
     if catalog_format == "ollama":
         return f"{base_url}/api/tags"
+    if catalog_format == "lmstudio":
+        root = base_url.removesuffix("/v1")
+        return f"{root}/api/v1/models"
     if catalog_format == "anthropic":
         return (
             f"{base_url}/models"
@@ -417,8 +439,12 @@ def probe_model_catalog_metadata(
             f"provider catalog verification failed ({type(exc).__name__})"
         ) from exc
 
-    collection = "models" if catalog_format == "ollama" else "data"
-    identifier = "name" if catalog_format == "ollama" else "id"
+    if catalog_format == "ollama":
+        collection, identifier = "models", "name"
+    elif catalog_format == "lmstudio":
+        collection, identifier = "models", "key"
+    else:
+        collection, identifier = "data", "id"
     if not isinstance(payload, dict) or not isinstance(payload.get(collection), list):
         raise ProviderVerificationError("provider returned an invalid model catalog")
 
@@ -427,14 +453,31 @@ def probe_model_catalog_metadata(
     for item in payload[collection]:
         if not isinstance(item, dict):
             continue
+        if catalog_format == "lmstudio" and item.get("type") == "embedding":
+            continue
         model_id = item.get(identifier)
         if not isinstance(model_id, str) or not model_id or model_id in seen:
             continue
         seen.add(model_id)
+        raw_aliases = item.get("aliases")
+        aliases = frozenset(
+            value
+            for value in raw_aliases
+            if isinstance(value, str) and value and value != model_id
+        ) if isinstance(raw_aliases, list) else frozenset()
         supported = item.get("supported_parameters")
-        parameters = frozenset(
-            value for value in supported if isinstance(value, str) and value
-        ) if isinstance(supported, list) else frozenset()
+        if isinstance(supported, list):
+            parameters = frozenset(
+                value for value in supported if isinstance(value, str) and value
+            )
+        elif isinstance(supported, dict):
+            parameters = frozenset(
+                str(name)
+                for name, enabled in supported.items()
+                if isinstance(name, str) and name and enabled is True
+            )
+        else:
+            parameters = frozenset()
         architecture = item.get("architecture")
         raw_modalities = (
             architecture.get("input_modalities")
@@ -444,21 +487,66 @@ def probe_model_catalog_metadata(
         modalities = frozenset(
             value for value in raw_modalities if isinstance(value, str) and value
         ) if isinstance(raw_modalities, list) else frozenset()
+        capabilities = item.get("capabilities")
+        capability_data = capabilities if isinstance(capabilities, dict) else {}
+        native_tools = _catalog_boolean(capability_data, "function_calling")
+        if native_tools is None:
+            native_tools = _catalog_boolean(capability_data, "trained_for_tool_use")
+        if native_tools is None:
+            native_tools = _catalog_boolean(capability_data, "tools")
+        vision = _catalog_boolean(capability_data, "vision")
+        reasoning = _catalog_boolean(capability_data, "reasoning")
+        if reasoning is None and catalog_format == "lmstudio":
+            reasoning_config = capability_data.get("reasoning")
+            if isinstance(reasoning_config, dict):
+                allowed = reasoning_config.get("allowed_options")
+                if isinstance(allowed, list):
+                    reasoning = any(
+                        option in {"on", "low", "medium", "high", "xhigh"}
+                        for option in allowed
+                        if isinstance(option, str)
+                    )
         top_provider = item.get("top_provider")
         top_provider_data = top_provider if isinstance(top_provider, dict) else {}
-        context_window = _positive_catalog_integer(
-            top_provider_data.get("context_length")
-        ) or _positive_catalog_integer(item.get("context_length"))
+        limits = item.get("limits")
+        limit_data = limits if isinstance(limits, dict) else {}
+        loaded_contexts: list[int] = []
+        if catalog_format == "lmstudio" and isinstance(item.get("loaded_instances"), list):
+            for instance in item["loaded_instances"]:
+                if not isinstance(instance, dict):
+                    continue
+                instance_config = instance.get("config")
+                if not isinstance(instance_config, dict):
+                    continue
+                loaded_context = _positive_catalog_integer(
+                    instance_config.get("context_length")
+                )
+                if loaded_context is not None:
+                    loaded_contexts.append(loaded_context)
+        context_window = (
+            min(loaded_contexts)
+            if loaded_contexts
+            else _positive_catalog_integer(top_provider_data.get("context_length"))
+            or _positive_catalog_integer(limit_data.get("max_context_length"))
+            or _positive_catalog_integer(item.get("max_context_length"))
+            or _positive_catalog_integer(item.get("max_model_len"))
+            or _positive_catalog_integer(item.get("context_length"))
+        )
         max_output = (
             _positive_catalog_integer(top_provider_data.get("max_completion_tokens"))
+            or _positive_catalog_integer(limit_data.get("max_completion_tokens"))
             or _positive_catalog_integer(item.get("max_completion_tokens"))
             or _positive_catalog_integer(item.get("max_output_tokens"))
         )
         models.append(
             ProviderModelMetadata(
                 model_id=model_id,
+                aliases=aliases,
                 supported_parameters=parameters,
                 input_modalities=modalities,
+                native_tools=native_tools,
+                vision=vision,
+                reasoning=reasoning,
                 context_window=context_window,
                 max_output_tokens=max_output,
             )
@@ -466,6 +554,11 @@ def probe_model_catalog_metadata(
     if not models:
         raise ProviderVerificationError("provider returned no model IDs")
     return tuple(models)
+
+
+def _catalog_boolean(values: Mapping[str, object], key: str) -> bool | None:
+    value = values.get(key)
+    return value if isinstance(value, bool) else None
 
 
 def _positive_catalog_integer(value: object) -> int | None:
@@ -534,14 +627,16 @@ def verify_provider_connection(
     """Resolve and verify the configured provider route and model catalog."""
 
     connection = resolve_provider_connection(config)
-    models = probe_model_catalog(
+    metadata = probe_model_catalog_metadata(
         connection.catalog_endpoint,
         headers=connection.headers,
         catalog_format=connection.catalog_format,
         timeout=timeout,
     )
+    models = tuple(item.model_id for item in metadata)
+    selected = select_provider_model_metadata(metadata, connection.model_name)
     return ProviderVerification(
         connection=connection,
         models=models,
-        selected_model_available=connection.model_name in models,
+        selected_model_available=selected is not None,
     )
