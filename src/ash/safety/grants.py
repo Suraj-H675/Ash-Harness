@@ -20,7 +20,7 @@ from ash.safety.trust import canonical_workspace
 from ash.safe_io import read_bounded_bytes, validate_unlinked_path
 
 
-CURRENT_PERMISSION_RULE_VERSION = 2
+CURRENT_PERMISSION_RULE_VERSION = 3
 MAX_RULE_FILE_BYTES = 1_000_000
 MAX_MANAGED_RULE_FILES = 16
 MAX_EXACT_VALUE_BYTES = 8192
@@ -55,6 +55,7 @@ class MatchOperator(StrEnum):
     PREFIX = "prefix"
     COMMAND_PREFIX = "command_prefix"
     PATH_PREFIX = "path_prefix"
+    PATH_GLOB = "path_glob"
     SUFFIX = "suffix"
     DOMAIN = "domain"
 
@@ -159,24 +160,65 @@ def _hostname_from_candidate(candidate: str) -> str | None:
         return None
 
 
-def _lexical_path_prefix_matches(candidate: str, expected_prefix: str) -> bool:
-    """Match a workspace-relative path without following links or allowing traversal."""
+def _normalize_lexical_workspace_path(candidate: str) -> str | None:
+    """Normalize a workspace path lexically without following filesystem links."""
 
     normalized = candidate.replace("\\", "/").strip("/")
     if not normalized:
-        return False
+        return None
     parts: list[str] = []
     for part in normalized.split("/"):
         if part in {"", "."}:
             continue
         if part == "..":
             if not parts:
-                return False
+                return None
             parts.pop()
             continue
         parts.append(part)
-    workspace_path = "/".join(parts) + "/"
-    return workspace_path.startswith(expected_prefix)
+    return "/".join(parts) or None
+
+
+def _lexical_path_prefix_matches(candidate: str, expected_prefix: str) -> bool:
+    """Match a workspace-relative path without following links or allowing traversal."""
+
+    workspace_path = _normalize_lexical_workspace_path(candidate)
+    return workspace_path is not None and f"{workspace_path}/".startswith(expected_prefix)
+
+
+def _simple_path_glob_matches(candidate: str, pattern: str) -> bool:
+    """Whole-value wildcard matching where '*' spans '/' and '?' matches one character."""
+
+    value = _normalize_lexical_workspace_path(candidate)
+    if value is None:
+        return False
+    if os.name == "nt":
+        value = value.casefold()
+        pattern = pattern.casefold()
+    value_index = pattern_index = 0
+    star_index = -1
+    star_value_index = 0
+    while value_index < len(value):
+        if pattern_index < len(pattern) and (
+            pattern[pattern_index] == "?" or pattern[pattern_index] == value[value_index]
+        ):
+            value_index += 1
+            pattern_index += 1
+            continue
+        if pattern_index < len(pattern) and pattern[pattern_index] == "*":
+            star_index = pattern_index
+            pattern_index += 1
+            star_value_index = value_index
+            continue
+        if star_index >= 0:
+            star_value_index += 1
+            value_index = star_value_index
+            pattern_index = star_index + 1
+            continue
+        return False
+    while pattern_index < len(pattern) and pattern[pattern_index] == "*":
+        pattern_index += 1
+    return pattern_index == len(pattern)
 
 
 @dataclass(frozen=True)
@@ -267,6 +309,24 @@ class ArgumentMatcher:
                     "path_prefix must be a relative workspace path without traversal"
                 )
             object.__setattr__(self, "value", normalized + "/")
+        if self.operator == MatchOperator.PATH_GLOB:
+            if self.argument not in (_PATH_ARGUMENTS | _SUFFIX_ARGUMENTS):
+                allowed = ", ".join(sorted(_PATH_ARGUMENTS | _SUFFIX_ARGUMENTS))
+                raise PermissionGrantError(
+                    f"path_glob can only match workspace path arguments: {allowed}"
+                )
+            value = self._validated_text("path_glob")
+            if "\\" in value or "\x00" in value or value.startswith("/"):
+                raise PermissionGrantError(
+                    "path_glob must use a relative POSIX-style workspace pattern"
+                )
+            parts = [part for part in value.split("/") if part not in {"", "."}]
+            if not parts or ".." in parts:
+                raise PermissionGrantError(
+                    "path_glob must be a relative workspace pattern without traversal"
+                )
+            normalized = "/".join(parts)
+            object.__setattr__(self, "value", normalized)
         if self.operator == MatchOperator.SUFFIX:
             if self.argument not in _SUFFIX_ARGUMENTS:
                 raise PermissionGrantError(
@@ -340,6 +400,8 @@ class ArgumentMatcher:
             return False
         if self.operator == MatchOperator.PATH_PREFIX:
             return _lexical_path_prefix_matches(candidate, str(self.value))
+        if self.operator == MatchOperator.PATH_GLOB:
+            return _simple_path_glob_matches(candidate, str(self.value))
         if self.operator == MatchOperator.SUFFIX:
             basename = candidate.replace("\\", "/").rstrip("/").split("/")[-1]
             return bool(basename) and basename.casefold().endswith(str(self.value))
@@ -350,14 +412,8 @@ class ArgumentMatcher:
                 return False
             if expected_domain.startswith("*."):
                 base_domain = expected_domain[2:]
-                matches_domain = hostname == base_domain or hostname.endswith(
-                    f".{base_domain}"
-                )
-            else:
-                matches_domain = hostname == expected_domain or hostname.endswith(
-                    f".{expected_domain}"
-                )
-            return matches_domain
+                return hostname != base_domain and hostname.endswith(f".{base_domain}")
+            return hostname == expected_domain
         if not isinstance(candidate, str):
             return False
         tokens = _safe_command_tokens(candidate)
@@ -428,11 +484,6 @@ class PermissionRule:
         normalized_effect = RuleEffect(effect)
         normalized_tool = _validate_identifier(tool_name, label="tool name")
         normalized_matchers = tuple(matchers)
-        arguments = [matcher.argument for matcher in normalized_matchers]
-        if len(arguments) != len(set(arguments)):
-            raise PermissionGrantError(
-                "a permission rule cannot match the same argument more than once"
-            )
         return cls(
             _rule_identifier(
                 normalized_effect,

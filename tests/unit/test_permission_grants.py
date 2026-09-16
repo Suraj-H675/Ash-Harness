@@ -71,7 +71,7 @@ def test_legacy_grants_migrate_on_the_next_atomic_write(tmp_path, monkeypatch) -
     )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["version"] == 2
+    assert payload["version"] == 3
     assert len(payload["workspaces"][str(workspace.resolve())]) == 2
     assert path.stat().st_mode & 0o777 == 0o600
 
@@ -108,13 +108,85 @@ def test_path_prefix_matcher_is_workspace_scoped_and_safe() -> None:
         ArgumentMatcher("command_line", MatchOperator.PATH_PREFIX, "docs")
 
 
+def test_permission_rule_composes_multiple_matchers_for_one_argument() -> None:
+    rule = PermissionRule.create(
+        RuleEffect.ALLOW,
+        "write_file",
+        [
+            ArgumentMatcher("file_path", MatchOperator.PATH_PREFIX, "docs"),
+            ArgumentMatcher("file_path", MatchOperator.SUFFIX, ".md"),
+        ],
+    )
+
+    assert rule.matches("write_file", {"file_path": "docs/guide.md"}) is True
+    assert rule.matches("write_file", {"file_path": "docs/guide.txt"}) is False
+    assert rule.matches("write_file", {"file_path": "README.md"}) is False
+    assert PermissionRule.from_payload(rule.as_payload()) == rule
+
+
+def test_path_glob_matcher_is_whole_value_and_traversal_safe() -> None:
+    matcher = ArgumentMatcher(
+        "file_path", MatchOperator.PATH_GLOB, "packages/*/README.md"
+    )
+    single = ArgumentMatcher(
+        "file_path", MatchOperator.PATH_GLOB, "packages/pkg?/README.md"
+    )
+
+    assert matcher.matches({"file_path": "packages/app/README.md"}) is True
+    assert matcher.matches({"file_path": "./packages/app/docs/README.md"}) is True
+    assert matcher.matches({"file_path": "packages/app/README.txt"}) is False
+    assert matcher.matches({"file_path": "../packages/app/README.md"}) is False
+    assert single.matches({"file_path": "packages/pkg1/README.md"}) is True
+    assert single.matches({"file_path": "packages/pkg12/README.md"}) is False
+
+    for invalid in ("/packages/*", "../packages/*", r"packages\*\README.md"):
+        with pytest.raises(PermissionGrantError, match="path_glob"):
+            ArgumentMatcher("file_path", MatchOperator.PATH_GLOB, invalid)
+    with pytest.raises(PermissionGrantError, match="path arguments"):
+        ArgumentMatcher("content", MatchOperator.PATH_GLOB, "packages/*")
+
+
+def test_version_two_permission_rules_remain_readable_and_upgrade_on_write(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    path = grants_path()
+    path.parent.mkdir(parents=True)
+    legacy_rule = PermissionRule.create(
+        RuleEffect.ALLOW,
+        "read_file",
+        [ArgumentMatcher("file_path", MatchOperator.PATH_PREFIX, "docs")],
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "workspaces": {str(workspace.resolve()): [legacy_rule.as_payload()]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_permission_rules(workspace) == [legacy_rule]
+    add_permission_rule(
+        workspace,
+        PermissionRule.create(RuleEffect.DENY, "run_command"),
+    )
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 3
+
+
 def test_domain_matcher_accepts_urls_and_hostnames_only() -> None:
-    url_matcher = ArgumentMatcher("url", MatchOperator.DOMAIN, "*.Example.COM")
+    wildcard = ArgumentMatcher("url", MatchOperator.DOMAIN, "*.Example.COM")
+    exact = ArgumentMatcher("url", MatchOperator.DOMAIN, "api.example.com")
     domain_matcher = ArgumentMatcher("domain", MatchOperator.DOMAIN, "docs.example.com")
 
-    assert url_matcher.matches({"url": "https://api.example.com/path"}) is True
-    assert url_matcher.matches({"url": "https://example.com/path"}) is True
-    assert url_matcher.matches({"url": "https://badexample.com/path"}) is False
+    assert wildcard.matches({"url": "https://api.example.com/path"}) is True
+    assert wildcard.matches({"url": "https://example.com/path"}) is False
+    assert wildcard.matches({"url": "https://badexample.com/path"}) is False
+    assert exact.matches({"url": "https://api.example.com/path"}) is True
+    assert exact.matches({"url": "https://evil.api.example.com/path"}) is False
     assert domain_matcher.matches({"domain": "DOCS.EXAMPLE.COM"}) is True
     assert domain_matcher.matches({"url": "https://user@example.com"}) is False
 

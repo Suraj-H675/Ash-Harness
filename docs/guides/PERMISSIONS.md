@@ -32,7 +32,7 @@ workspaces by canonical absolute path. For example:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "workspaces": {
     "/srv/app": [
       {
@@ -58,6 +58,9 @@ Users can persist scoped rules for the current workspace:
 ```bash
 ash permissions deny write_file --exact 'file_path=".env"'
 ash permissions allow run_command --command-prefix pytest
+ash permissions allow write_file --path-prefix file_path=docs --suffix file_path=.md
+ash permissions allow read_file --path-glob 'file_path=packages/*/README.md'
+ash permissions allow web_fetch --domain url=api.example.com
 ash permissions remove RULE_ID
 ash permissions clear --yes
 ```
@@ -65,3 +68,10 @@ ash permissions clear --yes
 Command-prefix matching accepts only simple commands. Compound commands,
 redirection, substitution, and ambiguous quoting require exact approval so a
 prefix grant cannot hide an unrelated command.
+
+Multiple matchers in one rule are AND-combined, including multiple constraints
+on the same argument. `--path-glob` matches the entire normalized workspace path
+using only `*` (zero or more characters, including `/`) and `?` (exactly one
+character); absolute, backslash, or traversal patterns are rejected. Domain rules
+are least-privilege: `example.com` matches only that hostname, while
+`*.example.com` matches subdomains but not the apex.

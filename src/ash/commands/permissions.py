@@ -123,6 +123,7 @@ def build_argument_matchers(
     allowed_set: list[str] | None = None,
     prefix: list[str] | None = None,
     path_prefix: list[str] | None = None,
+    path_glob: list[str] | None = None,
     suffix: list[str] | None = None,
     domain: list[str] | None = None,
     command_prefix: list[str] | None = None,
@@ -166,6 +167,9 @@ def build_argument_matchers(
     for raw in path_prefix or ():
         argument, value = _split_assignment(raw, option="--path-prefix")
         matchers.append(ArgumentMatcher(argument, MatchOperator.PATH_PREFIX, value))
+    for raw in path_glob or ():
+        argument, value = _split_assignment(raw, option="--path-glob")
+        matchers.append(ArgumentMatcher(argument, MatchOperator.PATH_GLOB, value))
     for raw in suffix or ():
         argument, value = _split_assignment(raw, option="--suffix")
         matchers.append(ArgumentMatcher(argument, MatchOperator.SUFFIX, value))
@@ -194,6 +198,7 @@ def add_cli_permission_rule(
     in_set: list[str] | None = None,
     prefix: list[str] | None = None,
     path_prefix: list[str] | None = None,
+    path_glob: list[str] | None = None,
     suffix: list[str] | None = None,
     domain: list[str] | None = None,
     command_prefix: list[str] | None = None,
@@ -210,6 +215,7 @@ def add_cli_permission_rule(
             allowed_set=in_set,
             prefix=prefix,
             path_prefix=path_prefix,
+            path_glob=path_glob,
             suffix=suffix,
             domain=domain,
             command_prefix=command_prefix,

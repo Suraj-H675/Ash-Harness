@@ -7,7 +7,7 @@ import pytest
 
 from ash.cli import main
 from ash.commands.permissions import build_argument_matchers, render_permission_grants
-from ash.safety.grants import load_permission_rules, load_tool_grants, set_tool_grant
+from ash.safety.grants import MatchOperator, load_permission_rules, load_tool_grants, set_tool_grant
 from ash.safety.policy import PermissionPolicy, PolicyAction
 
 
@@ -172,6 +172,95 @@ def test_permissions_cli_persists_safe_suffix_rule_and_enforces_it(
             {"file_path": "docs/README.md"},
         )
         is True
+    )
+
+
+def test_permissions_cli_combines_path_prefix_and_suffix_on_same_argument(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(workspace)
+
+    assert (
+        main(
+            [
+                "permissions",
+                "allow",
+                "write_file",
+                "--path-prefix",
+                "file_path=docs",
+                "--suffix",
+                "file_path=.md",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    policy = PermissionPolicy(
+        "interactive",
+        persistent_rules=load_permission_rules(workspace),
+    )
+    assert (
+        policy.evaluate("write_file", {"file_path": "docs/guide.md"}).action
+        == PolicyAction.ALLOW
+    )
+    assert (
+        policy.evaluate("write_file", {"file_path": "docs/guide.txt"}).action
+        == PolicyAction.ASK
+    )
+    assert (
+        policy.evaluate("write_file", {"file_path": "README.md"}).action
+        == PolicyAction.ASK
+    )
+
+
+def test_permissions_cli_persists_path_glob_rule_and_enforces_it(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(workspace)
+
+    assert (
+        main(
+            [
+                "permissions",
+                "allow",
+                "write_file",
+                "--path-glob",
+                "file_path=packages/*/README.md",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    rules = load_permission_rules(workspace)
+    assert rules[0].matchers[0].operator == MatchOperator.PATH_GLOB
+    policy = PermissionPolicy("interactive", persistent_rules=rules)
+    assert (
+        policy.evaluate(
+            "write_file", {"file_path": "packages/core/README.md"}
+        ).action
+        == PolicyAction.ALLOW
+    )
+    assert (
+        policy.evaluate(
+            "write_file", {"file_path": "packages/core/README.txt"}
+        ).action
+        == PolicyAction.ASK
+    )
+    assert (
+        rules[0].matches(
+            "write_file", {"file_path": "packages/core/README.txt"}
+        )
+        is False
     )
 
 

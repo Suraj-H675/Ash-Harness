@@ -2347,6 +2347,12 @@ def main(argv: list[str] | None = None) -> int:
             metavar="PATH_ARGUMENT=RELATIVE_PATH",
         )
         permissions_rule.add_argument(
+            "--path-glob",
+            action="append",
+            default=[],
+            metavar="PATH_ARGUMENT=RELATIVE_GLOB",
+        )
+        permissions_rule.add_argument(
             "--suffix",
             action="append",
             default=[],
@@ -3504,6 +3510,7 @@ def main(argv: list[str] | None = None) -> int:
                     in_set=getattr(args, "in"),
                     prefix=args.prefix,
                     path_prefix=args.path_prefix,
+                    path_glob=args.path_glob,
                     suffix=args.suffix,
                     domain=args.domain,
                     command_prefix=args.command_prefix,
