@@ -9,7 +9,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
@@ -22,7 +22,7 @@ from ash.core.redaction import redact_text
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC
 from ash.safety.guard import SafetyGuard
-from ash.safety.policy import PermissionPolicy
+from ash.safety.policy import PermissionPolicy, PolicyAction
 from ash.sandbox import SandboxManager
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.ui.headless import HeadlessUI
@@ -33,6 +33,11 @@ if TYPE_CHECKING:
 
 
 _PERSISTED_STOP_REASON = "stopped by persisted message"
+
+
+SubagentApprovalBroker = Callable[
+    [str, str, dict[str, Any]], Awaitable[bool | str | tuple[bool, str]]
+]
 
 
 async def _settle_spawn_cleanup_task(
@@ -107,6 +112,7 @@ class SpawnAgentTool(BaseTool):
         self._task_lease_seconds = config.agent_lease_seconds if config else 30.0
         self._custom_agents = dict(custom_agents or {})
         self._permission_policy_provider: Callable[[], PermissionPolicy] | None = None
+        self._foreground_approval_broker: SubagentApprovalBroker | None = None
         if self._custom_agents:
             self._update_description()
         self._tasks: dict[str, asyncio.Task[AgentReport]] = {}
@@ -122,6 +128,17 @@ class SpawnAgentTool(BaseTool):
         """Bind the parent runtime policy used to authorize child tool calls."""
 
         self._permission_policy_provider = provider
+
+    @property
+    def foreground_approval_broker(self) -> SubagentApprovalBroker | None:
+        return self._foreground_approval_broker
+
+    def set_foreground_approval_broker(
+        self, broker: SubagentApprovalBroker | None
+    ) -> None:
+        """Bind the live parent approval broker for direct foreground workers only."""
+
+        self._foreground_approval_broker = broker
 
     def _worker_permission_policy(self) -> PermissionPolicy:
         if self._permission_policy_provider is not None:
@@ -516,6 +533,11 @@ class SpawnAgentTool(BaseTool):
 
         branch_state: dict[str, str | None] = {"commit": None}
         cleanup_state = {"done": False}
+        foreground_approval_broker = (
+            self._foreground_approval_broker
+            if created_here and not args.background
+            else None
+        )
 
         async def provider_runner(context: dict[str, Any]) -> AgentReport:
             started = datetime.now(timezone.utc)
@@ -540,6 +562,7 @@ class SpawnAgentTool(BaseTool):
                     token_budget=task_token_budget,
                     time_budget_seconds=task_time_budget,
                     dependency_context=dependency_context,
+                    approval_broker=foreground_approval_broker,
                 )
                 artifacts["completion_tokens"] = completion_tokens
                 artifacts["cost_usd"] = task_cost_usd
@@ -793,6 +816,7 @@ class SpawnAgentTool(BaseTool):
         token_budget: int,
         time_budget_seconds: float,
         dependency_context: str,
+        approval_broker: SubagentApprovalBroker | None,
     ) -> tuple[str, int, float]:
         provider = self._provider_factory()
         guard = SafetyGuard(workspace)
@@ -873,6 +897,52 @@ class SpawnAgentTool(BaseTool):
             enable_semantic_memory=False,
         )
         loop.permission_policy = worker_policy
+        if approval_broker is not None:
+
+            async def approve_worker_tool(
+                tool_name: str, arguments: dict[str, Any]
+            ) -> bool | str | tuple[bool, str]:
+                decision = worker_policy.evaluate(tool_name, arguments)
+                if decision.action == PolicyAction.ALLOW:
+                    return True
+                if decision.action == PolicyAction.DENY:
+                    return False
+                parent_policy = (
+                    self._permission_policy_provider()
+                    if self._permission_policy_provider is not None
+                    else None
+                )
+                before_rule_ids = (
+                    {
+                        category: {rule.rule_id for rule in getattr(parent_policy, category)}
+                        for category in (
+                            "managed_rules",
+                            "session_rules",
+                            "persistent_rules",
+                        )
+                    }
+                    if parent_policy is not None
+                    else {}
+                )
+                result = await approval_broker(agent_id, tool_name, arguments)
+                if parent_policy is not None:
+                    for category in (
+                        "managed_rules",
+                        "session_rules",
+                        "persistent_rules",
+                    ):
+                        worker_rules = getattr(worker_policy, category)
+                        worker_ids = {rule.rule_id for rule in worker_rules}
+                        worker_rules.extend(
+                            rule
+                            for rule in getattr(parent_policy, category)
+                            if rule.rule_id not in before_rule_ids[category]
+                            and rule.rule_id not in worker_ids
+                            and rule.matches(tool_name, arguments)
+                        )
+                return result
+
+            loop.on_tool_approval = approve_worker_tool
         turn: asyncio.Task[str] | None = None
         inbox: asyncio.Task[None] | None = None
         loop_closed = False

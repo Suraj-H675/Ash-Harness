@@ -544,6 +544,18 @@ def build_runtime(
     )
     if callable(set_policy_provider):
         set_policy_provider(lambda: loop.permission_policy)
+    set_foreground_broker = getattr(
+        spawn_agent_tool, "set_foreground_approval_broker", None
+    )
+    if callable(set_foreground_broker) and approval_callback is not None:
+
+        async def approve_foreground_subagent(
+            agent_id: str, tool_name: str, arguments: dict[str, Any]
+        ) -> bool:
+            del agent_id
+            return await approval_callback(tool_name, arguments)
+
+        set_foreground_broker(approve_foreground_subagent)
     hooks.set_event_sink(loop._emit_event)
     def checkpoint_context() -> tuple[str, str, str] | None:
         if loop.current_session is None or loop.turn_context is None:

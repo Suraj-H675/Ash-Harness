@@ -327,6 +327,96 @@ async def test_delegate_agents_do_not_bypass_parent_permission_policy(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_delegate_worker_never_uses_foreground_approval_broker(tmp_path: Path) -> None:
+    class WritingProvider(ProviderABC):
+        model_name = "queued-writer"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "queued-write",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "queued.txt",
+                                "content": "must stay denied\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                assert any(
+                    message.get("role") == "tool"
+                    and "Denied by user" in str(message.get("content"))
+                    for message in messages
+                )
+                yield StreamChunk(content="queued denied", is_done=True)
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+    broker_calls: list[tuple[str, str]] = []
+
+    async def broker(agent_id: str, tool_name: str, arguments: dict) -> bool:
+        del arguments
+        broker_calls.append((agent_id, tool_name))
+        return True
+
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "queued-policy-db",
+        safety_tier="interactive",
+        max_concurrent_agents=1,
+        agent_token_budget=100,
+        agent_time_budget_seconds=10,
+        memory_backend="off",
+    )
+    db_path = config.db_directory / "agents.db"
+    spawn = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        WritingProvider,
+        config=config,
+    )
+    spawn.set_foreground_approval_broker(broker)
+    delegate = DelegateAgentsTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        spawn,
+        config,
+    )
+
+    result = await delegate.run(
+        goal="attempt queued write",
+        tasks=[
+            {
+                "key": "write",
+                "role": "coder",
+                "task": "write queued file",
+                "isolation": "shared",
+            }
+        ],
+    )
+
+    assert result.success is True
+    payload = json.loads(result.output)
+    assert payload["tasks"][0]["result"]["summary"] == "queued denied"
+    assert broker_calls == []
+    assert not (tmp_path / "queued.txt").exists()
+    await delegate.aclose()
+    await spawn.aclose()
+
+
+@pytest.mark.asyncio
 async def test_delegate_graph_enforces_shared_cost_ceiling(tmp_path: Path):
     config = AshConfig(
         model_pricing_usd_per_million={

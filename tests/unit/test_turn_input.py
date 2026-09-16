@@ -6,12 +6,16 @@ import pytest
 from types import SimpleNamespace
 from rich.console import Console
 
+from ash.agents.shared_state import SharedState
+from ash.config import AshConfig
 from ash.core.loop import AshLoop
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.grants import RuleEffect, load_permission_rules
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PolicyAction
+from ash.tools.agent import SpawnAgentTool
 from ash.tools.filesystem import WriteFileTool
 from ash.ui.terminal import TerminalUI
 from ash.ui.notifications import NotificationEvent
@@ -213,6 +217,247 @@ async def test_interactive_approval_preempts_steering_reader(tmp_path: Path) -> 
         (NotificationEvent.APPROVAL_REQUIRED, "Ash needs approval: write_file"),
         (NotificationEvent.TURN_COMPLETE, "Ash turn complete."),
     ]
+
+
+@pytest.mark.asyncio
+async def test_foreground_subagent_routes_ask_to_parent_approval_ui(tmp_path: Path) -> None:
+    class ParentProvider(ProviderABC):
+        model_name = "parent"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "spawn-child",
+                            "name": "spawn_agent",
+                            "arguments": {
+                                "role": "coder",
+                                "task": "write child file",
+                                "agent_id": "approval-child",
+                                "isolation": "shared",
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="parent done", is_done=True)
+
+    class ChildProvider(ProviderABC):
+        model_name = "child"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "child-write",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "child-approved.txt",
+                                "content": "approved by parent\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="child done", is_done=True)
+
+    prompt = RoutedPrompt()
+    await prompt.approvals.put("y")
+    await prompt.approvals.put("y")
+    notifier = RecordingNotifier()
+    ui = make_ui()
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "agent-db",
+        safety_tier="interactive",
+        memory_backend="off",
+    )
+    guard = SafetyGuard(tmp_path)
+    spawn = SpawnAgentTool(
+        guard,
+        SharedState(config.db_directory / "agents.db"),
+        ChildProvider,
+        config=config,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions-subagent.db"),
+        ParentProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={spawn.name: spawn},
+        safety_tier="interactive",
+        config=config,
+    )
+    previous_broker_calls: list[tuple[str, str]] = []
+
+    async def previous_broker(
+        agent_id: str, tool_name: str, arguments: dict[str, object]
+    ) -> bool:
+        del arguments
+        previous_broker_calls.append((agent_id, tool_name))
+        return False
+
+    spawn.set_foreground_approval_broker(previous_broker)
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+        notifier=notifier,
+    )
+
+    response = await controller.run("delegate the write")
+    assert spawn.foreground_approval_broker is previous_broker
+    assert previous_broker_calls == []
+    await loop.aclose()
+
+    assert response == "parent done"
+    assert (tmp_path / "child-approved.txt").read_text(encoding="utf-8") == (
+        "approved by parent\n"
+    )
+    assert sum(item.startswith("Approve") for item in prompt.prompts) == 2
+    assert notifier.calls == [
+        (NotificationEvent.APPROVAL_REQUIRED, "Ash needs approval: spawn_agent"),
+        (
+            NotificationEvent.APPROVAL_REQUIRED,
+            "Subagent approval-child needs approval: write_file",
+        ),
+        (NotificationEvent.TURN_COMPLETE, "Ash turn complete."),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_foreground_subagent_session_grant_applies_to_same_worker(tmp_path: Path) -> None:
+    class ParentProvider(ProviderABC):
+        model_name = "parent-session"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "spawn-session-child",
+                            "name": "spawn_agent",
+                            "arguments": {
+                                "role": "coder",
+                                "task": "write two child files",
+                                "agent_id": "session-child",
+                                "isolation": "shared",
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="parent done", is_done=True)
+
+    class ChildProvider(ProviderABC):
+        model_name = "child-session"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls in {1, 2}:
+                index = self.calls
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": f"child-write-{index}",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": f"child-{index}.txt",
+                                "content": f"child {index}\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="child done", is_done=True)
+
+    prompt = RoutedPrompt()
+    await prompt.approvals.put("y")
+    await prompt.approvals.put("a")
+    await prompt.approvals.put("n")  # must remain unused if the session grant synced
+    ui = make_ui()
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "agent-session-db",
+        safety_tier="interactive",
+        memory_backend="off",
+    )
+    guard = SafetyGuard(tmp_path)
+    spawn = SpawnAgentTool(
+        guard,
+        SharedState(config.db_directory / "agents.db"),
+        ChildProvider,
+        config=config,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions-subagent-grant.db"),
+        ParentProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={spawn.name: spawn},
+        safety_tier="interactive",
+        config=config,
+    )
+    spawn.set_permission_policy_provider(lambda: loop.permission_policy)
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+    )
+
+    response = await controller.run("delegate two writes")
+    await loop.aclose()
+
+    assert response == "parent done"
+    assert (tmp_path / "child-1.txt").read_text(encoding="utf-8") == "child 1\n"
+    assert (tmp_path / "child-2.txt").read_text(encoding="utf-8") == "child 2\n"
+    assert sum(item.startswith("Approve") for item in prompt.prompts) == 2
+    assert prompt.approvals.qsize() == 1
 
 
 @pytest.mark.asyncio

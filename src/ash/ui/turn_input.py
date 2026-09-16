@@ -64,8 +64,17 @@ class InteractiveTurnController:
         self.ui.record_user_input(user_input)
         previous_approval = self.loop.on_tool_approval
         previous_plan_approval = self.loop.on_plan_approval
+        spawn_agent = self.loop.tools.get("spawn_agent")
+        set_foreground_broker = getattr(
+            spawn_agent, "set_foreground_approval_broker", None
+        )
+        previous_foreground_broker = getattr(
+            spawn_agent, "foreground_approval_broker", None
+        )
         self.loop.on_tool_approval = self._request_approval
         self.loop.on_plan_approval = self._request_plan_approval
+        if callable(set_foreground_broker):
+            set_foreground_broker(self._request_subagent_approval)
         turn = asyncio.create_task(
             self.loop.run_turn(user_input, user_metadata=user_metadata)
         )
@@ -120,6 +129,8 @@ class InteractiveTurnController:
                 await self._cancel_turn(turn)
             self.loop.on_tool_approval = previous_approval
             self.loop.on_plan_approval = previous_plan_approval
+            if callable(set_foreground_broker):
+                set_foreground_broker(previous_foreground_broker)
 
     async def review_mcp_sampling(
         self, server: str, stage: str, payload: dict[str, Any]
@@ -238,14 +249,32 @@ class InteractiveTurnController:
             return True
         if self.ui.is_tool_approved_for_session(tool_name):
             return True
+        return await self._prompt_tool_approval(tool_name, arguments)
 
+    async def _request_subagent_approval(
+        self, agent_id: str, tool_name: str, arguments: dict[str, object]
+    ) -> bool | str:
+        return await self._prompt_tool_approval(
+            tool_name, arguments, requester=f"Subagent {agent_id}"
+        )
+
+    async def _prompt_tool_approval(
+        self,
+        tool_name: str,
+        arguments: dict[str, object],
+        *,
+        requester: str | None = None,
+    ) -> bool | str:
         self._approval_active = True
         self._approval_complete.clear()
         await self._cancel_steering_read()
+        approval_owner = requester or "Ash"
         self._notify(
             NotificationEvent.APPROVAL_REQUIRED,
-            f"Ash needs approval: {tool_name}",
+            f"{approval_owner} needs approval: {tool_name}",
         )
+        if requester is not None:
+            self.write_status(f"{requester} requests approval for {tool_name}.")
         self.ui.show_tool_approval(
             tool_name,
             arguments,

@@ -74,6 +74,67 @@ async def test_background_agent_can_be_stopped(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_background_subagent_never_uses_foreground_approval_broker(tmp_path) -> None:
+    class WritingProvider(FakeProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "background-write",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "background.txt",
+                                "content": "must stay denied\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                assert any(
+                    message.get("role") == "tool"
+                    and "Denied by user" in str(message.get("content"))
+                    for message in messages
+                )
+                yield StreamChunk(content="background denied", is_done=True)
+
+    broker_calls: list[tuple[str, str]] = []
+
+    async def broker(agent_id: str, tool_name: str, arguments: dict) -> bool:
+        del arguments
+        broker_calls.append((agent_id, tool_name))
+        return True
+
+    state = SharedState(tmp_path / "background-policy" / "agents.db")
+    config = AshConfig(workspace_root=tmp_path, safety_tier="interactive")
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, WritingProvider, config=config)
+    tool.set_foreground_approval_broker(broker)
+
+    started = await tool.run(
+        role="coder",
+        task="attempt background write",
+        agent_id="background-coder",
+        isolation="shared",
+        background=True,
+    )
+    assert started.success is True
+    report = await tool._tasks["background-coder"]
+
+    assert report.success is True
+    assert report.summary == "background denied"
+    assert broker_calls == []
+    assert not (tmp_path / "background.txt").exists()
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_agent_capacity_is_enforced_across_durable_leases(tmp_path) -> None:
     class SlowProvider(FakeProvider):
         def __init__(self) -> None:

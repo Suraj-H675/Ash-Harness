@@ -149,6 +149,82 @@ def test_runtime_subagents_inherit_live_parent_permission_policy(tmp_path) -> No
     asyncio.run(exercise())
 
 
+def test_runtime_brokers_direct_foreground_subagent_approval_callback(tmp_path) -> None:
+    class WritingProvider(ProviderABC):
+        model_name = "callback-writer"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "write-callback",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "callback-worker.txt",
+                                "content": "approved callback\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="callback worker done", is_done=True)
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+    approvals: list[tuple[str, str]] = []
+
+    async def approve(tool_name: str, arguments: dict) -> bool:
+        approvals.append((tool_name, str(arguments.get("file_path", ""))))
+        return True
+
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db-callback-policy",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        safety_tier="interactive",
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        agent_provider_factory=WritingProvider,
+        workspace_trusted=False,
+        approval_callback=approve,
+        run_maintenance=False,
+    )
+    spawn = runtime.loop.tools["spawn_agent"]
+
+    async def exercise() -> None:
+        result = await spawn.run(
+            role="coder",
+            task="write callback file",
+            agent_id="runtime-callback-worker",
+            isolation="shared",
+        )
+        assert result.success is True
+        assert result.output == "callback worker done"
+        assert (tmp_path / "callback-worker.txt").read_text(encoding="utf-8") == (
+            "approved callback\n"
+        )
+        assert approvals == [("write_file", "callback-worker.txt")]
+        await runtime.loop.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_runtime_passes_user_owned_cdp_settings_to_browser_tools(tmp_path, monkeypatch) -> None:
     captured = {}
 

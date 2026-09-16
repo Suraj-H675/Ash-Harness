@@ -101,12 +101,16 @@ with an actionable error and no worker starts. Foreground and background runs
 then heartbeat the lease, persist completion-token use, and commit the final
 report into the task record. Each worker snapshots the parent permission mode
 and its managed, session, and persistent rules when the worker starts. The
-headless child never upgrades itself to a more permissive mode; an unresolved
-`ASK` decision is denied unless an inherited rule already authorizes it.
-Parent-policy changes apply to subsequently started workers and do not mutate an
-already-running worker's snapshot. Stopping or shutting down a background
-worker cancels its durable task. Isolated branch commits are registered as
-`git-commit` artifacts.
+headless child never upgrades itself to a more permissive mode. A direct
+foreground worker may broker an unresolved `ASK` through the active interactive
+turn or an explicit runtime approval callback; rules created by that exact
+approval are copied into the worker when they match the approved call. Background
+and queued DAG workers never use the live foreground broker and therefore fail
+closed on unresolved `ASK` decisions until a durable asynchronous approval path
+is available. Other parent-policy changes apply only to subsequently started
+workers and do not mutate an already-running worker's snapshot. Stopping or
+shutting down a background worker cancels its durable task. Isolated branch
+commits are registered as `git-commit` artifacts.
 
 Use the operator interface from any later process:
 
