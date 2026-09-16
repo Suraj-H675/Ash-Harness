@@ -340,16 +340,25 @@ class SharedState:
         *,
         undelivered_only: bool = True,
         limit: int = 100,
+        message_type: str | None = None,
     ) -> list[IPCMessage]:
         """Return messages addressed to ``recipient_id``, oldest first."""
 
+        clauses = ["recipient_id = ?"]
+        params: list[Any] = [recipient_id]
+        if undelivered_only:
+            clauses.append("delivered = 0")
+        if message_type is not None:
+            clauses.append("message_type = ?")
+            params.append(message_type)
+        params.append(limit)
         sql = (
-            "SELECT * FROM ipc_messages WHERE recipient_id = ?"
-            + (" AND delivered = 0" if undelivered_only else "")
+            "SELECT * FROM ipc_messages WHERE "
+            + " AND ".join(clauses)
             + " ORDER BY timestamp ASC, message_id ASC LIMIT ?"
         )
         with closing(self._conn.cursor()) as cur:
-            rows = cur.execute(sql, (recipient_id, limit)).fetchall()
+            rows = cur.execute(sql, params).fetchall()
         return [_row_to_ipc(r) for r in rows]
 
     def mark_delivered(self, message_ids: Iterable[int]) -> int:
@@ -365,6 +374,184 @@ class SharedState:
                 ids,
             )
             return int(cur.rowcount)
+
+    def resolve_approval_request(
+        self,
+        request_message_id: int,
+        *,
+        approved: bool,
+        feedback: str = "",
+        resolver_id: str = "lead",
+    ) -> dict[str, Any]:
+        """Atomically resolve one pending background-agent approval request."""
+
+        if type(request_message_id) is not int or request_message_id < 1:
+            raise ValueError("approval request id must be a positive integer")
+        if type(approved) is not bool:
+            raise ValueError("approved must be a boolean")
+        if not isinstance(feedback, str):
+            raise ValueError("approval feedback must be text")
+        feedback = feedback.strip()[:500]
+        if not resolver_id.strip():
+            raise ValueError("resolver id must not be empty")
+
+        with self._write_lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM ipc_messages WHERE message_id = ?",
+                    (request_message_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(
+                        f"unknown approval request {request_message_id}"
+                    )
+                request = _row_to_ipc(row)
+                if request.recipient_id != "lead" or request.message_type != "approval_request":
+                    raise ValueError(
+                        f"message {request_message_id} is not an approval request"
+                    )
+                if request.delivered:
+                    raise ValueError(
+                        f"approval request {request_message_id} is already resolved"
+                    )
+                content = request.content
+                task_id = content.get("task_id")
+                attempt = content.get("attempt")
+                agent_id = content.get("agent_id")
+                tool_name = content.get("tool_name")
+                arguments_sha256 = content.get("arguments_sha256")
+                if (
+                    not isinstance(task_id, str)
+                    or type(attempt) is not int
+                    or attempt < 1
+                    or not isinstance(agent_id, str)
+                    or agent_id != request.sender_id
+                    or not isinstance(tool_name, str)
+                    or not isinstance(arguments_sha256, str)
+                    or len(arguments_sha256) != 64
+                ):
+                    raise ValueError(
+                        f"approval request {request_message_id} is malformed"
+                    )
+                task_row = self._conn.execute(
+                    """
+                    SELECT state, owner_agent_id, attempt
+                    FROM agent_tasks
+                    WHERE task_id = ?
+                    """,
+                    (task_id,),
+                ).fetchone()
+                if (
+                    task_row is None
+                    or task_row["state"] not in {"leased", "running"}
+                    or task_row["owner_agent_id"] != agent_id
+                    or int(task_row["attempt"]) != attempt
+                ):
+                    raise ValueError(
+                        f"approval request {request_message_id} is stale"
+                    )
+                updated = self._conn.execute(
+                    """
+                    UPDATE ipc_messages
+                    SET delivered = 1
+                    WHERE message_id = ? AND delivered = 0
+                    """,
+                    (request_message_id,),
+                )
+                if int(updated.rowcount) != 1:
+                    raise ValueError(
+                        f"approval request {request_message_id} is already resolved"
+                    )
+                response_content = {
+                    "request_message_id": request_message_id,
+                    "task_id": task_id,
+                    "attempt": attempt,
+                    "agent_id": agent_id,
+                    "tool_name": tool_name,
+                    "arguments_sha256": arguments_sha256,
+                    "approved": approved,
+                    "feedback": feedback,
+                }
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO ipc_messages
+                        (sender_id, recipient_id, message_type, content_json)
+                    VALUES (?, ?, 'approval_response', ?)
+                    """,
+                    (
+                        resolver_id.strip(),
+                        agent_id,
+                        json.dumps(response_content, ensure_ascii=False),
+                    ),
+                )
+                response_message_id = int(cur.lastrowid or 0)
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return {
+            "request_message_id": request_message_id,
+            "response_message_id": response_message_id,
+            **response_content,
+        }
+
+    def retire_stale_approval_requests(self, *, limit: int = 1000) -> list[int]:
+        """Mark unresolved approval requests stale when their task attempt is no longer active."""
+
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        retired: list[int] = []
+        with self._write_lock, self._conn:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM ipc_messages
+                WHERE recipient_id = 'lead'
+                  AND message_type = 'approval_request'
+                  AND delivered = 0
+                ORDER BY message_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            for row in rows:
+                message = _row_to_ipc(row)
+                content = message.content
+                task_id = content.get("task_id")
+                attempt = content.get("attempt")
+                agent_id = content.get("agent_id")
+                task_row = (
+                    self._conn.execute(
+                        """
+                        SELECT state, owner_agent_id, attempt
+                        FROM agent_tasks
+                        WHERE task_id = ?
+                        """,
+                        (task_id,),
+                    ).fetchone()
+                    if isinstance(task_id, str)
+                    else None
+                )
+                active = bool(
+                    task_row is not None
+                    and task_row["state"] in {"leased", "running"}
+                    and task_row["owner_agent_id"] == agent_id
+                    and type(attempt) is int
+                    and int(task_row["attempt"]) == attempt
+                )
+                if active:
+                    continue
+                updated = self._conn.execute(
+                    """
+                    UPDATE ipc_messages
+                    SET delivered = 1
+                    WHERE message_id = ? AND delivered = 0
+                    """,
+                    (message.message_id,),
+                )
+                if int(updated.rowcount) == 1:
+                    retired.append(message.message_id)
+        return retired
 
     def send_to_agent(
         self,

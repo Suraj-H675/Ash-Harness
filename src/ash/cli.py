@@ -2436,6 +2436,23 @@ def main(argv: list[str] | None = None) -> int:
     agents_messages.add_argument("--all", action="store_true", dest="all_messages")
     agents_messages.add_argument("--limit", type=int, default=50)
     agents_messages.add_argument("--json", action="store_true")
+    agents_approvals = agents_subparsers.add_parser(
+        "approvals", help="List durable subagent approval requests"
+    )
+    agents_approvals.add_argument("--all", action="store_true", dest="all_approvals")
+    agents_approvals.add_argument("--limit", type=int, default=50)
+    agents_approvals.add_argument("--json", action="store_true")
+    agents_approve = agents_subparsers.add_parser(
+        "approve", help="Approve one pending subagent request"
+    )
+    agents_approve.add_argument("request_id", type=int)
+    agents_approve.add_argument("--json", action="store_true")
+    agents_deny = agents_subparsers.add_parser(
+        "deny", help="Deny one pending subagent request"
+    )
+    agents_deny.add_argument("request_id", type=int)
+    agents_deny.add_argument("--feedback", default="")
+    agents_deny.add_argument("--json", action="store_true")
     agents_send = agents_subparsers.add_parser("send")
     agents_send.add_argument("recipient")
     agents_send.add_argument("content")
@@ -3528,12 +3545,14 @@ def main(argv: list[str] | None = None) -> int:
             apply_agent_branch,
             cancel_agent_graph,
             discard_agent_branch,
+            list_agent_approvals,
             list_agent_messages,
             list_agent_branches,
             list_agent_reports,
             list_agent_statuses,
             list_agent_task_events,
             list_agent_tasks,
+            render_agent_approvals,
             render_agent_messages,
             render_agent_branches,
             render_agent_reports,
@@ -3541,7 +3560,9 @@ def main(argv: list[str] | None = None) -> int:
             render_agent_task_events,
             render_agent_tasks,
             render_cancelled_agent_graph,
+            render_resolved_agent_approval,
             render_sent_agent_message,
+            resolve_agent_approval,
             send_agent_message,
         )
 
@@ -3666,6 +3687,31 @@ def main(argv: list[str] | None = None) -> int:
                                 recipient_id=args.recipient,
                                 undelivered_only=not args.all_messages,
                                 limit=args.limit,
+                            ),
+                            json_output=json_output,
+                        )
+                    )
+                elif args.agents_action == "approvals":
+                    print(
+                        render_agent_approvals(
+                            list_agent_approvals(
+                                database,
+                                pending_only=not args.all_approvals,
+                                limit=args.limit,
+                            ),
+                            json_output=json_output,
+                        )
+                    )
+                elif args.agents_action in {"approve", "deny"}:
+                    print(
+                        render_resolved_agent_approval(
+                            resolve_agent_approval(
+                                database,
+                                request_id=args.request_id,
+                                approved=args.agents_action == "approve",
+                                feedback=(
+                                    args.feedback if args.agents_action == "deny" else ""
+                                ),
                             ),
                             json_output=json_output,
                         )

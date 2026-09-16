@@ -83,3 +83,51 @@ def test_close_is_idempotent(tmp_path: Path) -> None:
 
     state.close()
     state.close()
+
+
+def test_retire_stale_approval_requests_preserves_active_and_retires_retried(
+    tmp_path: Path,
+) -> None:
+    state = SharedState(tmp_path / "approval-recovery.db")
+    state.tasks.create_task(
+        "approval recovery",
+        task_id="approval-recovery",
+        max_attempts=2,
+    )
+    lease = state.tasks.claim_task("worker-a", task_id="approval-recovery")
+    assert lease is not None
+    state.tasks.start_task("approval-recovery", lease.token)
+    request_id = state.send_message(
+        "worker-a",
+        "lead",
+        "approval_request",
+        {
+            "task_id": "approval-recovery",
+            "attempt": lease.task.attempt,
+            "agent_id": "worker-a",
+            "tool_name": "write_file",
+            "arguments_sha256": "b" * 64,
+            "arguments_preview": "{}",
+        },
+    )
+
+    assert state.retire_stale_approval_requests() == []
+    retried = state.tasks.fail_task(
+        "approval-recovery",
+        lease.token,
+        "retry",
+        retryable=True,
+    )
+    assert retried.state == "queued"
+    lease2 = state.tasks.claim_task("worker-b", task_id="approval-recovery")
+    assert lease2 is not None
+    state.tasks.start_task("approval-recovery", lease2.token)
+
+    assert state.retire_stale_approval_requests() == [request_id]
+    request = state.fetch_messages(
+        "lead",
+        undelivered_only=False,
+        message_type="approval_request",
+    )[0]
+    assert request.delivered is True
+    state.close()

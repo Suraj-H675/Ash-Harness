@@ -161,6 +161,75 @@ def list_agent_messages(
         state.close()
 
 
+def list_agent_approvals(
+    db_path: str | Path,
+    *,
+    pending_only: bool = True,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    state = SharedState(db_path)
+    try:
+        approvals: list[dict[str, Any]] = []
+        for message in state.fetch_messages(
+            "lead",
+            undelivered_only=pending_only,
+            limit=limit,
+            message_type="approval_request",
+        ):
+            content = message.content
+            task_id = content.get("task_id")
+            attempt = content.get("attempt")
+            agent_id = content.get("agent_id")
+            task = state.tasks.get_task(task_id) if isinstance(task_id, str) else None
+            active = bool(
+                not message.delivered
+                and task is not None
+                and task.state in {"leased", "running"}
+                and task.owner_agent_id == agent_id
+                and task.attempt == attempt
+            )
+            status = "pending" if active else ("resolved" if message.delivered else "stale")
+            approvals.append(
+                {
+                    "request_id": message.message_id,
+                    "agent_id": agent_id,
+                    "task_id": task_id,
+                    "attempt": attempt,
+                    "tool_name": content.get("tool_name"),
+                    "arguments_preview": content.get("arguments_preview", ""),
+                    "arguments_sha256": content.get("arguments_sha256"),
+                    "requested_at": content.get("requested_at")
+                    or message.timestamp.isoformat(),
+                    "status": status,
+                }
+            )
+        return approvals
+    finally:
+        state.close()
+
+
+def resolve_agent_approval(
+    db_path: str | Path,
+    *,
+    request_id: int,
+    approved: bool,
+    feedback: str = "",
+    resolver_id: str = "lead",
+) -> dict[str, Any]:
+    state = SharedState(db_path)
+    try:
+        return state.resolve_approval_request(
+            request_id,
+            approved=approved,
+            feedback=feedback,
+            resolver_id=resolver_id,
+        )
+    finally:
+        state.close()
+
+
 def send_agent_message(
     db_path: str | Path,
     *,
@@ -325,6 +394,37 @@ def render_agent_messages(
         f"{'delivered' if item['delivered'] else 'pending'}: "
         f"{_summarize_content(item['content'])}"
         for item in messages
+    )
+
+
+def render_agent_approvals(
+    approvals: list[dict[str, Any]],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"approvals": approvals}, sort_keys=True)
+    if not approvals:
+        return "No subagent approval requests recorded."
+    return "\n".join(
+        f"{item['request_id']} {item.get('agent_id') or '?'} "
+        f"{item.get('tool_name') or '?'} {item['status']}: "
+        f"{item.get('arguments_preview') or '{}'}"
+        for item in approvals
+    )
+
+
+def render_resolved_agent_approval(
+    resolution: dict[str, Any],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps({"approval": resolution}, sort_keys=True)
+    verb = "Approved" if resolution["approved"] else "Denied"
+    return (
+        f"{verb} subagent approval {resolution['request_message_id']} "
+        f"for {resolution['agent_id']} {resolution['tool_name']}."
     )
 
 

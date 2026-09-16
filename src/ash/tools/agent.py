@@ -18,7 +18,7 @@ from ash.agents.tasks import AgentTask, AgentTaskBudgetExceeded, AgentTaskError
 from ash.agents.subprocess_agent import AGENT_ROLES, AgentReport, SubprocessAgent
 from ash.agents.worktree import WorktreeError, WorktreeLease, WorktreeManager
 from ash.core.loop import AshLoop
-from ash.core.redaction import redact_text
+from ash.core.redaction import redact_text, redact_value
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC
 from ash.safety.guard import SafetyGuard
@@ -251,6 +251,7 @@ class SpawnAgentTool(BaseTool):
                 if task.metadata.get("dispatchable") is True
                 and task.metadata.get("workspace") == workspace
             ]
+            self._shared_state.retire_stale_approval_requests()
             for task in ready:
                 validation_error = self._queued_task_error(task)
                 if validation_error is not None:
@@ -538,6 +539,7 @@ class SpawnAgentTool(BaseTool):
             if created_here and not args.background
             else None
         )
+        durable_approval = bool(args.background)
 
         async def provider_runner(context: dict[str, Any]) -> AgentReport:
             started = datetime.now(timezone.utc)
@@ -563,6 +565,8 @@ class SpawnAgentTool(BaseTool):
                     time_budget_seconds=task_time_budget,
                     dependency_context=dependency_context,
                     approval_broker=foreground_approval_broker,
+                    durable_approval=durable_approval,
+                    durable_attempt=durable_lease.task.attempt,
                 )
                 artifacts["completion_tokens"] = completion_tokens
                 artifacts["cost_usd"] = task_cost_usd
@@ -817,6 +821,8 @@ class SpawnAgentTool(BaseTool):
         time_budget_seconds: float,
         dependency_context: str,
         approval_broker: SubagentApprovalBroker | None,
+        durable_approval: bool,
+        durable_attempt: int,
     ) -> tuple[str, int, float]:
         provider = self._provider_factory()
         guard = SafetyGuard(workspace)
@@ -943,6 +949,25 @@ class SpawnAgentTool(BaseTool):
                 return result
 
             loop.on_tool_approval = approve_worker_tool
+        elif durable_approval:
+
+            async def approve_durable_worker_tool(
+                tool_name: str, arguments: dict[str, Any]
+            ) -> bool | str | tuple[bool, str]:
+                decision = worker_policy.evaluate(tool_name, arguments)
+                if decision.action == PolicyAction.ALLOW:
+                    return True
+                if decision.action == PolicyAction.DENY:
+                    return False
+                return await self._await_durable_approval(
+                    agent_id=agent_id,
+                    durable_task_id=durable_task_id,
+                    attempt=durable_attempt,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
+
+            loop.on_tool_approval = approve_durable_worker_tool
         turn: asyncio.Task[str] | None = None
         inbox: asyncio.Task[None] | None = None
         loop_closed = False
@@ -1045,6 +1070,138 @@ class SpawnAgentTool(BaseTool):
                     raise close_error
                 if close_interrupted:
                     raise asyncio.CancelledError
+
+    async def _await_durable_approval(
+        self,
+        *,
+        agent_id: str,
+        durable_task_id: str,
+        attempt: int,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> bool | str | tuple[bool, str]:
+        try:
+            canonical_arguments = json.dumps(
+                arguments,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            redacted_arguments = json.dumps(
+                redact_value(arguments),
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            return "Approval request could not be persisted safely."
+        arguments_sha256 = hashlib.sha256(
+            canonical_arguments.encode("utf-8")
+        ).hexdigest()
+        preview = redacted_arguments
+        if len(preview) > 8192:
+            preview = preview[:8150] + "... [approval arguments truncated]"
+        request_payload = {
+            "task_id": durable_task_id,
+            "attempt": attempt,
+            "agent_id": agent_id,
+            "tool_name": tool_name,
+            "arguments_sha256": arguments_sha256,
+            "arguments_preview": preview,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+        }
+        request_message_id = await self._shared_state.send_message_async(
+            agent_id,
+            "lead",
+            "approval_request",
+            request_payload,
+        )
+        self._emit_task_lifecycle(
+            "agent.approval.requested",
+            durable_task_id,
+            agent_id=agent_id,
+            attempt=attempt,
+            request_message_id=request_message_id,
+            tool=tool_name,
+        )
+        try:
+            while True:
+                current = self._shared_state.tasks.get_task(durable_task_id)
+                if (
+                    current is None
+                    or current.state not in {"leased", "running"}
+                    or current.owner_agent_id != agent_id
+                    or current.attempt != attempt
+                ):
+                    self._shared_state.mark_delivered([request_message_id])
+                    return "Approval request is no longer active."
+                messages = self._shared_state.fetch_messages(
+                    agent_id,
+                    undelivered_only=True,
+                    limit=100,
+                )
+                stale_responses: list[int] = []
+                for message in messages:
+                    if message.message_type != "approval_response":
+                        continue
+                    content = message.content
+                    if content.get("request_message_id") != request_message_id:
+                        if (
+                            content.get("task_id") == durable_task_id
+                            and content.get("agent_id") == agent_id
+                            and isinstance(content.get("attempt"), int)
+                            and content["attempt"] <= attempt
+                        ):
+                            stale_responses.append(message.message_id)
+                        continue
+                    valid = (
+                        content.get("task_id") == durable_task_id
+                        and content.get("agent_id") == agent_id
+                        and content.get("attempt") == attempt
+                        and content.get("tool_name") == tool_name
+                        and content.get("arguments_sha256") == arguments_sha256
+                        and type(content.get("approved")) is bool
+                    )
+                    self._shared_state.mark_delivered(
+                        [message.message_id, request_message_id, *stale_responses]
+                    )
+                    if not valid:
+                        self._emit_task_lifecycle(
+                            "agent.approval.rejected",
+                            durable_task_id,
+                            agent_id=agent_id,
+                            attempt=attempt,
+                            request_message_id=request_message_id,
+                            reason="approval response correlation mismatch",
+                        )
+                        return "Approval response did not match the active request."
+                    approved = bool(content["approved"])
+                    feedback = str(content.get("feedback") or "").strip()[:500]
+                    self._emit_task_lifecycle(
+                        "agent.approval.resolved",
+                        durable_task_id,
+                        agent_id=agent_id,
+                        attempt=attempt,
+                        request_message_id=request_message_id,
+                        approved=approved,
+                    )
+                    if approved:
+                        return True
+                    return feedback or False
+                if stale_responses:
+                    self._shared_state.mark_delivered(stale_responses)
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            self._shared_state.mark_delivered([request_message_id])
+            self._emit_task_lifecycle(
+                "agent.approval.cancelled",
+                durable_task_id,
+                agent_id=agent_id,
+                attempt=attempt,
+                request_message_id=request_message_id,
+            )
+            raise
 
     async def _consume_worker_messages(
         self,

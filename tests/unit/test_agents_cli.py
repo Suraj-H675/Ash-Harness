@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8,11 +11,13 @@ from ash.agents.shared_state import SharedState
 from ash.cli import main
 from ash.commands.agents import (
     cancel_agent_graph,
+    list_agent_approvals,
     list_agent_messages,
     list_agent_reports,
     list_agent_statuses,
     list_agent_task_events,
     list_agent_tasks,
+    render_agent_approvals,
     render_agent_branches,
     render_agent_messages,
     render_agent_reports,
@@ -20,7 +25,9 @@ from ash.commands.agents import (
     render_agent_task_events,
     render_agent_tasks,
     render_cancelled_agent_graph,
+    render_resolved_agent_approval,
     render_sent_agent_message,
+    resolve_agent_approval,
     send_agent_message,
 )
 
@@ -163,6 +170,210 @@ def test_send_agent_message_renderer_emits_json(tmp_path: Path) -> None:
 
     assert payload["message"]["recipient_id"] == "agent-a"
     assert payload["message"]["content"] == {"summary": "continue"}
+
+
+def _seed_agent_approval(
+    db_path: Path,
+    *,
+    task_id: str = "approval-task",
+    agent_id: str = "approval-worker",
+    max_attempts: int = 1,
+) -> tuple[int, int, str]:
+    state = SharedState(db_path)
+    state.tasks.create_task(
+        "approval task",
+        task_id=task_id,
+        max_attempts=max_attempts,
+    )
+    lease = state.tasks.claim_task(agent_id, task_id=task_id)
+    assert lease is not None
+    state.tasks.start_task(task_id, lease.token)
+    request_id = state.send_message(
+        agent_id,
+        "lead",
+        "approval_request",
+        {
+            "task_id": task_id,
+            "attempt": lease.task.attempt,
+            "agent_id": agent_id,
+            "tool_name": "write_file",
+            "arguments_sha256": "a" * 64,
+            "arguments_preview": '{"file_path": "approved.txt"}',
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    state.close()
+    return request_id, lease.task.attempt, lease.token
+
+
+def test_agent_approval_resolution_is_atomic_and_correlated(tmp_path: Path) -> None:
+    db_path = tmp_path / "agents.db"
+    request_id, attempt, _ = _seed_agent_approval(db_path)
+
+    approvals = list_agent_approvals(db_path)
+    assert approvals == [
+        {
+            "request_id": request_id,
+            "agent_id": "approval-worker",
+            "task_id": "approval-task",
+            "attempt": attempt,
+            "tool_name": "write_file",
+            "arguments_preview": '{"file_path": "approved.txt"}',
+            "arguments_sha256": "a" * 64,
+            "requested_at": approvals[0]["requested_at"],
+            "status": "pending",
+        }
+    ]
+
+    resolution = resolve_agent_approval(
+        db_path,
+        request_id=request_id,
+        approved=True,
+    )
+    assert resolution["request_message_id"] == request_id
+    assert resolution["agent_id"] == "approval-worker"
+    assert resolution["attempt"] == attempt
+    assert resolution["approved"] is True
+
+    state = SharedState(db_path)
+    try:
+        response = state.fetch_messages(
+            "approval-worker",
+            undelivered_only=True,
+            message_type="approval_response",
+        )
+        assert len(response) == 1
+        assert response[0].content["request_message_id"] == request_id
+        request = state.fetch_messages(
+            "lead",
+            undelivered_only=False,
+            message_type="approval_request",
+        )[0]
+        assert request.delivered is True
+    finally:
+        state.close()
+
+    with pytest.raises(ValueError, match="already resolved"):
+        resolve_agent_approval(db_path, request_id=request_id, approved=False)
+
+
+def test_agent_approval_resolution_has_single_winner_across_connections(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "agents.db"
+    request_id, _, _ = _seed_agent_approval(db_path)
+
+    def resolve(approved: bool):
+        try:
+            return resolve_agent_approval(
+                db_path,
+                request_id=request_id,
+                approved=approved,
+            )
+        except ValueError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(resolve, (True, False)))
+
+    successes = [result for result in results if isinstance(result, dict)]
+    failures = [result for result in results if isinstance(result, ValueError)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert "already resolved" in str(failures[0])
+
+    state = SharedState(db_path)
+    try:
+        responses = state.fetch_messages(
+            "approval-worker",
+            undelivered_only=True,
+            message_type="approval_response",
+        )
+        assert len(responses) == 1
+        assert responses[0].content["approved"] is successes[0]["approved"]
+    finally:
+        state.close()
+
+
+def test_agent_approval_rejects_stale_attempt(tmp_path: Path) -> None:
+    db_path = tmp_path / "agents.db"
+    request_id, _, lease_token = _seed_agent_approval(db_path, max_attempts=2)
+    state = SharedState(db_path)
+    try:
+        retried = state.tasks.fail_task(
+            "approval-task",
+            lease_token,
+            "retry",
+            retryable=True,
+        )
+        assert retried.state == "queued"
+        lease2 = state.tasks.claim_task("replacement-worker", task_id="approval-task")
+        assert lease2 is not None
+        replacement = state.tasks.start_task("approval-task", lease2.token)
+        assert request_id in state.retire_stale_approval_requests()
+        new_request_id = state.send_message(
+            "replacement-worker",
+            "lead",
+            "approval_request",
+            {
+                "task_id": "approval-task",
+                "attempt": replacement.attempt,
+                "agent_id": "replacement-worker",
+                "tool_name": "write_file",
+                "arguments_sha256": "2" * 64,
+                "arguments_preview": '{"file_path":"retry.txt"}',
+            },
+        )
+    finally:
+        state.close()
+
+    with pytest.raises(ValueError, match="already resolved|stale"):
+        resolve_agent_approval(db_path, request_id=request_id, approved=True)
+
+    resolution = resolve_agent_approval(
+        db_path,
+        request_id=new_request_id,
+        approved=True,
+    )
+    assert resolution["attempt"] == replacement.attempt
+    assert resolution["agent_id"] == "replacement-worker"
+
+
+def test_agent_approval_renderers_emit_json(tmp_path: Path) -> None:
+    db_path = tmp_path / "agents.db"
+    request_id, _, _ = _seed_agent_approval(db_path)
+    approvals = list_agent_approvals(db_path)
+    listed = json.loads(render_agent_approvals(approvals, json_output=True))
+    assert listed["approvals"][0]["request_id"] == request_id
+    resolution = resolve_agent_approval(db_path, request_id=request_id, approved=False, feedback="no")
+    rendered = json.loads(render_resolved_agent_approval(resolution, json_output=True))
+    assert rendered["approval"]["approved"] is False
+    assert rendered["approval"]["feedback"] == "no"
+
+
+def test_agents_cli_lists_and_resolves_background_approvals(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db-approvals"
+    request_id, _, _ = _seed_agent_approval(db_dir / "agents.db")
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+
+    assert main(["agents", "approvals", "--json"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["approvals"][0]["request_id"] == request_id
+    assert listed["approvals"][0]["status"] == "pending"
+
+    assert main(["agents", "approve", str(request_id), "--json"]) == 0
+    approved = json.loads(capsys.readouterr().out)
+    assert approved["approval"]["request_message_id"] == request_id
+    assert approved["approval"]["approved"] is True
+
+    assert main(["agents", "approve", str(request_id), "--json"]) == 2
+    assert "already resolved" in capsys.readouterr().err
 
 
 def test_agents_cli_lists_persisted_statuses(

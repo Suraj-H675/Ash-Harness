@@ -105,9 +105,14 @@ headless child never upgrades itself to a more permissive mode. A direct
 foreground worker may broker an unresolved `ASK` through the active interactive
 turn or an explicit runtime approval callback; rules created by that exact
 approval are copied into the worker when they match the approved call. Background
-and queued DAG workers never use the live foreground broker and therefore fail
-closed on unresolved `ASK` decisions until a durable asynchronous approval path
-is available. Other parent-policy changes apply only to subsequently started
+and queued DAG workers never use the live foreground broker. Instead they persist
+a bounded, redacted `approval_request` to the lead inbox and keep the task lease
+alive while waiting. An operator can approve or deny that exact request from a
+later process. Resolution is atomic and bound to the request id, task id, task
+attempt, owner agent, tool name, and SHA-256 of the exact arguments; duplicate,
+stale, or mismatched replies fail closed. Cancelling a worker retires its pending
+request, and retry recovery retires requests from superseded attempts before a new
+worker can run. Other parent-policy changes apply only to subsequently started
 workers and do not mutate an already-running worker's snapshot. Stopping or
 shutting down a background worker cancels its durable task. Isolated branch
 commits are registered as `git-commit` artifacts.
@@ -121,6 +126,10 @@ ash agents tasks --json
 ash agents tasks --graph GRAPH_ID --json
 ash agents events --task TASK_ID
 ash agents events --type agent.task.failed --after 100 --json
+ash agents approvals
+ash agents approvals --all --json
+ash agents approve REQUEST_ID
+ash agents deny REQUEST_ID --feedback "use a read-only approach"
 ash agents cancel GRAPH_ID --yes
 ```
 

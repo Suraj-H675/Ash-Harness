@@ -112,7 +112,8 @@ async def test_background_subagent_never_uses_foreground_approval_broker(tmp_pat
         broker_calls.append((agent_id, tool_name))
         return True
 
-    state = SharedState(tmp_path / "background-policy" / "agents.db")
+    database = tmp_path / "background-policy" / "agents.db"
+    state = SharedState(database)
     config = AshConfig(workspace_root=tmp_path, safety_tier="interactive")
     tool = SpawnAgentTool(SafetyGuard(tmp_path), state, WritingProvider, config=config)
     tool.set_foreground_approval_broker(broker)
@@ -125,12 +126,338 @@ async def test_background_subagent_never_uses_foreground_approval_broker(tmp_pat
         background=True,
     )
     assert started.success is True
-    report = await tool._tasks["background-coder"]
 
+    request = None
+    for _ in range(100):
+        requests = state.fetch_messages(
+            "lead",
+            undelivered_only=True,
+            limit=100,
+            message_type="approval_request",
+        )
+        request = next(
+            (message for message in requests if message.sender_id == "background-coder"),
+            None,
+        )
+        if request is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert request is not None
+    assert broker_calls == []
+
+    resolver = SharedState(database)
+    try:
+        resolver.resolve_approval_request(
+            request.message_id,
+            approved=False,
+            feedback="keep background writes denied",
+        )
+    finally:
+        resolver.close()
+
+    report = await asyncio.wait_for(tool._tasks["background-coder"], timeout=2.0)
     assert report.success is True
     assert report.summary == "background denied"
     assert broker_calls == []
     assert not (tmp_path / "background.txt").exists()
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_subagent_waits_for_durable_approval_and_resumes(tmp_path) -> None:
+    class WritingProvider(FakeProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "durable-write",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "durable-approved.txt",
+                                "content": "approved later\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="background approved", is_done=True)
+
+    database = tmp_path / "durable-approval" / "agents.db"
+    state = SharedState(database)
+    config = AshConfig(workspace_root=tmp_path, safety_tier="interactive")
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, WritingProvider, config=config)
+
+    started = await tool.run(
+        role="coder",
+        task="wait for approval then write",
+        agent_id="approval-worker",
+        isolation="shared",
+        background=True,
+    )
+    assert started.success is True
+
+    request = None
+    for _ in range(100):
+        request = next(
+            (
+                message
+                for message in state.fetch_messages(
+                    "lead", undelivered_only=True, limit=100
+                )
+                if message.message_type == "approval_request"
+                and message.sender_id == "approval-worker"
+            ),
+            None,
+        )
+        if request is not None:
+            break
+        await asyncio.sleep(0.01)
+
+    assert request is not None
+    assert not (tmp_path / "durable-approved.txt").exists()
+    payload = request.content
+    resolver = SharedState(database)
+    try:
+        resolution = resolver.resolve_approval_request(
+            request.message_id,
+            approved=True,
+        )
+        assert resolution["task_id"] == payload["task_id"]
+        assert resolution["attempt"] == payload["attempt"]
+        assert resolution["arguments_sha256"] == payload["arguments_sha256"]
+    finally:
+        resolver.close()
+
+    report = await asyncio.wait_for(tool._tasks["approval-worker"], timeout=2.0)
+    assert report.success is True
+    assert report.summary == "background approved"
+    assert (tmp_path / "durable-approved.txt").read_text(encoding="utf-8") == (
+        "approved later\n"
+    )
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_approval_persists_redacted_bounded_argument_preview(
+    tmp_path,
+) -> None:
+    fake_secret = "supersecretvalue12345"
+    large_content = f"password={fake_secret}\n" + ("x" * 10_000)
+
+    class WritingProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            assert tools is not None
+            yield StreamChunk(
+                native_tool_calls=[
+                    {
+                        "id": "preview-write",
+                        "name": "write_file",
+                        "arguments": {
+                            "file_path": "preview.txt",
+                            "content": large_content,
+                            "overwrite": True,
+                        },
+                    }
+                ],
+                is_done=True,
+            )
+
+    database = tmp_path / "preview-approval" / "agents.db"
+    state = SharedState(database)
+    config = AshConfig(workspace_root=tmp_path, safety_tier="interactive")
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, WritingProvider, config=config)
+    started = await tool.run(
+        role="coder",
+        task="request large secret-looking write",
+        agent_id="preview-worker",
+        isolation="shared",
+        background=True,
+    )
+    assert started.success is True
+
+    request = None
+    for _ in range(100):
+        requests = state.fetch_messages(
+            "lead",
+            undelivered_only=True,
+            limit=100,
+            message_type="approval_request",
+        )
+        request = next(
+            (message for message in requests if message.sender_id == "preview-worker"),
+            None,
+        )
+        if request is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert request is not None
+    preview = request.content["arguments_preview"]
+    assert fake_secret not in preview
+    assert "[REDACTED]" in preview
+    assert len(preview) <= 8192
+    assert preview.endswith("... [approval arguments truncated]")
+    assert len(request.content["arguments_sha256"]) == 64
+
+    assert await tool.stop("preview-worker") is True
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_approval_response_mismatch_fails_closed(tmp_path) -> None:
+    class WritingProvider(FakeProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "mismatch-write",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "mismatch.txt",
+                                "content": "must not write\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                assert any(
+                    "Approval response did not match the active request"
+                    in str(message.get("content"))
+                    for message in messages
+                    if message.get("role") == "tool"
+                )
+                yield StreamChunk(content="mismatch denied", is_done=True)
+
+    database = tmp_path / "mismatch-approval" / "agents.db"
+    state = SharedState(database)
+    config = AshConfig(workspace_root=tmp_path, safety_tier="interactive")
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, WritingProvider, config=config)
+    started = await tool.run(
+        role="coder",
+        task="reject mismatched approval",
+        agent_id="mismatch-worker",
+        isolation="shared",
+        background=True,
+    )
+    assert started.success is True
+
+    request = None
+    for _ in range(100):
+        requests = state.fetch_messages(
+            "lead",
+            undelivered_only=True,
+            limit=100,
+            message_type="approval_request",
+        )
+        request = next(
+            (message for message in requests if message.sender_id == "mismatch-worker"),
+            None,
+        )
+        if request is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert request is not None
+    payload = request.content
+    state.send_message(
+        "lead",
+        "mismatch-worker",
+        "approval_response",
+        {
+            "request_message_id": request.message_id,
+            "task_id": payload["task_id"],
+            "attempt": payload["attempt"],
+            "agent_id": payload["agent_id"],
+            "tool_name": payload["tool_name"],
+            "arguments_sha256": "0" * 64,
+            "approved": True,
+            "feedback": "",
+        },
+    )
+
+    report = await asyncio.wait_for(tool._tasks["mismatch-worker"], timeout=2.0)
+    assert report.success is True
+    assert report.summary == "mismatch denied"
+    assert not (tmp_path / "mismatch.txt").exists()
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stopping_background_agent_retires_pending_approval(tmp_path) -> None:
+    class WritingProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            assert tools is not None
+            yield StreamChunk(
+                native_tool_calls=[
+                    {
+                        "id": "stop-waiting-write",
+                        "name": "write_file",
+                        "arguments": {
+                            "file_path": "never-written.txt",
+                            "content": "no\n",
+                            "overwrite": True,
+                        },
+                    }
+                ],
+                is_done=True,
+            )
+
+    database = tmp_path / "stop-approval" / "agents.db"
+    state = SharedState(database)
+    config = AshConfig(workspace_root=tmp_path, safety_tier="interactive")
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, WritingProvider, config=config)
+    started = await tool.run(
+        role="coder",
+        task="wait until stopped",
+        agent_id="stopped-approval-worker",
+        isolation="shared",
+        background=True,
+    )
+    assert started.success is True
+
+    request = None
+    for _ in range(100):
+        requests = state.fetch_messages(
+            "lead",
+            undelivered_only=True,
+            limit=100,
+            message_type="approval_request",
+        )
+        request = next(
+            (message for message in requests if message.sender_id == "stopped-approval-worker"),
+            None,
+        )
+        if request is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert request is not None
+
+    assert await tool.stop("stopped-approval-worker") is True
+    persisted = state.fetch_messages(
+        "lead",
+        undelivered_only=False,
+        limit=100,
+        message_type="approval_request",
+    )
+    stopped_request = next(
+        message for message in persisted if message.message_id == request.message_id
+    )
+    assert stopped_request.delivered is True
+    assert not (tmp_path / "never-written.txt").exists()
     await tool.aclose()
 
 

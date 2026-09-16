@@ -395,18 +395,47 @@ async def test_delegate_worker_never_uses_foreground_approval_broker(tmp_path: P
         config,
     )
 
-    result = await delegate.run(
-        goal="attempt queued write",
-        tasks=[
-            {
-                "key": "write",
-                "role": "coder",
-                "task": "write queued file",
-                "isolation": "shared",
-            }
-        ],
+    delegation = asyncio.create_task(
+        delegate.run(
+            goal="attempt queued write",
+            tasks=[
+                {
+                    "key": "write",
+                    "role": "coder",
+                    "task": "write queued file",
+                    "isolation": "shared",
+                }
+            ],
+        )
     )
+    request = None
+    resolver = SharedState(db_path)
+    try:
+        for _ in range(150):
+            requests = resolver.fetch_messages(
+                "lead",
+                undelivered_only=True,
+                limit=100,
+                message_type="approval_request",
+            )
+            request = next(
+                (message for message in requests if message.content.get("tool_name") == "write_file"),
+                None,
+            )
+            if request is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert request is not None
+        assert broker_calls == []
+        resolver.resolve_approval_request(
+            request.message_id,
+            approved=False,
+            feedback="queued worker denied",
+        )
+    finally:
+        resolver.close()
 
+    result = await asyncio.wait_for(delegation, timeout=3.0)
     assert result.success is True
     payload = json.loads(result.output)
     assert payload["tasks"][0]["result"]["summary"] == "queued denied"
