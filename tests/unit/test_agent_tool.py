@@ -6,7 +6,9 @@ from ash.agents.shared_state import SharedState
 from ash.config import AshConfig
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
+from ash.safety.grants import PermissionRule
 from ash.safety.guard import SafetyGuard
+from ash.safety.policy import PermissionPolicy
 from ash.tools.agent import SpawnAgentTool
 
 
@@ -223,6 +225,222 @@ async def test_coder_agent_edits_isolated_worktree_and_returns_branch(tmp_path) 
     report_messages = state.fetch_messages("lead", undelivered_only=False)
     report = report_messages[-1].content
     assert report["artifacts"]["branch"] == "ash-agent/coder-1"
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_interactive_parent_does_not_auto_approve_subagent_write(tmp_path) -> None:
+    class WritingProvider(FakeProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "write-1",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "worker.txt",
+                                "content": "should-not-write\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                assert any(
+                    message.get("role") == "tool"
+                    and "Denied by user" in str(message.get("content"))
+                    for message in messages
+                )
+                yield StreamChunk(content="write was denied", is_done=True)
+
+    state = SharedState(tmp_path / "state" / "agents.db")
+    config = AshConfig(workspace_root=tmp_path, safety_tier="interactive")
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        WritingProvider,
+        config=config,
+    )
+
+    result = await tool.run(
+        role="coder",
+        task="write a file",
+        agent_id="interactive-coder",
+        isolation="shared",
+    )
+
+    assert result.success is True
+    assert result.output == "write was denied"
+    assert not (tmp_path / "worker.txt").exists()
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_inherits_parent_session_allow_rule(tmp_path) -> None:
+    class WritingProvider(FakeProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[{
+                        "id": "write-allow",
+                        "name": "write_file",
+                        "arguments": {
+                            "file_path": "allowed.txt",
+                            "content": "allowed\n",
+                            "overwrite": True,
+                        },
+                    }],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="write completed", is_done=True)
+
+    state = SharedState(tmp_path / "state-allow" / "agents.db")
+    config = AshConfig(workspace_root=tmp_path, safety_tier="interactive")
+    parent_policy = PermissionPolicy(
+        "interactive",
+        session_rules=[PermissionRule.create("allow", "write_file")],
+    )
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, WritingProvider, config=config)
+    tool.set_permission_policy_provider(lambda: parent_policy)
+
+    result = await tool.run(
+        role="coder",
+        task="write allowed file",
+        agent_id="allowed-coder",
+        isolation="shared",
+    )
+
+    assert result.success is True
+    assert (tmp_path / "allowed.txt").read_text(encoding="utf-8") == "allowed\n"
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_inherits_managed_deny_over_auto_approve(tmp_path) -> None:
+    class WritingProvider(FakeProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[{
+                        "id": "write-deny",
+                        "name": "write_file",
+                        "arguments": {
+                            "file_path": "denied.txt",
+                            "content": "denied\n",
+                            "overwrite": True,
+                        },
+                    }],
+                    is_done=True,
+                )
+            else:
+                assert any(
+                    message.get("role") == "tool"
+                    and "matched deny rule" in str(message.get("content"))
+                    for message in messages
+                )
+                yield StreamChunk(content="managed deny honored", is_done=True)
+
+    state = SharedState(tmp_path / "state-deny" / "agents.db")
+    config = AshConfig(workspace_root=tmp_path, safety_tier="auto_approve")
+    parent_policy = PermissionPolicy(
+        "auto_approve",
+        managed_rules=[PermissionRule.create("deny", "write_file")],
+    )
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, WritingProvider, config=config)
+    tool.set_permission_policy_provider(lambda: parent_policy)
+
+    result = await tool.run(
+        role="coder",
+        task="attempt denied file",
+        agent_id="denied-coder",
+        isolation="shared",
+    )
+
+    assert result.success is True
+    assert result.output == "managed deny honored"
+    assert not (tmp_path / "denied.txt").exists()
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_subagent_uses_start_time_permission_snapshot(tmp_path) -> None:
+    class PausedWritingProvider(FakeProvider):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                type(self).started.set()
+                await type(self).release.wait()
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "write-snapshot",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "snapshot.txt",
+                                "content": "snapshot\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="snapshot complete", is_done=True)
+
+    PausedWritingProvider.started = asyncio.Event()
+    PausedWritingProvider.release = asyncio.Event()
+    state = SharedState(tmp_path / "state-snapshot" / "agents.db")
+    config = AshConfig(workspace_root=tmp_path, safety_tier="interactive")
+    parent_policy = PermissionPolicy(
+        "interactive",
+        session_rules=[PermissionRule.create("allow", "write_file")],
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path), state, PausedWritingProvider, config=config
+    )
+    tool.set_permission_policy_provider(lambda: parent_policy)
+
+    started = await tool.run(
+        role="coder",
+        task="write from snapshot",
+        agent_id="snapshot-coder",
+        isolation="shared",
+        background=True,
+    )
+    assert started.success is True
+    await PausedWritingProvider.started.wait()
+    parent_policy.session_rules.clear()
+    PausedWritingProvider.release.set()
+    report = await tool._tasks["snapshot-coder"]
+
+    assert report.success is True
+    assert report.summary == "snapshot complete"
+    assert (tmp_path / "snapshot.txt").read_text(encoding="utf-8") == "snapshot\n"
     await tool.aclose()
 
 

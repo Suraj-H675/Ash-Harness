@@ -9,7 +9,8 @@ from ash.runtime import build_runtime, build_tools
 from ash.context.turn import TurnContext
 from ash.config import AshConfig
 from ash.mcp.server import MCPServerConfig
-from ash.providers.base import ProviderABC
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.grants import PermissionRule, RuleEffect
 from ash.safety.guard import SafetyViolation
 from ash.sandbox import SandboxBackendUnavailable
@@ -77,6 +78,76 @@ def test_runtime_file_checkpoint_owns_and_finalizes_provider_tool_call(tmp_path)
         await runtime.loop.aclose()
 
     asyncio.run(exercise())
+
+
+def test_runtime_subagents_inherit_live_parent_permission_policy(tmp_path) -> None:
+    class WritingProvider(ProviderABC):
+        model_name = "writer"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "write-runtime",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "runtime-worker.txt",
+                                "content": "inherited\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="worker done", is_done=True)
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db-policy",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        safety_tier="interactive",
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        agent_provider_factory=WritingProvider,
+        workspace_trusted=False,
+        run_maintenance=False,
+    )
+    spawn = runtime.loop.tools["spawn_agent"]
+    runtime.loop.permission_policy.add_session_rule(
+        PermissionRule.create("allow", "write_file")
+    )
+
+    async def exercise() -> None:
+        result = await spawn.run(
+            role="coder",
+            task="write inherited file",
+            agent_id="runtime-policy-worker",
+            isolation="shared",
+        )
+        assert result.success is True
+        assert result.output == "worker done"
+        assert (tmp_path / "runtime-worker.txt").read_text(encoding="utf-8") == "inherited\n"
+        await runtime.loop.aclose()
+
+    asyncio.run(exercise())
+
 
 def test_runtime_passes_user_owned_cdp_settings_to_browser_tools(tmp_path, monkeypatch) -> None:
     captured = {}

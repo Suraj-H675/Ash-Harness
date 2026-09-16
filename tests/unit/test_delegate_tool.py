@@ -12,7 +12,9 @@ from ash.agents.tasks import AgentTaskCreate, AgentTaskError
 from ash.config import AshConfig
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
+from ash.safety.grants import PermissionRule
 from ash.safety.guard import SafetyGuard
+from ash.safety.policy import PermissionPolicy
 from ash.tools.agent import SpawnAgentTool
 from ash.tools.delegate import DelegateAgentsTool
 
@@ -235,6 +237,93 @@ async def test_delegate_agents_runs_dependency_dag_and_aggregates_results(
         state.close()
         await delegate.aclose()
         await spawn.aclose()
+
+
+@pytest.mark.asyncio
+async def test_delegate_agents_do_not_bypass_parent_permission_policy(tmp_path: Path) -> None:
+    class WritingProvider(ProviderABC):
+        model_name = "delegate-writer"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert tools is not None
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "delegate-write",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "delegated.txt",
+                                "content": "blocked\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                assert any(
+                    message.get("role") == "tool"
+                    and "matched deny rule" in str(message.get("content"))
+                    for message in messages
+                )
+                yield StreamChunk(content="delegated write denied", is_done=True)
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "delegate-policy-db",
+        safety_tier="auto_approve",
+        max_concurrent_agents=1,
+        agent_token_budget=100,
+        agent_time_budget_seconds=10,
+        memory_backend="off",
+    )
+    db_path = config.db_directory / "agents.db"
+    spawn = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        WritingProvider,
+        config=config,
+    )
+    parent_policy = PermissionPolicy(
+        "auto_approve",
+        managed_rules=[PermissionRule.create("deny", "write_file")],
+    )
+    spawn.set_permission_policy_provider(lambda: parent_policy)
+    delegate = DelegateAgentsTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        spawn,
+        config,
+    )
+
+    result = await delegate.run(
+        goal="attempt managed write",
+        tasks=[
+            {
+                "key": "write",
+                "role": "coder",
+                "task": "write delegated file",
+                "isolation": "shared",
+            }
+        ],
+    )
+
+    assert result.success is True
+    payload = json.loads(result.output)
+    assert payload["tasks"][0]["state"] == "succeeded"
+    assert payload["tasks"][0]["result"]["summary"] == "delegated write denied"
+    assert not (tmp_path / "delegated.txt").exists()
+    await delegate.aclose()
+    await spawn.aclose()
 
 
 @pytest.mark.asyncio
@@ -559,6 +648,7 @@ async def test_dependent_worktree_receives_verified_commit_and_result_context(
         agent_token_budget=100,
         agent_time_budget_seconds=10,
         memory_backend="off",
+        safety_tier="auto_edit",
     )
     db_path = config.db_directory / "agents.db"
     spawn = SpawnAgentTool(

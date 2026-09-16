@@ -22,6 +22,7 @@ from ash.core.redaction import redact_text
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC
 from ash.safety.guard import SafetyGuard
+from ash.safety.policy import PermissionPolicy
 from ash.sandbox import SandboxManager
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.ui.headless import HeadlessUI
@@ -105,6 +106,7 @@ class SpawnAgentTool(BaseTool):
         self._task_time_budget = config.agent_time_budget_seconds if config else 900.0
         self._task_lease_seconds = config.agent_lease_seconds if config else 30.0
         self._custom_agents = dict(custom_agents or {})
+        self._permission_policy_provider: Callable[[], PermissionPolicy] | None = None
         if self._custom_agents:
             self._update_description()
         self._tasks: dict[str, asyncio.Task[AgentReport]] = {}
@@ -113,6 +115,25 @@ class SpawnAgentTool(BaseTool):
     def set_custom_agents(self, agents: dict[str, "AgentDefinition"]) -> None:
         self._custom_agents = dict(agents)
         self._update_description()
+
+    def set_permission_policy_provider(
+        self, provider: Callable[[], PermissionPolicy]
+    ) -> None:
+        """Bind the parent runtime policy used to authorize child tool calls."""
+
+        self._permission_policy_provider = provider
+
+    def _worker_permission_policy(self) -> PermissionPolicy:
+        if self._permission_policy_provider is not None:
+            parent = self._permission_policy_provider()
+            return PermissionPolicy(
+                parent.mode,
+                managed_rules=list(parent.managed_rules),
+                persistent_rules=list(parent.persistent_rules),
+                session_rules=list(parent.session_rules),
+            )
+        mode = self._config.safety_tier if self._config is not None else "auto_approve"
+        return PermissionPolicy(mode)
 
     def supports_role(self, role: str) -> bool:
         return role in AGENT_ROLES or role in self._custom_agents
@@ -803,11 +824,13 @@ class SpawnAgentTool(BaseTool):
         worker_store = SessionStore(
             Path(self._shared_state.db_path).with_name("agent-sessions.db")
         )
+        worker_policy = self._worker_permission_policy()
+        worker_safety_tier = worker_policy.mode.value
         worker_config = (
             self._config.model_copy(
                 update={
                     "workspace_root": workspace,
-                    "safety_tier": "auto_approve",
+                    "safety_tier": worker_safety_tier,
                     "max_completion_tokens": min(
                         self._config.max_completion_tokens,
                         token_budget,
@@ -843,12 +866,13 @@ class SpawnAgentTool(BaseTool):
             ui=HeadlessUI(output_format="text", stream=io.StringIO()),
             project_root=workspace,
             tools=tools,
-            safety_tier="auto_approve",
+            safety_tier=worker_safety_tier,
             system_prompt=instructions,
             max_turn_iterations=self._max_turn_iterations,
             config=worker_config,
             enable_semantic_memory=False,
         )
+        loop.permission_policy = worker_policy
         turn: asyncio.Task[str] | None = None
         inbox: asyncio.Task[None] | None = None
         loop_closed = False

@@ -217,8 +217,8 @@ Research is clean-room: proprietary or leaked source is not used.
 
 | Capability | Ash status | Required production behavior |
 |---|---|---|
-| Spawn subagent tool | Verified locally | Real bounded provider-backed Ash loop, persisted reports, role-scoped tool manifests, background execution, cancellation, and no recursive spawning |
-| Parallel agents | Partial | Atomic DAG submission, dependency-ready dispatch, bounded retries, foreground/background operation, restart recovery, and durable graph-wide token and USD ceilings are wired; the user-facing provider-backed path is in-process and the low-level subprocess driver currently runs a simple serialized driver task, so cross-process provider-backed orchestration is not verified |
+| Spawn subagent tool | Verified locally | Real bounded provider-backed Ash loop, persisted reports, role-scoped tool manifests, background execution, cancellation, no recursive spawning, and start-time inheritance of the parent permission mode plus managed/session/persistent rules; unresolved child `ASK` decisions fail closed in the headless worker |
+| Parallel agents | Partial | Atomic DAG submission, dependency-ready dispatch, bounded retries, foreground/background operation, restart recovery, independent child sessions/workspaces, and durable graph-wide token and USD ceilings are wired. Separate OS processes are an implementation choice rather than a parity requirement; the remaining product gap is parent-visible approval brokerage for child `ASK` decisions instead of fail-closed denial |
 | Agent status/output | Verified locally | Live basic and full slash status with durable task identity, token budgets, and USD cost usage; top-level persisted status/report/message inspection |
 | Agent messaging | Verified locally | Typed SQLite IPC is persisted and inspectable; running workers consume steer/stop messages, acknowledge delivery, and enforce pending-message backpressure |
 | Role tool policies | Verified locally | Read/search baseline, coder-only scoped edits, sandbox-required tester commands, and no recursive spawn tool |

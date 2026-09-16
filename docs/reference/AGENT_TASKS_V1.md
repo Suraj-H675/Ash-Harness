@@ -99,8 +99,13 @@ branch.
 provider execution. If global capacity is full, the attempted task is cancelled
 with an actionable error and no worker starts. Foreground and background runs
 then heartbeat the lease, persist completion-token use, and commit the final
-report into the task record. Stopping or shutting down a background worker
-cancels its durable task. Isolated branch commits are registered as
+report into the task record. Each worker snapshots the parent permission mode
+and its managed, session, and persistent rules when the worker starts. The
+headless child never upgrades itself to a more permissive mode; an unresolved
+`ASK` decision is denied unless an inherited rule already authorizes it.
+Parent-policy changes apply to subsequently started workers and do not mutate an
+already-running worker's snapshot. Stopping or shutting down a background
+worker cancels its durable task. Isolated branch commits are registered as
 `git-commit` artifacts.
 
 Use the operator interface from any later process:

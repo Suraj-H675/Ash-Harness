@@ -538,6 +538,12 @@ def build_runtime(
         rule_count=len(rules),
     )
     loop.permission_policy.set_managed_rules(managed)
+    spawn_agent_tool = tools.get("spawn_agent")
+    set_policy_provider = getattr(
+        spawn_agent_tool, "set_permission_policy_provider", None
+    )
+    if callable(set_policy_provider):
+        set_policy_provider(lambda: loop.permission_policy)
     hooks.set_event_sink(loop._emit_event)
     def checkpoint_context() -> tuple[str, str, str] | None:
         if loop.current_session is None or loop.turn_context is None:
