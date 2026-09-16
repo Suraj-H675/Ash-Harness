@@ -323,6 +323,131 @@ def test_probe_model_catalog_metadata_preserves_mistral_capabilities(monkeypatch
     assert entry.context_window == 262_144
 
 
+def test_probe_cerebras_public_catalog_preserves_capabilities(monkeypatch) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "gpt-oss-120b",
+                        "capabilities": {
+                            "function_calling": True,
+                            "vision": False,
+                            "reasoning": True,
+                            "tools": True,
+                        },
+                        "limits": {
+                            "max_context_length": 131_072,
+                            "max_completion_tokens": 40_960,
+                        },
+                    }
+                ]
+            },
+            request=request,
+        ),
+    )
+
+    (entry,) = readiness.probe_model_catalog_metadata(
+        "https://api.cerebras.ai/public/v1/models",
+        headers={},
+        catalog_format="openai",
+    )
+
+    assert entry.model_id == "gpt-oss-120b"
+    assert entry.native_tools is True
+    assert entry.vision is False
+    assert entry.reasoning is True
+    assert entry.context_window == 131_072
+    assert entry.max_output_tokens == 40_960
+
+
+def test_probe_together_catalog_preserves_context_length(monkeypatch) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                    "type": "chat",
+                    "context_length": 131_072,
+                }
+            ],
+            request=request,
+        ),
+    )
+
+    (entry,) = readiness.probe_model_catalog_metadata(
+        "https://api.together.xyz/v1/models",
+        headers={},
+        catalog_format="together",
+    )
+
+    assert entry.model_id == "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    assert entry.context_window == 131_072
+    assert entry.native_tools is None
+    assert entry.vision is None
+
+
+def test_probe_xai_language_catalog_preserves_modalities(monkeypatch) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "models": [
+                    {
+                        "id": "grok-4.3",
+                        "aliases": ["latest"],
+                        "input_modalities": ["text", "image"],
+                        "output_modalities": ["text"],
+                    }
+                ]
+            },
+            request=request,
+        ),
+    )
+
+    (entry,) = readiness.probe_model_catalog_metadata(
+        "https://api.x.ai/v1/language-models",
+        headers={},
+        catalog_format="xai",
+    )
+
+    assert entry.model_id == "grok-4.3"
+    assert entry.aliases == frozenset({"latest"})
+    assert entry.input_modalities == frozenset({"text", "image"})
+
+
+def test_probe_fireworks_model_preserves_capabilities(monkeypatch) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "name": "accounts/fireworks/models/kimi-k2-instruct",
+                "contextLength": 131_072,
+                "supportsImageInput": True,
+                "supportsTools": True,
+            },
+            request=request,
+        ),
+    )
+
+    (entry,) = readiness.probe_model_catalog_metadata(
+        "https://api.fireworks.ai/v1/accounts/fireworks/models/kimi-k2-instruct",
+        headers={},
+        catalog_format="fireworks",
+    )
+
+    assert entry.model_id == "accounts/fireworks/models/kimi-k2-instruct"
+    assert entry.native_tools is True
+    assert entry.vision is True
+    assert entry.context_window == 131_072
+
+
 def test_probe_lmstudio_catalog_preserves_model_capabilities(monkeypatch) -> None:
     patch_catalog_client(
         monkeypatch,
@@ -389,6 +514,17 @@ def test_probe_vllm_catalog_keeps_tools_unknown_but_served_context(monkeypatch) 
     assert entry.vision is None
     assert entry.reasoning is None
     assert entry.context_window == 32_768
+
+
+def test_together_connection_uses_native_catalog_shape(monkeypatch) -> None:
+    monkeypatch.setenv("TOGETHER_API_KEY", "test-key")
+
+    connection = readiness.resolve_provider_connection(
+        _config("together/meta-llama/Llama-3.3-70B-Instruct-Turbo")
+    )
+
+    assert connection.catalog_format == "together"
+    assert connection.catalog_endpoint == "https://api.together.xyz/v1/models"
 
 
 def test_lmstudio_connection_uses_native_capability_catalog() -> None:

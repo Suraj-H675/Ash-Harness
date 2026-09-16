@@ -28,7 +28,9 @@ class ProviderConfigurationError(ValueError):
     """Raised when the selected provider cannot be constructed safely."""
 
 
-CatalogFormat = Literal["openai", "anthropic", "ollama", "lmstudio"]
+CatalogFormat = Literal[
+    "openai", "anthropic", "ollama", "lmstudio", "together", "xai", "fireworks"
+]
 AuthMode = Literal["bearer", "anthropic", "none"]
 MAX_PROVIDER_CATALOG_BYTES = 2_000_000
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
@@ -158,7 +160,7 @@ _BUILTIN_CONNECTIONS: dict[str, tuple[str, str, CatalogFormat, AuthMode]] = {
     "together": (
         "https://api.together.xyz/v1",
         "TOGETHER_API_BASE",
-        "openai",
+        "together",
         "bearer",
     ),
     "fireworks": (
@@ -439,18 +441,34 @@ def probe_model_catalog_metadata(
             f"provider catalog verification failed ({type(exc).__name__})"
         ) from exc
 
-    if catalog_format == "ollama":
-        collection, identifier = "models", "name"
-    elif catalog_format == "lmstudio":
-        collection, identifier = "models", "key"
+    identifier: str
+    items: list[object]
+    if catalog_format == "together":
+        if not isinstance(payload, list):
+            raise ProviderVerificationError("provider returned an invalid model catalog")
+        items = payload
+        identifier = "id"
+    elif catalog_format == "fireworks":
+        if not isinstance(payload, dict):
+            raise ProviderVerificationError("provider returned an invalid model catalog")
+        items = [payload]
+        identifier = "name"
     else:
-        collection, identifier = "data", "id"
-    if not isinstance(payload, dict) or not isinstance(payload.get(collection), list):
-        raise ProviderVerificationError("provider returned an invalid model catalog")
+        if catalog_format == "ollama":
+            collection, identifier = "models", "name"
+        elif catalog_format == "lmstudio":
+            collection, identifier = "models", "key"
+        elif catalog_format == "xai":
+            collection, identifier = "models", "id"
+        else:
+            collection, identifier = "data", "id"
+        if not isinstance(payload, dict) or not isinstance(payload.get(collection), list):
+            raise ProviderVerificationError("provider returned an invalid model catalog")
+        items = payload[collection]
 
     models: list[ProviderModelMetadata] = []
     seen: set[str] = set()
-    for item in payload[collection]:
+    for item in items:
         if not isinstance(item, dict):
             continue
         if catalog_format == "lmstudio" and item.get("type") == "embedding":
@@ -479,11 +497,13 @@ def probe_model_catalog_metadata(
         else:
             parameters = frozenset()
         architecture = item.get("architecture")
-        raw_modalities = (
-            architecture.get("input_modalities")
-            if isinstance(architecture, dict)
-            else None
-        )
+        raw_modalities = item.get("input_modalities")
+        if not isinstance(raw_modalities, list):
+            raw_modalities = (
+                architecture.get("input_modalities")
+                if isinstance(architecture, dict)
+                else None
+            )
         modalities = frozenset(
             value for value in raw_modalities if isinstance(value, str) and value
         ) if isinstance(raw_modalities, list) else frozenset()
@@ -496,6 +516,9 @@ def probe_model_catalog_metadata(
             native_tools = _catalog_boolean(capability_data, "tools")
         vision = _catalog_boolean(capability_data, "vision")
         reasoning = _catalog_boolean(capability_data, "reasoning")
+        if catalog_format == "fireworks":
+            native_tools = _catalog_boolean(item, "supportsTools")
+            vision = _catalog_boolean(item, "supportsImageInput")
         if reasoning is None and catalog_format == "lmstudio":
             reasoning_config = capability_data.get("reasoning")
             if isinstance(reasoning_config, dict):
@@ -531,6 +554,7 @@ def probe_model_catalog_metadata(
             or _positive_catalog_integer(item.get("max_context_length"))
             or _positive_catalog_integer(item.get("max_model_len"))
             or _positive_catalog_integer(item.get("context_length"))
+            or _positive_catalog_integer(item.get("contextLength"))
         )
         max_output = (
             _positive_catalog_integer(top_provider_data.get("max_completion_tokens"))

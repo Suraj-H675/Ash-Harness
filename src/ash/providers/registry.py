@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from threading import RLock
 from typing import TYPE_CHECKING, Callable
 
@@ -149,9 +150,20 @@ def _build_openai(config: "AshConfig", model_name: str) -> ProviderABC:
     return provider
 
 
+_FIREWORKS_MODEL_RESOURCE = re.compile(
+    r"^accounts/[A-Za-z0-9._-]+/models/[A-Za-z0-9._-]+$"
+)
+
+
+def _fireworks_capability_endpoint(model_name: str) -> str | None:
+    if not _FIREWORKS_MODEL_RESOURCE.fullmatch(model_name):
+        return None
+    return f"https://api.fireworks.ai/v1/{model_name}"
+
+
 def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderABC:
     from ash.providers.openai import OpenAIProvider
-    from ash.providers.readiness import resolve_provider_connection
+    from ash.providers.readiness import CatalogFormat, resolve_provider_connection
 
     connection = resolve_provider_connection(config)
     provider: ProviderABC
@@ -165,17 +177,50 @@ def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderAB
             catalog_endpoint=connection.catalog_endpoint,
             catalog_headers=connection.headers,
         )
-    elif connection.provider in {"mistral", "lmstudio", "vllm", "openai-compatible"}:
+    elif connection.provider in {
+        "mistral",
+        "lmstudio",
+        "vllm",
+        "openai-compatible",
+        "xai",
+        "together",
+        "fireworks",
+        "cerebras",
+    }:
         from ash.providers.openai_compatible import CatalogOpenAIProvider
+
+        catalog_endpoint = connection.catalog_endpoint
+        catalog_format = connection.catalog_format
+        catalog_headers = connection.headers
+        additional_catalog_sources: tuple[
+            tuple[str, CatalogFormat, dict[str, str]], ...
+        ] = ()
+        if connection.provider == "xai" and connection.uses_default_base_url:
+            additional_catalog_sources = (
+                (
+                    f"{connection.base_url}/language-models",
+                    "xai",
+                    connection.headers,
+                ),
+            )
+        elif connection.provider == "cerebras" and connection.uses_default_base_url:
+            catalog_endpoint = "https://api.cerebras.ai/public/v1/models"
+            catalog_headers = {}
+        elif connection.provider == "fireworks" and connection.uses_default_base_url:
+            fireworks_endpoint = _fireworks_capability_endpoint(model_name)
+            if fireworks_endpoint is not None:
+                catalog_endpoint = fireworks_endpoint
+                catalog_format = "fireworks"
 
         provider = CatalogOpenAIProvider(
             model_name=model_name,
             api_key=connection.api_key,
             provider_family=connection.provider,
             base_url=connection.base_url,
-            catalog_endpoint=connection.catalog_endpoint,
-            catalog_format=connection.catalog_format,
-            catalog_headers=connection.headers,
+            catalog_endpoint=catalog_endpoint,
+            catalog_format=catalog_format,
+            catalog_headers=catalog_headers,
+            additional_catalog_sources=additional_catalog_sources,
             allow_anonymous=connection.auth_mode == "none",
             local=connection.provider in {"lmstudio", "vllm"},
         )
@@ -186,7 +231,6 @@ def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderAB
             base_url=connection.base_url,
             allow_anonymous=connection.auth_mode == "none",
         )
-        _assign_openai_wire_route_identity(provider, connection.provider)
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider
 
@@ -336,13 +380,6 @@ def _build_custom_openai_provider(
     return provider
 
 
-
-def _assign_openai_wire_route_identity(provider: ProviderABC, family: str) -> None:
-    """Keep adapter capabilities while exposing the route that owns the request."""
-
-    capabilities = provider.capabilities
-    provider.provider_family = family
-    provider._ash_declared_capabilities = capabilities
 
 def create_default_provider_registry() -> ProviderRegistry:
     registry = ProviderRegistry()

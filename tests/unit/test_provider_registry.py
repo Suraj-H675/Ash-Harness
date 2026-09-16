@@ -148,13 +148,10 @@ def test_openai_compatible_catalog_providers_build_with_their_route(
 
     assert result.model_name == "test-model"
     assert result.provider_family == provider
-    if provider == "mistral":
+    if provider != "openrouter":
         assert result.capabilities.native_tools is False
         assert result.capabilities.vision is False
         assert callable(getattr(result, "detect_capabilities", None))
-    elif provider != "openrouter":
-        assert result.capabilities.native_tools is True
-        assert result.capabilities.vision is True
     assert result._base_url == base_url
 
 
@@ -431,6 +428,238 @@ async def test_mistral_negotiates_capabilities_from_provider_catalog(
         vision=True,
         context_window=131_072,
     )
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_xai_combines_context_and_language_modalities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    monkeypatch.setenv("XAI_API_KEY", "test-key")
+    provider = create_default_provider_registry().build(AshConfig(model="xai/latest"))
+    calls: list[tuple[str, str]] = []
+
+    def probe(endpoint, *, catalog_format, **kwargs):
+        del kwargs
+        calls.append((endpoint, catalog_format))
+        if catalog_format == "openai":
+            return (
+                ProviderModelMetadata(
+                    model_id="grok-4.3",
+                    context_window=131_072,
+                ),
+            )
+        return (
+            ProviderModelMetadata(
+                model_id="grok-4.3",
+                aliases=frozenset({"latest"}),
+                input_modalities=frozenset({"text", "image"}),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata", probe
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        vision=True,
+        context_window=131_072,
+    )
+    assert calls == [
+        ("https://api.x.ai/v1/models", "openai"),
+        ("https://api.x.ai/v1/language-models", "xai"),
+    ]
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_xai_keeps_verified_context_when_language_catalog_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata, ProviderVerificationError
+
+    monkeypatch.setenv("XAI_API_KEY", "test-key")
+    provider = create_default_provider_registry().build(AshConfig(model="xai/latest"))
+
+    def probe(endpoint, *, catalog_format, **kwargs):
+        del endpoint, kwargs
+        if catalog_format == "xai":
+            raise ProviderVerificationError("language catalog unavailable")
+        return (
+            ProviderModelMetadata(
+                model_id="latest",
+                context_window=131_072,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata", probe
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        context_window=131_072
+    )
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_catalog_source_conflict_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    monkeypatch.setenv("XAI_API_KEY", "test-key")
+    provider = create_default_provider_registry().build(AshConfig(model="xai/latest"))
+    calls = 0
+
+    def probe(*args, **kwargs):
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        return (
+            ProviderModelMetadata(
+                model_id="latest",
+                native_tools=calls == 1,
+                supported_parameters=frozenset({"tools"}),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata", probe
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities()
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_together_negotiates_context_without_assuming_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    monkeypatch.setenv("TOGETHER_API_KEY", "test-key")
+    provider = create_default_provider_registry().build(
+        AshConfig(model="together/meta-llama/Llama-3.3-70B-Instruct-Turbo")
+    )
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata",
+        lambda *args, **kwargs: (
+            ProviderModelMetadata(
+                model_id="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                context_window=131_072,
+            ),
+        ),
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        context_window=131_072
+    )
+    await provider.aclose()
+
+
+def test_fireworks_noncanonical_model_does_not_build_management_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    provider = create_default_provider_registry().build(
+        AshConfig(model="fireworks/not/a/canonical/resource/path")
+    )
+
+    assert provider.capabilities.native_tools is False
+    assert provider.capabilities.vision is False
+    assert provider._catalog_endpoint == "https://api.fireworks.ai/inference/v1/models"
+    assert provider._catalog_format == "openai"
+
+
+@pytest.mark.asyncio
+async def test_cerebras_uses_public_capability_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    monkeypatch.setenv("CEREBRAS_API_KEY", "test-key")
+    provider = create_default_provider_registry().build(
+        AshConfig(model="cerebras/gpt-oss-120b")
+    )
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    def probe(endpoint, *, headers, **kwargs):
+        del kwargs
+        seen.append((endpoint, dict(headers)))
+        return (
+            ProviderModelMetadata(
+                model_id="gpt-oss-120b",
+                native_tools=True,
+                vision=False,
+                reasoning=True,
+                context_window=131_072,
+                max_output_tokens=40_960,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata", probe
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        native_tools=True,
+        reasoning=True,
+        context_window=131_072,
+        max_output_tokens=40_960,
+    )
+    assert seen == [("https://api.cerebras.ai/public/v1/models", {})]
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fireworks_uses_selected_model_management_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    model = "accounts/fireworks/models/kimi-k2-instruct"
+    provider = create_default_provider_registry().build(
+        AshConfig(model=f"fireworks/{model}")
+    )
+    seen: list[tuple[str, str]] = []
+
+    def probe(endpoint, *, catalog_format, **kwargs):
+        del kwargs
+        seen.append((endpoint, catalog_format))
+        return (
+            ProviderModelMetadata(
+                model_id=model,
+                native_tools=True,
+                vision=True,
+                context_window=131_072,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata", probe
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        context_window=131_072,
+    )
+    assert seen == [
+        (
+            "https://api.fireworks.ai/v1/accounts/fireworks/models/kimi-k2-instruct",
+            "fireworks",
+        )
+    ]
     await provider.aclose()
 
 

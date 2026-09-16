@@ -77,13 +77,23 @@ implements an OpenAI-compatible HTTP API.
 The same wire/capability separation applies to built-in routes where Ash can
 inspect provider-owned metadata. Mistral starts conservative and reads the
 selected `/v1/models` entry for explicit function-calling, vision, and context
-support. LM Studio uses its native `/api/v1/models` metadata for tool training,
-vision, reasoning, and the conservative loaded-instance context. vLLM reads
-served model limits from `/v1/models`, but its catalog does not prove that
+support. xAI merges only safely matched evidence from `/v1/models` and
+`/v1/language-models`, so context and image-input support can be recovered even
+when an alias is present in only one source; conflicting evidence fails closed.
+Together uses its native `/v1/models` catalog shape for verified context limits
+without assuming tools or vision. Cerebras uses its public model catalog for
+explicit tools, vision, reasoning, context, and output limits. Fireworks uses
+selected-model management metadata only for a canonical
+`accounts/ACCOUNT/models/MODEL` resource and otherwise remains conservative.
+LM Studio uses its native `/api/v1/models` metadata for tool training, vision,
+reasoning, and the conservative loaded-instance context. vLLM reads served
+model limits from `/v1/models`, but its catalog does not prove that
 `--enable-auto-tool-choice` plus a compatible tool parser were enabled, so Ash
-does not activate native auto-tool calling from wire compatibility or model name
-alone. Generic `openai-compatible` routes likewise require catalog evidence.
-Exact model IDs take precedence; provider aliases are accepted only when they map to exactly one catalog entry. Missing, malformed, ambiguous-alias, or different-model metadata keeps the conservative path.
+does not activate native auto-tool calling from wire compatibility or model
+name alone. Generic `openai-compatible` routes likewise require catalog
+evidence. Exact model IDs take precedence; provider aliases are accepted only
+when they map to exactly one catalog entry. Missing, malformed, conflicting,
+ambiguous-alias, or different-model metadata keeps the conservative path.
 
 Connectivity diagnostics must receive a successful model catalog containing
 the selected model. A reachable endpoint with an empty catalog or a different

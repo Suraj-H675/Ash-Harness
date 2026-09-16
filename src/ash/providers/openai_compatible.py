@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.openai import OpenAIProvider
 from ash.providers.readiness import (
     CatalogFormat,
+    ProviderModelMetadata,
     probe_model_catalog_metadata,
     select_provider_model_metadata,
 )
@@ -26,6 +27,9 @@ class CatalogOpenAIProvider(OpenAIProvider):
         catalog_endpoint: str,
         catalog_format: CatalogFormat,
         catalog_headers: Mapping[str, str],
+        additional_catalog_sources: Sequence[
+            tuple[str, CatalogFormat, Mapping[str, str]]
+        ] = (),
         allow_anonymous: bool = False,
         local: bool = False,
         client: Any | None = None,
@@ -41,6 +45,13 @@ class CatalogOpenAIProvider(OpenAIProvider):
         self._catalog_endpoint = catalog_endpoint
         self._catalog_format = catalog_format
         self._catalog_headers = dict(catalog_headers)
+        self._catalog_sources = (
+            (catalog_endpoint, catalog_format, dict(catalog_headers)),
+            *(
+                (endpoint, source_format, dict(source_headers))
+                for endpoint, source_format, source_headers in additional_catalog_sources
+            ),
+        )
         self._local = local
         self._dynamic_capabilities: ProviderCapabilities | None = None
 
@@ -56,40 +67,86 @@ class CatalogOpenAIProvider(OpenAIProvider):
         if self._dynamic_capabilities is not None and not refresh:
             return self._dynamic_capabilities
         self._dynamic_capabilities = None
-        try:
-            catalog = await asyncio.to_thread(
-                probe_model_catalog_metadata,
-                self._catalog_endpoint,
-                headers=self._catalog_headers,
-                catalog_format=self._catalog_format,
-                timeout=5.0,
-            )
+        catalogs: list[tuple[ProviderModelMetadata, ...]] = []
+        direct_matches: list[tuple[int, ProviderModelMetadata]] = []
+        failures: list[Exception] = []
+        for endpoint, catalog_format, headers in self._catalog_sources:
+            try:
+                catalog = await asyncio.to_thread(
+                    probe_model_catalog_metadata,
+                    endpoint,
+                    headers=headers,
+                    catalog_format=catalog_format,
+                    timeout=5.0,
+                )
+            except Exception as exc:  # noqa: BLE001 - partial sources may still verify
+                failures.append(exc)
+                continue
+            catalog_index = len(catalogs)
+            catalogs.append(catalog)
             metadata = select_provider_model_metadata(catalog, self.model_name)
             if metadata is not None:
-                params = metadata.supported_parameters
-                self._dynamic_capabilities = ProviderCapabilities(
-                    native_tools=(
-                        metadata.native_tools
-                        if metadata.native_tools is not None
-                        else "tools" in params
-                    ),
-                    vision=(
-                        metadata.vision
-                        if metadata.vision is not None
-                        else "image" in metadata.input_modalities
-                    ),
-                    reasoning=(
-                        metadata.reasoning
-                        if metadata.reasoning is not None
-                        else bool({"reasoning", "reasoning_effort"} & params)
-                    ),
-                    local=self._local,
-                    context_window=metadata.context_window,
-                    max_output_tokens=metadata.max_output_tokens,
-                )
-        except Exception:
+                direct_matches.append((catalog_index, metadata))
+
+        matched = [metadata for _, metadata in direct_matches]
+        canonical_ids = {metadata.model_id for _, metadata in direct_matches}
+        if len(canonical_ids) == 1:
+            canonical_id = next(iter(canonical_ids))
+            directly_matched = {index for index, _ in direct_matches}
+            for index, catalog in enumerate(catalogs):
+                if index in directly_matched:
+                    continue
+                metadata = select_provider_model_metadata(catalog, canonical_id)
+                if metadata is not None:
+                    matched.append(metadata)
+
+        if matched:
+            params = frozenset().union(*(item.supported_parameters for item in matched))
+            modalities = frozenset().union(*(item.input_modalities for item in matched))
+            native_tools = _merge_capability_boolean(
+                [item.native_tools for item in matched],
+                fallback="tools" in params,
+            )
+            vision = _merge_capability_boolean(
+                [item.vision for item in matched],
+                fallback="image" in modalities,
+            )
+            reasoning = _merge_capability_boolean(
+                [item.reasoning for item in matched],
+                fallback=bool({"reasoning", "reasoning_effort"} & params),
+            )
+            context_windows = [
+                item.context_window for item in matched if item.context_window is not None
+            ]
+            output_limits = [
+                item.max_output_tokens
+                for item in matched
+                if item.max_output_tokens is not None
+            ]
+            self._dynamic_capabilities = ProviderCapabilities(
+                native_tools=native_tools,
+                vision=vision,
+                reasoning=reasoning,
+                local=self._local,
+                context_window=min(context_windows) if context_windows else None,
+                max_output_tokens=min(output_limits) if output_limits else None,
+            )
+        elif failures and len(failures) == len(self._catalog_sources):
             self._dynamic_capabilities = ProviderCapabilities(local=self._local)
-            raise
+            raise failures[0]
         if self._dynamic_capabilities is None:
             self._dynamic_capabilities = ProviderCapabilities(local=self._local)
         return self._dynamic_capabilities
+
+
+def _merge_capability_boolean(
+    values: Sequence[bool | None],
+    *,
+    fallback: bool,
+) -> bool:
+    known = {value for value in values if value is not None}
+    if len(known) > 1:
+        return False
+    if known:
+        return next(iter(known))
+    return fallback
