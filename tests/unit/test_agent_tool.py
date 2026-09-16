@@ -334,13 +334,11 @@ async def test_background_agent_honors_persisted_stop_message(tmp_path) -> None:
         {},
     )
 
-    for _ in range(30):
-        status = state.get_status("stopped-worker")
-        if status is not None and status.status == "failed":
-            break
-        await asyncio.sleep(0.05)
-    else:
-        pytest.fail("persisted stop was not consumed")
+    background_task = tool._tasks["stopped-worker"]
+    await asyncio.wait_for(
+        asyncio.gather(background_task, return_exceptions=True),
+        timeout=2.0,
+    )
 
     message = next(
         item
@@ -348,7 +346,13 @@ async def test_background_agent_honors_persisted_stop_message(tmp_path) -> None:
         if item.message_id == message_id
     )
     assert message.delivered is True
-    assert "persisted message" in state.get_status("stopped-worker").current_task
+    status = state.get_status("stopped-worker")
+    assert status is not None
+    assert status.current_task == "stopped by persisted message"
+    durable_task = state.tasks.get_task(str(status.metadata["durable_task_id"]))
+    assert durable_task is not None
+    assert durable_task.state == "cancelled"
+    assert durable_task.error == "stopped by persisted message"
     await tool.aclose()
 
 

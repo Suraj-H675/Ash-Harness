@@ -31,6 +31,9 @@ if TYPE_CHECKING:
     from ash.plugins.agents import AgentDefinition
 
 
+_PERSISTED_STOP_REASON = "stopped by persisted message"
+
+
 async def _settle_spawn_cleanup_task(
     task: asyncio.Task[Any],
 ) -> tuple[BaseException | None, bool]:
@@ -664,12 +667,12 @@ class SpawnAgentTool(BaseTool):
                     )
                 return report
             except asyncio.CancelledError:
-                current_status = self._shared_state.get_status(agent_id)
+                current_task = self._shared_state.tasks.get_task(durable_task.task_id)
                 cancellation_reason = (
-                    current_status.current_task
-                    if current_status is not None
-                    and current_status.status == "failed"
-                    and current_status.current_task == "stopped by persisted message"
+                    _PERSISTED_STOP_REASON
+                    if current_task is not None
+                    and current_task.state == "cancelled"
+                    and current_task.error == _PERSISTED_STOP_REASON
                     else "subagent execution cancelled"
                 )
                 self._shared_state.tasks.cancel_task(
@@ -984,10 +987,14 @@ class SpawnAgentTool(BaseTool):
             delivered: list[int] = []
             for message in messages:
                 if message.message_type == "stop":
+                    self._shared_state.tasks.cancel_task(
+                        durable_task_id,
+                        reason=_PERSISTED_STOP_REASON,
+                    )
                     self._shared_state.update_status(
                         agent_id,
                         "failed",
-                        current_task="stopped by persisted message",
+                        current_task=_PERSISTED_STOP_REASON,
                     )
                     delivered.append(message.message_id)
                     turn.cancel()
