@@ -1592,11 +1592,18 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 if (
                     (action == "cancel" and len(arguments) != 3)
                     or (
-                        action != "cancel"
-                        and action != "refresh"
+                        action not in {
+                            "cancel",
+                            "refresh",
+                            "watch",
+                            "unwatch",
+                            "watches",
+                        }
                         and len(arguments) > 1
                     )
                     or (action == "refresh" and len(arguments) > 2)
+                    or (action in {"watch", "unwatch"} and len(arguments) != 3)
+                    or (action == "watches" and len(arguments) not in {1, 2})
                     or (json_output and action != "status")
                     or action
                     not in {
@@ -1605,6 +1612,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         "tools",
                         "resources",
                         "prompts",
+                        "watch",
+                        "unwatch",
+                        "watches",
                         "tasks",
                         "cancel",
                         "login",
@@ -1734,6 +1744,41 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         key for key in loop.tools if key.startswith("mcp__")
                     ):
                         print(name)
+                elif action in {"watch", "unwatch"}:
+                    server_name, uri = arguments[1], arguments[2]
+                    try:
+                        if action == "watch":
+                            await runtime.watch_resource(server_name, uri)
+                            print(
+                                f"{safe_mcp_diagnostic(server_name)}: watching "
+                                f"{safe_mcp_diagnostic(uri)}"
+                            )
+                        else:
+                            await runtime.unwatch_resource(server_name, uri)
+                            print(
+                                f"{safe_mcp_diagnostic(server_name)}: stopped watching "
+                                f"{safe_mcp_diagnostic(uri)}"
+                            )
+                    except Exception as exc:
+                        print(
+                            f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
+                        )
+                elif action == "watches":
+                    watch_server = arguments[1] if len(arguments) == 2 else None
+                    try:
+                        watches = runtime.resource_watches(watch_server)
+                    except Exception as exc:
+                        print(
+                            f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
+                        )
+                        continue
+                    if not watches:
+                        print("No MCP resource watches.")
+                    for watch in watches:
+                        print(
+                            f"{safe_mcp_diagnostic(watch['server'])}: "
+                            f"{safe_mcp_diagnostic(watch['uri'])}"
+                        )
                 elif action == "tasks":
                     tasks = await runtime.list_tasks()
                     if not tasks:

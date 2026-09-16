@@ -64,7 +64,16 @@ async def test_repl_reports_targetless_reload_errors_and_redacts_cancel_failure(
     capsys,
 ) -> None:
     marker = "synthetic repl diagnostic marker"
-    commands = iter(("/mcp refresh", "/mcp cancel server task", "/exit"))
+    commands = iter(
+        (
+            "/mcp watch server file:///watched.txt",
+            "/mcp watches",
+            "/mcp unwatch server file:///watched.txt",
+            "/mcp refresh",
+            "/mcp cancel server task",
+            "/exit",
+        )
+    )
 
     class FakeTerminalUI:
         transcript = None
@@ -120,6 +129,24 @@ async def test_repl_reports_targetless_reload_errors_and_redacts_cancel_failure(
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
     class FakeRuntime:
+        def __init__(self) -> None:
+            self.watches: list[dict[str, str]] = []
+
+        async def watch_resource(self, server: str, uri: str) -> None:
+            self.watches.append({"server": server, "uri": uri})
+
+        async def unwatch_resource(self, server: str, uri: str) -> None:
+            self.watches = [
+                watch
+                for watch in self.watches
+                if watch != {"server": server, "uri": uri}
+            ]
+
+        def resource_watches(self, server: str | None = None) -> list[dict[str, str]]:
+            if server is None:
+                return list(self.watches)
+            return [watch for watch in self.watches if watch["server"] == server]
+
         async def cancel_task(self, server: str, task_id: str) -> dict:
             raise RuntimeError(f'upstream password="{marker}"')
 
@@ -175,6 +202,10 @@ async def test_repl_reports_targetless_reload_errors_and_redacts_cancel_failure(
     assert reload_calls == [{}]
     assert "MCP configuration reload failed; the previous runtime was preserved." in captured.out
     assert "MCP configuration reloaded." not in captured.out
+    assert "server: watching file:///watched.txt" in captured.out
+    assert "server: file:///watched.txt" in captured.out
+    assert "server: stopped watching file:///watched.txt" in captured.out
+    assert runtime.watches == []
     assert marker not in captured.out
     assert marker not in captured.err
     assert 'password="[REDACTED]": upstream password="[REDACTED]"' in captured.err

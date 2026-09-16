@@ -6170,3 +6170,497 @@ async def test_modern_http_subscription_loss_is_reported_after_ack() -> None:
     assert errors == ["MCP subscription HTTP stream ended without a graceful result"]
     await client.disconnect()
     await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_modern_resource_watch_uses_explicit_subscription_and_delivers_update() -> None:
+    server = r"""
+import json, sys
+listen_id = None
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"resources": {"subscribe": True}},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "subscriptions/listen":
+        listen_id = message["id"]
+        assert message["params"]["notifications"] == {
+            "resourceSubscriptions": ["file:///watched.txt"]
+        }
+        meta = {"io.modelcontextprotocol/subscriptionId": listen_id}
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {"notifications": {"resourceSubscriptions": ["file:///watched.txt"]}, "_meta": meta},
+        }), flush=True)
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/updated",
+            "params": {"uri": "file:///watched.txt", "_meta": meta},
+        }), flush=True)
+    elif method == "notifications/cancelled":
+        assert message["params"]["requestId"] == listen_id
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": listen_id,
+            "result": {"resultType": "complete"},
+        }), flush=True)
+"""
+    updated = asyncio.Event()
+    seen: list[str] = []
+
+    async def on_notification(method: str, params: dict) -> None:
+        if method == "notifications/resources/updated":
+            seen.append(str(params.get("uri")))
+            updated.set()
+
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern-resource-watch",
+            command=sys.executable,
+            args=["-u", "-c", server],
+            env={},
+        ),
+        notification_handler=on_notification,
+    )
+    await client.connect()
+    try:
+        await client.watch_resource("file:///watched.txt")
+        await asyncio.wait_for(updated.wait(), timeout=0.5)
+        assert client.watched_resources == ("file:///watched.txt",)
+        assert seen == ["file:///watched.txt"]
+        await client.unwatch_resource("file:///watched.txt")
+        assert client.watched_resources == ()
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_runtime_resource_watch_emits_update_event(tmp_path) -> None:
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"resources": {"subscribe": True}},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "subscriptions/listen":
+        listen_id = message["id"]
+        uri = message["params"]["notifications"]["resourceSubscriptions"][0]
+        meta = {"io.modelcontextprotocol/subscriptionId": listen_id}
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {"notifications": {"resourceSubscriptions": [uri]}, "_meta": meta},
+        }), flush=True)
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/updated",
+            "params": {"uri": uri, "_meta": meta},
+        }), flush=True)
+    elif method == "notifications/cancelled":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": message["params"]["requestId"],
+            "result": {"resultType": "complete"},
+        }), flush=True)
+"""
+    events: list[dict] = []
+    runtime = MCPRuntime(
+        {
+            "modern": MCPServerConfig(
+                name="modern",
+                command=sys.executable,
+                args=["-u", "-c", server],
+                env={},
+            )
+        },
+        SafetyGuard(tmp_path),
+        event_sink=events.append,
+    )
+    await runtime.start()
+    try:
+        await runtime.watch_resource("modern", "file:///watched.txt")
+        for _ in range(50):
+            if any(event.get("type") == "mcp.resource.updated" for event in events):
+                break
+            await asyncio.sleep(0.01)
+        assert runtime.resource_watches() == [
+            {"server": "modern", "uri": "file:///watched.txt"}
+        ]
+        assert any(
+            event.get("type") == "mcp.resource.updated"
+            and event.get("server") == "modern"
+            and event.get("uri") == "file:///watched.txt"
+            for event in events
+        )
+        await runtime.unwatch_resource("modern", "file:///watched.txt")
+        assert runtime.resource_watches() == []
+        assert any(event.get("type") == "mcp.resource.watch_stopped" for event in events)
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_resource_watch_uses_subscribe_and_unsubscribe() -> None:
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "server/discover":
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "legacy"}}), flush=True)
+    elif method == "initialize":
+        result = {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"resources": {"subscribe": True}},
+            "serverInfo": {"name": "legacy-watch", "version": "1"},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "resources/subscribe":
+        uri = message["params"]["uri"]
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": {}}), flush=True)
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/updated",
+            "params": {"uri": uri},
+        }), flush=True)
+    elif method == "resources/unsubscribe":
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": {}}), flush=True)
+"""
+    updated = asyncio.Event()
+    seen: list[str] = []
+
+    async def on_notification(method: str, params: dict) -> None:
+        if method == "notifications/resources/updated":
+            seen.append(str(params.get("uri")))
+            updated.set()
+
+    client = MCPClient(
+        MCPServerConfig(
+            name="legacy-resource-watch",
+            command=sys.executable,
+            args=["-u", "-c", server],
+            env={},
+        ),
+        notification_handler=on_notification,
+    )
+    await client.connect()
+    try:
+        await client.watch_resource("file:///legacy.txt")
+        await asyncio.wait_for(updated.wait(), timeout=0.5)
+        assert client.watched_resources == ("file:///legacy.txt",)
+        assert seen == ["file:///legacy.txt"]
+        await client.unwatch_resource("file:///legacy.txt")
+        assert client.watched_resources == ()
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modern_resource_watch_rejects_mismatched_acknowledgment() -> None:
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"resources": {"subscribe": True}},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "subscriptions/listen":
+        listen_id = message["id"]
+        meta = {"io.modelcontextprotocol/subscriptionId": listen_id}
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {
+                "notifications": {"resourceSubscriptions": ["file:///other.txt"]},
+                "_meta": meta,
+            },
+        }), flush=True)
+"""
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern-resource-watch-bad-ack",
+            command=sys.executable,
+            args=["-u", "-c", server],
+            env={},
+        ),
+        notification_handler=lambda method, params: None,
+    )
+    await client.connect()
+    try:
+        with pytest.raises(MCPProtocolError, match="did not match the requested URI"):
+            await client.watch_resource("file:///watched.txt")
+        assert client.watched_resources == ()
+    finally:
+        await client.disconnect()
+
+
+def test_resource_watch_limit_fails_closed() -> None:
+    client = MCPClient(
+        MCPServerConfig(name="limit", command=sys.executable, args=["-c", "pass"], env={})
+    )
+    client._initialized = True
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {"resources": {"subscribe": True}}
+    client._watched_resources = {f"file:///{index}.txt" for index in range(32)}
+
+    with pytest.raises(MCPProtocolError, match="resource watch limit reached"):
+        asyncio.run(client.watch_resource("file:///overflow.txt"))
+
+
+@pytest.mark.asyncio
+async def test_http_session_recovery_restores_legacy_resource_watch() -> None:
+    trace: list[tuple[str, str | None]] = []
+    initialize_count = 0
+    uri = "file:///watched-after-recovery.txt"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialize_count
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": 0, "result": {}}
+            )
+        payload = json.loads(request.content)
+        method = payload["method"]
+        session = request.headers.get("Mcp-Session-Id")
+        trace.append((method, session))
+        if method == "initialize":
+            initialize_count += 1
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": f"session-{initialize_count}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"resources": {"subscribe": True}},
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        if method == "resources/subscribe":
+            assert payload["params"]["uri"] == uri
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": payload["id"], "result": {}},
+            )
+        if method == "resources/read" and session == "session-1":
+            return httpx.Response(404)
+        if method == "resources/read" and session == "session-2":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "contents": [{"uri": uri, "text": "restored"}]
+                    },
+                },
+            )
+        raise AssertionError((method, session))
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="recover-watch",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    try:
+        await client.watch_resource(uri)
+        result = await client.read_resource(uri)
+        assert result["contents"][0]["text"] == "restored"
+        assert client.watched_resources == (uri,)
+        assert client._http_session_id == "session-2"
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+    assert trace == [
+        ("initialize", None),
+        ("notifications/initialized", "session-1"),
+        ("resources/subscribe", "session-1"),
+        ("resources/read", "session-1"),
+        ("initialize", None),
+        ("notifications/initialized", "session-2"),
+        ("resources/subscribe", "session-2"),
+        ("resources/read", "session-2"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_http_session_recovery_drops_watch_if_replacement_loses_capability() -> None:
+    initialize_count = 0
+    uri = "file:///lost-capability.txt"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialize_count
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        if request.content.startswith(b'{"jsonrpc":"2.0","id":0'):
+            return httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": 0, "result": {}}
+            )
+        payload = json.loads(request.content)
+        method = payload["method"]
+        session = request.headers.get("Mcp-Session-Id")
+        if method == "initialize":
+            initialize_count += 1
+            resources = {"subscribe": True} if initialize_count == 1 else {}
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": f"session-{initialize_count}"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"resources": resources},
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        if method == "resources/subscribe":
+            assert session == "session-1"
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": payload["id"], "result": {}},
+            )
+        if method == "resources/read" and session == "session-1":
+            return httpx.Response(404)
+        raise AssertionError((method, session))
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="recover-watch-lost",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+    try:
+        await client.watch_resource(uri)
+        with pytest.raises(
+            MCPProtocolError,
+            match="replacement session no longer supports watched resources",
+        ):
+            await client.read_resource(uri)
+        assert client.watched_resources == ()
+        assert client._initialized is False
+        assert client._http_session_id == ""
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_deferred_runtime_buffers_resource_updates_until_publication(tmp_path) -> None:
+    events: list[dict[str, object]] = []
+    runtime = MCPRuntime(
+        {"server": MCPServerConfig(name="server", command="fake", args=[], env={})},
+        SafetyGuard(tmp_path),
+        event_sink=events.append,
+        defer_notifications=True,
+    )
+    uri = "file:///startup-update.txt"
+    client = SimpleNamespace(
+        server_capabilities={"resources": {"subscribe": True}},
+        watched_resources=(uri,),
+    )
+    runtime.clients["server"] = client
+    runtime._started = True
+
+    await runtime._handle_notification(
+        "server",
+        client,
+        "notifications/resources/updated",
+        {"uri": uri},
+    )
+    await runtime._handle_notification(
+        "server",
+        client,
+        "notifications/resources/updated",
+        {"uri": uri},
+    )
+
+    assert events == []
+    assert runtime._startup_resource_updates == {("server", uri)}
+
+    runtime.activate_notifications()
+
+    assert events == [
+        {
+            "type": "mcp.resource.updated",
+            "server": "server",
+            "uri": uri,
+        }
+    ]
+    assert runtime._startup_resource_updates == set()
+
+
+@pytest.mark.asyncio
+async def test_runtime_watch_resource_emits_started_event_only_once(tmp_path) -> None:
+    events: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self._watched: set[str] = set()
+
+        @property
+        def watched_resources(self) -> tuple[str, ...]:
+            return tuple(sorted(self._watched))
+
+        async def watch_resource(self, uri: str) -> None:
+            self._watched.add(uri)
+
+    runtime = MCPRuntime(
+        {"server": MCPServerConfig(name="server", command="fake", args=[], env={})},
+        SafetyGuard(tmp_path),
+        event_sink=events.append,
+    )
+    client = FakeClient()
+    runtime.clients["server"] = client
+    uri = "file:///idempotent.txt"
+
+    await runtime.watch_resource("server", uri)
+    await runtime.watch_resource("server", uri)
+
+    assert events == [
+        {
+            "type": "mcp.resource.watch_started",
+            "server": "server",
+            "uri": uri,
+        }
+    ]

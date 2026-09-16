@@ -676,3 +676,146 @@ async def test_modern_subscription_refreshes_runtime_tool_catalog(tmp_path) -> N
         assert runtime.errors == {}
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_preserves_resource_watches(tmp_path) -> None:
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"resources": {"subscribe": True}},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "subscriptions/listen":
+        listen_id = message["id"]
+        notifications = message["params"]["notifications"]
+        meta = {"io.modelcontextprotocol/subscriptionId": listen_id}
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {"notifications": notifications, "_meta": meta},
+        }), flush=True)
+        watched = notifications.get("resourceSubscriptions", [])
+        if watched:
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "method": "notifications/resources/updated",
+                "params": {"uri": watched[0], "_meta": meta},
+            }), flush=True)
+    elif method == "notifications/cancelled":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": message["params"]["requestId"],
+            "result": {"resultType": "complete"},
+        }), flush=True)
+"""
+    config = MCPServerConfig(
+        name="watched",
+        command=sys.executable,
+        args=["-u", "-c", server],
+        env={},
+        transport="stdio",
+    )
+    events: list[dict[str, object]] = []
+    runtime = MCPRuntime(
+        {"watched": config}, SafetyGuard(tmp_path), event_sink=events.append
+    )
+    await runtime.start()
+    try:
+        await runtime.watch_resource("watched", "file:///watched.txt")
+        previous = runtime.clients["watched"]
+        for _ in range(20):
+            if any(event.get("type") == "mcp.resource.updated" for event in events):
+                break
+            await asyncio.sleep(0.01)
+        assert any(event.get("type") == "mcp.resource.updated" for event in events)
+        events.clear()
+
+        await runtime.replace_server("watched", config)
+
+        replacement = runtime.clients["watched"]
+        assert replacement is not previous
+        assert replacement.watched_resources == ("file:///watched.txt",)
+        assert runtime.resource_watches("watched") == [
+            {"server": "watched", "uri": "file:///watched.txt"}
+        ]
+        assert events == [
+            {
+                "type": "mcp.resource.updated",
+                "server": "watched",
+                "uri": "file:///watched.txt",
+            }
+        ]
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_full_reload_preserves_resource_watches(tmp_path) -> None:
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"resources": {"subscribe": True}},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "subscriptions/listen":
+        listen_id = message["id"]
+        notifications = message["params"]["notifications"]
+        meta = {"io.modelcontextprotocol/subscriptionId": listen_id}
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {"notifications": notifications, "_meta": meta},
+        }), flush=True)
+    elif method == "notifications/cancelled":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": message["params"]["requestId"],
+            "result": {"resultType": "complete"},
+        }), flush=True)
+"""
+    config = MCPServerConfig(
+        name="watched",
+        command=sys.executable,
+        args=["-u", "-c", server],
+        env={},
+        transport="stdio",
+    )
+    loop = AshLoop(
+        session_store=SessionStore(tmp_path / "sessions.db"),
+        provider=IdleProvider(),
+        safety_guard=SafetyGuard(tmp_path),
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+        mcp_configs={"watched": config},
+    )
+    await loop.start_session()
+    try:
+        runtime = loop._mcp_runtime
+        assert runtime is not None
+        await runtime.watch_resource("watched", "file:///watched.txt")
+        old_runtime = runtime
+
+        errors = await loop.reload_mcp_servers({"watched": config})
+
+        assert errors == {}
+        replacement = loop._mcp_runtime
+        assert replacement is not None
+        assert replacement is not old_runtime
+        assert replacement.resource_watches("watched") == [
+            {"server": "watched", "uri": "file:///watched.txt"}
+        ]
+    finally:
+        await loop.aclose()

@@ -73,6 +73,7 @@ ASSOCIATED_SERVER_REQUEST_METHODS = frozenset(
 MODERN_INPUT_REQUIRED_METHODS = frozenset({"tools/call", "prompts/get", "resources/read"})
 MAX_INPUT_REQUIRED_ROUNDS = 10
 INPUT_REQUIRED_RETRY_DELAY_SECONDS = 0.25
+MAX_RESOURCE_SUBSCRIPTIONS = 32
 SUBSCRIPTION_ACK_METHOD = "notifications/subscriptions/acknowledged"
 SUBSCRIPTION_CHANGE_FILTERS = {
     "notifications/tools/list_changed": "toolsListChanged",
@@ -263,6 +264,15 @@ class MCPClient:
         self._subscription_honored: dict[str, Any] = {}
         self._subscription_error: BaseException | None = None
         self._subscription_stopping = False
+        self._resource_subscription_tasks: dict[str, asyncio.Task[None]] = {}
+        self._resource_subscription_request_ids: dict[str, int] = {}
+        self._resource_subscription_uris_by_id: dict[int, str] = {}
+        self._resource_subscription_acks: dict[str, asyncio.Event] = {}
+        self._resource_subscription_errors: dict[str, BaseException] = {}
+        self._resource_subscription_honored: set[str] = set()
+        self._resource_subscription_stopping: set[str] = set()
+        self._watched_resources: set[str] = set()
+        self._resource_subscription_lock = asyncio.Lock()
         self._pending_initialize_session_id = ""
         self._session_generation = 0
         self._session_recovery_lock = asyncio.Lock()
@@ -308,6 +318,10 @@ class MCPClient:
 
     def supports_server_capability(self, name: str) -> bool:
         return isinstance(self.server_capabilities.get(name), dict)
+
+    @property
+    def watched_resources(self) -> tuple[str, ...]:
+        return tuple(sorted(self._watched_resources))
 
     @property
     def session_generation(self) -> int:
@@ -580,8 +594,15 @@ class MCPClient:
         meta = params.get("_meta")
         if not isinstance(meta, dict):
             return True
+        subscription_id = meta.get("io.modelcontextprotocol/subscriptionId")
+        if isinstance(subscription_id, int) and not isinstance(subscription_id, bool):
+            resource_uri = self._resource_subscription_uris_by_id.get(subscription_id)
+            if resource_uri is not None:
+                return self._handle_modern_resource_subscription_notification(
+                    resource_uri, subscription_id, method, params
+                )
         request_id = self._subscription_request_id
-        if request_id is None or meta.get("io.modelcontextprotocol/subscriptionId") != request_id:
+        if request_id is None or subscription_id != request_id:
             return True
         if method == SUBSCRIPTION_ACK_METHOD:
             raw_honored = params.get("notifications")
@@ -640,9 +661,9 @@ class MCPClient:
             self._subscription_ack.set()
             return True
         if method == SUBSCRIPTION_RESOURCE_UPDATED_METHOD:
-            # Ash does not request per-resource subscriptions yet. Modern
-            # resource-update notifications are therefore unsolicited and must
-            # not leak through merely because they carry this stream's id.
+            # Per-resource updates belong to dedicated watch subscriptions and
+            # are dispatched above by their own subscription id. An update on
+            # the catalog/list subscription is unsolicited and must be dropped.
             return True
         field = SUBSCRIPTION_CHANGE_FILTERS[method]
         return self._subscription_honored.get(field) is not True
@@ -679,6 +700,236 @@ class MCPClient:
         self._subscription_error = None
         self._subscription_ack = asyncio.Event()
         self._subscription_stopping = False
+
+    def _supports_resource_subscriptions(self) -> bool:
+        resources = self.server_capabilities.get("resources")
+        return isinstance(resources, dict) and resources.get("subscribe") is True
+
+    async def watch_resource(self, uri: str) -> None:
+        if not isinstance(uri, str) or not uri:
+            raise ValueError("MCP resource URI must be a non-empty string")
+        async with self._resource_subscription_lock:
+            if uri in self._watched_resources:
+                return
+            if not self._initialized:
+                raise MCPProtocolError("MCP client is not connected")
+            if not self._supports_resource_subscriptions():
+                raise MCPProtocolError("MCP server does not support resource subscriptions")
+            if len(self._watched_resources) >= MAX_RESOURCE_SUBSCRIPTIONS:
+                raise MCPProtocolError(
+                    f"MCP resource watch limit reached ({MAX_RESOURCE_SUBSCRIPTIONS})"
+                )
+            if self.protocol_version == MODERN_PROTOCOL_VERSION:
+                await self._start_modern_resource_subscription(uri)
+                return
+            self._watched_resources.add(uri)
+            try:
+                await self.request("resources/subscribe", {"uri": uri})
+            except BaseException:
+                self._watched_resources.discard(uri)
+                raise
+
+    async def unwatch_resource(self, uri: str) -> None:
+        async with self._resource_subscription_lock:
+            if uri not in self._watched_resources:
+                return
+            if self.protocol_version == MODERN_PROTOCOL_VERSION:
+                await self._stop_modern_resource_subscription(uri)
+                return
+            await self.request("resources/unsubscribe", {"uri": uri})
+            self._watched_resources.discard(uri)
+
+    async def _restore_legacy_resource_subscriptions(
+        self, *, skip_uri: str | None = None
+    ) -> None:
+        if not self._watched_resources:
+            return
+        if not self._supports_resource_subscriptions():
+            raise MCPProtocolError(
+                "MCP replacement session no longer supports watched resources"
+            )
+        for uri in sorted(self._watched_resources):
+            if uri == skip_uri:
+                continue
+            await self.request(
+                "resources/subscribe",
+                {"uri": uri},
+                _allow_session_recovery=False,
+            )
+
+    async def _start_modern_resource_subscription(self, uri: str) -> None:
+        if self.notification_handler is None:
+            raise MCPProtocolError(
+                "MCP resource watching requires a notification handler"
+            )
+        request_id = self._next_id
+        self._next_id += 1
+        ack = asyncio.Event()
+        self._resource_subscription_request_ids[uri] = request_id
+        self._resource_subscription_uris_by_id[request_id] = uri
+        self._resource_subscription_acks[uri] = ack
+        self._resource_subscription_errors.pop(uri, None)
+        task = asyncio.create_task(
+            self._run_modern_resource_subscription(uri, request_id),
+            name=f"ash-mcp-resource-watch-{self.config.name}",
+        )
+        self._resource_subscription_tasks[uri] = task
+        try:
+            await asyncio.wait_for(ack.wait(), timeout=self.timeout)
+        except BaseException:
+            await self._stop_modern_resource_subscription(uri)
+            raise
+        error = self._resource_subscription_errors.get(uri)
+        if error is not None:
+            await self._stop_modern_resource_subscription(uri)
+            raise MCPProtocolError(
+                f"MCP resource subscription failed before acknowledgment: {error}"
+            ) from error
+        if uri not in self._resource_subscription_honored:
+            await self._stop_modern_resource_subscription(uri)
+            raise MCPProtocolError(
+                f"MCP server did not honor resource subscription for {uri!r}"
+            )
+
+    async def _run_modern_resource_subscription(
+        self, uri: str, request_id: int
+    ) -> None:
+        requested: dict[str, Any] = {"resourceSubscriptions": [uri]}
+        failure: BaseException | None = None
+        try:
+            if self.config.transport == "stdio":
+                await self._run_modern_stdio_subscription(request_id, requested)
+            elif self.config.transport == "http":
+                await self._run_modern_http_subscription(request_id, requested)
+            else:
+                raise MCPProtocolError(
+                    "MCP 2026 resource subscriptions require stdio or http transport"
+                )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            failure = exc
+        else:
+            if uri not in self._resource_subscription_stopping:
+                failure = MCPProtocolError(
+                    f"MCP resource subscription for {uri!r} ended unexpectedly"
+                )
+        if failure is None or uri in self._resource_subscription_stopping:
+            return
+        ack = self._resource_subscription_acks.get(uri)
+        already_acknowledged = bool(ack is not None and ack.is_set())
+        self._resource_subscription_errors[uri] = failure
+        self._watched_resources.discard(uri)
+        self._resource_subscription_honored.discard(uri)
+        if ack is not None:
+            ack.set()
+        if already_acknowledged and self.subscription_failure_handler is not None:
+            wrapped = MCPProtocolError(
+                f"MCP resource watch {uri!r} failed: {failure}"
+            )
+            try:
+                outcome = self.subscription_failure_handler(wrapped)
+                if inspect.isawaitable(outcome):
+                    await outcome
+            except Exception:
+                pass
+        if already_acknowledged:
+            self._clear_modern_resource_subscription_state(uri)
+
+    def _handle_modern_resource_subscription_notification(
+        self, uri: str, request_id: int, method: str, params: dict[str, Any]
+    ) -> bool:
+        if method == SUBSCRIPTION_ACK_METHOD:
+            raw_honored = params.get("notifications")
+            ack = self._resource_subscription_acks.get(uri)
+            if ack is None:
+                return True
+            if not isinstance(raw_honored, dict):
+                self._resource_subscription_errors[uri] = MCPProtocolError(
+                    "MCP resource subscription acknowledgment omitted its notification filter"
+                )
+                ack.set()
+                return True
+            for field, value in raw_honored.items():
+                if field == "resourceSubscriptions":
+                    if not (
+                        isinstance(value, list)
+                        and value == [uri]
+                    ):
+                        self._resource_subscription_errors[uri] = MCPProtocolError(
+                            "MCP resource subscription acknowledgment did not match the requested URI"
+                        )
+                        ack.set()
+                        return True
+                    continue
+                if field in {
+                    "toolsListChanged",
+                    "promptsListChanged",
+                    "resourcesListChanged",
+                } and value is False:
+                    continue
+                self._resource_subscription_errors[uri] = MCPProtocolError(
+                    f"MCP resource subscription acknowledged unrequested filter {field!r}"
+                )
+                ack.set()
+                return True
+            if raw_honored.get("resourceSubscriptions") != [uri]:
+                self._resource_subscription_errors[uri] = MCPProtocolError(
+                    "MCP server did not honor the requested resource subscription"
+                )
+                ack.set()
+                return True
+            self._resource_subscription_honored.add(uri)
+            self._watched_resources.add(uri)
+            ack.set()
+            return True
+        if method != SUBSCRIPTION_RESOURCE_UPDATED_METHOD:
+            return True
+        if uri not in self._resource_subscription_honored:
+            return True
+        return params.get("uri") != uri
+
+    async def _stop_modern_resource_subscription(self, uri: str) -> None:
+        task = self._resource_subscription_tasks.get(uri)
+        request_id = self._resource_subscription_request_ids.get(uri)
+        self._resource_subscription_stopping.add(uri)
+        if (
+            task is not None
+            and not task.done()
+            and request_id is not None
+            and self.config.transport == "stdio"
+            and self._process is not None
+        ):
+            try:
+                await self.notify(
+                    "notifications/cancelled",
+                    {
+                        "requestId": request_id,
+                        "reason": "Ash stopped watching the MCP resource",
+                    },
+                    _allow_session_recovery=False,
+                )
+            except (MCPProtocolError, OSError):
+                pass
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._clear_modern_resource_subscription_state(uri)
+
+    async def _stop_all_modern_resource_subscriptions(self) -> None:
+        for uri in tuple(self._resource_subscription_tasks):
+            await self._stop_modern_resource_subscription(uri)
+
+    def _clear_modern_resource_subscription_state(self, uri: str) -> None:
+        request_id = self._resource_subscription_request_ids.pop(uri, None)
+        if request_id is not None:
+            self._resource_subscription_uris_by_id.pop(request_id, None)
+        self._resource_subscription_tasks.pop(uri, None)
+        self._resource_subscription_acks.pop(uri, None)
+        self._resource_subscription_errors.pop(uri, None)
+        self._resource_subscription_honored.discard(uri)
+        self._resource_subscription_stopping.discard(uri)
+        self._watched_resources.discard(uri)
 
     async def _initialize_protocol(self) -> None:
         self._pending_initialize_session_id = ""
@@ -1960,12 +2211,28 @@ class MCPClient:
                 self._stop_http_events()
                 try:
                     await self._initialize_protocol()
+                    skip_watch_uri = (
+                        str((params or {}).get("uri"))
+                        if method == "resources/subscribe"
+                        and isinstance((params or {}).get("uri"), str)
+                        else None
+                    )
+                    await self._restore_legacy_resource_subscriptions(
+                        skip_uri=skip_watch_uri
+                    )
                 except BaseException as primary:
                     session_to_close = (
                         self._http_session_id or self._pending_initialize_session_id
                     )
+                    self._initialized = False
+                    self._stop_http_events()
                     self._http_session_id = ""
                     self._pending_initialize_session_id = ""
+                    self.protocol_version = ""
+                    self.server_capabilities = {}
+                    self.server_info = {}
+                    self.server_instructions = ""
+                    self._watched_resources.clear()
                     cleanup_error: BaseException | None = None
                     cleanup_interrupted = False
                     try:
@@ -2464,6 +2731,7 @@ class MCPClient:
             raise
 
     async def _disconnect_impl(self) -> None:
+        await self._stop_all_modern_resource_subscriptions()
         await self._stop_modern_subscription()
         self._initialized = False
         self._stop_http_events()
@@ -2524,7 +2792,12 @@ class MCPClient:
         current = asyncio.current_task()
         tasks = [
             task
-            for task in (self._reader_task, self._stderr_task, *self._server_tasks)
+            for task in (
+                self._reader_task,
+                self._stderr_task,
+                *self._server_tasks,
+                *self._resource_subscription_tasks.values(),
+            )
             if task is not None and task is not current
         ]
         for task in tasks:
@@ -2544,6 +2817,14 @@ class MCPClient:
         self._subscription_error = None
         self._subscription_ack = asyncio.Event()
         self._subscription_stopping = False
+        self._resource_subscription_tasks.clear()
+        self._resource_subscription_request_ids.clear()
+        self._resource_subscription_uris_by_id.clear()
+        self._resource_subscription_acks.clear()
+        self._resource_subscription_errors.clear()
+        self._resource_subscription_honored.clear()
+        self._resource_subscription_stopping.clear()
+        self._watched_resources.clear()
         self.protocol_version = ""
         self.server_capabilities = {}
         self.server_info = {}

@@ -1028,6 +1028,10 @@ class AshLoop:
         from ash.mcp.runtime import MCPRuntime, _settle_task_after_cancellation
 
         runtime: MCPRuntime
+        old_runtime = self._mcp_runtime
+        previous_resource_watches = (
+            old_runtime.resource_watches() if old_runtime is not None else []
+        )
 
         async def replace_server_tools(
             server_name: str,
@@ -1058,6 +1062,13 @@ class AshLoop:
         )
         try:
             tools = await runtime.start()
+            for watch in previous_resource_watches:
+                server_name = watch["server"]
+                if server_name not in configs:
+                    continue
+                client = runtime.clients.get(server_name)
+                if client is not None:
+                    await client.watch_resource(watch["uri"])
         except BaseException as primary:
             cleanup_task = asyncio.create_task(runtime.close())
             cleanup_error, cleanup_cancelled = await _settle_task_after_cancellation(
@@ -1100,7 +1111,6 @@ class AshLoop:
             if cleanup_cancelled:
                 primary.add_note("MCP runtime cleanup was cancelled")
             raise
-        old_runtime = self._mcp_runtime
         for name in self._mcp_tool_names:
             old_tool = self.tools.pop(name, None)
             if old_tool is not None:

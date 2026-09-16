@@ -54,6 +54,7 @@ MAX_PATTERN_CHARACTERS = 1024
 MAX_VALIDATION_PAYLOAD_BYTES = 2 * 1024 * 1024
 MAX_WORKER_OUTPUT_BYTES = 64 * 1024
 MAX_CONSECUTIVE_TOOL_REFRESHES = 3
+MAX_PENDING_RESOURCE_UPDATES = 256
 TOOL_REFRESH_DEBOUNCE_SECONDS = 0.05
 TOOL_REFRESH_QUIET_PERIOD_SECONDS = TOOL_REFRESH_DEBOUNCE_SECONDS * 2
 
@@ -989,9 +990,11 @@ class MCPRuntime:
         self._refresh_requested: set[str] = set()
         self._replacement_clients: dict[str, MCPClient] = {}
         self._pending_replacement_notifications: set[str] = set()
+        self._pending_replacement_resource_updates: set[tuple[str, str]] = set()
         self._retired_clients: set[MCPClient] = set()
         self._retired_clients_lock = asyncio.Lock()
         self._startup_notifications: set[str] = set()
+        self._startup_resource_updates: set[tuple[str, str]] = set()
         self._catalog_revisions: dict[str, int] = {}
         self._started = False
         self._notifications_active = False
@@ -1178,6 +1181,7 @@ class MCPRuntime:
         candidate = self._configure_client(server_name, config)
         previous_client: MCPClient | None = None
         previous_tools: dict[str, BaseTool] = {}
+        previous_watches: tuple[str, ...] = ()
         previous_errors: dict[str, str] = {}
         snapshot_taken = False
         candidate_tools: dict[str, BaseTool] = {}
@@ -1187,6 +1191,9 @@ class MCPRuntime:
             async with lock:
                 previous_client = self.clients.get(server_name)
                 previous_tools = dict(self._server_tools.get(server_name, {}))
+                previous_watches = (
+                    previous_client.watched_resources if previous_client is not None else ()
+                )
                 previous_errors = {
                     key: value
                     for key, value in self.errors.items()
@@ -1198,6 +1205,8 @@ class MCPRuntime:
                     self._refresh_owners[server_name] = current_task
                 try:
                     await candidate.connect()
+                    for uri in previous_watches:
+                        await candidate.watch_resource(uri)
                     definitions = (
                         await candidate.list_tools()
                         if candidate.supports_server_capability("tools")
@@ -1250,6 +1259,19 @@ class MCPRuntime:
                             self.errors.pop(key, None)
                     if previous_client is not None:
                         self._retired_clients.add(previous_client)
+                    pending_resource_updates = sorted(
+                        uri
+                        for pending_server, uri in self._pending_replacement_resource_updates
+                        if pending_server == server_name
+                    )
+                    self._pending_replacement_resource_updates = {
+                        key
+                        for key in self._pending_replacement_resource_updates
+                        if key[0] != server_name
+                    }
+                    for uri in pending_resource_updates:
+                        if uri in candidate.watched_resources:
+                            self._emit_or_defer_resource_update(server_name, uri)
                     if server_name in self._pending_replacement_notifications:
                         self._pending_replacement_notifications.discard(server_name)
                         self._tool_catalog_epochs[server_name] += 1
@@ -1261,6 +1283,11 @@ class MCPRuntime:
         except asyncio.CancelledError:
             self._replacement_clients.pop(server_name, None)
             self._pending_replacement_notifications.discard(server_name)
+            self._pending_replacement_resource_updates = {
+                key
+                for key in self._pending_replacement_resource_updates
+                if key[0] != server_name
+            }
             if snapshot_taken:
                 self._restore_server_errors(server_name, previous_errors)
             await self._close_candidate(candidate, candidate_tools)
@@ -1268,6 +1295,11 @@ class MCPRuntime:
         except BaseException:
             self._replacement_clients.pop(server_name, None)
             self._pending_replacement_notifications.discard(server_name)
+            self._pending_replacement_resource_updates = {
+                key
+                for key in self._pending_replacement_resource_updates
+                if key[0] != server_name
+            }
             if snapshot_taken:
                 self._restore_server_errors(server_name, previous_errors)
             await self._close_candidate(candidate, candidate_tools)
@@ -1366,9 +1398,66 @@ class MCPRuntime:
         for name in tuple(self._startup_notifications):
             self._schedule_tool_refresh(name)
         self._startup_notifications.clear()
+        pending_resource_updates = tuple(sorted(self._startup_resource_updates))
+        self._startup_resource_updates.clear()
+        for server_name, uri in pending_resource_updates:
+            client = self.clients.get(server_name)
+            if client is None or uri not in client.watched_resources:
+                continue
+            self._emit_event(
+                {
+                    "type": "mcp.resource.updated",
+                    "server": server_name,
+                    "uri": safe_mcp_diagnostic(uri),
+                }
+            )
 
     def server_tools_snapshot(self) -> dict[str, dict[str, BaseTool]]:
         return {name: dict(tools) for name, tools in self._server_tools.items()}
+
+    async def watch_resource(self, server_name: str, uri: str) -> None:
+        client = self.clients.get(server_name)
+        if client is None:
+            raise ValueError(f"unknown MCP server: {server_name}")
+        was_watched = uri in client.watched_resources
+        await client.watch_resource(uri)
+        if not was_watched and uri in client.watched_resources:
+            self._emit_event(
+                {
+                    "type": "mcp.resource.watch_started",
+                    "server": server_name,
+                    "uri": safe_mcp_diagnostic(uri),
+                }
+            )
+
+    async def unwatch_resource(self, server_name: str, uri: str) -> None:
+        client = self.clients.get(server_name)
+        if client is None:
+            raise ValueError(f"unknown MCP server: {server_name}")
+        was_watched = uri in client.watched_resources
+        await client.unwatch_resource(uri)
+        if was_watched:
+            self._emit_event(
+                {
+                    "type": "mcp.resource.watch_stopped",
+                    "server": server_name,
+                    "uri": safe_mcp_diagnostic(uri),
+                }
+            )
+
+    def resource_watches(self, server_name: str | None = None) -> list[dict[str, str]]:
+        if server_name is not None and server_name not in self.configs:
+            raise ValueError(f"unknown MCP server: {server_name}")
+        names = (server_name,) if server_name is not None else tuple(self.configs)
+        watches: list[dict[str, str]] = []
+        for name in names:
+            client = self.clients.get(name)
+            if client is None:
+                continue
+            watches.extend(
+                {"server": name, "uri": uri} for uri in client.watched_resources
+            )
+        return watches
 
     def status_snapshot(self) -> list[dict[str, Any]]:
         """Return safe, bounded live status for every configured server."""
@@ -1447,6 +1536,27 @@ class MCPRuntime:
             )
         return tools
 
+    def _emit_or_defer_resource_update(self, server_name: str, uri: str) -> None:
+        if not self._notifications_active:
+            key = (server_name, uri)
+            if (
+                key in self._startup_resource_updates
+                or len(self._startup_resource_updates) < MAX_PENDING_RESOURCE_UPDATES
+            ):
+                self._startup_resource_updates.add(key)
+            else:
+                self.errors[f"{server_name}:notification:notifications/resources/updated"] = (
+                    "too many resource updates arrived before MCP runtime publication"
+                )
+            return
+        self._emit_event(
+            {
+                "type": "mcp.resource.updated",
+                "server": server_name,
+                "uri": safe_mcp_diagnostic(uri),
+            }
+        )
+
     async def _handle_notification(
         self,
         server_name: str,
@@ -1454,12 +1564,46 @@ class MCPRuntime:
         method: str,
         params: dict[str, Any],
     ) -> None:
-        del params
         if self._closed:
             return
         active_client = self.clients.get(server_name)
         replacement_client = self._replacement_clients.get(server_name)
         if active_client is not client and replacement_client is not client:
+            return
+        replacement_only = replacement_client is client and active_client is not client
+        if method == "notifications/resources/updated":
+            uri = params.get("uri")
+            if not isinstance(uri, str) or not uri:
+                self.errors[f"{server_name}:notification:{method}"] = (
+                    "server sent resources/updated without a valid URI"
+                )
+                return
+            resources = client.server_capabilities.get("resources")
+            if not isinstance(resources, dict) or resources.get("subscribe") is not True:
+                self.errors[f"{server_name}:notification:{method}"] = (
+                    "server sent resources/updated without declaring subscribe"
+                )
+                return
+            if uri not in client.watched_resources:
+                self.errors[f"{server_name}:notification:{method}"] = (
+                    "server sent resources/updated for an unwatched URI"
+                )
+                return
+            self.errors.pop(f"{server_name}:notification:{method}", None)
+            if replacement_only:
+                key = (server_name, uri)
+                if (
+                    key in self._pending_replacement_resource_updates
+                    or len(self._pending_replacement_resource_updates)
+                    < MAX_PENDING_RESOURCE_UPDATES
+                ):
+                    self._pending_replacement_resource_updates.add(key)
+                else:
+                    self.errors[f"{server_name}:notification:{method}"] = (
+                        "too many resource updates arrived during MCP replacement"
+                    )
+                return
+            self._emit_or_defer_resource_update(server_name, uri)
             return
         capability_by_notification = {
             "notifications/tools/list_changed": "tools",
@@ -1469,7 +1613,7 @@ class MCPRuntime:
         capability = capability_by_notification.get(method)
         if capability is None:
             return
-        if replacement_client is client and active_client is not client:
+        if replacement_only:
             if capability == "tools":
                 self._pending_replacement_notifications.add(server_name)
             return

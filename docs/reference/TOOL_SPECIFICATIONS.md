@@ -301,8 +301,15 @@ for the legacy stateful path. For MCP 2026-07-28, Ash automatically opens a
 `subscriptions/listen` stream for every advertised tools/prompts/resources
 `listChanged` capability, validates the acknowledged subset and subscription
 ID, and routes correlated list changes through the existing bounded refresh
-path. Abrupt subscription loss is surfaced as a runtime diagnostic. Per-resource
-`resourceSubscriptions` and the redesigned Tasks extension remain unimplemented.
+path. Abrupt subscription loss is surfaced as a runtime diagnostic. Resource
+updates are explicit rather than implicit: `/mcp watch SERVER URI` opens a
+bounded per-URI `resourceSubscriptions` stream, `/mcp unwatch SERVER URI`
+closes only that watch, and `/mcp watches [SERVER]` lists the session-scoped
+watch set. Legacy 2025 servers use `resources/subscribe`/`resources/unsubscribe`;
+active watches are restored across targeted/full MCP reloads and safe HTTP
+session recovery, and failed restoration clears stale watch state. Reading a
+resource does not auto-subscribe it. The redesigned MCP 2026 Tasks extension
+remains unimplemented.
 
 ---
 
