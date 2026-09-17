@@ -269,12 +269,14 @@ class RunCommandTool(BaseTool):
                 output="",
                 error=f"Sandbox unavailable; command was not run: {exc}",
             )
+        redacted_stdout = _redact_captured_output(result.stdout)
+        redacted_stderr = _redact_captured_output(result.stderr)
         output, truncated = _truncate_command_output(
-            result.stdout,
-            force=result.output_truncated and bool(result.stdout),
+            redacted_stdout,
+            force=result.output_truncated and bool(redacted_stdout),
             notice=OUTPUT_CAPTURE_LIMIT_NOTICE,
         )
-        error, error_truncated = _truncate_command_output(result.stderr)
+        error, error_truncated = _truncate_command_output(redacted_stderr)
         if error_truncated:
             truncated = True
         if result.output_truncated and not result.stdout:
@@ -401,8 +403,8 @@ class RunCommandTool(BaseTool):
                     cancellation.add_note("Process-tree cleanup was cancelled")
             raise
         except ProcessOutputLimitExceeded as exc:
-            stdout = decode_stream(exc.stdout)
-            stderr = decode_stream(exc.stderr)
+            stdout = _redact_captured_output(decode_stream(exc.stdout))
+            stderr = _redact_captured_output(decode_stream(exc.stderr))
             output, _ = _truncate_command_output(
                 stdout,
                 force=True,
@@ -422,8 +424,8 @@ class RunCommandTool(BaseTool):
                 diagnostic_summary=extract_diagnostic_summary(stdout, stderr),
             )
 
-        stdout = decode_stream(stdout_bytes)
-        stderr = decode_stream(stderr_bytes)
+        stdout = _redact_captured_output(decode_stream(stdout_bytes))
+        stderr = _redact_captured_output(decode_stream(stderr_bytes))
         output, truncated = _truncate_command_output(stdout)
         error, error_truncated = _truncate_command_output(stderr)
 
@@ -491,6 +493,17 @@ def build_scrubbed_command_env(
     if project_root is not None:
         env["ASH_WORKSPACE_ROOT"] = str(project_root)
     return env
+
+
+def _redact_captured_output(output: str) -> str:
+    """Redact captured process output without unbounded whole-buffer regex work."""
+
+    redactor = StreamingRedactor()
+    chunks = (
+        redactor.feed(output[index : index + 4096])
+        for index in range(0, len(output), 4096)
+    )
+    return "".join((*chunks, redactor.finish()))
 
 
 def _truncate_command_output(

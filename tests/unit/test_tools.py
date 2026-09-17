@@ -776,6 +776,28 @@ async def test_run_command_streams_redacted_output_with_invocation_context(
 
 
 @pytest.mark.asyncio
+async def test_run_command_redacts_bare_provider_keys_from_final_result(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    provider_key = "xai-" + "a" * 80
+    script = (
+        "import sys; "
+        f"print({provider_key!r}); "
+        f"print({provider_key!r}, file=sys.stderr)"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+    result = await RunCommandTool(guard).run(command_line=command)
+
+    assert result.success is True
+    assert provider_key not in result.output
+    assert provider_key not in (result.error or "")
+    assert "[REDACTED]" in result.output
+    assert "[REDACTED]" in (result.error or "")
+
+
+@pytest.mark.asyncio
 async def test_run_command_bounds_live_output(
     guard: SafetyGuard,
 ) -> None:

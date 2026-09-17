@@ -55,6 +55,8 @@ _SECRET_PATTERNS = (
     _SECRET_VALUE_ASSIGNMENT,
     re.compile(r"\b(sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,})\b"),
     re.compile(r"\b(gsk_[A-Za-z0-9_-]{12,})\b"),
+    re.compile(r"\b(xai-[A-Za-z0-9_-]{20,})\b"),
+    re.compile(r"\b(csk[-_][A-Za-z0-9_-]{12,})\b"),
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"),
 )
 _SECRET_CANDIDATE_PATTERNS = (
@@ -72,7 +74,9 @@ _SECRET_CANDIDATE_PATTERNS = (
     (
         "provider API key",
         re.compile(
-            r"\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,}|gsk_[A-Za-z0-9_-]{12,})\b"
+            r"\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,}|"
+            r"gsk_[A-Za-z0-9_-]{12,}|xai-[A-Za-z0-9_-]{20,}|"
+            r"csk[-_][A-Za-z0-9_-]{12,})\b"
         ),
     ),
 )

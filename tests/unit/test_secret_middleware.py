@@ -18,6 +18,26 @@ def test_redaction_handles_common_secret_shapes() -> None:
 
 
 @pytest.mark.parametrize(
+    "provider_key",
+    [
+        "sk-or-v1-" + "a" * 64,
+        "xai-" + "a" * 80,
+        "csk-" + "a" * 40,
+        "csk_" + "b" * 40,
+    ],
+)
+def test_redaction_handles_bare_provider_api_keys(provider_key: str) -> None:
+    rendered = redact_text(f"provider echoed {provider_key}")
+
+    assert provider_key not in rendered
+    assert "[REDACTED]" in rendered
+    findings = find_secret_candidates(f"provider echoed {provider_key}")
+    assert [(item.kind, item.line_number) for item in findings] == [
+        ("provider API key", 1)
+    ]
+
+
+@pytest.mark.parametrize(
     ("header", "safe_prefix"),
     [
         ("Authorization: Basic dXNlcjpwYXNz", "Authorization: Basic "),
