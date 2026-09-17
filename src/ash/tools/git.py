@@ -9,6 +9,7 @@ the model finishes a turn (and any tools ran).
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Annotated, Any, Iterable, Mapping, Sequence
 from pydantic import BaseModel, Field
 
 from ash.core.redaction import find_secret_candidates
+from ash.safe_io import read_bounded_bytes
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.safety.git import read_only_git_args, read_only_git_environment
 from ash.safety.guard import SafetyGuard
@@ -40,6 +42,7 @@ GIT_OUTPUT_LIMIT_EXIT = -2
 MAX_SECRET_FINDINGS = 20
 MAX_GIT_PATH_CHARS = 4_096
 MAX_COMMIT_MESSAGE_CHARS = 65_536
+MAX_COMMIT_MESSAGE_BYTES = MAX_COMMIT_MESSAGE_CHARS * 4
 MAX_COMMIT_PATHS = 1_000
 MAX_COMMIT_AUTHOR_CHARS = 512
 MAX_AUTO_COMMIT_VERIFY_BYTES = 20 * 1024 * 1024
@@ -333,35 +336,181 @@ class AutoCommitTool(BaseTool):
             )
         secret_findings = _scan_added_secret_findings(scan_stdout)
         if secret_findings:
-            rendered = ", ".join(
-                f"{location} ({kind})"
-                for location, kind in secret_findings[:MAX_SECRET_FINDINGS]
+            return _secret_scan_failure(secret_findings)
+        if expected_sha256 is not None:
+            return await self._commit_index_snapshot(
+                workspace_root,
+                args,
+                resolved_paths,
+                expected_sha256=expected_sha256,
+                run_hooks=False,
             )
-            suffix = (
-                f", and {len(secret_findings) - MAX_SECRET_FINDINGS} more"
-                if len(secret_findings) > MAX_SECRET_FINDINGS
-                else ""
+        return await self._commit_index_snapshot(
+            workspace_root,
+            args,
+            resolved_paths,
+            expected_sha256=None,
+            run_hooks=True,
+        )
+
+    async def _commit_index_snapshot(
+        self,
+        workspace_root: Path,
+        args: AutoCommitArgs,
+        resolved_paths: Sequence[str],
+        *,
+        expected_sha256: Mapping[str, str] | None,
+        run_hooks: bool,
+    ) -> ToolResult:
+        message_file: Path | None = None
+        if run_hooks:
+            hook_result, message_file = await self._run_commit_hooks_before_snapshot(
+                workspace_root,
+                args.message,
             )
+            if hook_result is not None:
+                return hook_result
+            staged_after_hooks = await _cached_paths(
+                workspace_root,
+                self.environment_allowlist,
+                sandbox_manager=self.sandbox_manager,
+            )
+            if staged_after_hooks is None:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error="git diff --cached failed after commit hooks",
+                )
+            unrelated_after_hooks = _paths_outside_scope(
+                staged_after_hooks, resolved_paths
+            )
+            if unrelated_after_hooks:
+                return ToolResult(
+                    success=False,
+                    output="Changes remain staged for inspection.",
+                    error=(
+                        "Refused to commit paths staged outside explicit scope by "
+                        "Git hooks or concurrent changes: "
+                        + ", ".join(unrelated_after_hooks[:20])
+                    ),
+                )
+            if not staged_after_hooks:
+                return ToolResult(
+                    success=True,
+                    output="No changes to commit.",
+                    token_count=0,
+                )
+
+        tree_code, tree_stdout, tree_stderr = await _run_git(
+            workspace_root,
+            ["write-tree"],
+            self.environment_allowlist,
+            sandbox_manager=self.sandbox_manager,
+        )
+        if tree_code != 0:
             return ToolResult(
                 success=False,
-                output="Changes remain staged for inspection.",
-                error=(
-                    "Potential secret detected in staged additions; commit refused: "
-                    f"{rendered}{suffix}"
+                output=tree_stdout,
+                error=_format_git_failure(
+                    "git write-tree", tree_code, tree_stdout, tree_stderr
                 ),
             )
+        tree = tree_stdout.strip()
 
+        parent_code, parent_stdout, parent_stderr = await _run_git(
+            workspace_root,
+            ["rev-parse", "--verify", "HEAD"],
+            self.environment_allowlist,
+            sandbox_manager=self.sandbox_manager,
+            read_only=True,
+        )
+        parent = parent_stdout.strip() if parent_code == 0 else None
+        if parent is None:
+            symbolic_code, _, symbolic_stderr = await _run_git(
+                workspace_root,
+                ["symbolic-ref", "--quiet", "HEAD"],
+                self.environment_allowlist,
+                sandbox_manager=self.sandbox_manager,
+                read_only=True,
+            )
+            if symbolic_code != 0:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(
+                        "git rev-parse HEAD failed before owned commit: "
+                        + (parent_stderr.strip() or symbolic_stderr.strip())
+                    ),
+                )
+
+        if expected_sha256 is not None:
+            changed_paths: list[str] = []
+            for relative_path in resolved_paths:
+                expected = expected_sha256.get(relative_path)
+                try:
+                    _, snapshot = snapshot_scoped_file(
+                        workspace_root / relative_path,
+                        self.safety_guard,
+                        max_bytes=MAX_AUTO_COMMIT_VERIFY_BYTES,
+                    )
+                except Exception:  # noqa: BLE001 - ownership check fails closed
+                    snapshot = None
+                if expected is None or snapshot is None or snapshot.sha256 != expected:
+                    changed_paths.append(relative_path)
+            if changed_paths:
+                return ToolResult(
+                    success=False,
+                    output="Changes remain staged for inspection.",
+                    error=(
+                        "Refused to auto-commit paths changed after Ash's last edit: "
+                        + ", ".join(changed_paths[:20])
+                    ),
+                )
+            compare_code, compare_stdout, compare_stderr = await _run_git(
+                workspace_root,
+                ["diff", "--quiet", tree, "--", *resolved_paths],
+                self.environment_allowlist,
+                sandbox_manager=self.sandbox_manager,
+                read_only=True,
+            )
+            if compare_code == 1:
+                return ToolResult(
+                    success=False,
+                    output="Changes remain staged for inspection.",
+                    error=(
+                        "Refused to auto-commit because the frozen Git index no longer "
+                        "matches Ash's owned working files."
+                    ),
+                )
+            if compare_code != 0:
+                return ToolResult(
+                    success=False,
+                    output=compare_stdout,
+                    error=_format_git_failure(
+                        "git diff for owned snapshot verification",
+                        compare_code,
+                        compare_stdout,
+                        compare_stderr,
+                    ),
+                )
+
+        commit_args = [
+            "-c",
+            f"user.name={_name_from_author(args.author)}",
+            "-c",
+            f"user.email={_email_from_author(args.author)}",
+            "commit-tree",
+            tree,
+        ]
+        if parent is not None:
+            commit_args.extend(["-p", parent])
+        if message_file is None:
+            commit_args.extend(["-m", args.message])
+        else:
+            commit_args.extend(["-F", str(message_file)])
         commit_code, commit_stdout, commit_stderr = await _run_git(
             workspace_root,
-            [
-                "-c",
-                f"user.name={_name_from_author(args.author)}",
-                "-c",
-                f"user.email={_email_from_author(args.author)}",
-                "commit",
-                "-m",
-                args.message,
-            ],
+            commit_args,
             self.environment_allowlist,
             sandbox_manager=self.sandbox_manager,
         )
@@ -370,14 +519,210 @@ class AutoCommitTool(BaseTool):
                 success=False,
                 output=commit_stdout,
                 error=_format_git_failure(
-                    "git commit", commit_code, commit_stdout, commit_stderr
+                    "git commit-tree", commit_code, commit_stdout, commit_stderr
+                ),
+            )
+        commit = commit_stdout.strip()
+
+        scope_code, scope_stdout, scope_stderr = await _run_git(
+            workspace_root,
+            [
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "-z",
+                commit,
+            ],
+            self.environment_allowlist,
+            sandbox_manager=self.sandbox_manager,
+            read_only=True,
+        )
+        if scope_code != 0:
+            return ToolResult(
+                success=False,
+                output=scope_stdout,
+                error=_format_git_failure(
+                    "git diff-tree for commit scope verification",
+                    scope_code,
+                    scope_stdout,
+                    scope_stderr,
+                ),
+            )
+        frozen_paths = sorted(path for path in scope_stdout.split("\0") if path)
+        unrelated_frozen = _paths_outside_scope(frozen_paths, resolved_paths)
+        if unrelated_frozen:
+            return ToolResult(
+                success=False,
+                output="Changes remain staged for inspection.",
+                error=(
+                    "Refused to commit frozen paths outside explicit scope: "
+                    + ", ".join(unrelated_frozen[:20])
                 ),
             )
 
-        return ToolResult(
-            success=True,
-            output=commit_stdout.strip() or "Commit created.",
+        scan_code, scan_stdout, scan_stderr = await _run_git(
+            workspace_root,
+            [
+                "show",
+                "--format=",
+                "--no-color",
+                "--unified=0",
+                commit,
+                "--",
+                *resolved_paths,
+            ],
+            self.environment_allowlist,
+            sandbox_manager=self.sandbox_manager,
+            read_only=True,
         )
+        if scan_code != 0:
+            return ToolResult(
+                success=False,
+                output=scan_stdout,
+                error=_format_git_failure(
+                    "git show for secret scan",
+                    scan_code,
+                    scan_stdout,
+                    scan_stderr,
+                ),
+            )
+        secret_findings = _scan_added_secret_findings(scan_stdout)
+        if secret_findings:
+            return _secret_scan_failure(secret_findings)
+
+        expected_head = parent or ("0" * len(commit))
+        update_code, update_stdout, update_stderr = await _run_git(
+            workspace_root,
+            ["update-ref", "HEAD", commit, expected_head],
+            self.environment_allowlist,
+            sandbox_manager=self.sandbox_manager,
+        )
+        if update_code != 0:
+            return ToolResult(
+                success=False,
+                output=update_stdout,
+                error=_format_git_failure(
+                    "git update-ref", update_code, update_stdout, update_stderr
+                ),
+            )
+        output = f"Commit {commit} created."
+        if run_hooks:
+            post_code, post_stdout, post_stderr = await _run_git(
+                workspace_root,
+                ["hook", "run", "--ignore-missing", "post-commit"],
+                self.environment_allowlist,
+                sandbox_manager=self.sandbox_manager,
+            )
+            hook_output = "\n".join(
+                part.strip() for part in (post_stdout, post_stderr) if part.strip()
+            )
+            if hook_output:
+                output += f"\n{hook_output}"
+            if post_code != 0:
+                output += f"\npost-commit hook exited with code {post_code}."
+        return ToolResult(success=True, output=output)
+
+    async def _run_commit_hooks_before_snapshot(
+        self,
+        workspace_root: Path,
+        message: str,
+    ) -> tuple[ToolResult | None, Path | None]:
+        pre_code, pre_stdout, pre_stderr = await _run_git(
+            workspace_root,
+            ["hook", "run", "--ignore-missing", "pre-commit"],
+            self.environment_allowlist,
+            sandbox_manager=self.sandbox_manager,
+        )
+        if pre_code != 0:
+            return (
+                ToolResult(
+                    success=False,
+                    output=pre_stdout,
+                    error=_format_git_failure(
+                        "git commit", pre_code, pre_stdout, pre_stderr
+                    ),
+                ),
+                None,
+            )
+
+        path_code, path_stdout, path_stderr = await _run_git(
+            workspace_root,
+            ["rev-parse", "--git-path", "COMMIT_EDITMSG"],
+            self.environment_allowlist,
+            sandbox_manager=self.sandbox_manager,
+            read_only=True,
+        )
+        if path_code != 0 or not path_stdout.strip():
+            return (
+                ToolResult(
+                    success=False,
+                    output=path_stdout,
+                    error=_format_git_failure(
+                        "git rev-parse COMMIT_EDITMSG",
+                        path_code,
+                        path_stdout,
+                        path_stderr,
+                    ),
+                ),
+                None,
+            )
+        raw_message_path = Path(path_stdout.strip())
+        message_path = (
+            raw_message_path
+            if raw_message_path.is_absolute()
+            else workspace_root / raw_message_path
+        )
+        try:
+            _write_no_follow(message_path, message.encode("utf-8"))
+        except OSError as exc:
+            return (
+                ToolResult(
+                    success=False,
+                    output="",
+                    error=f"could not prepare Git commit message: {exc}",
+                ),
+                None,
+            )
+
+        for hook_name, hook_args in (
+            ("prepare-commit-msg", [str(message_path), "message"]),
+            ("commit-msg", [str(message_path)]),
+        ):
+            hook_code, hook_stdout, hook_stderr = await _run_git(
+                workspace_root,
+                ["hook", "run", "--ignore-missing", hook_name, "--", *hook_args],
+                self.environment_allowlist,
+                sandbox_manager=self.sandbox_manager,
+            )
+            if hook_code != 0:
+                return (
+                    ToolResult(
+                        success=False,
+                        output=hook_stdout,
+                        error=_format_git_failure(
+                            "git commit", hook_code, hook_stdout, hook_stderr
+                        ),
+                    ),
+                    None,
+                )
+        try:
+            read_bounded_bytes(
+                message_path,
+                MAX_COMMIT_MESSAGE_BYTES,
+                label="Git commit message",
+            )
+        except (OSError, ValueError) as exc:
+            return (
+                ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Git commit message is unsafe after hooks: {exc}",
+                ),
+                None,
+            )
+        return None, message_path
 
 
 async def _run_git(
@@ -563,6 +908,47 @@ def _format_git_failure(
     if stdout.strip():
         parts.append(f"stdout:\n{stdout.strip()}")
     return "\n".join(parts)
+
+
+def _write_no_follow(path: Path, contents: bytes) -> None:
+    if path.is_symlink():
+        raise OSError(f"refusing to write symlinked Git commit message: {path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        view = memoryview(contents)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write while preparing Git commit message")
+            view = view[written:]
+    finally:
+        os.close(descriptor)
+
+
+def _secret_scan_failure(
+    findings: Sequence[tuple[str, str]],
+) -> ToolResult:
+    rendered = ", ".join(
+        f"{location} ({kind})" for location, kind in findings[:MAX_SECRET_FINDINGS]
+    )
+    suffix = (
+        f", and {len(findings) - MAX_SECRET_FINDINGS} more"
+        if len(findings) > MAX_SECRET_FINDINGS
+        else ""
+    )
+    return ToolResult(
+        success=False,
+        output="Changes remain staged for inspection.",
+        error=(
+            "Potential secret detected in staged additions; commit refused: "
+            f"{rendered}{suffix}"
+        ),
+    )
 
 
 def _scan_added_secret_findings(diff: str) -> list[tuple[str, str]]:

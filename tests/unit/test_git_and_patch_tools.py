@@ -518,6 +518,282 @@ async def test_auto_commit_surfaces_hook_failure_output(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_owned_auto_commit_does_not_run_hook_that_mutates_owned_file(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+
+    await _init_repo(tmp_path)
+    target = tmp_path / "tracked.txt"
+    target.write_text("old\n")
+    await _git(tmp_path, "add", "tracked.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    target.write_text("ash owned\n")
+    expected = hashlib.sha256(target.read_bytes()).hexdigest()
+    hook = tmp_path / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'hook mutated\\n' > tracked.txt\n"
+        "git add -- tracked.txt\n"
+    )
+    hook.chmod(0o755)
+
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run_owned(
+        message="owned edit",
+        paths=["tracked.txt"],
+        expected_sha256={"tracked.txt": expected},
+    )
+
+    assert result.success is True
+    process = await asyncio.create_subprocess_exec(
+        "git",
+        "show",
+        "HEAD:tracked.txt",
+        cwd=tmp_path,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await communicate_process(process)
+    assert process.returncode == 0
+    assert stdout.decode() == "ash owned\n"
+    assert target.read_text() == "ash owned\n"
+
+
+@pytest.mark.asyncio
+async def test_owned_auto_commit_does_not_absorb_hook_staged_unrelated_path(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+
+    await _init_repo(tmp_path)
+    target = tmp_path / "tracked.txt"
+    unrelated = tmp_path / "unrelated.txt"
+    target.write_text("old\n")
+    unrelated.write_text("user old\n")
+    await _git(tmp_path, "add", "tracked.txt", "unrelated.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    target.write_text("ash owned\n")
+    unrelated.write_text("user concurrent\n")
+    expected = hashlib.sha256(target.read_bytes()).hexdigest()
+    hook = tmp_path / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\ngit add -- unrelated.txt\n")
+    hook.chmod(0o755)
+
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run_owned(
+        message="owned edit",
+        paths=["tracked.txt"],
+        expected_sha256={"tracked.txt": expected},
+    )
+
+    assert result.success is True
+    process = await asyncio.create_subprocess_exec(
+        "git",
+        "show",
+        "--format=",
+        "--name-only",
+        "HEAD",
+        cwd=tmp_path,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await communicate_process(process)
+    assert process.returncode == 0
+    assert stdout.decode().splitlines() == ["tracked.txt"]
+    assert unrelated.read_text() == "user concurrent\n"
+
+
+@pytest.mark.asyncio
+async def test_explicit_auto_commit_hook_cannot_expand_path_scope(tmp_path: Path) -> None:
+    await _init_repo(tmp_path)
+    target = tmp_path / "tracked.txt"
+    unrelated = tmp_path / "unrelated.txt"
+    target.write_text("old\n")
+    unrelated.write_text("user old\n")
+    await _git(tmp_path, "add", "tracked.txt", "unrelated.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    target.write_text("explicit edit\n")
+    unrelated.write_text("user concurrent\n")
+    hook = tmp_path / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\ngit add -- unrelated.txt\n")
+    hook.chmod(0o755)
+
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run(
+        message="explicit edit",
+        paths=["tracked.txt"],
+    )
+
+    assert result.success is False
+    assert "outside explicit scope" in (result.error or "")
+    process = await asyncio.create_subprocess_exec(
+        "git",
+        "show",
+        "--format=",
+        "--name-only",
+        "HEAD",
+        cwd=tmp_path,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await communicate_process(process)
+    assert process.returncode == 0
+    assert stdout.decode().splitlines() == ["tracked.txt", "unrelated.txt"]
+    status = await GitStatusTool(SafetyGuard(tmp_path)).run()
+    assert "M  unrelated.txt" in status.output
+
+
+@pytest.mark.asyncio
+async def test_owned_auto_commit_supports_unborn_repository(tmp_path: Path) -> None:
+    import hashlib
+
+    await _init_repo(tmp_path)
+    target = tmp_path / "first.txt"
+    target.write_text("first owned commit\n")
+    expected = hashlib.sha256(target.read_bytes()).hexdigest()
+
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run_owned(
+        message="first owned commit",
+        paths=["first.txt"],
+        expected_sha256={"first.txt": expected},
+    )
+
+    assert result.success is True
+    process = await asyncio.create_subprocess_exec(
+        "git",
+        "show",
+        "HEAD:first.txt",
+        cwd=tmp_path,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await communicate_process(process)
+    assert process.returncode == 0
+    assert stdout.decode() == "first owned commit\n"
+
+
+@pytest.mark.asyncio
+async def test_explicit_auto_commit_rescans_secret_injected_by_hook(
+    tmp_path: Path,
+) -> None:
+    await _init_repo(tmp_path)
+    target = tmp_path / "config.env"
+    target.write_text("SAFE=value\n")
+    await _git(tmp_path, "add", "config.env")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    target.write_text("SAFE=changed\n")
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz"
+    hook = tmp_path / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"printf 'OPENAI_API_KEY={secret}\\n' > config.env\n"
+        "git add -- config.env\n"
+    )
+    hook.chmod(0o755)
+
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run(
+        message="hook injected secret",
+        paths=["config.env"],
+    )
+
+    assert result.success is False
+    assert "Potential secret detected" in (result.error or "")
+    assert secret not in (result.error or "")
+    log = await GitLogTool(SafetyGuard(tmp_path)).run(limit=1)
+    assert "initial" in log.output
+
+
+@pytest.mark.asyncio
+async def test_owned_auto_commit_refuses_concurrent_head_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+    import ash.tools.git as git_tools
+
+    await _init_repo(tmp_path)
+    target = tmp_path / "tracked.txt"
+    target.write_text("old\n")
+    await _git(tmp_path, "add", "tracked.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    target.write_text("ash owned\n")
+    expected = hashlib.sha256(target.read_bytes()).hexdigest()
+    original_run_git = git_tools._run_git
+    moved = False
+
+    async def move_head_before_update(cwd, args, *positional, **kwargs):
+        nonlocal moved
+        if list(args[:2]) == ["update-ref", "HEAD"] and not moved:
+            moved = True
+            await _git(tmp_path, "commit", "--allow-empty", "-qm", "concurrent user")
+        return await original_run_git(cwd, args, *positional, **kwargs)
+
+    monkeypatch.setattr(git_tools, "_run_git", move_head_before_update)
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run_owned(
+        message="owned edit",
+        paths=["tracked.txt"],
+        expected_sha256={"tracked.txt": expected},
+    )
+
+    assert moved is True
+    assert result.success is False
+    assert "git update-ref failed" in (result.error or "")
+    log = await GitLogTool(SafetyGuard(tmp_path)).run(limit=1)
+    assert "concurrent user" in log.output
+
+
+@pytest.mark.asyncio
+async def test_explicit_auto_commit_preserves_commit_hook_sequence(
+    tmp_path: Path,
+) -> None:
+    await _init_repo(tmp_path)
+    target = tmp_path / "tracked.txt"
+    target.write_text("old\n")
+    await _git(tmp_path, "add", "tracked.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    target.write_text("new\n")
+    marker = tmp_path / "hook-order.txt"
+    hooks = tmp_path / ".git" / "hooks"
+    (hooks / "pre-commit").write_text(
+        "#!/bin/sh\nprintf 'pre\\n' >> hook-order.txt\n"
+    )
+    (hooks / "prepare-commit-msg").write_text(
+        "#!/bin/sh\n"
+        "printf 'prepare:%s\\n' \"$2\" >> hook-order.txt\n"
+        "printf '\\nprepared-by-hook\\n' >> \"$1\"\n"
+    )
+    (hooks / "commit-msg").write_text(
+        "#!/bin/sh\n"
+        "grep -q 'prepared-by-hook' \"$1\" || exit 9\n"
+        "printf 'commit-msg\\n' >> hook-order.txt\n"
+    )
+    (hooks / "post-commit").write_text(
+        "#!/bin/sh\nprintf 'post\\n' >> hook-order.txt\nexit 7\n"
+    )
+    for name in ("pre-commit", "prepare-commit-msg", "commit-msg", "post-commit"):
+        hook = hooks / name
+        hook.chmod(0o755)
+
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run(
+        message="explicit hooks",
+        paths=["tracked.txt"],
+    )
+
+    assert result.success is True
+    assert "post-commit hook exited with code 7" in result.output
+    assert marker.read_text().splitlines() == [
+        "pre",
+        "prepare:message",
+        "commit-msg",
+        "post",
+    ]
+    process = await asyncio.create_subprocess_exec(
+        "git",
+        "log",
+        "-1",
+        "--format=%B",
+        cwd=tmp_path,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await communicate_process(process)
+    assert process.returncode == 0
+    assert "prepared-by-hook" in stdout.decode()
+
+
+@pytest.mark.asyncio
 async def test_auto_commit_scrubs_hook_environment_except_explicit_allowlist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
