@@ -44,6 +44,8 @@ _MAX_METADATA_BYTES = 1024 * 1024
 _CAPTURE_CHUNK_BYTES = 8192
 _CAPTURE_QUEUE_SIZE = 8
 _WINDOWS_TASKKILL_TIMEOUT_SECONDS = 5.0
+_KILLPG = getattr(os, "killpg", None)
+_SIGKILL = getattr(signal, "SIGKILL", None)
 
 
 class InstallError(RuntimeError):
@@ -956,27 +958,35 @@ def _terminate_process(
     if process.poll() is not None:
         return
     options = plan.spawn_options if plan is not None else {"start_new_session": True}
-    if options.get("start_new_session"):
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            process.terminate()
-    else:
+    if not options.get("start_new_session") or not _signal_process_group(
+        process.pid, signal.SIGTERM
+    ):
         process.terminate()
     try:
         process.wait(timeout=_WINDOWS_TASKKILL_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        if options.get("start_new_session"):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                process.kill()
-        else:
+        if (
+            not options.get("start_new_session")
+            or _SIGKILL is None
+            or not _signal_process_group(process.pid, _SIGKILL)
+        ):
             process.kill()
         try:
             process.wait(timeout=_WINDOWS_TASKKILL_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             pass
+
+
+def _signal_process_group(pid: int, signum: int) -> bool:
+    """Signal a POSIX process group when the runtime exposes that primitive."""
+
+    if _KILLPG is None:
+        return False
+    try:
+        _KILLPG(pid, signum)
+    except (OSError, ProcessLookupError):
+        return False
+    return True
 
 
 def _best_effort_root_kill(process: subprocess.Popen[Any]) -> None:

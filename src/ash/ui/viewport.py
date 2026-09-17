@@ -42,6 +42,9 @@ from ash.ui.transcript import Transcript, TranscriptEntry, TranscriptEvent
 from ash.ui.theme import Theme, get_theme, viewport_styles
 
 
+_FCHMOD = getattr(os, "fchmod", None)
+
+
 def _is_history_link(path: Path) -> bool:
     return path.is_symlink() or (
         hasattr(path, "is_junction") and path.is_junction()
@@ -71,6 +74,9 @@ class PrivateFileHistory(FileHistory):
 
     def _open_fd(self, flags: int, mode: int = 0o600) -> int:
         validate_history_path(self._path)
+        fchmod = _FCHMOD
+        if os.name != "nt" and fchmod is None:
+            raise OSError("private prompt-history permissions are unavailable")
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(self._path, flags, mode)
@@ -79,7 +85,8 @@ class PrivateFileHistory(FileHistory):
             os.close(descriptor)
             raise ValueError(f"prompt history path is not a regular file: {self._path}")
         if os.name != "nt":
-            os.fchmod(descriptor, 0o600)
+            assert fchmod is not None
+            fchmod(descriptor, 0o600)
         return descriptor
 
     def load_history_strings(self) -> Iterable[str]:

@@ -15,6 +15,13 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None  # type: ignore[assignment]
 
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_FCHMOD = getattr(os, "fchmod", None)
+_FLOCK = getattr(fcntl, "flock", None) if fcntl is not None else None
+_LOCK_EX = getattr(fcntl, "LOCK_EX", None) if fcntl is not None else None
+_LOCK_UN = getattr(fcntl, "LOCK_UN", None) if fcntl is not None else None
+
 
 class AnchoredFilesystemError(RuntimeError):
     """A descriptor-anchored plugin filesystem operation was unsafe or failed."""
@@ -29,16 +36,14 @@ def supports_anchored_mutation() -> bool:
 
     if os.name != "posix" or fcntl is None:
         return False
-    if not all(
-        getattr(os, flag, 0)
-        for flag in ("O_DIRECTORY", "O_NOFOLLOW", "O_CREAT", "O_EXCL")
-    ):
+    if not _O_DIRECTORY or not _O_NOFOLLOW or not os.O_CREAT or not os.O_EXCL:
+        return False
+    if _FCHMOD is None or _FLOCK is None or _LOCK_EX is None or _LOCK_UN is None:
         return False
     if not all(
         hasattr(os, name)
         for name in (
             "close",
-            "fchmod",
             "fstat",
             "fsync",
             "listdir",
@@ -158,7 +163,7 @@ class AnchoredDirectory:
             opened = os.fstat(current_descriptor)
             _require_directory_identity(opened, expected, absolute)
             if private:
-                os.fchmod(current_descriptor, 0o700)
+                _fchmod(current_descriptor, 0o700)
             descriptor = current_descriptor
             current_descriptor = -1
             if root_descriptor != descriptor:
@@ -322,7 +327,7 @@ class AnchoredDirectory:
         try:
             descriptor = os.open(
                 name,
-                flags | os.O_NOFOLLOW | _close_on_exec_flag(),
+                flags | _nofollow_flag() | _close_on_exec_flag(),
                 mode,
                 dir_fd=self.descriptor,
             )
@@ -349,6 +354,11 @@ class AnchoredDirectory:
                 os.close(descriptor)
             raise
 
+    def chmod(self, mode: int) -> None:
+        """Apply a mode to the held directory through the anchored descriptor."""
+
+        _fchmod(self.descriptor, mode)
+
     def create_file(self, name: str, *, mode: int = 0o600) -> int:
         descriptor = self.open_file(
             name,
@@ -357,7 +367,7 @@ class AnchoredDirectory:
             expected_type=stat.S_IFREG,
         )
         try:
-            os.fchmod(descriptor, mode)
+            _fchmod(descriptor, mode)
             return descriptor
         except BaseException:
             try:
@@ -371,13 +381,13 @@ class AnchoredDirectory:
         """Hold an exclusive lock for mutations rooted in this directory."""
 
         _validate_name(name)
-        if fcntl is None:
+        if _FLOCK is None or _LOCK_EX is None or _LOCK_UN is None:
             raise AnchoredFilesystemUnavailable(
                 "descriptor-anchored plugin lifecycle locking is unavailable"
             )
         descriptor = self.descriptor
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            _FLOCK(descriptor, _LOCK_EX)
         except OSError as exc:
             raise AnchoredFilesystemError(
                 "could not acquire the anchored plugin lifecycle lock"
@@ -386,7 +396,7 @@ class AnchoredDirectory:
             yield
         finally:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                _FLOCK(descriptor, _LOCK_UN)
             except OSError as exc:
                 raise AnchoredFilesystemError(
                     "could not release the anchored plugin lifecycle lock"
@@ -709,10 +719,7 @@ def _copy_directory(
                     max_depth=max_depth,
                     depth=depth + 1,
                 )
-                os.fchmod(
-                    child_destination.descriptor,
-                    stat.S_IMODE(metadata.st_mode),
-                )
+                child_destination.chmod(stat.S_IMODE(metadata.st_mode))
             finally:
                 child_source.close()
                 if child_destination is not None:
@@ -884,7 +891,31 @@ def _path_components(path: Path) -> tuple[str, ...]:
 
 
 def _directory_flags() -> int:
-    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | _close_on_exec_flag()
+    return os.O_RDONLY | _directory_flag() | _nofollow_flag() | _close_on_exec_flag()
+
+
+def _directory_flag() -> int:
+    if not _O_DIRECTORY:
+        raise AnchoredFilesystemUnavailable(
+            "descriptor-anchored directory opens are unavailable"
+        )
+    return _O_DIRECTORY
+
+
+def _nofollow_flag() -> int:
+    if not _O_NOFOLLOW:
+        raise AnchoredFilesystemUnavailable(
+            "descriptor-anchored no-follow opens are unavailable"
+        )
+    return _O_NOFOLLOW
+
+
+def _fchmod(descriptor: int, mode: int) -> None:
+    if _FCHMOD is None:
+        raise AnchoredFilesystemUnavailable(
+            "descriptor-anchored permission changes are unavailable"
+        )
+    _FCHMOD(descriptor, mode)
 
 
 def _close_on_exec_flag() -> int:

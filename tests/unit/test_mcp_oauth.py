@@ -375,6 +375,20 @@ def test_secure_store_capability_requires_fstat(
     assert private_store.secure_private_store_available() is False
 
 
+@pytest.mark.parametrize(
+    ("attribute", "missing"),
+    (("_O_NOFOLLOW", 0), ("_O_DIRECTORY", 0), ("_FCHMOD", None)),
+)
+def test_secure_store_capability_requires_captured_posix_primitives(
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+    missing: object,
+) -> None:
+    monkeypatch.setattr(private_store, attribute, missing)
+
+    assert private_store.secure_private_store_available() is False
+
+
 def test_oauth_store_runtime_unsupported_is_reported_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

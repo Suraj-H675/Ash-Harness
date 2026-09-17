@@ -18,6 +18,8 @@ from ash.safety.environment import resolve_host_executable
 ProcessStreamCallback = Callable[[str, str], None]
 INHERIT_PROCESS_GROUP_ENV = "ASH_INTERNAL_INHERIT_PROCESS_GROUP"
 WINDOWS_TASKKILL_TIMEOUT_SECONDS = 5.0
+_KILLPG = getattr(os, "killpg", None)
+_SIGKILL = getattr(signal, "SIGKILL", None)
 
 
 class ProcessTreeError(RuntimeError):
@@ -137,7 +139,9 @@ async def terminate_process_tree(
     )
     survivors = [pid for pid in descendants if _pid_exists(pid)]
     if process.returncode is None or survivors:
-        _signal_posix_processes(process.pid, survivors, signal.SIGKILL)
+        if _SIGKILL is None:
+            raise ProcessTreeUnavailable("POSIX hard-kill signal is unavailable")
+        _signal_posix_processes(process.pid, survivors, _SIGKILL)
         await asyncio.gather(
             _wait_for_returncode(process, grace_seconds),
             _wait_for_pids(survivors, grace_seconds),
@@ -323,24 +327,20 @@ def terminate_process_tree_sync(
     if process.poll() is not None:
         return
     options = plan.spawn_options if plan is not None else process_group_options()
-    if options.get("start_new_session"):
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            process.terminate()
-    else:
+    if not options.get("start_new_session") or not _signal_process_group(
+        process.pid, signal.SIGTERM
+    ):
         process.terminate()
     try:
         process.wait(timeout=timeout_seconds)
         return
     except subprocess.TimeoutExpired:
         pass
-    if options.get("start_new_session"):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            process.kill()
-    else:
+    if (
+        not options.get("start_new_session")
+        or _SIGKILL is None
+        or not _signal_process_group(process.pid, _SIGKILL)
+    ):
         process.kill()
     process.wait(timeout=timeout_seconds)
 
@@ -409,6 +409,18 @@ def _best_effort_sync_root_kill(
         process.wait(timeout=timeout_seconds)
     except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
         pass
+
+
+def _signal_process_group(pid: int, signum: int) -> bool:
+    """Signal one POSIX process group when the runtime exposes killpg."""
+
+    if _KILLPG is None:
+        return False
+    try:
+        _KILLPG(pid, signum)
+    except (OSError, ProcessLookupError):
+        return False
+    return True
 
 
 def _signal_posix_processes(root: int, descendants: list[int], signum: int) -> None:

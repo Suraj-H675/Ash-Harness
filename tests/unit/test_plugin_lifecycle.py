@@ -1549,6 +1549,29 @@ def test_git_tree_size_scan_closes_completed_directory_descriptors(
         assert not lifecycle._tree_exceeds_bytes_at(directory, 1)
 
 
+@pytest.mark.parametrize(
+    ("attribute", "missing"),
+    (
+        ("_O_NOFOLLOW", 0),
+        ("_O_DIRECTORY", 0),
+        ("_FCHMOD", None),
+        ("_FLOCK", None),
+        ("_LOCK_EX", None),
+        ("_LOCK_UN", None),
+    ),
+)
+def test_anchored_mutation_capability_requires_captured_posix_primitives(
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+    missing: object,
+) -> None:
+    monkeypatch.setattr(anchored_fs, attribute, missing)
+
+    assert anchored_fs.supports_anchored_mutation() is False
+    with pytest.raises(anchored_fs.AnchoredFilesystemUnavailable, match="unavailable"):
+        anchored_fs.require_anchored_mutation()
+
+
 def test_strict_identity_mutation_capability_is_explicitly_unavailable() -> None:
     _require_anchored_platform()
     assert not anchored_fs.supports_strict_identity_mutation()

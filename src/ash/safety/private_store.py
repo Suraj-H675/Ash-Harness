@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Iterator
 
 
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_FCHMOD = getattr(os, "fchmod", None)
+
+
 PRIVATE_STORE_UNAVAILABLE_MESSAGE = (
     "secure MCP OAuth credential persistence is unavailable on this platform/build"
 )
@@ -41,16 +46,18 @@ def secure_private_store_available() -> bool:
 
     if os.name != "posix":
         return False
-    if any(
-        not getattr(os, name, 0)
-        for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_CREAT", "O_EXCL")
+    if (
+        not _O_DIRECTORY
+        or not _O_NOFOLLOW
+        or not os.O_CREAT
+        or not os.O_EXCL
+        or _FCHMOD is None
     ):
         return False
     if not all(
         hasattr(os, name)
         for name in (
             "close",
-            "fchmod",
             "fstat",
             "fsync",
             "mkdir",
@@ -115,7 +122,7 @@ class PrivateStore:
         _validate_name(name)
         try:
             with self.opened(create=False) as store_descriptor:
-                flags = os.O_RDONLY | _close_on_exec_flag() | os.O_NOFOLLOW
+                flags = os.O_RDONLY | _close_on_exec_flag() | _nofollow_flag()
                 try:
                     descriptor = os.open(name, flags, dir_fd=store_descriptor)
                 except FileNotFoundError:
@@ -161,7 +168,7 @@ class PrivateStore:
                         | os.O_CREAT
                         | os.O_EXCL
                         | _close_on_exec_flag()
-                        | os.O_NOFOLLOW
+                        | _nofollow_flag()
                     )
                     descriptor = os.open(
                         temporary_name,
@@ -170,7 +177,7 @@ class PrivateStore:
                         dir_fd=store_descriptor,
                     )
                     created = True
-                    os.fchmod(descriptor, 0o600)
+                    _fchmod(descriptor, 0o600)
                     _write_all(descriptor, payload)
                     os.fsync(descriptor)
                     os.close(descriptor)
@@ -230,7 +237,10 @@ class PrivateStore:
         try:
             root_descriptor = os.open(
                 Path(self.trusted_root.anchor or os.sep),
-                os.O_RDONLY | _close_on_exec_flag() | os.O_DIRECTORY | os.O_NOFOLLOW,
+                os.O_RDONLY
+                | _close_on_exec_flag()
+                | _directory_flag()
+                | _nofollow_flag(),
             )
             current_descriptor = root_descriptor
             all_components = self._anchor_components + self._components
@@ -248,7 +258,7 @@ class PrivateStore:
                 raise PrivateStoreError(
                     "MCP OAuth credential store is not a directory"
                 )
-            os.fchmod(current_descriptor, 0o700)
+            _fchmod(current_descriptor, 0o700)
             result = current_descriptor
             current_descriptor = -1
             if root_descriptor >= 0 and root_descriptor != result:
@@ -285,6 +295,24 @@ def _close_on_exec_flag() -> int:
     return getattr(os, "O_CLOEXEC", 0)
 
 
+def _directory_flag() -> int:
+    if not _O_DIRECTORY:
+        raise PrivateStoreUnavailable(PRIVATE_STORE_UNAVAILABLE_MESSAGE)
+    return _O_DIRECTORY
+
+
+def _nofollow_flag() -> int:
+    if not _O_NOFOLLOW:
+        raise PrivateStoreUnavailable(PRIVATE_STORE_UNAVAILABLE_MESSAGE)
+    return _O_NOFOLLOW
+
+
+def _fchmod(descriptor: int, mode: int) -> None:
+    if _FCHMOD is None:
+        raise PrivateStoreUnavailable(PRIVATE_STORE_UNAVAILABLE_MESSAGE)
+    _FCHMOD(descriptor, mode)
+
+
 def _require_available() -> None:
     if not secure_private_store_available():
         raise PrivateStoreUnavailable(PRIVATE_STORE_UNAVAILABLE_MESSAGE)
@@ -306,7 +334,7 @@ def _open_or_create_directory(
     *,
     create: bool,
 ) -> int:
-    flags = os.O_RDONLY | _close_on_exec_flag() | os.O_DIRECTORY | os.O_NOFOLLOW
+    flags = os.O_RDONLY | _close_on_exec_flag() | _directory_flag() | _nofollow_flag()
     try:
         return os.open(name, flags, dir_fd=parent_descriptor)
     except FileNotFoundError:

@@ -212,7 +212,7 @@ class PluginSnapshot:
         root = self.require_entry(())
         if root.kind != "directory":
             raise PluginSnapshotError("plugin snapshot root is not a directory")
-        os.fchmod(destination.descriptor, root.mode)
+        destination.chmod(root.mode)
         _write_directory(self, destination, ())
 
     def verify_materialized(self, directory: AnchoredDirectory) -> None:
@@ -351,7 +351,7 @@ def _write_directory(
         if entry.kind == "directory":
             child = destination.create_child(name)
             try:
-                os.fchmod(child.descriptor, entry.mode)
+                child.chmod(entry.mode)
                 _write_directory(snapshot, child, entry.relative)
             finally:
                 child.close()
