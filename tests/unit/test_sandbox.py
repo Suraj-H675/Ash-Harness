@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -776,6 +777,89 @@ def test_run_with_real_bwrap_hides_outside_file_contents(tmp_path: Path) -> None
     finally:
         outside.unlink(missing_ok=True)
         outside_dir.rmdir()
+
+
+
+def test_run_with_real_bwrap_enforces_write_and_network_boundaries(tmp_path: Path) -> None:
+    """Real Linux isolation permits workspace writes but blocks host writes/network."""
+
+    if not has_bwrap():
+        pytest.skip("bwrap not installed or usable on this host")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = SandboxManager(
+        workspace_root=workspace,
+        preferred_tier=SANDBOX_TIER_BWRAP,
+        network=False,
+    )
+    assert manager.backend_name == "bubblewrap"
+
+    inside = workspace / "inside.txt"
+    inside_result = asyncio.run(
+        manager.run(
+            ["/bin/sh", "-c", f"printf ok > {shlex.quote(str(inside))}"],
+            cwd=workspace,
+            timeout=15,
+        )
+    )
+    assert inside_result.exit_code == 0, inside_result.stderr
+    assert inside.read_text(encoding="utf-8") == "ok"
+
+    outside_dir = Path(tempfile.mkdtemp(prefix=".ash-bwrap-write-", dir=Path.home()))
+    outside = outside_dir / "blocked.txt"
+    try:
+        outside_result = asyncio.run(
+            manager.run(
+                ["/bin/sh", "-c", f"printf blocked > {shlex.quote(str(outside))}"],
+                cwd=workspace,
+                timeout=15,
+            )
+        )
+        assert outside_result.exit_code != 0
+        assert not outside.exists()
+        asyncio.run(_assert_bwrap_loopback_blocked(manager, workspace))
+    finally:
+        outside.unlink(missing_ok=True)
+        outside_dir.rmdir()
+
+
+async def _assert_bwrap_loopback_blocked(
+    manager: SandboxManager, workspace: Path
+) -> None:
+    accepted = asyncio.Event()
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        accepted.set()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    port = int(server.sockets[0].getsockname()[1])
+    python = next(
+        (candidate for candidate in (Path("/usr/bin/python3"), Path("/usr/bin/python")) if candidate.exists()),
+        None,
+    )
+    if python is None:
+        server.close()
+        await server.wait_closed()
+        pytest.skip("no system Python inside Bubblewrap system mounts")
+    script = (
+        "import socket; "
+        f"socket.create_connection(('127.0.0.1',{port}), timeout=1).close()"
+    )
+    try:
+        result = await manager.run(
+            [str(python), "-c", script],
+            cwd=workspace,
+            timeout=10,
+        )
+        assert result.exit_code != 0
+        await asyncio.sleep(0.05)
+        assert not accepted.is_set()
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 # ---------------------------------------------------------------------------
