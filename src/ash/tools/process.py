@@ -12,6 +12,11 @@ from typing import Any, Iterable
 
 from pydantic import BaseModel, Field
 
+from ash.core.redaction import (
+    LONG_TOKEN_WITHHELD_MARKER,
+    StreamingRedactor,
+    redact_text,
+)
 from ash.safety.environment import resolve_host_executable
 from ash.safety.guard import SafetyGuard
 from ash.sandbox.process_utils import (
@@ -72,6 +77,8 @@ class Job:
     output_truncated: bool = False
     readers: list[asyncio.Task[None]] = field(default_factory=list)
     sandbox_backend: str = "scoped"
+    stdout_redactor: StreamingRedactor = field(default_factory=StreamingRedactor)
+    stderr_redactor: StreamingRedactor = field(default_factory=StreamingRedactor)
 
 
 class BackgroundProcessArgs(BaseModel):
@@ -249,8 +256,17 @@ class BackgroundProcessTool(BaseTool):
         )
         assert process.stdout is not None and process.stderr is not None
         job.readers = [
-            asyncio.create_task(self._read(process.stdout, job, "")),
-            asyncio.create_task(self._read(process.stderr, job, "[stderr] ")),
+            asyncio.create_task(
+                self._read(process.stdout, job, "", job.stdout_redactor)
+            ),
+            asyncio.create_task(
+                self._read(
+                    process.stderr,
+                    job,
+                    "[stderr] ",
+                    job.stderr_redactor,
+                )
+            ),
         ]
         self.jobs[job.job_id] = job
         return self._result(f"Started {job.job_id} (pid {process.pid}).")
@@ -267,12 +283,28 @@ class BackgroundProcessTool(BaseTool):
         for job_id in terminal_ids[: max(0, excess)]:
             self.jobs.pop(job_id, None)
 
-    async def _read(self, stream: asyncio.StreamReader, job: Job, prefix: str) -> None:
-        while chunk := await stream.read(4096):
-            self._append_output(
-                job,
-                prefix + chunk.decode("utf-8", errors="replace"),
-            )
+    async def _read(
+        self,
+        stream: asyncio.StreamReader,
+        job: Job,
+        prefix: str,
+        redactor: StreamingRedactor,
+    ) -> None:
+        try:
+            while chunk := await stream.read(4096):
+                delta = redactor.feed(chunk.decode("utf-8", errors="replace"))
+                if delta:
+                    self._append_redacted_output(job, prefix + delta)
+        finally:
+            delta = redactor.finish()
+            if delta:
+                self._append_redacted_output(job, prefix + delta)
+
+    @staticmethod
+    def _append_redacted_output(job: Job, text: str) -> None:
+        BackgroundProcessTool._append_output(job, text)
+        if LONG_TOKEN_WITHHELD_MARKER in text:
+            job.output_truncated = True
 
     @staticmethod
     def _append_output(job: Job, text: str) -> None:
@@ -298,7 +330,10 @@ class BackgroundProcessTool(BaseTool):
             if job.process.returncode is None
             else f"exited({job.process.returncode})"
         )
-        return f"{job.job_id} {state} [{job.sandbox_backend}]: {job.command}"
+        return (
+            f"{job.job_id} {state} [{job.sandbox_backend}]: "
+            f"{redact_text(job.command)}"
+        )
 
     @staticmethod
     def _result(output: str, *, truncated: bool = False) -> ToolResult:

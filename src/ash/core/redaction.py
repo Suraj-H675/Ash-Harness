@@ -94,6 +94,8 @@ _SECRET_ASSIGNMENT = re.compile(
     )
     """
 )
+LONG_TOKEN_WITHHELD_MARKER = "[long unbroken output token withheld]"
+
 _PLACEHOLDER_TERMS = (
     "changeme",
     "dummy",
@@ -274,7 +276,7 @@ class StreamingRedactor:
             if len(self._buffer) > self.max_token_characters:
                 self._buffer = ""
                 self._withholding_long_token = True
-                return "[long unbroken output token withheld]"
+                return LONG_TOKEN_WITHHELD_MARKER
             return ""
 
         boundary = _last_whitespace_boundary(self._buffer)
@@ -287,7 +289,7 @@ class StreamingRedactor:
         if len(self._buffer) > self.max_token_characters:
             self._buffer = ""
             self._withholding_long_token = True
-            return "[long unbroken output token withheld]"
+            return LONG_TOKEN_WITHHELD_MARKER
         return ""
 
     def finish(self) -> str:

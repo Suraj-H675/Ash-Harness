@@ -9,6 +9,7 @@ import pytest
 
 from ash.safety.guard import SafetyGuard
 from ash.sandbox import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable, SandboxInvocation
+from ash.core.redaction import LONG_TOKEN_WITHHELD_MARKER
 from ash.tools.process import (
     BACKGROUND_OUTPUT_TRUNCATION_MARKER,
     MAX_BACKGROUND_COMMAND_CHARS,
@@ -63,6 +64,58 @@ async def test_background_process_forwards_allowlisted_environment(
 
 
 @pytest.mark.asyncio
+async def test_background_process_stream_redacts_secret_split_across_polls(
+    tmp_path,
+) -> None:
+    first_fragment = "xai-" + "a" * 10
+    second_fragment = "a" * 70
+    script = (
+        "import sys,time; "
+        f"sys.stdout.write({first_fragment!r}); sys.stdout.flush(); "
+        "time.sleep(0.4); "
+        f"sys.stdout.write({second_fragment!r} + '\\n'); sys.stdout.flush()"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+
+    started = await tool.run(action="start", command=command)
+    job_id = started.output.split()[1]
+    await asyncio.sleep(0.12)
+    first = await tool.run(action="poll", job_id=job_id)
+    await tool.jobs[job_id].process.wait()
+    await asyncio.gather(*tool.jobs[job_id].readers)
+    second = await tool.run(action="poll", job_id=job_id)
+
+    first_payload = first.output.split("\n", 1)[1] if "\n" in first.output else ""
+    second_payload = second.output.split("\n", 1)[1]
+    assert first_payload == ""
+    assert first_fragment not in first_payload
+    assert second_fragment not in second_payload
+    assert "[REDACTED]" in second_payload
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_process_redacts_secret_in_status_command(tmp_path) -> None:
+    provider_key = "xai-" + "a" * 80
+    command = f"printf %s {shlex.quote(provider_key)}"
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+
+    started = await tool.run(action="start", command=command)
+    job_id = started.output.split()[1]
+    await tool.jobs[job_id].process.wait()
+    await asyncio.gather(*tool.jobs[job_id].readers)
+    listed = await tool.run(action="list")
+    polled = await tool.run(action="poll", job_id=job_id)
+
+    assert provider_key not in listed.output
+    assert provider_key not in polled.output
+    assert "[REDACTED]" in listed.output
+    assert "[REDACTED]" in polled.output
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_background_process_handles_long_lines_and_bounds_output(tmp_path) -> None:
     script = (
         "import sys; "
@@ -79,13 +132,11 @@ async def test_background_process_handles_long_lines_and_bounds_output(tmp_path)
     polled = await tool.run(action="poll", job_id=job_id)
 
     assert job.process.returncode == 0
-    assert job.output_size == MAX_BACKGROUND_OUTPUT_CHARS
+    assert job.output_size == len(LONG_TOKEN_WITHHELD_MARKER)
     assert job.output_truncated is True
-    assert BACKGROUND_OUTPUT_TRUNCATION_MARKER.rstrip() in polled.output
+    assert LONG_TOKEN_WITHHELD_MARKER in polled.output
+    assert BACKGROUND_OUTPUT_TRUNCATION_MARKER.rstrip() not in polled.output
     assert polled.truncated is True
-    assert len("".join(job.output)) == (
-        MAX_BACKGROUND_OUTPUT_CHARS + len(BACKGROUND_OUTPUT_TRUNCATION_MARKER)
-    )
     await tool.aclose()
 
 
