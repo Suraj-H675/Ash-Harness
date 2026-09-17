@@ -101,16 +101,32 @@ class WorktreeManager:
         lease: WorktreeLease,
         *,
         message: str,
+        baseline_commit: str | None = None,
     ) -> str | None:
         self._validate_lease_path(lease)
+        branch = await self._git_at(
+            lease.path,
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "HEAD",
+            check=False,
+        )
+        if branch.returncode != 0 or branch.stdout.strip() != lease.branch:
+            raise WorktreeError(
+                "agent worktree HEAD is not attached to the managed branch "
+                f"{lease.branch}"
+            )
         status = await self._git_at(
             lease.path,
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
         )
+        baseline = baseline_commit or lease.base_commit
         if not status.stdout:
-            return None
+            head = (await self._git_at(lease.path, "rev-parse", "HEAD")).stdout.strip()
+            return head if head != baseline else None
         await self._git_at(lease.path, "add", "-A", "--", ".")
         await self._git_at(
             lease.path,
@@ -135,6 +151,9 @@ class WorktreeManager:
         """Merge verified retained agent commits into an isolated worktree."""
 
         self._validate_lease_path(lease)
+        starting_head = (
+            await self._git_at(lease.path, "rev-parse", "HEAD")
+        ).stdout.strip()
         verified: list[str] = []
         seen: set[str] = set()
         for branch, expected_commit in artifacts:
@@ -197,6 +216,22 @@ class WorktreeManager:
             )
             if result.returncode != 0:
                 await self._git_at(lease.path, "merge", "--abort", check=False)
+                rollback = await self._git_at(
+                    lease.path,
+                    "reset",
+                    "--hard",
+                    starting_head,
+                    check=False,
+                )
+                if rollback.returncode != 0:
+                    primary = (
+                        result.stderr.strip()
+                        or f"artifact commit {commit} conflicts with dependent worktree"
+                    )
+                    rollback_detail = rollback.stderr.strip() or "unknown rollback failure"
+                    raise WorktreeError(
+                        f"{primary}; dependency rollback failed: {rollback_detail}"
+                    )
                 raise WorktreeError(
                     result.stderr.strip()
                     or f"artifact commit {commit} conflicts with dependent worktree"
@@ -211,20 +246,54 @@ class WorktreeManager:
         lease: WorktreeLease,
         *,
         keep_branch: bool,
+        expected_head: str | None = None,
     ) -> None:
         self._validate_lease_path(lease)
+        status = await self._git_at(
+            lease.path,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        )
+        if status.stdout:
+            raise WorktreeError(
+                "refusing to remove agent worktree with uncommitted changes"
+            )
+        if not keep_branch:
+            head = (await self._git_at(lease.path, "rev-parse", "HEAD")).stdout.strip()
+            disposable_head = expected_head or lease.base_commit
+            if head != disposable_head:
+                raise WorktreeError(
+                    "refusing to remove agent worktree with unretained commits"
+                )
         await self._git("worktree", "unlock", str(lease.path), check=False)
         result = await self._git(
             "worktree",
             "remove",
-            "--force",
             str(lease.path),
             check=False,
         )
         if result.returncode != 0 and lease.path.exists():
             raise WorktreeError(result.stderr.strip() or "git worktree remove failed")
         if not keep_branch:
-            await self._git("branch", "-D", lease.branch, check=False)
+            branch_head = await self._git(
+                "rev-parse",
+                "--verify",
+                f"refs/heads/{lease.branch}",
+                check=False,
+            )
+            if (
+                branch_head.returncode == 0
+                and branch_head.stdout.strip() != disposable_head
+            ):
+                raise WorktreeError(
+                    "agent branch changed during cleanup; preserved updated branch"
+                )
+            deleted = await self._git("branch", "-D", lease.branch, check=False)
+            if deleted.returncode != 0:
+                raise WorktreeError(
+                    deleted.stderr.strip() or f"could not delete agent branch {lease.branch}"
+                )
         await self._git("worktree", "prune", "--expire", "now", check=False)
 
     async def list_agent_branches(self) -> list[tuple[str, str]]:

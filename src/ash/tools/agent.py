@@ -489,7 +489,11 @@ class SpawnAgentTool(BaseTool):
             except asyncio.CancelledError:
                 if lease is not None:
                     try:
-                        await worktree_manager.remove(lease, keep_branch=False)
+                        await worktree_manager.remove(
+                            lease,
+                            keep_branch=False,
+                            expected_head=accepted_commit or lease.base_commit,
+                        )
                     except WorktreeError:
                         pass
                 self._shared_state.tasks.cancel_task(
@@ -506,7 +510,11 @@ class SpawnAgentTool(BaseTool):
             except WorktreeError as exc:
                 if lease is not None:
                     try:
-                        await worktree_manager.remove(lease, keep_branch=False)
+                        await worktree_manager.remove(
+                            lease,
+                            keep_branch=False,
+                            expected_head=accepted_commit or lease.base_commit,
+                        )
                     except WorktreeError:
                         pass
                 failed = self._shared_state.tasks.fail_task(
@@ -598,6 +606,7 @@ class SpawnAgentTool(BaseTool):
                     commit = await worktree_manager.commit_changes(
                         lease,
                         message=f"ash agent {agent_id}: {args.task[:120]}",
+                        baseline_commit=accepted_commit or lease.base_commit,
                     )
                 except WorktreeError as exc:
                     summary = f"{summary}\nWorktree commit failed: {exc}"
@@ -617,6 +626,7 @@ class SpawnAgentTool(BaseTool):
                     await worktree_manager.remove(
                         lease,
                         keep_branch=branch_state["commit"] is not None,
+                        expected_head=accepted_commit or lease.base_commit,
                     )
                 except WorktreeError as exc:
                     summary = f"{summary}\nWorktree cleanup failed: {exc}"
@@ -772,6 +782,7 @@ class SpawnAgentTool(BaseTool):
                         await worktree_manager.remove(
                             lease,
                             keep_branch=branch_state["commit"] is not None,
+                            expected_head=accepted_commit or lease.base_commit,
                         )
                     except WorktreeError:
                         # Preserve the original worker failure/cancellation. The

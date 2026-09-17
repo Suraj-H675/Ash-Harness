@@ -108,6 +108,129 @@ def test_worktree_without_changes_removes_branch(
     assert result.returncode != 0
 
 
+def test_worktree_remove_preserves_uncommitted_changes(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    manager = WorktreeManager(repository, tmp_path / "agents")
+
+    async def run():
+        lease = await manager.create("dirty-cleanup")
+        (lease.path / "file.txt").write_text("valuable work\n", encoding="utf-8")
+        with pytest.raises(WorktreeError, match="uncommitted changes"):
+            await manager.remove(lease, keep_branch=False)
+        return lease
+
+    lease = asyncio.run(run())
+
+    assert lease.path.joinpath("file.txt").read_text(encoding="utf-8") == (
+        "valuable work\n"
+    )
+    assert _git(repository, "rev-parse", lease.branch) == lease.base_commit
+
+
+def test_worktree_remove_preserves_unretained_commits(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    manager = WorktreeManager(repository, tmp_path / "agents")
+
+    async def run():
+        lease = await manager.create("committed-cleanup")
+        (lease.path / "file.txt").write_text("worker commit\n", encoding="utf-8")
+        _git(lease.path, "add", "file.txt")
+        _git(
+            lease.path,
+            "-c",
+            "user.name=Worker",
+            "-c",
+            "user.email=worker@example.com",
+            "commit",
+            "-qm",
+            "worker commit",
+        )
+        worker_commit = _git(lease.path, "rev-parse", "HEAD")
+        with pytest.raises(WorktreeError, match="unretained commits"):
+            await manager.remove(lease, keep_branch=False)
+        return lease, worker_commit
+
+    lease, worker_commit = asyncio.run(run())
+
+    assert lease.path.exists()
+    assert _git(repository, "rev-parse", lease.branch) == worker_commit
+
+
+def test_commit_changes_returns_preexisting_worker_commit(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    manager = WorktreeManager(repository, tmp_path / "agents")
+
+    async def run():
+        lease = await manager.create("self-commit")
+        (lease.path / "file.txt").write_text("worker commit\n", encoding="utf-8")
+        _git(lease.path, "add", "file.txt")
+        _git(
+            lease.path,
+            "-c",
+            "user.name=Worker",
+            "-c",
+            "user.email=worker@example.com",
+            "commit",
+            "-qm",
+            "worker commit",
+        )
+        worker_commit = _git(lease.path, "rev-parse", "HEAD")
+        captured = await manager.commit_changes(
+            lease,
+            message="ash capture",
+            baseline_commit=lease.base_commit,
+        )
+        await manager.remove(lease, keep_branch=True)
+        return lease, worker_commit, captured
+
+    lease, worker_commit, captured = asyncio.run(run())
+
+    assert captured == worker_commit
+    assert _git(repository, "rev-parse", lease.branch) == worker_commit
+
+
+def test_commit_changes_rejects_detached_worker_head(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    manager = WorktreeManager(repository, tmp_path / "agents")
+
+    async def run():
+        lease = await manager.create("detached-worker")
+        _git(lease.path, "checkout", "--detach", "-q")
+        (lease.path / "file.txt").write_text("detached work\n", encoding="utf-8")
+        _git(lease.path, "add", "file.txt")
+        _git(
+            lease.path,
+            "-c",
+            "user.name=Worker",
+            "-c",
+            "user.email=worker@example.com",
+            "commit",
+            "-qm",
+            "detached worker commit",
+        )
+        detached_commit = _git(lease.path, "rev-parse", "HEAD")
+        with pytest.raises(WorktreeError, match="managed branch"):
+            await manager.commit_changes(
+                lease,
+                message="ash capture",
+                baseline_commit=lease.base_commit,
+            )
+        return lease, detached_commit
+
+    lease, detached_commit = asyncio.run(run())
+
+    assert lease.path.exists()
+    assert _git(lease.path, "rev-parse", "HEAD") == detached_commit
+
+
 def test_dependent_worktree_accepts_verified_agent_commit(
     repository: Path,
     tmp_path: Path,
@@ -137,6 +260,47 @@ def test_dependent_worktree_accepts_verified_agent_commit(
         _git(repository, "merge-base", "--is-ancestor", producer.branch, accepted) == ""
     )
     assert _git(repository, "rev-parse", consumer.branch) == accepted
+
+
+def test_accepted_dependency_commit_is_disposable_baseline(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    manager = WorktreeManager(repository, tmp_path / "agents")
+
+    async def run():
+        producer = await manager.create("baseline-producer")
+        (producer.path / "producer.txt").write_text("producer\n", encoding="utf-8")
+        producer_commit = await manager.commit_changes(producer, message="produce")
+        assert producer_commit is not None
+        await manager.remove(producer, keep_branch=True)
+
+        consumer = await manager.create("baseline-consumer")
+        accepted = await manager.accept_git_artifacts(
+            consumer, [(producer.branch, producer_commit)]
+        )
+        assert accepted is not None
+        captured = await manager.commit_changes(
+            consumer,
+            message="no worker changes",
+            baseline_commit=accepted,
+        )
+        await manager.remove(
+            consumer,
+            keep_branch=False,
+            expected_head=accepted,
+        )
+        return consumer, captured
+
+    consumer, captured = asyncio.run(run())
+
+    assert captured is None
+    result = subprocess.run(
+        ["git", "show-ref", "--verify", f"refs/heads/{consumer.branch}"],
+        cwd=repository,
+        check=False,
+    )
+    assert result.returncode != 0
 
 
 def test_dependent_worktree_rejects_stale_artifact_commit(
@@ -192,6 +356,7 @@ def test_dependent_worktree_aborts_conflicting_artifact_merge(
                 )
             status = _git(consumer.path, "status", "--porcelain=v1")
             assert status == ""
+            assert _git(consumer.path, "rev-parse", "HEAD") == consumer.base_commit
         finally:
             await manager.remove(consumer, keep_branch=False)
 
