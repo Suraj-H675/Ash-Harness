@@ -16,7 +16,13 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from ash.safe_io import strict_json_loads, validate_unlinked_file_path
+from ash.safe_io import (
+    create_unlinked_regular_file,
+    descriptor_path,
+    strict_json_loads,
+    validate_unlinked_file_path,
+    verify_open_file_identity,
+)
 
 
 Role = Literal["system", "user", "assistant", "tool"]
@@ -266,6 +272,38 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
 def _restrict_file_permissions(path: Path) -> None:
     if os.name != "nt" and path.exists():
         path.chmod(0o600)
+
+
+def _write_descriptor(descriptor: int, payload: bytes) -> None:
+    os.ftruncate(descriptor, 0)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write while creating session backup")
+        view = view[written:]
+
+
+def _backup_connection_to_descriptor(
+    source: sqlite3.Connection,
+    descriptor: int,
+) -> None:
+    stable_path = descriptor_path(descriptor)
+    if stable_path is not None:
+        with closing(sqlite3.connect(stable_path)) as target:
+            source.backup(target)
+        return
+
+    with closing(sqlite3.connect(":memory:")) as target:
+        source.backup(target)
+        serialize = getattr(target, "serialize", None)
+        if not callable(serialize):
+            raise SessionStorageError(
+                "Secure session backup is unavailable on this platform/build"
+            )
+        payload = serialize()
+    _write_descriptor(descriptor, payload)
 
 
 def get_db_connection(db_path: str | Path) -> sqlite3.Connection:
@@ -699,12 +737,26 @@ class SessionStore:
             )
         except ValueError as exc:
             raise SessionStorageError(str(exc)) from exc
-        with (
-            closing(get_db_connection(source_path)) as source,
-            closing(sqlite3.connect(destination_path)) as target,
-        ):
-            source.backup(target)
-        _restrict_file_permissions(destination_path)
+        try:
+            with create_unlinked_regular_file(
+                destination_path,
+                label="session backup",
+                mode=0o600,
+            ) as descriptor:
+                with closing(get_db_connection(source_path)) as source:
+                    _backup_connection_to_descriptor(source, descriptor)
+                os.fsync(descriptor)
+                verify_open_file_identity(
+                    destination_path,
+                    descriptor,
+                    label="session backup",
+                )
+        except FileExistsError as exc:
+            raise SessionStorageError(
+                f"Backup destination already exists: {destination_path}"
+            ) from exc
+        except ValueError as exc:
+            raise SessionStorageError(str(exc)) from exc
         return destination_path
 
     def _init_db(self) -> None:

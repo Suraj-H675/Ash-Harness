@@ -6,11 +6,14 @@ from pathlib import Path
 import pytest
 
 from ash.safe_io import (
+    create_unlinked_regular_file,
     read_bounded_text,
+    replace_open_file,
     strict_json_loads,
     validate_unlinked_directory_path,
     validate_unlinked_file_path,
     validate_unlinked_path,
+    verify_open_file_identity,
 )
 
 
@@ -106,3 +109,37 @@ def test_validate_unlinked_directory_path_rejects_directory_and_parent_links(
     for path in (linked_directory, linked_parent / "state"):
         with pytest.raises(ValueError, match="symlink or junction"):
             validate_unlinked_directory_path(path, label="test state directory")
+
+
+def test_created_file_identity_check_rejects_replaced_visible_entry(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    with create_unlinked_regular_file(path, label="test state") as descriptor:
+        path.unlink()
+        path.write_bytes(b"attacker replacement")
+
+        with pytest.raises(ValueError, match="changed after opening"):
+            verify_open_file_identity(path, descriptor, label="test state")
+
+    assert path.read_bytes() == b"attacker replacement"
+
+
+def test_replace_open_file_refuses_source_replacement(tmp_path: Path) -> None:
+    source = tmp_path / "restore.tmp"
+    destination = tmp_path / "sessions.db"
+    destination.write_bytes(b"current database")
+    with create_unlinked_regular_file(source, label="restore temp") as descriptor:
+        source.unlink()
+        source.write_bytes(b"attacker replacement")
+
+        with pytest.raises(ValueError, match="changed after opening"):
+            replace_open_file(
+                source,
+                destination,
+                descriptor,
+                label="restore temp",
+            )
+
+    assert destination.read_bytes() == b"current database"
+    assert source.read_bytes() == b"attacker replacement"

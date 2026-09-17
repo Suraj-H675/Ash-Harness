@@ -446,6 +446,55 @@ def test_manual_backup_is_consistent_and_never_overwrites(tmp_path: Path) -> Non
         store.backup(destination)
 
 
+def test_manual_backup_does_not_follow_destination_swapped_to_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.core.session as session_module
+
+    store = SessionStore(tmp_path / "sessions.db")
+    source_session = store.create_session("/source")
+    destination = tmp_path / "manual.backup"
+    victim = tmp_path / "victim.db"
+    with sqlite3.connect(victim) as connection:
+        connection.execute("CREATE TABLE victim_marker(value TEXT)")
+        connection.execute("INSERT INTO victim_marker VALUES ('do-not-touch')")
+
+    real_connect = sqlite3.connect
+    swapped = False
+
+    def swap_before_destination_open(database, *args, **kwargs):
+        nonlocal swapped
+        if Path(str(database)) == destination and not swapped:
+            swapped = True
+            try:
+                destination.symlink_to(victim)
+            except OSError as exc:
+                pytest.skip(f"symlinks are unavailable: {exc}")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(session_module.sqlite3, "connect", swap_before_destination_open)
+
+    assert store.backup(destination) == destination
+    assert swapped is False
+    monkeypatch.setattr(session_module.sqlite3, "connect", real_connect)
+    with real_connect(victim) as connection:
+        assert connection.execute("SELECT value FROM victim_marker").fetchone() == (
+            "do-not-touch",
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
+            ).fetchone()
+            is None
+        )
+    assert SessionStore(destination).load_session(source_session.session_id).session_id == (
+        source_session.session_id
+    )
+    assert source_session.session_id in {
+        item.session_id for item in store.list_sessions(limit=10)
+    }
+
+
 def test_message_storage_round_trips_in_insert_order(tmp_path: Path) -> None:
     db_path = tmp_path / "session_store.db"
     store = SessionStore(db_path)

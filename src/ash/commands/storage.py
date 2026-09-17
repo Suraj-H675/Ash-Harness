@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import platform
-import shutil
 import subprocess
 import sqlite3
 from dataclasses import asdict, dataclass
@@ -15,7 +14,14 @@ from uuid import uuid4
 
 from ash.core.session import CURRENT_SCHEMA_VERSION, SessionStorageError, SessionStore
 from ash.core.redaction import redact_text
-from ash.safe_io import validate_unlinked_file_path
+from ash.safe_io import (
+    create_unlinked_regular_file,
+    descriptor_path,
+    open_unlinked_regular_file,
+    replace_open_file,
+    validate_unlinked_file_path,
+    verify_open_file_identity,
+)
 from ash.safety.environment import resolve_host_executable
 from ash.ui.safe_text import terminal_safe_text
 
@@ -43,30 +49,7 @@ def check_database(path: str | Path) -> StorageCheck:
     try:
         uri = f"{database.as_uri()}?mode=ro"
         with sqlite3.connect(uri, uri=True) as connection:
-            integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
-            messages.extend(str(row[0]) for row in integrity_rows if row[0] != "ok")
-            foreign_rows = connection.execute("PRAGMA foreign_key_check").fetchall()
-            messages.extend(
-                "foreign key violation: " + ", ".join(str(value) for value in row)
-                for row in foreign_rows
-            )
-            table = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='schema_migrations'"
-            ).fetchone()
-            if table is None:
-                version = 0
-            else:
-                version = int(
-                    connection.execute(
-                        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
-                    ).fetchone()[0]
-                )
-                if version > CURRENT_SCHEMA_VERSION:
-                    messages.append(
-                        f"schema {version} is newer than supported schema "
-                        f"{CURRENT_SCHEMA_VERSION}"
-                    )
+            version, messages = _inspect_database(connection)
     except (OSError, sqlite3.DatabaseError) as exc:
         messages.append(str(exc))
     return StorageCheck(
@@ -76,6 +59,87 @@ def check_database(path: str | Path) -> StorageCheck:
         schema_version=version,
         messages=tuple(messages or ("ok",)),
     )
+
+
+def _inspect_database(connection: sqlite3.Connection) -> tuple[int, list[str]]:
+    messages: list[str] = []
+    integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+    messages.extend(str(row[0]) for row in integrity_rows if row[0] != "ok")
+    foreign_rows = connection.execute("PRAGMA foreign_key_check").fetchall()
+    messages.extend(
+        "foreign key violation: " + ", ".join(str(value) for value in row)
+        for row in foreign_rows
+    )
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    ).fetchone()
+    version = 0
+    if table is not None:
+        version = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+            ).fetchone()[0]
+        )
+        if version > CURRENT_SCHEMA_VERSION:
+            messages.append(
+                f"schema {version} is newer than supported schema {CURRENT_SCHEMA_VERSION}"
+            )
+    return version, messages
+
+
+def _check_database_descriptor(descriptor: int, *, display_path: Path) -> StorageCheck:
+    stable_path = descriptor_path(descriptor)
+    messages: list[str] = []
+    version: int | None = None
+    try:
+        if stable_path is not None:
+            uri = f"file:{stable_path}?mode=ro&immutable=1"
+            with sqlite3.connect(uri, uri=True) as connection:
+                version, messages = _inspect_database(connection)
+        else:
+            position = os.lseek(descriptor, 0, os.SEEK_CUR)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            os.lseek(descriptor, position, os.SEEK_SET)
+            with sqlite3.connect(":memory:") as connection:
+                deserialize = getattr(connection, "deserialize", None)
+                if not callable(deserialize):
+                    raise sqlite3.DatabaseError(
+                        "secure descriptor validation is unavailable"
+                    )
+                deserialize(b"".join(chunks))
+                version, messages = _inspect_database(connection)
+    except (OSError, sqlite3.DatabaseError) as exc:
+        messages.append(str(exc))
+    return StorageCheck(
+        path=str(display_path),
+        exists=True,
+        ok=not messages,
+        schema_version=version,
+        messages=tuple(messages or ("ok",)),
+    )
+
+
+def _copy_descriptor(source: int, destination: int) -> None:
+    os.lseek(source, 0, os.SEEK_SET)
+    os.ftruncate(destination, 0)
+    os.lseek(destination, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(source, 1024 * 1024)
+        if not chunk:
+            break
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination, view)
+            if written <= 0:
+                raise OSError("short write while copying session backup")
+            view = view[written:]
+    os.fsync(destination)
 
 
 def backup_database(path: str | Path, destination: str | Path | None = None) -> Path:
@@ -104,59 +168,90 @@ def restore_database(
         raise SessionStorageError(str(exc)) from exc
     if database == backup_path:
         raise SessionStorageError("Backup and destination must differ")
-    check = check_database(backup_path)
-    if not check.ok:
-        raise SessionStorageError(
-            "Refusing to restore an unhealthy backup: " + "; ".join(check.messages)
-        )
-
-    database.parent.mkdir(parents=True, exist_ok=True)
     try:
-        database = validate_unlinked_file_path(database, label="session database")
-        backup_path = validate_unlinked_file_path(backup_path, label="session backup")
-    except ValueError as exc:
+        with open_unlinked_regular_file(
+            backup_path,
+            label="session backup",
+        ) as backup_descriptor:
+            backup_check = _check_database_descriptor(
+                backup_descriptor,
+                display_path=backup_path,
+            )
+            if not backup_check.ok:
+                raise SessionStorageError(
+                    "Refusing to restore an unhealthy backup: "
+                    + "; ".join(backup_check.messages)
+                )
+            database.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                database = validate_unlinked_file_path(
+                    database, label="session database"
+                )
+            except ValueError as exc:
+                raise SessionStorageError(str(exc)) from exc
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            temporary = database.with_name(
+                f".{database.name}.restore-{uuid4().hex}.tmp"
+            )
+            preserved: list[Path] = []
+            with create_unlinked_regular_file(
+                temporary,
+                label="session restore temporary",
+                mode=0o600,
+            ) as temporary_descriptor:
+                _copy_descriptor(backup_descriptor, temporary_descriptor)
+                temporary_check = _check_database_descriptor(
+                    temporary_descriptor,
+                    display_path=temporary,
+                )
+                if not temporary_check.ok:
+                    raise SessionStorageError(
+                        "Refusing to restore an unhealthy backup: "
+                        + "; ".join(temporary_check.messages)
+                    )
+                for current in (
+                    database,
+                    Path(f"{database}-wal"),
+                    Path(f"{database}-shm"),
+                ):
+                    if current.exists():
+                        preserved_path = database.with_name(
+                            f"{current.name}.pre-restore.{timestamp}.raw"
+                        )
+                        with open_unlinked_regular_file(
+                            current,
+                            label="session pre-restore source",
+                        ) as current_descriptor:
+                            with create_unlinked_regular_file(
+                                preserved_path,
+                                label="session pre-restore snapshot",
+                                mode=0o600,
+                            ) as preserved_descriptor:
+                                _copy_descriptor(
+                                    current_descriptor,
+                                    preserved_descriptor,
+                                )
+                                verify_open_file_identity(
+                                    preserved_path,
+                                    preserved_descriptor,
+                                    label="session pre-restore snapshot",
+                                )
+                        preserved.append(preserved_path)
+
+                try:
+                    validate_unlinked_file_path(database, label="session database")
+                except ValueError as exc:
+                    raise SessionStorageError(str(exc)) from exc
+                for sidecar in (Path(f"{database}-wal"), Path(f"{database}-shm")):
+                    sidecar.unlink(missing_ok=True)
+                replace_open_file(
+                    temporary,
+                    database,
+                    temporary_descriptor,
+                    label="session restore temporary",
+                )
+    except (OSError, ValueError) as exc:
         raise SessionStorageError(str(exc)) from exc
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    preserved: list[Path] = []
-    for current in (database, Path(f"{database}-wal"), Path(f"{database}-shm")):
-        if current.exists():
-            preserved_path = database.with_name(
-                f"{current.name}.pre-restore.{timestamp}.raw"
-            )
-            shutil.copy2(current, preserved_path)
-            _restrict(preserved_path)
-            preserved.append(preserved_path)
-
-    temporary = database.with_name(f".{database.name}.restore-{uuid4().hex}.tmp")
-    try:
-        try:
-            validate_unlinked_file_path(database, label="session database")
-            validate_unlinked_file_path(backup_path, label="session backup")
-        except ValueError as exc:
-            raise SessionStorageError(str(exc)) from exc
-        shutil.copy2(backup_path, temporary)
-        _restrict(temporary)
-        temporary_check = check_database(temporary)
-        if not temporary_check.ok:
-            raise SessionStorageError(
-                "Copied backup failed verification: "
-                + "; ".join(temporary_check.messages)
-            )
-        for sidecar in (Path(f"{database}-wal"), Path(f"{database}-shm")):
-            sidecar.unlink(missing_ok=True)
-        try:
-            validate_unlinked_file_path(database, label="session database")
-        except ValueError as exc:
-            raise SessionStorageError(str(exc)) from exc
-        os.replace(temporary, database)
-        _restrict(database)
-    finally:
-        for artifact in (
-            temporary,
-            Path(f"{temporary}-wal"),
-            Path(f"{temporary}-shm"),
-        ):
-            artifact.unlink(missing_ok=True)
     return database, tuple(preserved)
 
 

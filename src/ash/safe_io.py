@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import os
 import stat
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Iterator, TextIO
 
 from ash.safety.path_scope import lexical_target_path, path_has_link_component
 
@@ -72,6 +73,236 @@ def validate_unlinked_directory_path(path: str | Path, *, label: str) -> Path:
     """Reject a linked directory or immediate parent without resolving wider aliases."""
 
     return _validate_unlinked_target_and_parent(path, label=label)
+
+
+@contextmanager
+def open_unlinked_regular_file(
+    path: str | Path,
+    *,
+    label: str,
+) -> Iterator[int]:
+    """Open one existing regular file without re-resolving its final entry."""
+
+    target = validate_unlinked_file_path(path, label=label)
+    parent_descriptor = -1
+    descriptor = -1
+    try:
+        parent_descriptor = _open_parent_directory(target)
+        flags = os.O_RDONLY | _close_on_exec_flag() | _nofollow_flag()
+        if parent_descriptor >= 0:
+            descriptor = os.open(target.name, flags, dir_fd=parent_descriptor)
+        else:
+            descriptor = os.open(target, flags)
+            _verify_path_identity(target, descriptor, label=label)
+        _require_regular_descriptor(descriptor, target, label=label)
+        yield descriptor
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+@contextmanager
+def create_unlinked_regular_file(
+    path: str | Path,
+    *,
+    label: str,
+    mode: int = 0o600,
+) -> Iterator[int]:
+    """Exclusively create one regular file and remove only that inode on failure."""
+
+    target = validate_unlinked_file_path(path, label=label)
+    parent_descriptor = -1
+    descriptor = -1
+    completed = False
+    try:
+        parent_descriptor = _open_parent_directory(target)
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | _close_on_exec_flag()
+            | _nofollow_flag()
+        )
+        if parent_descriptor >= 0:
+            descriptor = os.open(target.name, flags, mode, dir_fd=parent_descriptor)
+        else:
+            descriptor = os.open(target, flags, mode)
+            _verify_path_identity(target, descriptor, label=label)
+        _require_regular_descriptor(descriptor, target, label=label)
+        if hasattr(os, "fchmod") and os.name != "nt":
+            os.fchmod(descriptor, mode)
+        yield descriptor
+        completed = True
+    finally:
+        if not completed and descriptor >= 0:
+            _unlink_same_open_file(
+                target,
+                descriptor,
+                parent_descriptor=parent_descriptor,
+            )
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def descriptor_path(descriptor: int) -> str | None:
+    """Return a stable path to one held descriptor when the OS exposes one."""
+
+    if descriptor < 0:
+        raise ValueError("descriptor must be non-negative")
+    if os.name != "posix":
+        return None
+    candidate = f"/dev/fd/{descriptor}"
+    try:
+        os.stat(candidate)
+    except OSError:
+        return None
+    return candidate
+
+
+def verify_open_file_identity(
+    path: str | Path,
+    descriptor: int,
+    *,
+    label: str,
+) -> Path:
+    """Require that a visible file path still names the held regular-file inode."""
+
+    target = validate_unlinked_file_path(path, label=label)
+    _require_regular_descriptor(descriptor, target, label=label)
+    parent_descriptor = -1
+    try:
+        parent_descriptor = _open_parent_directory(target)
+        if parent_descriptor >= 0:
+            observed = os.stat(
+                target.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        else:
+            observed = os.lstat(target)
+        opened = os.fstat(descriptor)
+        if stat.S_ISLNK(observed.st_mode) or (
+            observed.st_dev,
+            observed.st_ino,
+        ) != (opened.st_dev, opened.st_ino):
+            raise ValueError(f"refusing to use {label} that changed after opening: {target}")
+        return target
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def replace_open_file(
+    source: str | Path,
+    destination: str | Path,
+    descriptor: int,
+    *,
+    label: str,
+) -> Path:
+    """Replace a same-directory destination with the inode held by ``descriptor``."""
+
+    source_path = validate_unlinked_file_path(source, label=label)
+    destination_path = validate_unlinked_file_path(destination, label=label)
+    if source_path.parent != destination_path.parent:
+        raise ValueError(f"refusing to move {label} across directories")
+    _require_regular_descriptor(descriptor, source_path, label=label)
+    parent_descriptor = -1
+    try:
+        parent_descriptor = _open_parent_directory(source_path)
+        supports_dir_fd = getattr(os, "supports_dir_fd", ())
+        if parent_descriptor >= 0 and os.rename in supports_dir_fd:
+            observed = os.stat(
+                source_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(descriptor)
+            if stat.S_ISLNK(observed.st_mode) or (
+                observed.st_dev,
+                observed.st_ino,
+            ) != (opened.st_dev, opened.st_ino):
+                raise ValueError(
+                    f"refusing to replace {label} that changed after opening: {source_path}"
+                )
+            os.rename(
+                source_path.name,
+                destination_path.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            try:
+                os.fsync(parent_descriptor)
+            except OSError:
+                pass
+            return destination_path
+        verify_open_file_identity(source_path, descriptor, label=label)
+        os.replace(source_path, destination_path)
+        return destination_path
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def _open_parent_directory(target: Path) -> int:
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    if (
+        os.open not in supports_dir_fd
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+    ):
+        return -1
+    flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+    return os.open(target.parent, flags)
+
+
+def _close_on_exec_flag() -> int:
+    return getattr(os, "O_CLOEXEC", 0)
+
+
+def _nofollow_flag() -> int:
+    return getattr(os, "O_NOFOLLOW", 0)
+
+
+def _require_regular_descriptor(descriptor: int, path: Path, *, label: str) -> None:
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        raise ValueError(f"refusing to use non-regular {label}: {path}")
+
+
+def _verify_path_identity(path: Path, descriptor: int, *, label: str) -> None:
+    observed = os.lstat(path)
+    if stat.S_ISLNK(observed.st_mode):
+        raise ValueError(f"refusing to use symlinked {label}: {path}")
+    opened = os.fstat(descriptor)
+    if (observed.st_dev, observed.st_ino) != (opened.st_dev, opened.st_ino):
+        raise ValueError(f"refusing to use {label} that changed while opening: {path}")
+
+
+def _unlink_same_open_file(
+    path: Path,
+    descriptor: int,
+    *,
+    parent_descriptor: int,
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        if parent_descriptor >= 0:
+            observed = os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (observed.st_dev, observed.st_ino) == (opened.st_dev, opened.st_ino):
+                os.unlink(path.name, dir_fd=parent_descriptor)
+            return
+        observed = os.lstat(path)
+        if (observed.st_dev, observed.st_ino) == (opened.st_dev, opened.st_ino):
+            path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def read_bounded_bytes(

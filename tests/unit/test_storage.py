@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -99,6 +101,73 @@ def test_restore_cleans_temporary_sqlite_sidecars(tmp_path: Path) -> None:
     restore_database(path, backup, confirmed=True)
 
     assert not list(tmp_path.glob(".sessions.db.restore-*.tmp*"))
+
+
+def test_restore_uses_validated_backup_bytes_when_backup_path_is_swapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "sessions.db"
+    current_store = SessionStore(path)
+    current_store.create_session("/current")
+    backup = tmp_path / "known-good.db"
+    good_store = SessionStore(backup)
+    good_session = good_store.create_session("/good")
+    replacement = tmp_path / "replacement.db"
+    replacement_store = SessionStore(replacement)
+    replacement_session = replacement_store.create_session("/replacement")
+    real_copy2 = shutil.copy2
+    swapped = False
+
+    def swap_backup_before_copy(source, destination, *args, **kwargs):
+        nonlocal swapped
+        if Path(source) == backup and not swapped:
+            swapped = True
+            backup.unlink()
+            try:
+                backup.symlink_to(replacement)
+            except OSError as exc:
+                pytest.skip(f"symlinks are unavailable: {exc}")
+        return real_copy2(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", swap_backup_before_copy)
+
+    restore_database(path, backup, confirmed=True)
+
+    assert swapped is False
+    restored_ids = {
+        item.session_id for item in SessionStore(path).list_sessions(limit=10)
+    }
+    assert good_session.session_id in restored_ids
+    assert replacement_session.session_id not in restored_ids
+
+
+def test_restore_does_not_follow_pre_restore_snapshot_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.commands.storage as storage_module
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 1, 2, 3, 4, 5, 678901, tzinfo=tz or timezone.utc)
+
+    path = tmp_path / "sessions.db"
+    SessionStore(path).create_session("/current")
+    backup = backup_database(path, tmp_path / "known-good.db")
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do-not-touch\n", encoding="utf-8")
+    timestamp = "20260102T030405678901Z"
+    preserved_path = tmp_path / f"sessions.db.pre-restore.{timestamp}.raw"
+    try:
+        preserved_path.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+    monkeypatch.setattr(storage_module, "datetime", FixedDateTime)
+
+    with pytest.raises(SessionStorageError, match="symlink or junction"):
+        restore_database(path, backup, confirmed=True)
+
+    assert victim.read_text(encoding="utf-8") == "do-not-touch\n"
 
 
 def test_backup_rejects_symlinked_destination(tmp_path: Path) -> None:
