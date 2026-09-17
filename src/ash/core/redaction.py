@@ -260,6 +260,14 @@ class StreamingRedactor:
             self._buffer = self._buffer[boundary:]
             return ""
 
+        if (
+            len(self._buffer) > self.max_token_characters
+            and _last_whitespace_boundary(self._buffer) is None
+        ):
+            self._buffer = ""
+            self._withholding_long_token = True
+            return LONG_TOKEN_WITHHELD_MARKER
+
         incomplete_start = _incomplete_secret_assignment_start(self._buffer)
         header_start = _incomplete_sensitive_header_start(self._buffer)
         if header_start is not None:

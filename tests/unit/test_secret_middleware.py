@@ -1,6 +1,8 @@
 import pytest
 
+import ash.core.redaction as redaction_module
 from ash.core.redaction import (
+    LONG_TOKEN_WITHHELD_MARKER,
     StreamingRedactor,
     find_secret_candidates,
     redact_text,
@@ -266,6 +268,22 @@ def test_streaming_redactor_withholds_unbounded_tokens() -> None:
     assert emitted == "[long unbroken output token withheld]"
     assert redactor.feed("still-hidden ") == ""
     assert redactor.feed("safe\n") == "safe\n"
+
+
+def test_streaming_redactor_withholds_long_token_before_secret_scan(monkeypatch) -> None:
+    def fail_if_scanned(_value: str) -> int | None:
+        raise AssertionError("long unbroken token should be withheld before secret scanning")
+
+    monkeypatch.setattr(
+        redaction_module,
+        "_incomplete_secret_assignment_start",
+        fail_if_scanned,
+    )
+    redactor = StreamingRedactor(max_token_characters=256)
+
+    emitted = redactor.feed("x" * 257)
+
+    assert emitted == LONG_TOKEN_WITHHELD_MARKER
 
 
 def test_secret_candidate_scanner_reports_kinds_without_values() -> None:
