@@ -8,6 +8,7 @@ executable verification so users do not need to understand pipx/uv internals.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -146,6 +147,14 @@ class _CapturedResult:
     stderr: str = ""
 
 
+@dataclass(frozen=True)
+class _OwnedMetadataFile:
+    path: Path
+    device: int
+    inode: int
+    sha256: str
+
+
 def install(
     *,
     extras: Sequence[str] = (),
@@ -190,7 +199,7 @@ def install(
             environment=environment,
             previous=previous_uv,
         )
-    quarantine_path: Path | None = None
+    quarantine: _OwnedMetadataFile | None = None
     repairing_corrupt_metadata = False
     if inspection.succeeded:
         previous = inspection.state
@@ -201,13 +210,13 @@ def install(
             runner=runner,
             environment=environment,
         )
-        metadata_path = _corrupt_ash_metadata_path(pipx_home)
-        if metadata_path is None:
+        corrupt_metadata = _corrupt_ash_metadata(pipx_home)
+        if corrupt_metadata is None:
             detail = inspection.error or "unknown pipx inspection failure"
             raise InstallError(
                 f"Could not inspect the existing pipx installation: {detail}"
             )
-        quarantine_path = _quarantine_pipx_metadata(metadata_path)
+        quarantine = _quarantine_pipx_metadata_owned(corrupt_metadata)
         repairing_corrupt_metadata = True
         previous = _PipxState()
         if not extras:
@@ -291,16 +300,23 @@ def install(
             runner=runner,
             environment=environment,
         )
-        if quarantine_path is not None:
-            quarantine_path.unlink()
+        if quarantine is not None:
+            try:
+                _remove_owned_quarantine(quarantine)
+            except InstallError as exc:
+                print(
+                    "Warning: Ash repaired pipx successfully but left the "
+                    f"metadata quarantine untouched because ownership changed: {exc}",
+                    file=sys.stderr,
+                )
     except Exception as exc:
-        if not repairing_corrupt_metadata or quarantine_path is None:
+        if not repairing_corrupt_metadata or quarantine is None:
             raise
         detail = str(exc).strip() or type(exc).__name__
         raise InstallError(
             "Corrupt pipx metadata for Ash was detected, but automatic repair "
             "failed. "
-            f"The original metadata was preserved at {quarantine_path}. "
+            f"The original metadata was preserved at {quarantine.path}. "
             f"{detail}"
         ) from exc
     return InstallResult(
@@ -369,31 +385,268 @@ def _pipx_home_directory(
     return os.path.expanduser(directory)
 
 
-def _corrupt_ash_metadata_path(pipx_home: str | None) -> Path | None:
+def _corrupt_ash_metadata(pipx_home: str | None) -> _OwnedMetadataFile | None:
     if not pipx_home:
         return None
-    metadata_path = Path(pipx_home) / "venvs" / _PACKAGE_NAME / "pipx_metadata.json"
+    metadata_path = Path(
+        os.path.abspath(
+            (Path(pipx_home).expanduser() / "venvs" / _PACKAGE_NAME / "pipx_metadata.json")
+        )
+    )
     try:
-        contents = _read_bounded_file(metadata_path, max_bytes=_MAX_METADATA_BYTES)
+        contents, metadata = _read_bounded_file_with_identity(
+            metadata_path,
+            max_bytes=_MAX_METADATA_BYTES,
+        )
         text = contents.decode("utf-8")
     except (OSError, UnicodeError, ValueError):
         return None
     try:
         json.loads(text)
     except json.JSONDecodeError:
-        return metadata_path
+        return _OwnedMetadataFile(
+            path=metadata_path,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            sha256=hashlib.sha256(contents).hexdigest(),
+        )
     return None
 
 
+def _corrupt_ash_metadata_path(pipx_home: str | None) -> Path | None:
+    corrupt = _corrupt_ash_metadata(pipx_home)
+    return corrupt.path if corrupt is not None else None
+
+
 def _quarantine_pipx_metadata(metadata_path: Path) -> Path:
-    while True:
-        quarantine_path = metadata_path.with_name(
-            f"{metadata_path.name}.corrupt-{uuid.uuid4().hex}"
+    contents, metadata = _read_bounded_file_with_identity(
+        metadata_path,
+        max_bytes=_MAX_METADATA_BYTES,
+    )
+    owned = _OwnedMetadataFile(
+        path=Path(os.path.abspath(metadata_path.expanduser())),
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        sha256=hashlib.sha256(contents).hexdigest(),
+    )
+    return _quarantine_pipx_metadata_owned(owned).path
+
+
+def _quarantine_pipx_metadata_owned(
+    metadata: _OwnedMetadataFile,
+) -> _OwnedMetadataFile:
+    if not _installer_supports_dir_fd():
+        return _quarantine_pipx_metadata_owned_fallback(metadata)
+
+    try:
+        parent_descriptor = _open_installer_directory(metadata.path.parent)
+    except OSError as exc:
+        raise InstallError(
+            f"could not safely open pipx metadata directory: {exc}"
+        ) from exc
+    source_descriptor = -1
+    try:
+        source_name = metadata.path.name
+        source_flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            source_flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            source_flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            source_flags |= os.O_NONBLOCK
+        source_descriptor = os.open(
+            source_name,
+            source_flags,
+            dir_fd=parent_descriptor,
         )
-        if not quarantine_path.exists():
+        source = os.fstat(source_descriptor)
+        if (source.st_dev, source.st_ino) != (metadata.device, metadata.inode):
+            raise InstallError("pipx metadata changed before it could be quarantined")
+        if not stat.S_ISREG(source.st_mode):
+            raise InstallError("pipx metadata is no longer a regular file")
+        source_bytes = _read_bounded_descriptor(
+            source_descriptor,
+            max_bytes=_MAX_METADATA_BYTES,
+            path=metadata.path,
+        )
+        if hashlib.sha256(source_bytes).hexdigest() != metadata.sha256:
+            raise InstallError("pipx metadata contents changed before quarantine")
+
+        for _ in range(32):
+            quarantine_name = f"{source_name}.corrupt-{uuid.uuid4().hex}"
+            quarantine_path = metadata.path.with_name(quarantine_name)
+            quarantine_descriptor = -1
+            try:
+                quarantine_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_CLOEXEC"):
+                    quarantine_flags |= os.O_CLOEXEC
+                if hasattr(os, "O_NOFOLLOW"):
+                    quarantine_flags |= os.O_NOFOLLOW
+                quarantine_descriptor = os.open(
+                    quarantine_name,
+                    quarantine_flags,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise InstallError(
+                    f"could not safely create pipx metadata quarantine: {exc}"
+                ) from exc
+            try:
+                if hasattr(os, "fchmod") and os.name != "nt":
+                    os.fchmod(quarantine_descriptor, 0o600)
+                _write_installer_descriptor(quarantine_descriptor, source_bytes)
+                os.fsync(quarantine_descriptor)
+                quarantined = os.fstat(quarantine_descriptor)
+                current = os.stat(
+                    source_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (current.st_dev, current.st_ino) != (
+                    metadata.device,
+                    metadata.inode,
+                ):
+                    raise InstallError(
+                        "pipx metadata changed while being quarantined"
+                    )
+                os.unlink(source_name, dir_fd=parent_descriptor)
+                return _OwnedMetadataFile(
+                    path=quarantine_path,
+                    device=quarantined.st_dev,
+                    inode=quarantined.st_ino,
+                    sha256=metadata.sha256,
+                )
+            except Exception:
+                if quarantine_descriptor >= 0:
+                    try:
+                        quarantined = os.fstat(quarantine_descriptor)
+                        _unlink_installer_entry_if_same(
+                            parent_descriptor,
+                            quarantine_name,
+                            quarantined,
+                        )
+                    except OSError:
+                        pass
+                raise
+            finally:
+                if quarantine_descriptor >= 0:
+                    os.close(quarantine_descriptor)
+        raise InstallError("could not allocate a unique pipx metadata quarantine name")
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError(
+            f"could not safely quarantine corrupt pipx metadata: {exc}"
+        ) from exc
+    finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        os.close(parent_descriptor)
+
+
+def _quarantine_pipx_metadata_owned_fallback(
+    metadata: _OwnedMetadataFile,
+) -> _OwnedMetadataFile:
+    raise InstallError(
+        "safe automatic quarantine of corrupt pipx metadata is unavailable on "
+        f"this platform; metadata was left untouched at {metadata.path}"
+    )
+
+
+def _remove_owned_quarantine(quarantine: _OwnedMetadataFile) -> None:
+    try:
+        contents, metadata = _read_bounded_file_with_identity(
+            quarantine.path,
+            max_bytes=_MAX_METADATA_BYTES,
+        )
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        raise InstallError(
+            f"could not safely inspect pipx metadata quarantine: {exc}"
+        ) from exc
+    if (metadata.st_dev, metadata.st_ino) != (quarantine.device, quarantine.inode):
+        raise InstallError("pipx metadata quarantine changed before cleanup")
+    if hashlib.sha256(contents).hexdigest() != quarantine.sha256:
+        raise InstallError("pipx metadata quarantine contents changed before cleanup")
+
+    try:
+        parent_descriptor = _open_installer_directory(quarantine.path.parent)
+    except OSError as exc:
+        raise InstallError(
+            f"could not safely open pipx metadata quarantine directory: {exc}"
+        ) from exc
+    try:
+        current = os.stat(
+            quarantine.path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (current.st_dev, current.st_ino) != (quarantine.device, quarantine.inode):
+            raise InstallError("pipx metadata quarantine changed before cleanup")
+        os.unlink(quarantine.path.name, dir_fd=parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _open_installer_directory(path: Path) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return os.open(path, flags)
+
+
+def _installer_supports_dir_fd() -> bool:
+    supported: set[Any] = set(getattr(os, "supports_dir_fd", ()))
+    return all(function in supported for function in (os.open, os.stat, os.unlink))
+
+
+def _write_installer_descriptor(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write while preserving pipx metadata")
+        view = view[written:]
+
+
+def _read_bounded_descriptor(
+    descriptor: int,
+    *,
+    max_bytes: int,
+    path: Path,
+) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    contents = bytearray()
+    while len(contents) <= max_bytes:
+        remaining = max_bytes + 1 - len(contents)
+        chunk = os.read(descriptor, min(_CAPTURE_CHUNK_BYTES, remaining))
+        if not chunk:
             break
-    metadata_path.rename(quarantine_path)
-    return quarantine_path
+        contents.extend(chunk)
+    if len(contents) > max_bytes:
+        raise ValueError(f"file exceeds {max_bytes} bytes: {path}")
+    return bytes(contents)
+
+
+def _unlink_installer_entry_if_same(
+    parent_descriptor: int,
+    name: str,
+    expected: os.stat_result,
+) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino):
+        os.unlink(name, dir_fd=parent_descriptor)
 
 
 def _completed_output_detail(completed: Any) -> str:
@@ -1002,6 +1255,15 @@ def _best_effort_root_kill(process: subprocess.Popen[Any]) -> None:
 
 
 def _read_bounded_file(path: Path, *, max_bytes: int) -> bytes:
+    contents, _metadata = _read_bounded_file_with_identity(path, max_bytes=max_bytes)
+    return contents
+
+
+def _read_bounded_file_with_identity(
+    path: Path,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, os.stat_result]:
     if path.is_symlink():
         raise ValueError(f"refusing to read symlink: {path}")
     flags = os.O_RDONLY
@@ -1014,7 +1276,8 @@ def _read_bounded_file(path: Path, *, max_bytes: int) -> bytes:
     descriptor = -1
     try:
         descriptor = os.open(path, flags)
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
             raise ValueError(f"refusing to read non-regular file: {path}")
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = -1
@@ -1024,7 +1287,7 @@ def _read_bounded_file(path: Path, *, max_bytes: int) -> bytes:
             os.close(descriptor)
     if len(contents) > max_bytes:
         raise ValueError(f"file exceeds {max_bytes} bytes: {path}")
-    return contents
+    return contents, metadata
 
 
 def _normalize_extras(values: Sequence[str]) -> tuple[str, ...]:

@@ -923,6 +923,208 @@ def test_quarantine_pipx_metadata_does_not_overwrite_existing_destination(
     assert second.read_text(encoding="utf-8") == "corrupt"
 
 
+def test_quarantine_pipx_metadata_does_not_overwrite_racing_destination(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import ash.installer as installer_module
+
+    metadata_path = tmp_path / "pipx_metadata.json"
+    metadata_path.write_text("corrupt", encoding="utf-8")
+    first = tmp_path / "pipx_metadata.json.corrupt-first"
+    second = tmp_path / "pipx_metadata.json.corrupt-second"
+    values = iter(["first", "second"])
+    monkeypatch.setattr(
+        installer_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex=next(values)),
+    )
+    real_open = installer_module.os.open
+    injected = False
+    monkeypatch.setattr(installer_module, "_installer_supports_dir_fd", lambda: True)
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal injected
+        if path == first.name and flags & os.O_CREAT and not injected:
+            injected = True
+            first.write_text("sentinel", encoding="utf-8")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(installer_module.os, "open", racing_open)
+
+    result = installer_module._quarantine_pipx_metadata(metadata_path)
+
+    assert injected is True
+    assert result == second
+    assert first.read_text(encoding="utf-8") == "sentinel"
+    assert second.read_text(encoding="utf-8") == "corrupt"
+
+
+def test_quarantine_rejects_metadata_replaced_after_corruption_detection(
+    tmp_path,
+) -> None:
+    import ash.installer as installer_module
+
+    pipx_home = tmp_path / "pipx-home"
+    metadata_directory = pipx_home / "venvs" / "ash-ai"
+    metadata_directory.mkdir(parents=True)
+    metadata_path = metadata_directory / "pipx_metadata.json"
+    metadata_path.write_text("{", encoding="utf-8")
+    detected = installer_module._corrupt_ash_metadata(str(pipx_home))
+    assert detected is not None
+    original = metadata_directory / "original-metadata"
+    metadata_path.rename(original)
+    replacement = b"UNRELATED REPLACEMENT\n"
+    metadata_path.write_bytes(replacement)
+
+    with pytest.raises(InstallError, match="changed before it could be quarantined"):
+        installer_module._quarantine_pipx_metadata_owned(detected)
+
+    assert metadata_path.read_bytes() == replacement
+    assert original.read_text(encoding="utf-8") == "{"
+    assert list(metadata_directory.glob("pipx_metadata.json.corrupt-*")) == []
+
+
+def test_successful_repair_does_not_delete_replaced_quarantine(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    import ash.installer as installer_module
+
+    pipx_home = tmp_path / "pipx-home"
+    metadata_directory = pipx_home / "venvs" / "ash-ai"
+    metadata_directory.mkdir(parents=True)
+    metadata_path = metadata_directory / "pipx_metadata.json"
+    metadata_path.write_text("{", encoding="utf-8")
+    launcher_directory = tmp_path / "bin"
+    launcher_directory.mkdir()
+    managed_executable = str(metadata_directory / "bin" / "ash")
+    repaired_metadata = {
+        "venvs": {
+            "ash-ai": {
+                "metadata": {
+                    "main_package": {
+                        "package_or_url": "ash-ai @ git+https://example.invalid/ash",
+                        "app_paths": [{"__Path__": managed_executable}],
+                    }
+                }
+            }
+        }
+    }
+    quarantine = metadata_directory / "pipx_metadata.json.corrupt-cleanup"
+    saved_original = metadata_directory / "original-quarantine"
+    replacement = b"UNRELATED REPLACEMENT\n"
+    installed = False
+    replaced = False
+    monkeypatch.setattr(
+        installer_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="cleanup"),
+    )
+
+    def runner(command, **kwargs):
+        nonlocal installed, replaced
+        if command == ["/usr/bin/pipx", "list", "--json"]:
+            if not installed:
+                return _completed(returncode=1, stderr="JSONDecodeError")
+            return _completed(stdout=json.dumps(repaired_metadata))
+        if command[1:3] == ["install", "--force"]:
+            assert quarantine.exists()
+            metadata_path.write_text(json.dumps(repaired_metadata), encoding="utf-8")
+            installed = True
+            return _completed()
+        if command == [managed_executable, "--version"]:
+            quarantine.rename(saved_original)
+            quarantine.write_bytes(replacement)
+            replaced = True
+            return _completed(stdout="ash 0.1.0\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    outcome = install(
+        runner=runner,
+        which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
+        environ={
+            "PATH": f"{launcher_directory}{os.pathsep}/usr/bin",
+            "PIPX_HOME": str(pipx_home),
+            "PIPX_BIN_DIR": str(launcher_directory),
+        },
+    )
+
+    assert replaced is True
+    assert outcome.manager == "pipx"
+    assert outcome.version == "ash 0.1.0"
+    assert quarantine.read_bytes() == replacement
+    assert saved_original.exists()
+    assert "ownership changed" in capsys.readouterr().err
+
+
+def test_failed_repair_preserves_owned_quarantine(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import ash.installer as installer_module
+
+    pipx_home = tmp_path / "pipx-home"
+    metadata_directory = pipx_home / "venvs" / "ash-ai"
+    metadata_directory.mkdir(parents=True)
+    metadata_path = metadata_directory / "pipx_metadata.json"
+    metadata_path.write_text("{", encoding="utf-8")
+    launcher_directory = tmp_path / "bin"
+    launcher_directory.mkdir()
+    quarantine = metadata_directory / "pipx_metadata.json.corrupt-failed"
+    monkeypatch.setattr(
+        installer_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="failed"),
+    )
+
+    def runner(command, **kwargs):
+        if command == ["/usr/bin/pipx", "list", "--json"]:
+            return _completed(returncode=1, stderr="JSONDecodeError")
+        if command[1:3] == ["install", "--force"]:
+            return _completed(returncode=1, stderr="repair failed")
+        raise AssertionError(f"unexpected command: {command}")
+
+    with pytest.raises(InstallError) as excinfo:
+        install(
+            runner=runner,
+            which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
+            environ={
+                "PATH": f"{launcher_directory}{os.pathsep}/usr/bin",
+                "PIPX_HOME": str(pipx_home),
+                "PIPX_BIN_DIR": str(launcher_directory),
+            },
+        )
+
+    assert "original metadata was preserved at" in str(excinfo.value).lower()
+    assert str(quarantine) in str(excinfo.value)
+    assert not metadata_path.exists()
+    assert quarantine.read_text(encoding="utf-8") == "{"
+
+
+def test_corrupt_metadata_repair_fails_closed_without_dir_fd_support(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import ash.installer as installer_module
+
+    pipx_home = tmp_path / "pipx-home"
+    metadata_directory = pipx_home / "venvs" / "ash-ai"
+    metadata_directory.mkdir(parents=True)
+    metadata_path = metadata_directory / "pipx_metadata.json"
+    metadata_path.write_text("{", encoding="utf-8")
+    detected = installer_module._corrupt_ash_metadata(str(pipx_home))
+    assert detected is not None
+    monkeypatch.setattr(installer_module, "_installer_supports_dir_fd", lambda: False)
+
+    with pytest.raises(InstallError, match="safe automatic quarantine"):
+        installer_module._quarantine_pipx_metadata_owned(detected)
+
+    assert metadata_path.read_text(encoding="utf-8") == "{"
+    assert list(metadata_directory.glob("pipx_metadata.json.corrupt-*")) == []
+
+
 def test_installer_does_not_quarantine_metadata_for_unrelated_pipx_failure(
     tmp_path,
 ) -> None:
