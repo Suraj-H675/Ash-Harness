@@ -292,6 +292,7 @@ def _backup_connection_to_descriptor(
     stable_path = descriptor_path(descriptor)
     if stable_path is not None:
         with closing(sqlite3.connect(stable_path)) as target:
+            target.execute("PRAGMA journal_mode=OFF;")
             source.backup(target)
         return
 
