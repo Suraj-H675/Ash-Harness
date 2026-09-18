@@ -348,6 +348,59 @@ def open_anchored_regular_file(
             os.close(descriptor)
 
 
+@contextmanager
+def create_anchored_regular_file(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+    mode: int = 0o600,
+) -> Iterator[int]:
+    """Exclusively create one regular file below ``trusted_root``."""
+
+    if not _supports_anchored_path_io():
+        validate_unlinked_path(path, trusted_root=trusted_root, label=label)
+        with create_unlinked_regular_file(path, label=label, mode=mode) as descriptor:
+            yield descriptor
+        return
+    with _open_anchored_parent(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    ) as (parent_descriptor, name, target):
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | _close_on_exec_flag()
+            | _nofollow_flag()
+        )
+        try:
+            descriptor = os.open(name, flags, mode, dir_fd=parent_descriptor)
+        except FileExistsError as exc:
+            observed = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(observed.st_mode):
+                raise ValueError(
+                    f"refusing to use {label} through a symlink or junction: {target}"
+                ) from exc
+            raise
+        completed = False
+        try:
+            _require_regular_descriptor(descriptor, target, label=label)
+            if hasattr(os, "fchmod") and os.name != "nt":
+                os.fchmod(descriptor, mode)
+            yield descriptor
+            completed = True
+        finally:
+            if not completed:
+                _unlink_same_directory_entry(parent_descriptor, name, descriptor)
+            os.close(descriptor)
+
+
 def unlink_anchored_open_file(
     path: str | Path,
     descriptor: int,
@@ -380,6 +433,143 @@ def unlink_anchored_open_file(
             os.fsync(parent_descriptor)
         except OSError:
             pass
+
+
+def require_anchored_path_absent(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+) -> None:
+    """Require that one anchored path is still absent."""
+
+    root, target, _ = _anchored_path_parts(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    )
+    if not _supports_anchored_path_io():
+        validate_unlinked_path(target.parent, trusted_root=root, label=label)
+        try:
+            os.lstat(target)
+        except FileNotFoundError:
+            return
+        raise ValueError(f"refusing to use {label} that appeared after snapshot: {target}")
+    with _open_anchored_parent(
+        target,
+        trusted_root=root,
+        label=label,
+    ) as (parent_descriptor, name, _target):
+        try:
+            os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise ValueError(f"refusing to use {label} that appeared after snapshot: {target}")
+
+
+def replace_anchored_open_file(
+    source: str | Path,
+    destination: str | Path,
+    descriptor: int,
+    *,
+    trusted_root: str | Path,
+    label: str,
+    expected_destination_descriptor: int | None = None,
+    require_destination_absent: bool = False,
+) -> Path:
+    """Atomically replace one anchored sibling with the inode held by ``descriptor``."""
+
+    root, source_path, source_parts = _anchored_path_parts(
+        source,
+        trusted_root=trusted_root,
+        label=label,
+    )
+    _root, destination_path, destination_parts = _anchored_path_parts(
+        destination,
+        trusted_root=root,
+        label=label,
+    )
+    if source_parts[:-1] != destination_parts[:-1]:
+        raise ValueError(f"refusing to move {label} across directories")
+    if expected_destination_descriptor is not None and require_destination_absent:
+        raise ValueError("destination cannot be both expected and required absent")
+    if not _supports_anchored_path_io():
+        return replace_open_file(source_path, destination_path, descriptor, label=label)
+
+    with _open_anchored_parent(
+        source_path,
+        trusted_root=root,
+        label=label,
+    ) as (parent_descriptor, source_name, target):
+        opened = os.fstat(descriptor)
+        observed = os.stat(
+            source_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if stat.S_ISLNK(observed.st_mode) or (
+            observed.st_dev,
+            observed.st_ino,
+        ) != (opened.st_dev, opened.st_ino):
+            raise ValueError(
+                f"refusing to replace {label} that changed after opening: {target}"
+            )
+        destination_name = destination_parts[-1]
+        try:
+            destination_metadata = os.stat(
+                destination_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            destination_metadata = None
+        if expected_destination_descriptor is not None:
+            expected_destination = os.fstat(expected_destination_descriptor)
+            if destination_metadata is None or stat.S_ISLNK(
+                destination_metadata.st_mode
+            ) or (
+                destination_metadata.st_dev,
+                destination_metadata.st_ino,
+            ) != (
+                expected_destination.st_dev,
+                expected_destination.st_ino,
+            ):
+                raise ValueError(
+                    f"refusing to replace {label} destination that changed after "
+                    f"snapshot: {destination_path}"
+                )
+        elif require_destination_absent and destination_metadata is not None:
+            raise ValueError(
+                f"refusing to replace {label} destination that appeared after "
+                f"snapshot: {destination_path}"
+            )
+        if destination_metadata is not None and not stat.S_ISREG(
+            destination_metadata.st_mode
+        ):
+            raise ValueError(
+                f"refusing to replace non-regular {label}: {destination_path}"
+            )
+        os.rename(
+            source_name,
+            destination_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        try:
+            os.fsync(parent_descriptor)
+        except OSError:
+            pass
+        current = os.stat(
+            destination_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError(
+                f"refusing to use {label} that changed during replacement: "
+                f"{destination_path}"
+            )
+        return destination_path
 
 
 def _read_bounded_descriptor(

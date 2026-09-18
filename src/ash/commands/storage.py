@@ -7,6 +7,7 @@ import os
 import platform
 import subprocess
 import sqlite3
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,12 +16,14 @@ from uuid import uuid4
 from ash.core.session import CURRENT_SCHEMA_VERSION, SessionStorageError, SessionStore
 from ash.core.redaction import redact_text
 from ash.safe_io import (
-    create_unlinked_regular_file,
+    create_anchored_regular_file,
     descriptor_path,
+    open_anchored_regular_file,
     open_unlinked_regular_file,
-    replace_open_file,
+    require_anchored_path_absent,
+    replace_anchored_open_file,
+    unlink_anchored_open_file,
     validate_unlinked_file_path,
-    verify_open_file_identity,
 )
 from ash.safety.environment import resolve_host_executable
 from ash.ui.safe_text import terminal_safe_text
@@ -142,6 +145,14 @@ def _copy_descriptor(source: int, destination: int) -> None:
     os.fsync(destination)
 
 
+def _storage_trusted_root(path: Path) -> Path:
+    candidate = Path(os.path.abspath(path.expanduser()))
+    root = candidate.parent.parent
+    while not root.exists() and root != root.parent:
+        root = root.parent
+    return root
+
+
 def backup_database(path: str | Path, destination: str | Path | None = None) -> Path:
     check = check_database(path)
     if not check.ok:
@@ -168,6 +179,7 @@ def restore_database(
         raise SessionStorageError(str(exc)) from exc
     if database == backup_path:
         raise SessionStorageError("Backup and destination must differ")
+    trusted_root = _storage_trusted_root(database)
     try:
         with open_unlinked_regular_file(
             backup_path,
@@ -194,8 +206,9 @@ def restore_database(
                 f".{database.name}.restore-{uuid4().hex}.tmp"
             )
             preserved: list[Path] = []
-            with create_unlinked_regular_file(
+            with create_anchored_regular_file(
                 temporary,
+                trusted_root=trusted_root,
                 label="session restore temporary",
                 mode=0o600,
             ) as temporary_descriptor:
@@ -209,47 +222,72 @@ def restore_database(
                         "Refusing to restore an unhealthy backup: "
                         + "; ".join(temporary_check.messages)
                     )
-                for current in (
+                tracked = (
                     database,
                     Path(f"{database}-wal"),
                     Path(f"{database}-shm"),
-                ):
-                    if current.exists():
+                )
+                with ExitStack() as current_stack:
+                    current_descriptors: dict[Path, int | None] = {}
+                    for current in tracked:
+                        try:
+                            current_descriptor = current_stack.enter_context(
+                                open_anchored_regular_file(
+                                    current,
+                                    trusted_root=trusted_root,
+                                    label="session pre-restore source",
+                                )
+                            )
+                        except FileNotFoundError:
+                            current_descriptors[current] = None
+                            continue
+                        current_descriptors[current] = current_descriptor
                         preserved_path = database.with_name(
                             f"{current.name}.pre-restore.{timestamp}.raw"
                         )
-                        with open_unlinked_regular_file(
-                            current,
-                            label="session pre-restore source",
-                        ) as current_descriptor:
-                            with create_unlinked_regular_file(
-                                preserved_path,
-                                label="session pre-restore snapshot",
-                                mode=0o600,
-                            ) as preserved_descriptor:
-                                _copy_descriptor(
-                                    current_descriptor,
-                                    preserved_descriptor,
-                                )
-                                verify_open_file_identity(
-                                    preserved_path,
-                                    preserved_descriptor,
-                                    label="session pre-restore snapshot",
-                                )
+                        with create_anchored_regular_file(
+                            preserved_path,
+                            trusted_root=trusted_root,
+                            label="session pre-restore snapshot",
+                            mode=0o600,
+                        ) as preserved_descriptor:
+                            _copy_descriptor(
+                                current_descriptor,
+                                preserved_descriptor,
+                            )
                         preserved.append(preserved_path)
 
-                try:
-                    validate_unlinked_file_path(database, label="session database")
-                except ValueError as exc:
-                    raise SessionStorageError(str(exc)) from exc
-                for sidecar in (Path(f"{database}-wal"), Path(f"{database}-shm")):
-                    sidecar.unlink(missing_ok=True)
-                replace_open_file(
-                    temporary,
-                    database,
-                    temporary_descriptor,
-                    label="session restore temporary",
-                )
+                    try:
+                        validate_unlinked_file_path(database, label="session database")
+                    except ValueError as exc:
+                        raise SessionStorageError(str(exc)) from exc
+
+                    for sidecar in tracked[1:]:
+                        sidecar_descriptor = current_descriptors[sidecar]
+                        if sidecar_descriptor is None:
+                            require_anchored_path_absent(
+                                sidecar,
+                                trusted_root=trusted_root,
+                                label="session restore sidecar",
+                            )
+                        else:
+                            unlink_anchored_open_file(
+                                sidecar,
+                                sidecar_descriptor,
+                                trusted_root=trusted_root,
+                                label="session restore sidecar",
+                            )
+
+                    database_descriptor = current_descriptors[database]
+                    replace_anchored_open_file(
+                        temporary,
+                        database,
+                        temporary_descriptor,
+                        trusted_root=trusted_root,
+                        label="session restore temporary",
+                        expected_destination_descriptor=database_descriptor,
+                        require_destination_absent=database_descriptor is None,
+                    )
     except (OSError, ValueError) as exc:
         raise SessionStorageError(str(exc)) from exc
     return database, tuple(preserved)

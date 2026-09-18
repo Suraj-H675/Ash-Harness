@@ -170,6 +170,136 @@ def test_restore_does_not_follow_pre_restore_snapshot_symlink(
     assert victim.read_text(encoding="utf-8") == "do-not-touch\n"
 
 
+def test_restore_rejects_database_directory_swapped_before_sidecar_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.commands.storage as storage_module
+
+    db_dir = tmp_path / "db"
+    db_dir.mkdir()
+    database = db_dir / "sessions.db"
+    SessionStore(database).create_session("/current")
+    backup = tmp_path / "backup.db"
+    SessionStore(backup).create_session("/backup")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_wal = outside / "sessions.db-wal"
+    outside_shm = outside / "sessions.db-shm"
+    outside_wal.write_bytes(b"DO NOT DELETE WAL\n")
+    outside_shm.write_bytes(b"DO NOT DELETE SHM\n")
+    real_validate = storage_module.validate_unlinked_file_path
+    database_validations = 0
+    swapped = False
+
+    def validate_then_swap(path, *args, **kwargs):
+        nonlocal database_validations, swapped
+        result = real_validate(path, *args, **kwargs)
+        if kwargs.get("label") == "session database":
+            database_validations += 1
+            if database_validations == 3 and not swapped:
+                swapped = True
+                db_dir.rename(tmp_path / "db-real")
+                try:
+                    db_dir.symlink_to(outside, target_is_directory=True)
+                except OSError as exc:
+                    pytest.skip(f"symlink creation is unavailable: {exc}")
+        return result
+
+    monkeypatch.setattr(
+        storage_module,
+        "validate_unlinked_file_path",
+        validate_then_swap,
+    )
+
+    with pytest.raises(SessionStorageError, match="symlink or junction"):
+        restore_database(database, backup, confirmed=True)
+
+    assert swapped is True
+    assert outside_wal.read_bytes() == b"DO NOT DELETE WAL\n"
+    assert outside_shm.read_bytes() == b"DO NOT DELETE SHM\n"
+    assert (tmp_path / "db-real" / "sessions.db").exists()
+
+
+def test_restore_rejects_database_replaced_after_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.commands.storage as storage_module
+
+    db_dir = tmp_path / "db"
+    db_dir.mkdir()
+    database = db_dir / "sessions.db"
+    SessionStore(database).create_session("/current")
+    backup = tmp_path / "backup.db"
+    SessionStore(backup).create_session("/backup")
+    replacement = b"UNRELATED REPLACEMENT\n"
+    real_validate = storage_module.validate_unlinked_file_path
+    database_validations = 0
+    replaced = False
+
+    def validate_then_replace(path, *args, **kwargs):
+        nonlocal database_validations, replaced
+        result = real_validate(path, *args, **kwargs)
+        if kwargs.get("label") == "session database":
+            database_validations += 1
+            if database_validations == 3 and not replaced:
+                replaced = True
+                database.unlink()
+                database.write_bytes(replacement)
+        return result
+
+    monkeypatch.setattr(
+        storage_module,
+        "validate_unlinked_file_path",
+        validate_then_replace,
+    )
+
+    with pytest.raises(SessionStorageError, match="destination that changed"):
+        restore_database(database, backup, confirmed=True)
+
+    assert replaced is True
+    assert database.read_bytes() == replacement
+
+
+def test_restore_rejects_sidecar_created_after_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.commands.storage as storage_module
+
+    db_dir = tmp_path / "db"
+    db_dir.mkdir()
+    database = db_dir / "sessions.db"
+    SessionStore(database).create_session("/current")
+    backup = tmp_path / "backup.db"
+    SessionStore(backup).create_session("/backup")
+    wal = db_dir / "sessions.db-wal"
+    sentinel = b"NEW CONCURRENT WAL\n"
+    real_validate = storage_module.validate_unlinked_file_path
+    database_validations = 0
+    created = False
+
+    def validate_then_create(path, *args, **kwargs):
+        nonlocal database_validations, created
+        result = real_validate(path, *args, **kwargs)
+        if kwargs.get("label") == "session database":
+            database_validations += 1
+            if database_validations == 3 and not created:
+                created = True
+                wal.write_bytes(sentinel)
+        return result
+
+    monkeypatch.setattr(
+        storage_module,
+        "validate_unlinked_file_path",
+        validate_then_create,
+    )
+
+    with pytest.raises(SessionStorageError, match="appeared after snapshot"):
+        restore_database(database, backup, confirmed=True)
+
+    assert created is True
+    assert wal.read_bytes() == sentinel
+
+
 def test_backup_rejects_symlinked_destination(tmp_path: Path) -> None:
     path = tmp_path / "sessions.db"
     SessionStore(path).create_session("/workspace")

@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import io
+import os
 from pathlib import Path
 
 import pytest
 
 from ash.safe_io import (
     atomic_write_unlinked_bytes,
+    create_anchored_regular_file,
     create_unlinked_regular_file,
     ensure_anchored_directory,
     read_bounded_open_file,
     read_bounded_text,
     remove_anchored_directory_tree,
+    replace_anchored_open_file,
     replace_open_file,
     strict_json_loads,
     validate_unlinked_directory_path,
@@ -219,3 +222,63 @@ def test_anchored_directory_removal_does_not_follow_nested_symlink(tmp_path: Pat
 
     assert not profile.exists()
     assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_anchored_regular_file_creation_rejects_intermediate_symlink(
+    tmp_path: Path,
+) -> None:
+    trusted_root = tmp_path / "home"
+    trusted_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (trusted_root / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+    target = trusted_root / ".ash" / "restore.tmp"
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        with create_anchored_regular_file(
+            target,
+            trusted_root=trusted_root,
+            label="restore temporary",
+        ):
+            pass
+
+    assert not (outside / "restore.tmp").exists()
+
+
+def test_anchored_replace_rejects_parent_swap_and_preserves_outside_destination(
+    tmp_path: Path,
+) -> None:
+    trusted_root = tmp_path / "home"
+    directory = trusted_root / "db"
+    directory.mkdir(parents=True)
+    source = directory / "restore.tmp"
+    destination = directory / "sessions.db"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "sessions.db"
+    victim.write_bytes(b"DO NOT REPLACE\n")
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        with create_anchored_regular_file(
+            source,
+            trusted_root=trusted_root,
+            label="restore temporary",
+        ) as descriptor:
+            os.write(descriptor, b"replacement")
+            directory.rename(trusted_root / "db-real")
+            try:
+                directory.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+            replace_anchored_open_file(
+                source,
+                destination,
+                descriptor,
+                trusted_root=trusted_root,
+                label="restore temporary",
+            )
+
+    assert victim.read_bytes() == b"DO NOT REPLACE\n"
