@@ -185,7 +185,7 @@ class SearchTextArgs(BaseModel):
 
 class SearchTextTool(BaseTool):
     name = "search_text"
-    description = "Search workspace text with bounded file and line locations."
+    description = "Search workspace text using ripgrep with file and line locations."
     args_schema = SearchTextArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:
