@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -20,7 +19,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
-from ash.safe_io import read_bounded_bytes, strict_json_loads, validate_unlinked_path
+from ash.safe_io import (
+    atomic_write_unlinked_bytes,
+    ensure_anchored_directory,
+    read_bounded_open_file,
+    strict_json_loads,
+    validate_unlinked_path,
+)
 
 CATALOG_VERSION = 1
 MAX_CATALOG_BYTES = 256 * 1024
@@ -34,6 +39,20 @@ _DIGEST = re.compile(r"^[0-9a-f]{40,64}$")
 
 class PluginCatalogError(ValueError):
     """Raised when a signed catalog is malformed or untrusted."""
+
+
+def _catalog_trusted_root(path: Path) -> Path:
+    candidate = Path(os.path.abspath(path.expanduser()))
+    home = Path(os.path.abspath(Path.home().expanduser()))
+    try:
+        candidate.relative_to(home)
+    except ValueError:
+        root = candidate.parent.parent
+    else:
+        root = home
+    while not root.exists() and root != root.parent:
+        root = root.parent
+    return root
 
 
 def trusted_catalog_keys_path() -> Path:
@@ -74,15 +93,8 @@ def fetch_catalog(
 
     if not 1.0 <= timeout_seconds <= 60.0:
         raise PluginCatalogError("catalog fetch timeout must be 1 to 60 seconds")
-    destination = catalog_cache_path(url)
-    home = Path.home()
-    try:
-        destination.relative_to(home)
-        trusted_root = home
-    except ValueError:
-        # Internal/test overrides may place the cache outside HOME. Keep the
-        # immediate cache parent below the validation root so it is inspected.
-        trusted_root = destination.parent.parent
+    destination = Path(os.path.abspath(catalog_cache_path(url).expanduser()))
+    trusted_root = _catalog_trusted_root(destination)
     try:
         destination = validate_unlinked_path(
             destination,
@@ -136,7 +148,15 @@ def fetch_catalog(
     except (UnicodeError, ValueError, KeyError, TypeError):
         # Do not cache malformed or unsigned payloads.
         raise PluginCatalogError("invalid signed plugin catalog response") from None
-    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        ensure_anchored_directory(
+            destination.parent,
+            trusted_root=trusted_root,
+            label="plugin catalog cache directory",
+            mode=0o700,
+        )
+    except (OSError, ValueError) as exc:
+        raise PluginCatalogError(f"could not prepare plugin catalog cache: {exc}") from exc
     try:
         validate_unlinked_path(
             destination,
@@ -145,35 +165,16 @@ def fetch_catalog(
         )
     except ValueError as exc:
         raise PluginCatalogError(str(exc)) from exc
-    if os.name != "nt":
-        destination.parent.chmod(0o700)
-    descriptor = -1
-    temporary: Path | None = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=destination.parent,
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
+        atomic_write_unlinked_bytes(
+            destination,
+            raw,
+            label="plugin catalog cache",
+            mode=0o600,
+            trusted_root=trusted_root,
         )
-        temporary = Path(temporary_name)
-        if os.name != "nt" and hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = -1
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise PluginCatalogError(f"could not save plugin catalog: {exc}") from exc
-    finally:
-        if descriptor != -1:
-            os.close(descriptor)
-        if temporary is not None:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
     return destination
 
 
@@ -193,13 +194,8 @@ class SignedCatalog:
 
 
 def load_trusted_keys(path: Path) -> dict[str, bytes]:
-    candidate = path.expanduser()
-    home = Path.home()
-    try:
-        candidate.relative_to(home)
-        trusted_root = home
-    except ValueError:
-        trusted_root = candidate.parent.parent
+    candidate = Path(os.path.abspath(path.expanduser()))
+    trusted_root = _catalog_trusted_root(candidate)
     try:
         path = validate_unlinked_path(
             candidate,
@@ -209,7 +205,12 @@ def load_trusted_keys(path: Path) -> dict[str, bytes]:
     except ValueError as exc:
         raise PluginCatalogError(str(exc)) from exc
     try:
-        raw = read_bounded_bytes(path, 64 * 1024, label="trusted catalog keys")
+        raw = read_bounded_open_file(
+            path,
+            64 * 1024,
+            label="trusted catalog keys",
+            trusted_root=trusted_root,
+        )
     except (OSError, ValueError) as exc:
         if "exceeds" in str(exc):
             raise PluginCatalogError(
@@ -262,8 +263,15 @@ def parse_and_verify_catalog(
     *,
     trusted_keys_path: Path,
 ) -> SignedCatalog:
+    candidate = Path(os.path.abspath(path.expanduser()))
+    trusted_root = _catalog_trusted_root(candidate)
     try:
-        raw = read_bounded_bytes(path, MAX_CATALOG_BYTES, label="plugin catalog")
+        raw = read_bounded_open_file(
+            candidate,
+            MAX_CATALOG_BYTES,
+            label="plugin catalog",
+            trusted_root=trusted_root,
+        )
     except (OSError, ValueError) as exc:
         if "exceeds" in str(exc):
             raise PluginCatalogError(

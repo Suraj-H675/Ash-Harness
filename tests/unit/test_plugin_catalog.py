@@ -11,6 +11,7 @@ import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+import ash.plugins.catalog as catalog_module
 import ash.plugins.lifecycle as plugin_lifecycle
 from ash.plugins.catalog import (
     MAX_CATALOG_BYTES,
@@ -89,6 +90,21 @@ def test_signed_catalog_round_trip(tmp_path: Path) -> None:
     verified = parse_and_verify_catalog(
         files["catalog_path"], trusted_keys_path=files["keys_path"]
     )
+    assert verified.sequence == 1
+    assert verified.entries["demo"].name == "demo"
+
+
+def test_signed_catalog_relative_paths_resolve_from_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_catalog(tmp_path / "catalog.json")
+    monkeypatch.chdir(tmp_path)
+
+    verified = parse_and_verify_catalog(
+        Path("catalog.json"),
+        trusted_keys_path=Path("keys.json"),
+    )
+
     assert verified.sequence == 1
     assert verified.entries["demo"].name == "demo"
 
@@ -266,6 +282,46 @@ def test_remote_catalog_fetch_rejects_linked_cache_parent(
     assert not (outside / "catalog.json").exists()
 
 
+def test_remote_catalog_fetch_rejects_cache_parent_swapped_before_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_parent = tmp_path / "cache"
+    cache_parent.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "catalog.json"
+    victim.write_text('{"marker":"do-not-touch"}\n', encoding="utf-8")
+    destination = cache_parent / "catalog.json"
+    monkeypatch.setattr(catalog_module, "catalog_cache_path", lambda url: destination)
+    real_write = catalog_module.atomic_write_unlinked_bytes
+    swapped = False
+
+    def write_then_swap(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            cache_parent.rename(tmp_path / "cache-real")
+            try:
+                cache_parent.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(catalog_module, "atomic_write_unlinked_bytes", write_then_swap)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'{"keyId":"demo"}', request=request)
+
+    with pytest.raises(PluginCatalogError, match="could not save plugin catalog"):
+        fetch_catalog(
+            "https://plugins.example/catalog.json",
+            transport=httpx.MockTransport(handler),
+        )
+
+    assert swapped is True
+    assert victim.read_text(encoding="utf-8") == '{"marker":"do-not-touch"}\n'
+
+
 def test_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     files = _write_catalog(tmp_path / "catalog.json")
     raw = files["catalog_path"].read_text()
@@ -314,6 +370,90 @@ def test_trusted_catalog_keys_reject_linked_state_parent(tmp_path: Path) -> None
 
     with pytest.raises(PluginCatalogError, match="symlink or junction"):
         load_trusted_keys(home / ".ash" / "catalog-keys.json")
+
+
+def test_trusted_catalog_keys_reject_state_parent_swapped_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    state = home / ".ash"
+    state.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _, public_key, _ = generate_catalog_signing_key()
+    key_path = state / "catalog-keys.json"
+    key_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "keys": [
+                    {
+                        "keyId": "legit-key",
+                        "algorithm": "ed25519",
+                        "publicKey": public_key,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (outside / "catalog-keys.json").write_text(
+        key_path.read_text(encoding="utf-8").replace("legit-key", "evil-key"),
+        encoding="utf-8",
+    )
+    real_read = catalog_module.read_bounded_open_file
+    swapped = False
+
+    def read_then_swap(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            state.rename(home / ".ash-real")
+            try:
+                state.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(catalog_module, "read_bounded_open_file", read_then_swap)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    with pytest.raises(PluginCatalogError, match="cannot read trusted catalog keys"):
+        load_trusted_keys(key_path)
+    assert swapped is True
+
+
+def test_signed_catalog_rejects_parent_swapped_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog_parent = tmp_path / "catalog-parent"
+    catalog_parent.mkdir()
+    outside = tmp_path / "outside-catalog"
+    outside.mkdir()
+    legitimate = _write_catalog(catalog_parent / "catalog.json")
+    attacker = _write_catalog(outside / "catalog.json")
+    real_read = catalog_module.read_bounded_open_file
+    swapped = False
+
+    def read_then_swap(path, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == legitimate["catalog_path"] and not swapped:
+            swapped = True
+            catalog_parent.rename(tmp_path / "catalog-parent-real")
+            try:
+                catalog_parent.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_module, "read_bounded_open_file", read_then_swap)
+
+    with pytest.raises(PluginCatalogError, match="cannot read plugin catalog"):
+        parse_and_verify_catalog(
+            legitimate["catalog_path"],
+            trusted_keys_path=attacker["keys_path"],
+        )
+    assert swapped is True
 
 
 def test_git_install_verifies_catalog_revision(tmp_path: Path) -> None:
