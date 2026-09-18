@@ -2,24 +2,20 @@
 
 from __future__ import annotations
 
-import asyncio
 import fnmatch
-import json
+import io
+import stat
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, TextIO
 
 from pydantic import BaseModel, Field
 
-from ash.safety.environment import resolve_host_executable
-from ash.sandbox.process_utils import (
-    ProcessOutputLimitExceeded,
-    ProcessTreeError,
-    ProcessTreeUnavailable,
-    communicate_process,
-    prepare_process_tree,
-    settle_process_tree_after_cancellation,
-    terminate_process_tree,
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import (
+    list_scoped_directory,
+    read_scoped_bytes,
+    stat_scoped_path,
 )
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 
@@ -27,7 +23,6 @@ from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 DEFAULT_MAX_RESULTS = 200
 HARD_MAX_RESULTS = 2_000
 MAX_SEARCH_CAPTURE_BYTES = 2_000_000
-SEARCH_TIMEOUT_SECONDS = 30
 MAX_SEARCH_LINE_CHARS = 64 * 1024
 MAX_SEARCH_MATCH_CARRY_CHARS = 4 * 1024
 MAX_LIST_DIRECTORY_DEPTH = 4
@@ -40,34 +35,39 @@ MAX_SEARCH_FILE_BYTES = 8 * 1024 * 1024
 
 def _iter_workspace_paths(
     root: Path,
+    guard: SafetyGuard,
     *,
     recursive: bool,
     max_depth: int | None = None,
-) -> Iterator[Path]:
+) -> Iterator[tuple[Path, bool]]:
     """Yield workspace entries lazily without descending through links."""
 
-    def walk(directory: Path, depth: int) -> Iterator[Path]:
+    def walk(directory: Path, depth: int) -> Iterator[tuple[Path, bool]]:
         if max_depth is not None and depth >= max_depth:
             return
         try:
-            children = directory.iterdir()
-            for path in children:
-                yield path
+            _, children = list_scoped_directory(directory, guard)
+            for name, is_directory in children:
+                path = directory / name
+                yield path, is_directory
                 if not recursive or (
                     max_depth is not None and depth + 1 >= max_depth
                 ):
                     continue
-                try:
-                    is_link = path.is_symlink()
-                    is_directory = path.is_dir()
-                except OSError:
-                    continue
-                if is_directory and not is_link:
+                if is_directory:
                     yield from walk(path, depth + 1)
-        except OSError:
+        except (OSError, SafetyViolation):
             return
 
     yield from walk(root, 0)
+
+
+def _is_scoped_directory(path: Path, guard: SafetyGuard) -> bool:
+    try:
+        _, metadata = stat_scoped_path(path, guard)
+    except (OSError, SafetyViolation):
+        return False
+    return stat.S_ISDIR(metadata.st_mode)
 
 
 class ListDirectoryArgs(BaseModel):
@@ -84,14 +84,15 @@ class ListDirectoryTool(BaseTool):
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ListDirectoryArgs(**kwargs)
         root = self.safety_guard.validate_path(args.directory_path)
-        if not root.is_dir():
+        if not _is_scoped_directory(root, self.safety_guard):
             return ToolResult(
                 success=False, output="", error=f"Not a directory: {root}"
             )
         entries: list[str] = []
         truncated = False
-        for path in _iter_workspace_paths(
+        for path, is_directory in _iter_workspace_paths(
             root,
+            self.safety_guard,
             recursive=args.recursive,
             max_depth=MAX_LIST_DIRECTORY_DEPTH,
         ):
@@ -99,10 +100,6 @@ class ListDirectoryTool(BaseTool):
                 truncated = True
                 break
             relative = path.relative_to(root).as_posix()
-            try:
-                is_directory = path.is_dir() and not path.is_symlink()
-            except OSError:
-                is_directory = False
             entries.append(relative + ("/" if is_directory else ""))
         entries.sort()
         output = "\n".join(entries)
@@ -130,7 +127,7 @@ class GlobFilesTool(BaseTool):
     async def run(self, **kwargs: Any) -> ToolResult:
         args = GlobFilesArgs(**kwargs)
         root = self.safety_guard.validate_path(args.directory_path)
-        if not root.is_dir():
+        if not _is_scoped_directory(root, self.safety_guard):
             return ToolResult(
                 success=False, output="", error=f"Not a directory: {root}"
             )
@@ -138,8 +135,9 @@ class GlobFilesTool(BaseTool):
         match_truncated = False
         scan_truncated = False
         scanned = 0
-        for path in _iter_workspace_paths(
+        for path, is_directory in _iter_workspace_paths(
             root,
+            self.safety_guard,
             recursive=True,
             max_depth=MAX_GLOB_DEPTH,
         ):
@@ -147,10 +145,13 @@ class GlobFilesTool(BaseTool):
             if scanned > MAX_GLOB_SCAN_ENTRIES:
                 scan_truncated = True
                 break
+            if is_directory:
+                continue
             try:
-                if path.is_symlink() or not path.is_file():
+                _, metadata = stat_scoped_path(path, self.safety_guard)
+                if not stat.S_ISREG(metadata.st_mode):
                     continue
-            except OSError:
+            except (OSError, SafetyViolation):
                 continue
             relative = path.relative_to(root).as_posix()
             if not fnmatch.fnmatch(relative, args.pattern):
@@ -184,155 +185,17 @@ class SearchTextArgs(BaseModel):
 
 class SearchTextTool(BaseTool):
     name = "search_text"
-    description = "Search workspace text using ripgrep with file and line locations."
+    description = "Search workspace text with bounded file and line locations."
     args_schema = SearchTextArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = SearchTextArgs(**kwargs)
         root = self.safety_guard.validate_path(args.directory_path)
-        if not root.is_dir():
+        if not _is_scoped_directory(root, self.safety_guard):
             return ToolResult(
                 success=False, output="", error=f"Not a directory: {root}"
             )
-        rg = resolve_host_executable(
-            "rg", workspace_root=self.safety_guard.project_root, cwd=root
-        )
-        if rg is None:
-            return await self._python_fallback(root, args)
-
-        command = [
-            rg,
-            "--json",
-            "--line-number",
-            "--color",
-            "never",
-            "--max-depth",
-            str(MAX_SEARCH_DEPTH),
-            "--max-filesize",
-            str(MAX_SEARCH_FILE_BYTES),
-        ]
-        if args.fixed_strings:
-            command.append("--fixed-strings")
-        if not args.case_sensitive:
-            command.append("--ignore-case")
-        if args.glob:
-            command.extend(("--glob", args.glob))
-        command.extend(("--", args.pattern, "."))
-        try:
-            process_tree_plan = prepare_process_tree(
-                workspace_root=self.safety_guard.project_root
-            )
-        except ProcessTreeUnavailable as exc:
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Search was not started: {exc}",
-            )
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=root,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **process_tree_plan.spawn_options,
-        )
-        output_limited = False
-        cleanup_error: str | None = None
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                communicate_process(
-                    process,
-                    max_output_bytes=MAX_SEARCH_CAPTURE_BYTES,
-                    process_tree_plan=process_tree_plan,
-                ),
-                timeout=SEARCH_TIMEOUT_SECONDS,
-            )
-        except ProcessOutputLimitExceeded as exc:
-            stdout, stderr = exc.stdout, exc.stderr
-            output_limited = True
-            if exc.cleanup_error is not None:
-                cleanup_error = f"Process-tree cleanup failed: {exc.cleanup_error}"
-        except asyncio.TimeoutError:
-            try:
-                await terminate_process_tree(process, plan=process_tree_plan)
-            except ProcessTreeError as exc:
-                cleanup_error = f"Process-tree cleanup failed: {exc}"
-            return ToolResult(
-                success=False,
-                output="",
-                error=(
-                    f"search timed out after {SEARCH_TIMEOUT_SECONDS} seconds"
-                    + (f". {cleanup_error}" if cleanup_error else "")
-                ),
-            )
-        except asyncio.CancelledError as cancellation:
-            cleanup_failure, cleanup_cancelled = (
-                await settle_process_tree_after_cancellation(
-                    process, plan=process_tree_plan
-                )
-            )
-            if cleanup_failure is not None:
-                cancellation.add_note(
-                    f"Process-tree cleanup failed: {cleanup_failure}"
-                )
-            if cleanup_cancelled:
-                cancellation.add_note("Process-tree cleanup was cancelled")
-            raise
-        if process.returncode not in (0, 1):
-            error = stderr.decode("utf-8", errors="replace").strip()
-            if cleanup_error:
-                error = f"{error}; {cleanup_error}" if error else cleanup_error
-            return ToolResult(
-                success=False,
-                output="",
-                error=error,
-            )
-        matches: list[str] = []
-        match_truncated = False
-        for line in stdout.decode("utf-8", errors="replace").splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                # A bounded capture may end in the middle of one JSON event.
-                continue
-            if not isinstance(event, dict) or event.get("type") != "match":
-                continue
-            data = event.get("data")
-            if not isinstance(data, dict):
-                continue
-            path_data = data.get("path")
-            lines_data = data.get("lines")
-            path = path_data.get("text") if isinstance(path_data, dict) else None
-            line_number = data.get("line_number")
-            text = lines_data.get("text") if isinstance(lines_data, dict) else None
-            if (
-                not isinstance(path, str)
-                or not isinstance(line_number, int)
-                or isinstance(line_number, bool)
-                or not isinstance(text, str)
-            ):
-                continue
-            text = text.rstrip("\r\n")
-            if len(matches) >= args.max_results:
-                match_truncated = True
-                break
-            matches.append(f"{path}:{line_number}:{text}")
-        truncated = match_truncated or output_limited
-        output = "\n".join(matches)
-        if truncated or output_limited:
-            suffix = (
-                f"\n[search output capture truncated after "
-                f"{MAX_SEARCH_CAPTURE_BYTES} bytes]"
-                if output_limited
-                else f"\n[truncated after {args.max_results} matches]"
-            )
-            output += suffix
-        return ToolResult(
-            success=cleanup_error is None,
-            output=output,
-            error=cleanup_error,
-            token_count=count_output_tokens(output),
-            truncated=truncated or output_limited,
-        )
+        return await self._python_fallback(root, args)
 
     async def _python_fallback(
         self,
@@ -395,8 +258,9 @@ class SearchTextTool(BaseTool):
         match_limited = False
         scan_truncated = False
         scanned = 0
-        for path in _iter_workspace_paths(
+        for path, is_directory in _iter_workspace_paths(
             root,
+            self.safety_guard,
             recursive=True,
             max_depth=MAX_SEARCH_DEPTH,
         ):
@@ -404,21 +268,21 @@ class SearchTextTool(BaseTool):
             if scanned > MAX_SEARCH_SCAN_ENTRIES:
                 scan_truncated = True
                 break
-            try:
-                if path.is_symlink() or not path.is_file():
-                    continue
-            except OSError:
+            if is_directory:
                 continue
             relative = path.relative_to(root).as_posix()
             if args.glob and not fnmatch.fnmatch(relative, args.glob):
                 continue
             try:
-                if path.stat().st_size > MAX_SEARCH_FILE_BYTES:
-                    continue
-            except OSError:
-                continue
-            try:
-                with path.open(encoding="utf-8") as handle:
+                _, content = read_scoped_bytes(
+                    path,
+                    self.safety_guard,
+                    max_bytes=MAX_SEARCH_FILE_BYTES,
+                )
+                with io.TextIOWrapper(
+                    io.BytesIO(content),
+                    encoding="utf-8",
+                ) as handle:
                     for line_number, text, matched, line_truncated in bounded_lines(
                         handle
                     ):
@@ -440,7 +304,7 @@ class SearchTextTool(BaseTool):
                             break
                         matches.append(rendered)
                         output_bytes += separator_bytes + rendered_bytes
-            except (OSError, UnicodeError):
+            except (OSError, UnicodeError, SafetyViolation):
                 continue
             if output_limited or match_limited:
                 break

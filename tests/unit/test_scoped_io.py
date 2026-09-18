@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import stat
 from contextlib import nullcontext
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from ash.safety.scoped_io import (
     remove_scoped_file,
     read_scoped_bytes,
     restore_scoped_file,
+    stat_scoped_path,
 )
 
 
@@ -176,3 +178,26 @@ def test_scoped_directory_listing_does_not_follow_child_links(tmp_path) -> None:
     assert ("folder", True) in entries
     assert ("file.txt", False) in entries
     assert ("linked-folder", False) in entries
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_scoped_stat_reports_regular_files_and_directories(
+    tmp_path, fallback: bool
+) -> None:
+    directory = tmp_path / "folder"
+    directory.mkdir()
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("x", encoding="utf-8")
+    guard = SafetyGuard(tmp_path)
+
+    mode = (
+        patch("ash.safety.scoped_io._supports_anchored_io", return_value=False)
+        if fallback
+        else nullcontext()
+    )
+    with mode:
+        _, directory_metadata = stat_scoped_path(directory, guard)
+        _, file_metadata = stat_scoped_path(file_path, guard)
+
+    assert stat.S_ISDIR(directory_metadata.st_mode)
+    assert stat.S_ISREG(file_metadata.st_mode)

@@ -108,6 +108,52 @@ def snapshot_scoped_file(
     return target, _fallback_snapshot(target, guard, max_bytes=max_bytes)
 
 
+def stat_scoped_path(
+    path: str | Path,
+    guard: SafetyGuard,
+) -> tuple[Path, os.stat_result]:
+    """Return no-follow metadata for one workspace entry."""
+
+    target = guard.validate_mutation_path(path)
+    if _supports_anchored_io():
+        if target == guard.project_root:
+            flags = (
+                os.O_RDONLY
+                | _flag("O_DIRECTORY")
+                | _flag("O_CLOEXEC")
+                | _flag("O_NOFOLLOW")
+            )
+            try:
+                directory_fd = os.open(guard.project_root, flags)
+            except OSError as exc:
+                raise _scoped_open_error(target, exc) from exc
+            try:
+                return target, os.fstat(directory_fd)
+            finally:
+                os.close(directory_fd)
+        with _open_parent(target, guard, create=False) as (parent_fd, name):
+            try:
+                metadata = os.stat(
+                    name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise _scoped_open_error(target, exc) from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ScopedIOError(f"path is a symlink: {target}")
+            return target, metadata
+
+    before = _fallback_identity(target)
+    assert before is not None
+    guard.validate_mutation_path(target)
+    after = _fallback_identity(target)
+    assert after is not None
+    if not _same_snapshot(before, after):
+        raise ScopedFileChanged(f"path changed while inspecting: {target}")
+    return target, after
+
+
 def list_scoped_directory(
     path: str | Path,
     guard: SafetyGuard,
