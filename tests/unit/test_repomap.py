@@ -10,6 +10,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from ash.repo.parser import SymbolExtractor
+from ash.repo import repomap as repomap_module
 from ash.repo.repomap import RepoMap, calculate_personalized_pagerank
 
 
@@ -120,6 +122,141 @@ def test_repomap_skips_directory_links(tmp_path: Path) -> None:
     repo_map = RepoMap(workspace)
 
     assert {node.path.name for node in repo_map.files} == {"keep.py"}
+
+
+def test_repomap_does_not_parse_file_swapped_to_external_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "safe.py"
+    target.write_text("def harmless():\n    pass\n", encoding="utf-8")
+    saved = workspace / "safe-saved.py"
+    outside = tmp_path / "outside.py"
+    outside.write_text(
+        "def OUTSIDE_SECRET_SYMBOL():\n    pass\n",
+        encoding="utf-8",
+    )
+    real_extract = SymbolExtractor.extract
+    swapped = False
+
+    def extract_after_swap(self, file_path, *args, **kwargs):
+        nonlocal swapped
+        if Path(file_path) == target and not swapped:
+            target.rename(saved)
+            try:
+                target.symlink_to(outside)
+            except OSError as exc:
+                saved.rename(target)
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+            swapped = True
+        return real_extract(self, file_path, *args, **kwargs)
+
+    monkeypatch.setattr(SymbolExtractor, "extract", extract_after_swap)
+    try:
+        repo_map = RepoMap(workspace)
+    finally:
+        if target.is_symlink():
+            target.unlink()
+        if saved.exists():
+            saved.rename(target)
+
+    rendered = repo_map.render(repo_map.rank([]), top_files=5, symbols_per_file=5)
+
+    assert swapped is True
+    assert "OUTSIDE_SECRET_SYMBOL" not in rendered
+    assert "harmless" in rendered
+
+
+def test_repomap_find_references_does_not_read_swapped_external_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "safe.py"
+    target.write_text("def harmless():\n    return 1\n", encoding="utf-8")
+    saved = workspace / "safe-saved.py"
+    outside = tmp_path / "outside.py"
+    outside.write_text(
+        "def caller():\n    outside_name()\n",
+        encoding="utf-8",
+    )
+    repo_map = RepoMap(workspace)
+    real_find_references = SymbolExtractor.find_references
+    swapped = False
+
+    def find_after_swap(self, file_path, name, *args, **kwargs):
+        nonlocal swapped
+        if Path(file_path) == target and not swapped:
+            target.rename(saved)
+            try:
+                target.symlink_to(outside)
+            except OSError as exc:
+                saved.rename(target)
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+            swapped = True
+        return real_find_references(self, file_path, name, *args, **kwargs)
+
+    monkeypatch.setattr(SymbolExtractor, "find_references", find_after_swap)
+    try:
+        matches = repo_map.find_references("outside_name")
+    finally:
+        if target.is_symlink():
+            target.unlink()
+        if saved.exists():
+            saved.rename(target)
+
+    assert swapped is True
+    assert matches == []
+
+
+def test_repomap_discovery_does_not_descend_into_swapped_external_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    nested = workspace / "docs"
+    nested.mkdir()
+    (nested / "local.py").write_text("def local(): pass\n", encoding="utf-8")
+    kept = workspace / "z_keep.py"
+    kept.write_text("def keep(): pass\n", encoding="utf-8")
+    saved = workspace / "docs-saved"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for name in ("a.py", "b.py", "c.py", "d.py"):
+        (outside / name).write_text("def other(): pass\n", encoding="utf-8")
+
+    real_list_scoped_directory = repomap_module.list_scoped_directory
+    swapped = False
+
+    def list_then_swap(path: Path, guard):
+        nonlocal swapped
+        result = real_list_scoped_directory(path, guard)
+        if Path(path) == workspace and not swapped:
+            nested.rename(saved)
+            try:
+                nested.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                saved.rename(nested)
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+            swapped = True
+        return result
+
+    monkeypatch.setattr(repomap_module, "list_scoped_directory", list_then_swap)
+    monkeypatch.setattr(repomap_module, "MAX_REPO_DISCOVERY_ENTRIES", 3)
+    try:
+        discovered = repomap_module._discover_source_files(workspace)
+    finally:
+        if nested.is_symlink():
+            nested.unlink()
+        if saved.exists():
+            saved.rename(nested)
+
+    relative = {path.relative_to(workspace).as_posix() for path in discovered}
+
+    assert swapped is True
+    assert relative <= {"docs/local.py", "z_keep.py"}
+    assert "z_keep.py" in relative
 
 
 def test_repomap_bounds_discovery_entries(tmp_path: Path, monkeypatch) -> None:

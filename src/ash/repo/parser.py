@@ -241,8 +241,8 @@ class SymbolExtractor:
     def __init__(self) -> None:
         self._parsers: dict[str, Parser] = {}
 
-    def extract(self, file_path: Path) -> list[Symbol]:
-        parsed = self._parse_file(file_path)
+    def extract(self, file_path: Path, *, source: bytes | None = None) -> list[Symbol]:
+        parsed = self._parse_file(file_path, source=source)
         if parsed is None:
             return []
         spec, root = parsed
@@ -262,10 +262,11 @@ class SymbolExtractor:
         name: str,
         *,
         case_sensitive: bool = True,
+        source: bytes | None = None,
     ) -> list[SourceLocation]:
         """Find identifier references, excluding structural declaration names."""
 
-        parsed = self._parse_file(file_path)
+        parsed = self._parse_file(file_path, source=source)
         if parsed is None:
             return []
         spec, root = parsed
@@ -291,17 +292,23 @@ class SymbolExtractor:
             )
         return matches
 
-    def _parse_file(self, file_path: Path) -> tuple[LanguageSpec, Node] | None:
+    def _parse_file(
+        self,
+        file_path: Path,
+        *,
+        source: bytes | None = None,
+    ) -> tuple[LanguageSpec, Node] | None:
         spec = LANGUAGE_BY_SUFFIX.get(file_path.suffix.casefold())
         if spec is None:
             return None
-        try:
-            if file_path.stat().st_size > MAX_SOURCE_FILE_BYTES:
+        if source is None:
+            try:
+                if file_path.stat().st_size > MAX_SOURCE_FILE_BYTES:
+                    return None
+                with file_path.open("rb") as handle:
+                    source = handle.read(MAX_SOURCE_FILE_BYTES + 1)
+            except OSError:
                 return None
-            with file_path.open("rb") as handle:
-                source = handle.read(MAX_SOURCE_FILE_BYTES + 1)
-        except OSError:
-            return None
         if len(source) > MAX_SOURCE_FILE_BYTES:
             return None
         parser = self._parsers.get(spec.name)

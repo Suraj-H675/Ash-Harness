@@ -16,6 +16,7 @@ Given a workspace, the map:
 from __future__ import annotations
 
 import fnmatch
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,12 @@ from ash.repo.parser import (
     SourceLocation,
     Symbol,
     SymbolExtractor,
+)
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import (
+    list_scoped_directory,
+    read_scoped_bytes,
+    stat_scoped_path,
 )
 
 MAX_REPO_DISCOVERY_ENTRIES = 100_000
@@ -100,7 +107,9 @@ def _discover_source_files(
     *,
     ignored_dirs: frozenset[str] = DEFAULT_IGNORED_DIRS,
     exclude_patterns: Iterable[str] = (),
+    guard: SafetyGuard | None = None,
 ) -> list[Path]:
+    guard = guard or SafetyGuard(project_root)
     patterns = tuple(exclude_patterns)
     files: list[Path] = []
 
@@ -108,28 +117,18 @@ def _discover_source_files(
 
     def walk(directory: Path, local_patterns: tuple[str, ...], depth: int) -> bool:
         nonlocal entries_seen
-        entries: list[Path] = []
         try:
-            for entry in directory.iterdir():
-                entries.append(entry)
-                if len(entries) >= MAX_REPO_DISCOVERY_ENTRIES:
-                    break
-        except OSError:
+            _, listed = list_scoped_directory(directory, guard)
+        except (OSError, SafetyViolation):
             return False
-        entries.sort(key=lambda p: p.name)
-        for entry in entries:
+        entries = sorted(listed, key=lambda item: item[0])[
+            :MAX_REPO_DISCOVERY_ENTRIES
+        ]
+        for name, is_directory in entries:
             entries_seen += 1
             if entries_seen > MAX_REPO_DISCOVERY_ENTRIES:
                 return True
-            if entry.is_symlink() or (
-                hasattr(entry, "is_junction") and entry.is_junction()
-            ):
-                continue
-            try:
-                is_directory = entry.is_dir()
-                is_file = entry.is_file()
-            except OSError:
-                continue
+            entry = directory / name
             relative = entry.relative_to(project_root)
             if _matches_exclude_pattern(
                 relative, local_patterns, is_dir=is_directory
@@ -148,7 +147,7 @@ def _discover_source_files(
                 )
                 if walk(entry, child_patterns, depth + 1):
                     return True
-            elif is_file and entry.suffix.casefold() in SOURCE_SUFFIXES:
+            elif entry.suffix.casefold() in SOURCE_SUFFIXES:
                 files.append(entry)
         return False
 
@@ -459,6 +458,7 @@ class RepoMap:
         exclude_patterns: list[str] | None = None,
     ) -> None:
         self.project_root = project_root.resolve()
+        self._guard = SafetyGuard(self.project_root)
         self._extractor = extractor or SymbolExtractor()
         self._max_files = max_files
         self._exclude_patterns = exclude_patterns or []
@@ -525,10 +525,19 @@ class RepoMap:
         for file_node in self._files:
             if not self._matches_path_glob(file_node.path, path_glob):
                 continue
+            try:
+                _, source = read_scoped_bytes(
+                    file_node.path,
+                    self._guard,
+                    max_bytes=MAX_SOURCE_FILE_BYTES,
+                )
+            except (OSError, SafetyViolation):
+                continue
             for location in self._extractor.find_references(
                 file_node.path,
                 name,
                 case_sensitive=case_sensitive,
+                source=source,
             ):
                 matches.append(location)
                 if len(matches) >= limit:
@@ -675,6 +684,7 @@ class RepoMap:
         discovered = _discover_source_files(
             self.project_root,
             exclude_patterns=self._exclude_patterns,
+            guard=self._guard,
         )
         ignored = _git_ignored_files(self.project_root, discovered)
         paths = [path for path in discovered if path.resolve() not in ignored][
@@ -685,19 +695,29 @@ class RepoMap:
         next_cache: dict[Path, tuple[tuple[int, int], FileNode]] = {}
 
         for path in paths:
-            resolved = path.resolve()
             try:
-                stat = path.stat()
-            except OSError:
+                resolved, metadata = stat_scoped_path(path, self._guard)
+            except (OSError, SafetyViolation):
                 continue
-            if stat.st_size > MAX_SOURCE_FILE_BYTES:
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > MAX_SOURCE_FILE_BYTES
+            ):
                 continue
-            fingerprint = (stat.st_mtime_ns, stat.st_size)
+            fingerprint = (metadata.st_mtime_ns, metadata.st_size)
             cached = self._file_cache.get(resolved)
             if cached is not None and cached[0] == fingerprint:
                 node = cached[1]
             else:
-                symbols = tuple(self._extractor.extract(path))
+                try:
+                    _, source = read_scoped_bytes(
+                        resolved,
+                        self._guard,
+                        max_bytes=MAX_SOURCE_FILE_BYTES,
+                    )
+                except (OSError, SafetyViolation):
+                    continue
+                symbols = tuple(self._extractor.extract(resolved, source=source))
                 refs = _extract_references(symbols)
                 node = FileNode(
                     path=resolved,
@@ -706,7 +726,7 @@ class RepoMap:
                 )
             files.append(node)
             next_cache[resolved] = (fingerprint, node)
-            module_name = _normalize_module_name(path, self.project_root)
+            module_name = _normalize_module_name(resolved, self.project_root)
             if module_name is not None:
                 module_index[module_name] = resolved
 
