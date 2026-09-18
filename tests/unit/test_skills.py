@@ -777,6 +777,167 @@ def test_write_python_skill_writes_and_registry_reloads(tmp_path: Path) -> None:
     assert result2.output == "second"
 
 
+def test_write_python_skill_rejects_target_swapped_to_external_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.tools.skills as skills_module
+
+    skill_dir = tmp_path / "skills"
+    skill_dir.mkdir()
+    target = skill_dir / "racy.py"
+    external = tmp_path / "external.py"
+    sentinel = b"DO NOT TOUCH\n"
+    external.write_bytes(sentinel)
+    real_write = skills_module.atomic_write_unlinked_bytes
+    swapped = False
+
+    def write_then_swap(path, *args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            target.symlink_to(external)
+        return real_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(skills_module, "atomic_write_unlinked_bytes", write_then_swap)
+
+    with pytest.raises(ValueError):
+        write_python_skill(
+            skill_dir,
+            name="racy",
+            description="demo",
+            trigger="",
+            body="async def execute(context):\n    return 'ok'\n",
+            allow_unsafe_code=True,
+        )
+
+    assert swapped is True
+    assert external.read_bytes() == sentinel
+
+
+def test_executable_skill_read_rejects_target_swapped_to_external_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.tools.skills as skills_module
+
+    skill_dir = tmp_path / "skills"
+    skill_dir.mkdir()
+    target = skill_dir / "safe.py"
+    target.write_text(
+        '"""\nname: safe\ndescription: safe\ntrigger: \n"""\n\n'
+        "async def execute(context):\n    return 'SAFE'\n",
+        encoding="utf-8",
+    )
+    external = tmp_path / "outside.py"
+    external.write_text(
+        '"""\nname: evil\ndescription: evil\ntrigger: \n"""\n\n'
+        "async def execute(context):\n    return 'EVIL'\n",
+        encoding="utf-8",
+    )
+    real_read = skills_module.read_bounded_open_file
+    swapped = False
+
+    def read_then_swap(path, *args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            target.unlink()
+            target.symlink_to(external)
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(skills_module, "read_bounded_open_file", read_then_swap)
+
+    with pytest.raises(SkillParseError, match="cannot be a link"):
+        parse_python_skill(target)
+    assert swapped is True
+
+
+def test_compile_skill_does_not_execute_external_code_after_path_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.tools.skills as skills_module
+
+    skill_dir = tmp_path / "skills"
+    skill_dir.mkdir()
+    target = skill_dir / "safe.py"
+    target.write_text(
+        '"""\nname: safe\ndescription: safe\ntrigger: \n"""\n\n'
+        "async def execute(context):\n    return 'SAFE'\n",
+        encoding="utf-8",
+    )
+    marker = tmp_path / "SIDE_EFFECT"
+    external = tmp_path / "outside.py"
+    external.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('EXECUTED')\n"
+        '"""\nname: evil\ndescription: evil\ntrigger: \n"""\n\n'
+        "async def execute(context):\n    return 'EVIL'\n",
+        encoding="utf-8",
+    )
+    real_read = skills_module.read_bounded_open_file
+    swapped = False
+
+    def read_then_swap(path, *args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            target.unlink()
+            target.symlink_to(external)
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(skills_module, "read_bounded_open_file", read_then_swap)
+
+    with pytest.raises(SkillParseError, match="cannot be a link"):
+        compile_skill(target, _safety_guard(tmp_path), allow_unsafe_code=True)
+    assert swapped is True
+    assert not marker.exists()
+
+
+def test_registry_reload_does_not_execute_external_code_after_path_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.tools.skills as skills_module
+
+    skill_dir = tmp_path / "skills"
+    skill_dir.mkdir()
+    target = skill_dir / "safe.py"
+    target.write_text(
+        '"""\nname: safe\ndescription: safe\ntrigger: \n"""\n\n'
+        "async def execute(context):\n    return 'SAFE'\n",
+        encoding="utf-8",
+    )
+    marker = tmp_path / "REGISTRY_SIDE_EFFECT"
+    external = tmp_path / "outside.py"
+    external.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('EXECUTED')\n"
+        '"""\nname: evil\ndescription: evil\ntrigger: \n"""\n\n'
+        "async def execute(context):\n    return 'EVIL'\n",
+        encoding="utf-8",
+    )
+    real_read = skills_module.read_bounded_open_file
+    swapped = False
+
+    def read_then_swap(path, *args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            target.unlink()
+            target.symlink_to(external)
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(skills_module, "read_bounded_open_file", read_then_swap)
+    registry = ToolRegistry(
+        _safety_guard(tmp_path),
+        skill_roots=(skill_dir,),
+        allow_executable_skills=True,
+    )
+
+    with pytest.raises(SkillParseError, match="cannot be a link"):
+        registry.reload_skill_module("safe", target)
+    assert swapped is True
+    assert not marker.exists()
+
+
 def test_registry_reload_uses_current_source_when_timestamp_and_size_match(
     tmp_path: Path,
 ) -> None:

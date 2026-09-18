@@ -345,6 +345,82 @@ def test_on_agent_success_restores_replaced_skill_when_reload_fails(
     assert asyncio.run(old_tool.run()).output == "old behavior"
 
 
+def test_on_agent_success_rollback_does_not_overwrite_swapped_external_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.tools.skill_writer as skill_writer_module
+
+    root = tmp_path / "skills"
+    registry = ToolRegistry(
+        SafetyGuard(tmp_path), skill_roots=(root,), allow_executable_skills=True
+    )
+    first_report = AgentReport(
+        agent_id="agent-1",
+        role="general",
+        task="stable replacement",
+        success=True,
+        summary="done",
+        artifacts={
+            "should_skillify": True,
+            "skill_body": "async def execute(context):\n    return 'old behavior'\n",
+        },
+    )
+    first = asyncio.run(
+        on_agent_success(
+            first_report,
+            root,
+            registry=registry,
+            allow_unsafe_code=True,
+        )
+    )
+    assert first is not None and first.success is True
+    path = root / "stable_replacement.py"
+    external = tmp_path / "external.py"
+    sentinel = b"EXTERNAL MUST SURVIVE\n"
+    external.write_bytes(sentinel)
+    real_open = skill_writer_module.open_anchored_regular_file
+    swapped = False
+
+    def open_then_swap(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            path.unlink()
+            path.symlink_to(external)
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(skill_writer_module, "open_anchored_regular_file", open_then_swap)
+    replacement_report = AgentReport(
+        agent_id="agent-1",
+        role="general",
+        task="stable replacement",
+        success=True,
+        summary="done",
+        artifacts={
+            "should_skillify": True,
+            "skill_body": (
+                "raise RuntimeError('replacement import failed')\n\n"
+                "async def execute(context):\n    return 'new behavior'\n"
+            ),
+        },
+    )
+
+    result = asyncio.run(
+        on_agent_success(
+            replacement_report,
+            root,
+            registry=registry,
+            allow_unsafe_code=True,
+        )
+    )
+
+    assert result is not None
+    assert result.success is False
+    assert "rollback failed" in (result.error or "")
+    assert swapped is True
+    assert external.read_bytes() == sentinel
+
+
 def test_skill_writer_rejects_oversized_serialized_python_before_writing(
     tmp_path: Path,
 ) -> None:

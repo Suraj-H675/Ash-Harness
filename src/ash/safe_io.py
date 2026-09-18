@@ -298,6 +298,90 @@ def read_bounded_open_file(
         )
 
 
+@contextmanager
+def open_anchored_regular_file(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+    writable: bool = False,
+) -> Iterator[int]:
+    """Open one regular file below ``trusted_root`` without following links."""
+
+    if not _supports_anchored_path_io():
+        validate_unlinked_path(path, trusted_root=trusted_root, label=label)
+        target = validate_unlinked_file_path(path, label=label)
+        flags = (os.O_RDWR if writable else os.O_RDONLY) | _close_on_exec_flag()
+        flags |= _nofollow_flag()
+        descriptor = os.open(target, flags)
+        try:
+            _require_regular_descriptor(descriptor, target, label=label)
+            yield descriptor
+        finally:
+            os.close(descriptor)
+        return
+    with _open_anchored_parent(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    ) as (parent_descriptor, name, target):
+        flags = (os.O_RDWR if writable else os.O_RDONLY) | _close_on_exec_flag()
+        flags |= _nofollow_flag()
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+        except OSError as exc:
+            try:
+                observed = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                raise exc
+            if stat.S_ISLNK(observed.st_mode):
+                raise ValueError(f"refusing to open symlinked {label}: {target}") from exc
+            raise
+        try:
+            _require_regular_descriptor(descriptor, target, label=label)
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+
+def unlink_anchored_open_file(
+    path: str | Path,
+    descriptor: int,
+    *,
+    trusted_root: str | Path,
+    label: str,
+) -> None:
+    """Unlink ``path`` only while it still names the already-open descriptor."""
+
+    if not _supports_anchored_path_io():
+        validate_unlinked_path(path, trusted_root=trusted_root, label=label)
+        unlink_open_file(path, descriptor, label=label)
+        return
+    with _open_anchored_parent(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    ) as (parent_descriptor, name, target):
+        opened = os.fstat(descriptor)
+        observed = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(observed.st_mode) or (
+            observed.st_dev,
+            observed.st_ino,
+        ) != (opened.st_dev, opened.st_ino):
+            raise ValueError(
+                f"refusing to unlink {label} that changed after opening: {target}"
+            )
+        os.unlink(name, dir_fd=parent_descriptor)
+        try:
+            os.fsync(parent_descriptor)
+        except OSError:
+            pass
+
+
 def _read_bounded_descriptor(
     descriptor: int,
     max_bytes: int,
@@ -336,13 +420,14 @@ def atomic_write_unlinked_bytes(
     if not isinstance(payload, bytes):
         raise TypeError("atomic file payload must be bytes")
     if trusted_root is not None and _supports_anchored_path_io():
-        return _atomic_write_anchored_bytes(
+        target, _identity = _atomic_write_anchored_bytes(
             path,
             payload,
             trusted_root=trusted_root,
             label=label,
             mode=mode,
         )
+        return target
     if trusted_root is not None:
         validate_unlinked_path(path, trusted_root=trusted_root, label=label)
     target = validate_unlinked_file_path(path, label=label)
@@ -369,6 +454,38 @@ def atomic_write_unlinked_bytes(
         )
 
 
+def atomic_write_unlinked_bytes_with_identity(
+    path: str | Path,
+    payload: bytes,
+    *,
+    trusted_root: str | Path,
+    label: str,
+    mode: int = 0o600,
+) -> tuple[Path, tuple[int, int]]:
+    """Atomically write bytes and return the committed file's device/inode identity."""
+
+    if not isinstance(payload, bytes):
+        raise TypeError("atomic file payload must be bytes")
+    if _supports_anchored_path_io():
+        return _atomic_write_anchored_bytes(
+            path,
+            payload,
+            trusted_root=trusted_root,
+            label=label,
+            mode=mode,
+        )
+    target = atomic_write_unlinked_bytes(
+        path,
+        payload,
+        label=label,
+        mode=mode,
+        trusted_root=trusted_root,
+    )
+    with open_unlinked_regular_file(target, label=label) as descriptor:
+        opened = os.fstat(descriptor)
+        return target, (opened.st_dev, opened.st_ino)
+
+
 def _atomic_write_anchored_bytes(
     path: str | Path,
     payload: bytes,
@@ -376,7 +493,7 @@ def _atomic_write_anchored_bytes(
     trusted_root: str | Path,
     label: str,
     mode: int,
-) -> Path:
+) -> tuple[Path, tuple[int, int]]:
     with _open_anchored_parent(
         path,
         trusted_root=trusted_root,
@@ -448,7 +565,7 @@ def _atomic_write_anchored_bytes(
                 trusted_root=trusted_root,
                 label=label,
             )
-            return target
+            return target, (opened.st_dev, opened.st_ino)
         finally:
             if not renamed:
                 _unlink_same_directory_entry(

@@ -14,6 +14,7 @@ The agent signals skillification readiness by setting:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,9 +23,10 @@ from typing import TYPE_CHECKING
 from ash.tools.skills import (
     UNSAFE_EXECUTABLE_SKILL_MESSAGE,
     _read_executable_skill_text,
+    _write_python_skill_owned,
     validate_executable_skill_name,
-    write_python_skill,
 )
+from ash.safe_io import open_anchored_regular_file, unlink_anchored_open_file
 
 if TYPE_CHECKING:
     from ash.agents.subprocess_agent import AgentReport
@@ -77,15 +79,32 @@ class SkillWriter:
 
         Returns a :class:`SkillWriteResult` indicating success or failure.
         """
+        result, _identity = self._write_skill_owned(
+            name=name,
+            description=description,
+            trigger=trigger,
+            body=body,
+            allow_unsafe_code=allow_unsafe_code,
+        )
+        return result
+
+    def _write_skill_owned(
+        self,
+        *,
+        name: str,
+        description: str,
+        trigger: str = "",
+        body: str,
+        allow_unsafe_code: bool = False,
+    ) -> tuple[SkillWriteResult, tuple[int, int] | None]:
         unsafe_error = self._unsafe_write_error(allow_unsafe_code)
         if unsafe_error is not None:
-            return SkillWriteResult(
-                success=False,
-                path=None,
-                error=unsafe_error,
+            return (
+                SkillWriteResult(success=False, path=None, error=unsafe_error),
+                None,
             )
         try:
-            path = write_python_skill(
+            path, identity = _write_python_skill_owned(
                 self.skill_root,
                 name=name,
                 description=description,
@@ -94,14 +113,17 @@ class SkillWriter:
                 allow_unsafe_code=True,
             )
         except OSError as exc:
-            return SkillWriteResult(
-                success=False,
-                path=None,
-                error=f"failed to write skill: {exc}",
+            return (
+                SkillWriteResult(
+                    success=False,
+                    path=None,
+                    error=f"failed to write skill: {exc}",
+                ),
+                None,
             )
         except (TypeError, ValueError) as exc:
-            return SkillWriteResult(success=False, path=None, error=str(exc))
-        return SkillWriteResult(success=True, path=path, error=None)
+            return SkillWriteResult(success=False, path=None, error=str(exc)), None
+        return SkillWriteResult(success=True, path=path, error=None), identity
 
     def _unsafe_write_error(self, allow_unsafe_code: bool) -> str | None:
         if not allow_unsafe_code:
@@ -237,7 +259,7 @@ async def on_agent_success(
                 path=None,
                 error=f"failed to snapshot existing skill: {exc}",
             )
-    result = writer.write_skill(
+    result, written_identity = writer._write_skill_owned(
         name=safe_name,
         description=f"Automates: {task}",
         trigger="",
@@ -245,6 +267,7 @@ async def on_agent_success(
         allow_unsafe_code=allow_unsafe_code,
     )
     if result.success and result.path is not None:
+        assert written_identity is not None
         try:
             reloaded = writer.reload(safe_name, result.path)
             if registry is None or reloaded is not None:
@@ -253,11 +276,36 @@ async def on_agent_success(
         except Exception as exc:  # noqa: BLE001
             reload_error = f"failed to reload skill: {exc}"
         try:
-            if previous_exists:
-                assert previous_bytes is not None
-                result.path.write_bytes(previous_bytes)
-            else:
-                result.path.unlink(missing_ok=True)
+            candidate = Path(os.path.abspath(result.path))
+            with open_anchored_regular_file(
+                candidate,
+                trusted_root=candidate.parent,
+                label="executable skill rollback",
+                writable=True,
+            ) as descriptor:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != written_identity:
+                    raise ValueError(
+                        "refusing to roll back executable skill that changed after write"
+                    )
+                if previous_exists:
+                    assert previous_bytes is not None
+                    os.ftruncate(descriptor, 0)
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    view = memoryview(previous_bytes)
+                    while view:
+                        written = os.write(descriptor, view)
+                        if written <= 0:
+                            raise OSError("short write while rolling back executable skill")
+                        view = view[written:]
+                    os.fsync(descriptor)
+                else:
+                    unlink_anchored_open_file(
+                        candidate,
+                        descriptor,
+                        trusted_root=candidate.parent,
+                        label="executable skill rollback",
+                    )
         except Exception as rollback_exc:  # noqa: BLE001
             reload_error = f"{reload_error}; rollback failed: {rollback_exc}"
         return SkillWriteResult(

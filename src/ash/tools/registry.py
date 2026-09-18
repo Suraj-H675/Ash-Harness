@@ -14,9 +14,6 @@ only when a discovery pass runs.
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
-import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -219,41 +216,28 @@ class ToolRegistry:
             )
 
             raise SkillParseError(UNSAFE_EXECUTABLE_SKILL_MESSAGE)
-        from ash.tools.skills import validate_executable_skill_path
-
-        validate_executable_skill_path(path)
-        module_name = f"_ash_skill_{name}_{abs(hash(str(path)))}"
-        spec = importlib.util.spec_from_file_location(module_name, path)
-        if spec is None or spec.loader is None:
-            return None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        try:
-            loader = spec.loader
-            if isinstance(loader, importlib.machinery.SourceFileLoader):
-                source = loader.get_source(module_name)
-                if source is None:
-                    sys.modules.pop(module_name, None)
-                    return None
-                code = compile(source, str(path), "exec")
-                exec(code, module.__dict__)  # noqa: S102
-            else:
-                loader.exec_module(module)
-        except Exception:
-            sys.modules.pop(module_name, None)
-            raise
         from ash.tools.skills import (
             SkillParseError,
+            _execute_python_skill_source,
+            _parse_python_skill_source,
+            _read_executable_skill_text,
             build_tool_from_python_module,
-            parse_python_skill,
         )
 
-        # Re-parse so the docstring-driven V7 metadata is honoured.
+        source = _read_executable_skill_text(path)
+        module_name = f"_ash_skill_{name}_{abs(hash(str(path)))}"
+        try:
+            module = _execute_python_skill_source(module_name, path, source)
+        except Exception:
+            raise
+
+        # Parse the exact bytes that were executed so metadata cannot be swapped
+        # independently of the module body after validation.
         parsed_name: str | None = None
         parsed_description: str | None = None
         parsed_trigger: str | None = None
         try:
-            parsed = parse_python_skill(path)
+            parsed = _parse_python_skill_source(path, source)
             parsed_name = parsed.name
             parsed_description = parsed.description
             parsed_trigger = parsed.trigger
@@ -267,6 +251,7 @@ class ToolRegistry:
             parsed_name=parsed_name,
             parsed_description=parsed_description,
             parsed_trigger=parsed_trigger,
+            source_path_verified=True,
             allow_unsafe_code=True,
         )
         self._loaded_skill_modules[name] = path

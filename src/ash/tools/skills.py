@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import textwrap
 import types
@@ -33,7 +34,12 @@ from typing import Any, Callable, Mapping, Sequence, cast
 
 from pydantic import BaseModel, create_model
 
-from ash.safe_io import strict_json_loads
+from ash.safe_io import (
+    atomic_write_unlinked_bytes,
+    atomic_write_unlinked_bytes_with_identity,
+    read_bounded_open_file,
+    strict_json_loads,
+)
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult
 from ash.tools.registry import SkillIndexEntry
@@ -287,6 +293,12 @@ def parse_python_skill(path: Path) -> _PythonSkill:
     """Parse a Python skill file with the V7 docstring convention."""
 
     source = _read_executable_skill_text(path)
+    return _parse_python_skill_source(path, source)
+
+
+def _parse_python_skill_source(path: Path, source: str) -> _PythonSkill:
+    """Parse already-secured Python skill source without reopening ``path``."""
+
     try:
         tree = ast.parse(source, filename=str(path))
     except SyntaxError as exc:
@@ -357,6 +369,7 @@ def build_tool_from_python_module(
     parsed_name: str | None = None,
     parsed_description: str | None = None,
     parsed_trigger: str | None = None,
+    source_path_verified: bool = False,
     allow_unsafe_code: bool = False,
 ) -> BaseTool:
     """Wrap a Python skill module's ``execute`` function in a :class:`BaseTool`.
@@ -369,7 +382,7 @@ def build_tool_from_python_module(
 
     if not allow_unsafe_code:
         raise SkillParseError(UNSAFE_EXECUTABLE_SKILL_MESSAGE)
-    if source_path is not None:
+    if source_path is not None and not source_path_verified:
         validate_executable_skill_path(source_path)
     execute = getattr(module, "execute", None)
     if execute is None or not callable(execute):
@@ -445,27 +458,15 @@ def compile_skill(
 
     if not allow_unsafe_code:
         raise SkillParseError(UNSAFE_EXECUTABLE_SKILL_MESSAGE)
-    validate_executable_skill_path(path)
 
     if path.suffix == ".py":
-        # Load as a module, then hand it to the module wrapper.
-        import importlib.util
-        import sys
-
+        source = _read_executable_skill_text(path)
+        parsed = _parse_python_skill_source(path, source)
         module_name = f"_ash_skill_compile_{path.stem}_{abs(hash(str(path)))}"
-        spec = importlib.util.spec_from_file_location(module_name, path)
-        if spec is None or spec.loader is None:
-            raise SkillParseError(f"Could not load Python module from {path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
         try:
-            spec.loader.exec_module(module)
+            module = _execute_python_skill_source(module_name, path, source)
         except Exception as exc:
-            sys.modules.pop(module_name, None)
             raise SkillParseError(f"Failed to import {path}: {exc}") from exc
-        # Re-parse so docstring metadata (name/description/trigger) is
-        # honoured even when the module did not set __ash_name__.
-        parsed = parse_python_skill(path)
         return build_tool_from_python_module(
             module,
             safety_guard,
@@ -473,6 +474,7 @@ def compile_skill(
             parsed_name=parsed.name,
             parsed_description=parsed.description,
             parsed_trigger=parsed.trigger,
+            source_path_verified=True,
             allow_unsafe_code=True,
         )
 
@@ -659,21 +661,53 @@ def asyncio_is_coroutine(fn: Callable[..., Any]) -> bool:
 
 
 def validate_executable_skill_path(path: Path) -> None:
-    if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
-        raise SkillParseError(f"executable skill cannot be a link: {path}")
-    if path.stat().st_size > MAX_EXECUTABLE_SKILL_BYTES:
-        raise SkillParseError("executable skill exceeds 256 KiB")
+    _read_executable_skill_bytes(path)
 
 
 def _read_executable_skill_text(path: Path) -> str:
     """Read a skill with a hard byte cap that remains safe across file races."""
 
-    validate_executable_skill_path(path)
-    with path.open("rb") as handle:
-        raw = handle.read(MAX_EXECUTABLE_SKILL_BYTES + 1)
-    if len(raw) > MAX_EXECUTABLE_SKILL_BYTES:
-        raise SkillParseError("executable skill exceeds 256 KiB")
-    return raw.decode("utf-8")
+    return _read_executable_skill_bytes(path).decode("utf-8")
+
+
+def _read_executable_skill_bytes(path: Path) -> bytes:
+    candidate = Path(os.path.abspath(path.expanduser()))
+    try:
+        return read_bounded_open_file(
+            candidate,
+            MAX_EXECUTABLE_SKILL_BYTES,
+            label="executable skill",
+            trusted_root=candidate.parent,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if "symlink" in detail or "junction" in detail:
+            raise SkillParseError(f"executable skill cannot be a link: {path}") from exc
+        if "exceeds" in detail:
+            raise SkillParseError("executable skill exceeds 256 KiB") from exc
+        raise SkillParseError(detail) from exc
+
+
+def _execute_python_skill_source(
+    module_name: str,
+    path: Path,
+    source: str,
+) -> types.ModuleType:
+    """Execute already-secured skill source without reopening its pathname."""
+
+    import sys
+
+    module = types.ModuleType(module_name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    sys.modules[module_name] = module
+    try:
+        code = compile(source, str(path), "exec")
+        exec(code, module.__dict__)  # noqa: S102
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
 
 
 # --- self-extension ------------------------------------------------------
@@ -695,6 +729,64 @@ def write_python_skill(
     active without restarting the agent.
     """
 
+    path, serialized = _prepare_python_skill_write(
+        skill_dir,
+        name=name,
+        description=description,
+        trigger=trigger,
+        body=body,
+        allow_unsafe_code=allow_unsafe_code,
+    )
+    candidate = Path(os.path.abspath(path))
+    atomic_write_unlinked_bytes(
+        candidate,
+        serialized,
+        label="executable skill",
+        mode=0o600,
+        trusted_root=candidate.parent,
+    )
+    return path
+
+
+def _write_python_skill_owned(
+    skill_dir: Path,
+    *,
+    name: str,
+    description: str,
+    trigger: str,
+    body: str,
+    allow_unsafe_code: bool,
+) -> tuple[Path, tuple[int, int]]:
+    """Write a skill and return the committed file's stable device/inode identity."""
+
+    path, serialized = _prepare_python_skill_write(
+        skill_dir,
+        name=name,
+        description=description,
+        trigger=trigger,
+        body=body,
+        allow_unsafe_code=allow_unsafe_code,
+    )
+    candidate = Path(os.path.abspath(path))
+    _written, identity = atomic_write_unlinked_bytes_with_identity(
+        candidate,
+        serialized,
+        label="executable skill",
+        mode=0o600,
+        trusted_root=candidate.parent,
+    )
+    return path, identity
+
+
+def _prepare_python_skill_write(
+    skill_dir: Path,
+    *,
+    name: str,
+    description: str,
+    trigger: str,
+    body: str,
+    allow_unsafe_code: bool,
+) -> tuple[Path, bytes]:
     if not allow_unsafe_code:
         raise ValueError(UNSAFE_EXECUTABLE_SKILL_MESSAGE)
     validate_executable_skill_name(name)
@@ -705,6 +797,28 @@ def write_python_skill(
         hasattr(skill_dir, "is_junction") and skill_dir.is_junction()
     ):
         raise ValueError(f"skill directory cannot be a link: {skill_dir}")
+    serialized = _render_python_skill_bytes(
+        name=name,
+        description=description,
+        trigger=trigger,
+        body=body,
+    )
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    path = skill_dir / f"{name}.py"
+    if path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    ):
+        raise ValueError(f"skill file cannot be a link: {path}")
+    return path, serialized
+
+
+def _render_python_skill_bytes(
+    *,
+    name: str,
+    description: str,
+    trigger: str,
+    body: str,
+) -> bytes:
     body = textwrap.dedent(body).strip("\n")
     docstring = (
         f'"""\nname: {name}\ndescription: {description}\ntrigger: {trigger}\n"""'
@@ -723,14 +837,7 @@ def write_python_skill(
         for node in tree.body
     ):
         raise ValueError("invalid Python skill: no execute() function found")
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    path = skill_dir / f"{name}.py"
-    if path.is_symlink() or (
-        hasattr(path, "is_junction") and path.is_junction()
-    ):
-        raise ValueError(f"skill file cannot be a link: {path}")
-    path.write_bytes(serialized)
-    return path
+    return serialized
 
 
 # --- hooks for runtime context ------------------------------------------
