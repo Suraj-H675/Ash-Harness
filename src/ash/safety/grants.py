@@ -7,17 +7,23 @@ import json
 import os
 import re
 import shlex
-import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from ash.safety.trust import canonical_workspace
-from ash.safe_io import read_bounded_bytes, validate_unlinked_path
+from ash.safe_io import (
+    atomic_write_unlinked_bytes,
+    create_unlinked_regular_file,
+    open_unlinked_regular_file,
+    read_bounded_open_file,
+    unlink_open_file,
+    validate_unlinked_path,
+)
 
 
 CURRENT_PERMISSION_RULE_VERSION = 3
@@ -623,7 +629,7 @@ def _read_payload(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"version": CURRENT_PERMISSION_RULE_VERSION, "workspaces": {}}
     try:
-        raw = read_bounded_bytes(
+        raw = read_bounded_open_file(
             path,
             MAX_RULE_FILE_BYTES,
             label="permission rule file",
@@ -757,32 +763,60 @@ def _locked_rule_file(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(path.suffix + ".lock")
     deadline = time.monotonic() + 3.0
-    descriptor: int | None = None
-    while descriptor is None:
+    while True:
+        stack = ExitStack()
         try:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            descriptor = stack.enter_context(
+                create_unlinked_regular_file(
+                    lock_path,
+                    label="permission rule lock",
+                    mode=0o600,
+                )
+            )
         except FileExistsError:
+            stack.close()
             try:
-                stale = time.time() - lock_path.stat().st_mtime > 30
-            except OSError:
-                stale = False
+                with open_unlinked_regular_file(
+                    lock_path,
+                    label="permission rule lock",
+                ) as existing_descriptor:
+                    stale = time.time() - os.fstat(existing_descriptor).st_mtime > 30
+                    if stale:
+                        unlink_open_file(
+                            lock_path,
+                            existing_descriptor,
+                            label="permission rule lock",
+                        )
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as exc:
+                raise PermissionGrantError(
+                    f"cannot inspect permission rule lock: {exc}"
+                ) from exc
             if stale:
-                try:
-                    lock_path.unlink()
-                except OSError:
-                    pass
                 continue
             if time.monotonic() >= deadline:
                 raise PermissionGrantError("timed out waiting for permission rule lock")
             time.sleep(0.025)
-    try:
-        yield
-    finally:
-        os.close(descriptor)
-        try:
-            lock_path.unlink()
-        except OSError:
-            pass
+        except (OSError, ValueError) as exc:
+            stack.close()
+            raise PermissionGrantError(
+                f"cannot create permission rule lock: {exc}"
+            ) from exc
+        else:
+            with stack:
+                try:
+                    yield
+                finally:
+                    try:
+                        unlink_open_file(
+                            lock_path,
+                            descriptor,
+                            label="permission rule lock",
+                        )
+                    except (FileNotFoundError, OSError, ValueError):
+                        pass
+            return
 
 
 def _write_workspaces(
@@ -797,24 +831,18 @@ def _write_workspaces(
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-    )
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
+        serialized = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
+        atomic_write_unlinked_bytes(
+            path,
+            serialized,
+            label="permission rule state",
+            mode=0o600,
+        )
+    except (OSError, ValueError) as exc:
+        raise PermissionGrantError(f"cannot write permission rule file: {exc}") from exc
 
 
 def _update_rules(

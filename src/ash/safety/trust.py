@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from pathlib import Path
 
-from ash.safe_io import read_bounded_bytes
+from ash.safe_io import (
+    atomic_write_unlinked_bytes,
+    chmod_unlinked_directory,
+    read_bounded_open_file,
+)
 
 
 MAX_TRUST_STORE_BYTES = 1_000_000
@@ -48,7 +51,7 @@ def load_trusted_workspaces() -> set[str]:
     if not path.exists():
         return set()
     try:
-        raw = read_bounded_bytes(
+        raw = read_bounded_open_file(
             path,
             MAX_TRUST_STORE_BYTES,
             label="trusted workspace store",
@@ -91,21 +94,21 @@ def _save(entries: set[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _validate_trust_store_path(path)
     if os.name != "nt":
-        path.parent.chmod(0o700)
-    fd, temporary = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        chmod_unlinked_directory(
+            path.parent,
+            0o700,
+            label="workspace trust state directory",
+        )
+    payload = (
+        json.dumps(
+            {"version": 1, "workspaces": sorted(entries)},
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
+    atomic_write_unlinked_bytes(
+        path,
+        payload,
+        label="workspace trust state",
+        mode=0o600,
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"version": 1, "workspaces": sorted(entries)}, handle, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise

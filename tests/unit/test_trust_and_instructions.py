@@ -77,6 +77,84 @@ def test_symlinked_user_state_root_cannot_redirect_workspace_trust(
     assert not (outside / "trusted-workspaces.json").exists()
 
 
+def test_workspace_trust_read_rejects_parent_swapped_after_validation(
+    tmp_path, monkeypatch
+) -> None:
+    import json
+    import pytest
+    import ash.safety.trust as trust_module
+
+    home = tmp_path / "home"
+    state_dir = home / ".ash"
+    state_dir.mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "trusted-workspaces.json").write_text(
+        json.dumps(
+            {"version": 1, "workspaces": [str(workspace.resolve())]}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    real_validate = trust_module._validate_trust_store_path
+    swapped = False
+
+    def validate_then_swap(path):
+        nonlocal swapped
+        real_validate(path)
+        if not swapped:
+            swapped = True
+            state_dir.rename(home / ".ash-real")
+            try:
+                state_dir.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    monkeypatch.setattr(trust_module, "_validate_trust_store_path", validate_then_swap)
+
+    assert is_workspace_trusted(workspace) is False
+    assert swapped is True
+
+
+def test_workspace_trust_write_rejects_parent_swapped_after_validation(
+    tmp_path, monkeypatch
+) -> None:
+    import pytest
+    import ash.safety.trust as trust_module
+
+    home = tmp_path / "home"
+    state_dir = home / ".ash"
+    state_dir.mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "trusted-workspaces.json"
+    victim.write_text("DO NOT TOUCH\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    real_validate = trust_module._validate_trust_store_path
+    validation_count = 0
+
+    def validate_then_swap(path):
+        nonlocal validation_count
+        real_validate(path)
+        validation_count += 1
+        if validation_count == 3:
+            state_dir.rename(home / ".ash-real")
+            try:
+                state_dir.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    monkeypatch.setattr(trust_module, "_validate_trust_store_path", validate_then_swap)
+
+    with pytest.raises((OSError, ValueError)):
+        set_workspace_trusted(workspace, True)
+    assert victim.read_text(encoding="utf-8") == "DO NOT TOUCH\n"
+
+
 def test_malformed_or_unsupported_trust_store_fails_closed(
     tmp_path, monkeypatch
 ) -> None:

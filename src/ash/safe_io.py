@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import stat
 from contextlib import contextmanager
 from pathlib import Path
@@ -245,6 +246,134 @@ def replace_open_file(
     finally:
         if parent_descriptor >= 0:
             os.close(parent_descriptor)
+
+
+def read_bounded_open_file(
+    path: str | Path,
+    max_bytes: int,
+    *,
+    label: str,
+) -> bytes:
+    """Read one bounded regular file through a held no-follow descriptor."""
+
+    if max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
+    with open_unlinked_regular_file(path, label=label) as descriptor:
+        metadata = os.fstat(descriptor)
+        if metadata.st_size > max_bytes:
+            raise ValueError(f"{label} exceeds {max_bytes} bytes: {path}")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"{label} exceeds {max_bytes} bytes: {path}")
+        return b"".join(chunks)
+
+
+def atomic_write_unlinked_bytes(
+    path: str | Path,
+    payload: bytes,
+    *,
+    label: str,
+    mode: int = 0o600,
+) -> Path:
+    """Atomically replace one file without following a mutable parent or leaf link."""
+
+    if not isinstance(payload, bytes):
+        raise TypeError("atomic file payload must be bytes")
+    target = validate_unlinked_file_path(path, label=label)
+    temporary = target.with_name(f".{target.name}.{secrets.token_hex(16)}.tmp")
+    with create_unlinked_regular_file(
+        temporary,
+        label=f"{label} temporary",
+        mode=mode,
+    ) as descriptor:
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError(f"short write while writing {label}")
+            view = view[written:]
+        os.fsync(descriptor)
+        return replace_open_file(
+            temporary,
+            target,
+            descriptor,
+            label=label,
+        )
+
+
+def unlink_open_file(
+    path: str | Path,
+    descriptor: int,
+    *,
+    label: str,
+) -> None:
+    """Unlink a visible path only when it still names ``descriptor``."""
+
+    target = validate_unlinked_file_path(path, label=label)
+    _require_regular_descriptor(descriptor, target, label=label)
+    parent_descriptor = -1
+    try:
+        parent_descriptor = _open_parent_directory(target)
+        opened = os.fstat(descriptor)
+        if parent_descriptor >= 0:
+            observed = os.stat(
+                target.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(observed.st_mode) or (
+                observed.st_dev,
+                observed.st_ino,
+            ) != (opened.st_dev, opened.st_ino):
+                raise ValueError(
+                    f"refusing to unlink {label} that changed after opening: {target}"
+                )
+            os.unlink(target.name, dir_fd=parent_descriptor)
+            try:
+                os.fsync(parent_descriptor)
+            except OSError:
+                pass
+            return
+        _verify_path_identity(target, descriptor, label=label)
+        target.unlink()
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def chmod_unlinked_directory(
+    path: str | Path,
+    mode: int,
+    *,
+    label: str,
+) -> Path:
+    """Apply permissions to one directory without following a replaced leaf link."""
+
+    target = validate_unlinked_directory_path(path, label=label)
+    if os.name == "nt":
+        return target
+    flags = os.O_RDONLY | _close_on_exec_flag()
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    flags |= _nofollow_flag()
+    descriptor = os.open(target, flags)
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ValueError(f"refusing to chmod non-directory {label}: {target}")
+        os.fchmod(descriptor, mode)
+    finally:
+        os.close(descriptor)
+    return target
 
 
 def _open_parent_directory(target: Path) -> int:

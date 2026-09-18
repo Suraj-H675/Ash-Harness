@@ -293,6 +293,156 @@ def test_permission_rule_file_rejects_symlinked_user_state_root(
     assert not (outside / "permission-grants.json").exists()
 
 
+def test_permission_rule_read_rejects_parent_swapped_after_validation(
+    tmp_path, monkeypatch
+) -> None:
+    import ash.safety.grants as grants_module
+
+    home = tmp_path / "home"
+    state_dir = home / ".ash"
+    state_dir.mkdir(parents=True)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    rule = PermissionRule.create(RuleEffect.ALLOW, "run_command")
+    (outside / "permission-grants.json").write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "workspaces": {
+                    str(workspace.resolve()): [rule.as_payload()],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    real_validate = grants_module.validate_unlinked_path
+    swapped = False
+
+    def validate_then_swap(*args, **kwargs):
+        nonlocal swapped
+        result = real_validate(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            state_dir.rename(home / ".ash-real")
+            try:
+                state_dir.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return result
+
+    monkeypatch.setattr(grants_module, "validate_unlinked_path", validate_then_swap)
+
+    with pytest.raises(PermissionGrantError):
+        load_permission_rules(workspace)
+    assert swapped is True
+
+
+def test_permission_rule_write_rejects_parent_swapped_after_validation(
+    tmp_path, monkeypatch
+) -> None:
+    import ash.safety.grants as grants_module
+
+    home = tmp_path / "home"
+    state_dir = home / ".ash"
+    state_dir.mkdir(parents=True)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "permission-grants.json"
+    victim.write_text("DO NOT TOUCH\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    real_validated = grants_module._validated_grants_path
+    validation_count = 0
+
+    def validated_then_swap():
+        nonlocal validation_count
+        result = real_validated()
+        validation_count += 1
+        if validation_count == 3:
+            state_dir.rename(home / ".ash-real")
+            try:
+                state_dir.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return result
+
+    monkeypatch.setattr(grants_module, "_validated_grants_path", validated_then_swap)
+
+    with pytest.raises(PermissionGrantError):
+        add_permission_rule(
+            workspace,
+            PermissionRule.create(RuleEffect.ALLOW, "run_command"),
+        )
+    assert victim.read_text(encoding="utf-8") == "DO NOT TOUCH\n"
+
+
+def test_permission_rule_stale_lock_cleanup_rejects_parent_swap(
+    tmp_path, monkeypatch
+) -> None:
+    import os
+    import time as time_module
+    import ash.safety.grants as grants_module
+
+    home = tmp_path / "home"
+    state_dir = home / ".ash"
+    state_dir.mkdir(parents=True)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    lock_path = state_dir / "permission-grants.json.lock"
+    lock_path.write_text("stale\n", encoding="utf-8")
+    os.utime(lock_path, (0, 0))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "permission-grants.json.lock"
+    victim.write_text("DO NOT TOUCH\n", encoding="utf-8")
+    os.utime(victim, (0, 0))
+    monkeypatch.setenv("HOME", str(home))
+    real_time = time_module.time
+    swapped = False
+
+    def time_then_swap():
+        nonlocal swapped
+        now = real_time()
+        if not swapped:
+            swapped = True
+            state_dir.rename(home / ".ash-real")
+            try:
+                state_dir.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return now
+
+    monkeypatch.setattr(grants_module.time, "time", time_then_swap)
+
+    with pytest.raises(PermissionGrantError):
+        add_permission_rule(
+            workspace,
+            PermissionRule.create(RuleEffect.ALLOW, "run_command"),
+        )
+    assert swapped is True
+    assert victim.read_text(encoding="utf-8") == "DO NOT TOUCH\n"
+
+
+def test_permission_rule_lock_does_not_consume_body_file_exists(
+    tmp_path, monkeypatch
+) -> None:
+    import ash.safety.grants as grants_module
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    path = grants_path()
+    path.parent.mkdir(parents=True)
+
+    with pytest.raises(FileExistsError, match="body failure"):
+        with grants_module._locked_rule_file(path):
+            raise FileExistsError("body failure")
+
+    assert not path.with_suffix(path.suffix + ".lock").exists()
+
+
 def test_exact_scope_never_silently_drops_large_non_content_arguments() -> None:
     with pytest.raises(PermissionGrantError, match="exceeds 8 KiB"):
         build_exact_scope_matchers(
