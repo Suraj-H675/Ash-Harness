@@ -266,7 +266,20 @@ def read_bounded_open_file(
             label=label,
         ) as (parent_descriptor, name, target):
             flags = os.O_RDONLY | _close_on_exec_flag() | _nofollow_flag()
-            descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+            try:
+                descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+            except OSError as exc:
+                try:
+                    observed = os.stat(
+                        name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    raise exc
+                if stat.S_ISLNK(observed.st_mode):
+                    raise ValueError(f"refusing to read symlinked {label}: {target}") from exc
+                raise
             try:
                 return _read_bounded_descriptor(
                     descriptor,
@@ -503,6 +516,271 @@ def ensure_anchored_directory(
         return target
     finally:
         os.close(descriptor)
+
+
+def anchored_directory_exists(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+) -> bool:
+    """Return whether one directory exists below a trusted root without following links."""
+
+    root, target, _ = _anchored_path_parts(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    )
+    if not _supports_anchored_path_io():
+        try:
+            validate_unlinked_path(target, trusted_root=root, label=label)
+        except ValueError:
+            return False
+        return target.is_dir() and not target.is_symlink()
+    try:
+        with _open_anchored_parent(
+            target,
+            trusted_root=root,
+            label=label,
+        ) as (parent_descriptor, name, _target):
+            try:
+                observed = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+            return stat.S_ISDIR(observed.st_mode) and not stat.S_ISLNK(observed.st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def anchored_regular_file_exists(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+) -> bool:
+    """Return whether one regular file exists below a trusted root without following links."""
+
+    root, target, _ = _anchored_path_parts(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    )
+    if not _supports_anchored_path_io():
+        try:
+            validate_unlinked_path(target, trusted_root=root, label=label)
+        except ValueError:
+            return False
+        return target.is_file() and not target.is_symlink()
+    try:
+        with _open_anchored_parent(
+            target,
+            trusted_root=root,
+            label=label,
+        ) as (parent_descriptor, name, _target):
+            try:
+                observed = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+            return stat.S_ISREG(observed.st_mode) and not stat.S_ISLNK(observed.st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def list_anchored_directory(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+    max_entries: int,
+) -> list[tuple[str, bool]]:
+    """List one directory through a held descriptor, returning name/directory pairs."""
+
+    if max_entries < 0:
+        raise ValueError("max_entries must be non-negative")
+    root, target, _ = _anchored_path_parts(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    )
+    if not _supports_anchored_path_io():
+        validate_unlinked_path(target, trusted_root=root, label=label)
+        entries: list[tuple[str, bool]] = []
+        for index, entry in enumerate(os.scandir(target), 1):
+            if index > max_entries:
+                raise ValueError(f"{label} exceeds {max_entries} entries")
+            entries.append((entry.name, entry.is_dir(follow_symlinks=False)))
+        return entries
+    with _open_anchored_parent(
+        target,
+        trusted_root=root,
+        label=label,
+    ) as (parent_descriptor, name, _target):
+        flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+        directory_descriptor = _open_anchored_directory_component(
+            parent_descriptor,
+            name,
+            flags=flags,
+            target=target,
+            label=label,
+        )
+        try:
+            entries = []
+            for index, entry_name in enumerate(os.listdir(directory_descriptor), 1):
+                if index > max_entries:
+                    raise ValueError(f"{label} exceeds {max_entries} entries")
+                observed = os.stat(
+                    entry_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                entries.append((entry_name, stat.S_ISDIR(observed.st_mode)))
+            return entries
+        finally:
+            os.close(directory_descriptor)
+
+
+def create_anchored_directory(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+    mode: int = 0o700,
+) -> Path:
+    """Exclusively create one directory below a trusted root without following links."""
+
+    root, target, _ = _anchored_path_parts(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    )
+    if not _supports_anchored_path_io():
+        validate_unlinked_path(target.parent, trusted_root=root, label=label)
+        target.mkdir(mode=mode)
+        validate_unlinked_path(target, trusted_root=root, label=label)
+        return target
+    with _open_anchored_parent(
+        target,
+        trusted_root=root,
+        label=label,
+    ) as (parent_descriptor, name, _target):
+        os.mkdir(name, mode, dir_fd=parent_descriptor)
+        flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+        descriptor = _open_anchored_directory_component(
+            parent_descriptor,
+            name,
+            flags=flags,
+            target=target,
+            label=label,
+        )
+        try:
+            if hasattr(os, "fchmod") and os.name != "nt":
+                os.fchmod(descriptor, mode)
+            opened = os.fstat(descriptor)
+            observed = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (observed.st_dev, observed.st_ino) != (opened.st_dev, opened.st_ino):
+                raise ValueError(f"refusing to use {label} that changed after creation: {target}")
+            return target
+        finally:
+            os.close(descriptor)
+
+
+def remove_anchored_directory_tree(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+) -> None:
+    """Recursively remove one directory through held descriptors without following links."""
+
+    root, target, _ = _anchored_path_parts(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    )
+    if not _supports_anchored_path_io() or os.rmdir not in getattr(os, "supports_dir_fd", ()):
+        validate_unlinked_path(target, trusted_root=root, label=label)
+        import shutil
+
+        shutil.rmtree(target)
+        return
+    with _open_anchored_parent(
+        target,
+        trusted_root=root,
+        label=label,
+    ) as (parent_descriptor, name, _target):
+        flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+        descriptor = _open_anchored_directory_component(
+            parent_descriptor,
+            name,
+            flags=flags,
+            target=target,
+            label=label,
+        )
+        try:
+            _remove_directory_contents(descriptor, target=target, label=label)
+            opened = os.fstat(descriptor)
+            observed = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (observed.st_dev, observed.st_ino) != (opened.st_dev, opened.st_ino):
+                raise ValueError(f"refusing to remove {label} that changed during deletion: {target}")
+            os.rmdir(name, dir_fd=parent_descriptor)
+            try:
+                os.fsync(parent_descriptor)
+            except OSError:
+                pass
+        finally:
+            os.close(descriptor)
+
+
+def _remove_directory_contents(descriptor: int, *, target: Path, label: str) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+    for entry_name in os.listdir(descriptor):
+        observed = os.stat(entry_name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(observed.st_mode):
+            child_descriptor = _open_anchored_directory_component(
+                descriptor,
+                entry_name,
+                flags=flags,
+                target=target / entry_name,
+                label=label,
+            )
+            try:
+                _remove_directory_contents(
+                    child_descriptor,
+                    target=target / entry_name,
+                    label=label,
+                )
+                opened = os.fstat(child_descriptor)
+                current = os.stat(
+                    entry_name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise ValueError(
+                        f"refusing to remove {label} entry that changed during deletion: "
+                        f"{target / entry_name}"
+                    )
+                os.rmdir(entry_name, dir_fd=descriptor)
+            finally:
+                os.close(child_descriptor)
+            continue
+        os.unlink(entry_name, dir_fd=descriptor)
 
 
 def unlink_open_file(

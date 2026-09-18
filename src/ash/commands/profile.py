@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +15,14 @@ from ash.profiles import (
     set_active_profile,
     validate_profile_name,
 )
-from ash.safe_io import read_bounded_bytes
+from ash.safe_io import (
+    anchored_directory_exists,
+    anchored_regular_file_exists,
+    create_anchored_directory,
+    ensure_anchored_directory,
+    read_bounded_open_file,
+    remove_anchored_directory_tree,
+)
 from ash.ui.safe_text import terminal_safe_text
 
 
@@ -30,24 +36,37 @@ def _profile_metadata(name: str, *, base_directory: Path) -> dict[str, Any]:
     env_path = directory / ".env"
     config_path = directory / "ash.toml"
     model = ""
-    if env_path.is_file():
-        try:
-            raw = read_bounded_bytes(env_path, 1024 * 1024, label="profile dotenv file")
-            for line in raw.decode("utf-8").splitlines():
-                key, separator, value = line.partition("=")
-                if separator and key.strip() == "ASH_MODEL":
-                    model = value.strip()
-                    break
-        except (OSError, UnicodeError, ValueError):
-            model = ""
+    trusted_root = base_directory.parent
+    try:
+        raw = read_bounded_open_file(
+            env_path,
+            1024 * 1024,
+            label="profile dotenv file",
+            trusted_root=trusted_root,
+        )
+        for line in raw.decode("utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == "ASH_MODEL":
+                model = value.strip()
+                break
+    except (FileNotFoundError, OSError, UnicodeError, ValueError):
+        model = ""
     return {
         "name": normalized,
         "active": normalized == active_profile_name(ash_dir=base_directory),
         "directory": str(directory),
         "config_file": str(config_path),
-        "config_present": config_path.is_file(),
+        "config_present": anchored_regular_file_exists(
+            config_path,
+            trusted_root=trusted_root,
+            label="profile config file",
+        ),
         "credentials_file": str(env_path),
-        "credentials_present": env_path.is_file(),
+        "credentials_present": anchored_regular_file_exists(
+            env_path,
+            trusted_root=trusted_root,
+            label="profile credential file",
+        ),
         "model": model,
     }
 
@@ -113,9 +132,28 @@ def add_profile(name: str) -> str:
     if normalized == DEFAULT_PROFILE:
         raise ValueError("the default profile already exists")
     directory = profile_directory(normalized, ash_dir=base_directory)
-    if directory.exists():
+    trusted_root = base_directory.parent
+    if anchored_directory_exists(
+        directory,
+        trusted_root=trusted_root,
+        label="profile directory",
+    ):
         raise ValueError(f"profile already exists: {normalized}")
-    directory.mkdir(parents=True, mode=0o700)
+    ensure_anchored_directory(
+        directory.parent,
+        trusted_root=trusted_root,
+        label="profiles directory",
+        mode=0o700,
+    )
+    try:
+        create_anchored_directory(
+            directory,
+            trusted_root=trusted_root,
+            label="profile directory",
+            mode=0o700,
+        )
+    except FileExistsError as exc:
+        raise ValueError(f"profile already exists: {normalized}") from exc
     return normalized
 
 
@@ -133,13 +171,17 @@ def remove_profile(name: str, *, confirmed: bool) -> str:
     if normalized == DEFAULT_PROFILE:
         raise ValueError("the default profile cannot be removed")
     directory = profile_directory(normalized, ash_dir=base_directory)
-    if not directory.is_dir():
+    if not profile_exists(normalized, ash_dir=base_directory):
         raise ValueError(f"profile does not exist: {normalized}")
     if not confirmed:
         raise ValueError("removing a profile requires --yes")
     if active_profile_name(ash_dir=base_directory) == normalized:
         set_active_profile(DEFAULT_PROFILE, ash_dir=base_directory)
-    shutil.rmtree(directory)
+    remove_anchored_directory_tree(
+        directory,
+        trusted_root=base_directory.parent,
+        label="profile directory",
+    )
     return normalized
 
 

@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import os
 import re
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
-from ash.safe_io import read_bounded_bytes
+from ash.safe_io import (
+    anchored_directory_exists,
+    atomic_write_unlinked_bytes,
+    ensure_anchored_directory,
+    list_anchored_directory,
+    read_bounded_open_file,
+)
 
 
 DEFAULT_PROFILE = "default"
@@ -78,16 +83,18 @@ def active_profile_name(
         value = str(environment["ASH_PROFILE"]).strip()
         return validate_profile_name(value or DEFAULT_PROFILE)
 
-    marker = _state_root(ash_dir) / _ACTIVE_PROFILE_FILENAME
-    if not marker.is_file():
-        return DEFAULT_PROFILE
+    root = _state_root(ash_dir)
+    marker = root / _ACTIVE_PROFILE_FILENAME
     try:
-        raw = read_bounded_bytes(
+        raw = read_bounded_open_file(
             marker,
             MAX_ACTIVE_PROFILE_BYTES,
             label="active Ash profile marker",
+            trusted_root=root.parent,
         )
         value = raw.decode("utf-8").strip()
+    except FileNotFoundError:
+        return DEFAULT_PROFILE
     except (OSError, ValueError) as exc:
         raise ValueError(f"cannot read active Ash profile marker {marker}: {exc}") from exc
     return validate_profile_name(value or DEFAULT_PROFILE)
@@ -98,47 +105,45 @@ def set_active_profile(name: str, *, ash_dir: Path | None = None) -> str:
 
     normalized = validate_profile_name(name)
     root = _state_root(ash_dir)
-    root.mkdir(parents=True, exist_ok=True)
+    ensure_anchored_directory(
+        root,
+        trusted_root=root.parent,
+        label="Ash state directory",
+        mode=0o700,
+    )
     marker = root / _ACTIVE_PROFILE_FILENAME
-    fd, temporary = tempfile.mkstemp(dir=root, prefix=f".{marker.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(normalized + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, marker)
-        if os.name != "nt":
-            marker.chmod(0o600)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
+    atomic_write_unlinked_bytes(
+        marker,
+        (normalized + "\n").encode("utf-8"),
+        label="active Ash profile marker",
+        mode=0o600,
+        trusted_root=root.parent,
+    )
     return normalized
 
 
 def list_profile_names(*, ash_dir: Path | None = None) -> tuple[str, ...]:
     """Return the default profile plus valid named profile directories."""
 
-    root = profiles_directory(ash_dir)
+    state_root = _state_root(ash_dir)
+    root = _profiles_root(state_root)
     names = [DEFAULT_PROFILE]
-    if root.is_dir():
-        if root.is_symlink():
-            raise ValueError(f"refusing to enumerate symlinked profiles directory: {root}")
-        for index, path in enumerate(root.iterdir(), 1):
-            if index > MAX_PROFILE_ENTRIES:
-                raise ValueError(
-                    f"profile directory exceeds {MAX_PROFILE_ENTRIES} entries"
-                )
-            if path.is_symlink():
-                continue
-            if not path.is_dir():
-                continue
-            try:
-                names.append(validate_profile_name(path.name))
-            except ValueError:
-                continue
+    try:
+        entries = list_anchored_directory(
+            root,
+            trusted_root=state_root.parent,
+            label="profile directory",
+            max_entries=MAX_PROFILE_ENTRIES,
+        )
+    except FileNotFoundError:
+        entries = []
+    for entry_name, is_directory in entries:
+        if not is_directory:
+            continue
+        try:
+            names.append(validate_profile_name(entry_name))
+        except ValueError:
+            continue
     return tuple(sorted(set(names), key=lambda value: (value != DEFAULT_PROFILE, value)))
 
 
@@ -148,8 +153,13 @@ def profile_exists(name: str, *, ash_dir: Path | None = None) -> bool:
     normalized = validate_profile_name(name)
     if normalized == DEFAULT_PROFILE:
         return True
-    directory = profile_directory(normalized, ash_dir=ash_dir)
-    return directory.is_dir() and not directory.is_symlink()
+    state_root = _state_root(ash_dir)
+    directory = _profiles_root(state_root) / normalized
+    return anchored_directory_exists(
+        directory,
+        trusted_root=state_root.parent,
+        label="profile directory",
+    )
 
 
 __all__ = [

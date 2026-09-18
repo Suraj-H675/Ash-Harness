@@ -64,6 +64,75 @@ def test_active_profile_marker_symlink_is_not_followed(tmp_path: Path) -> None:
         active_profile_name(environ={}, ash_dir=tmp_path)
 
 
+def test_active_profile_read_rejects_state_root_swapped_after_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.profiles as profiles_module
+
+    home = tmp_path / "home"
+    state = home / ".ash"
+    state.mkdir(parents=True)
+    (state / "active-profile").write_text("default\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "active-profile").write_text("work\n", encoding="utf-8")
+    real_state_root = profiles_module._state_root
+    swapped = False
+
+    def state_root_then_swap(ash_dir=None):
+        nonlocal swapped
+        root = real_state_root(ash_dir)
+        if not swapped:
+            swapped = True
+            state.rename(home / ".ash-real")
+            try:
+                state.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return root
+
+    monkeypatch.setattr(profiles_module, "_state_root", state_root_then_swap)
+
+    with pytest.raises((OSError, ValueError)):
+        profiles_module.active_profile_name(environ={}, ash_dir=state)
+    assert swapped is True
+
+
+def test_active_profile_write_rejects_state_root_swapped_after_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.profiles as profiles_module
+
+    home = tmp_path / "home"
+    state = home / ".ash"
+    state.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "active-profile"
+    victim.write_text("do-not-touch\n", encoding="utf-8")
+    real_state_root = profiles_module._state_root
+    swapped = False
+
+    def state_root_then_swap(ash_dir=None):
+        nonlocal swapped
+        root = real_state_root(ash_dir)
+        if not swapped:
+            swapped = True
+            state.rename(home / ".ash-real")
+            try:
+                state.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return root
+
+    monkeypatch.setattr(profiles_module, "_state_root", state_root_then_swap)
+
+    with pytest.raises((OSError, ValueError)):
+        profiles_module.set_active_profile("work", ash_dir=state)
+    assert swapped is True
+    assert victim.read_text(encoding="utf-8") == "do-not-touch\n"
+
+
 def test_profile_commands_keep_credentials_out_of_inventory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -199,6 +268,81 @@ def test_symlinked_profiles_root_cannot_redirect_profile_mutations(
     with pytest.raises(ValueError, match="symlinked profiles directory"):
         remove_profile("work", confirmed=True)
     assert victim.joinpath("sentinel.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_profile_add_rejects_profiles_root_swapped_after_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.commands.profile as profile_module
+
+    home = tmp_path / "home"
+    base = home / ".ash"
+    profiles = base / "profiles"
+    profiles.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_profile_directory = profile_module.profile_directory
+    swapped = False
+
+    def directory_then_swap(name, *, ash_dir=None):
+        nonlocal swapped
+        directory = real_profile_directory(name, ash_dir=ash_dir)
+        if not swapped:
+            swapped = True
+            profiles.rename(base / "profiles-real")
+            try:
+                profiles.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return directory
+
+    monkeypatch.setattr(profile_module, "_base_ash_directory", lambda: base)
+    monkeypatch.setattr(profile_module, "profile_directory", directory_then_swap)
+
+    with pytest.raises((OSError, ValueError)):
+        profile_module.add_profile("work")
+    assert swapped is True
+    assert not (outside / "work").exists()
+
+
+def test_profile_remove_rejects_profiles_root_swapped_before_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.commands.profile as profile_module
+
+    home = tmp_path / "home"
+    base = home / ".ash"
+    profiles = base / "profiles"
+    local_work = profiles / "work"
+    local_work.mkdir(parents=True)
+    (local_work / "local.txt").write_text("local\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    victim = outside / "work"
+    victim.mkdir(parents=True)
+    sentinel = victim / "sentinel.txt"
+    sentinel.write_text("DO NOT DELETE\n", encoding="utf-8")
+    real_active = profile_module.active_profile_name
+    swapped = False
+
+    def active_then_swap(*args, **kwargs):
+        nonlocal swapped
+        active = real_active(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            profiles.rename(base / "profiles-real")
+            try:
+                profiles.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return active
+
+    monkeypatch.setattr(profile_module, "_base_ash_directory", lambda: base)
+    monkeypatch.setattr(profile_module, "active_profile_name", active_then_swap)
+
+    with pytest.raises((OSError, ValueError)):
+        profile_module.remove_profile("work", confirmed=True)
+    assert swapped is True
+    assert sentinel.read_text(encoding="utf-8") == "DO NOT DELETE\n"
 
 
 def test_symlinked_user_state_root_cannot_redirect_profile_config(

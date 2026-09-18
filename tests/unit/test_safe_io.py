@@ -11,6 +11,7 @@ from ash.safe_io import (
     ensure_anchored_directory,
     read_bounded_open_file,
     read_bounded_text,
+    remove_anchored_directory_tree,
     replace_open_file,
     strict_json_loads,
     validate_unlinked_directory_path,
@@ -194,3 +195,27 @@ def test_anchored_directory_creation_builds_nested_state_tree(tmp_path: Path) ->
 
     assert created == target
     assert target.is_dir()
+
+
+def test_anchored_directory_removal_does_not_follow_nested_symlink(tmp_path: Path) -> None:
+    trusted_root = tmp_path / "home"
+    profile = trusted_root / ".ash" / "profiles" / "work"
+    profile.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    try:
+        (profile / "linked-outside").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+    (profile / "local.txt").write_text("delete\n", encoding="utf-8")
+
+    remove_anchored_directory_tree(
+        profile,
+        trusted_root=trusted_root,
+        label="profile directory",
+    )
+
+    assert not profile.exists()
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
