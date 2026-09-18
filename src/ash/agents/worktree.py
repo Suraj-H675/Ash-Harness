@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -77,23 +76,21 @@ class WorktreeManager:
         path = self.storage_root / safe_id
         if path.exists() or path.is_symlink():
             raise WorktreeError(f"agent worktree path already exists: {path}")
-        try:
-            await self._git(
-                "worktree",
-                "add",
-                "--lock",
-                "--reason",
-                f"Ash subagent {safe_id}",
-                "-b",
-                branch,
-                str(path),
-                base_commit,
-            )
-        except Exception:
-            await self._git("branch", "-D", branch, check=False)
-            if path.exists():
-                shutil.rmtree(path, ignore_errors=True)
-            raise
+        # A failed `git worktree add` leaves ownership of both the path and the
+        # branch ambiguous: Git may have created either partially, or another
+        # process may have claimed the previously-free name before the failure
+        # returned. Do not guess ownership and destructively clean up here.
+        await self._git(
+            "worktree",
+            "add",
+            "--lock",
+            "--reason",
+            f"Ash subagent {safe_id}",
+            "-b",
+            branch,
+            str(path),
+            base_commit,
+        )
         return WorktreeLease(safe_id, path, branch, base_commit)
 
     async def commit_changes(

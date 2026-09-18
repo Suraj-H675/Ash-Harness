@@ -455,6 +455,71 @@ def test_worktree_revalidates_storage_before_create(
     assert result.returncode != 0
 
 
+def test_worktree_add_failure_does_not_delete_replacement_directory(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage_root = tmp_path / "agents"
+    manager = WorktreeManager(repository, storage_root)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    sentinel = victim / "sentinel.txt"
+    sentinel.write_text("DO NOT DELETE\n", encoding="utf-8")
+    real_git = manager._git
+
+    async def fail_after_replacement(*args: str, check: bool = True):
+        if args[:2] == ("worktree", "add"):
+            path = storage_root / "coder-replaced"
+            path.mkdir()
+            (path / "partial.txt").write_text("partial\n", encoding="utf-8")
+            path.rename(storage_root / "partial-saved")
+            victim.rename(path)
+            raise WorktreeError("simulated worktree add failure")
+        return await real_git(*args, check=check)
+
+    monkeypatch.setattr(manager, "_git", fail_after_replacement)
+
+    with pytest.raises(WorktreeError, match="simulated worktree add failure"):
+        asyncio.run(manager.create("coder-replaced"))
+
+    replacement = storage_root / "coder-replaced"
+    assert (replacement / "sentinel.txt").read_text(encoding="utf-8") == (
+        "DO NOT DELETE\n"
+    )
+    assert (storage_root / "partial-saved" / "partial.txt").read_text(
+        encoding="utf-8"
+    ) == "partial\n"
+
+
+def test_worktree_add_failure_does_not_delete_replacement_branch(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WorktreeManager(repository, tmp_path / "agents")
+    real_git = manager._git
+    replacement_branch = "ash-agent/coder-branch-replaced"
+
+    async def fail_after_branch_replacement(*args: str, check: bool = True):
+        if args[:2] == ("worktree", "add"):
+            _git(repository, "branch", replacement_branch, "HEAD")
+            raise WorktreeError("simulated worktree add failure")
+        return await real_git(*args, check=check)
+
+    monkeypatch.setattr(manager, "_git", fail_after_branch_replacement)
+
+    with pytest.raises(WorktreeError, match="simulated worktree add failure"):
+        asyncio.run(manager.create("coder-branch-replaced"))
+
+    assert _git(
+        repository,
+        "show-ref",
+        "--verify",
+        f"refs/heads/{replacement_branch}",
+    )
+
+
 def test_worktree_apply_rejects_dirty_lead(repository: Path, tmp_path: Path) -> None:
     manager = WorktreeManager(repository, tmp_path / "agents")
 
