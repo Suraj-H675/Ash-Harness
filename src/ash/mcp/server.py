@@ -6,15 +6,17 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from ash.safe_io import strict_json_loads
+from ash.safe_io import (
+    atomic_write_unlinked_bytes,
+    read_bounded_open_file,
+    strict_json_loads,
+)
 from ash.safety.environment import build_scrubbed_environment
-from ash.safe_io import read_bounded_bytes
 from ash.mcp.oauth import MCPOAuthError, canonical_resource_uri
 from ash.sandbox.process_utils import (
     ProcessTreeError,
@@ -29,6 +31,16 @@ MCP_SERVER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 MCP_OAUTH_SCOPE = re.compile(
     r"[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*"
 )
+
+
+def _mcp_config_trusted_root(path: Path) -> Path:
+    """Return an existing ancestor that anchors MCP config parent traversal."""
+
+    absolute = Path(os.path.abspath(path.expanduser()))
+    candidate = absolute.parent.parent
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
 
 
 class MCPServerLifecycleError(RuntimeError):
@@ -296,14 +308,16 @@ def load_mcp_servers(
     """Load MCP server definitions from .mcp.json."""
     if config_path is None:
         config_path = Path(".mcp.json")
-    if not config_path.exists():
-        return {}
+    trusted_root = _mcp_config_trusted_root(config_path)
     try:
-        raw_bytes = read_bounded_bytes(
+        raw_bytes = read_bounded_open_file(
             config_path,
             MAX_MCP_CONFIG_BYTES,
             label="MCP config",
+            trusted_root=trusted_root,
         )
+    except FileNotFoundError:
+        return {}
     except ValueError as exc:
         if "exceeds" in str(exc):
             raise ValueError(f"MCP config exceeds 256 KiB: {config_path}") from exc
@@ -377,6 +391,7 @@ def save_mcp_servers(
     """Atomically persist MCP server definitions."""
 
     path = config_path or Path(".mcp.json")
+    trusted_root = _mcp_config_trusted_root(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         name: {
@@ -392,22 +407,14 @@ def save_mcp_servers(
         }
         for name, config in sorted(servers.items())
     }
-    fd, temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    serialized = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    atomic_write_unlinked_bytes(
+        path,
+        serialized,
+        label="MCP config",
+        mode=0o600,
+        trusted_root=trusted_root,
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
     return path
 
 

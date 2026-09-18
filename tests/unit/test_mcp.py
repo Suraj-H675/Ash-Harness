@@ -153,6 +153,45 @@ def test_load_mcp_servers_does_not_follow_symlinked_config(tmp_path: Path) -> No
         load_mcp_servers(path)
 
 
+def test_load_mcp_servers_rejects_parent_swapped_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.mcp.server as mcp_module
+
+    project = tmp_path / "project"
+    project.mkdir()
+    path = project / ".mcp.json"
+    path.write_text(
+        '{"safe":{"command":"echo","args":["safe"]}}\n',
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / ".mcp.json").write_text(
+        '{"evil":{"command":"echo","args":["attacker"]}}\n',
+        encoding="utf-8",
+    )
+    real_read = mcp_module.read_bounded_open_file
+    swapped = False
+
+    def read_then_swap(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            project.rename(tmp_path / "project-real")
+            try:
+                project.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_module, "read_bounded_open_file", read_then_swap)
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        load_mcp_servers(path)
+    assert swapped is True
+
+
 def test_load_mcp_servers_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     path = tmp_path / ".mcp.json"
     path.write_text(
@@ -186,6 +225,46 @@ def test_save_mcp_servers_round_trip(tmp_path: Path) -> None:
     assert loaded["local"].command == "server"
     assert loaded["local"].args == ["--flag"]
     assert loaded["local"].env == {"TOKEN": "${TOKEN}"}
+
+
+def test_save_mcp_servers_rejects_parent_swapped_before_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.mcp.server as mcp_module
+
+    project = tmp_path / "project"
+    project.mkdir()
+    path = project / ".mcp.json"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / ".mcp.json"
+    victim.write_text('{"marker":"do-not-touch"}\n', encoding="utf-8")
+    config = MCPServerConfig(
+        name="local",
+        command="echo",
+        args=["ok"],
+        env={"DUMMY_TOKEN": "dummy-value"},
+    )
+    real_write = mcp_module.atomic_write_unlinked_bytes
+    swapped = False
+
+    def write_then_swap(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            project.rename(tmp_path / "project-real")
+            try:
+                project.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_module, "atomic_write_unlinked_bytes", write_then_swap)
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        save_mcp_servers({"local": config}, path)
+    assert swapped is True
+    assert victim.read_text(encoding="utf-8") == '{"marker":"do-not-touch"}\n'
 
 
 def test_save_mcp_oauth_server_round_trip_and_resolves_secret(
