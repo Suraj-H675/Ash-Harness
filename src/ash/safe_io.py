@@ -253,27 +253,61 @@ def read_bounded_open_file(
     max_bytes: int,
     *,
     label: str,
+    trusted_root: str | Path | None = None,
 ) -> bytes:
     """Read one bounded regular file through a held no-follow descriptor."""
 
     if max_bytes < 0:
         raise ValueError("max_bytes must be non-negative")
+    if trusted_root is not None and _supports_anchored_path_io():
+        with _open_anchored_parent(
+            path,
+            trusted_root=trusted_root,
+            label=label,
+        ) as (parent_descriptor, name, target):
+            flags = os.O_RDONLY | _close_on_exec_flag() | _nofollow_flag()
+            descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+            try:
+                return _read_bounded_descriptor(
+                    descriptor,
+                    max_bytes,
+                    path=target,
+                    label=label,
+                )
+            finally:
+                os.close(descriptor)
     with open_unlinked_regular_file(path, label=label) as descriptor:
-        metadata = os.fstat(descriptor)
-        if metadata.st_size > max_bytes:
+        return _read_bounded_descriptor(
+            descriptor,
+            max_bytes,
+            path=Path(path),
+            label=label,
+        )
+
+
+def _read_bounded_descriptor(
+    descriptor: int,
+    max_bytes: int,
+    *,
+    path: Path,
+    label: str,
+) -> bytes:
+    _require_regular_descriptor(descriptor, path, label=label)
+    metadata = os.fstat(descriptor)
+    if metadata.st_size > max_bytes:
+        raise ValueError(f"{label} exceeds {max_bytes} bytes: {path}")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > max_bytes:
             raise ValueError(f"{label} exceeds {max_bytes} bytes: {path}")
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - total))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if total > max_bytes:
-                raise ValueError(f"{label} exceeds {max_bytes} bytes: {path}")
-        return b"".join(chunks)
+    return b"".join(chunks)
 
 
 def atomic_write_unlinked_bytes(
@@ -282,11 +316,22 @@ def atomic_write_unlinked_bytes(
     *,
     label: str,
     mode: int = 0o600,
+    trusted_root: str | Path | None = None,
 ) -> Path:
     """Atomically replace one file without following a mutable parent or leaf link."""
 
     if not isinstance(payload, bytes):
         raise TypeError("atomic file payload must be bytes")
+    if trusted_root is not None and _supports_anchored_path_io():
+        return _atomic_write_anchored_bytes(
+            path,
+            payload,
+            trusted_root=trusted_root,
+            label=label,
+            mode=mode,
+        )
+    if trusted_root is not None:
+        validate_unlinked_path(path, trusted_root=trusted_root, label=label)
     target = validate_unlinked_file_path(path, label=label)
     temporary = target.with_name(f".{target.name}.{secrets.token_hex(16)}.tmp")
     with create_unlinked_regular_file(
@@ -309,6 +354,155 @@ def atomic_write_unlinked_bytes(
             descriptor,
             label=label,
         )
+
+
+def _atomic_write_anchored_bytes(
+    path: str | Path,
+    payload: bytes,
+    *,
+    trusted_root: str | Path,
+    label: str,
+    mode: int,
+) -> Path:
+    with _open_anchored_parent(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    ) as (parent_descriptor, name, target):
+        temporary_name = f".{name}.{secrets.token_hex(16)}.tmp"
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | _close_on_exec_flag()
+            | _nofollow_flag()
+        )
+        descriptor = os.open(temporary_name, flags, mode, dir_fd=parent_descriptor)
+        renamed = False
+        try:
+            _require_regular_descriptor(descriptor, target, label=label)
+            if hasattr(os, "fchmod") and os.name != "nt":
+                os.fchmod(descriptor, mode)
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError(f"short write while writing {label}")
+                view = view[written:]
+            os.fsync(descriptor)
+
+            temporary_metadata = os.stat(
+                temporary_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(descriptor)
+            if (
+                stat.S_ISLNK(temporary_metadata.st_mode)
+                or (temporary_metadata.st_dev, temporary_metadata.st_ino)
+                != (opened.st_dev, opened.st_ino)
+            ):
+                raise ValueError(
+                    f"refusing to replace {label} after temporary file changed: {target}"
+                )
+            try:
+                destination_metadata = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                destination_metadata = None
+            if destination_metadata is not None and not stat.S_ISREG(
+                destination_metadata.st_mode
+            ):
+                raise ValueError(f"refusing to replace non-regular {label}: {target}")
+
+            os.rename(
+                temporary_name,
+                name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            renamed = True
+            try:
+                os.fsync(parent_descriptor)
+            except OSError:
+                pass
+            _verify_anchored_file_identity(
+                target,
+                descriptor,
+                trusted_root=trusted_root,
+                label=label,
+            )
+            return target
+        finally:
+            if not renamed:
+                _unlink_same_directory_entry(
+                    parent_descriptor,
+                    temporary_name,
+                    descriptor,
+                )
+            os.close(descriptor)
+
+
+def ensure_anchored_directory(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+    mode: int = 0o700,
+) -> Path:
+    """Create/open one directory tree below a trusted root without following links."""
+
+    root, target, parts = _anchored_path_parts(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    )
+    if not _supports_anchored_path_io():
+        target.mkdir(parents=True, exist_ok=True)
+        validate_unlinked_path(target, trusted_root=root, label=label)
+        if os.name != "nt":
+            target.chmod(mode)
+        return target
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+    descriptor = os.open(root, flags)
+    try:
+        for component in parts:
+            try:
+                next_descriptor = _open_anchored_directory_component(
+                    descriptor,
+                    component,
+                    flags=flags,
+                    target=target,
+                    label=label,
+                )
+            except FileNotFoundError:
+                os.mkdir(component, mode, dir_fd=descriptor)
+                next_descriptor = _open_anchored_directory_component(
+                    descriptor,
+                    component,
+                    flags=flags,
+                    target=target,
+                    label=label,
+                )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ValueError(f"refusing to use non-directory {label}: {target}")
+        if hasattr(os, "fchmod") and os.name != "nt":
+            os.fchmod(descriptor, mode)
+        _verify_anchored_directory_identity(
+            target,
+            descriptor,
+            trusted_root=root,
+            label=label,
+        )
+        return target
+    finally:
+        os.close(descriptor)
 
 
 def unlink_open_file(
@@ -374,6 +568,167 @@ def chmod_unlinked_directory(
     finally:
         os.close(descriptor)
     return target
+
+
+def _supports_anchored_path_io() -> bool:
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    return bool(
+        os.name == "posix"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and os.open in supports_dir_fd
+        and os.mkdir in supports_dir_fd
+        and os.rename in supports_dir_fd
+        and os.stat in supports_dir_fd
+        and os.unlink in supports_dir_fd
+    )
+
+
+def _anchored_path_parts(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+) -> tuple[Path, Path, tuple[str, ...]]:
+    root = Path(os.path.abspath(Path(trusted_root).expanduser()))
+    target = lexical_target_path(path, root)
+    try:
+        relative = target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"refusing to use {label} outside trusted root: {target}") from exc
+    if not relative.parts:
+        raise ValueError(f"refusing to use trusted root itself as {label}: {target}")
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError(f"refusing to use invalid {label} path: {target}")
+    return root, target, tuple(relative.parts)
+
+
+@contextmanager
+def _open_anchored_parent(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+) -> Iterator[tuple[int, str, Path]]:
+    root, target, parts = _anchored_path_parts(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    )
+    flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+    descriptor = os.open(root, flags)
+    try:
+        for component in parts[:-1]:
+            next_descriptor = _open_anchored_directory_component(
+                descriptor,
+                component,
+                flags=flags,
+                target=target,
+                label=label,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        yield descriptor, parts[-1], target
+    finally:
+        os.close(descriptor)
+
+
+def _verify_anchored_file_identity(
+    path: Path,
+    descriptor: int,
+    *,
+    trusted_root: str | Path,
+    label: str,
+) -> None:
+    with _open_anchored_parent(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    ) as (parent_descriptor, name, target):
+        observed = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+        if stat.S_ISLNK(observed.st_mode) or (
+            observed.st_dev,
+            observed.st_ino,
+        ) != (opened.st_dev, opened.st_ino):
+            raise ValueError(
+                f"refusing to use {label} that changed after writing: {target}"
+            )
+
+
+def _verify_anchored_directory_identity(
+    path: Path,
+    descriptor: int,
+    *,
+    trusted_root: str | Path,
+    label: str,
+) -> None:
+    root, target, parts = _anchored_path_parts(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    )
+    flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+    visible_descriptor = os.open(root, flags)
+    try:
+        for component in parts:
+            next_descriptor = _open_anchored_directory_component(
+                visible_descriptor,
+                component,
+                flags=flags,
+                target=target,
+                label=label,
+            )
+            os.close(visible_descriptor)
+            visible_descriptor = next_descriptor
+        visible = os.fstat(visible_descriptor)
+        opened = os.fstat(descriptor)
+        if (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError(
+                f"refusing to use {label} that changed after opening: {target}"
+            )
+    finally:
+        os.close(visible_descriptor)
+
+
+def _unlink_same_directory_entry(
+    parent_descriptor: int,
+    name: str,
+    descriptor: int,
+) -> None:
+    try:
+        observed = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+        if (observed.st_dev, observed.st_ino) == (opened.st_dev, opened.st_ino):
+            os.unlink(name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        pass
+
+
+def _open_anchored_directory_component(
+    parent_descriptor: int,
+    component: str,
+    *,
+    flags: int,
+    target: Path,
+    label: str,
+) -> int:
+    try:
+        return os.open(component, flags, dir_fd=parent_descriptor)
+    except OSError as exc:
+        try:
+            metadata = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            raise exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(
+                f"refusing to use {label} through a symlink or junction: {target}"
+            ) from exc
+        raise
 
 
 def _open_parent_directory(target: Path) -> int:

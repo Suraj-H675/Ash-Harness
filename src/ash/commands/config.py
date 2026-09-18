@@ -1,10 +1,4 @@
-"""Credential and configuration storage for Ash.
-
-Handles reading/writing to ~/.ash/.env (API keys + ASH_MODEL) and
-~/.ash/ash.toml (custom OpenAI-compatible providers).
-
-All file writes are atomic (tempfile.mkstemp + os.replace).
-"""
+"""Credential and configuration storage for Ash."""
 
 from __future__ import annotations
 
@@ -13,7 +7,6 @@ import hashlib
 import os
 import re
 import sys
-import tempfile
 import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -22,7 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from ash.profiles import active_profile_name, profile_directory
-from ash.safe_io import read_bounded_bytes, strict_json_loads, validate_unlinked_path
+from ash.safe_io import (
+    atomic_write_unlinked_bytes,
+    ensure_anchored_directory,
+    read_bounded_open_file,
+    strict_json_loads,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -66,21 +64,31 @@ def _paths() -> tuple[Path, Path, Path]:
     return ash_dir, ash_dir / ".env", ash_dir / "ash.toml"
 
 
+def _state_trusted_root(ash_dir: Path | None = None) -> Path:
+    """Return the stable anchor above Ash's mutable state tree."""
+
+    state_dir = Path(os.path.abspath((ash_dir or _paths()[0]).expanduser()))
+    default_root = Path(os.path.abspath((Path.home() / ".ash").expanduser()))
+    try:
+        state_dir.relative_to(default_root)
+    except ValueError:
+        candidate = state_dir.parent
+    else:
+        candidate = default_root.parent
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
+
+
 def ensure_ash_dir() -> Path:
     """Create ~/.ash/ directory if it does not exist. Returns the path."""
     ash_dir, _, _ = _paths()
-    validate_unlinked_path(
+    return ensure_anchored_directory(
         ash_dir,
-        trusted_root=ash_dir.parent,
+        trusted_root=_state_trusted_root(ash_dir),
         label="Ash state directory",
+        mode=0o700,
     )
-    ash_dir.mkdir(parents=True, exist_ok=True)
-    validate_unlinked_path(
-        ash_dir,
-        trusted_root=ash_dir.parent,
-        label="Ash state directory",
-    )
-    return ash_dir
 
 
 def get_env_path() -> Path:
@@ -107,58 +115,51 @@ def backup_config_file(path: str | Path, *, label: str) -> Path:
         raise FileNotFoundError(source)
 
     before = source.stat()
-    contents = read_bounded_bytes(
+    contents = read_bounded_open_file(
         source,
         MAX_CONFIG_FILE_BYTES,
         label="config backup source",
     )
     source_digest = hashlib.sha256(contents).digest()
-    backup_dir = ensure_ash_dir() / "backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
-        backup_dir.chmod(0o700)
+    ash_dir = ensure_ash_dir()
+    trusted_root = _state_trusted_root(ash_dir)
+    backup_dir = ensure_anchored_directory(
+        ash_dir / "backups",
+        trusted_root=trusted_root,
+        label="config backup directory",
+        mode=0o700,
+    )
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     destination = backup_dir / f"{label}.{timestamp}.bak"
-    fd, temporary = tempfile.mkstemp(
-        dir=backup_dir,
-        prefix=f".{label}.",
-        suffix=".tmp",
+    after = source.stat()
+    if (before.st_size, before.st_mtime_ns) != (
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise OSError(f"config changed while it was being backed up: {source}")
+    atomic_write_unlinked_bytes(
+        destination,
+        contents,
+        label="config backup",
+        mode=0o600,
+        trusted_root=trusted_root,
     )
-    try:
-        with os.fdopen(fd, "wb") as target:
-            target.write(contents)
-            target.flush()
-            os.fsync(target.fileno())
-        after = source.stat()
-        if (before.st_size, before.st_mtime_ns) != (
-            after.st_size,
-            after.st_mtime_ns,
-        ):
-            raise OSError(f"config changed while it was being backed up: {source}")
-        copied_digest = hashlib.sha256(
-            read_bounded_bytes(
-                temporary,
-                MAX_CONFIG_FILE_BYTES,
-                label="temporary config backup",
-            )
-        ).digest()
-        if copied_digest != source_digest:
-            raise OSError(f"config backup verification failed: {source}")
-        os.replace(temporary, destination)
-        if os.name != "nt":
-            destination.chmod(0o600)
-        return destination
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
+    copied_digest = hashlib.sha256(
+        read_bounded_open_file(
+            destination,
+            MAX_CONFIG_FILE_BYTES,
+            label="config backup",
+            trusted_root=trusted_root,
+        )
+    ).digest()
+    if copied_digest != source_digest:
+        raise OSError(f"config backup verification failed: {source}")
+    return destination
 
 
 def config_file_digest(path: str | Path) -> str:
     return hashlib.sha256(
-        read_bounded_bytes(
+        read_bounded_open_file(
             path,
             MAX_CONFIG_FILE_BYTES,
             label="config file",
@@ -208,16 +209,18 @@ def record_config_migration(path: str | Path, backup: str | Path) -> None:
 
 def _load_migration_state() -> dict[str, Any]:
     path = migration_state_path()
-    if not path.exists():
-        return {"version": 1, "migrations": {}}
+    trusted_root = _state_trusted_root(path.parent)
     try:
         value = strict_json_loads(
-            read_bounded_bytes(
+            read_bounded_open_file(
                 path,
                 MAX_MIGRATION_STATE_BYTES,
                 label="config migration state",
+                trusted_root=trusted_root,
             ).decode("utf-8")
         )
+    except FileNotFoundError:
+        return {"version": 1, "migrations": {}}
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"cannot load config migration state {path}: {exc}") from exc
     if (
@@ -232,25 +235,13 @@ def _load_migration_state() -> dict[str, Any]:
 def _save_migration_state(state: dict[str, Any]) -> None:
     path = migration_state_path()
     payload = (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    fd, temporary = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
+    atomic_write_unlinked_bytes(
+        path,
+        payload,
+        label="config migration state",
+        mode=0o600,
+        trusted_root=_state_trusted_root(path.parent),
     )
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        if os.name != "nt":
-            path.chmod(0o600)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
 
 
 # ---------------------------------------------------------------------------
@@ -283,14 +274,19 @@ def save_env_values(values: dict[str, str]) -> None:
             )
 
     ash_dir = ensure_ash_dir()
+    trusted_root = _state_trusted_root(ash_dir)
     env_file = get_env_path()
     lines: list[str] = []
-    if env_file.exists():
-        raw = read_bounded_bytes(
+    try:
+        raw = read_bounded_open_file(
             env_file,
             MAX_ENV_FILE_BYTES,
             label="dotenv file",
+            trusted_root=trusted_root,
         )
+    except FileNotFoundError:
+        raw = None
+    if raw is not None:
         for raw_line in raw.decode("utf-8").splitlines(keepends=True):
             stripped = raw_line.strip()
             if not stripped or stripped.startswith("#"):
@@ -302,25 +298,17 @@ def save_env_values(values: dict[str, str]) -> None:
                     continue
             lines.append(raw_line)
 
-    fd, tmp = tempfile.mkstemp(dir=str(ash_dir), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-            if lines and not lines[-1].endswith("\n"):
-                f.write("\n")
-            for key, value in values.items():
-                f.write(f"{key}={value}\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, env_file)
-        os.chmod(env_file, 0o600)
-    except Exception:
-        # Clean up temp file on failure
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    rendered = "".join(lines)
+    if rendered and not rendered.endswith("\n"):
+        rendered += "\n"
+    rendered += "".join(f"{key}={value}\n" for key, value in values.items())
+    atomic_write_unlinked_bytes(
+        env_file,
+        rendered.encode("utf-8"),
+        label="dotenv file",
+        mode=0o600,
+        trusted_root=trusted_root,
+    )
     os.environ.update(values)
     _FILE_BACKED_ENV_VALUES.update(
         {key: (str(env_file), value) for key, value in values.items()}
@@ -345,10 +333,15 @@ def get_env_value(key: str) -> str | None:
         return os.environ[key]
 
     env_file = get_env_path()
-    if not env_file.exists():
+    try:
+        raw = read_bounded_open_file(
+            env_file,
+            MAX_ENV_FILE_BYTES,
+            label="dotenv file",
+            trusted_root=_state_trusted_root(_paths()[0]),
+        )
+    except FileNotFoundError:
         return None
-
-    raw = read_bounded_bytes(env_file, MAX_ENV_FILE_BYTES, label="dotenv file")
     for line in raw.decode("utf-8").splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -364,9 +357,15 @@ def load_env() -> dict[str, str]:
     """Load all key=value pairs from ~/.ash/.env (ignores comments/blank lines)."""
     env: dict[str, str] = {}
     env_file = get_env_path()
-    if not env_file.exists():
+    try:
+        raw = read_bounded_open_file(
+            env_file,
+            MAX_ENV_FILE_BYTES,
+            label="dotenv file",
+            trusted_root=_state_trusted_root(_paths()[0]),
+        )
+    except FileNotFoundError:
         return env
-    raw = read_bounded_bytes(env_file, MAX_ENV_FILE_BYTES, label="dotenv file")
     for line in raw.decode("utf-8").splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -384,56 +383,42 @@ def load_env() -> dict[str, str]:
 
 def save_config(config: dict[str, Any]) -> None:
     """Save a dict (typically custom_providers) to ~/.ash/ash.toml.
-
-    Writes atomically via tempfile.mkstemp + os.replace.
     """
     ash_dir = ensure_ash_dir()
+    trusted_root = _state_trusted_root(ash_dir)
     config_file = get_config_path()
     import toml  # type: ignore[import-untyped]
 
     # Serialize to string via toml library
     toml_str = toml.dumps(config)
 
-    fd, tmp = tempfile.mkstemp(dir=str(ash_dir), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(toml_str)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, config_file)
-        os.chmod(config_file, 0o600)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    atomic_write_unlinked_bytes(
+        config_file,
+        toml_str.encode("utf-8"),
+        label="user TOML config",
+        mode=0o600,
+        trusted_root=trusted_root,
+    )
 
 
 def load_config(*, strict: bool = False) -> dict[str, Any]:
     """Load ~/.ash/ash.toml, optionally surfacing malformed input."""
     config_file = get_config_path()
-    if not config_file.exists():
-        return {}
     try:
+        raw = read_bounded_open_file(
+            config_file,
+            MAX_CONFIG_FILE_BYTES,
+            label="user TOML config",
+            trusted_root=_state_trusted_root(_paths()[0]),
+        )
         if strict:
-            value = tomllib.loads(
-                read_bounded_bytes(
-                    config_file,
-                    MAX_CONFIG_FILE_BYTES,
-                    label="user TOML config",
-                ).decode("utf-8")
-            )
+            value = tomllib.loads(raw.decode("utf-8"))
             return value if isinstance(value, dict) else {}
         import toml  # type: ignore[import-untyped]
 
-        return toml.loads(
-            read_bounded_bytes(
-                config_file,
-                MAX_CONFIG_FILE_BYTES,
-                label="user TOML config",
-            ).decode("utf-8")
-        )
+        return toml.loads(raw.decode("utf-8"))
+    except FileNotFoundError:
+        return {}
     except Exception:
         if strict:
             raise
@@ -541,16 +526,17 @@ def render_config_explain(
 
 def _load_raw_toml_config() -> dict[str, Any]:
     path = get_config_path()
-    if not path.exists():
-        return {}
     try:
         value = tomllib.loads(
-            read_bounded_bytes(
+            read_bounded_open_file(
                 path,
                 MAX_CONFIG_FILE_BYTES,
                 label="user TOML config",
+                trusted_root=_state_trusted_root(_paths()[0]),
             ).decode("utf-8")
         )
+    except FileNotFoundError:
+        return {}
     except Exception:
         return {}
     return value if isinstance(value, dict) else {}

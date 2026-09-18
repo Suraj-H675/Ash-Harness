@@ -6,7 +6,10 @@ from pathlib import Path
 import pytest
 
 from ash.safe_io import (
+    atomic_write_unlinked_bytes,
     create_unlinked_regular_file,
+    ensure_anchored_directory,
+    read_bounded_open_file,
     read_bounded_text,
     replace_open_file,
     strict_json_loads,
@@ -143,3 +146,51 @@ def test_replace_open_file_refuses_source_replacement(tmp_path: Path) -> None:
 
     assert destination.read_bytes() == b"current database"
     assert source.read_bytes() == b"attacker replacement"
+
+
+def test_anchored_io_rejects_intermediate_symlink(tmp_path: Path) -> None:
+    trusted_root = tmp_path / "home"
+    trusted_root.mkdir()
+    outside = tmp_path / "outside"
+    nested_outside = outside / "profiles" / "work"
+    nested_outside.mkdir(parents=True)
+    victim = nested_outside / ".env"
+    victim.write_bytes(b"DUMMY=attacker\n")
+    try:
+        (trusted_root / ".ash").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+    target = trusted_root / ".ash" / "profiles" / "work" / ".env"
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        read_bounded_open_file(
+            target,
+            1024,
+            label="profile dotenv",
+            trusted_root=trusted_root,
+        )
+    with pytest.raises(ValueError, match="symlink or junction"):
+        atomic_write_unlinked_bytes(
+            target,
+            b"DUMMY=secret\n",
+            label="profile dotenv",
+            trusted_root=trusted_root,
+        )
+
+    assert victim.read_bytes() == b"DUMMY=attacker\n"
+
+
+def test_anchored_directory_creation_builds_nested_state_tree(tmp_path: Path) -> None:
+    trusted_root = tmp_path / "home"
+    trusted_root.mkdir()
+    target = trusted_root / ".ash" / "profiles" / "work"
+
+    created = ensure_anchored_directory(
+        target,
+        trusted_root=trusted_root,
+        label="profile state",
+        mode=0o700,
+    )
+
+    assert created == target
+    assert target.is_dir()

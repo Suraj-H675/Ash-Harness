@@ -94,6 +94,45 @@ class TestAtomicWrite:
 
         assert not (outside / ".env").exists()
 
+    def test_save_env_value_rejects_state_root_swapped_after_path_resolution(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        home = tmp_path / "home"
+        state = home / ".ash"
+        state.mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        victim = outside / ".env"
+        victim.write_text("MARKER=do-not-touch\n", encoding="utf-8")
+        cli_config.ASH_DIR = state
+        cli_config.ENV_FILE = state / ".env"
+        cli_config.CONFIG_FILE = state / "ash.toml"
+        monkeypatch.delenv("DUMMY_API_KEY", raising=False)
+        real_get_env_path = cli_config.get_env_path
+        swapped = False
+
+        def get_path_then_swap():
+            nonlocal swapped
+            path = real_get_env_path()
+            if not swapped:
+                swapped = True
+                state.rename(home / ".ash-real")
+                try:
+                    state.symlink_to(outside, target_is_directory=True)
+                except OSError as exc:
+                    pytest.skip(f"symlink creation is unavailable: {exc}")
+            return path
+
+        monkeypatch.setattr(cli_config, "get_env_path", get_path_then_swap)
+
+        with pytest.raises((OSError, ValueError)):
+            cli_config.save_env_value("DUMMY_API_KEY", "dummy-secret-value")
+        assert swapped is True
+        assert victim.read_text(encoding="utf-8") == "MARKER=do-not-touch\n"
+        assert "DUMMY_API_KEY" not in os.environ
+
     def test_save_env_value_sets_os_environ(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -260,6 +299,48 @@ class TestAtomicWrite:
         with pytest.raises(ValueError, match="duplicate JSON object key"):
             cli_config.is_config_migration_recorded(source)
 
+    def test_migration_state_rejects_state_root_swapped_after_path_resolution(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        home = tmp_path / "home"
+        state = home / ".ash"
+        state.mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        victim = outside / "config-migrations.json"
+        victim.write_text(
+            '{"version":1,"migrations":{"attacker":{}}}\n',
+            encoding="utf-8",
+        )
+        cli_config.ASH_DIR = state
+        cli_config.ENV_FILE = state / ".env"
+        cli_config.CONFIG_FILE = state / "ash.toml"
+        real_state_path = cli_config.migration_state_path
+        swapped = False
+
+        def state_path_then_swap():
+            nonlocal swapped
+            path = real_state_path()
+            if not swapped:
+                swapped = True
+                state.rename(home / ".ash-real")
+                try:
+                    state.symlink_to(outside, target_is_directory=True)
+                except OSError as exc:
+                    pytest.skip(f"symlink creation is unavailable: {exc}")
+            return path
+
+        monkeypatch.setattr(cli_config, "migration_state_path", state_path_then_swap)
+
+        with pytest.raises((OSError, ValueError)):
+            cli_config._load_migration_state()
+        assert swapped is True
+        assert victim.read_text(encoding="utf-8") == (
+            '{"version":1,"migrations":{"attacker":{}}}\n'
+        )
+
     def test_save_env_values_commits_related_settings_together(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -307,7 +388,9 @@ class TestAtomicWrite:
         cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.setattr(
-            cli_config.os, "replace", MagicMock(side_effect=OSError("disk"))
+            cli_config,
+            "atomic_write_unlinked_bytes",
+            MagicMock(side_effect=OSError("disk")),
         )
 
         with pytest.raises(OSError, match="disk"):
@@ -424,6 +507,46 @@ class TestLoadEnv:
         with pytest.raises(ValueError, match="dotenv file exceeds"):
             cli_config.load_env()
 
+    def test_get_env_value_rejects_state_root_swapped_after_path_resolution(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        home = tmp_path / "home"
+        state = home / ".ash"
+        state.mkdir(parents=True)
+        (state / ".env").write_text("DUMMY_READ_KEY=legitimate\n", encoding="utf-8")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / ".env").write_text(
+            "DUMMY_READ_KEY=attacker-controlled\n",
+            encoding="utf-8",
+        )
+        cli_config.ASH_DIR = state
+        cli_config.ENV_FILE = state / ".env"
+        cli_config.CONFIG_FILE = state / "ash.toml"
+        monkeypatch.delenv("DUMMY_READ_KEY", raising=False)
+        real_get_env_path = cli_config.get_env_path
+        swapped = False
+
+        def get_path_then_swap():
+            nonlocal swapped
+            path = real_get_env_path()
+            if not swapped:
+                swapped = True
+                state.rename(home / ".ash-real")
+                try:
+                    state.symlink_to(outside, target_is_directory=True)
+                except OSError as exc:
+                    pytest.skip(f"symlink creation is unavailable: {exc}")
+            return path
+
+        monkeypatch.setattr(cli_config, "get_env_path", get_path_then_swap)
+
+        with pytest.raises((OSError, ValueError)):
+            cli_config.get_env_value("DUMMY_READ_KEY")
+        assert swapped is True
+
 
 class TestTomlConfig:
     """Tests for save_config / load_config with TOML."""
@@ -491,6 +614,82 @@ class TestTomlConfig:
 
         with pytest.raises(ValueError, match="user TOML config exceeds"):
             cli_config.load_config(strict=True)
+
+    def test_save_config_rejects_state_root_swapped_after_path_resolution(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        home = tmp_path / "home"
+        state = home / ".ash"
+        state.mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        victim = outside / "ash.toml"
+        victim.write_text('marker = "do-not-touch"\n', encoding="utf-8")
+        cli_config.ASH_DIR = state
+        cli_config.ENV_FILE = state / ".env"
+        cli_config.CONFIG_FILE = state / "ash.toml"
+        real_get_config_path = cli_config.get_config_path
+        swapped = False
+
+        def get_path_then_swap():
+            nonlocal swapped
+            path = real_get_config_path()
+            if not swapped:
+                swapped = True
+                state.rename(home / ".ash-real")
+                try:
+                    state.symlink_to(outside, target_is_directory=True)
+                except OSError as exc:
+                    pytest.skip(f"symlink creation is unavailable: {exc}")
+            return path
+
+        monkeypatch.setattr(cli_config, "get_config_path", get_path_then_swap)
+
+        with pytest.raises((OSError, ValueError)):
+            cli_config.save_config({"model": "dummy/model"})
+        assert swapped is True
+        assert victim.read_text(encoding="utf-8") == 'marker = "do-not-touch"\n'
+
+    def test_load_config_rejects_state_root_swapped_after_path_resolution(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        home = tmp_path / "home"
+        state = home / ".ash"
+        state.mkdir(parents=True)
+        (state / "ash.toml").write_text('model = "legitimate/model"\n', encoding="utf-8")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "ash.toml").write_text(
+            'model = "attacker/model"\n',
+            encoding="utf-8",
+        )
+        cli_config.ASH_DIR = state
+        cli_config.ENV_FILE = state / ".env"
+        cli_config.CONFIG_FILE = state / "ash.toml"
+        real_get_config_path = cli_config.get_config_path
+        swapped = False
+
+        def get_path_then_swap():
+            nonlocal swapped
+            path = real_get_config_path()
+            if not swapped:
+                swapped = True
+                state.rename(home / ".ash-real")
+                try:
+                    state.symlink_to(outside, target_is_directory=True)
+                except OSError as exc:
+                    pytest.skip(f"symlink creation is unavailable: {exc}")
+            return path
+
+        monkeypatch.setattr(cli_config, "get_config_path", get_path_then_swap)
+
+        with pytest.raises((OSError, ValueError)):
+            cli_config.load_config(strict=True)
+        assert swapped is True
 
 
 def test_json_schema_loader_rejects_oversized_files(tmp_path: Path) -> None:
