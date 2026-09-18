@@ -747,6 +747,64 @@ def remove_anchored_directory_tree(
             os.close(descriptor)
 
 
+def remove_anchored_path(
+    path: str | Path,
+    *,
+    trusted_root: str | Path,
+    label: str,
+) -> bool:
+    """Remove one file, symlink, or directory below a trusted root without following links."""
+
+    root, target, _ = _anchored_path_parts(
+        path,
+        trusted_root=trusted_root,
+        label=label,
+    )
+    if not _supports_anchored_path_io():
+        validate_unlinked_path(target.parent, trusted_root=root, label=label)
+        try:
+            observed = os.lstat(target)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISDIR(observed.st_mode) and not stat.S_ISLNK(observed.st_mode):
+            import shutil
+
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        return True
+
+    try:
+        with _open_anchored_parent(
+            target,
+            trusted_root=root,
+            label=label,
+        ) as (parent_descriptor, name, _target):
+            try:
+                observed = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+            if stat.S_ISDIR(observed.st_mode) and not stat.S_ISLNK(observed.st_mode):
+                remove_anchored_directory_tree(
+                    target,
+                    trusted_root=root,
+                    label=label,
+                )
+                return True
+            os.unlink(name, dir_fd=parent_descriptor)
+            try:
+                os.fsync(parent_descriptor)
+            except OSError:
+                pass
+            return True
+    except FileNotFoundError:
+        return False
+
+
 def _remove_directory_contents(descriptor: int, *, target: Path, label: str) -> None:
     flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
     for entry_name in os.listdir(descriptor):

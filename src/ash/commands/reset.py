@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
+
+from ash.safe_io import remove_anchored_path
 
 
 def reset_local_state(
@@ -31,10 +32,10 @@ def reset_local_state(
         targets.extend((root / "cache", root / "chroma", root / "history"))
     removed: list[Path] = []
     for target in targets:
-        if target.is_symlink() or target.is_file():
-            target.unlink(missing_ok=True)
-            removed.append(target)
-        elif target.is_dir():
-            shutil.rmtree(target)
+        if remove_anchored_path(
+            target,
+            trusted_root=root.parent,
+            label="Ash reset state",
+        ):
             removed.append(target)
     return removed

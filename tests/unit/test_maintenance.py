@@ -54,6 +54,43 @@ def test_reset_rejects_symlinked_ash_state_directory(tmp_path, monkeypatch) -> N
     assert victim.read_text(encoding="utf-8") == "KEEP=value\n"
 
 
+def test_reset_rejects_state_root_swapped_after_initial_validation(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    state = home / ".ash"
+    (state / "db").mkdir(parents=True)
+    (state / "db" / "local.txt").write_text("local\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    victim = outside / "db"
+    victim.mkdir(parents=True)
+    sentinel = victim / "sentinel.txt"
+    sentinel.write_text("DO NOT DELETE\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    real_is_symlink = type(state).is_symlink
+    swapped = False
+
+    def is_symlink_then_swap(path):
+        nonlocal swapped
+        result = real_is_symlink(path)
+        if path == state and not swapped:
+            swapped = True
+            state.rename(home / ".ash-real")
+            try:
+                state.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return result
+
+    monkeypatch.setattr(type(state), "is_symlink", is_symlink_then_swap)
+
+    with pytest.raises((OSError, ValueError)):
+        reset_local_state(config=False, sessions=True, cache=False, confirmed=True)
+
+    assert swapped is True
+    assert sentinel.read_text(encoding="utf-8") == "DO NOT DELETE\n"
+
+
 def test_reset_cli_reports_symlinked_state_without_traceback(
     tmp_path, monkeypatch, capsys
 ) -> None:
