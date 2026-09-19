@@ -90,6 +90,9 @@ class CatalogOpenAIProvider(OpenAIProvider):
 
         matched = [metadata for _, metadata in direct_matches]
         canonical_ids = {metadata.model_id for _, metadata in direct_matches}
+        if len(canonical_ids) > 1:
+            self._dynamic_capabilities = ProviderCapabilities(local=self._local)
+            return self._dynamic_capabilities
         if len(canonical_ids) == 1:
             canonical_id = next(iter(canonical_ids))
             directly_matched = {index for index, _ in direct_matches}
