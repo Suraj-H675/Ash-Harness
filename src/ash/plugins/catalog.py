@@ -27,11 +27,13 @@ from ash.safe_io import (
     validate_unlinked_path,
 )
 
-CATALOG_VERSION = 1
+CATALOG_VERSION = 2
+LEGACY_CATALOG_VERSION = 1
 MAX_CATALOG_BYTES = 256 * 1024
 MAX_CATALOG_ENTRIES = 1_000
 SIGNATURE_ALGORITHM = "ed25519"
 _KEY_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
+_PUBLISHER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PLUGIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _SOURCE = re.compile(r"^(https|file)://\S+$")
 _DIGEST = re.compile(r"^[0-9a-f]{40,64}$")
@@ -185,12 +187,14 @@ class CatalogEntry:
     source: str
     ref: str
     digest: str
+    publisher: str | None = None
 
 
 @dataclass(frozen=True)
 class SignedCatalog:
     sequence: int
     entries: dict[str, CatalogEntry]
+    publisher: str | None = None
 
 
 def load_trusted_keys(path: Path) -> dict[str, bytes]:
@@ -310,9 +314,22 @@ def parse_and_verify_catalog(
 
 
 def _validate_catalog(catalog: Mapping[str, Any]) -> SignedCatalog:
-    if set(catalog) != {"version", "sequence", "entries"}:
-        raise PluginCatalogError("invalid plugin catalog fields")
-    if catalog["version"] != CATALOG_VERSION:
+    version = catalog.get("version")
+    publisher: str | None
+    if version == LEGACY_CATALOG_VERSION:
+        if set(catalog) != {"version", "sequence", "entries"}:
+            raise PluginCatalogError("invalid plugin catalog fields")
+        publisher = None
+    elif version == CATALOG_VERSION:
+        if set(catalog) != {"version", "publisher", "sequence", "entries"}:
+            raise PluginCatalogError("invalid plugin catalog fields")
+        raw_publisher = catalog["publisher"]
+        if not isinstance(raw_publisher, str) or not _PUBLISHER.fullmatch(
+            raw_publisher
+        ):
+            raise PluginCatalogError("invalid plugin catalog publisher")
+        publisher = raw_publisher
+    else:
         raise PluginCatalogError("unsupported plugin catalog version")
     sequence = catalog["sequence"]
     if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
@@ -324,14 +341,14 @@ def _validate_catalog(catalog: Mapping[str, Any]) -> SignedCatalog:
         raise PluginCatalogError("plugin catalog exceeds entry limit")
     entries: dict[str, CatalogEntry] = {}
     for item in entries_payload:
-        entry = _validate_entry(item)
+        entry = _validate_entry(item, publisher=publisher)
         if entry.name in entries:
             raise PluginCatalogError(f"duplicate plugin catalog entry {entry.name!r}")
         entries[entry.name] = entry
-    return SignedCatalog(sequence=sequence, entries=entries)
+    return SignedCatalog(sequence=sequence, entries=entries, publisher=publisher)
 
 
-def _validate_entry(item: Any) -> CatalogEntry:
+def _validate_entry(item: Any, *, publisher: str | None = None) -> CatalogEntry:
     if not isinstance(item, dict) or set(item) != {
         "name",
         "version",
@@ -363,7 +380,12 @@ def _validate_entry(item: Any) -> CatalogEntry:
     if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
         raise PluginCatalogError("invalid plugin catalog entry digest")
     return CatalogEntry(
-        name=name, version=version, source=source, ref=ref, digest=digest
+        name=name,
+        version=version,
+        source=source,
+        ref=ref,
+        digest=digest,
+        publisher=publisher,
     )
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -28,6 +28,7 @@ from ash.hooks.config import (
 )
 from ash.plugins.catalog import (
     CatalogEntry,
+    SignedCatalog,
     fetch_catalog,
     default_catalog_path,
     parse_and_verify_catalog,
@@ -60,6 +61,8 @@ from ash.safe_io import read_bounded_bytes, strict_json_loads
 
 ExtensionKind = Literal["all", "skills", "agents", "plugins", "hooks"]
 PluginAction = Literal["install", "enable", "disable", "uninstall"]
+CatalogSource = Path | str
+CatalogSelection = CatalogSource | Sequence[CatalogSource] | None
 ExtensionAction = Literal[
     "all",
     "skills",
@@ -378,7 +381,7 @@ def render_extension_inventory(
 
 
 def _verified_catalog(
-    catalog: Path | str | None = None,
+    catalog: CatalogSource | None = None,
     *,
     transport: Any | None = None,
 ):
@@ -418,15 +421,45 @@ def _verified_catalog(
         raise PluginLifecycleError(str(exc)) from exc
 
 
+def _verified_catalogs(
+    catalog: CatalogSelection = None,
+    *,
+    transport: Any | None = None,
+) -> tuple[SignedCatalog, ...]:
+    if isinstance(catalog, Path | str) or catalog is None:
+        sources: tuple[CatalogSource | None, ...] = (catalog,)
+    else:
+        sources = tuple(catalog)
+        if not sources:
+            sources = (None,)
+    verified = tuple(
+        _verified_catalog(source, transport=transport) for source in sources
+    )
+    if len(verified) <= 1:
+        return verified
+    publishers = [item.publisher for item in verified]
+    if any(publisher is None for publisher in publishers):
+        raise PluginLifecycleError(
+            "multiple plugin catalogs require version 2 signed publisher identity"
+        )
+    publisher_names = [publisher for publisher in publishers if publisher is not None]
+    if len(set(publisher_names)) != len(publisher_names):
+        raise PluginLifecycleError("duplicate plugin catalog publisher in selection")
+    return verified
+
+
 def search_catalog_plugins(
     query: str = "",
     *,
-    catalog: Path | str | None = None,
+    catalog: CatalogSelection = None,
     transport: Any | None = None,
-) -> tuple[int, tuple[CatalogEntry, ...]]:
-    verified = _verified_catalog(catalog, transport=transport)
+) -> tuple[tuple[SignedCatalog, ...], tuple[CatalogEntry, ...]]:
+    verified = _verified_catalogs(catalog, transport=transport)
     normalized = query.strip().casefold()
-    entries = sorted(verified.entries.values(), key=lambda entry: entry.name.casefold())
+    entries = sorted(
+        (entry for item in verified for entry in item.entries.values()),
+        key=lambda entry: ((entry.publisher or "").casefold(), entry.name.casefold()),
+    )
     if normalized:
         entries = [
             entry
@@ -434,6 +467,8 @@ def search_catalog_plugins(
             if normalized
             in " ".join(
                 (
+                    entry.publisher or "",
+                    f"@{entry.publisher}/{entry.name}" if entry.publisher else entry.name,
                     entry.name,
                     entry.version,
                     entry.source,
@@ -441,33 +476,64 @@ def search_catalog_plugins(
                 )
             ).casefold()
         ]
-    return verified.sequence, tuple(entries)
+    return verified, tuple(entries)
 
 
 def render_catalog_search(
-    sequence: int,
+    catalogs: tuple[SignedCatalog, ...],
     entries: tuple[CatalogEntry, ...],
     *,
     json_output: bool = False,
 ) -> str:
-    payload = {
-        "sequence": sequence,
-        "plugins": [
-            {
-                "name": entry.name,
-                "version": entry.version,
-                "source": entry.source,
-                "ref": entry.ref,
-                "digest": entry.digest,
-            }
-            for entry in entries
-        ],
-    }
+    plugin_payload = [
+        {
+            **({"publisher": entry.publisher} if entry.publisher is not None else {}),
+            "name": entry.name,
+            "version": entry.version,
+            "source": entry.source,
+            "ref": entry.ref,
+            "digest": entry.digest,
+        }
+        for entry in entries
+    ]
+    if len(catalogs) == 1:
+        catalog = catalogs[0]
+        payload = {
+            "sequence": catalog.sequence,
+            **({"publisher": catalog.publisher} if catalog.publisher is not None else {}),
+            "plugins": plugin_payload,
+        }
+    else:
+        payload = {
+            "catalogs": [
+                {"publisher": item.publisher, "sequence": item.sequence}
+                for item in catalogs
+            ],
+            "plugins": plugin_payload,
+        }
     if json_output:
         return json.dumps(payload, sort_keys=True)
-    lines = [f"Catalog sequence: {sequence}", "Plugins:"]
+    if len(catalogs) == 1:
+        catalog = catalogs[0]
+        heading = (
+            f"Catalog @{catalog.publisher} sequence: {catalog.sequence}"
+            if catalog.publisher is not None
+            else f"Catalog sequence: {catalog.sequence}"
+        )
+        lines = [heading, "Plugins:"]
+    else:
+        lines = ["Catalogs:"]
+        lines.extend(
+            f"  @{item.publisher} sequence {item.sequence}" for item in catalogs
+        )
+        lines.append("Plugins:")
     lines.extend(
-        f"  {entry.name} {entry.version} [{entry.source}@{entry.ref}]"
+        (
+            f"  @{entry.publisher}/{entry.name} {entry.version} "
+            f"[{entry.source}@{entry.ref}]"
+            if entry.publisher is not None
+            else f"  {entry.name} {entry.version} [{entry.source}@{entry.ref}]"
+        )
         for entry in entries
     )
     if not entries:
@@ -478,12 +544,38 @@ def render_catalog_search(
 def catalog_entry_for_name(
     name: str,
     *,
-    catalog: Path | str | None = None,
+    catalog: CatalogSelection = None,
 ) -> CatalogEntry:
-    _, entries = search_catalog_plugins(name, catalog=catalog)
-    matches = [entry for entry in entries if entry.name.casefold() == name.casefold()]
-    if len(matches) != 1:
+    catalogs = _verified_catalogs(catalog)
+    requested_publisher: str | None = None
+    requested_name = name
+    if name.startswith("@"):
+        qualified = name[1:].split("/", 1)
+        if len(qualified) != 2 or not all(qualified) or "/" in qualified[1]:
+            raise PluginLifecycleError(
+                "publisher-qualified plugin must use @publisher/name"
+            )
+        requested_publisher, requested_name = qualified
+    matches = [
+        entry
+        for item in catalogs
+        for entry in item.entries.values()
+        if entry.name.casefold() == requested_name.casefold()
+        and (
+            requested_publisher is None
+            or (entry.publisher or "").casefold() == requested_publisher.casefold()
+        )
+    ]
+    if not matches:
         raise PluginLifecycleError(f"unknown catalog plugin: {name}")
+    if len(matches) != 1:
+        choices = ", ".join(
+            f"@{entry.publisher}/{entry.name}"
+            for entry in matches
+            if entry.publisher is not None
+        )
+        suffix = f"; choose one of: {choices}" if choices else ""
+        raise PluginLifecycleError(f"ambiguous catalog plugin: {name}{suffix}")
     if not matches[0].source.lower().startswith(("https://", "file://")):
         raise PluginLifecycleError(
             f"catalog plugin {name!r} does not use an HTTPS Git source"
@@ -498,7 +590,7 @@ def manage_local_plugin(
     replace: bool = False,
     confirmed: bool = False,
     git_ref: str | None = None,
-    catalog: Path | str | None = None,
+    catalog: CatalogSelection = None,
 ) -> dict[str, Any]:
     if action == "install":
         state = load_extension_state()
@@ -517,9 +609,10 @@ def manage_local_plugin(
         if target.startswith(("https://", "http://")):
             expected = None
             if git_ref and (catalog is not None or default_catalog_path() is not None):
-                verified_catalog = _verified_catalog(catalog)
+                verified_catalogs = _verified_catalogs(catalog)
                 matches = [
                     entry
+                    for verified_catalog in verified_catalogs
                     for entry in verified_catalog.entries.values()
                     if entry.source == target and entry.ref == git_ref
                 ]

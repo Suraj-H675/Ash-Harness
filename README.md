@@ -316,7 +316,10 @@ Ash is extensible without changing the core runtime:
   tools;
 - namespacing and dependency constraints to prevent collisions;
 - local-directory and trusted HTTPS Git repository sources;
-- publisher-pinned, signed catalogs with bounded redirect-free caching;
+- signed catalogs with pinned Ed25519 trust keys and bounded redirect-free
+  caching; catalog v2 binds a lowercase publisher namespace into the signed
+  payload, repeatable `--catalog` inputs can be searched together, and
+  `@publisher/plugin` selects an exact publisher when names overlap;
 - validation for traversal, links, malformed manifests, oversized components,
   missing dependencies, and unsafe replacements;
 - enable, disable, uninstall, inventory, search, and atomic live reload;

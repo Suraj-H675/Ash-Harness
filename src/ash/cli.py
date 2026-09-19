@@ -2486,7 +2486,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     extensions_parser.add_argument("extensions_target", nargs="?")
     extensions_parser.add_argument("--ref")
-    extensions_parser.add_argument("--catalog")
+    extensions_parser.add_argument(
+        "--catalog",
+        action="append",
+        help=(
+            "Signed catalog path or HTTPS URL; repeat for publisher-qualified "
+            "catalog v2 selection"
+        ),
+    )
     extensions_parser.add_argument("--replace", action="store_true")
     extensions_parser.add_argument("--yes", action="store_true")
     extensions_parser.add_argument("--json", action="store_true")
@@ -3860,13 +3867,13 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             try:
                 if action == "search":
-                    sequence, entries = search_catalog_plugins(
+                    catalogs, entries = search_catalog_plugins(
                         args.extensions_target or "",
                         catalog=args.catalog,
                     )
                     print(
                         render_catalog_search(
-                            sequence,
+                            catalogs,
                             entries,
                             json_output=args.json,
                         )

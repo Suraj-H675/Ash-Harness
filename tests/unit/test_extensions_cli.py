@@ -492,6 +492,76 @@ def _write_signed_catalog(
     return catalog_path
 
 
+def _write_publisher_catalog(
+    root: Path,
+    *,
+    filename: str,
+    publisher: str,
+    name: str,
+    source: str,
+    digest: str,
+    private_key: Ed25519PrivateKey,
+    key_id: str = "publisher-key",
+    sequence: int = 1,
+) -> Path:
+    encoded_private = (
+        base64.urlsafe_b64encode(private_key.private_bytes_raw()).rstrip(b"=").decode()
+    )
+    catalog_payload = {
+        "version": 2,
+        "publisher": publisher,
+        "sequence": sequence,
+        "entries": [
+            {
+                "name": name,
+                "version": "1.0.0",
+                "source": source,
+                "ref": "v1.0.0",
+                "digest": digest,
+            }
+        ],
+    }
+    path = root / filename
+    path.write_text(
+        json.dumps(
+            {
+                "catalog": catalog_payload,
+                "keyId": key_id,
+                "algorithm": "ed25519",
+                "signature": sign_catalog(catalog_payload, encoded_private),
+            }
+        )
+    )
+    return path
+
+
+def _write_publisher_key(
+    root: Path,
+    private_key: Ed25519PrivateKey,
+    *,
+    key_id: str = "publisher-key",
+) -> Path:
+    public_key = private_key.public_key().public_bytes_raw()
+    path = root / "publisher-keys.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "keys": [
+                    {
+                        "keyId": key_id,
+                        "algorithm": "ed25519",
+                        "publicKey": base64.urlsafe_b64encode(public_key)
+                        .rstrip(b"=")
+                        .decode(),
+                    }
+                ],
+            }
+        )
+    )
+    return path
+
+
 @pytest.mark.asyncio
 async def test_https_catalog_is_cached_and_verified_for_search(
     tmp_path: Path,
@@ -552,13 +622,14 @@ async def test_https_catalog_is_cached_and_verified_for_search(
         return httpx.Response(200, content=body)
 
     transport = httpx.MockTransport(handler)
-    sequence, entries = search_catalog_plugins(
+    catalogs, entries = search_catalog_plugins(
         "remote",
         catalog=url,
         transport=transport,
     )
 
-    assert sequence == 4
+    assert catalogs[0].sequence == 4
+    assert catalogs[0].publisher is None
     assert entries[0].name == "remote"
     assert (home / ".ash" / "cache" / "catalogs").is_dir()
 
@@ -591,6 +662,325 @@ def test_extensions_cli_preserves_https_catalog_url(
 
     assert requested == [url]
     assert payload["plugins"][0]["name"] == "demo"
+
+
+def test_multi_catalog_search_and_publisher_qualified_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.extensions import catalog_entry_for_name, search_catalog_plugins
+    from ash.plugins.lifecycle import PluginLifecycleError
+
+    private_key = Ed25519PrivateKey.generate()
+    keys = _write_publisher_key(tmp_path, private_key)
+    alpha = _write_publisher_catalog(
+        tmp_path,
+        filename="alpha.json",
+        publisher="alpha",
+        name="demo",
+        source="https://plugins.example/alpha-demo.git",
+        digest="a" * 64,
+        private_key=private_key,
+        sequence=3,
+    )
+    beta = _write_publisher_catalog(
+        tmp_path,
+        filename="beta.json",
+        publisher="beta",
+        name="demo",
+        source="https://plugins.example/beta-demo.git",
+        digest="b" * 64,
+        private_key=private_key,
+        sequence=9,
+    )
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(keys))
+
+    catalogs, entries = search_catalog_plugins("demo", catalog=[alpha, beta])
+
+    assert [(item.publisher, item.sequence) for item in catalogs] == [
+        ("alpha", 3),
+        ("beta", 9),
+    ]
+    assert [(entry.publisher, entry.name) for entry in entries] == [
+        ("alpha", "demo"),
+        ("beta", "demo"),
+    ]
+    with pytest.raises(PluginLifecycleError, match="ambiguous catalog plugin"):
+        catalog_entry_for_name("demo", catalog=[alpha, beta])
+    selected = catalog_entry_for_name("@beta/demo", catalog=[alpha, beta])
+    assert selected.publisher == "beta"
+    assert selected.source == "https://plugins.example/beta-demo.git"
+    with pytest.raises(PluginLifecycleError, match="@publisher/name"):
+        catalog_entry_for_name("@beta/demo/extra", catalog=[alpha, beta])
+
+
+def test_multi_catalog_selection_rejects_v1_or_duplicate_publishers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.extensions import search_catalog_plugins
+    from ash.plugins.lifecycle import PluginLifecycleError
+
+    private_key = Ed25519PrivateKey.generate()
+    keys = _write_publisher_key(tmp_path, private_key)
+    first = _write_publisher_catalog(
+        tmp_path,
+        filename="first.json",
+        publisher="alpha",
+        name="first",
+        source="https://plugins.example/first.git",
+        digest="a" * 64,
+        private_key=private_key,
+    )
+    duplicate = _write_publisher_catalog(
+        tmp_path,
+        filename="duplicate.json",
+        publisher="alpha",
+        name="second",
+        source="https://plugins.example/second.git",
+        digest="b" * 64,
+        private_key=private_key,
+    )
+    encoded_private = (
+        base64.urlsafe_b64encode(private_key.private_bytes_raw()).rstrip(b"=").decode()
+    )
+    legacy_payload = {
+        "version": 1,
+        "sequence": 1,
+        "entries": [
+            {
+                "name": "legacy",
+                "version": "1.0.0",
+                "source": "https://plugins.example/legacy.git",
+                "ref": "v1.0.0",
+                "digest": "c" * 64,
+            }
+        ],
+    }
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "catalog": legacy_payload,
+                "keyId": "publisher-key",
+                "algorithm": "ed25519",
+                "signature": sign_catalog(legacy_payload, encoded_private),
+            }
+        )
+    )
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(keys))
+
+    with pytest.raises(PluginLifecycleError, match="duplicate.*publisher"):
+        search_catalog_plugins("", catalog=[first, duplicate])
+
+    with pytest.raises(PluginLifecycleError, match="version 2.*publisher"):
+        search_catalog_plugins("", catalog=[first, legacy])
+
+
+def test_extensions_cli_accepts_repeatable_publisher_catalogs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    keys = _write_publisher_key(tmp_path, private_key)
+    alpha = _write_publisher_catalog(
+        tmp_path,
+        filename="alpha.json",
+        publisher="alpha",
+        name="demo",
+        source="https://plugins.example/alpha-demo.git",
+        digest="a" * 64,
+        private_key=private_key,
+        sequence=2,
+    )
+    beta = _write_publisher_catalog(
+        tmp_path,
+        filename="beta.json",
+        publisher="beta",
+        name="demo",
+        source="https://plugins.example/beta-demo.git",
+        digest="b" * 64,
+        private_key=private_key,
+        sequence=4,
+    )
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(keys))
+
+    assert (
+        main(
+            [
+                "extensions",
+                "search",
+                "demo",
+                "--catalog",
+                str(alpha),
+                "--catalog",
+                str(beta),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["catalogs"] == [
+        {"publisher": "alpha", "sequence": 2},
+        {"publisher": "beta", "sequence": 4},
+    ]
+    assert [item["publisher"] for item in payload["plugins"]] == ["alpha", "beta"]
+
+
+def test_single_v1_catalog_json_contract_is_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    catalog = _write_signed_catalog(
+        tmp_path,
+        source="https://plugins.example/demo.git",
+        digest="d" * 64,
+    )
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(tmp_path / "keys.json"))
+
+    assert (
+        main(
+            [
+                "extensions",
+                "search",
+                "demo",
+                "--catalog",
+                str(catalog),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload == {
+        "sequence": 1,
+        "plugins": [
+            {
+                "name": "demo",
+                "version": "1.2.3",
+                "source": "https://plugins.example/demo.git",
+                "ref": "v1.2.3",
+                "digest": "d" * 64,
+            }
+        ],
+    }
+
+
+def test_publisher_qualified_install_uses_exact_signed_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from ash.commands.extensions import manage_local_plugin
+    from ash.plugins.lifecycle import InstalledPlugin
+
+    private_key = Ed25519PrivateKey.generate()
+    keys = _write_publisher_key(tmp_path, private_key)
+    alpha = _write_publisher_catalog(
+        tmp_path,
+        filename="alpha-install.json",
+        publisher="alpha",
+        name="demo",
+        source="https://plugins.example/alpha-demo.git",
+        digest="a" * 64,
+        private_key=private_key,
+    )
+    beta = _write_publisher_catalog(
+        tmp_path,
+        filename="beta-install.json",
+        publisher="beta",
+        name="demo",
+        source="https://plugins.example/beta-demo.git",
+        digest="b" * 64,
+        private_key=private_key,
+    )
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(keys))
+    monkeypatch.setattr(
+        "ash.commands.extensions.load_extension_state",
+        lambda: SimpleNamespace(disabled_plugins=frozenset()),
+    )
+    monkeypatch.setattr(
+        "ash.commands.extensions.set_plugin_enabled", lambda *args, **kwargs: None
+    )
+    observed: dict[str, object] = {}
+
+    def install(source_arg: str, **kwargs):
+        observed["source"] = source_arg
+        observed.update(kwargs)
+        return InstalledPlugin("demo", "1.0.0", tmp_path / "installed" / "demo")
+
+    monkeypatch.setattr("ash.commands.extensions.install_git_plugin", install)
+
+    result = manage_local_plugin(
+        "install",
+        "@beta/demo",
+        catalog=[alpha, beta],
+    )
+
+    expected = observed["expected"]
+    assert result["name"] == "demo"
+    assert observed["source"] == "https://plugins.example/beta-demo.git"
+    assert observed["ref"] == "v1.0.0"
+    assert expected.publisher == "beta"
+    assert expected.digest == "b" * 64
+
+
+def test_direct_url_install_rejects_ambiguous_multi_catalog_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from ash.commands.extensions import manage_local_plugin
+    from ash.plugins.lifecycle import PluginLifecycleError
+
+    private_key = Ed25519PrivateKey.generate()
+    keys = _write_publisher_key(tmp_path, private_key)
+    source = "https://plugins.example/shared.git"
+    alpha = _write_publisher_catalog(
+        tmp_path,
+        filename="alpha-shared.json",
+        publisher="alpha",
+        name="alpha-demo",
+        source=source,
+        digest="a" * 64,
+        private_key=private_key,
+    )
+    beta = _write_publisher_catalog(
+        tmp_path,
+        filename="beta-shared.json",
+        publisher="beta",
+        name="beta-demo",
+        source=source,
+        digest="b" * 64,
+        private_key=private_key,
+    )
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(keys))
+    monkeypatch.setattr(
+        "ash.commands.extensions.load_extension_state",
+        lambda: SimpleNamespace(disabled_plugins=frozenset()),
+    )
+
+    def unexpected_install(*args, **kwargs):
+        raise AssertionError("ambiguous signed pin must not start installation")
+
+    monkeypatch.setattr(
+        "ash.commands.extensions.install_git_plugin", unexpected_install
+    )
+
+    with pytest.raises(PluginLifecycleError, match="exactly one entry"):
+        manage_local_plugin(
+            "install",
+            source,
+            git_ref="v1.0.0",
+            catalog=[alpha, beta],
+        )
 
 
 def test_extensions_catalog_search_and_name_install_are_pinned(
@@ -685,7 +1075,7 @@ def test_direct_url_install_uses_matching_signed_catalog_entry(
 
     monkeypatch.setattr(
         "ash.commands.extensions._verified_catalog",
-        lambda catalog=None: SimpleNamespace(entries={"demo": expected}),
+        lambda catalog=None, *, transport=None: SimpleNamespace(entries={"demo": expected}),
     )
     monkeypatch.setattr(
         "ash.commands.extensions.load_extension_state",
@@ -733,7 +1123,7 @@ def test_direct_url_install_fails_closed_when_catalog_does_not_pin_request(
     )
     monkeypatch.setattr(
         "ash.commands.extensions._verified_catalog",
-        lambda catalog=None: SimpleNamespace(entries={"demo": entry}),
+        lambda catalog=None, *, transport=None: SimpleNamespace(entries={"demo": entry}),
     )
     monkeypatch.setattr(
         "ash.commands.extensions.load_extension_state",
