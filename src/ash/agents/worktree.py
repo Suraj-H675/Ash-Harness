@@ -10,12 +10,15 @@ from typing import Sequence
 
 from ash.safe_io import validate_unlinked_directory_path, validate_unlinked_path
 from ash.safety.environment import resolve_host_executable
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import ScopedIOError
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
     ProcessTreeError,
     ProcessTreeUnavailable,
     communicate_process,
     prepare_process_tree,
+    prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
@@ -440,21 +443,38 @@ async def _run_git(
         if check:
             raise WorktreeError(result.stderr)
         return result
+    command = [git, *args]
+    cwd_guard = SafetyGuard(cwd)
     try:
-        process_tree_plan = prepare_process_tree(workspace_root=cwd)
-    except ProcessTreeUnavailable as exc:
+        with prepare_scoped_process_launch(
+            command,
+            cwd=cwd,
+            guard=cwd_guard,
+        ) as launch:
+            try:
+                process_tree_plan = prepare_process_tree(
+                    workspace_root=cwd_guard.project_root
+                )
+            except ProcessTreeUnavailable as exc:
+                result = GitResult(126, "", f"git command was not started: {exc}")
+                if check:
+                    raise WorktreeError(result.stderr) from exc
+                return result
+            spawn_options = dict(process_tree_plan.spawn_options)
+            if launch.pass_fds:
+                spawn_options["pass_fds"] = launch.pass_fds
+            process = await asyncio.create_subprocess_exec(
+                *launch.argv,
+                cwd=launch.cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **spawn_options,
+            )
+    except (ProcessTreeUnavailable, SafetyViolation, ScopedIOError) as exc:
         result = GitResult(126, "", f"git command was not started: {exc}")
         if check:
             raise WorktreeError(result.stderr) from exc
         return result
-    process = await asyncio.create_subprocess_exec(
-        git,
-        *args,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        **process_tree_plan.spawn_options,
-    )
     try:
         stdout, stderr = await asyncio.wait_for(
             communicate_process(

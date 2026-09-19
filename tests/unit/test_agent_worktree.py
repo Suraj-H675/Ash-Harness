@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from ash.agents.worktree import WorktreeError, WorktreeManager
+from ash.agents.worktree import WorktreeError, WorktreeManager, _run_git
 
 
 def _git(root: Path, *args: str) -> str:
@@ -58,6 +59,80 @@ def test_worktree_agent_commits_branch_without_mutating_lead(
     assert repository.joinpath("file.txt").read_text(encoding="utf-8") == "base\n"
     assert not lease.path.exists()
     assert _git(repository, "show", f"{lease.branch}:file.txt") == "worker"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_worktree_git_cwd_swap_cannot_escape_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox import process_utils as process_utils_module
+
+    repository = tmp_path / "repository"
+    outside = tmp_path / "outside"
+    saved = tmp_path / "repository-saved"
+    repository.mkdir()
+    outside.mkdir()
+    _git(repository, "init", "-q")
+    _git(outside, "init", "-q")
+    real_prepare = process_utils_module.prepare_process_tree
+    swapped = False
+
+    def prepare_then_swap(*args, **kwargs):
+        nonlocal swapped
+        plan = real_prepare(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            repository.rename(saved)
+            try:
+                repository.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return plan
+
+    monkeypatch.setattr("ash.agents.worktree.prepare_process_tree", prepare_then_swap)
+
+    result = await _run_git(
+        repository,
+        ("rev-parse", "--show-toplevel"),
+        check=False,
+    )
+
+    assert swapped is True
+    assert result.returncode == 0, result.stderr
+    assert Path(result.stdout.strip()).resolve() == saved.resolve()
+
+
+@pytest.mark.asyncio
+async def test_worktree_git_fails_closed_without_stable_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from ash.sandbox.process_utils import ProcessTreeUnavailable
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+
+    def unavailable(*args, **kwargs):
+        raise ProcessTreeUnavailable("stable cwd unavailable")
+
+    create = AsyncMock(side_effect=AssertionError("worktree Git must not launch"))
+    monkeypatch.setattr(
+        "ash.agents.worktree.prepare_scoped_process_launch", unavailable
+    )
+    monkeypatch.setattr(
+        "ash.agents.worktree.asyncio.create_subprocess_exec", create
+    )
+
+    result = await _run_git(repository, ("status",), check=False)
+
+    assert result.returncode == 126
+    assert "stable cwd unavailable" in result.stderr
+    create.assert_not_awaited()
 
 
 def test_worktree_agent_branch_can_be_applied_and_removed(
