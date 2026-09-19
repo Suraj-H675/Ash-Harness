@@ -311,6 +311,94 @@ async def test_lsp_client_launches_resolved_host_command(
     assert not marker.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_lsp_client_cwd_swap_cannot_escape_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox import process_utils as process_utils_module
+
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    outside.mkdir()
+    cwd_log = tmp_path / "lsp-cwd.txt"
+    wrapper = tmp_path / "host-lsp-server"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import runpy\n"
+        "from pathlib import Path\n"
+        f"Path({str(cwd_log)!r}).write_text(str(Path.cwd()), encoding='utf-8')\n"
+        f"runpy.run_path({str(FIXTURE_SERVER)!r}, run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    config = replace(
+        fake_config(tmp_path / "lsp.jsonl"),
+        command=(str(wrapper),),
+    )
+    real_prepare = process_utils_module.prepare_process_tree
+    swapped = False
+
+    def prepare_then_swap(*args, **kwargs):
+        nonlocal swapped
+        plan = real_prepare(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            workspace.rename(saved)
+            try:
+                workspace.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"Symlink creation is unavailable: {exc}")
+        return plan
+
+    monkeypatch.setattr("ash.lsp.client.prepare_process_tree", prepare_then_swap)
+    client = LSPClient(
+        config,
+        workspace,
+        diagnostics_callback=AsyncMock(return_value=None),
+    )
+    try:
+        await client.start()
+    finally:
+        await client.aclose()
+
+    assert swapped is True
+    assert Path(cwd_log.read_text(encoding="utf-8")).resolve() == saved.resolve()
+
+
+@pytest.mark.asyncio
+async def test_lsp_client_fails_closed_when_stable_cwd_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox.process_utils import ProcessTreeUnavailable
+
+    client = LSPClient(
+        fake_config(tmp_path / "lsp.jsonl"),
+        tmp_path,
+        diagnostics_callback=AsyncMock(return_value=None),
+    )
+
+    def unavailable(*args, **kwargs):
+        raise ProcessTreeUnavailable("stable cwd unavailable")
+
+    monkeypatch.setattr(
+        "ash.lsp.client.prepare_scoped_process_launch",
+        unavailable,
+    )
+    create = AsyncMock()
+    monkeypatch.setattr("ash.lsp.client.asyncio.create_subprocess_exec", create)
+
+    with pytest.raises(LSPError, match="stable cwd unavailable"):
+        await client.start()
+
+    create.assert_not_awaited()
+    assert client.process is None
+
+
 def test_position_encoding_uses_negotiated_units() -> None:
     text = 'x = "\U0001f600"\n'
     assert _lsp_position(text, 1, 7, "utf-8") == {"line": 0, "character": 9}

@@ -15,13 +15,14 @@ from typing import Any
 from ash.lsp.config import LSPServerConfig, resolve_lsp_command
 from ash.core.redaction import redact_text
 from ash.safety.environment import build_scrubbed_environment
-from ash.safety.guard import SafetyGuard
+from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import ScopedIOError, read_scoped_bytes
 from ash.sandbox.process_utils import (
     ProcessTreeError,
     ProcessTreePlan,
     ProcessTreeUnavailable,
     prepare_process_tree,
+    prepare_scoped_process_launch,
     terminate_process_tree,
 )
 
@@ -105,24 +106,33 @@ class LSPClient:
                 f"failed to start LSP server {self.config.name}: {exc}"
             ) from exc
         try:
-            process_tree_plan = prepare_process_tree(workspace_root=self.root)
-        except ProcessTreeUnavailable as exc:
-            raise LSPError(
-                f"failed to start LSP server {self.config.name}: {exc}"
-            ) from exc
-        self._process_tree_plan = process_tree_plan
-        try:
-            self.process = await asyncio.create_subprocess_exec(
-                *launch_command,
+            with prepare_scoped_process_launch(
+                launch_command,
                 cwd=self.root,
-                env=environment,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                limit=MAX_LSP_HEADER_BYTES + 4,
-                **process_tree_plan.spawn_options,
-            )
-        except OSError as exc:
+                guard=self._guard,
+                search_path=environment.get("PATH"),
+            ) as launch:
+                try:
+                    process_tree_plan = prepare_process_tree(workspace_root=self.root)
+                except ProcessTreeUnavailable as exc:
+                    raise LSPError(
+                        f"failed to start LSP server {self.config.name}: {exc}"
+                    ) from exc
+                self._process_tree_plan = process_tree_plan
+                spawn_options = dict(process_tree_plan.spawn_options)
+                if launch.pass_fds:
+                    spawn_options["pass_fds"] = launch.pass_fds
+                self.process = await asyncio.create_subprocess_exec(
+                    *launch.argv,
+                    cwd=launch.cwd,
+                    env=environment,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    limit=MAX_LSP_HEADER_BYTES + 4,
+                    **spawn_options,
+                )
+        except (OSError, ProcessTreeUnavailable, SafetyViolation, ScopedIOError) as exc:
             self._process_tree_plan = None
             raise LSPError(
                 f"failed to start LSP server {self.config.name}: {exc}"
