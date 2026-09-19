@@ -92,6 +92,86 @@ def test_custom_command_catalog_rejects_direct_linked_command(tmp_path: Path) ->
     assert "cannot be a link" in catalog.errors[str(linked)]
 
 
+def test_custom_command_swap_cannot_escape_source_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "commands"
+    root.mkdir()
+    command_path = root / "safe.md"
+    saved = root / "safe-saved.md"
+    outside = tmp_path / "outside.md"
+    command_path.write_text("Safe prompt", encoding="utf-8")
+    outside.write_text("Outside prompt", encoding="utf-8")
+    real_is_symlink = Path.is_symlink
+    checks = 0
+    swapped = False
+
+    def is_symlink_then_swap(path: Path) -> bool:
+        nonlocal checks, swapped
+        result = real_is_symlink(path)
+        if path == command_path:
+            checks += 1
+        if path == command_path and checks == 2 and not result and not swapped:
+            swapped = True
+            command_path.rename(saved)
+            try:
+                command_path.symlink_to(outside)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return result
+
+    monkeypatch.setattr(Path, "is_symlink", is_symlink_then_swap)
+
+    catalog = CustomCommandCatalog(((root, "user"),))
+    commands = catalog.discover()
+
+    assert swapped is True
+    assert commands == []
+    assert str(command_path) in catalog.errors
+
+
+def test_custom_command_parent_swap_cannot_escape_source_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "commands"
+    nested = root / "review"
+    nested.mkdir(parents=True)
+    command_path = nested / "security.md"
+    saved = root / "review-saved"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    command_path.write_text("Safe prompt", encoding="utf-8")
+    (outside / "security.md").write_text("Outside prompt", encoding="utf-8")
+    real_is_symlink = Path.is_symlink
+    checks = 0
+    swapped = False
+
+    def is_symlink_then_swap(path: Path) -> bool:
+        nonlocal checks, swapped
+        result = real_is_symlink(path)
+        if path == command_path:
+            checks += 1
+        if path == command_path and checks == 2 and not result and not swapped:
+            swapped = True
+            nested.rename(saved)
+            try:
+                nested.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return result
+
+    monkeypatch.setattr(Path, "is_symlink", is_symlink_then_swap)
+
+    catalog = CustomCommandCatalog(((root, "user"),))
+    commands = catalog.discover()
+
+    assert swapped is True
+    assert commands == []
+    assert str(command_path) in catalog.errors
+
+
 def test_custom_command_catalog_bounds_recursive_discovery(
     tmp_path: Path, monkeypatch
 ) -> None:

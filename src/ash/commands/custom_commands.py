@@ -6,6 +6,9 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import read_scoped_bytes
+
 
 MAX_COMMAND_BYTES = 128 * 1024
 MAX_COMMAND_DISCOVERY_ENTRIES = 100_000
@@ -135,8 +138,14 @@ def _parse(
 ) -> CustomCommand:
     if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
         raise ValueError("command file cannot be a link")
-    with path.open("rb") as handle:
-        raw = handle.read(MAX_COMMAND_BYTES + 1)
+    try:
+        _, raw = read_scoped_bytes(
+            path,
+            SafetyGuard(root),
+            max_bytes=MAX_COMMAND_BYTES + 1,
+        )
+    except SafetyViolation as exc:
+        raise ValueError(str(exc)) from exc
     return parse_custom_command_bytes(
         raw,
         path,
