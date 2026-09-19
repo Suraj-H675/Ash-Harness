@@ -1416,34 +1416,42 @@ class MCPRuntime:
         return {name: dict(tools) for name, tools in self._server_tools.items()}
 
     async def watch_resource(self, server_name: str, uri: str) -> None:
-        client = self.clients.get(server_name)
-        if client is None:
+        lock = self._refresh_locks.get(server_name)
+        if lock is None:
             raise ValueError(f"unknown MCP server: {server_name}")
-        was_watched = uri in client.watched_resources
-        await client.watch_resource(uri)
-        if not was_watched and uri in client.watched_resources:
-            self._emit_event(
-                {
-                    "type": "mcp.resource.watch_started",
-                    "server": server_name,
-                    "uri": safe_mcp_diagnostic(uri),
-                }
-            )
+        async with lock:
+            client = self.clients.get(server_name)
+            if client is None:
+                raise ValueError(f"unknown MCP server: {server_name}")
+            was_watched = uri in client.watched_resources
+            await client.watch_resource(uri)
+            if not was_watched and uri in client.watched_resources:
+                self._emit_event(
+                    {
+                        "type": "mcp.resource.watch_started",
+                        "server": server_name,
+                        "uri": safe_mcp_diagnostic(uri),
+                    }
+                )
 
     async def unwatch_resource(self, server_name: str, uri: str) -> None:
-        client = self.clients.get(server_name)
-        if client is None:
+        lock = self._refresh_locks.get(server_name)
+        if lock is None:
             raise ValueError(f"unknown MCP server: {server_name}")
-        was_watched = uri in client.watched_resources
-        await client.unwatch_resource(uri)
-        if was_watched:
-            self._emit_event(
-                {
-                    "type": "mcp.resource.watch_stopped",
-                    "server": server_name,
-                    "uri": safe_mcp_diagnostic(uri),
-                }
-            )
+        async with lock:
+            client = self.clients.get(server_name)
+            if client is None:
+                raise ValueError(f"unknown MCP server: {server_name}")
+            was_watched = uri in client.watched_resources
+            await client.unwatch_resource(uri)
+            if was_watched:
+                self._emit_event(
+                    {
+                        "type": "mcp.resource.watch_stopped",
+                        "server": server_name,
+                        "uri": safe_mcp_diagnostic(uri),
+                    }
+                )
 
     def resource_watches(self, server_name: str | None = None) -> list[dict[str, str]]:
         if server_name is not None and server_name not in self.configs:

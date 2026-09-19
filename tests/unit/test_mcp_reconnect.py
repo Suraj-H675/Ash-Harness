@@ -815,6 +815,91 @@ for line in sys.stdin:
         await runtime.close()
 
 
+@pytest.mark.parametrize("operation", ["watch", "unwatch"])
+@pytest.mark.asyncio
+async def test_resource_watch_change_racing_with_reconnect_is_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    replacement_connect_started = asyncio.Event()
+    release_replacement_connect = asyncio.Event()
+
+    class RaceClient:
+        def __init__(self, config, **kwargs) -> None:
+            del kwargs
+            self.config = config
+            self._watched: set[str] = set()
+            self.session_generation = 1
+            self.server_capabilities = {"resources": {"subscribe": True}}
+
+        @property
+        def watched_resources(self) -> tuple[str, ...]:
+            return tuple(sorted(self._watched))
+
+        async def connect(self) -> None:
+            if self.config.env.get("ASH_DYNAMIC_MODE") == "replacement":
+                replacement_connect_started.set()
+                await release_replacement_connect.wait()
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def watch_resource(self, uri: str) -> None:
+            self._watched.add(uri)
+
+        async def unwatch_resource(self, uri: str) -> None:
+            self._watched.discard(uri)
+
+        def supports_server_capability(self, capability: str) -> bool:
+            return capability == "resources"
+
+        async def list_tools(self) -> list[dict[str, object]]:
+            return []
+
+    monkeypatch.setattr("ash.mcp.runtime.MCPClient", RaceClient)
+    initial = MCPServerConfig(
+        name="watched",
+        command="unused",
+        args=[],
+        env={"ASH_DYNAMIC_MODE": "initial"},
+        transport="stdio",
+    )
+    replacement = MCPServerConfig(
+        name="watched",
+        command="unused",
+        args=[],
+        env={"ASH_DYNAMIC_MODE": "replacement"},
+        transport="stdio",
+    )
+    runtime = MCPRuntime({"watched": initial}, SafetyGuard(tmp_path))
+    await runtime.start()
+    uri = "file:///race.txt"
+    try:
+        if operation == "unwatch":
+            await runtime.watch_resource("watched", uri)
+
+        replace_task = asyncio.create_task(runtime.replace_server("watched", replacement))
+        await asyncio.wait_for(replacement_connect_started.wait(), timeout=1)
+
+        mutation_task = asyncio.create_task(
+            runtime.watch_resource("watched", uri)
+            if operation == "watch"
+            else runtime.unwatch_resource("watched", uri)
+        )
+        await asyncio.sleep(0)
+        assert mutation_task.done() is False
+        release_replacement_connect.set()
+        await asyncio.wait_for(replace_task, timeout=1)
+        await asyncio.wait_for(mutation_task, timeout=1)
+
+        expected = [{"server": "watched", "uri": uri}] if operation == "watch" else []
+        assert runtime.resource_watches("watched") == expected
+    finally:
+        release_replacement_connect.set()
+        await runtime.close()
+
+
 @pytest.mark.asyncio
 async def test_full_reload_preserves_resource_watches(tmp_path) -> None:
     server = r"""

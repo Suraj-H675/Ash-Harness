@@ -6900,6 +6900,7 @@ async def test_runtime_watch_resource_emits_started_event_only_once(tmp_path) ->
     )
     client = FakeClient()
     runtime.clients["server"] = client
+    runtime._refresh_locks["server"] = asyncio.Lock()
     uri = "file:///idempotent.txt"
 
     await runtime.watch_resource("server", uri)
