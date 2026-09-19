@@ -606,6 +606,65 @@ async def test_targeted_reconnect_waits_for_catalog_refresh_before_snapshot(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "capability"),
+    [
+        ("notifications/tools/list_changed", "tools"),
+        ("notifications/resources/list_changed", "resources"),
+        ("notifications/prompts/list_changed", "prompts"),
+    ],
+)
+async def test_replacement_list_change_requires_declared_capability(
+    tmp_path: Path,
+    method: str,
+    capability: str,
+) -> None:
+    runtime = MCPRuntime({}, SafetyGuard(tmp_path))
+    active = MCPClient(_config("one"))
+    replacement = MCPClient(_config("one"))
+    active.server_capabilities = {capability: {"listChanged": True}}
+    replacement.server_capabilities = {capability: {}}
+    runtime.clients["one"] = active
+    runtime._replacement_clients["one"] = replacement
+
+    await runtime._handle_notification("one", replacement, method, {})
+
+    assert "one" not in runtime._pending_replacement_notifications
+    assert runtime.errors[f"one:notification:{method}"] == (
+        "server sent list_changed without declaring listChanged"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "capability"),
+    [
+        ("notifications/tools/list_changed", "tools"),
+        ("notifications/resources/list_changed", "resources"),
+        ("notifications/prompts/list_changed", "prompts"),
+    ],
+)
+async def test_valid_list_change_clears_prior_protocol_error(
+    tmp_path: Path,
+    method: str,
+    capability: str,
+) -> None:
+    runtime = MCPRuntime({}, SafetyGuard(tmp_path))
+    client = MCPClient(_config("one"))
+    client.server_capabilities = {capability: {}}
+    runtime.clients["one"] = client
+
+    await runtime._handle_notification("one", client, method, {})
+    error_key = f"one:notification:{method}"
+    assert error_key in runtime.errors
+
+    client.server_capabilities = {capability: {"listChanged": True}}
+    await runtime._handle_notification("one", client, method, {})
+
+    assert error_key not in runtime.errors
+
+
+@pytest.mark.asyncio
 async def test_mcp_reload_log_redacts_bounded_server_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

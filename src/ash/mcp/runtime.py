@@ -1613,10 +1613,6 @@ class MCPRuntime:
         capability = capability_by_notification.get(method)
         if capability is None:
             return
-        if replacement_only:
-            if capability == "tools":
-                self._pending_replacement_notifications.add(server_name)
-            return
         advertised = client.server_capabilities.get(capability)
         if (
             not isinstance(advertised, dict)
@@ -1625,6 +1621,11 @@ class MCPRuntime:
             self.errors[f"{server_name}:notification:{method}"] = (
                 "server sent list_changed without declaring listChanged"
             )
+            return
+        self.errors.pop(f"{server_name}:notification:{method}", None)
+        if replacement_only:
+            if capability == "tools":
+                self._pending_replacement_notifications.add(server_name)
             return
         if capability == "tools":
             self._tool_catalog_epochs[server_name] = (
