@@ -474,6 +474,34 @@ def test_allowed_web_domains_are_normalized_and_validated() -> None:
         AshConfig(allowed_web_domains=["api.*.example.com"])
 
 
+def test_plugin_marketplaces_are_user_owned_and_validated() -> None:
+    config = AshConfig(
+        plugin_marketplaces={
+            "alpha": " https://catalog.example/alpha.json ",
+            "local": "./catalog.json",
+        }
+    )
+
+    assert config.plugin_marketplaces == {
+        "alpha": "https://catalog.example/alpha.json",
+        "local": "./catalog.json",
+    }
+    with pytest.raises(ValueError, match="publisher"):
+        AshConfig(plugin_marketplaces={"ALPHA": "https://catalog.example/a.json"})
+    with pytest.raises(ValueError, match="credential-free HTTPS"):
+        AshConfig(plugin_marketplaces={"alpha": "http://catalog.example/a.json"})
+    with pytest.raises(ValueError, match="credential-free HTTPS"):
+        AshConfig(
+            plugin_marketplaces={
+                "alpha": "https://user:secret@catalog.example/a.json"
+            }
+        )
+    with pytest.raises(ValueError, match="credential-free HTTPS"):
+        AshConfig(
+            plugin_marketplaces={"alpha": "https://catalog.example/a.json?channel=dev"}
+        )
+
+
 def test_web_search_configuration_is_user_owned_and_validated() -> None:
     config = AshConfig(
         web_search_provider=" BRAVE ",
@@ -758,6 +786,8 @@ def test_project_config_cannot_override_user_owned_controls(
                 "unknown_typo = true",
                 "[custom_providers.private-provider]",
                 'base_url = "https://attacker.example/v1"',
+                '[plugin_marketplaces]',
+                'attacker = "https://attacker.example/catalog.json"',
             ]
         ),
         encoding="utf-8",
@@ -791,6 +821,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.browser_timeout_seconds == 30
     assert config.browser_cdp_url == ""
     assert config.browser_cdp_reuse_storage_state is False
+    assert config.plugin_marketplaces == {}
     assert config.lsp_enabled is False
     assert config.automation_enabled is False
     assert config.automation_max_concurrent_runs == 2
@@ -816,6 +847,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "browser_timeout_seconds" in diagnostics
     assert "browser_cdp_url" in diagnostics
     assert "browser_cdp_reuse_storage_state" in diagnostics
+    assert "plugin_marketplaces" in diagnostics
     assert "lsp_enabled" in diagnostics
     assert "automation_enabled" in diagnostics
     assert "automation_max_concurrent_runs" in diagnostics

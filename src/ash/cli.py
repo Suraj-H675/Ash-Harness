@@ -2182,6 +2182,28 @@ def main(argv: list[str] | None = None) -> int:
         "explain", help="Show effective config values and their sources"
     )
     config_explain.add_argument("--json", action="store_true")
+    marketplace_parser = subparsers.add_parser(
+        "marketplace",
+        help="Manage user-owned signed plugin marketplace catalogs",
+    )
+    marketplace_subparsers = marketplace_parser.add_subparsers(
+        dest="marketplace_action", required=True
+    )
+    marketplace_list = marketplace_subparsers.add_parser(
+        "list", help="List registered publisher catalogs without network access"
+    )
+    marketplace_list.add_argument("--json", action="store_true")
+    marketplace_add = marketplace_subparsers.add_parser(
+        "add", help="Verify and register one signed catalog v2 source"
+    )
+    marketplace_add.add_argument("source")
+    marketplace_add.add_argument("--replace", action="store_true")
+    marketplace_add.add_argument("--json", action="store_true")
+    marketplace_remove = marketplace_subparsers.add_parser(
+        "remove", help="Remove one registered publisher catalog"
+    )
+    marketplace_remove.add_argument("publisher")
+    marketplace_remove.add_argument("--json", action="store_true")
     diff_mode_parser = subparsers.add_parser(
         "diff-mode",
         help="Select approval diff preview layout",
@@ -2998,6 +3020,47 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+
+    if args.command == "marketplace":
+        from ash.commands.marketplace import (
+            add_marketplace,
+            registered_marketplaces,
+            remove_marketplace,
+            render_marketplace_action,
+            render_marketplaces,
+        )
+
+        try:
+            if args.marketplace_action == "list":
+                print(
+                    render_marketplaces(
+                        registered_marketplaces(),
+                        json_output=args.json,
+                    )
+                )
+                return 0
+            if args.marketplace_action == "add":
+                print(
+                    render_marketplace_action(
+                        add_marketplace(args.source, replace=args.replace),
+                        json_output=args.json,
+                    )
+                )
+                return 0
+            if args.marketplace_action == "remove":
+                print(
+                    render_marketplace_action(
+                        remove_marketplace(args.publisher),
+                        json_output=args.json,
+                    )
+                )
+                return 0
+        except (OSError, ValueError) as exc:
+            from ash.core.redaction import redact_text
+
+            print(f"Error: {redact_text(str(exc))}", file=sys.stderr)
+            return 2
+        parser.error(f"unsupported marketplace action: {args.marketplace_action}")
 
     if args.command == "diff-mode":
         from ash.commands.config import load_config, save_config
@@ -3866,10 +3929,17 @@ def main(argv: list[str] | None = None) -> int:
                 print("Error: --yes is only valid with uninstall", file=sys.stderr)
                 return 2
             try:
+                catalog_selection = args.catalog
+                if action in {"search", "install"} and not catalog_selection:
+                    from ash.commands.marketplace import registered_marketplaces
+
+                    configured_marketplaces = registered_marketplaces()
+                    if configured_marketplaces:
+                        catalog_selection = configured_marketplaces
                 if action == "search":
                     catalogs, entries = search_catalog_plugins(
                         args.extensions_target or "",
-                        catalog=args.catalog,
+                        catalog=catalog_selection,
                     )
                     print(
                         render_catalog_search(
@@ -3885,7 +3955,7 @@ def main(argv: list[str] | None = None) -> int:
                         replace=args.replace,
                         confirmed=args.yes,
                         git_ref=args.ref,
-                        catalog=args.catalog,
+                        catalog=catalog_selection,
                     )
                     print(render_plugin_action(result, json_output=args.json))
             except (OSError, PluginLifecycleError) as exc:

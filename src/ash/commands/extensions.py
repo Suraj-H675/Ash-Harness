@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -62,7 +62,9 @@ from ash.safe_io import read_bounded_bytes, strict_json_loads
 ExtensionKind = Literal["all", "skills", "agents", "plugins", "hooks"]
 PluginAction = Literal["install", "enable", "disable", "uninstall"]
 CatalogSource = Path | str
-CatalogSelection = CatalogSource | Sequence[CatalogSource] | None
+CatalogSelection = (
+    CatalogSource | Sequence[CatalogSource] | Mapping[str, CatalogSource] | None
+)
 ExtensionAction = Literal[
     "all",
     "skills",
@@ -426,8 +428,16 @@ def _verified_catalogs(
     *,
     transport: Any | None = None,
 ) -> tuple[SignedCatalog, ...]:
-    if isinstance(catalog, Path | str) or catalog is None:
-        sources: tuple[CatalogSource | None, ...] = (catalog,)
+    expected_publishers: tuple[str | None, ...] | None = None
+    sources: tuple[CatalogSource | None, ...]
+    if isinstance(catalog, Mapping):
+        expected_publishers = tuple(catalog.keys())
+        sources = tuple(catalog.values())
+        if not sources:
+            sources = (None,)
+            expected_publishers = None
+    elif isinstance(catalog, Path | str) or catalog is None:
+        sources = (catalog,)
     else:
         sources = tuple(catalog)
         if not sources:
@@ -435,6 +445,13 @@ def _verified_catalogs(
     verified = tuple(
         _verified_catalog(source, transport=transport) for source in sources
     )
+    if expected_publishers is not None:
+        for expected, item in zip(expected_publishers, verified, strict=True):
+            if item.publisher != expected:
+                actual = item.publisher or "legacy-v1"
+                raise PluginLifecycleError(
+                    f"registered marketplace @{expected} returned publisher {actual!r}"
+                )
     if len(verified) <= 1:
         return verified
     publishers = [item.publisher for item in verified]

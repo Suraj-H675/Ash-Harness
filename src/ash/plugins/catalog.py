@@ -43,6 +43,14 @@ class PluginCatalogError(ValueError):
     """Raised when a signed catalog is malformed or untrusted."""
 
 
+def validate_catalog_publisher(value: str) -> str:
+    """Validate one signed catalog publisher namespace."""
+
+    if not isinstance(value, str) or not _PUBLISHER.fullmatch(value):
+        raise PluginCatalogError("invalid plugin catalog publisher")
+    return value
+
+
 def _catalog_trusted_root(path: Path) -> Path:
     candidate = Path(os.path.abspath(path.expanduser()))
     home = Path(os.path.abspath(Path.home().expanduser()))
@@ -323,12 +331,7 @@ def _validate_catalog(catalog: Mapping[str, Any]) -> SignedCatalog:
     elif version == CATALOG_VERSION:
         if set(catalog) != {"version", "publisher", "sequence", "entries"}:
             raise PluginCatalogError("invalid plugin catalog fields")
-        raw_publisher = catalog["publisher"]
-        if not isinstance(raw_publisher, str) or not _PUBLISHER.fullmatch(
-            raw_publisher
-        ):
-            raise PluginCatalogError("invalid plugin catalog publisher")
-        publisher = raw_publisher
+        publisher = validate_catalog_publisher(catalog["publisher"])
     else:
         raise PluginCatalogError("unsupported plugin catalog version")
     sequence = catalog["sequence"]

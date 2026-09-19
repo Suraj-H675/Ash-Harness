@@ -320,6 +320,10 @@ Ash is extensible without changing the core runtime:
   caching; catalog v2 binds a lowercase publisher namespace into the signed
   payload, repeatable `--catalog` inputs can be searched together, and
   `@publisher/plugin` selects an exact publisher when names overlap;
+- persistent, profile-scoped `ash marketplace list/add/remove` registration
+  for signed catalog v2 publishers; registered sources are re-verified on use,
+  publisher drift fails closed, and explicit `--catalog` still overrides the
+  saved registry;
 - validation for traversal, links, malformed manifests, oversized components,
   missing dependencies, and unsafe replacements;
 - enable, disable, uninstall, inventory, search, and atomic live reload;

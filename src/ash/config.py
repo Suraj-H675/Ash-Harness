@@ -10,6 +10,7 @@ import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import (
@@ -33,11 +34,69 @@ from ash.safe_io import read_bounded_bytes
 CURRENT_CONFIG_SCHEMA_VERSION = 1
 MAX_CONFIG_FILE_BYTES = 1024 * 1024
 MAX_DOTENV_FILE_BYTES = 1024 * 1024
+MAX_PLUGIN_MARKETPLACES = 32
+MAX_PLUGIN_MARKETPLACE_SOURCE_CHARS = 4096
 
 _INITIAL_USER_CONFIG_PATH = Path.home() / ".ash" / "ash.toml"
 _INITIAL_DOTENV_PATH = Path.home() / ".ash" / ".env"
 _DOTENV_RUNTIME_LOCK = threading.RLock()
 _DOTENV_RUNTIME_VALUES: dict[str, str] = {}
+
+
+def validate_plugin_marketplace_source(source: Any, *, publisher: str) -> str:
+    """Validate one marketplace source string without fetching it."""
+
+    if not isinstance(source, str):
+        raise ValueError(f"plugin marketplace source for {publisher!r} must be a string")
+    normalized = source.strip()
+    if (
+        not normalized
+        or len(normalized) > MAX_PLUGIN_MARKETPLACE_SOURCE_CHARS
+        or any(
+            ord(character) < 32 or ord(character) == 127 for character in normalized
+        )
+    ):
+        raise ValueError(f"plugin marketplace source for {publisher!r} is invalid")
+    if "://" in normalized:
+        parsed = urlsplit(normalized)
+        if (
+            parsed.scheme.casefold() != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or bool(parsed.query)
+            or bool(parsed.fragment)
+        ):
+            raise ValueError(
+                "plugin marketplace URLs must be credential-free HTTPS URLs "
+                "without query strings or fragments"
+            )
+    return normalized
+
+
+def validate_plugin_marketplaces(value: Any) -> dict[str, str]:
+    """Validate the user-owned signed marketplace registry without network I/O."""
+
+    from ash.plugins.catalog import validate_catalog_publisher
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("plugin_marketplaces must be a publisher-to-source table")
+    if len(value) > MAX_PLUGIN_MARKETPLACES:
+        raise ValueError(
+            f"plugin_marketplaces supports at most {MAX_PLUGIN_MARKETPLACES} entries"
+        )
+    normalized: dict[str, str] = {}
+    for raw_publisher, raw_source in value.items():
+        if not isinstance(raw_publisher, str):
+            raise ValueError("plugin marketplace publisher must be a string")
+        publisher = validate_catalog_publisher(raw_publisher)
+        normalized[publisher] = validate_plugin_marketplace_source(
+            raw_source,
+            publisher=publisher,
+        )
+    return normalized
 
 
 def _publish_dotenv_runtime_values(
@@ -625,6 +684,13 @@ class AshConfig(BaseSettings):
             "from the existing default context into Ash's isolated context."
         ),
     )
+    plugin_marketplaces: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "User-owned signed plugin marketplace registry: publisher -> local path "
+            "or HTTPS catalog URL. Project config cannot set this field."
+        ),
+    )
 
     db_directory: Path = Field(
         default=Path.home() / ".ash" / "db",
@@ -934,6 +1000,11 @@ class AshConfig(BaseSettings):
                 )
             normalized.append(item)
         return sorted(set(normalized))
+
+    @field_validator("plugin_marketplaces", mode="before")
+    @classmethod
+    def validate_plugin_marketplaces_field(cls, value: Any) -> dict[str, str]:
+        return validate_plugin_marketplaces(value)
 
     @field_validator("browser_cdp_url")
     @classmethod
