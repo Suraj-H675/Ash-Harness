@@ -324,6 +324,9 @@ Ash is extensible without changing the core runtime:
   for signed catalog v2 publishers; registered sources are re-verified on use,
   publisher drift fails closed, and explicit `--catalog` still overrides the
   saved registry;
+- managed Git/catalog installs persist Ash-owned source, ref, resolved commit,
+  version, and signed publisher provenance transactionally with plugin
+  replacement/uninstall; local replacements clear stale remote provenance;
 - validation for traversal, links, malformed manifests, oversized components,
   missing dependencies, and unsafe replacements;
 - enable, disable, uninstall, inventory, search, and atomic live reload;

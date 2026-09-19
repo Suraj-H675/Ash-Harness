@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -13,6 +14,8 @@ import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+from packaging.version import InvalidVersion, parse as parse_version
 
 from ash.safe_io import strict_json_loads
 from ash.plugins.anchored_fs import (
@@ -47,10 +50,16 @@ MAX_PLUGIN_FILES = 10_000
 MAX_PLUGIN_BYTES = 256 * 1024 * 1024
 MAX_EXTENSION_STATE_BYTES = 256 * 1024
 STATE_VERSION = 1
+MAX_PLUGIN_INSTALL_RECORDS_BYTES = 512 * 1024
+MAX_PLUGIN_INSTALL_RECORDS = 10_000
+PLUGIN_INSTALL_RECORDS_VERSION = 1
+PLUGIN_INSTALL_RECORDS_FILENAME = ".ash-install-records.json"
 MAX_GIT_CLONE_BYTES = MAX_PLUGIN_BYTES
 MAX_GIT_CLONE_SECONDS = 300
 MAX_GIT_ERROR_BYTES = 64 * 1024
 _GIT_CLONE_POLL_SECONDS = 0.05
+_GIT_DIGEST = re.compile(r"^[0-9a-f]{40,64}$")
+_INSTALL_RECORD_UNCHANGED = object()
 
 
 class PluginLifecycleError(ValueError):
@@ -69,12 +78,220 @@ class InstalledPlugin:
     root: Path
 
 
+@dataclass(frozen=True)
+class PluginInstallRecord:
+    name: str
+    version: str
+    source: str
+    ref: str
+    digest: str
+    publisher: str | None = None
+
+
 def user_plugin_root() -> Path:
     return Path.home() / ".ash" / "plugins"
 
 
 def extension_state_path() -> Path:
     return Path.home() / ".ash" / "extensions.json"
+
+
+def plugin_install_records_path(destination_root: Path | None = None) -> Path:
+    root = (destination_root or user_plugin_root()).expanduser()
+    return root / PLUGIN_INSTALL_RECORDS_FILENAME
+
+
+def load_plugin_install_records(
+    destination_root: Path | None = None,
+) -> dict[str, PluginInstallRecord]:
+    root = (destination_root or user_plugin_root()).expanduser()
+    _require_anchored_plugin_mutation()
+    try:
+        directory = AnchoredDirectory.open(root, create=False)
+    except FileNotFoundError:
+        return {}
+    except (AnchoredFilesystemError, OSError) as exc:
+        raise _lifecycle_error("plugin install records", exc) from exc
+    try:
+        return _read_plugin_install_records_at(directory, root)
+    except PluginLifecycleError:
+        raise
+    except (AnchoredFilesystemError, OSError) as exc:
+        raise _lifecycle_error("plugin install records", exc) from exc
+    finally:
+        directory.close()
+
+
+def _validate_plugin_install_record(record: PluginInstallRecord) -> None:
+    _validate_plugin_name(record.name)
+    try:
+        parse_version(record.version)
+    except InvalidVersion as exc:
+        raise PluginLifecycleError("plugin install record version is invalid") from exc
+    if not record.source or len(record.source) > 2048 or any(
+        ord(character) < 32 or ord(character) == 127 for character in record.source
+    ):
+        raise PluginLifecycleError("plugin install record source is invalid")
+    if not record.ref or len(record.ref) > 255 or any(
+        character in "\x00\r\n" for character in record.ref
+    ):
+        raise PluginLifecycleError("plugin install record ref is invalid")
+    if not _GIT_DIGEST.fullmatch(record.digest):
+        raise PluginLifecycleError("plugin install record digest is invalid")
+    if record.publisher is not None:
+        from ash.plugins.catalog import validate_catalog_publisher
+
+        try:
+            validate_catalog_publisher(record.publisher)
+        except PluginCatalogError as exc:
+            raise PluginLifecycleError("plugin install record publisher is invalid") from exc
+
+
+def _parse_plugin_install_records(
+    raw: bytes,
+    path: Path,
+) -> dict[str, PluginInstallRecord]:
+    try:
+        payload = strict_json_loads(raw)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise PluginLifecycleError(
+            f"cannot load plugin install records {path}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict) or set(payload) != {"version", "plugins"}:
+        raise PluginLifecycleError(f"invalid plugin install records: {path}")
+    if payload["version"] != PLUGIN_INSTALL_RECORDS_VERSION:
+        raise PluginLifecycleError(f"invalid plugin install records: {path}")
+    plugins = payload["plugins"]
+    if not isinstance(plugins, dict) or len(plugins) > MAX_PLUGIN_INSTALL_RECORDS:
+        raise PluginLifecycleError(f"invalid plugin install records: {path}")
+    records: dict[str, PluginInstallRecord] = {}
+    for name, item in plugins.items():
+        if not isinstance(name, str) or not isinstance(item, dict):
+            raise PluginLifecycleError(f"invalid plugin install records: {path}")
+        if set(item) != {"version", "source", "ref", "digest", "publisher"}:
+            raise PluginLifecycleError(f"invalid plugin install record for {name!r}")
+        values = (item["version"], item["source"], item["ref"], item["digest"])
+        if not all(isinstance(value, str) for value in values):
+            raise PluginLifecycleError(f"invalid plugin install record for {name!r}")
+        publisher = item["publisher"]
+        if publisher is not None and not isinstance(publisher, str):
+            raise PluginLifecycleError(f"invalid plugin install record for {name!r}")
+        record = PluginInstallRecord(
+            name=name,
+            version=item["version"],
+            source=item["source"],
+            ref=item["ref"],
+            digest=item["digest"],
+            publisher=publisher,
+        )
+        _validate_plugin_install_record(record)
+        records[name] = record
+    return records
+
+
+def _read_plugin_install_records_at(
+    directory: AnchoredDirectory,
+    root: Path,
+) -> dict[str, PluginInstallRecord]:
+    raw = directory.read_file(
+        PLUGIN_INSTALL_RECORDS_FILENAME,
+        max_bytes=MAX_PLUGIN_INSTALL_RECORDS_BYTES,
+    )
+    if raw is None:
+        return {}
+    return _parse_plugin_install_records(raw, plugin_install_records_path(root))
+
+
+def _save_plugin_install_records_at(
+    directory: AnchoredDirectory,
+    records: dict[str, PluginInstallRecord],
+) -> None:
+    if len(records) > MAX_PLUGIN_INSTALL_RECORDS:
+        raise PluginLifecycleError(
+            f"plugin install records exceed {MAX_PLUGIN_INSTALL_RECORDS} entries"
+        )
+    for name, record in records.items():
+        if name != record.name:
+            raise PluginLifecycleError("plugin install record key does not match name")
+        _validate_plugin_install_record(record)
+    existing = directory.stat(PLUGIN_INSTALL_RECORDS_FILENAME)
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise PluginLifecycleError("plugin install records state is not a regular file")
+    if not records:
+        if existing is not None:
+            directory.unlink(PLUGIN_INSTALL_RECORDS_FILENAME, expected=existing)
+            directory.sync()
+        return
+    payload = {
+        "version": PLUGIN_INSTALL_RECORDS_VERSION,
+        "plugins": {
+            name: {
+                "version": record.version,
+                "source": record.source,
+                "ref": record.ref,
+                "digest": record.digest,
+                "publisher": record.publisher,
+            }
+            for name, record in sorted(records.items())
+        },
+    }
+    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if len(data) > MAX_PLUGIN_INSTALL_RECORDS_BYTES:
+        raise PluginLifecycleError("plugin install records state is too large")
+    temporary = directory.unique_name(
+        f".{PLUGIN_INSTALL_RECORDS_FILENAME}.", ".tmp"
+    )
+    descriptor = -1
+    temporary_identity: os.stat_result | None = None
+    try:
+        descriptor = directory.create_file(temporary, mode=0o600)
+        temporary_identity = os.fstat(descriptor)
+        _write_all(descriptor, data)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        directory.rename(
+            temporary,
+            PLUGIN_INSTALL_RECORDS_FILENAME,
+            expected_source=temporary_identity,
+        )
+        temporary = ""
+        directory.sync()
+    except BaseException as primary:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except BaseException as cleanup:
+                primary.add_note(f"install-record descriptor close failed: {cleanup}")
+            descriptor = -1
+        if temporary:
+            try:
+                directory.unlink(
+                    temporary,
+                    expected=temporary_identity,
+                    missing_ok=True,
+                )
+            except BaseException as cleanup:
+                primary.add_note(f"install-record temporary cleanup failed: {cleanup}")
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _transition_plugin_install_records_at(
+    directory: AnchoredDirectory,
+    before: dict[str, PluginInstallRecord],
+    after: dict[str, PluginInstallRecord],
+) -> None:
+    try:
+        _save_plugin_install_records_at(directory, after)
+    except BaseException as primary:
+        try:
+            _save_plugin_install_records_at(directory, before)
+        except BaseException as cleanup:
+            primary.add_note(f"plugin install record rollback failed: {cleanup}")
+        raise
 
 
 def load_extension_state(path: Path | None = None) -> ExtensionState:
@@ -157,8 +374,11 @@ def install_local_plugin(
     _validator_at: Callable[[PluginSnapshot, PluginManifest], None] | None = None,
     _source_directory: AnchoredDirectory | None = None,
     _snapshot: PluginSnapshot | None = None,
+    _install_record: PluginInstallRecord | None | object = _INSTALL_RECORD_UNCHANGED,
 ) -> InstalledPlugin:
     source_path = source.expanduser()
+    if destination_root is None and _install_record is _INSTALL_RECORD_UNCHANGED:
+        _install_record = None
     _require_anchored_plugin_mutation()
     owns_source_directory = _source_directory is None
     if _source_directory is None:
@@ -203,6 +423,15 @@ def install_local_plugin(
             manifest = _load_manifest_snapshot(snapshot)
             _validate_manifest_snapshot(manifest, snapshot)
             _validate_plugin_name(manifest.name)
+            if isinstance(_install_record, PluginInstallRecord):
+                _validate_plugin_install_record(_install_record)
+                if (
+                    _install_record.name != manifest.name
+                    or _install_record.version != manifest.version
+                ):
+                    raise PluginLifecycleError(
+                        "plugin install record does not match plugin manifest"
+                    )
         except PluginLifecycleError:
             raise
         except (
@@ -222,6 +451,12 @@ def install_local_plugin(
                 AnchoredDirectory.open(root, create=True) as root_directory,
                 root_directory.lock(".ash-lifecycle.lock"),
             ):
+                install_records_before: dict[str, PluginInstallRecord] | None = None
+                if _install_record is not _INSTALL_RECORD_UNCHANGED:
+                    install_records_before = _read_plugin_install_records_at(
+                        root_directory,
+                        root,
+                    )
                 installed_versions = _installed_plugin_versions_at(
                     root_directory,
                     excluding=manifest.name,
@@ -327,6 +562,18 @@ def install_local_plugin(
                         destination_directory,
                         destination,
                     )
+                    if install_records_before is not None:
+                        install_records_after = dict(install_records_before)
+                        if _install_record is None:
+                            install_records_after.pop(manifest.name, None)
+                        else:
+                            assert isinstance(_install_record, PluginInstallRecord)
+                            install_records_after[manifest.name] = _install_record
+                        _transition_plugin_install_records_at(
+                            root_directory,
+                            install_records_before,
+                            install_records_after,
+                        )
                     published = True
                     if destination_moved and backup_name is not None:
                         assert backup_directory is not None
@@ -439,12 +686,22 @@ def uninstall_local_plugin(
         raise PluginLifecycleError("uninstall requires explicit confirmation")
     root = (destination_root or user_plugin_root()).expanduser()
     destination = root / name
+    manage_install_record = destination_root is None
     _require_anchored_plugin_mutation()
     try:
         with (
             AnchoredDirectory.open(root, create=False) as root_directory,
             root_directory.lock(".ash-lifecycle.lock"),
         ):
+            install_records_before: dict[str, PluginInstallRecord] | None = None
+            install_records_after: dict[str, PluginInstallRecord] | None = None
+            if manage_install_record:
+                install_records_before = _read_plugin_install_records_at(
+                    root_directory,
+                    root,
+                )
+                install_records_after = dict(install_records_before)
+                install_records_after.pop(name, None)
             destination_metadata = root_directory.stat(name)
             if destination_metadata is None or not stat.S_ISDIR(
                 destination_metadata.st_mode
@@ -468,6 +725,8 @@ def uninstall_local_plugin(
                     )
                 quarantine_name = root_directory.unique_name(f".{name}.uninstall-")
                 primary: BaseException | None = None
+                record_transitioned = False
+                quarantine_removed = False
                 try:
                     root_directory.rename(
                         name,
@@ -481,23 +740,51 @@ def uninstall_local_plugin(
                         raise AnchoredFilesystemError(
                             "plugin destination changed during uninstall"
                         )
+                    if (
+                        install_records_before is not None
+                        and install_records_after is not None
+                    ):
+                        _transition_plugin_install_records_at(
+                            root_directory,
+                            install_records_before,
+                            install_records_after,
+                        )
+                        record_transitioned = True
                     root_directory.remove_tree(
                         quarantine_name,
                         expected_descriptor=plugin_directory.descriptor,
                     )
+                    quarantine_removed = True
                     root_directory.sync()
                 except BaseException as exc:
                     primary = exc
-                    try:
-                        _restore_moved_entry(
-                            root_directory,
-                            name,
-                            quarantine_name,
-                            conflict_prefix=f".{name}.uninstall-conflict-",
-                            expected_descriptor=plugin_directory.descriptor,
-                        )
-                    except BaseException as cleanup:
-                        primary.add_note(f"uninstall rollback failed: {cleanup}")
+                    if (
+                        record_transitioned
+                        and not quarantine_removed
+                        and install_records_before is not None
+                        and install_records_after is not None
+                    ):
+                        try:
+                            _transition_plugin_install_records_at(
+                                root_directory,
+                                install_records_after,
+                                install_records_before,
+                            )
+                        except BaseException as cleanup:
+                            primary.add_note(
+                                f"install record restoration failed: {cleanup}"
+                            )
+                    if not quarantine_removed:
+                        try:
+                            _restore_moved_entry(
+                                root_directory,
+                                name,
+                                quarantine_name,
+                                conflict_prefix=f".{name}.uninstall-conflict-",
+                                expected_descriptor=plugin_directory.descriptor,
+                            )
+                        except BaseException as cleanup:
+                            primary.add_note(f"uninstall rollback failed: {cleanup}")
                     raise
     except PluginLifecycleError:
         raise
@@ -853,6 +1140,7 @@ def install_git_plugin(
                 "could not clone plugin source"
                 + (f": {detail_text}" if detail_text else "")
             )
+        resolved_digest = _resolve_git_revision(checkout_directory, git_path)
         snapshot = PluginSnapshot.capture(
             checkout_directory,
             max_files=MAX_PLUGIN_FILES,
@@ -871,6 +1159,18 @@ def install_git_plugin(
                 checkout_directory=checkout_directory,
                 snapshot=snapshot,
             )
+        record_manifest = _load_manifest_snapshot(snapshot)
+        _validate_manifest_snapshot(record_manifest, snapshot)
+        install_record: PluginInstallRecord | object = _INSTALL_RECORD_UNCHANGED
+        if destination_root is None:
+            install_record = PluginInstallRecord(
+                name=record_manifest.name,
+                version=record_manifest.version,
+                source=source,
+                ref=ref,
+                digest=resolved_digest,
+                publisher=expected.publisher if expected is not None else None,
+            )
         _remove_git_metadata(checkout_directory)
         return install_local_plugin(
             checkout,
@@ -880,6 +1180,7 @@ def install_git_plugin(
             _validator_at=_validator_at,
             _source_directory=checkout_directory,
             _snapshot=snapshot,
+            _install_record=install_record,
         )
     except BaseException as exc:
         git_primary = exc
@@ -969,6 +1270,27 @@ def _terminate_git_clone(
     plan: ProcessTreePlan,
 ) -> None:
     terminate_process_tree_sync(process, plan=plan, timeout_seconds=1.0)
+
+
+def _resolve_git_revision(directory: AnchoredDirectory, git_path: str) -> str:
+    completed = subprocess.run(
+        [
+            git_path,
+            "-C",
+            str(directory.descriptor_path()),
+            "rev-parse",
+            "HEAD",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        text=True,
+        pass_fds=(directory.descriptor,) if os.name == "posix" else (),
+    )
+    digest = completed.stdout.strip().casefold()
+    if completed.returncode or not _GIT_DIGEST.fullmatch(digest):
+        raise PluginLifecycleError("could not resolve plugin Git revision")
+    return digest
 
 
 def _remove_git_metadata(directory: AnchoredDirectory) -> None:
