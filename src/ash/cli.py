@@ -2486,7 +2486,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     extensions_parser.add_argument("extensions_target", nargs="?")
     extensions_parser.add_argument("--ref")
-    extensions_parser.add_argument("--catalog", type=Path)
+    extensions_parser.add_argument("--catalog")
     extensions_parser.add_argument("--replace", action="store_true")
     extensions_parser.add_argument("--yes", action="store_true")
     extensions_parser.add_argument("--json", action="store_true")

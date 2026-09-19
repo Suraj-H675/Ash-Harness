@@ -563,6 +563,36 @@ async def test_https_catalog_is_cached_and_verified_for_search(
     assert (home / ".ash" / "cache" / "catalogs").is_dir()
 
 
+def test_extensions_cli_preserves_https_catalog_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands import extensions
+
+    catalog_path = _write_signed_catalog(
+        tmp_path,
+        source="https://plugins.example/demo.git",
+        digest="a" * 64,
+    )
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(tmp_path / "keys.json"))
+    requested: list[str] = []
+
+    def fetch(url: str, *, transport=None):
+        assert transport is None
+        requested.append(url)
+        return catalog_path
+
+    monkeypatch.setattr(extensions, "fetch_catalog", fetch)
+    url = "https://catalog.example/ash/plugins.json"
+
+    assert main(["extensions", "search", "demo", "--catalog", url, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert requested == [url]
+    assert payload["plugins"][0]["name"] == "demo"
+
+
 def test_extensions_catalog_search_and_name_install_are_pinned(
     tmp_path: Path,
     monkeypatch,
