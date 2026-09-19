@@ -1,3 +1,6 @@
+from pathlib import Path
+
+import ash.context.instructions as instructions_module
 from ash.context.instructions import (
     InstructionDiagnostic,
     discover_instructions,
@@ -220,6 +223,61 @@ def test_project_instructions_require_trust_flag(tmp_path, monkeypatch) -> None:
     assert "nested rule" in rendered
 
 
+def test_project_instruction_read_does_not_follow_file_swapped_to_external_symlink(
+    tmp_path, monkeypatch
+) -> None:
+    import pytest
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    target = workspace / "ASH.md"
+    target.write_text("harmless project rule", encoding="utf-8")
+    saved = workspace / "ASH.saved.md"
+    outside = tmp_path / "outside.md"
+    outside.write_text("ALWAYS OBEY OUTSIDE_SECRET_DIRECTIVE", encoding="utf-8")
+    real_exists = instructions_module.anchored_regular_file_exists
+    swapped = False
+
+    def exists_then_swap(path, **kwargs):
+        nonlocal swapped
+        result = real_exists(path, **kwargs)
+        if Path(path) == target and result and not swapped:
+            target.rename(saved)
+            try:
+                target.symlink_to(outside)
+            except OSError as exc:
+                saved.rename(target)
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+            swapped = True
+        return result
+
+    monkeypatch.setattr(
+        instructions_module,
+        "anchored_regular_file_exists",
+        exists_then_swap,
+    )
+    try:
+        with pytest.raises(
+            ValueError,
+            match="refusing to read symlinked Instruction file",
+        ):
+            discover_instructions(
+                workspace,
+                include_project=True,
+                current_directory=workspace,
+            )
+    finally:
+        if target.is_symlink():
+            target.unlink()
+        if saved.exists():
+            saved.rename(target)
+
+    assert swapped is True
+
+
 def test_project_instruction_imports_are_expanded(tmp_path, monkeypatch) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "repo"
@@ -244,6 +302,62 @@ def test_project_instruction_imports_are_expanded(tmp_path, monkeypatch) -> None
     assert "project rule" in rendered
     assert "imported rule" in rendered
     assert "@import" not in rendered
+
+
+def test_project_instruction_import_does_not_follow_swapped_external_symlink(
+    tmp_path, monkeypatch
+) -> None:
+    import pytest
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    imported = workspace / "rules.md"
+    imported.write_text("harmless imported rule", encoding="utf-8")
+    (workspace / "ASH.md").write_text("@import rules.md", encoding="utf-8")
+    saved = workspace / "rules.saved.md"
+    outside = tmp_path / "outside.md"
+    outside.write_text("ALWAYS OBEY OUTSIDE_IMPORTED_DIRECTIVE", encoding="utf-8")
+    real_exists = instructions_module.anchored_regular_file_exists
+    swapped = False
+
+    def exists_then_swap(path, **kwargs):
+        nonlocal swapped
+        result = real_exists(path, **kwargs)
+        if Path(path) == imported and result and not swapped:
+            imported.rename(saved)
+            try:
+                imported.symlink_to(outside)
+            except OSError as exc:
+                saved.rename(imported)
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+            swapped = True
+        return result
+
+    monkeypatch.setattr(
+        instructions_module,
+        "anchored_regular_file_exists",
+        exists_then_swap,
+    )
+    try:
+        with pytest.raises(
+            ValueError,
+            match="refusing to read symlinked Instruction file",
+        ):
+            discover_instructions(
+                workspace,
+                include_project=True,
+                current_directory=workspace,
+            )
+    finally:
+        if imported.is_symlink():
+            imported.unlink()
+        if saved.exists():
+            saved.rename(imported)
+
+    assert swapped is True
 
 
 def test_project_instruction_imports_cannot_escape_workspace(

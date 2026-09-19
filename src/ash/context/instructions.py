@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import shlex
 
+from ash.safe_io import anchored_regular_file_exists, read_bounded_open_file
+
 
 MAX_INSTRUCTION_FILE_BYTES = 128 * 1024
 MAX_INSTRUCTION_IMPORT_DEPTH = 5
@@ -164,7 +166,7 @@ def _read_with_imports(
         return []
 
     seen.add(resolved)
-    instruction = _read(resolved, scope)
+    instruction = _read(resolved, scope, root=root)
     if instruction is None:
         if depth > 0:
             _diagnose(diagnostics, path, "instruction import file does not exist")
@@ -192,11 +194,26 @@ def _read_with_imports(
     return files
 
 
-def _read(path: Path, scope: str) -> InstructionFile | None:
-    if not path.is_file():
+def _read(path: Path, scope: str, *, root: Path) -> InstructionFile | None:
+    if not anchored_regular_file_exists(
+        path,
+        trusted_root=root,
+        label="instruction file",
+    ):
         return None
-    with path.open("rb") as handle:
-        raw = handle.read(MAX_INSTRUCTION_FILE_BYTES + 1)
+    try:
+        raw = read_bounded_open_file(
+            path,
+            MAX_INSTRUCTION_FILE_BYTES,
+            trusted_root=root,
+            label="Instruction file",
+        )
+    except ValueError as exc:
+        if str(exc).startswith("Instruction file exceeds "):
+            raise ValueError(
+                f"Instruction file is too large (>{MAX_INSTRUCTION_FILE_BYTES} bytes): {path}"
+            ) from exc
+        raise
     if len(raw) > MAX_INSTRUCTION_FILE_BYTES:
         raise ValueError(
             f"Instruction file is too large (>{MAX_INSTRUCTION_FILE_BYTES} bytes): {path}"
