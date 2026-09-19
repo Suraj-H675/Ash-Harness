@@ -3738,11 +3738,15 @@ class AshLoop:
         """Switch to a different provider and model. Rebuilds provider instance."""
         from ash.cli import _build_provider  # lazy import to avoid circular
 
+        async def _close_old_provider(provider: ProviderABC) -> None:
+            await provider.aclose()
+
         if self._config is None:
             raise RuntimeError("AshLoop was not constructed with a config object")
 
         model_str = f"{provider}/{model}"
         new_config = self._config.model_copy(update={"model": model_str})
+        old_provider = self.provider
         self.provider = _build_provider(new_config)
         self._config = new_config
         self._provider_circuit_key = _provider_circuit_key(self.provider)
@@ -3757,6 +3761,8 @@ class AshLoop:
                 tools_provider=lambda: list(registry.as_dict().values()),
                 root_provider=lambda: self.project_root,
             )
+        if isinstance(old_provider, ProviderABC):
+            asyncio.create_task(_close_old_provider(old_provider))
 
     def switch_model(self, model: str) -> None:
         """Switch to a model string. If model contains '/', treat as provider/model.

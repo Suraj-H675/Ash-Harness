@@ -1912,6 +1912,41 @@ async def test_switch_model_closes_previous_provider(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_switch_provider_closes_previous_provider(tmp_path):
+    closed = []
+
+    class ClosableProvider(MockProvider):
+        async def aclose(self):
+            closed.append(True)
+            await super().aclose()
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "provider-switch.db"),
+        ClosableProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="ollama/test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+        ),
+    )
+    await loop.start_session()
+    old_provider = loop.provider
+
+    with patch("ash.cli._build_provider") as build_provider:
+        build_provider.return_value = MockProvider()
+        loop.switch_provider("openai", "next")
+
+    assert loop.provider is not old_provider
+    await asyncio.sleep(0)
+    assert closed == [True]
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
     store = SessionStore(tmp_path / "cache-usage.db")
     ui = EventUI()
