@@ -325,11 +325,17 @@ Ash is extensible without changing the core runtime:
   publisher drift fails closed, and explicit `--catalog` still overrides the
   saved registry;
 - managed Git/catalog installs persist Ash-owned source, ref, resolved commit,
-  version, and signed publisher provenance transactionally with plugin
-  replacement/uninstall; local replacements clear stale remote provenance;
+  version, signed publisher, and source-origin provenance transactionally with
+  plugin replacement/uninstall; local replacements clear stale remote
+  provenance;
+- `ash extensions update NAME` and `/plugins update NAME` update one tracked
+  plugin through that provenance: direct Git refs use resolved-commit no-op
+  detection, catalog installs are re-resolved through the currently verified
+  signed catalog/marketplace source, changed candidates reuse atomic replacement,
+  disabled state is preserved, and ambiguous legacy provenance fails closed;
 - validation for traversal, links, malformed manifests, oversized components,
   missing dependencies, and unsafe replacements;
-- enable, disable, uninstall, inventory, search, and atomic live reload;
+- update, enable, disable, uninstall, inventory, search, and atomic live reload;
 - isolated versioned JSON-RPC stdio for executable plugins;
 - lazy plugin startup with no ambient secrets or network access;
 - ordinary approval, audit, hook, sandbox, and dry-run policy around plugins;

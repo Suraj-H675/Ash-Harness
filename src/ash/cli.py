@@ -1290,9 +1290,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 continue
             if command.name == "plugins":
                 from ash.commands.extensions import (
+                    CatalogSelection,
                     PluginAction,
                     manage_local_plugin,
                     render_plugin_action,
+                    update_local_plugin,
                 )
                 from ash.plugins.lifecycle import PluginLifecycleError
                 from ash.plugins.lifecycle import load_extension_state
@@ -1302,7 +1304,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
                 if arguments:
                     action = arguments[0]
-                    if action not in {"install", "enable", "disable", "uninstall"}:
+                    if action not in {
+                        "install",
+                        "update",
+                        "enable",
+                        "disable",
+                        "uninstall",
+                    }:
                         print(f"Usage: {command.usage}", file=sys.stderr)
                         continue
                     positional = [
@@ -1315,7 +1323,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         and (index := arguments.index("--ref")) + 1 < len(arguments)
                         else None
                     )
-                    catalog = default_catalog_path()
+                    catalog: CatalogSelection = default_catalog_path()
+                    if action in {"install", "update"} and catalog is None:
+                        from ash.commands.marketplace import registered_marketplaces
+
+                        marketplaces = registered_marketplaces()
+                        if marketplaces:
+                            catalog = marketplaces
                     allowed_flags = (
                         {"--replace", "--ref"}
                         if action == "install"
@@ -1327,23 +1341,35 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         print(f"Usage: {command.usage}", file=sys.stderr)
                         continue
                     try:
-                        plugin_result = manage_local_plugin(
-                            cast(PluginAction, action),
-                            positional[0],
-                            replace="--replace" in flags,
-                            confirmed="--yes" in flags,
-                            git_ref=ref,
-                            catalog=catalog,
+                        if action == "update":
+                            plugin_result = update_local_plugin(
+                                positional[0],
+                                catalog=catalog,
+                            )
+                        else:
+                            plugin_result = manage_local_plugin(
+                                cast(PluginAction, action),
+                                positional[0],
+                                replace="--replace" in flags,
+                                confirmed="--yes" in flags,
+                                git_ref=ref,
+                                catalog=catalog,
+                            )
+                        reload_result = (
+                            await reload_plugin_components()
+                            if action != "update"
+                            or plugin_result.get("status") == "updated"
+                            else None
                         )
-                        reload_result = await reload_plugin_components()
                     except (OSError, PluginLifecycleError, ValueError) as exc:
                         print(
                             f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
                         )
                         continue
                     print(render_plugin_action(plugin_result, json_output=False))
-                    print(reload_result.summary)
-                    _print_mcp_reload_errors(reload_result.mcp_errors)
+                    if reload_result is not None:
+                        print(reload_result.summary)
+                        _print_mcp_reload_errors(reload_result.mcp_errors)
                     continue
 
                 roots = [(Path.home() / ".ash" / "plugins", "user")]
@@ -2500,6 +2526,7 @@ def main(argv: list[str] | None = None) -> int:
             "hooks",
             "search",
             "install",
+            "update",
             "enable",
             "disable",
             "uninstall",
@@ -3903,13 +3930,14 @@ def main(argv: list[str] | None = None) -> int:
             search_catalog_plugins,
             discover_extensions,
             manage_local_plugin,
+            update_local_plugin,
             render_extension_inventory,
             render_plugin_action,
         )
         from ash.plugins.lifecycle import PluginLifecycleError
 
         action = args.extensions_action
-        if action in {"search", "install", "enable", "disable", "uninstall"}:
+        if action in {"search", "install", "update", "enable", "disable", "uninstall"}:
             if not args.extensions_target and action != "search":
                 print(
                     f"Error: `ash extensions {action}` requires a target",
@@ -3919,9 +3947,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.replace and action != "install":
                 print("Error: --replace is only valid with install", file=sys.stderr)
                 return 2
-            if args.catalog and action not in {"search", "install"}:
+            if args.ref and action == "update":
+                print("Error: --ref is only valid with install", file=sys.stderr)
+                return 2
+            if args.catalog and action not in {"search", "install", "update"}:
                 print(
-                    "Error: --catalog is only valid with search or install",
+                    "Error: --catalog is only valid with search, install, or update",
                     file=sys.stderr,
                 )
                 return 2
@@ -3930,7 +3961,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             try:
                 catalog_selection = args.catalog
-                if action in {"search", "install"} and not catalog_selection:
+                if action in {"search", "install", "update"} and not catalog_selection:
                     from ash.commands.marketplace import registered_marketplaces
 
                     configured_marketplaces = registered_marketplaces()
@@ -3948,6 +3979,12 @@ def main(argv: list[str] | None = None) -> int:
                             json_output=args.json,
                         )
                     )
+                elif action == "update":
+                    result = update_local_plugin(
+                        args.extensions_target,
+                        catalog=catalog_selection,
+                    )
+                    print(render_plugin_action(result, json_output=args.json))
                 else:
                     result = manage_local_plugin(
                         action,

@@ -36,10 +36,14 @@ from ash.plugins.catalog import (
 )
 from ash.plugins.manifest import PluginManifest, namespaced_plugin_tool_name
 from ash.plugins.lifecycle import (
+    InstalledPlugin,
+    PluginInstallRecord,
     PluginLifecycleError,
     install_git_plugin,
     install_local_plugin,
     load_extension_state,
+    load_plugin_install_records,
+    require_plugin_install_record_current,
     set_plugin_enabled,
     uninstall_local_plugin,
     user_plugin_root,
@@ -73,6 +77,7 @@ ExtensionAction = Literal[
     "hooks",
     "search",
     "install",
+    "update",
     "enable",
     "disable",
     "uninstall",
@@ -713,6 +718,150 @@ def manage_local_plugin(
     }
 
 
+def update_local_plugin(
+    target: str,
+    *,
+    catalog: CatalogSelection = None,
+) -> dict[str, Any]:
+    """Update one managed Git/catalog plugin from its persisted provenance."""
+
+    plugin = _installed_user_plugin(target)
+    _validate_plugin_contents(plugin.root, plugin.manifest)
+    records = load_plugin_install_records()
+    record = records.get(target)
+    if record is None:
+        raise PluginLifecycleError(
+            f"plugin {target!r} is not tracked for updates; reinstall it from Git "
+            "or a signed catalog"
+        )
+    if record.version != plugin.manifest.version:
+        raise PluginLifecycleError(
+            f"tracked install metadata for {target!r} does not match installed "
+            "plugin version; reinstall it before updating"
+        )
+
+    state = load_extension_state()
+
+    def validate_update(root: Path, manifest: PluginManifest) -> None:
+        if manifest.name != target:
+            raise PluginLifecycleError(
+                f"updated plugin manifest {manifest.name!r} does not match "
+                f"tracked plugin {target!r}"
+            )
+        _require_enabled_dependencies(manifest, state.disabled_plugins)
+        _validate_plugin_contents(root, manifest)
+
+    def validate_update_at(
+        snapshot: PluginSnapshot,
+        manifest: PluginManifest,
+    ) -> None:
+        if manifest.name != target:
+            raise PluginLifecycleError(
+                f"updated plugin manifest {manifest.name!r} does not match "
+                f"tracked plugin {target!r}"
+            )
+        _require_enabled_dependencies(manifest, state.disabled_plugins)
+        _validate_plugin_contents_at(snapshot, manifest)
+
+    if record.origin == "legacy-unknown":
+        raise PluginLifecycleError(
+            f"plugin {target!r} uses legacy install provenance whose original trust "
+            "source cannot be determined; reinstall it before updating"
+        )
+
+    if record.origin == "catalog":
+        catalog_name = (
+            f"@{record.publisher}/{target}"
+            if record.publisher is not None
+            else target
+        )
+        expected = catalog_entry_for_name(
+            catalog_name,
+            catalog=catalog,
+        )
+        unchanged = (
+            expected.name == record.name
+            and expected.version == record.version
+            and expected.source == record.source
+            and expected.ref == record.ref
+            and expected.digest == record.digest
+            and expected.publisher == record.publisher
+        )
+        if unchanged:
+            require_plugin_install_record_current(record)
+            return _plugin_update_result(
+                target,
+                plugin.root,
+                before=record,
+                after=record,
+                status="unchanged",
+            )
+        install_git_plugin(
+            expected.source,
+            ref=expected.ref,
+            replace=True,
+            validator=validate_update,
+            _validator_at=validate_update_at,
+            expected=expected,
+            _expected_previous_record=record,
+        )
+    else:
+        install_git_plugin(
+            record.source,
+            ref=record.ref,
+            replace=True,
+            validator=validate_update,
+            _validator_at=validate_update_at,
+            _skip_if_digest=record.digest,
+            _unchanged=InstalledPlugin(
+                plugin.manifest.name,
+                plugin.manifest.version,
+                plugin.root,
+            ),
+            _expected_previous_record=record,
+        )
+
+    updated_records = load_plugin_install_records()
+    after = updated_records.get(target)
+    if after is None:
+        raise PluginLifecycleError(
+            f"plugin {target!r} update completed without install provenance"
+        )
+    status: Literal["updated", "unchanged"] = (
+        "unchanged" if after.digest == record.digest else "updated"
+    )
+    return _plugin_update_result(
+        target,
+        plugin.root,
+        before=record,
+        after=after,
+        status=status,
+    )
+
+
+def _plugin_update_result(
+    name: str,
+    root: Path,
+    *,
+    before: PluginInstallRecord,
+    after: PluginInstallRecord,
+    status: Literal["updated", "unchanged"],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "action": "update",
+        "name": name,
+        "status": status,
+        "previous_version": before.version,
+        "version": after.version,
+        "previous_digest": before.digest,
+        "digest": after.digest,
+        "root": str(root),
+    }
+    if after.publisher is not None:
+        result["publisher"] = after.publisher
+    return result
+
+
 def render_plugin_action(result: dict[str, Any], *, json_output: bool) -> str:
     if json_output:
         return json.dumps(result, sort_keys=True)
@@ -720,6 +869,13 @@ def render_plugin_action(result: dict[str, Any], *, json_output: bool) -> str:
     name = str(result["name"])
     if action == "install":
         return f"Installed and enabled {name} {result['version']} at {result['root']}"
+    if action == "update":
+        if result["status"] == "unchanged":
+            return f"{name} {result['version']} is already up to date"
+        return (
+            f"Updated {name} {result['previous_version']} -> {result['version']} "
+            f"at {result['root']}"
+        )
     if action == "uninstall":
         return f"Uninstalled {name} from {result['root']}"
     return f"{action.capitalize()}d {name}"

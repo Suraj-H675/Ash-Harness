@@ -13,7 +13,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from packaging.version import InvalidVersion, parse as parse_version
 
@@ -52,7 +52,7 @@ MAX_EXTENSION_STATE_BYTES = 256 * 1024
 STATE_VERSION = 1
 MAX_PLUGIN_INSTALL_RECORDS_BYTES = 512 * 1024
 MAX_PLUGIN_INSTALL_RECORDS = 10_000
-PLUGIN_INSTALL_RECORDS_VERSION = 1
+PLUGIN_INSTALL_RECORDS_VERSION = 2
 PLUGIN_INSTALL_RECORDS_FILENAME = ".ash-install-records.json"
 MAX_GIT_CLONE_BYTES = MAX_PLUGIN_BYTES
 MAX_GIT_CLONE_SECONDS = 300
@@ -86,6 +86,7 @@ class PluginInstallRecord:
     ref: str
     digest: str
     publisher: str | None = None
+    origin: Literal["git", "catalog", "legacy-unknown"] = "legacy-unknown"
 
 
 def user_plugin_root() -> Path:
@@ -122,6 +123,31 @@ def load_plugin_install_records(
         directory.close()
 
 
+def require_plugin_install_record_current(record: PluginInstallRecord) -> None:
+    """Fail if one managed plugin's provenance changed since it was read."""
+
+    root = user_plugin_root().expanduser()
+    _require_anchored_plugin_mutation()
+    try:
+        with (
+            AnchoredDirectory.open(root, create=False) as directory,
+            directory.lock(".ash-lifecycle.lock"),
+        ):
+            current = _read_plugin_install_records_at(directory, root).get(record.name)
+            if current != record:
+                raise PluginLifecycleError(
+                    f"plugin {record.name!r} changed while update was in progress"
+                )
+    except FileNotFoundError as exc:
+        raise PluginLifecycleError(
+            f"plugin {record.name!r} changed while update was in progress"
+        ) from exc
+    except PluginLifecycleError:
+        raise
+    except (AnchoredFilesystemError, OSError) as exc:
+        raise _lifecycle_error("plugin install records", exc) from exc
+
+
 def _validate_plugin_install_record(record: PluginInstallRecord) -> None:
     _validate_plugin_name(record.name)
     try:
@@ -145,6 +171,12 @@ def _validate_plugin_install_record(record: PluginInstallRecord) -> None:
             validate_catalog_publisher(record.publisher)
         except PluginCatalogError as exc:
             raise PluginLifecycleError("plugin install record publisher is invalid") from exc
+    if record.origin not in {"git", "catalog", "legacy-unknown"}:
+        raise PluginLifecycleError("plugin install record origin is invalid")
+    if record.origin != "catalog" and record.publisher is not None:
+        raise PluginLifecycleError(
+            "plugin install record publisher requires catalog origin"
+        )
 
 
 def _parse_plugin_install_records(
@@ -159,7 +191,8 @@ def _parse_plugin_install_records(
         ) from exc
     if not isinstance(payload, dict) or set(payload) != {"version", "plugins"}:
         raise PluginLifecycleError(f"invalid plugin install records: {path}")
-    if payload["version"] != PLUGIN_INSTALL_RECORDS_VERSION:
+    version = payload["version"]
+    if version not in {1, PLUGIN_INSTALL_RECORDS_VERSION}:
         raise PluginLifecycleError(f"invalid plugin install records: {path}")
     plugins = payload["plugins"]
     if not isinstance(plugins, dict) or len(plugins) > MAX_PLUGIN_INSTALL_RECORDS:
@@ -168,7 +201,10 @@ def _parse_plugin_install_records(
     for name, item in plugins.items():
         if not isinstance(name, str) or not isinstance(item, dict):
             raise PluginLifecycleError(f"invalid plugin install records: {path}")
-        if set(item) != {"version", "source", "ref", "digest", "publisher"}:
+        expected_keys = {"version", "source", "ref", "digest", "publisher"}
+        if version == PLUGIN_INSTALL_RECORDS_VERSION:
+            expected_keys.add("origin")
+        if set(item) != expected_keys:
             raise PluginLifecycleError(f"invalid plugin install record for {name!r}")
         values = (item["version"], item["source"], item["ref"], item["digest"])
         if not all(isinstance(value, str) for value in values):
@@ -176,6 +212,21 @@ def _parse_plugin_install_records(
         publisher = item["publisher"]
         if publisher is not None and not isinstance(publisher, str):
             raise PluginLifecycleError(f"invalid plugin install record for {name!r}")
+        origin: Literal["git", "catalog", "legacy-unknown"]
+        if version == 1:
+            origin = "catalog" if publisher is not None else "legacy-unknown"
+        else:
+            raw_origin = item["origin"]
+            if not isinstance(raw_origin, str):
+                raise PluginLifecycleError(f"invalid plugin install record for {name!r}")
+            if raw_origin == "git":
+                origin = "git"
+            elif raw_origin == "catalog":
+                origin = "catalog"
+            elif raw_origin == "legacy-unknown":
+                origin = "legacy-unknown"
+            else:
+                raise PluginLifecycleError(f"invalid plugin install record for {name!r}")
         record = PluginInstallRecord(
             name=name,
             version=item["version"],
@@ -183,6 +234,7 @@ def _parse_plugin_install_records(
             ref=item["ref"],
             digest=item["digest"],
             publisher=publisher,
+            origin=origin,
         )
         _validate_plugin_install_record(record)
         records[name] = record
@@ -231,6 +283,7 @@ def _save_plugin_install_records_at(
                 "ref": record.ref,
                 "digest": record.digest,
                 "publisher": record.publisher,
+                "origin": record.origin,
             }
             for name, record in sorted(records.items())
         },
@@ -375,6 +428,7 @@ def install_local_plugin(
     _source_directory: AnchoredDirectory | None = None,
     _snapshot: PluginSnapshot | None = None,
     _install_record: PluginInstallRecord | None | object = _INSTALL_RECORD_UNCHANGED,
+    _expected_install_record: PluginInstallRecord | object = _INSTALL_RECORD_UNCHANGED,
 ) -> InstalledPlugin:
     source_path = source.expanduser()
     if destination_root is None and _install_record is _INSTALL_RECORD_UNCHANGED:
@@ -452,11 +506,24 @@ def install_local_plugin(
                 root_directory.lock(".ash-lifecycle.lock"),
             ):
                 install_records_before: dict[str, PluginInstallRecord] | None = None
-                if _install_record is not _INSTALL_RECORD_UNCHANGED:
+                if (
+                    _install_record is not _INSTALL_RECORD_UNCHANGED
+                    or _expected_install_record is not _INSTALL_RECORD_UNCHANGED
+                ):
                     install_records_before = _read_plugin_install_records_at(
                         root_directory,
                         root,
                     )
+                if isinstance(_expected_install_record, PluginInstallRecord):
+                    assert install_records_before is not None
+                    if (
+                        install_records_before.get(_expected_install_record.name)
+                        != _expected_install_record
+                    ):
+                        raise PluginLifecycleError(
+                            f"plugin {_expected_install_record.name!r} changed while "
+                            "update was in progress"
+                        )
                 installed_versions = _installed_plugin_versions_at(
                     root_directory,
                     excluding=manifest.name,
@@ -998,6 +1065,9 @@ def install_git_plugin(
     validator: Callable[[Path, PluginManifest], None] | None = None,
     _validator_at: Callable[[PluginSnapshot, PluginManifest], None] | None = None,
     expected: CatalogEntry | None = None,
+    _skip_if_digest: str | None = None,
+    _unchanged: InstalledPlugin | None = None,
+    _expected_previous_record: PluginInstallRecord | None = None,
 ) -> InstalledPlugin:
     _require_anchored_plugin_mutation()
     parsed = urllib.parse.urlsplit(source)
@@ -1024,6 +1094,13 @@ def install_git_plugin(
         raise PluginLifecycleError("plugin Git reference is invalid")
     if len(source) > 2048:
         raise PluginLifecycleError("plugin Git source URL is too long")
+    if _skip_if_digest is not None:
+        if expected is not None:
+            raise PluginLifecycleError(
+                "digest-based update no-op cannot bypass signed catalog verification"
+            )
+        if not _GIT_DIGEST.fullmatch(_skip_if_digest) or _unchanged is None:
+            raise PluginLifecycleError("invalid tracked plugin update digest")
 
     workspace = Path.cwd().resolve()
     git_path = resolve_host_executable("git", workspace_root=workspace, cwd=workspace)
@@ -1141,6 +1218,11 @@ def install_git_plugin(
                 + (f": {detail_text}" if detail_text else "")
             )
         resolved_digest = _resolve_git_revision(checkout_directory, git_path)
+        if _skip_if_digest == resolved_digest:
+            assert _unchanged is not None
+            if _expected_previous_record is not None:
+                require_plugin_install_record_current(_expected_previous_record)
+            return _unchanged
         snapshot = PluginSnapshot.capture(
             checkout_directory,
             max_files=MAX_PLUGIN_FILES,
@@ -1170,6 +1252,7 @@ def install_git_plugin(
                 ref=ref,
                 digest=resolved_digest,
                 publisher=expected.publisher if expected is not None else None,
+                origin="catalog" if expected is not None else "git",
             )
         _remove_git_metadata(checkout_directory)
         return install_local_plugin(
@@ -1181,6 +1264,11 @@ def install_git_plugin(
             _source_directory=checkout_directory,
             _snapshot=snapshot,
             _install_record=install_record,
+            _expected_install_record=(
+                _expected_previous_record
+                if _expected_previous_record is not None
+                else _INSTALL_RECORD_UNCHANGED
+            ),
         )
     except BaseException as exc:
         git_primary = exc

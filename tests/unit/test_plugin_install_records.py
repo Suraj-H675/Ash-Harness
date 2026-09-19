@@ -84,6 +84,7 @@ def test_managed_git_install_persists_exact_provenance(
     assert records["demo"].ref == "v1.0.0"
     assert records["demo"].digest == digest
     assert records["demo"].publisher is None
+    assert records["demo"].origin == "git"
 
 
 def test_managed_git_install_preserves_existing_long_version_compatibility(
@@ -118,6 +119,29 @@ def test_managed_catalog_install_persists_signed_publisher(
     install_git_plugin(source, ref="v1.0.0", expected=expected)
 
     assert load_plugin_install_records()["demo"].publisher == "alpha"
+    assert load_plugin_install_records()["demo"].origin == "catalog"
+
+
+def test_publisherless_catalog_install_is_still_tracked_as_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolated_home(tmp_path, monkeypatch)
+    source, digest = _git_plugin(tmp_path / "repo")
+    expected = CatalogEntry(
+        name="demo",
+        version="1.0.0",
+        source=source,
+        ref="v1.0.0",
+        digest=digest,
+        publisher=None,
+    )
+
+    install_git_plugin(source, ref="v1.0.0", expected=expected)
+
+    record = load_plugin_install_records()["demo"]
+    assert record.publisher is None
+    assert record.origin == "catalog"
 
 
 def test_install_record_updates_preserve_other_managed_plugins(
@@ -298,7 +322,7 @@ def test_install_records_reject_symlinked_state_file(
 @pytest.mark.parametrize(
     "payload",
     [
-        {"version": 2, "plugins": {}},
+        {"version": 999, "plugins": {}},
         {"version": 1, "plugins": {"../escape": {}}},
         {
             "version": 1,
@@ -328,3 +352,40 @@ def test_install_records_reject_malformed_or_tampered_state(
 
     with pytest.raises(PluginLifecycleError, match="install record"):
         load_plugin_install_records()
+
+
+def test_v1_install_records_migrate_origin_conservatively(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolated_home(tmp_path, monkeypatch)
+    root = lifecycle.user_plugin_root()
+    root.mkdir(parents=True)
+    digest = "a" * 40
+    payload = {
+        "version": 1,
+        "plugins": {
+            "direct": {
+                "version": "1.0.0",
+                "source": "https://plugins.example/direct.git",
+                "ref": "main",
+                "digest": digest,
+                "publisher": None,
+            },
+            "signed": {
+                "version": "1.0.0",
+                "source": "https://plugins.example/signed.git",
+                "ref": "v1.0.0",
+                "digest": digest,
+                "publisher": "alpha",
+            },
+        },
+    }
+    (root / lifecycle.PLUGIN_INSTALL_RECORDS_FILENAME).write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    records = load_plugin_install_records()
+
+    assert records["direct"].origin == "legacy-unknown"
+    assert records["signed"].origin == "catalog"
