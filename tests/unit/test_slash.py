@@ -34,6 +34,7 @@ def test_help_lists_core_session_commands() -> None:
     assert "/hooks" in rendered
     assert "/reload-plugins" in rendered
     assert "update NAME" in rendered
+    assert "update --all" in rendered
     assert "/help [query]" in rendered
     assert "aliases: /clear" in rendered
     assert "/capabilities [--refresh]" in rendered

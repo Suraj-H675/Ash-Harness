@@ -1294,6 +1294,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     PluginAction,
                     manage_local_plugin,
                     render_plugin_action,
+                    render_plugin_update_all,
+                    update_all_local_plugins,
                     update_local_plugin,
                 )
                 from ash.plugins.lifecycle import PluginLifecycleError
@@ -1333,18 +1335,29 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     allowed_flags = (
                         {"--replace", "--ref"}
                         if action == "install"
+                        else {"--all"}
+                        if action == "update"
                         else {"--yes"}
                         if action == "uninstall"
                         else set()
                     )
-                    if len(positional) != 1 or not flags <= allowed_flags:
+                    update_all = action == "update" and "--all" in flags
+                    expected_positionals = 0 if update_all else 1
+                    if (
+                        len(positional) != expected_positionals
+                        or not flags <= allowed_flags
+                    ):
                         print(f"Usage: {command.usage}", file=sys.stderr)
                         continue
                     try:
                         if action == "update":
-                            plugin_result = update_local_plugin(
-                                positional[0],
-                                catalog=catalog,
+                            plugin_result = (
+                                update_all_local_plugins(catalog=catalog)
+                                if update_all
+                                else update_local_plugin(
+                                    positional[0],
+                                    catalog=catalog,
+                                )
                             )
                         else:
                             plugin_result = manage_local_plugin(
@@ -1359,6 +1372,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             await reload_plugin_components()
                             if action != "update"
                             or plugin_result.get("status") == "updated"
+                            or plugin_result.get("updated", 0) > 0
                             else None
                         )
                     except (OSError, PluginLifecycleError, ValueError) as exc:
@@ -1366,7 +1380,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
                         )
                         continue
-                    print(render_plugin_action(plugin_result, json_output=False))
+                    print(
+                        render_plugin_update_all(plugin_result, json_output=False)
+                        if update_all
+                        else render_plugin_action(plugin_result, json_output=False)
+                    )
                     if reload_result is not None:
                         print(reload_result.summary)
                         _print_mcp_reload_errors(reload_result.mcp_errors)
@@ -2545,6 +2563,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     extensions_parser.add_argument("--replace", action="store_true")
     extensions_parser.add_argument("--yes", action="store_true")
+    extensions_parser.add_argument(
+        "--all",
+        dest="extensions_all",
+        action="store_true",
+        help="Update every tracked plugin when used with `extensions update`",
+    )
     extensions_parser.add_argument("--json", action="store_true")
     agents_parser = subparsers.add_parser(
         "agents", help="Inspect persisted subagent status and reports"
@@ -3930,6 +3954,8 @@ def main(argv: list[str] | None = None) -> int:
             search_catalog_plugins,
             discover_extensions,
             manage_local_plugin,
+            render_plugin_update_all,
+            update_all_local_plugins,
             update_local_plugin,
             render_extension_inventory,
             render_plugin_action,
@@ -3938,7 +3964,20 @@ def main(argv: list[str] | None = None) -> int:
 
         action = args.extensions_action
         if action in {"search", "install", "update", "enable", "disable", "uninstall"}:
-            if not args.extensions_target and action != "search":
+            if args.extensions_all and action != "update":
+                print("Error: --all is only valid with update", file=sys.stderr)
+                return 2
+            if action == "update" and args.extensions_all and args.extensions_target:
+                print(
+                    "Error: update accepts a target or --all, not both",
+                    file=sys.stderr,
+                )
+                return 2
+            if (
+                not args.extensions_target
+                and action != "search"
+                and not (action == "update" and args.extensions_all)
+            ):
                 print(
                     f"Error: `ash extensions {action}` requires a target",
                     file=sys.stderr,
@@ -3980,11 +4019,17 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     )
                 elif action == "update":
-                    result = update_local_plugin(
-                        args.extensions_target,
-                        catalog=catalog_selection,
-                    )
-                    print(render_plugin_action(result, json_output=args.json))
+                    if args.extensions_all:
+                        result = update_all_local_plugins(catalog=catalog_selection)
+                        print(render_plugin_update_all(result, json_output=args.json))
+                        if result["errors"]:
+                            return 1
+                    else:
+                        result = update_local_plugin(
+                            args.extensions_target,
+                            catalog=catalog_selection,
+                        )
+                        print(render_plugin_action(result, json_output=args.json))
                 else:
                     result = manage_local_plugin(
                         action,
@@ -4003,6 +4048,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.extensions_target
                 or args.replace
                 or args.yes
+                or args.extensions_all
                 or args.ref
                 or args.catalog
             ):

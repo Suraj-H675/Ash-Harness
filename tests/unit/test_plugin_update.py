@@ -67,6 +67,7 @@ def _commit_plugin(
 def _git_plugin(
     root: Path,
     *,
+    name: str = "demo",
     version: str = "1.0.0",
     tag: str | None = None,
 ) -> tuple[str, str, str]:
@@ -74,7 +75,7 @@ def _git_plugin(
         pytest.skip("git is unavailable")
     root.mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(root)], check=True)
-    digest = _commit_plugin(root, version=version, tag=tag)
+    digest = _commit_plugin(root, name=name, version=version, tag=tag)
     branch = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
         check=True,
@@ -797,3 +798,146 @@ def test_extensions_update_rejects_install_only_flags(capsys) -> None:
     assert "--replace" in capsys.readouterr().err
     assert main(["extensions", "update", "demo", "--ref", "main"]) == 2
     assert "--ref" in capsys.readouterr().err
+
+
+def test_extensions_update_all_empty_is_successful_noop(
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["extensions", "update", "--all", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload == {
+        "action": "update-all",
+        "errors": 0,
+        "results": [],
+        "unchanged": 0,
+        "updated": 0,
+    }
+
+
+def test_extensions_update_all_empty_human_summary(
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["extensions", "update", "--all"]) == 0
+    output = capsys.readouterr().out
+
+    assert "No tracked plugins to update." in output
+    assert "0 updated, 0 unchanged, 0 failed" in output
+
+
+def test_bulk_update_human_errors_are_terminal_safe() -> None:
+    rendered = extension_commands.render_plugin_update_all(
+        {
+            "action": "update-all",
+            "updated": 0,
+            "unchanged": 0,
+            "errors": 1,
+            "results": [
+                {
+                    "action": "update",
+                    "name": "demo",
+                    "status": "error",
+                    "error": "bad\x1b]8;;https://evil.example\x07link\x1b]8;;\x07",
+                }
+            ],
+        },
+        json_output=False,
+    )
+
+    assert "\x1b" not in rendered
+    assert "Failed to update demo:" in rendered
+
+
+def test_extensions_update_all_is_deterministic_and_reports_each_outcome(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    beta_source, beta_branch, beta_digest = _git_plugin(
+        tmp_path / "beta-repo", name="beta"
+    )
+    alpha_source, alpha_branch, alpha_digest = _git_plugin(
+        tmp_path / "alpha-repo", name="alpha"
+    )
+    install_git_plugin(beta_source, ref=beta_branch)
+    install_git_plugin(alpha_source, ref=alpha_branch)
+    alpha_new_digest = _commit_plugin(
+        tmp_path / "alpha-repo", name="alpha", version="2.0.0"
+    )
+
+    assert main(["extensions", "update", "--all", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert [item["name"] for item in payload["results"]] == ["alpha", "beta"]
+    assert [item["status"] for item in payload["results"]] == [
+        "updated",
+        "unchanged",
+    ]
+    assert payload["updated"] == 1
+    assert payload["unchanged"] == 1
+    assert payload["errors"] == 0
+    records = load_plugin_install_records()
+    assert records["alpha"].digest == alpha_new_digest
+    assert records["beta"].digest == beta_digest
+    assert alpha_new_digest != alpha_digest
+
+
+def test_extensions_update_all_continues_after_error_and_returns_failure(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    alpha_source, alpha_branch, _ = _git_plugin(
+        tmp_path / "alpha-repo", name="alpha"
+    )
+    beta_source, beta_branch, _ = _git_plugin(
+        tmp_path / "beta-repo", name="beta"
+    )
+    install_git_plugin(alpha_source, ref=alpha_branch)
+    install_git_plugin(beta_source, ref=beta_branch)
+    (user_plugin_root() / "alpha" / "plugin.json").write_text(
+        json.dumps({"name": "alpha", "version": "9.0.0"}), encoding="utf-8"
+    )
+    beta_new_digest = _commit_plugin(
+        tmp_path / "beta-repo", name="beta", version="2.0.0"
+    )
+
+    assert main(["extensions", "update", "--all", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    assert [item["name"] for item in payload["results"]] == ["alpha", "beta"]
+    assert payload["results"][0]["status"] == "error"
+    assert "does not match installed plugin version" in payload["results"][0]["error"]
+    assert payload["results"][1]["status"] == "updated"
+    assert payload["updated"] == 1
+    assert payload["unchanged"] == 0
+    assert payload["errors"] == 1
+    assert load_plugin_install_records()["beta"].digest == beta_new_digest
+
+
+def test_extensions_update_all_ignores_untracked_local_plugins(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    local = tmp_path / "local"
+    local.mkdir()
+    (local / "plugin.json").write_text(
+        json.dumps({"name": "local-only", "version": "1.0.0"}), encoding="utf-8"
+    )
+    install_local_plugin(local)
+
+    assert main(["extensions", "update", "--all", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["results"] == []
+    assert (user_plugin_root() / "local-only" / "plugin.json").is_file()
+
+
+def test_extensions_update_all_rejects_target_and_wrong_actions(capsys) -> None:
+    assert main(["extensions", "update", "demo", "--all"]) == 2
+    assert "--all" in capsys.readouterr().err
+    assert main(["extensions", "install", "demo", "--all"]) == 2
+    assert "--all" in capsys.readouterr().err

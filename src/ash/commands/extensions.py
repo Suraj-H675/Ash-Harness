@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from ash.core.redaction import redact_text
 from ash.mcp.server import load_mcp_servers, parse_mcp_servers_payload
 from ash.plugins.agents import (
     AgentCatalog,
@@ -62,6 +63,7 @@ from ash.plugins.skills import (
 )
 from ash.safety.trust import canonical_workspace, is_workspace_trusted
 from ash.safe_io import read_bounded_bytes, strict_json_loads
+from ash.ui.safe_text import terminal_safe_text
 
 ExtensionKind = Literal["all", "skills", "agents", "plugins", "hooks"]
 PluginAction = Literal["install", "enable", "disable", "uninstall"]
@@ -839,6 +841,38 @@ def update_local_plugin(
     )
 
 
+def update_all_local_plugins(
+    *,
+    catalog: CatalogSelection = None,
+) -> dict[str, Any]:
+    """Update every tracked plugin independently and report all outcomes."""
+
+    names = sorted(load_plugin_install_records())
+    results: list[dict[str, Any]] = []
+    for name in names:
+        try:
+            results.append(update_local_plugin(name, catalog=catalog))
+        except (OSError, PluginLifecycleError, ValueError) as exc:
+            results.append(
+                {
+                    "action": "update",
+                    "name": name,
+                    "status": "error",
+                    "error": redact_text(str(exc)),
+                }
+            )
+    updated = sum(result.get("status") == "updated" for result in results)
+    unchanged = sum(result.get("status") == "unchanged" for result in results)
+    errors = sum(result.get("status") == "error" for result in results)
+    return {
+        "action": "update-all",
+        "updated": updated,
+        "unchanged": unchanged,
+        "errors": errors,
+        "results": results,
+    }
+
+
 def _plugin_update_result(
     name: str,
     root: Path,
@@ -879,6 +913,30 @@ def render_plugin_action(result: dict[str, Any], *, json_output: bool) -> str:
     if action == "uninstall":
         return f"Uninstalled {name} from {result['root']}"
     return f"{action.capitalize()}d {name}"
+
+
+def render_plugin_update_all(result: dict[str, Any], *, json_output: bool) -> str:
+    if json_output:
+        return json.dumps(result, sort_keys=True)
+    lines: list[str] = []
+    for outcome in result["results"]:
+        if outcome.get("status") == "error":
+            lines.append(
+                "Failed to update "
+                f"{outcome['name']}: "
+                f"{terminal_safe_text(str(outcome['error']), single_line=True)}"
+            )
+        else:
+            lines.append(render_plugin_action(outcome, json_output=False))
+    if not lines:
+        lines.append("No tracked plugins to update.")
+    lines.append(
+        "Update summary: "
+        f"{result['updated']} updated, "
+        f"{result['unchanged']} unchanged, "
+        f"{result['errors']} failed."
+    )
+    return "\n".join(lines)
 
 
 def _installed_user_plugin(name: str):

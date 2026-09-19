@@ -333,6 +333,11 @@ Ash is extensible without changing the core runtime:
   detection, catalog installs are re-resolved through the currently verified
   signed catalog/marketplace source, changed candidates reuse atomic replacement,
   disabled state is preserved, and ambiguous legacy provenance fails closed;
+- `ash extensions update --all` and `/plugins update --all` process every
+  tracked plugin in deterministic order, preserve each plugin's independent
+  atomic update boundary, continue after per-plugin failures, and report
+  updated/unchanged/error outcomes; the CLI returns a failing status when any
+  tracked update fails;
 - validation for traversal, links, malformed manifests, oversized components,
   missing dependencies, and unsafe replacements;
 - update, enable, disable, uninstall, inventory, search, and atomic live reload;
