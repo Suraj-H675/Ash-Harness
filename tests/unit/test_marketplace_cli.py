@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -16,12 +17,15 @@ from ash.plugins.catalog import sign_catalog
 def isolated_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from ash.commands import config as cli_config
 
+    missing = object()
+    old_profile: str | object = os.environ.get("ASH_PROFILE", missing)
     home = tmp_path / "home"
     ash_dir = home / ".ash"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("ASH_PROFILE", raising=False)
     monkeypatch.delenv("ASH_PLUGIN_CATALOG", raising=False)
     monkeypatch.delenv("ASH_PLUGIN_MARKETPLACES", raising=False)
+    old_paths = (cli_config.ASH_DIR, cli_config.ENV_FILE, cli_config.CONFIG_FILE)
     cli_config.ASH_DIR = ash_dir
     cli_config.ENV_FILE = ash_dir / ".env"
     cli_config.CONFIG_FILE = ash_dir / "ash.toml"
@@ -32,6 +36,11 @@ def isolated_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     try:
         yield
     finally:
+        cli_config.ASH_DIR, cli_config.ENV_FILE, cli_config.CONFIG_FILE = old_paths
+        if old_profile is missing:
+            os.environ.pop("ASH_PROFILE", None)
+        else:
+            os.environ["ASH_PROFILE"] = str(old_profile)
         AshConfig.model_config["toml_file"] = old_toml
         AshConfig.model_config["env_file"] = old_env
 
