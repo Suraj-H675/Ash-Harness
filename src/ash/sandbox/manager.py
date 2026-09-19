@@ -17,10 +17,14 @@ import asyncio
 import os
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence, TypedDict
+from typing import Iterator, Sequence, TypedDict
 
+from ash.safe_io import descriptor_path
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import open_scoped_directory
 from ash.sandbox._base import (
     SANDBOX_TIER_BWRAP,
     SANDBOX_TIER_DOCKER,
@@ -341,6 +345,7 @@ class SandboxManager:
                 invocation.argv,
                 invocation.cwd,
                 deadline,
+                workspace_root=self.workspace_root,
                 fallback=invocation.fallback_used,
                 env=env,
                 stream_callback=stream_callback,
@@ -352,6 +357,7 @@ class SandboxManager:
             deadline=deadline,
             tier=invocation.tier,
             backend_name=invocation.backend_name,
+            workspace_root=self.workspace_root,
             env=env,
             stream_callback=stream_callback,
         )
@@ -513,6 +519,7 @@ async def _run_scoped(
     cwd: Path | None,
     deadline: int,
     *,
+    workspace_root: Path | None,
     fallback: bool,
     env: dict[str, str] | None = None,
     stream_callback: ProcessStreamCallback | None = None,
@@ -524,14 +531,18 @@ async def _run_scoped(
         process_tree_plan = prepare_process_tree(workspace_root=cwd)
     except ProcessTreeUnavailable as exc:
         raise SandboxBackendUnavailable(str(exc)) from exc
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        cwd=str(cwd) if cwd is not None else None,
-        env=env if env is not None else {"PATH": os.defpath},
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        **process_tree_plan.spawn_options,
-    )
+    with _stable_subprocess_cwd(cwd, workspace_root) as (spawn_cwd, pass_fds):
+        spawn_options = dict(process_tree_plan.spawn_options)
+        if pass_fds:
+            spawn_options["pass_fds"] = pass_fds
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=spawn_cwd,
+            env=env if env is not None else {"PATH": os.defpath},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **spawn_options,
+        )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             communicate_process(
@@ -606,6 +617,7 @@ async def _run_subprocess(
     deadline: int,
     tier: SandboxTier,
     backend_name: str,
+    workspace_root: Path | None,
     env: dict[str, str] | None = None,
     stream_callback: ProcessStreamCallback | None = None,
 ) -> SandboxResult:
@@ -616,14 +628,18 @@ async def _run_subprocess(
         process_tree_plan = prepare_process_tree(workspace_root=cwd)
     except ProcessTreeUnavailable as exc:
         raise SandboxBackendUnavailable(str(exc)) from exc
-    process = await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=str(cwd) if cwd is not None else None,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        **process_tree_plan.spawn_options,
-    )
+    with _stable_subprocess_cwd(cwd, workspace_root) as (spawn_cwd, pass_fds):
+        spawn_options = dict(process_tree_plan.spawn_options)
+        if pass_fds:
+            spawn_options["pass_fds"] = pass_fds
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=spawn_cwd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **spawn_options,
+        )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             communicate_process(
@@ -689,6 +705,33 @@ async def _run_subprocess(
         fallback_used=False,
         duration_seconds=time.monotonic() - start,
     )
+
+
+@contextmanager
+def _stable_subprocess_cwd(
+    cwd: Path | None,
+    workspace_root: Path | None,
+) -> Iterator[tuple[str | None, tuple[int, ...]]]:
+    """Hold a POSIX workspace cwd stable across subprocess creation."""
+
+    if cwd is None or os.name != "posix":
+        yield (str(cwd) if cwd is not None else None), ()
+        return
+    root = workspace_root or cwd
+    try:
+        with open_scoped_directory(cwd, SafetyGuard(root)) as (_, directory_fd):
+            scoped_cwd = descriptor_path(directory_fd)
+            if scoped_cwd is None:
+                raise SandboxBackendUnavailable(
+                    "race-resistant cwd descriptors are unavailable on this platform"
+                )
+            yield scoped_cwd, (directory_fd,)
+    except SandboxBackendUnavailable:
+        raise
+    except (SafetyViolation, OSError) as exc:
+        raise SandboxBackendUnavailable(
+            f"sandbox cwd became unavailable before launch: {exc}"
+        ) from exc
 
 
 # --- macOS sandbox-exec ----------------------------------------------------

@@ -17,8 +17,10 @@ from ash.core.redaction import (
     StreamingRedactor,
     redact_text,
 )
+from ash.safe_io import descriptor_path
 from ash.safety.environment import resolve_host_executable
 from ash.safety.guard import SafetyGuard
+from ash.safety.scoped_io import open_scoped_directory
 from ash.sandbox.process_utils import (
     ProcessTreeError,
     ProcessTreePlan,
@@ -238,15 +240,38 @@ class BackgroundProcessTool(BaseTool):
                 output="",
                 error=f"Command was not started: {exc}",
             )
-        process = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=cwd,
-            env=environment,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **process_tree_plan.spawn_options,
-        )
+        if platform.system() != "Windows":
+            with open_scoped_directory(cwd, self.safety_guard) as (_, directory_fd):
+                scoped_cwd = descriptor_path(directory_fd)
+                if scoped_cwd is None:
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error=(
+                            "Command was not started: race-resistant cwd descriptors "
+                            "are unavailable on this platform."
+                        ),
+                    )
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=scoped_cwd,
+                    env=environment,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    pass_fds=(directory_fd,),
+                    **process_tree_plan.spawn_options,
+                )
+        else:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=cwd,
+                env=environment,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **process_tree_plan.spawn_options,
+            )
         job = Job(
             uuid.uuid4().hex[:12],
             args.command,

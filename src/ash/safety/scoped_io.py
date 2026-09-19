@@ -211,6 +211,52 @@ def list_scoped_directory(
     return target, entries
 
 
+@contextmanager
+def open_scoped_directory(
+    path: str | Path,
+    guard: SafetyGuard,
+) -> Iterator[tuple[Path, int]]:
+    """Hold one validated workspace directory open across an external operation."""
+
+    target = guard.validate_path(path)
+    if not _supports_anchored_directory_open():
+        raise ScopedIOError(
+            "race-resistant directory handles are unavailable on this platform"
+        )
+    flags = (
+        os.O_RDONLY | _flag("O_DIRECTORY") | _flag("O_CLOEXEC") | _flag("O_NOFOLLOW")
+    )
+    directory_fd = -1
+    try:
+        if target == guard.project_root:
+            try:
+                directory_fd = os.open(guard.project_root, flags)
+            except OSError as exc:
+                raise _scoped_open_error(target, exc) from exc
+        else:
+            with _open_parent(target, guard, create=False) as (parent_fd, name):
+                try:
+                    directory_fd = os.open(name, flags, dir_fd=parent_fd)
+                except OSError as exc:
+                    raise _scoped_open_error(target, exc) from exc
+        metadata = os.fstat(directory_fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ScopedIOError(f"not a directory: {target}")
+        yield target, directory_fd
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
+def _supports_anchored_directory_open() -> bool:
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and os.open in os.supports_dir_fd
+    )
+
+
 def atomic_write_scoped_text(
     path: str | Path,
     content: str,

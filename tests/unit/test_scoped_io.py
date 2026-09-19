@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import stat
 from contextlib import nullcontext
 from unittest.mock import patch
@@ -13,11 +14,67 @@ from ash.safety.scoped_io import (
     ScopedIOError,
     atomic_write_scoped_text,
     list_scoped_directory,
+    open_scoped_directory,
     remove_scoped_file,
     read_scoped_bytes,
     restore_scoped_file,
     stat_scoped_path,
 )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory descriptor")
+def test_open_scoped_directory_holds_original_inode_after_rename(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory = workspace / "work"
+    directory.mkdir()
+    saved = workspace / "work-saved"
+    expected = directory.stat()
+
+    with open_scoped_directory("work", SafetyGuard(workspace)) as (resolved, fd):
+        directory.rename(saved)
+        held = os.fstat(fd)
+
+    assert resolved == directory
+    assert (held.st_dev, held.st_ino) == (expected.st_dev, expected.st_ino)
+    assert (saved.stat().st_dev, saved.stat().st_ino) == (held.st_dev, held.st_ino)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory descriptor")
+def test_open_scoped_directory_accepts_internal_symlink_alias(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "target"
+    target.mkdir()
+    alias = workspace / "alias"
+    try:
+        alias.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+
+    with open_scoped_directory("alias", SafetyGuard(workspace)) as (resolved, fd):
+        held = os.fstat(fd)
+
+    expected = target.stat()
+    assert resolved == target
+    assert (held.st_dev, held.st_ino) == (expected.st_dev, expected.st_ino)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory descriptor")
+def test_open_scoped_directory_rejects_external_symlink_alias(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    alias = workspace / "alias"
+    try:
+        alias.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+
+    with pytest.raises(SafetyViolation, match="outside project scope"):
+        with open_scoped_directory("alias", SafetyGuard(workspace)):
+            pytest.fail("external alias must not be opened")
 
 
 @pytest.mark.parametrize("fallback", [False, True])

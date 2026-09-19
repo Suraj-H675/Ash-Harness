@@ -11,8 +11,10 @@ from typing import Any, Iterable
 from pydantic import BaseModel, Field
 
 from ash.core.redaction import StreamingRedactor
+from ash.safe_io import descriptor_path
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import open_scoped_directory
 from ash.sandbox._base import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable
 from ash.sandbox.manager import SandboxManager, SandboxResult
 from ash.sandbox.process_utils import (
@@ -22,9 +24,9 @@ from ash.sandbox.process_utils import (
     communicate_process,
     prepare_process_tree,
     settle_process_tree_after_cancellation,
+    terminate_process_tree,
 )
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
-from ash.sandbox.process_utils import terminate_process_tree
 
 
 DEFAULT_TIMEOUT_SECONDS = 300
@@ -353,14 +355,30 @@ class RunCommandTool(BaseTool):
                     **process_tree_plan.spawn_options,
                 )
             else:
-                process = await asyncio.create_subprocess_shell(
-                    command_line,
-                    cwd=cwd,
-                    env=env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    **process_tree_plan.spawn_options,
-                )
+                cwd_target = Path(cwd) if cwd is not None else workspace
+                with open_scoped_directory(
+                    cwd_target,
+                    self.safety_guard,
+                ) as (_, directory_fd):
+                    scoped_cwd = descriptor_path(directory_fd)
+                    if scoped_cwd is None:
+                        return ToolResult(
+                            success=False,
+                            output="",
+                            error=(
+                                "Error: command was not started: race-resistant "
+                                "cwd descriptors are unavailable on this platform."
+                            ),
+                        )
+                    process = await asyncio.create_subprocess_shell(
+                        command_line,
+                        cwd=scoped_cwd,
+                        env=env,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        pass_fds=(directory_fd,),
+                        **process_tree_plan.spawn_options,
+                    )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 communicate_process(
                     process,

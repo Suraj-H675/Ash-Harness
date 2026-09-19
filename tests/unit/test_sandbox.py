@@ -78,6 +78,95 @@ def test_resolve_host_executable_skips_workspace_shadow(
     assert resolved == str((host_bin / "helper").resolve())
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")
+@pytest.mark.asyncio
+async def test_manager_run_uses_held_cwd_after_path_is_swapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.safe_io import descriptor_path as real_descriptor_path
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cwd = workspace / "work"
+    cwd.mkdir()
+    saved = workspace / "work-saved"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    swapped = False
+
+    def descriptor_after_swap(directory_fd: int) -> str | None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            cwd.rename(saved)
+            try:
+                cwd.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"Symlink creation is unavailable: {exc}")
+        return real_descriptor_path(directory_fd)
+
+    monkeypatch.setattr(
+        "ash.sandbox.manager.descriptor_path",
+        descriptor_after_swap,
+    )
+    manager = SandboxManager(workspace_root=workspace, backend_preference="direct")
+
+    result = await manager.run(
+        ["/bin/sh", "-c", "printf safe > marker.txt"],
+        cwd=cwd,
+        timeout=5,
+    )
+
+    assert swapped is True
+    assert result.exit_code == 0
+    assert not (outside / "marker.txt").exists()
+    assert (saved / "marker.txt").read_text(encoding="utf-8") == "safe"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")
+@pytest.mark.asyncio
+async def test_manager_run_fails_closed_if_cwd_changes_before_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cwd = workspace / "work"
+    cwd.mkdir()
+    saved = workspace / "work-saved"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    manager = SandboxManager(workspace_root=workspace, backend_preference="direct")
+    real_prepare = manager.prepare
+    swapped = False
+
+    def prepare_then_swap(*args, **kwargs):
+        nonlocal swapped
+        invocation = real_prepare(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            cwd.rename(saved)
+            try:
+                cwd.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"Symlink creation is unavailable: {exc}")
+        return invocation
+
+    monkeypatch.setattr(manager, "prepare", prepare_then_swap)
+
+    with pytest.raises(SandboxBackendUnavailable, match="cwd became unavailable"):
+        await manager.run(
+            ["/bin/sh", "-c", "printf unsafe > marker.txt"],
+            cwd=cwd,
+            timeout=5,
+        )
+
+    assert swapped is True
+    assert not (outside / "marker.txt").exists()
+    assert not (saved / "marker.txt").exists()
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="bubblewrap is Linux-only")
 def test_manager_does_not_trust_workspace_shadowed_bwrap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

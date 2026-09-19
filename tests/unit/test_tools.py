@@ -940,6 +940,115 @@ async def test_run_command_blocks_wrapped_dynamic_executable_before_launch(
         )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_run_command_cwd_swap_cannot_escape_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cwd = workspace / "work"
+    cwd.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    saved = workspace / "work-saved"
+    guard = SafetyGuard(workspace)
+    real_validate_path = guard.validate_path
+    swapped = False
+
+    def validate_then_swap(path):
+        nonlocal swapped
+        resolved = real_validate_path(path)
+        if path == "work" and not swapped:
+            swapped = True
+            cwd.rename(saved)
+            try:
+                cwd.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return resolved
+
+    monkeypatch.setattr(guard, "validate_path", validate_then_swap)
+
+    with pytest.raises(SafetyViolation, match="outside project scope"):
+        await RunCommandTool(guard, project_root=workspace).run(
+            command_line="printf safe > marker.txt",
+            cwd="work",
+        )
+
+    assert swapped is True
+    assert not (outside / "marker.txt").exists()
+    assert not (saved / "marker.txt").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_run_command_uses_held_cwd_after_path_is_swapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.safe_io import descriptor_path as real_descriptor_path
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cwd = workspace / "work"
+    cwd.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    saved = workspace / "work-saved"
+    swapped = False
+
+    def descriptor_after_swap(directory_fd: int) -> str | None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            cwd.rename(saved)
+            try:
+                cwd.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return real_descriptor_path(directory_fd)
+
+    monkeypatch.setattr(
+        "ash.tools.command.descriptor_path",
+        descriptor_after_swap,
+    )
+
+    result = await RunCommandTool(
+        SafetyGuard(workspace), project_root=workspace
+    ).run(
+        command_line="printf safe > marker.txt",
+        cwd="work",
+    )
+
+    assert swapped is True
+    assert result.success is True
+    assert not (outside / "marker.txt").exists()
+    assert (saved / "marker.txt").read_text(encoding="utf-8") == "safe"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor cwd")
+@pytest.mark.asyncio
+async def test_run_command_fails_closed_without_descriptor_cwd(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ash.tools.command.descriptor_path", lambda _fd: None)
+    monkeypatch.setattr(
+        "ash.tools.command.asyncio.create_subprocess_shell",
+        lambda *args, **kwargs: pytest.fail("command must not launch"),
+    )
+
+    result = await RunCommandTool(guard, project_root=project_root).run(
+        command_line="printf unsafe"
+    )
+
+    assert result.success is False
+    assert "race-resistant cwd descriptors are unavailable" in (result.error or "")
+
+
 @pytest.mark.asyncio
 async def test_run_command_requires_literal_path_for_windows_file_cmdlets(
     guard: SafetyGuard,

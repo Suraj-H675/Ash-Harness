@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from ash.safety.guard import SafetyGuard
+from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.sandbox import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable, SandboxInvocation
 from ash.core.redaction import LONG_TOKEN_WITHHELD_MARKER
 from ash.tools.process import (
@@ -275,6 +275,120 @@ async def test_background_process_fails_closed_when_sandbox_disappears(
 
     assert result.success is False
     assert "command was not started" in (result.error or "")
+    assert not tool.jobs
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_background_process_cwd_swap_cannot_escape_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cwd = workspace / "work"
+    cwd.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    saved = workspace / "work-saved"
+    guard = SafetyGuard(workspace)
+    real_validate_path = guard.validate_path
+    swapped = False
+
+    def validate_then_swap(path):
+        nonlocal swapped
+        resolved = real_validate_path(path)
+        if path == "work" and not swapped:
+            swapped = True
+            cwd.rename(saved)
+            try:
+                cwd.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return resolved
+
+    monkeypatch.setattr(guard, "validate_path", validate_then_swap)
+    tool = BackgroundProcessTool(guard)
+
+    with pytest.raises(SafetyViolation, match="outside project scope"):
+        await tool.run(
+            action="start",
+            command="printf safe > marker.txt",
+            cwd="work",
+        )
+
+    assert swapped is True
+    assert not (outside / "marker.txt").exists()
+    assert not (saved / "marker.txt").exists()
+    assert not tool.jobs
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_background_process_uses_held_cwd_after_path_is_swapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.safe_io import descriptor_path as real_descriptor_path
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cwd = workspace / "work"
+    cwd.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    saved = workspace / "work-saved"
+    swapped = False
+
+    def descriptor_after_swap(directory_fd: int) -> str | None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            cwd.rename(saved)
+            try:
+                cwd.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return real_descriptor_path(directory_fd)
+
+    monkeypatch.setattr(
+        "ash.tools.process.descriptor_path",
+        descriptor_after_swap,
+    )
+    tool = BackgroundProcessTool(SafetyGuard(workspace))
+
+    started = await tool.run(
+        action="start",
+        command="printf safe > marker.txt",
+        cwd="work",
+    )
+    job_id = started.output.split()[1]
+    job = tool.jobs[job_id]
+    await job.process.wait()
+    await asyncio.gather(*job.readers)
+
+    assert swapped is True
+    assert not (outside / "marker.txt").exists()
+    assert (saved / "marker.txt").read_text(encoding="utf-8") == "safe"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor cwd")
+@pytest.mark.asyncio
+async def test_background_process_fails_closed_without_descriptor_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ash.tools.process.descriptor_path", lambda _fd: None)
+    monkeypatch.setattr(
+        "ash.tools.process.asyncio.create_subprocess_exec",
+        AsyncMock(side_effect=AssertionError("command must not launch")),
+    )
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+
+    result = await tool.run(action="start", command="printf unsafe")
+
+    assert result.success is False
+    assert "race-resistant cwd descriptors are unavailable" in (result.error or "")
     assert not tool.jobs
 
 
