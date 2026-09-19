@@ -257,7 +257,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Offline test suite | Partial | No hidden home-directory mutation or live network dependency |
 | Cross-platform CI | Partial | Linux/macOS CI workflow and platform-neutral installed-wheel smoke gate exist; Windows workflow is intentionally deferred until parity work resumes |
 | Packaging CI | Verified locally | Wheel/sdist build, minimal clean install, artifact metadata/content, CLI/config/trust, repo-map import, optional dependency absence, and missing-extra behavior are exercised |
-| Security tests | Partial | Command/path bypass corpus, sandbox escape assumptions, secret leaks |
+| Security tests | Partial | Command bypass coverage includes shell-expanded destructive options, dynamic executables, and common process/shell wrappers at the real command-tool boundary; broader path bypass corpus, sandbox escape assumptions, and secret-leak coverage remain |
 | Performance tests | Partial | Lightweight CLI import graph and installed version startup are regression-tested under one second; bounded large-repository memory indexing is covered by a 170-file offline benchmark; long-session memory proves 1,000-file indexing plus 20 exact-recall rounds with bounded indexing and sub-50 ms recall; redraw latency benchmarks remain |
 | Compatibility policy | Verified locally | Config, session, and plugin manifest schemas are versioned with future-version refusal, minimum-version enforcement, and plugin deprecation notices |
 

@@ -925,6 +925,22 @@ async def test_run_command_blocks_unsafe_commands(guard: SafetyGuard) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_command_blocks_wrapped_dynamic_executable_before_launch(
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ash.tools.command.asyncio.create_subprocess_shell",
+        lambda *args, **kwargs: pytest.fail("blocked command must not launch"),
+    )
+
+    with pytest.raises(SafetyViolation, match="dynamic executable expansion"):
+        await RunCommandTool(guard).run(
+            command_line='cmd=rm; timeout 5 env "$cmd" -rf /'
+        )
+
+
+@pytest.mark.asyncio
 async def test_run_command_requires_literal_path_for_windows_file_cmdlets(
     guard: SafetyGuard,
     monkeypatch: pytest.MonkeyPatch,

@@ -246,13 +246,216 @@ class SafetyGuard:
         """Reject a shell-expanded command name that could conceal the blocklist."""
 
         for segment in cls._posix_command_segments(command_str):
-            executable = next(
-                (token for token in segment if not cls._is_shell_assignment(token)),
-                None,
-            )
+            executable = cls._effective_executable_token(segment)
             if executable is not None and cls._has_shell_expansion(executable):
                 return executable
         return None
+
+    @classmethod
+    def _effective_executable_token(cls, segment: tuple[str, ...]) -> str | None:
+        """Return the command token after simple shell execution wrappers."""
+
+        index = 0
+        while index < len(segment) and cls._is_shell_assignment(segment[index]):
+            index += 1
+        while index < len(segment):
+            token = segment[index]
+            if cls._has_shell_expansion(token):
+                return token
+            command = token.rsplit("/", 1)[-1].casefold()
+            if command == "command":
+                index += 1
+                while index < len(segment):
+                    option = segment[index]
+                    if option == "--":
+                        index += 1
+                        break
+                    if option in {"-v", "-V"}:
+                        return None
+                    if option == "-p":
+                        index += 1
+                        continue
+                    break
+                continue
+            if command == "exec":
+                index += 1
+                while index < len(segment):
+                    option = segment[index]
+                    if option == "--":
+                        index += 1
+                        break
+                    if option == "-a":
+                        index += 2
+                        continue
+                    if option.startswith("-") and option != "-":
+                        index += 1
+                        continue
+                    break
+                continue
+            if command == "env":
+                index += 1
+                while index < len(segment):
+                    option = segment[index]
+                    if cls._is_shell_assignment(option):
+                        index += 1
+                        continue
+                    if option == "--":
+                        index += 1
+                        break
+                    if option in {"-u", "--unset", "-C", "--chdir"}:
+                        index += 2
+                        continue
+                    if option.startswith(
+                        ("--unset=", "--chdir=", "--argv0=")
+                    ) or option in {"-i", "--ignore-environment", "-0", "--null"}:
+                        index += 1
+                        continue
+                    if option.startswith("-") and option != "-":
+                        index += 1
+                        continue
+                    break
+                continue
+            if command in {"nohup", "setsid"}:
+                index = cls._skip_wrapper_options(segment, index + 1)
+                continue
+            if command == "nice":
+                index = cls._skip_wrapper_options(
+                    segment,
+                    index + 1,
+                    value_options=frozenset({"-n", "--adjustment"}),
+                )
+                continue
+            if command == "timeout":
+                index = cls._skip_wrapper_options(
+                    segment,
+                    index + 1,
+                    value_options=frozenset(
+                        {"-k", "--kill-after", "-s", "--signal"}
+                    ),
+                )
+                if index >= len(segment):
+                    return None
+                index += 1  # duration
+                continue
+            if command == "xargs":
+                index = cls._skip_wrapper_options(
+                    segment,
+                    index + 1,
+                    value_options=frozenset(
+                        {
+                            "-a",
+                            "--arg-file",
+                            "-d",
+                            "--delimiter",
+                            "-E",
+                            "--eof",
+                            "-I",
+                            "--replace",
+                            "-L",
+                            "--max-lines",
+                            "-n",
+                            "--max-args",
+                            "-P",
+                            "--max-procs",
+                            "-s",
+                            "--max-chars",
+                        }
+                    ),
+                )
+                continue
+            if command == "sudo":
+                index = cls._skip_wrapper_options(
+                    segment,
+                    index + 1,
+                    value_options=frozenset(
+                        {
+                            "-C",
+                            "--close-from",
+                            "-D",
+                            "--chdir",
+                            "-g",
+                            "--group",
+                            "-h",
+                            "--host",
+                            "-p",
+                            "--prompt",
+                            "-R",
+                            "--chroot",
+                            "-r",
+                            "--role",
+                            "-t",
+                            "--type",
+                            "-T",
+                            "--command-timeout",
+                            "-u",
+                            "--user",
+                        }
+                    ),
+                )
+                while index < len(segment) and cls._is_shell_assignment(
+                    segment[index]
+                ):
+                    index += 1
+                continue
+            if command == "doas":
+                index = cls._skip_wrapper_options(
+                    segment,
+                    index + 1,
+                    value_options=frozenset({"-a", "-C", "-u"}),
+                )
+                continue
+            if command == "stdbuf":
+                index = cls._skip_wrapper_options(
+                    segment,
+                    index + 1,
+                    value_options=frozenset({"-i", "-o", "-e"}),
+                )
+                continue
+            if command == "taskset":
+                index += 1
+                process_mode = False
+                while index < len(segment):
+                    option = segment[index]
+                    if option == "--":
+                        index += 1
+                        break
+                    if option in {"-p", "--pid"}:
+                        process_mode = True
+                        index += 1
+                        continue
+                    if option.startswith("-") and option != "-":
+                        index += 1
+                        continue
+                    break
+                if process_mode or index >= len(segment):
+                    return None
+                index += 1  # CPU mask/list
+                continue
+            return token
+        return None
+
+    @staticmethod
+    def _skip_wrapper_options(
+        segment: tuple[str, ...],
+        index: int,
+        *,
+        value_options: frozenset[str] = frozenset(),
+    ) -> int:
+        """Advance to a wrapper's first positional token."""
+
+        while index < len(segment):
+            token = segment[index]
+            if token == "--":
+                return index + 1
+            option_name = token.split("=", 1)[0]
+            if option_name in value_options:
+                index += 1 if "=" in token else 2
+                continue
+            if token.startswith("-") and token != "-":
+                index += 1
+                continue
+            return index
+        return index
 
     @classmethod
     def _ambiguous_destructive_posix_pattern(cls, command_str: str) -> str | None:
@@ -280,11 +483,13 @@ class SafetyGuard:
                 parse_options = False
                 continue
             if parse_options and token.startswith("--"):
+                ambiguous_options = ambiguous_options or cls._has_shell_expansion(token)
                 option = token.split("=", 1)[0].casefold()
                 recursive = recursive or option == "--recursive"
                 force = force or option == "--force"
                 continue
             if parse_options and token.startswith("-") and token != "-":
+                ambiguous_options = ambiguous_options or cls._has_shell_expansion(token)
                 option = token[1:].casefold()
                 recursive = recursive or "r" in option
                 force = force or "f" in option
@@ -312,9 +517,15 @@ class SafetyGuard:
                 parse_options = False
                 continue
             if parse_options and token.startswith("--"):
+                ambiguous_recursive = (
+                    ambiguous_recursive or cls._has_shell_expansion(token)
+                )
                 recursive = recursive or token.split("=", 1)[0].casefold() == "--recursive"
                 continue
             if parse_options and token.startswith("-") and token != "-":
+                ambiguous_recursive = (
+                    ambiguous_recursive or cls._has_shell_expansion(token)
+                )
                 recursive = recursive or "r" in token[1:].casefold()
                 continue
             if not mode_seen and cls._has_shell_expansion(token):

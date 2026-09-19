@@ -184,3 +184,88 @@ def test_validate_command_allows_expansion_in_arguments(tmp_path: Path) -> None:
     guard = SafetyGuard(tmp_path)
 
     assert guard.validate_command('printf "%s\\n" "$HOME"') == (True, "")
+    assert guard.validate_command('command -v "$SHELL"') == (True, "")
+    assert (
+        guard.validate_command('env HOME="$HOME" printf "%s\\n" "$HOME"')
+        == (True, "")
+    )
+    assert guard.validate_command('nohup printf "%s\\n" "$HOME"') == (True, "")
+    assert (
+        guard.validate_command('nice -n 5 printf "%s\\n" "$HOME"') == (True, "")
+    )
+    assert (
+        guard.validate_command('timeout 5 printf "%s\\n" "$HOME"') == (True, "")
+    )
+    assert (
+        guard.validate_command('taskset -c 0 printf "%s\\n" "$HOME"')
+        == (True, "")
+    )
+    assert (
+        guard.validate_command('sudo -u "$USER" printf "%s\\n" "$HOME"')
+        == (True, "")
+    )
+    assert (
+        guard.validate_command('timeout --signal "$SIGNAL" 5 printf ok')
+        == (True, "")
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm --rec${UNSET:-ursive} --force /",
+        "rm --recursive --fo${UNSET:-rce} /",
+        "chmod --rec${UNSET:-ursive} 777 /",
+    ],
+)
+def test_validate_command_blocks_shell_expanded_destructive_options(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+
+    with pytest.raises(SafetyViolation, match="Blocked command pattern"):
+        guard.validate_command(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'cmd=rm; command "$cmd" -rf /',
+        'cmd=rm; exec "$cmd" -rf /',
+        'cmd=chmod; env "$cmd" -R 777 /',
+    ],
+)
+def test_validate_command_blocks_dynamic_executable_behind_shell_wrappers(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+
+    with pytest.raises(SafetyViolation, match="dynamic executable expansion"):
+        guard.validate_command(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'cmd=rm; nohup "$cmd" -rf /',
+        'cmd=rm; nice "$cmd" -rf /',
+        'cmd=rm; timeout 5 "$cmd" -rf /',
+        'cmd=rm; printf "/\\n" | xargs "$cmd" -rf',
+        'cmd=rm; sudo "$cmd" -rf /',
+        'cmd=rm; doas "$cmd" -rf /',
+        'cmd=rm; setsid "$cmd" -rf /',
+        'cmd=rm; stdbuf -oL "$cmd" -rf /',
+        'cmd=rm; taskset -c 0 "$cmd" -rf /',
+        'cmd=rm; timeout 5 env "$cmd" -rf /',
+    ],
+)
+def test_validate_command_blocks_dynamic_executable_behind_process_wrappers(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+
+    with pytest.raises(SafetyViolation, match="dynamic executable expansion"):
+        guard.validate_command(command)
