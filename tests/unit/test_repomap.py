@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ import pytest
 from ash.repo.parser import SymbolExtractor
 from ash.repo import repomap as repomap_module
 from ash.repo.repomap import RepoMap, calculate_personalized_pagerank
+from ash.safety.guard import SafetyGuard
 
 
 def test_pagerank_concentrates_on_teleport_node() -> None:
@@ -322,6 +324,90 @@ def test_repomap_honors_gitignore_for_untracked_files(tmp_path: Path) -> None:
     repo_map = RepoMap(tmp_path)
 
     assert [node.path.name for node in repo_map.files] == ["kept.py"]
+
+
+@pytest.mark.skipif(
+    shutil.which("git") is None or os.name != "posix",
+    reason="Git and POSIX descriptor cwd are required",
+)
+def test_gitignore_check_pins_workspace_across_path_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    replacement = tmp_path / "replacement"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    replacement.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    subprocess.run(["git", "init", "-q"], cwd=replacement, check=True)
+    (workspace / ".gitignore").write_text("secret.py\n", encoding="utf-8")
+    secret = workspace / "secret.py"
+    secret.write_text("SECRET = 1\n", encoding="utf-8")
+    (replacement / ".gitignore").write_text("", encoding="utf-8")
+    metadata = workspace.stat()
+    expected_identity = (metadata.st_dev, metadata.st_ino)
+    real_run = repomap_module.subprocess.run
+    swapped = False
+
+    def run_after_swap(*args, **kwargs):
+        nonlocal swapped
+        command = args[0] if args else kwargs.get("args", ())
+        if "check-ignore" in command and not swapped:
+            workspace.rename(saved)
+            try:
+                workspace.symlink_to(replacement, target_is_directory=True)
+            except OSError as exc:
+                saved.rename(workspace)
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+            swapped = True
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(repomap_module.subprocess, "run", run_after_swap)
+
+    ignored = repomap_module._git_ignored_files(
+        workspace,
+        [secret],
+        guard=SafetyGuard(workspace),
+        expected_root_identity=expected_identity,
+    )
+
+    assert swapped is True
+    assert ignored == {secret}
+
+
+@pytest.mark.skipif(
+    shutil.which("git") is None or os.name != "posix",
+    reason="Git and POSIX descriptor cwd are required",
+)
+def test_gitignore_check_fails_closed_when_workspace_identity_already_changed(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    replacement = tmp_path / "replacement"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    replacement.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    subprocess.run(["git", "init", "-q"], cwd=replacement, check=True)
+    secret = workspace / "secret.py"
+    secret.write_text("SECRET = 1\n", encoding="utf-8")
+    metadata = workspace.stat()
+    expected_identity = (metadata.st_dev, metadata.st_ino)
+    workspace.rename(saved)
+    try:
+        workspace.symlink_to(replacement, target_is_directory=True)
+    except OSError as exc:
+        saved.rename(workspace)
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    ignored = repomap_module._git_ignored_files(
+        workspace,
+        [secret],
+        guard=SafetyGuard(workspace),
+        expected_root_identity=expected_identity,
+    )
+
+    assert ignored == {secret}
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")

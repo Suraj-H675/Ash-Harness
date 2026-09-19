@@ -33,9 +33,14 @@ from ash.repo.parser import (
 )
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import (
+    ScopedIOError,
     list_scoped_directory,
     read_scoped_bytes,
     stat_scoped_path,
+)
+from ash.sandbox.process_utils import (
+    ProcessTreeUnavailable,
+    prepare_scoped_process_launch,
 )
 
 MAX_REPO_DISCOVERY_ENTRIES = 100_000
@@ -186,35 +191,71 @@ def _matches_exclude_pattern(
     return False
 
 
-def _git_ignored_files(project_root: Path, paths: Iterable[Path]) -> set[Path]:
+def _git_ignored_files(
+    project_root: Path,
+    paths: Iterable[Path],
+    *,
+    guard: SafetyGuard | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> set[Path]:
     """Return untracked files ignored by Git, or an empty set outside a worktree."""
 
-    relative_paths = [path.relative_to(project_root).as_posix() for path in paths]
-    if not relative_paths:
+    candidates = list(paths)
+    relative_to_candidate = {
+        path.relative_to(project_root).as_posix(): path for path in candidates
+    }
+    if not relative_to_candidate:
         return set()
     git = resolve_host_executable("git", workspace_root=project_root, cwd=project_root)
     if git is None:
         return set()
-    payload = "\0".join(relative_paths).encode("utf-8") + b"\0"
+    payload = "\0".join(relative_to_candidate).encode("utf-8") + b"\0"
     try:
         environment = read_only_git_environment()
-        completed = subprocess.run(
+        with prepare_scoped_process_launch(
             [git, *read_only_git_args(["check-ignore", "--stdin", "-z"])],
             cwd=project_root,
-            input=payload,
-            capture_output=True,
-            check=False,
-            timeout=10,
-            env=environment,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return set()
+            guard=guard or SafetyGuard(project_root),
+            search_path=environment.get("PATH"),
+            expected_cwd_identity=expected_root_identity,
+        ) as launch:
+            if launch.pass_fds:
+                completed = subprocess.run(
+                    launch.argv,
+                    cwd=launch.cwd,
+                    input=payload,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                    env=environment,
+                    pass_fds=launch.pass_fds,
+                )
+            else:
+                completed = subprocess.run(
+                    launch.argv,
+                    cwd=launch.cwd,
+                    input=payload,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                    env=environment,
+                )
+    except (
+        OSError,
+        subprocess.TimeoutExpired,
+        ProcessTreeUnavailable,
+        SafetyViolation,
+        ScopedIOError,
+    ):
+        return set(candidates)
     if completed.returncode not in {0, 1}:
         return set()
     return {
-        (project_root / item.decode("utf-8", errors="surrogateescape")).resolve()
+        candidate
         for item in completed.stdout.split(b"\0")
         if item
+        for relative in [item.decode("utf-8", errors="surrogateescape")]
+        if (candidate := relative_to_candidate.get(relative)) is not None
     }
 
 
@@ -459,6 +500,8 @@ class RepoMap:
     ) -> None:
         self.project_root = project_root.resolve()
         self._guard = SafetyGuard(self.project_root)
+        root_metadata = self.project_root.stat()
+        self._project_root_identity = (root_metadata.st_dev, root_metadata.st_ino)
         self._extractor = extractor or SymbolExtractor()
         self._max_files = max_files
         self._exclude_patterns = exclude_patterns or []
@@ -686,10 +729,13 @@ class RepoMap:
             exclude_patterns=self._exclude_patterns,
             guard=self._guard,
         )
-        ignored = _git_ignored_files(self.project_root, discovered)
-        paths = [path for path in discovered if path.resolve() not in ignored][
-            : self._max_files
-        ]
+        ignored = _git_ignored_files(
+            self.project_root,
+            discovered,
+            guard=self._guard,
+            expected_root_identity=self._project_root_identity,
+        )
+        paths = [path for path in discovered if path not in ignored][: self._max_files]
         files: list[FileNode] = []
         module_index: dict[str, Path] = {}
         next_cache: dict[Path, tuple[tuple[int, int], FileNode]] = {}
