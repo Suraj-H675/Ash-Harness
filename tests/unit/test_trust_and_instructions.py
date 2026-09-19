@@ -223,6 +223,130 @@ def test_project_instructions_require_trust_flag(tmp_path, monkeypatch) -> None:
     assert "nested rule" in rendered
 
 
+def test_project_instructions_fall_back_to_agents_md(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    agents = workspace / "AGENTS.md"
+    agents.write_text("agents compatibility rule", encoding="utf-8")
+
+    discovered = discover_instructions(
+        workspace,
+        include_project=True,
+        current_directory=workspace,
+    )
+
+    assert [item.path for item in discovered] == [agents]
+    assert discovered[0].content == "agents compatibility rule"
+
+
+def test_project_instructions_fall_back_to_claude_md(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    claude = workspace / "CLAUDE.md"
+    claude.write_text("claude compatibility rule", encoding="utf-8")
+
+    discovered = discover_instructions(
+        workspace,
+        include_project=True,
+        current_directory=workspace,
+    )
+
+    assert [item.path for item in discovered] == [claude]
+    assert discovered[0].content == "claude compatibility rule"
+
+
+def test_native_ash_md_wins_over_compatibility_files(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    native = workspace / "ASH.md"
+    native.write_text("native ash rule", encoding="utf-8")
+    (workspace / "AGENTS.md").write_text("agents rule", encoding="utf-8")
+    (workspace / "CLAUDE.md").write_text("claude rule", encoding="utf-8")
+
+    discovered = discover_instructions(
+        workspace,
+        include_project=True,
+        current_directory=workspace,
+    )
+
+    assert [item.path for item in discovered] == [native]
+    assert discovered[0].content == "native ash rule"
+
+
+def test_agents_md_wins_over_claude_md_fallback(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    agents = workspace / "AGENTS.md"
+    agents.write_text("agents rule", encoding="utf-8")
+    (workspace / "CLAUDE.md").write_text("claude rule", encoding="utf-8")
+
+    discovered = discover_instructions(
+        workspace,
+        include_project=True,
+        current_directory=workspace,
+    )
+
+    assert [item.path for item in discovered] == [agents]
+    assert discovered[0].content == "agents rule"
+
+
+def test_project_instruction_fallbacks_compose_by_hierarchical_scope(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    nested = workspace / "src" / "feature"
+    (home / ".ash").mkdir(parents=True)
+    nested.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    root_agents = workspace / "AGENTS.md"
+    nested_claude = workspace / "src" / "CLAUDE.md"
+    root_agents.write_text("root agents rule", encoding="utf-8")
+    nested_claude.write_text("nested claude rule", encoding="utf-8")
+
+    discovered = discover_instructions(
+        workspace,
+        include_project=True,
+        current_directory=nested,
+    )
+
+    assert [item.path for item in discovered] == [root_agents, nested_claude]
+
+
+def test_compatibility_instruction_files_still_require_project_trust(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    (home / ".ash" / "ASH.md").write_text("global rule", encoding="utf-8")
+    (workspace / "AGENTS.md").write_text("project agents rule", encoding="utf-8")
+
+    discovered = discover_instructions(
+        workspace,
+        include_project=False,
+        current_directory=workspace,
+    )
+
+    assert [(item.scope, item.content) for item in discovered] == [
+        ("user", "global rule")
+    ]
+
+
 def test_project_instruction_read_does_not_follow_file_swapped_to_external_symlink(
     tmp_path, monkeypatch
 ) -> None:

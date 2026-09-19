@@ -11,6 +11,7 @@ from ash.safe_io import anchored_regular_file_exists, read_bounded_open_file
 
 MAX_INSTRUCTION_FILE_BYTES = 128 * 1024
 MAX_INSTRUCTION_IMPORT_DEPTH = 5
+PROJECT_INSTRUCTION_FILENAMES = ("ASH.md", "AGENTS.md", "CLAUDE.md")
 _AFFIRMATIVE_DIRECTIVES = ("always ", "must ", "use ", "prefer ", "do ")
 _NEGATIVE_DIRECTIVES = ("never ", "do not ", "don't ", "dont ", "avoid ", "no ")
 
@@ -57,27 +58,54 @@ def discover_instructions(
         relative = current.relative_to(root)
     except ValueError:
         relative = Path()
-    candidates = [root / "ASH.md", root / ".ash" / "ASH.md"]
+
+    files.extend(
+        _read_project_scope(
+            root,
+            root=root,
+            diagnostics=diagnostics,
+        )
+    )
+    files.extend(
+        _read_with_imports(
+            root / ".ash" / "ASH.md",
+            "project",
+            root=root,
+            diagnostics=diagnostics,
+            seen=set(),
+        )
+    )
     cursor = root
     for part in relative.parts:
         cursor /= part
-        candidates.append(cursor / "ASH.md")
-    seen: set[Path] = set()
-    for path in candidates:
-        if path in seen:
-            continue
-        seen.add(path)
         files.extend(
-            _read_with_imports(
-                path,
-                "project",
+            _read_project_scope(
+                cursor,
                 root=root,
                 diagnostics=diagnostics,
-                seen=set(),
             )
         )
     lint_instruction_conflicts(files, diagnostics)
     return files
+
+
+def _read_project_scope(
+    directory: Path,
+    *,
+    root: Path,
+    diagnostics: list[InstructionDiagnostic] | None,
+) -> list[InstructionFile]:
+    for filename in PROJECT_INSTRUCTION_FILENAMES:
+        loaded = _read_with_imports(
+            directory / filename,
+            "project",
+            root=root,
+            diagnostics=diagnostics,
+            seen=set(),
+        )
+        if loaded:
+            return loaded
+    return []
 
 
 def lint_instruction_conflicts(

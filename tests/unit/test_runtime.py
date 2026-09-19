@@ -30,6 +30,40 @@ class RuntimeProvider(ProviderABC):
             yield
 
 
+def test_trusted_runtime_loads_agents_md_project_instructions(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    marker = "runtime agents compatibility rule"
+    agents = workspace / "AGENTS.md"
+    agents.write_text(marker, encoding="utf-8")
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+
+    assert marker in runtime.loop.system_prompt
+    assert str(agents) in runtime.loop.system_prompt
+    asyncio.run(runtime.loop.aclose())
+
+
 def test_runtime_file_checkpoint_owns_and_finalizes_provider_tool_call(tmp_path) -> None:
     (tmp_path / "file.txt").write_text("before", encoding="utf-8")
     config = AshConfig(
