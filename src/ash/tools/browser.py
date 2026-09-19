@@ -10,6 +10,7 @@ import json
 import mimetypes
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse, urlunparse
@@ -29,6 +30,19 @@ from ash.tools.web import _normalize_allowed_domains, _validate_public_url
 MAX_SNAPSHOT_CHARS = 30_000
 MAX_INTERACTIVE_ELEMENTS = 150
 MAX_CDP_STORAGE_STATE_BYTES = 4 * 1024 * 1024
+BROWSER_TOOL_NAMES = frozenset(
+    {
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_scroll",
+        "browser_back",
+        "browser_screenshot",
+        "browser_upload",
+        "browser_download",
+    }
+)
 ELEMENT_REF = re.compile(r"^e[1-9][0-9]{0,3}$")
 INTERACTIVE_SELECTOR = ",".join(
     (
@@ -100,6 +114,11 @@ class BrowserSession:
         self._context: Any | None = None
         self._page: Any | None = None
         self._proxy: BrowserPolicyProxy | None = None
+
+    @property
+    def is_started(self) -> bool:
+        page = self._page
+        return page is not None and not page.is_closed()
 
     async def ensure_started(self) -> Any:
         async with self._lock:
@@ -938,3 +957,22 @@ def build_browser_tools(
         BrowserUploadTool(safety_guard, session),
         BrowserDownloadTool(safety_guard, session),
     ]
+
+
+def browser_session_from_tools(
+    tools: Mapping[str, BaseTool],
+) -> BrowserSession | None:
+    """Return the single shared browser session owned by one complete tool family."""
+
+    sessions: dict[int, BrowserSession] = {}
+    for name in BROWSER_TOOL_NAMES:
+        tool = tools.get(name)
+        if tool is None:
+            return None
+        session = getattr(tool, "session", None)
+        if not isinstance(session, BrowserSession):
+            return None
+        sessions[id(session)] = session
+    if len(sessions) != 1:
+        return None
+    return next(iter(sessions.values()))

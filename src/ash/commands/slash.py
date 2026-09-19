@@ -90,6 +90,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "/permissions [mode|allow TOOL|ask TOOL|deny TOOL|revoke TOOL|remove RULE_ID]",
     ),
     SlashCommand("sandbox", "Show active sandbox capabilities", "/sandbox"),
+    SlashCommand(
+        "browser",
+        "Attach or return browser tools at runtime",
+        "/browser [status|connect [URL] [--reuse-storage-state]|disconnect]",
+    ),
     SlashCommand("doctor", "Run local diagnostics", "/doctor"),
     SlashCommand(
         "mcp",

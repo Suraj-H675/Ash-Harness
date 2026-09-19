@@ -26,6 +26,7 @@ from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionMode
 from ash.ui.terminal import TerminalUI
 from ash.tools.command import RunCommandTool, quote_powershell_literal_path
+from ash.tools.browser import BrowserSession, BrowserUnavailableError, build_browser_tools
 from ash.tools.filesystem import ReadFileTool
 from pathlib import Path
 import tempfile
@@ -94,6 +95,205 @@ class StartTool(MyTestTool):
 
     async def start(self):
         self.starts += 1
+
+
+def _browser_tool_map(guard: SafetyGuard, **kwargs):
+    return {tool.name: tool for tool in build_browser_tools(guard, **kwargs)}
+
+
+@pytest.mark.asyncio
+async def test_browser_runtime_failed_attach_preserves_current_tool_family(
+    tmp_path, monkeypatch
+):
+    guard = SafetyGuard(tmp_path)
+    tools = _browser_tool_map(guard)
+    old_session = tools["browser_navigate"].session
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "browser-switch.db"),
+        MockProvider(),
+        guard,
+        object(),
+        tmp_path,
+        tools=tools,
+        config=config,
+    )
+    closed: list[BrowserSession] = []
+
+    async def fake_ensure_started(self: BrowserSession):
+        if self.cdp_url:
+            raise BrowserUnavailableError("attach failed")
+        return object()
+
+    async def fake_close(self: BrowserSession) -> None:
+        closed.append(self)
+
+    monkeypatch.setattr(BrowserSession, "ensure_started", fake_ensure_started)
+    monkeypatch.setattr(BrowserSession, "close", fake_close)
+
+    with pytest.raises(BrowserUnavailableError, match="attach failed"):
+        await loop.configure_browser_runtime(
+            cdp_url="http://127.0.0.1:9222",
+            reuse_storage_state=False,
+        )
+
+    assert loop.tools["browser_navigate"].session is old_session
+    assert all(
+        tool.session is old_session
+        for name, tool in loop.tools.items()
+        if name.startswith("browser_")
+    )
+    assert old_session not in closed
+    assert len(closed) == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_runtime_connect_disconnect_swaps_shared_session_once(
+    tmp_path, monkeypatch
+):
+    guard = SafetyGuard(tmp_path)
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        browser_persistent_profile=True,
+    )
+    tools = _browser_tool_map(
+        guard,
+        profile_path=config.db_directory / "browser-profile",
+    )
+    initial_session = tools["browser_navigate"].session
+    loop = AshLoop(
+        SessionStore(tmp_path / "browser-switch-success.db"),
+        MockProvider(),
+        guard,
+        object(),
+        tmp_path,
+        tools=tools,
+        config=config,
+    )
+    closed: list[BrowserSession] = []
+
+    async def fake_ensure_started(self: BrowserSession):
+        return object()
+
+    async def fake_close(self: BrowserSession) -> None:
+        closed.append(self)
+
+    monkeypatch.setattr(BrowserSession, "ensure_started", fake_ensure_started)
+    monkeypatch.setattr(BrowserSession, "close", fake_close)
+
+    connected = await loop.configure_browser_runtime(
+        cdp_url="http://127.0.0.1:9222",
+        reuse_storage_state=True,
+    )
+    attached_session = loop.tools["browser_navigate"].session
+
+    assert attached_session is not initial_session
+    assert attached_session.cdp_url == "http://127.0.0.1:9222"
+    assert attached_session.cdp_reuse_storage_state is True
+    assert all(
+        tool.session is attached_session
+        for name, tool in loop.tools.items()
+        if name.startswith("browser_")
+    )
+    assert connected["backend"] == "cdp"
+    assert connected["profile"] == "isolated"
+    assert closed == [initial_session]
+
+    disconnected = await loop.configure_browser_runtime(cdp_url=None)
+    managed_session = loop.tools["browser_navigate"].session
+
+    assert managed_session is not attached_session
+    assert managed_session.cdp_url == ""
+    assert managed_session.profile_path == config.db_directory / "browser-profile"
+    assert disconnected["backend"] == "managed"
+    assert disconnected["profile"] == "persistent"
+    assert closed == [initial_session, attached_session]
+    assert config.browser_cdp_url == ""
+    assert config.browser_persistent_profile is True
+
+
+@pytest.mark.asyncio
+async def test_browser_runtime_reconfiguration_is_rejected_during_active_turn(tmp_path):
+    guard = SafetyGuard(tmp_path)
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "browser-switch-running.db"),
+        MockProvider(),
+        guard,
+        object(),
+        tmp_path,
+        tools=_browser_tool_map(guard),
+        config=config,
+    )
+    loop._turn_running = True
+
+    with pytest.raises(RuntimeError, match="while a turn is running"):
+        await loop.configure_browser_runtime(cdp_url="http://127.0.0.1:9222")
+
+
+@pytest.mark.asyncio
+async def test_browser_runtime_cancellation_after_old_close_starts_publishes_candidate(
+    tmp_path, monkeypatch
+):
+    guard = SafetyGuard(tmp_path)
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    tools = _browser_tool_map(guard)
+    old_session = tools["browser_navigate"].session
+    loop = AshLoop(
+        SessionStore(tmp_path / "browser-switch-cancel.db"),
+        MockProvider(),
+        guard,
+        object(),
+        tmp_path,
+        tools=tools,
+        config=config,
+    )
+    old_close_started = asyncio.Event()
+    allow_old_close = asyncio.Event()
+
+    async def fake_ensure_started(self: BrowserSession):
+        return object()
+
+    async def fake_close(self: BrowserSession) -> None:
+        if self is old_session:
+            old_close_started.set()
+            await allow_old_close.wait()
+
+    monkeypatch.setattr(BrowserSession, "ensure_started", fake_ensure_started)
+    monkeypatch.setattr(BrowserSession, "close", fake_close)
+
+    task = asyncio.create_task(
+        loop.configure_browser_runtime(cdp_url="http://127.0.0.1:9222")
+    )
+    await asyncio.wait_for(old_close_started.wait(), timeout=1.0)
+    task.cancel()
+    allow_old_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    published_session = loop.tools["browser_navigate"].session
+    assert published_session is not old_session
+    assert published_session.cdp_url == "http://127.0.0.1:9222"
+    assert all(
+        tool.session is published_session
+        for name, tool in loop.tools.items()
+        if name.startswith("browser_")
+    )
 
 
 @pytest.mark.asyncio

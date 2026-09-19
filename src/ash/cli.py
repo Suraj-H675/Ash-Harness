@@ -55,6 +55,10 @@ MAX_SESSION_IMPORT_BYTES = 50 * 1024 * 1024
 MAX_JSON_SCHEMA_BYTES = 1024 * 1024
 MAX_CLI_INPUT_BYTES = 1_000_000
 MAX_CRON_PROMPT_BYTES = 64 * 1024
+DEFAULT_BROWSER_CDP_URL = "http://127.0.0.1:9222"
+BROWSER_COMMAND_USAGE = (
+    "Usage: /browser [status|connect [URL] [--reuse-storage-state]|disconnect]"
+)
 
 
 @dataclass(frozen=True)
@@ -526,6 +530,76 @@ async def _interactive_model_picker(
         )
     except Exception as exc:
         write_output(f"Error: {exc}", file=sys.stderr)
+
+
+def _render_browser_runtime_status(status: dict[str, Any]) -> str:
+    backend = str(status.get("backend") or "unavailable")
+    started = "started" if bool(status.get("started")) else "not started"
+    if backend == "cdp":
+        endpoint = terminal_safe_text(
+            str(status.get("cdp_url") or ""),
+            single_line=True,
+        )
+        reuse = "enabled" if bool(status.get("reuse_storage_state")) else "disabled"
+        return "\n".join(
+            (
+                "Browser backend: attached via CDP",
+                f"Endpoint: {endpoint}",
+                f"Storage-state reuse: {reuse}",
+                "Context: Ash-owned isolated context",
+                f"Session: {started}",
+                "Control policy: loopback-only CDP; page traffic uses Ash network policy",
+            )
+        )
+    if backend == "managed":
+        profile = terminal_safe_text(
+            str(status.get("profile") or "ephemeral"),
+            single_line=True,
+        )
+        return "\n".join(
+            (
+                "Browser backend: managed Chromium",
+                f"Profile: {profile}",
+                f"Session: {started}",
+                "Page traffic: Ash network policy",
+            )
+        )
+    return "Browser backend: unavailable"
+
+
+async def _handle_browser_command(
+    loop: "AshLoop",
+    config: "AshConfig",
+    arguments: list[str],
+) -> str:
+    action = arguments[0].casefold() if arguments else "status"
+    if action == "status":
+        if len(arguments) != 1 and arguments:
+            raise ValueError(BROWSER_COMMAND_USAGE)
+        return _render_browser_runtime_status(loop.browser_runtime_status())
+    if action == "disconnect":
+        if len(arguments) != 1:
+            raise ValueError(BROWSER_COMMAND_USAGE)
+        status = await loop.configure_browser_runtime(cdp_url=None)
+        return _render_browser_runtime_status(status)
+    if action != "connect":
+        raise ValueError(BROWSER_COMMAND_USAGE)
+
+    cdp_url = ""
+    reuse_storage_state = False
+    for argument in arguments[1:]:
+        if argument == "--reuse-storage-state":
+            reuse_storage_state = True
+            continue
+        if argument.startswith("-") or cdp_url:
+            raise ValueError(BROWSER_COMMAND_USAGE)
+        cdp_url = argument
+    target = cdp_url or config.browser_cdp_url or DEFAULT_BROWSER_CDP_URL
+    status = await loop.configure_browser_runtime(
+        cdp_url=target,
+        reuse_storage_state=reuse_storage_state,
+    )
+    return _render_browser_runtime_status(status)
 
 
 async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
@@ -1578,6 +1652,15 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 )
                 if sandbox_status["remediation"]:
                     print(f"Action: {sandbox_status['remediation']}")
+                continue
+            if command.name == "browser":
+                try:
+                    print(
+                        await _handle_browser_command(loop, config, arguments),
+                        flush=True,
+                    )
+                except (RuntimeError, ValueError) as exc:
+                    _print_classified_error(exc)
                 continue
             if command.name == "doctor":
                 from ash.commands.doctor import render_doctor, run_doctor

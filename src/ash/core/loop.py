@@ -625,6 +625,7 @@ class AshLoop:
         self._mcp_tool_names: set[str] = set()
         self._mcp_tools_by_server: dict[str, set[str]] = {}
         self._mcp_reload_lock = asyncio.Lock()
+        self._browser_reload_lock = asyncio.Lock()
         self._retired_mcp_runtimes: set[Any] = set()
         self._closing = False
         self._closed = False
@@ -691,14 +692,16 @@ class AshLoop:
                     )
             self._mcp_tool_names.clear()
             self._mcp_tools_by_server.clear()
-            tool_outcomes = await asyncio.gather(
-                *(tool.aclose() for tool in self.tools.values()),
-                return_exceptions=True,
-            )
+            async with self._browser_reload_lock:
+                closing_tools = list(self.tools.values())
+                tool_outcomes = await asyncio.gather(
+                    *(tool.aclose() for tool in closing_tools),
+                    return_exceptions=True,
+                )
             tool_failures = [
                 (tool.name, outcome)
                 for tool, outcome in zip(
-                    self.tools.values(), tool_outcomes, strict=True
+                    closing_tools, tool_outcomes, strict=True
                 )
                 if isinstance(outcome, BaseException)
             ]
@@ -1052,6 +1055,141 @@ class AshLoop:
             tool.set_event_sink(self._emit_event)
         self.tools.update(next_tools)
         self._plugin_tool_names = set(next_tools)
+
+    def browser_runtime_status(self) -> dict[str, Any]:
+        """Describe the browser tool family's currently published backend."""
+
+        from ash.tools.browser import browser_session_from_tools
+
+        session = browser_session_from_tools(self.tools)
+        if session is None:
+            return {
+                "backend": "unavailable",
+                "cdp_url": "",
+                "reuse_storage_state": False,
+                "profile": "unavailable",
+                "started": False,
+            }
+        return {
+            "backend": "cdp" if session.cdp_url else "managed",
+            "cdp_url": session.cdp_url,
+            "reuse_storage_state": session.cdp_reuse_storage_state,
+            "profile": (
+                "isolated"
+                if session.cdp_url
+                else "persistent"
+                if session.profile_path is not None
+                else "ephemeral"
+            ),
+            "started": session.is_started,
+        }
+
+    async def configure_browser_runtime(
+        self,
+        *,
+        cdp_url: str | None,
+        reuse_storage_state: bool = False,
+    ) -> dict[str, Any]:
+        """Preflight and atomically replace the browser tool family's shared session."""
+
+        from ash.tools.browser import (
+            BROWSER_TOOL_NAMES,
+            _settle_browser_cleanup_task,
+            browser_session_from_tools,
+            build_browser_tools,
+        )
+
+        config = self._config
+        if config is None:
+            raise RuntimeError("browser runtime reconfiguration requires AshConfig")
+        if reuse_storage_state and not cdp_url:
+            raise ValueError("storage-state reuse requires a CDP endpoint")
+
+        async with self._browser_reload_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("cannot reconfigure browser after loop shutdown")
+            if self._turn_running:
+                raise RuntimeError("cannot reconfigure browser while a turn is running")
+
+            profile_path = (
+                config.db_directory / "browser-profile"
+                if not cdp_url and config.browser_persistent_profile
+                else None
+            )
+            candidate_list = build_browser_tools(
+                self.safety_guard,
+                headless=config.browser_headless,
+                timeout_seconds=config.browser_timeout_seconds,
+                allowed_domains=config.allowed_web_domains,
+                profile_path=profile_path,
+                cdp_url=cdp_url,
+                cdp_reuse_storage_state=reuse_storage_state,
+            )
+            candidate_tools = {tool.name: tool for tool in candidate_list}
+            if set(candidate_tools) != BROWSER_TOOL_NAMES:
+                raise RuntimeError("browser tool family is incomplete")
+            candidate_session = browser_session_from_tools(candidate_tools)
+            if candidate_session is None:
+                raise RuntimeError("browser tools do not share one session")
+
+            async def close_candidate() -> tuple[BaseException | None, bool]:
+                task = asyncio.create_task(
+                    candidate_session.close(),
+                    name="ash-browser-candidate-cleanup",
+                )
+                return await _settle_browser_cleanup_task(task)
+
+            try:
+                await candidate_session.ensure_started()
+                for tool in candidate_tools.values():
+                    await tool.start()
+            except BaseException as primary:
+                cleanup_error, cleanup_cancelled = await close_candidate()
+                if cleanup_error is not None:
+                    primary.add_note(f"browser candidate cleanup failed: {cleanup_error}")
+                if cleanup_cancelled:
+                    primary.add_note("browser candidate cleanup was cancelled")
+                raise
+
+            old_session = browser_session_from_tools(self.tools)
+            current_browser_names = BROWSER_TOOL_NAMES & self.tools.keys()
+            if current_browser_names != BROWSER_TOOL_NAMES or old_session is None:
+                cleanup_error, cleanup_cancelled = await close_candidate()
+                if cleanup_error is not None:
+                    raise RuntimeError(
+                        f"browser candidate cleanup failed: {cleanup_error}"
+                    ) from cleanup_error
+                if cleanup_cancelled:
+                    raise asyncio.CancelledError
+                raise RuntimeError("current browser tool family is incomplete")
+
+            close_task = asyncio.create_task(
+                old_session.close(),
+                name="ash-browser-runtime-replacement-cleanup",
+            )
+            close_error, close_cancelled = await _settle_browser_cleanup_task(close_task)
+            if close_error is not None:
+                candidate_error, candidate_cancelled = await close_candidate()
+                if candidate_error is not None:
+                    close_error.add_note(
+                        f"browser candidate cleanup failed: {candidate_error}"
+                    )
+                if candidate_cancelled:
+                    close_error.add_note("browser candidate cleanup was cancelled")
+                raise RuntimeError("failed to close the current browser session") from close_error
+
+            for name in BROWSER_TOOL_NAMES:
+                old_tool = self.tools.pop(name)
+                self._started_tool_ids.discard(id(old_tool))
+            for tool in candidate_tools.values():
+                tool.set_event_sink(self._emit_event)
+            self.tools.update(candidate_tools)
+            self._started_tool_ids.update(id(tool) for tool in candidate_tools.values())
+            self._prune_tool_search_activations()
+            status = self.browser_runtime_status()
+            if close_cancelled:
+                raise asyncio.CancelledError
+            return status
 
     async def _start_mcp_runtime(self) -> None:
         async with self._mcp_reload_lock:

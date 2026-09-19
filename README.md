@@ -262,9 +262,15 @@ provides:
 - disabled service workers and blocked password-field filling;
 - ephemeral contexts by default;
 - optional Ash-owned persistent browser profiles; and
+- runtime `/browser connect` / `disconnect` / `status` switching for a
+  loopback Chromium CDP endpoint, with candidate preflight and an Ash-owned
+  isolated context;
+- explicit `--reuse-storage-state` copying of bounded cookies/local storage
+  from the attached browser into Ash's isolated context; and
 - deterministic browser cleanup and health diagnostics.
 
-Attaching to an already-running browser through CDP is not currently exposed.
+Remote CDP endpoints and direct ownership/control of pre-existing browser tabs
+remain intentionally unsupported.
 
 ### MCP integration
 
@@ -421,7 +427,7 @@ Ash deliberately reports unsupported or partial surfaces instead of pretending
 they are complete:
 
 - subscription-based provider authentication is not included;
-- browser CDP attachment is not exposed;
+- remote browser CDP and direct takeover of pre-existing tabs are not exposed;
 - ACP image/audio/embedded-resource and advanced session capabilities are not
   advertised until their full behavior is implemented;
 - A2A push notifications, file/data modalities, extended cards, gRPC, and
