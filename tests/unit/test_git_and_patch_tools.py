@@ -20,6 +20,7 @@ from ash.tools.git import (
     git_dirty_paths,
 )
 from ash.tools.patch import ApplyPatchTool
+from ash.tools.patch import _git_apply
 
 
 async def _git(root: Path, *args: str) -> None:
@@ -276,6 +277,139 @@ async def test_run_git_uses_supplied_sandbox_manager(
         assert Path(command[0]).is_absolute()
     else:
         assert command[0] == expected_executable
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_run_git_cwd_swap_cannot_escape_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox import process_utils as process_utils_module
+
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    outside.mkdir()
+    await _init_repo(workspace)
+    await _init_repo(outside)
+    real_prepare = process_utils_module.prepare_process_tree
+    swapped = False
+
+    def prepare_then_swap(*args, **kwargs):
+        nonlocal swapped
+        plan = real_prepare(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            workspace.rename(saved)
+            try:
+                workspace.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"Symlink creation is unavailable: {exc}")
+        return plan
+
+    monkeypatch.setattr("ash.tools.git.prepare_process_tree", prepare_then_swap)
+
+    code, stdout, stderr = await _run_git(workspace, ["rev-parse", "--show-toplevel"])
+
+    assert swapped is True
+    assert code == 0, stderr
+    assert Path(stdout.strip()).resolve() == saved.resolve()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_git_apply_cwd_swap_cannot_escape_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox import process_utils as process_utils_module
+
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    outside.mkdir()
+    real_prepare = process_utils_module.prepare_process_tree
+    swapped = False
+
+    def prepare_then_swap(*args, **kwargs):
+        nonlocal swapped
+        plan = real_prepare(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            workspace.rename(saved)
+            try:
+                workspace.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"Symlink creation is unavailable: {exc}")
+        return plan
+
+    monkeypatch.setattr("ash.tools.patch.prepare_process_tree", prepare_then_swap)
+    patch_text = """diff --git a/marker.txt b/marker.txt
+new file mode 100644
+--- /dev/null
++++ b/marker.txt
+@@ -0,0 +1 @@
++safe
+"""
+
+    code, stdout, stderr = await _git_apply(workspace, patch_text, check=False)
+
+    assert swapped is True
+    assert code == 0, stderr
+    assert not (outside / "marker.txt").exists()
+    assert (saved / "marker.txt").read_text(encoding="utf-8") == "safe\n"
+
+
+@pytest.mark.asyncio
+async def test_run_git_fails_closed_when_stable_cwd_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    from ash.sandbox.process_utils import ProcessTreeUnavailable
+
+    with (
+        patch(
+            "ash.tools.git.prepare_scoped_process_launch",
+            side_effect=ProcessTreeUnavailable("stable cwd unavailable"),
+        ),
+        patch("ash.tools.git.asyncio.create_subprocess_exec", AsyncMock()) as create,
+    ):
+        code, stdout, stderr = await _run_git(tmp_path, ["status"])
+
+    assert code == 126
+    assert stdout == ""
+    assert "stable cwd unavailable" in stderr
+    create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_git_apply_fails_closed_when_stable_cwd_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    from ash.sandbox.process_utils import ProcessTreeUnavailable
+
+    patch_text = """diff --git a/marker.txt b/marker.txt
+new file mode 100644
+--- /dev/null
++++ b/marker.txt
+@@ -0,0 +1 @@
++safe
+"""
+    with (
+        patch(
+            "ash.tools.patch.prepare_scoped_process_launch",
+            side_effect=ProcessTreeUnavailable("stable cwd unavailable"),
+        ),
+        patch("ash.tools.patch.asyncio.create_subprocess_exec", AsyncMock()) as create,
+    ):
+        code, stdout, stderr = await _git_apply(tmp_path, patch_text, check=False)
+
+    assert code == 126
+    assert stdout == ""
+    assert "stable cwd unavailable" in stderr
+    create.assert_not_awaited()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX Git hook fixture")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 from pathlib import Path
 from typing import Any
@@ -11,12 +12,14 @@ from pydantic import BaseModel, Field
 
 from ash.safety.environment import resolve_host_executable
 from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import ScopedIOError
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
     ProcessTreeError,
     ProcessTreeUnavailable,
     communicate_process,
     prepare_process_tree,
+    prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
@@ -127,22 +130,37 @@ async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, s
     git = resolve_host_executable("git", workspace_root=cwd, cwd=cwd)
     if git is None:
         return 127, "", "git is unavailable outside the workspace"
-    try:
-        process_tree_plan = prepare_process_tree(workspace_root=cwd)
-    except ProcessTreeUnavailable as exc:
-        return 126, "", f"git apply was not started: {exc}"
     command = [git, "apply", "--whitespace=nowarn"]
     if check:
         command.append("--check")
     command.append("-")
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        cwd=cwd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        **process_tree_plan.spawn_options,
-    )
+    cwd_guard = SafetyGuard(cwd)
+    try:
+        with prepare_scoped_process_launch(
+            command,
+            cwd=cwd,
+            guard=cwd_guard,
+            search_path=os.environ.get("PATH"),
+        ) as launch:
+            try:
+                process_tree_plan = prepare_process_tree(
+                    workspace_root=cwd_guard.project_root
+                )
+            except ProcessTreeUnavailable as exc:
+                return 126, "", f"git apply was not started: {exc}"
+            spawn_options = dict(process_tree_plan.spawn_options)
+            if launch.pass_fds:
+                spawn_options["pass_fds"] = launch.pass_fds
+            process = await asyncio.create_subprocess_exec(
+                *launch.argv,
+                cwd=launch.cwd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **spawn_options,
+            )
+    except (ProcessTreeUnavailable, SafetyViolation, ScopedIOError) as exc:
+        return 126, "", f"git apply was not started: {exc}"
     try:
         stdout, stderr = await asyncio.wait_for(
             communicate_process(

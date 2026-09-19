@@ -21,8 +21,8 @@ from ash.core.redaction import find_secret_candidates
 from ash.safe_io import read_bounded_bytes
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.safety.git import read_only_git_args, read_only_git_environment
-from ash.safety.guard import SafetyGuard
-from ash.safety.scoped_io import snapshot_scoped_file
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import ScopedIOError, snapshot_scoped_file
 from ash.sandbox import SandboxBackendUnavailable, SandboxManager
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
@@ -30,6 +30,7 @@ from ash.sandbox.process_utils import (
     ProcessTreeUnavailable,
     communicate_process,
     prepare_process_tree,
+    prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
@@ -767,18 +768,33 @@ async def _run_git(
                 result.stderr or f"git output exceeded {DEFAULT_GIT_OUTPUT_LIMIT} bytes",
             )
         return result.exit_code, result.stdout, result.stderr
+    cwd_guard = SafetyGuard(cwd)
     try:
-        process_tree_plan = prepare_process_tree(workspace_root=cwd)
-    except ProcessTreeUnavailable as exc:
+        with prepare_scoped_process_launch(
+            cmd,
+            cwd=cwd,
+            guard=cwd_guard,
+            search_path=environment.get("PATH"),
+        ) as launch:
+            try:
+                process_tree_plan = prepare_process_tree(
+                    workspace_root=cwd_guard.project_root
+                )
+            except ProcessTreeUnavailable as exc:
+                return 126, "", f"git command was not started: {exc}"
+            spawn_options = dict(process_tree_plan.spawn_options)
+            if launch.pass_fds:
+                spawn_options["pass_fds"] = launch.pass_fds
+            process = await asyncio.create_subprocess_exec(
+                *launch.argv,
+                cwd=launch.cwd,
+                env=environment,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **spawn_options,
+            )
+    except (ProcessTreeUnavailable, SafetyViolation, ScopedIOError) as exc:
         return 126, "", f"git command was not started: {exc}"
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(cwd),
-        env=environment,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        **process_tree_plan.spawn_options,
-    )
     try:
         stdout, stderr = await asyncio.wait_for(
             communicate_process(
