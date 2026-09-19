@@ -108,7 +108,7 @@ class CatalogOpenAIProvider(OpenAIProvider):
             modalities = frozenset().union(*(item.input_modalities for item in matched))
             native_tools = _merge_capability_boolean(
                 [item.native_tools for item in matched],
-                fallback="tools" in params,
+                fallback=self.provider_family != "vllm" and "tools" in params,
             )
             vision = _merge_capability_boolean(
                 [item.vision for item in matched],

@@ -283,6 +283,63 @@ def test_local_openai_compatible_catalog_providers_are_anonymous(
 
 
 @pytest.mark.asyncio
+async def test_vllm_supported_tools_parameter_does_not_enable_native_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    provider = create_default_provider_registry().build(
+        AshConfig(model="vllm/local-model")
+    )
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata",
+        lambda *args, **kwargs: (
+            ProviderModelMetadata(
+                model_id="local-model",
+                supported_parameters=frozenset({"tools"}),
+                context_window=32_768,
+            ),
+        ),
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        local=True,
+        context_window=32_768,
+    )
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_vllm_explicit_tool_capability_enables_native_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    provider = create_default_provider_registry().build(
+        AshConfig(model="vllm/local-model")
+    )
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata",
+        lambda *args, **kwargs: (
+            ProviderModelMetadata(
+                model_id="local-model",
+                native_tools=True,
+                context_window=32_768,
+            ),
+        ),
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        native_tools=True,
+        local=True,
+        context_window=32_768,
+    )
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
 async def test_custom_anonymous_openai_compatible_provider_builds_without_bearer_auth() -> (
     None
 ):
