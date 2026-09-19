@@ -462,6 +462,7 @@ class AshLoop:
         provider_circuit_breaker: ProviderCircuitBreaker | None = None,
         system_prompt: str | None = None,
         additional_instructions: str = "",
+        additional_instructions_loader: Callable[[], str] | None = None,
         token_counter: TokenCounterLike | None = None,
         max_turn_iterations: int = DEFAULT_MAX_TURN_ITERATIONS,
         repo_map: RepoMap | None = None,
@@ -522,13 +523,13 @@ class AshLoop:
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self._generated_system_prompt = not bool(system_prompt)
         self._additional_instructions = additional_instructions
-        self.system_prompt = system_prompt or _default_system_prompt(
+        self._additional_instructions_loader = additional_instructions_loader
+        self._core_system_prompt = system_prompt or _default_system_prompt(
             project_root,
             native_tools=_provider_capabilities(provider).native_tools,
         )
-        if additional_instructions:
-            self.system_prompt = f"{self.system_prompt}\n\n{additional_instructions}"
-        self._base_system_prompt = self.system_prompt
+        self._base_system_prompt = self._compose_base_system_prompt()
+        self.system_prompt = self._base_system_prompt
         self.token_counter = token_counter
         self.max_turn_iterations = max_turn_iterations
         if max_steering_messages < 1:
@@ -808,8 +809,40 @@ class AshLoop:
             else XML_TOOL_PROTOCOL
         )
         previous = XML_TOOL_PROTOCOL if desired == NATIVE_TOOL_PROTOCOL else NATIVE_TOOL_PROTOCOL
-        self._base_system_prompt = self._base_system_prompt.replace(previous, desired)
-        self.system_prompt = self.system_prompt.replace(previous, desired)
+        self._core_system_prompt = self._core_system_prompt.replace(previous, desired)
+        self._replace_base_system_prompt(self._compose_base_system_prompt())
+
+    def _compose_base_system_prompt(self) -> str:
+        if self._additional_instructions:
+            return f"{self._core_system_prompt}\n\n{self._additional_instructions}"
+        return self._core_system_prompt
+
+    def _replace_base_system_prompt(self, replacement: str) -> None:
+        previous = self._base_system_prompt
+        suffix = ""
+        if self.system_prompt == previous:
+            pass
+        elif self.system_prompt.startswith(previous):
+            suffix = self.system_prompt[len(previous) :]
+        else:
+            self._base_system_prompt = replacement
+            return
+        self._base_system_prompt = replacement
+        self.system_prompt = f"{replacement}{suffix}"
+
+    def _refresh_additional_instructions(self) -> None:
+        loader = self._additional_instructions_loader
+        if loader is None:
+            return
+        try:
+            refreshed = loader()
+        except (OSError, UnicodeError, ValueError) as exc:
+            _log.warning("Could not refresh project instructions: %s", exc)
+            return
+        if refreshed == self._additional_instructions:
+            return
+        self._additional_instructions = refreshed
+        self._replace_base_system_prompt(self._compose_base_system_prompt())
 
     async def start_session(self, session_id: str | None = None) -> Session:
         """Create a new session or restore one by id."""
@@ -3209,6 +3242,7 @@ class AshLoop:
     ) -> list[dict[str, Any]]:
         """Build the messages payload for the provider."""
 
+        self._refresh_additional_instructions()
         system_content = f"{self.system_prompt}\n\n{UNTRUSTED_CONTENT_BOUNDARY}"
         try:
             from ash.plugins.skills import ListSkillsTool, render_available_skills

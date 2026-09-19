@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from ash.context.instructions import MAX_INSTRUCTION_FILE_BYTES
 from ash.runtime import build_runtime, build_tools
 from ash.context.turn import TurnContext
 from ash.config import AshConfig
@@ -62,6 +63,148 @@ def test_trusted_runtime_loads_agents_md_project_instructions(
     assert marker in runtime.loop.system_prompt
     assert str(agents) in runtime.loop.system_prompt
     asyncio.run(runtime.loop.aclose())
+
+
+def test_trusted_runtime_refreshes_changed_project_instructions_each_turn(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    agents = workspace / "AGENTS.md"
+    agents.write_text("initial runtime instruction", encoding="utf-8")
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+
+    async def exercise() -> None:
+        session = await runtime.loop.start_session()
+        before = runtime.loop._build_messages(session)[0]["content"]
+        assert "initial runtime instruction" in before
+        session_suffix = "PRESERVE_SESSION_PROMPT_SUFFIX"
+        runtime.loop.system_prompt = f"{runtime.loop.system_prompt}\n\n{session_suffix}"
+
+        agents.write_text("updated runtime instruction", encoding="utf-8")
+        after = runtime.loop._build_messages(session)[0]["content"]
+        assert "updated runtime instruction" in after
+        assert "initial runtime instruction" not in after
+        assert session_suffix in after
+
+        agents.unlink()
+        after_delete = runtime.loop._build_messages(session)[0]["content"]
+        assert "updated runtime instruction" not in after_delete
+        assert session_suffix in after_delete
+        await runtime.loop.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_runtime_instruction_refresh_keeps_last_good_on_read_failure(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    agents = workspace / "AGENTS.md"
+    marker = "last known good runtime instruction"
+    agents.write_text(marker, encoding="utf-8")
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+
+    async def exercise() -> None:
+        session = await runtime.loop.start_session()
+        assert marker in runtime.loop._build_messages(session)[0]["content"]
+
+        agents.write_bytes(b"x" * (MAX_INSTRUCTION_FILE_BYTES + 1))
+        after_failure = runtime.loop._build_messages(session)[0]["content"]
+        assert marker in after_failure
+        await runtime.loop.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_runtime_instruction_refresh_does_not_follow_external_symlink(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    agents = workspace / "AGENTS.md"
+    agents.write_text("safe runtime instruction", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("OUTSIDE_RUNTIME_INSTRUCTION_SECRET", encoding="utf-8")
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+
+    async def exercise() -> None:
+        session = await runtime.loop.start_session()
+        assert "safe runtime instruction" in runtime.loop._build_messages(session)[0][
+            "content"
+        ]
+        saved = workspace / "AGENTS.saved.md"
+        agents.rename(saved)
+        try:
+            try:
+                agents.symlink_to(outside)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+            refreshed = runtime.loop._build_messages(session)[0]["content"]
+            assert "OUTSIDE_RUNTIME_INSTRUCTION_SECRET" not in refreshed
+        finally:
+            if agents.is_symlink():
+                agents.unlink()
+            if saved.exists():
+                saved.rename(agents)
+        await runtime.loop.aclose()
+
+    asyncio.run(exercise())
 
 
 def test_runtime_file_checkpoint_owns_and_finalizes_provider_tool_call(tmp_path) -> None:

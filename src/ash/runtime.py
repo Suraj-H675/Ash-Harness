@@ -420,15 +420,21 @@ def build_runtime(
         lsp_manager=lsp_manager,
     )
 
-    instruction_diagnostics: list[InstructionDiagnostic] = []
-    instructions = render_instructions(
-        discover_instructions(
-            config.workspace_root,
-            include_project=trusted,
-            diagnostics=instruction_diagnostics,
-        ),
-        instruction_diagnostics,
-    )
+    instruction_current_directory = Path.cwd().expanduser().resolve()
+
+    def load_runtime_instructions() -> str:
+        instruction_diagnostics: list[InstructionDiagnostic] = []
+        return render_instructions(
+            discover_instructions(
+                config.workspace_root,
+                include_project=trusted,
+                current_directory=instruction_current_directory,
+                diagnostics=instruction_diagnostics,
+            ),
+            instruction_diagnostics,
+        )
+
+    instructions = load_runtime_instructions()
     project_hook_environment = (("ASH_PROJECT_ROOT", str(config.workspace_root)),)
     hook_sources: list[Path | HookConfigSource] = [
         HookConfigSource(
@@ -514,6 +520,7 @@ def build_runtime(
         tools=tools,
         hooks=hooks,
         additional_instructions=instructions,
+        additional_instructions_loader=load_runtime_instructions,
         config=config,
         max_steering_messages=config.steering_queue_limit,
         planner=Planner(active_provider) if config.enable_sprint_planning else None,

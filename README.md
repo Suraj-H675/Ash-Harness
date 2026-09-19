@@ -126,7 +126,8 @@ Ash manages context as a first-class runtime resource:
 - bounded pruning of stale large tool results;
 - persistent global `~/.ash/ASH.md` plus trusted hierarchical project
   instructions with ordered `ASH.md` → `AGENTS.md` → `CLAUDE.md`
-  compatibility fallbacks, bounded imports, diagnostics, and conflict linting;
+  compatibility fallbacks, live refresh between model iterations, bounded imports,
+  diagnostics, and conflict linting;
 - project-root-aware repository maps with active-file ranking;
 - searchable redacted session memory;
 - explicit project memory indexing, search, clear, and privacy export;
