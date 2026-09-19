@@ -2026,6 +2026,157 @@ async def test_loop_shutdown_surfaces_retired_provider_close_failure(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_loop_shutdown_retry_does_not_reclose_successful_resources(tmp_path):
+    class FailingRetiredProvider(MockProvider):
+        async def aclose(self):
+            raise RuntimeError("retired provider close failed")
+
+    class CountingProvider(MockProvider):
+        def __init__(self):
+            self.close_calls = 0
+
+        async def aclose(self):
+            self.close_calls += 1
+            await super().aclose()
+
+    class CountingTool(MyTestTool):
+        name = "counting_tool"
+
+        def __init__(self, guard):
+            super().__init__(guard)
+            self.close_calls = 0
+
+        async def aclose(self):
+            self.close_calls += 1
+            await super().aclose()
+
+    guard = SafetyGuard(tmp_path)
+    tool = CountingTool(guard)
+    current_provider = CountingProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "shutdown-retry.db"),
+        FailingRetiredProvider(),
+        guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+        config=AshConfig(
+            model="ollama/test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+        ),
+    )
+    await loop.start_session()
+
+    with patch("ash.cli._build_provider") as build_provider:
+        build_provider.return_value = current_provider
+        loop.switch_provider("openai", "next")
+
+    await asyncio.sleep(0)
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="failed to close 1 retired provider"):
+            await loop.aclose()
+
+    assert current_provider.close_calls == 1
+    assert tool.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_loop_shutdown_retry_retries_failed_tool_cleanup(tmp_path):
+    class FlakyTool(MyTestTool):
+        name = "flaky_tool"
+
+        def __init__(self, guard):
+            super().__init__(guard)
+            self.close_calls = 0
+
+        async def aclose(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("temporary tool close failure")
+            await super().aclose()
+
+    guard = SafetyGuard(tmp_path)
+    tool = FlakyTool(guard)
+    loop = AshLoop(
+        SessionStore(tmp_path / "tool-close-retry.db"),
+        MockProvider(),
+        guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+        config=AshConfig(
+            model="ollama/test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+        ),
+    )
+    await loop.start_session()
+
+    with pytest.raises(RuntimeError, match="failed to close 1 tool"):
+        await loop.aclose()
+
+    assert tool.close_calls == 1
+    await loop.aclose()
+    assert tool.close_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_loop_shutdown_retry_retries_failed_provider_cleanup(tmp_path):
+    class FlakyProvider(MockProvider):
+        def __init__(self):
+            self.close_calls = 0
+
+        async def aclose(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("temporary provider close failure")
+            await super().aclose()
+
+    class CountingTool(MyTestTool):
+        name = "provider_retry_tool"
+
+        def __init__(self, guard):
+            super().__init__(guard)
+            self.close_calls = 0
+
+        async def aclose(self):
+            self.close_calls += 1
+            await super().aclose()
+
+    guard = SafetyGuard(tmp_path)
+    provider = FlakyProvider()
+    tool = CountingTool(guard)
+    loop = AshLoop(
+        SessionStore(tmp_path / "provider-close-retry.db"),
+        provider,
+        guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+        config=AshConfig(
+            model="ollama/test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+        ),
+    )
+    await loop.start_session()
+
+    with pytest.raises(RuntimeError, match="temporary provider close failure"):
+        await loop.aclose()
+
+    assert provider.close_calls == 1
+    assert tool.close_calls == 1
+    await loop.aclose()
+    assert provider.close_calls == 2
+    assert tool.close_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_loop_shutdown_waits_for_multiple_rapid_provider_retirements(tmp_path):
     first_started = asyncio.Event()
     second_started = asyncio.Event()

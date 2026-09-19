@@ -524,6 +524,7 @@ class AshLoop:
         self.project_root = project_root
         self.tools: dict[str, BaseTool] = dict(tools or {})
         self._started_tool_ids: set[int] = set()
+        self._closed_tool_ids: set[int] = set()
         search_tool = self.tools.get("search_tools")
         set_catalog_provider = getattr(search_tool, "set_catalog_provider", None)
         if callable(set_catalog_provider):
@@ -648,6 +649,7 @@ class AshLoop:
         self._retired_mcp_runtimes: set[Any] = set()
         self._retired_provider_close_tasks: set[asyncio.Task[None]] = set()
         self._retired_provider_close_errors: list[BaseException] = []
+        self._provider_closed = False
         self._closing = False
         self._closed = False
         self._mcp_configs = dict(mcp_configs or {})
@@ -714,11 +716,24 @@ class AshLoop:
             self._mcp_tool_names.clear()
             self._mcp_tools_by_server.clear()
             async with self._browser_reload_lock:
-                closing_tools = list(self.tools.values())
+                closing_tools = [
+                    tool
+                    for tool in self.tools.values()
+                    if id(tool) not in self._closed_tool_ids
+                ]
                 tool_outcomes = await asyncio.gather(
                     *(tool.aclose() for tool in closing_tools),
                     return_exceptions=True,
                 )
+            self._closed_tool_ids.update(
+                id(tool)
+                for tool, outcome in zip(
+                    closing_tools,
+                    tool_outcomes,
+                    strict=True,
+                )
+                if not isinstance(outcome, BaseException)
+            )
             tool_failures = [
                 (tool.name, outcome)
                 for tool, outcome in zip(
@@ -733,10 +748,13 @@ class AshLoop:
                 )
             retired_provider_errors = tuple(self._retired_provider_close_errors)
             provider_error: BaseException | None = None
-            try:
-                await self.provider.aclose()
-            except BaseException as exc:
-                provider_error = exc
+            if not self._provider_closed:
+                try:
+                    await self.provider.aclose()
+                except BaseException as exc:
+                    provider_error = exc
+                else:
+                    self._provider_closed = True
             if tool_failures:
                 details = "; ".join(
                     f"{name}: {str(error)[:500]}"
@@ -3775,6 +3793,7 @@ class AshLoop:
         new_config = self._config.model_copy(update={"model": model_str})
         old_provider = self.provider
         self.provider = _build_provider(new_config)
+        self._provider_closed = False
         self._config = new_config
         self._provider_circuit_key = _provider_circuit_key(self.provider)
         self._sync_generated_tool_protocol()
@@ -3810,6 +3829,7 @@ class AshLoop:
             )
         old_provider = self.provider
         self.provider = _build_provider(new_config)
+        self._provider_closed = False
         self._config = new_config
         self._provider_circuit_key = _provider_circuit_key(self.provider)
         self._sync_generated_tool_protocol()
