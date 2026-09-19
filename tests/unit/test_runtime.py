@@ -207,6 +207,249 @@ def test_runtime_instruction_refresh_does_not_follow_external_symlink(
     asyncio.run(exercise())
 
 
+def test_runtime_activates_nested_instructions_after_reading_scoped_file(
+    tmp_path, monkeypatch
+) -> None:
+    class NestedInstructionProvider(ProviderABC):
+        model_name = "nested-instruction-model"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.system_prompts: list[str] = []
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            self.system_prompts.append(str(messages[0]["content"]))
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "read-nested-file",
+                            "name": "read_file",
+                            "arguments": {
+                                "file_path": "packages/api/src/app.py",
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="done", is_done=True)
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    api = workspace / "packages" / "api"
+    sibling = workspace / "packages" / "web"
+    (home / ".ash").mkdir(parents=True)
+    (api / "src").mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    (api / "src" / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (api / "AGENTS.md").write_text(
+        "API_NESTED_RUNTIME_RULE_71C9", encoding="utf-8"
+    )
+    (sibling / "AGENTS.md").write_text(
+        "SIBLING_WEB_RULE_MUST_NOT_LOAD_44D2", encoding="utf-8"
+    )
+    provider = NestedInstructionProvider()
+    config = AshConfig(
+        model="ollama/nested-instruction-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=provider,
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+
+    async def exercise() -> None:
+        assert await runtime.loop.run_turn("inspect the API implementation") == "done"
+        await runtime.loop.aclose()
+
+    asyncio.run(exercise())
+
+    assert len(provider.system_prompts) == 2
+    assert "API_NESTED_RUNTIME_RULE_71C9" not in provider.system_prompts[0]
+    assert "API_NESTED_RUNTIME_RULE_71C9" in provider.system_prompts[1]
+    assert "SIBLING_WEB_RULE_MUST_NOT_LOAD_44D2" not in provider.system_prompts[1]
+
+
+def test_runtime_combines_parallel_nested_instruction_scopes_then_narrows(
+    tmp_path, monkeypatch
+) -> None:
+    class MultiScopeProvider(ProviderABC):
+        model_name = "multi-scope-model"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.system_prompts: list[str] = []
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            self.system_prompts.append(str(messages[0]["content"]))
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "read-api",
+                            "name": "read_file",
+                            "arguments": {"file_path": "packages/api/src/app.py"},
+                        },
+                        {
+                            "id": "read-web",
+                            "name": "read_file",
+                            "arguments": {"file_path": "packages/web/src/app.ts"},
+                        },
+                    ],
+                    is_done=True,
+                )
+            elif self.calls == 2:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "read-api-again",
+                            "name": "read_file",
+                            "arguments": {"file_path": "packages/api/src/app.py"},
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="done", is_done=True)
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    api = workspace / "packages" / "api"
+    web = workspace / "packages" / "web"
+    (home / ".ash").mkdir(parents=True)
+    (api / "src").mkdir(parents=True)
+    (web / "src").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    (api / "src" / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (web / "src" / "app.ts").write_text("export const value = 1\n", encoding="utf-8")
+    (api / "AGENTS.md").write_text("API_SCOPE_RULE_F61A", encoding="utf-8")
+    (web / "CLAUDE.md").write_text("WEB_SCOPE_RULE_8C3D", encoding="utf-8")
+    provider = MultiScopeProvider()
+    config = AshConfig(
+        model="ollama/multi-scope-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=provider,
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+
+    async def exercise() -> None:
+        assert await runtime.loop.run_turn("inspect both packages") == "done"
+        await runtime.loop.aclose()
+
+    asyncio.run(exercise())
+
+    assert len(provider.system_prompts) == 3
+    assert "API_SCOPE_RULE_F61A" not in provider.system_prompts[0]
+    assert "WEB_SCOPE_RULE_8C3D" not in provider.system_prompts[0]
+    assert "API_SCOPE_RULE_F61A" in provider.system_prompts[1]
+    assert "WEB_SCOPE_RULE_8C3D" in provider.system_prompts[1]
+    assert "API_SCOPE_RULE_F61A" in provider.system_prompts[2]
+    assert "WEB_SCOPE_RULE_8C3D" not in provider.system_prompts[2]
+
+
+def test_untrusted_runtime_does_not_activate_nested_project_instructions(
+    tmp_path, monkeypatch
+) -> None:
+    class UntrustedScopeProvider(ProviderABC):
+        model_name = "untrusted-scope-model"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.system_prompts: list[str] = []
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            self.system_prompts.append(str(messages[0]["content"]))
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "read-untrusted-nested",
+                            "name": "read_file",
+                            "arguments": {"file_path": "packages/api/src/app.py"},
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(content="done", is_done=True)
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    api = workspace / "packages" / "api"
+    (home / ".ash").mkdir(parents=True)
+    (api / "src").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    (api / "src" / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (api / "AGENTS.md").write_text(
+        "UNTRUSTED_NESTED_RULE_MUST_NOT_LOAD_E12A", encoding="utf-8"
+    )
+    provider = UntrustedScopeProvider()
+    config = AshConfig(
+        model="ollama/untrusted-scope-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=provider,
+        workspace_trusted=False,
+        run_maintenance=False,
+    )
+
+    async def exercise() -> None:
+        assert await runtime.loop.run_turn("inspect the API implementation") == "done"
+        await runtime.loop.aclose()
+
+    asyncio.run(exercise())
+
+    assert len(provider.system_prompts) == 2
+    assert "UNTRUSTED_NESTED_RULE_MUST_NOT_LOAD_E12A" not in provider.system_prompts[0]
+    assert "UNTRUSTED_NESTED_RULE_MUST_NOT_LOAD_E12A" not in provider.system_prompts[1]
+
+
 def test_runtime_file_checkpoint_owns_and_finalizes_provider_tool_call(tmp_path) -> None:
     (tmp_path / "file.txt").write_text("before", encoding="utf-8")
     config = AshConfig(

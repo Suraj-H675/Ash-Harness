@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 import shlex
@@ -37,6 +38,21 @@ def discover_instructions(
     current_directory: Path | None = None,
     diagnostics: list[InstructionDiagnostic] | None = None,
 ) -> list[InstructionFile]:
+    return discover_instructions_for_directories(
+        workspace,
+        include_project=include_project,
+        current_directories=((current_directory or Path.cwd()),),
+        diagnostics=diagnostics,
+    )
+
+
+def discover_instructions_for_directories(
+    workspace: Path,
+    *,
+    include_project: bool,
+    current_directories: Sequence[Path],
+    diagnostics: list[InstructionDiagnostic] | None = None,
+) -> list[InstructionFile]:
     files: list[InstructionFile] = []
     global_path = Path.home() / ".ash" / "ASH.md"
     files.extend(
@@ -53,11 +69,6 @@ def discover_instructions(
         lint_instruction_conflicts(files, diagnostics)
         return files
     root = workspace.expanduser().resolve()
-    current = (current_directory or Path.cwd()).expanduser().resolve()
-    try:
-        relative = current.relative_to(root)
-    except ValueError:
-        relative = Path()
 
     files.extend(
         _read_project_scope(
@@ -75,16 +86,26 @@ def discover_instructions(
             seen=set(),
         )
     )
-    cursor = root
-    for part in relative.parts:
-        cursor /= part
-        files.extend(
-            _read_project_scope(
-                cursor,
-                root=root,
-                diagnostics=diagnostics,
+    visited_directories = {root}
+    for current_directory in current_directories:
+        current = current_directory.expanduser().resolve()
+        try:
+            relative = current.relative_to(root)
+        except ValueError:
+            continue
+        cursor = root
+        for part in relative.parts:
+            cursor /= part
+            if cursor in visited_directories:
+                continue
+            visited_directories.add(cursor)
+            files.extend(
+                _read_project_scope(
+                    cursor,
+                    root=root,
+                    diagnostics=diagnostics,
+                )
             )
-        )
     lint_instruction_conflicts(files, diagnostics)
     return files
 

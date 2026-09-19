@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Sequence
 
 from ash.config import AshConfig
 from ash.context.instructions import (
     InstructionDiagnostic,
-    discover_instructions,
+    discover_instructions_for_directories,
     render_instructions,
 )
 from ash.core.checkpoints import FileCheckpointMiddleware
@@ -422,19 +422,19 @@ def build_runtime(
 
     instruction_current_directory = Path.cwd().expanduser().resolve()
 
-    def load_runtime_instructions() -> str:
+    def load_runtime_instructions(current_directories: Sequence[Path]) -> str:
         instruction_diagnostics: list[InstructionDiagnostic] = []
         return render_instructions(
-            discover_instructions(
+            discover_instructions_for_directories(
                 config.workspace_root,
                 include_project=trusted,
-                current_directory=instruction_current_directory,
+                current_directories=current_directories,
                 diagnostics=instruction_diagnostics,
             ),
             instruction_diagnostics,
         )
 
-    instructions = load_runtime_instructions()
+    instructions = load_runtime_instructions((instruction_current_directory,))
     project_hook_environment = (("ASH_PROJECT_ROOT", str(config.workspace_root)),)
     hook_sources: list[Path | HookConfigSource] = [
         HookConfigSource(
@@ -521,6 +521,7 @@ def build_runtime(
         hooks=hooks,
         additional_instructions=instructions,
         additional_instructions_loader=load_runtime_instructions,
+        instruction_scope_directories=(instruction_current_directory,),
         config=config,
         max_steering_messages=config.steering_queue_limit,
         planner=Planner(active_provider) if config.enable_sprint_planning else None,

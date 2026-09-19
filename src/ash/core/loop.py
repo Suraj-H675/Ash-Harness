@@ -462,7 +462,8 @@ class AshLoop:
         provider_circuit_breaker: ProviderCircuitBreaker | None = None,
         system_prompt: str | None = None,
         additional_instructions: str = "",
-        additional_instructions_loader: Callable[[], str] | None = None,
+        additional_instructions_loader: Callable[[Sequence[Path]], str] | None = None,
+        instruction_scope_directories: Sequence[Path] | None = None,
         token_counter: TokenCounterLike | None = None,
         max_turn_iterations: int = DEFAULT_MAX_TURN_ITERATIONS,
         repo_map: RepoMap | None = None,
@@ -524,6 +525,9 @@ class AshLoop:
         self._generated_system_prompt = not bool(system_prompt)
         self._additional_instructions = additional_instructions
         self._additional_instructions_loader = additional_instructions_loader
+        self._instruction_scope_directories = list(
+            instruction_scope_directories or (project_root,)
+        )
         self._core_system_prompt = system_prompt or _default_system_prompt(
             project_root,
             native_tools=_provider_capabilities(provider).native_tools,
@@ -835,7 +839,7 @@ class AshLoop:
         if loader is None:
             return
         try:
-            refreshed = loader()
+            refreshed = loader(tuple(self._instruction_scope_directories))
         except (OSError, UnicodeError, ValueError) as exc:
             _log.warning("Could not refresh project instructions: %s", exc)
             return
@@ -1701,6 +1705,7 @@ class AshLoop:
                     "[Circuit breaker tripped — see prior tool errors. Halting turn.]"
                 ).strip()
                 break
+            self._record_instruction_scope_activity(tool_calls, results)
 
             # Persist tool results as user-role messages so the model sees
             # them on the next iteration.
@@ -2900,6 +2905,31 @@ class AshLoop:
             self._remember_repo_file(resolved)
         if tool_name in FILE_WRITE_TOOLS and not bool(arguments.get("dry_run", False)):
             self._repo_map_dirty = True
+
+    def _record_instruction_scope_activity(
+        self,
+        tool_calls: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+    ) -> None:
+        if self._additional_instructions_loader is None:
+            return
+        directories: list[Path] = []
+        for call, result in zip(tool_calls, results, strict=True):
+            if call.get("name") != "read_file" or not bool(result.get("success")):
+                continue
+            arguments = call.get("arguments")
+            if not isinstance(arguments, dict):
+                continue
+            for path in self._tool_paths("read_file", arguments):
+                try:
+                    resolved = self.safety_guard.validate_path(path)
+                except Exception:  # noqa: BLE001 - context tracking is best-effort
+                    continue
+                directory = resolved.parent
+                if directory not in directories:
+                    directories.append(directory)
+        if directories:
+            self._instruction_scope_directories = directories
 
     def _record_turn_file_mutation(
         self,
