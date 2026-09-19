@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 from collections import deque
 from contextlib import suppress
 from pathlib import Path
@@ -20,7 +21,22 @@ from ash.plugins.manifest import (
     PluginToolManifest,
     namespaced_plugin_tool_name,
 )
-from ash.plugins.registry import DiscoveredPlugin
+from ash.plugins.anchored_fs import (
+    AnchoredDirectory,
+    AnchoredFilesystemError,
+    supports_anchored_mutation,
+)
+from ash.plugins.registry import (
+    MAX_PLUGIN_TREE_DEPTH,
+    MAX_PLUGIN_TREE_ENTRIES,
+    DiscoveredPlugin,
+)
+from ash.plugins.snapshot import (
+    MAX_PLUGIN_BYTES,
+    MAX_PLUGIN_FILES,
+    PluginSnapshot,
+    PluginSnapshotError,
+)
 from ash.safety.guard import SafetyGuard
 from ash.sandbox import SandboxBackendUnavailable, SandboxManager
 from ash.sandbox.process_utils import (
@@ -86,6 +102,10 @@ class PluginHostClient:
         if plugin.manifest.runtime is None:
             raise ValueError("plugin has no executable runtime")
         self.plugin = plugin
+        try:
+            self._plugin_root_metadata: os.stat_result | None = plugin.root.stat()
+        except OSError:
+            self._plugin_root_metadata = None
         self.runtime = plugin.manifest.runtime
         self.sandbox_manager = sandbox_manager
         self.allow_unisolated = allow_unisolated
@@ -97,6 +117,7 @@ class PluginHostClient:
         self._next_id = 1
         self._lock = asyncio.Lock()
         self._closed = False
+        self._docker_workspace_volume: str | None = None
 
     @property
     def running(self) -> bool:
@@ -145,7 +166,11 @@ class PluginHostClient:
         """Stop the shared host and all of its descendants, idempotently."""
 
         async with self._lock:
-            if self._closed and self._process is None:
+            if (
+                self._closed
+                and self._process is None
+                and self._docker_workspace_volume is None
+            ):
                 return
             was_closed = self._closed
             self._closed = True
@@ -190,10 +215,23 @@ class PluginHostClient:
         self._stderr_size = 0
         env = _plugin_environment()
         try:
-            with self.sandbox_manager.prepare_launch(
-                self.runtime.command,
-                cwd=self.plugin.root,
-            ) as invocation:
+            if (
+                self.sandbox_manager.backend_name == "docker"
+                and supports_anchored_mutation()
+            ):
+                self._docker_workspace_volume = (
+                    await self._stage_docker_plugin_workspace()
+                )
+                invocation_context = self.sandbox_manager.prepare_docker_volume_launch(
+                    self.runtime.command,
+                    workspace_volume=self._docker_workspace_volume,
+                )
+            else:
+                invocation_context = self.sandbox_manager.prepare_launch(
+                    self.runtime.command,
+                    cwd=self.plugin.root,
+                )
+            with invocation_context as invocation:
                 try:
                     process_tree_plan = prepare_process_tree(
                         workspace_root=self.plugin.root
@@ -248,6 +286,43 @@ class PluginHostClient:
             raise PluginRuntimeError(
                 "plugin initialize response has an unsupported protocol_version"
             )
+
+    async def _stage_docker_plugin_workspace(self) -> str:
+        """Capture the discovered plugin inode and stage immutable bytes in Docker."""
+
+        if self._plugin_root_metadata is None:
+            raise PluginRuntimeError(
+                "plugin source is unavailable for Docker staging"
+            )
+        try:
+            with AnchoredDirectory.open(
+                self.plugin.root,
+                create=False,
+                private=False,
+                expected=self._plugin_root_metadata,
+            ) as source:
+                snapshot = PluginSnapshot.capture(
+                    source,
+                    max_files=MAX_PLUGIN_FILES,
+                    max_bytes=MAX_PLUGIN_BYTES,
+                    max_entries=MAX_PLUGIN_TREE_ENTRIES,
+                    max_depth=MAX_PLUGIN_TREE_DEPTH,
+                )
+        except (AnchoredFilesystemError, OSError, PluginSnapshotError) as exc:
+            raise PluginRuntimeError(
+                f"plugin source changed before Docker staging: {exc}"
+            ) from exc
+        try:
+            with tempfile.TemporaryFile(prefix="ash-plugin-runtime-") as archive:
+                uid = os.getuid() if sys.platform != "win32" and hasattr(os, "getuid") else 0
+                gid = os.getgid() if sys.platform != "win32" and hasattr(os, "getgid") else 0
+                snapshot.write_tar(archive, uid=uid, gid=gid)
+                archive.flush()
+                return await self.sandbox_manager.stage_docker_workspace(archive)
+        except (OSError, PluginSnapshotError, SandboxBackendUnavailable) as exc:
+            raise PluginRuntimeError(f"plugin Docker staging failed: {exc}") from exc
+        finally:
+            snapshot.close()
 
     async def _exchange(
         self,
@@ -379,13 +454,9 @@ class PluginHostClient:
             if process.stdin is not None:
                 with suppress(BrokenPipeError, ConnectionResetError):
                     await process.stdin.wait_closed()
-        if cleanup_error is not None:
-            self._closed = True
-            raise PluginRuntimeError(
-                f"plugin process cleanup failed: {cleanup_error}"
-            ) from cleanup_error
-        self._process = None
-        self._process_tree_plan = None
+        if cleanup_error is None:
+            self._process = None
+            self._process_tree_plan = None
         task = self._stderr_task
         self._stderr_task = None
         if task is not None:
@@ -393,6 +464,24 @@ class PluginHostClient:
                 task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+        volume_error: BaseException | None = None
+        volume = self._docker_workspace_volume
+        if cleanup_error is None and volume is not None:
+            try:
+                await self.sandbox_manager.remove_docker_workspace(volume)
+            except BaseException as exc:
+                volume_error = exc
+            else:
+                self._docker_workspace_volume = None
+        if cleanup_error is not None or volume_error is not None:
+            self._closed = True
+            details: list[str] = []
+            if cleanup_error is not None:
+                details.append(f"process-tree cleanup failed: {cleanup_error}")
+            if volume_error is not None:
+                details.append(f"Docker workspace cleanup failed: {volume_error}")
+            error = PluginRuntimeError("plugin cleanup failed: " + "; ".join(details))
+            raise error from (cleanup_error or volume_error)
 
 
 class PluginRuntimeTool(BaseTool):

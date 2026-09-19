@@ -10,13 +10,18 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import tarfile
 import tempfile
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 from ash.plugins.anchored_fs import AnchoredDirectory
+
+MAX_PLUGIN_FILES = 10_000
+MAX_PLUGIN_BYTES = 256 * 1024 * 1024
 
 
 class PluginSnapshotError(ValueError):
@@ -214,6 +219,59 @@ class PluginSnapshot:
             raise PluginSnapshotError("plugin snapshot root is not a directory")
         destination.chmod(root.mode)
         _write_directory(self, destination, ())
+
+    def write_tar(
+        self,
+        destination: BinaryIO,
+        *,
+        root_name: str = "workspace",
+        uid: int = 0,
+        gid: int = 0,
+    ) -> None:
+        """Serialize the immutable snapshot as a deterministic tar stream."""
+
+        self._ensure_open()
+        try:
+            root_parts = _relative_parts(root_name)
+        except ValueError as exc:
+            raise ValueError(
+                "tar root_name must be one relative path component"
+            ) from exc
+        if len(root_parts) != 1:
+            raise ValueError("tar root_name must be one relative path component")
+        if uid < 0 or gid < 0:
+            raise ValueError("tar uid and gid must be non-negative")
+        root_component = root_parts[0]
+        with tarfile.open(
+            fileobj=destination,
+            mode="w|",
+            format=tarfile.PAX_FORMAT,
+        ) as archive:
+            for entry in self._entries:
+                archive_path = PurePosixPath(root_component, *entry.relative).as_posix()
+                info = tarfile.TarInfo(archive_path)
+                info.mode = entry.mode
+                info.uid = uid
+                info.gid = gid
+                info.uname = ""
+                info.gname = ""
+                info.mtime = 0
+                if entry.kind == "directory":
+                    info.type = tarfile.DIRTYPE
+                    info.size = 0
+                    archive.addfile(info)
+                    continue
+                if entry.kind != "file":
+                    raise PluginSnapshotError(
+                        f"unsupported snapshot entry kind: {entry.kind}"
+                    )
+                info.type = tarfile.REGTYPE
+                info.size = entry.size
+                with tempfile.TemporaryFile(prefix="ash-plugin-tar-entry-") as staged:
+                    for chunk in self.iter_bytes(entry):
+                        staged.write(chunk)
+                    staged.seek(0)
+                    archive.addfile(info, staged)
 
     def verify_materialized(self, directory: AnchoredDirectory) -> None:
         """Verify a materialized tree against the immutable snapshot."""

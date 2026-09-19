@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import secrets
 import sys
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence, TypedDict
+from typing import BinaryIO, Sequence, TypedDict
 
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import ScopedIOError, open_scoped_directory
@@ -74,6 +76,7 @@ SANDBOX_TIER_SANDBOX_EXEC: int = SANDBOX_TIER_BWRAP
 # A tier identifies the command-wrapper shape; this capability identifies the
 # backends whose current semantics also prevent arbitrary host file reads.
 _FULL_ISOLATION_BACKENDS = frozenset({"bubblewrap", "docker"})
+_ASH_PLUGIN_VOLUME = re.compile(r"^ash-plugin-[0-9a-f]{24}$")
 
 
 @dataclass(frozen=True)
@@ -443,6 +446,7 @@ class SandboxManager:
                     passthrough_env_names=passthrough_env_names,
                     workspace_fd=workspace_fd,
                     read_only_fds=tuple(read_only_fds),
+                    docker_workspace_volume=None,
                 )
                 if invocation.backend_name != "bubblewrap":
                     yield invocation
@@ -486,6 +490,92 @@ class SandboxManager:
             passthrough_env_names=passthrough_env_names,
             workspace_fd=None,
             read_only_fds=None,
+            docker_workspace_volume=None,
+        )
+
+    @contextmanager
+    def prepare_docker_volume_launch(
+        self,
+        command: Sequence[str],
+        *,
+        workspace_volume: str,
+        passthrough_env_names: Sequence[str] = (),
+    ) -> Iterator[SandboxInvocation]:
+        """Prepare a Docker launch backed only by a daemon-managed volume."""
+
+        if self._selected_backend != "docker":
+            raise SandboxBackendUnavailable("Docker is not the active sandbox backend")
+        invocation = self._prepare(
+            command,
+            cwd=None,
+            passthrough_env_names=passthrough_env_names,
+            workspace_fd=None,
+            read_only_fds=None,
+            docker_workspace_volume=workspace_volume,
+        )
+        if invocation.backend_name != "docker":
+            raise SandboxBackendUnavailable(
+                "Docker staged workspace cannot use scoped fallback"
+            )
+        yield invocation
+
+    async def stage_docker_workspace(self, archive: BinaryIO) -> str:
+        """Create a daemon-managed workspace volume from an immutable tar stream."""
+
+        if self._selected_backend != "docker":
+            raise SandboxBackendUnavailable("Docker is not the active sandbox backend")
+        backend = self._build_backend(self._tier)
+        if not isinstance(backend, DockerSandbox) or backend.docker_path is None:
+            raise SandboxBackendUnavailable("Docker backend is unavailable")
+        volume_name = f"ash-plugin-{secrets.token_hex(12)}"
+        created = False
+        try:
+            await _run_docker_control(
+                [backend.docker_path, "volume", "create", volume_name]
+            )
+            created = True
+            stager = DockerSandbox(
+                image=self.docker_image,
+                workspace_root=self.workspace_root,
+                network=False,
+                workspace_read_only=False,
+                docker_path=backend.docker_path,
+                run_as_host_user=False,
+            )
+            stage_argv = stager.wrap(
+                ["/bin/tar", "-xf", "-", "-C", "/"],
+                workspace_volume=volume_name,
+            )
+            archive.seek(0)
+            await _run_docker_control(stage_argv, stdin=archive, timeout_seconds=300)
+            return volume_name
+        except BaseException as primary:
+            if created:
+                cleanup_task = asyncio.create_task(
+                    self.remove_docker_workspace(volume_name)
+                )
+                cleanup_error, cleanup_cancelled = await _settle_cleanup_task(
+                    cleanup_task
+                )
+                if cleanup_error is not None:
+                    primary.add_note(
+                        f"Docker workspace cleanup failed: {cleanup_error}"
+                    )
+                if cleanup_cancelled:
+                    primary.add_note("Docker workspace cleanup was cancelled")
+            raise
+
+    async def remove_docker_workspace(self, volume_name: str) -> None:
+        """Remove one staged Docker workspace volume created by Ash."""
+
+        if not _ASH_PLUGIN_VOLUME.fullmatch(volume_name):
+            raise SandboxBackendUnavailable("refusing to remove foreign Docker volume")
+        docker = resolve_host_executable("docker", workspace_root=self.workspace_root)
+        if docker is None:
+            raise SandboxBackendUnavailable("Docker executable is unavailable")
+        await _run_docker_control(
+            [docker, "volume", "rm", "--force", volume_name],
+            timeout_seconds=60,
         )
 
     def _prepare(
@@ -496,6 +586,7 @@ class SandboxManager:
         passthrough_env_names: Sequence[str],
         workspace_fd: int | None,
         read_only_fds: tuple[tuple[int, Path], ...] | None,
+        docker_workspace_volume: str | None,
     ) -> SandboxInvocation:
         """Prepare argv, optionally binding Bubblewrap to a held workspace FD."""
 
@@ -510,6 +601,13 @@ class SandboxManager:
                     passthrough_env_names=passthrough_env_names,
                     workspace_fd=workspace_fd,
                     read_only_fds=read_only_fds,
+                )
+            elif isinstance(backend, DockerSandbox):
+                wrapped = backend.wrap(
+                    command,
+                    cwd=cwd,
+                    passthrough_env_names=passthrough_env_names,
+                    workspace_volume=docker_workspace_volume,
                 )
             else:
                 wrapped = backend.wrap(
@@ -867,6 +965,101 @@ async def _run_subprocess(
         fallback_used=False,
         duration_seconds=time.monotonic() - start,
     )
+
+
+async def _settle_cleanup_task(
+    task: asyncio.Task[None],
+) -> tuple[BaseException | None, bool]:
+    """Finish one cleanup task despite caller cancellation."""
+
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, cancelled
+    return None, cancelled
+
+
+async def _run_docker_control(
+    argv: Sequence[str],
+    *,
+    stdin: BinaryIO | None = None,
+    timeout_seconds: float = 60,
+) -> bytes:
+    """Run one bounded Docker CLI control command with managed cleanup."""
+
+    if timeout_seconds <= 0:
+        raise ValueError("Docker control timeout must be positive")
+    try:
+        process_tree_plan = prepare_process_tree()
+    except ProcessTreeUnavailable as exc:
+        raise SandboxBackendUnavailable(
+            f"Docker control command was not started: {exc}"
+        ) from exc
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=stdin if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **process_tree_plan.spawn_options,
+        )
+    except OSError as exc:
+        raise SandboxBackendUnavailable(
+            f"Docker control command was not started: {exc}"
+        ) from exc
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            stdout, stderr = await communicate_process(
+                process,
+                max_output_bytes=64 * 1024,
+                process_tree_plan=process_tree_plan,
+            )
+    except TimeoutError as exc:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process, plan=process_tree_plan
+            )
+        )
+        detail = f"Docker control command timed out after {timeout_seconds:g} seconds"
+        if cleanup_error is not None:
+            detail += f"; process-tree cleanup failed: {cleanup_error}"
+        if cleanup_cancelled:
+            detail += "; process-tree cleanup was cancelled"
+        raise SandboxBackendUnavailable(detail) from exc
+    except asyncio.CancelledError as cancellation:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process, plan=process_tree_plan
+            )
+        )
+        if cleanup_error is not None:
+            cancellation.add_note(
+                f"Docker process-tree cleanup failed: {cleanup_error}"
+            )
+        if cleanup_cancelled:
+            cancellation.add_note("Docker process-tree cleanup was cancelled")
+        raise
+    except ProcessOutputLimitExceeded as exc:
+        detail = "Docker control command exceeded the 64 KiB output limit"
+        if exc.cleanup_error is not None:
+            detail += f"; process-tree cleanup failed: {exc.cleanup_error}"
+        raise SandboxBackendUnavailable(detail) from exc
+    if process.returncode != 0:
+        error = stderr.decode("utf-8", errors="replace").strip()[-4096:]
+        detail = f"Docker control command failed with status {process.returncode}"
+        if error:
+            detail += f": {error}"
+        raise SandboxBackendUnavailable(detail)
+    return stdout
 
 
 # --- macOS sandbox-exec ----------------------------------------------------

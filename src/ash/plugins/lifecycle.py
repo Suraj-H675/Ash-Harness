@@ -25,7 +25,12 @@ from ash.plugins.anchored_fs import (
     require_anchored_mutation,
     supports_anchored_mutation,
 )
-from ash.plugins.snapshot import PluginSnapshot, PluginSnapshotError
+from ash.plugins.snapshot import (
+    MAX_PLUGIN_BYTES,
+    MAX_PLUGIN_FILES,
+    PluginSnapshot,
+    PluginSnapshotError,
+)
 from ash.plugins.manifest import (
     MAX_PLUGIN_MANIFEST_BYTES,
     PLUGIN_NAME,
@@ -46,8 +51,6 @@ from ash.sandbox.process_utils import (
     terminate_process_tree_sync,
 )
 
-MAX_PLUGIN_FILES = 10_000
-MAX_PLUGIN_BYTES = 256 * 1024 * 1024
 MAX_EXTENSION_STATE_BYTES = 256 * 1024
 STATE_VERSION = 1
 MAX_PLUGIN_INSTALL_RECORDS_BYTES = 512 * 1024

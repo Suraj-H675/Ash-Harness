@@ -14,6 +14,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -27,6 +28,7 @@ from ash.safety.environment import resolve_host_executable
 
 
 DEFAULT_IMAGE = "ash-sandbox:latest"
+_DOCKER_VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,7 @@ class DockerSandbox(SandboxBackend):
     memory_limit: str | None = None
     cpus: float | None = None
     docker_path: str | None = None
+    run_as_host_user: bool = True
 
     def __post_init__(self) -> None:
         if self.docker_path is None:
@@ -66,6 +69,7 @@ class DockerSandbox(SandboxBackend):
         *,
         cwd: Path | None = None,
         passthrough_env_names: Sequence[str] = (),
+        workspace_volume: str | None = None,
     ) -> list[str]:
         """Build a full ``docker run --rm … image command`` argv list."""
 
@@ -88,7 +92,11 @@ class DockerSandbox(SandboxBackend):
             "--env",
             "HOME=/tmp",
         ]
-        if sys.platform != "win32" and hasattr(os, "getuid"):
+        if (
+            self.run_as_host_user
+            and sys.platform != "win32"
+            and hasattr(os, "getuid")
+        ):
             args.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
         if not self.network:
             args.append("--network=none")
@@ -101,7 +109,18 @@ class DockerSandbox(SandboxBackend):
 
         # Bind-mount the workspace and the output directory if given.
         container_cwd: str | None = None
-        if self.workspace_root is not None:
+        if workspace_volume is not None:
+            if not _DOCKER_VOLUME_NAME.fullmatch(workspace_volume):
+                raise SandboxBackendUnavailable("invalid Docker workspace volume name")
+            mount = (
+                f"type=volume,source={workspace_volume},target=/workspace,"
+                "volume-nocopy"
+            )
+            if self.workspace_read_only:
+                mount += ",readonly"
+            args.extend(["--mount", mount])
+            container_cwd = "/workspace"
+        elif self.workspace_root is not None:
             root = Path(self.workspace_root).resolve()
             if not root.is_dir():
                 raise SandboxBackendUnavailable(
@@ -117,6 +136,10 @@ class DockerSandbox(SandboxBackend):
             out.mkdir(parents=True, exist_ok=True)
             args.extend(["--mount", f"type=bind,source={out},target=/output"])
         if cwd is not None:
+            if workspace_volume is not None:
+                raise SandboxBackendUnavailable(
+                    "host cwd is unavailable with a staged Docker workspace"
+                )
             cwd_path = Path(cwd).resolve()
             if self.workspace_root is None:
                 raise SandboxBackendUnavailable(

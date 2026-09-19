@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import shlex
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -685,6 +686,130 @@ def test_docker_can_mount_workspace_read_only(tmp_path: Path) -> None:
 
     mount = argv[argv.index("--mount") + 1]
     assert mount.endswith("target=/workspace,readonly")
+
+
+def test_docker_can_mount_daemon_workspace_volume_read_only(tmp_path: Path) -> None:
+    fake = tmp_path / "docker"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    backend = DockerSandbox(
+        workspace_root=tmp_path,
+        workspace_read_only=True,
+        docker_path=str(fake),
+    )
+
+    argv = backend.wrap(
+        ["echo", "hi"],
+        workspace_volume="ash-plugin-0123456789abcdef",
+    )
+
+    mount = argv[argv.index("--mount") + 1]
+    assert mount == (
+        "type=volume,source=ash-plugin-0123456789abcdef,"
+        "target=/workspace,volume-nocopy,readonly"
+    )
+    assert f"source={tmp_path}" not in " ".join(argv)
+    assert argv[argv.index("--workdir") + 1] == "/workspace"
+
+
+def test_docker_staged_volume_rejects_host_cwd_and_invalid_name(tmp_path: Path) -> None:
+    fake = tmp_path / "docker"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    backend = DockerSandbox(workspace_root=tmp_path, docker_path=str(fake))
+
+    with pytest.raises(SandboxBackendUnavailable, match="volume name"):
+        backend.wrap(["true"], workspace_volume="../escape")
+    with pytest.raises(SandboxBackendUnavailable, match="host cwd"):
+        backend.wrap(
+            ["true"],
+            cwd=tmp_path,
+            workspace_volume="ash-plugin-0123456789abcdef",
+        )
+
+
+@pytest.mark.asyncio
+async def test_manager_stages_docker_workspace_without_host_bind(
+    tmp_path: Path,
+) -> None:
+    archive = io.BytesIO(b"tar-bytes")
+    docker_control = AsyncMock(return_value=b"")
+    with (
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+        patch(
+            "ash.sandbox.docker.resolve_host_executable",
+            return_value="/usr/bin/docker",
+        ),
+        patch("ash.sandbox.manager._run_docker_control", docker_control),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            workspace_read_only=True,
+        )
+        volume = await manager.stage_docker_workspace(archive)
+
+    assert volume.startswith("ash-plugin-")
+    assert docker_control.await_count == 2
+    create_argv = docker_control.await_args_list[0].args[0]
+    assert create_argv == ["/usr/bin/docker", "volume", "create", volume]
+    stage_argv = docker_control.await_args_list[1].args[0]
+    assert "run" in stage_argv
+    assert f"source={tmp_path}" not in " ".join(stage_argv)
+    mount = stage_argv[stage_argv.index("--mount") + 1]
+    assert mount == (
+        f"type=volume,source={volume},target=/workspace,volume-nocopy"
+    )
+    assert stage_argv[-5:] == ["/bin/tar", "-xf", "-", "-C", "/"]
+    assert docker_control.await_args_list[1].kwargs["stdin"] is archive
+    assert archive.tell() == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_removes_docker_volume_when_staging_fails(
+    tmp_path: Path,
+) -> None:
+    docker_control = AsyncMock(
+        side_effect=[
+            b"",
+            SandboxBackendUnavailable("stage failed"),
+            b"",
+        ]
+    )
+    with (
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+        patch(
+            "ash.sandbox.docker.resolve_host_executable",
+            return_value="/usr/bin/docker",
+        ),
+        patch(
+            "ash.sandbox.manager.resolve_host_executable",
+            return_value="/usr/bin/docker",
+        ),
+        patch("ash.sandbox.manager._run_docker_control", docker_control),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+        )
+        with pytest.raises(SandboxBackendUnavailable, match="stage failed"):
+            await manager.stage_docker_workspace(io.BytesIO(b"tar"))
+
+    assert docker_control.await_count == 3
+    cleanup_argv = docker_control.await_args_list[2].args[0]
+    assert cleanup_argv[:4] == ["/usr/bin/docker", "volume", "rm", "--force"]
+    assert cleanup_argv[4].startswith("ash-plugin-")
+
+
+@pytest.mark.asyncio
+async def test_manager_refuses_to_remove_foreign_docker_volume(tmp_path: Path) -> None:
+    manager = SandboxManager(workspace_root=tmp_path, backend_preference="direct")
+
+    for name in ("user-data", "ash-plugin-user-data", "ash-plugin-deadbeef"):
+        with pytest.raises(SandboxBackendUnavailable, match="foreign"):
+            await manager.remove_docker_workspace(name)
 
 
 def test_docker_forwards_environment_by_name_without_exposing_value(

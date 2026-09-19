@@ -1,6 +1,9 @@
 import os
 import sys
+import tarfile
+from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -9,16 +12,25 @@ from ash.config import AshConfig
 from ash.core.loop import AshLoop, _execute_tool_once
 from ash.core.session import SessionStore
 from ash.plugins.manifest import PluginManifest
+from ash.plugins.anchored_fs import supports_anchored_mutation
 from ash.plugins.registry import DiscoveredPlugin
 from ash.plugins.runtime import (
     PluginHostClient,
+    PluginRuntimeError,
     PluginRuntimeTool,
     build_plugin_runtime_tools,
     plugin_tool_name,
 )
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.guard import SafetyGuard
-from ash.sandbox import BubblewrapSandbox, SandboxManager, has_bwrap
+from ash.sandbox import (
+    BubblewrapSandbox,
+    SANDBOX_TIER_DOCKER,
+    SandboxBackendUnavailable,
+    SandboxInvocation,
+    SandboxManager,
+    has_bwrap,
+)
 
 
 HOST_SOURCE = r"""
@@ -235,6 +247,166 @@ async def test_isolated_plugin_host_pins_root_across_path_swap(
         assert result.output == "ORIGINAL"
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not supports_anchored_mutation(),
+    reason="descriptor-anchored Docker plugin staging is unavailable",
+)
+async def test_docker_plugin_staging_streams_immutable_snapshot(tmp_path: Path) -> None:
+    plugin = _plugin(tmp_path / "plugin")
+    observed: dict[str, object] = {}
+    manager = Mock()
+    manager.backend_name = "docker"
+
+    async def stage(archive) -> str:
+        archive.seek(0)
+        with tarfile.open(fileobj=archive, mode="r:*") as tar:
+            members = {member.name: member for member in tar.getmembers()}
+            observed["names"] = set(members)
+            runtime = members["workspace/runtime.py"]
+            runtime_file = tar.extractfile(runtime)
+            assert runtime_file is not None
+            observed["runtime"] = runtime_file.read()
+        return "ash-plugin-testvolume"
+
+    manager.stage_docker_workspace = AsyncMock(side_effect=stage)
+    client = PluginHostClient(plugin, manager, allow_unisolated=False)
+
+    volume = await client._stage_docker_plugin_workspace()
+
+    assert volume == "ash-plugin-testvolume"
+    assert observed["names"] == {"workspace", "workspace/runtime.py"}
+    assert observed["runtime"] == HOST_SOURCE.encode("utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not supports_anchored_mutation(),
+    reason="descriptor-anchored Docker plugin staging is unavailable",
+)
+async def test_docker_plugin_staging_rejects_replaced_source_root(
+    tmp_path: Path,
+) -> None:
+    plugin = _plugin(tmp_path / "plugin")
+    manager = Mock()
+    manager.backend_name = "docker"
+    manager.stage_docker_workspace = AsyncMock(return_value="ash-plugin-unused")
+    client = PluginHostClient(plugin, manager, allow_unisolated=False)
+    saved = tmp_path / "plugin-saved"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "runtime.py").write_text("print('replacement')\n", encoding="utf-8")
+    plugin.root.rename(saved)
+    try:
+        plugin.root.symlink_to(replacement, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    with pytest.raises(PluginRuntimeError, match="source changed"):
+        await client._stage_docker_plugin_workspace()
+
+    manager.stage_docker_workspace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not supports_anchored_mutation(),
+    reason="descriptor-anchored Docker plugin staging is unavailable",
+)
+async def test_docker_plugin_runtime_uses_staged_volume_and_cleans_it(
+    tmp_path: Path,
+) -> None:
+    plugin = _plugin(tmp_path / "plugin")
+    manager = Mock()
+    manager.backend_name = "docker"
+    manager.is_fully_isolated.return_value = True
+    manager.stage_docker_workspace = AsyncMock(return_value="ash-plugin-testvolume")
+    manager.remove_docker_workspace = AsyncMock(return_value=None)
+    manager.prepare_docker_volume_launch.return_value = nullcontext(
+        SandboxInvocation(
+            (sys.executable, "-c", HOST_SOURCE),
+            None,
+            SANDBOX_TIER_DOCKER,
+            "docker",
+        )
+    )
+    client = PluginHostClient(plugin, manager, allow_unisolated=False)
+
+    result = await client.call_tool("echo", {"text": "hello"})
+
+    assert result.success is True
+    assert result.output == "hello"
+    manager.prepare_docker_volume_launch.assert_called_once_with(
+        plugin.manifest.runtime.command,
+        workspace_volume="ash-plugin-testvolume",
+    )
+    await client.aclose()
+    manager.remove_docker_workspace.assert_awaited_once_with(
+        "ash-plugin-testvolume"
+    )
+    assert client._docker_workspace_volume is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not supports_anchored_mutation(),
+    reason="descriptor-anchored Docker plugin staging is unavailable",
+)
+async def test_docker_plugin_volume_cleanup_is_retryable(tmp_path: Path) -> None:
+    plugin = _plugin(tmp_path / "plugin")
+    manager = Mock()
+    manager.backend_name = "docker"
+    manager.remove_docker_workspace = AsyncMock(
+        side_effect=[SandboxBackendUnavailable("volume busy"), None]
+    )
+    client = PluginHostClient(plugin, manager, allow_unisolated=False)
+    client._closed = True
+    client._docker_workspace_volume = "ash-plugin-retryvolume"
+
+    with pytest.raises(PluginRuntimeError, match="Docker workspace cleanup failed"):
+        await client.aclose()
+
+    assert client._docker_workspace_volume == "ash-plugin-retryvolume"
+    await client.aclose()
+    assert client._docker_workspace_volume is None
+    assert manager.remove_docker_workspace.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_docker_plugin_keeps_bind_launch_when_snapshot_anchors_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin = _plugin(tmp_path / "plugin")
+    manager = Mock()
+    manager.backend_name = "docker"
+    manager.is_fully_isolated.return_value = True
+    manager.stage_docker_workspace = AsyncMock(return_value="ash-plugin-unused")
+    manager.prepare_launch.return_value = nullcontext(
+        SandboxInvocation(
+            (sys.executable, "-c", HOST_SOURCE),
+            None,
+            SANDBOX_TIER_DOCKER,
+            "docker",
+        )
+    )
+    monkeypatch.setattr(
+        "ash.plugins.runtime.supports_anchored_mutation",
+        lambda: False,
+    )
+    client = PluginHostClient(plugin, manager, allow_unisolated=False)
+
+    result = await client.call_tool("echo", {"text": "portable"})
+
+    assert result.success is True
+    assert result.output == "portable"
+    manager.stage_docker_workspace.assert_not_awaited()
+    manager.prepare_launch.assert_called_once_with(
+        plugin.manifest.runtime.command,
+        cwd=plugin.root,
+    )
+    await client.aclose()
 
 
 @pytest.mark.asyncio
