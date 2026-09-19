@@ -8,7 +8,7 @@ import os
 import sys
 import tempfile
 from collections import deque
-from contextlib import suppress
+from contextlib import AbstractContextManager, nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
@@ -37,13 +37,16 @@ from ash.plugins.snapshot import (
     PluginSnapshot,
     PluginSnapshotError,
 )
-from ash.safety.guard import SafetyGuard
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import ScopedIOError
 from ash.sandbox import SandboxBackendUnavailable, SandboxManager
 from ash.sandbox.process_utils import (
     ProcessTreeError,
     ProcessTreePlan,
     ProcessTreeUnavailable,
+    ScopedProcessLaunch,
     prepare_process_tree,
+    prepare_scoped_process_launch,
     terminate_process_tree,
 )
 from ash.tools.base import (
@@ -241,23 +244,54 @@ class PluginHostClient:
                         f"plugin process was not started: {exc}"
                     ) from exc
                 self._process_tree_plan = process_tree_plan
+                launch_context: AbstractContextManager[ScopedProcessLaunch]
+                if invocation.cwd is None:
+                    launch_context = nullcontext(
+                        ScopedProcessLaunch(tuple(invocation.argv), None)
+                    )
+                else:
+                    expected_identity = (
+                        None
+                        if self._plugin_root_metadata is None
+                        else (
+                            self._plugin_root_metadata.st_dev,
+                            self._plugin_root_metadata.st_ino,
+                        )
+                    )
+                    launch_context = prepare_scoped_process_launch(
+                        invocation.argv,
+                        cwd=invocation.cwd,
+                        guard=SafetyGuard(self.plugin.root),
+                        search_path=env.get("PATH"),
+                        expected_cwd_identity=expected_identity,
+                    )
                 spawn_options = dict(process_tree_plan.spawn_options)
-                if invocation.pass_fds:
-                    spawn_options["pass_fds"] = invocation.pass_fds
-                self._process = await asyncio.create_subprocess_exec(
-                    *invocation.argv,
-                    cwd=invocation.cwd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                    limit=MAX_PLUGIN_MESSAGE_BYTES + 1,
-                    **spawn_options,
-                )
+                with launch_context as launch:
+                    inherited_fds = tuple(
+                        dict.fromkeys((*invocation.pass_fds, *launch.pass_fds))
+                    )
+                    if inherited_fds:
+                        spawn_options["pass_fds"] = inherited_fds
+                    self._process = await asyncio.create_subprocess_exec(
+                        *launch.argv,
+                        cwd=launch.cwd,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env,
+                        limit=MAX_PLUGIN_MESSAGE_BYTES + 1,
+                        **spawn_options,
+                    )
         except SandboxBackendUnavailable as exc:
             self._process = None
             self._process_tree_plan = None
             raise PluginRuntimeError(f"plugin sandbox unavailable: {exc}") from exc
+        except (ProcessTreeUnavailable, SafetyViolation, ScopedIOError) as exc:
+            self._process = None
+            self._process_tree_plan = None
+            raise PluginRuntimeError(
+                f"plugin process was not started: {exc}"
+            ) from exc
         except OSError as exc:
             self._process = None
             self._process_tree_plan = None

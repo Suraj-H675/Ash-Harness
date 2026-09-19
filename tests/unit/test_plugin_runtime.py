@@ -1,7 +1,7 @@
 import os
 import sys
 import tarfile
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -247,6 +247,49 @@ async def test_isolated_plugin_host_pins_root_across_path_swap(
         assert result.output == "ORIGINAL"
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX cwd identity regression")
+async def test_direct_plugin_host_refuses_root_swap_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin = _plugin(tmp_path / "plugin")
+    replacement = tmp_path / "replacement"
+    saved = tmp_path / "plugin-saved"
+    replacement.mkdir()
+    replacement_source = (
+        "from pathlib import Path\n"
+        "Path('replacement-executed').write_text('yes')\n"
+        + HOST_SOURCE
+    )
+    (replacement / "runtime.py").write_text(replacement_source, encoding="utf-8")
+    manager = _direct_manager(plugin.root)
+    client = PluginHostClient(plugin, manager, allow_unisolated=True)
+    original_prepare_launch = manager.prepare_launch
+    swapped = False
+
+    @contextmanager
+    def prepare_then_swap(*args: object, **kwargs: object):
+        nonlocal swapped
+        with original_prepare_launch(*args, **kwargs) as invocation:
+            if not swapped:
+                plugin.root.rename(saved)
+                try:
+                    plugin.root.symlink_to(replacement, target_is_directory=True)
+                except OSError as exc:
+                    pytest.skip(f"symlink creation is unavailable: {exc}")
+                swapped = True
+            yield invocation
+
+    monkeypatch.setattr(manager, "prepare_launch", prepare_then_swap)
+
+    with pytest.raises(PluginRuntimeError, match="working directory identity changed"):
+        await client.call_tool("echo", {"text": "must-not-run"})
+
+    assert swapped is True
+    assert not (replacement / "replacement-executed").exists()
+    assert client.running is False
 
 
 @pytest.mark.asyncio
