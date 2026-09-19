@@ -25,11 +25,13 @@ from ash.hooks.registry import (
     SessionStartHook,
 )
 from ash.safe_io import read_bounded_bytes
+from ash.safety.guard import SafetyGuard
 from ash.safety.path_scope import lexical_target_path, path_has_link_component
 from ash.sandbox.process_utils import (
     ProcessTreeUnavailable,
     communicate_process,
     prepare_process_tree,
+    prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
 )
 
@@ -58,6 +60,7 @@ class HookConfigSource:
     cwd: Path | None = None
     environment: tuple[tuple[str, str], ...] = ()
     trusted_root: Path | None = None
+    cwd_identity: tuple[int, int] | None = None
 
 
 def load_command_hooks(
@@ -69,6 +72,15 @@ def load_command_hooks(
         path = source.path
         if not path.is_file():
             continue
+        if source.cwd is not None:
+            metadata = source.cwd.stat()
+            source = HookConfigSource(
+                path=source.path,
+                cwd=source.cwd,
+                environment=source.environment,
+                trusted_root=source.trusted_root,
+                cwd_identity=(metadata.st_dev, metadata.st_ino),
+            )
         if source.trusted_root is not None:
             trusted_root = source.trusted_root.expanduser().resolve()
             lexical = lexical_target_path(path, trusted_root)
@@ -227,19 +239,30 @@ async def _run(
     encoded_payload = json.dumps(payload).encode()
     if len(encoded_payload) > MAX_HOOK_PAYLOAD_BYTES:
         raise ValueError("hook payload exceeds 1 MiB")
+    launch_context = prepare_scoped_process_launch(
+        expanded_command,
+        cwd=source.cwd,
+        guard=SafetyGuard(source.cwd or Path.cwd()),
+        search_path=environment.get("PATH"),
+        expected_cwd_identity=source.cwd_identity,
+    )
     try:
         process_tree_plan = prepare_process_tree(workspace_root=source.cwd)
     except ProcessTreeUnavailable as exc:
         raise RuntimeError(f"hook process was not started: {exc}") from exc
-    process = await asyncio.create_subprocess_exec(
-        *expanded_command,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=environment,
-        cwd=source.cwd,
-        **process_tree_plan.spawn_options,
-    )
+    with launch_context as launch:
+        spawn_options = dict(process_tree_plan.spawn_options)
+        if launch.pass_fds:
+            spawn_options["pass_fds"] = launch.pass_fds
+        process = await asyncio.create_subprocess_exec(
+            *launch.argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=environment,
+            cwd=launch.cwd,
+            **spawn_options,
+        )
     try:
         stdout, stderr = await communicate_process(
             process,

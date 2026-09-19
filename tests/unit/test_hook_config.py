@@ -51,6 +51,45 @@ async def test_plugin_hook_uses_root_environment_and_working_directory(
 
 
 @pytest.mark.asyncio
+async def test_plugin_hook_refuses_working_directory_symlink_swap(tmp_path) -> None:
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "marker"
+    config = plugin / "hooks.json"
+    command = [
+        sys.executable,
+        "-c",
+        "from pathlib import Path; Path('marker').write_text('executed')",
+    ]
+    config.write_text(json.dumps({"session_start": [{"command": command}]}))
+    registry = load_command_hooks(
+        [
+            HookConfigSource(
+                config,
+                cwd=plugin,
+                trusted_root=plugin,
+            )
+        ]
+    )
+
+    original = tmp_path / "plugin-original"
+    plugin.rename(original)
+    try:
+        plugin.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    await registry.fire_session_start()
+
+    assert registry.get_injected_prompt() == ""
+    assert not marker.exists()
+    assert len(registry.diagnostics) == 1
+    assert registry.diagnostics[0].error == "working directory identity changed"
+
+
+@pytest.mark.asyncio
 async def test_command_pre_tool_hook_can_deny_with_structured_output(tmp_path) -> None:
     config = tmp_path / "hooks.json"
     command = [

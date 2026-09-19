@@ -131,6 +131,7 @@ def prepare_scoped_process_launch(
     cwd: str | Path | None,
     guard: SafetyGuard,
     search_path: str | None = None,
+    expected_cwd_identity: tuple[int, int] | None = None,
 ) -> Iterator[ScopedProcessLaunch]:
     """Prepare a subprocess launch whose POSIX cwd cannot be pathname-swapped."""
 
@@ -143,6 +144,12 @@ def prepare_scoped_process_launch(
         )
         return
     with open_scoped_directory(cwd, guard) as (_, directory_fd):
+        opened = os.fstat(directory_fd)
+        if expected_cwd_identity is not None and (
+            opened.st_dev,
+            opened.st_ino,
+        ) != expected_cwd_identity:
+            raise ProcessTreeUnavailable("working directory identity changed")
         yield _prepare_posix_cwd_launch(
             directory_fd,
             command,
