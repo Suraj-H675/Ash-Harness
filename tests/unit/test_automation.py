@@ -210,7 +210,7 @@ async def test_automation_subprocess_runner_uses_isolated_python(
     result = await client.prompt("run")
 
     assert result.response == "ok"
-    assert captured["args"][:4] == (
+    assert captured["args"][-4:] == (
         sys.executable,
         "-I",
         "-m",
