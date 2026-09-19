@@ -734,12 +734,15 @@ async def test_manager_stages_docker_workspace_without_host_bind(
 ) -> None:
     archive = io.BytesIO(b"tar-bytes")
     docker_control = AsyncMock(return_value=b"")
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake_docker.chmod(0o755)
     with (
         patch("ash.sandbox.manager.has_bwrap", return_value=False),
         patch("ash.sandbox.manager.has_docker", return_value=True),
         patch(
             "ash.sandbox.docker.resolve_host_executable",
-            return_value="/usr/bin/docker",
+            return_value=str(fake_docker),
         ),
         patch("ash.sandbox.manager._run_docker_control", docker_control),
     ):
@@ -753,7 +756,7 @@ async def test_manager_stages_docker_workspace_without_host_bind(
     assert volume.startswith("ash-plugin-")
     assert docker_control.await_count == 2
     create_argv = docker_control.await_args_list[0].args[0]
-    assert create_argv == ["/usr/bin/docker", "volume", "create", volume]
+    assert create_argv == [str(fake_docker), "volume", "create", volume]
     stage_argv = docker_control.await_args_list[1].args[0]
     assert "run" in stage_argv
     assert f"source={tmp_path}" not in " ".join(stage_argv)
@@ -770,6 +773,9 @@ async def test_manager_stages_docker_workspace_without_host_bind(
 async def test_manager_removes_docker_volume_when_staging_fails(
     tmp_path: Path,
 ) -> None:
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake_docker.chmod(0o755)
     docker_control = AsyncMock(
         side_effect=[
             b"",
@@ -782,11 +788,11 @@ async def test_manager_removes_docker_volume_when_staging_fails(
         patch("ash.sandbox.manager.has_docker", return_value=True),
         patch(
             "ash.sandbox.docker.resolve_host_executable",
-            return_value="/usr/bin/docker",
+            return_value=str(fake_docker),
         ),
         patch(
             "ash.sandbox.manager.resolve_host_executable",
-            return_value="/usr/bin/docker",
+            return_value=str(fake_docker),
         ),
         patch("ash.sandbox.manager._run_docker_control", docker_control),
     ):
@@ -799,7 +805,12 @@ async def test_manager_removes_docker_volume_when_staging_fails(
 
     assert docker_control.await_count == 3
     cleanup_argv = docker_control.await_args_list[2].args[0]
-    assert cleanup_argv[:4] == ["/usr/bin/docker", "volume", "rm", "--force"]
+    assert cleanup_argv[:4] == [
+        str(fake_docker),
+        "volume",
+        "rm",
+        "--force",
+    ]
     assert cleanup_argv[4].startswith("ash-plugin-")
 
 
