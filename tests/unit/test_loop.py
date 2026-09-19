@@ -2833,6 +2833,7 @@ async def test_provider_circuit_fails_fast_then_allows_probe(tmp_path):
 
 class ImageCaptureProvider(ProviderABC):
     model_name = "vision-test"
+    _ash_declared_capabilities = ProviderCapabilities(vision=True)
 
     def __init__(self) -> None:
         self.messages = []
@@ -2875,6 +2876,43 @@ async def test_image_blocks_reach_provider_but_are_not_persisted(tmp_path):
     persisted = loaded.messages[0].metadata
     assert "image_blocks" not in persisted
     assert persisted["images"][0]["path"] == "image.png"
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ordered_content_blocks_reach_provider_but_are_not_persisted(tmp_path):
+    provider = ImageCaptureProvider()
+    store = SessionStore(tmp_path / "ordered-images.db")
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+    metadata = {
+        "content_blocks": [
+            {"type": "text", "text": "before"},
+            {"type": "image", "media_type": "image/png", "data": "YWJj"},
+            {"type": "text", "text": "after"},
+        ],
+        "images": [
+            {"source": "acp-inline", "media_type": "image/png", "sha256": "digest"}
+        ],
+    }
+
+    response = await loop.run_turn("before\n\nafter", user_metadata=metadata)
+
+    assert response == "image inspected"
+    user_content = next(
+        message["content"] for message in provider.messages if message["role"] == "user"
+    )
+    assert user_content == metadata["content_blocks"]
+    assert loop.current_session is not None
+    loaded = store.load_session(loop.current_session.session_id)
+    persisted = loaded.messages[0].metadata
+    assert "content_blocks" not in persisted
+    assert persisted["images"][0]["source"] == "acp-inline"
     await loop.aclose()
 
 

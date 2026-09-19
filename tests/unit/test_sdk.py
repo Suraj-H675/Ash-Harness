@@ -8,6 +8,7 @@ from ash.agents.shared_state import SharedState
 from ash.sdk import AshClient
 from ash.config import AshConfig
 from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.failover import FailoverProvider
 from ash.sandbox import SandboxBackendUnavailable
 
@@ -45,6 +46,17 @@ class SerialProvider(SDKProvider):
             yield StreamChunk(content="<response>done</response>", is_done=True)
         finally:
             self.active -= 1
+
+
+class VisionSDKProvider(SDKProvider):
+    _ash_declared_capabilities = ProviderCapabilities(vision=True)
+
+    def __init__(self) -> None:
+        self.messages = []
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        self.messages = list(messages)
+        yield StreamChunk(content="<response>image ok</response>", is_done=True)
 
 
 class SteeringSDKProvider(SDKProvider):
@@ -159,6 +171,61 @@ async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
         assert client.sessions()[0].model == "ollama/sdk-model"
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_accepts_image_only_turn_without_persisting_raw_data(
+    tmp_path,
+) -> None:
+    provider = VisionSDKProvider()
+    config = AshConfig(
+        model="custom/vision-sdk",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+    metadata = {
+        "content_blocks": [
+            {"type": "image", "media_type": "image/png", "data": "YWJj"}
+        ],
+        "images": [
+            {"source": "sdk-inline", "media_type": "image/png", "sha256": "digest"}
+        ],
+    }
+
+    async with await AshClient.create(config=config, provider=provider) as client:
+        result = await client.prompt("", user_metadata=metadata)
+        loaded = client.loop.session_store.load_session(result.session_id)
+
+    assert result.response == "image ok"
+    user = next(item for item in provider.messages if item["role"] == "user")
+    assert user["content"] == [
+        {"type": "image", "media_type": "image/png", "data": "YWJj"}
+    ]
+    assert "content_blocks" not in loaded.messages[0].metadata
+    assert loaded.messages[0].metadata["images"][0]["source"] == "sdk-inline"
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_still_rejects_truly_empty_turn(tmp_path) -> None:
+    config = AshConfig(
+        model="custom/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+    async with await AshClient.create(config=config, provider=SDKProvider()) as client:
+        with pytest.raises(ValueError, match="prompt cannot be empty"):
+            await client.prompt("", user_metadata={"source": "metadata-only"})
+        with pytest.raises(ValueError, match="prompt cannot be empty"):
+            await client.prompt(
+                "",
+                user_metadata={
+                    "content_blocks": [{"type": "text", "text": ""}]
+                },
+            )
 
 
 @pytest.mark.asyncio

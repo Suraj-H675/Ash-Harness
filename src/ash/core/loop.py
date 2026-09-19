@@ -339,6 +339,9 @@ def _audit_action_for_tool(tool_name: str) -> AuditAction:
 
 
 def _canonical_message_content(message: Message) -> Any:
+    content_blocks = message.metadata.get("content_blocks")
+    if message.role == "user" and isinstance(content_blocks, list):
+        return content_blocks
     image_blocks = message.metadata.get("image_blocks")
     if message.role != "user" or not isinstance(image_blocks, list):
         return message.content
@@ -346,6 +349,22 @@ def _canonical_message_content(message: Message) -> Any:
         {"type": "text", "text": message.content},
         *image_blocks,
     ]
+
+
+def _metadata_has_image_blocks(metadata: dict[str, Any] | None) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    image_blocks = metadata.get("image_blocks")
+    if isinstance(image_blocks, list) and any(
+        isinstance(block, dict) and block.get("type") == "image"
+        for block in image_blocks
+    ):
+        return True
+    content_blocks = metadata.get("content_blocks")
+    return isinstance(content_blocks, list) and any(
+        isinstance(block, dict) and block.get("type") == "image"
+        for block in content_blocks
+    )
 
 
 UNTRUSTED_CONTENT_BOUNDARY = (
@@ -1423,6 +1442,11 @@ class AshLoop:
         self._turn_running = True
         try:
             await self._negotiate_provider_capabilities()
+            if (
+                _metadata_has_image_blocks(user_metadata)
+                and not _provider_capabilities(self.provider).vision
+            ):
+                raise ValueError("active model does not support vision input")
             return await self._run_turn(user_input, user_metadata=user_metadata)
         except asyncio.CancelledError:
             current_turn_id = self.turn_context.turn_id if self.turn_context else None
@@ -1597,6 +1621,7 @@ class AshLoop:
         )
         persisted_metadata = dict(user_message.metadata)
         persisted_metadata.pop("image_blocks", None)
+        persisted_metadata.pop("content_blocks", None)
         self.session_store.save_message(
             session.session_id,
             user_message.model_copy(

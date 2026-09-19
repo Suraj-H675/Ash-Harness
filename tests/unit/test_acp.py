@@ -21,6 +21,7 @@ acp = pytest.importorskip("acp")
 from acp import PROTOCOL_VERSION, connect_to_agent, run_agent, text_block
 from acp.schema import (
     AllowedOutcome,
+    AudioContentBlock,
     EnvVariable,
     HttpHeader,
     HttpMcpServer,
@@ -31,9 +32,10 @@ from acp.schema import (
     ResourceContentBlock,
 )
 
-from ash.sdk import AshEvent
+from ash.sdk import AshClient, AshEvent
 from ash.config import AshConfig
 from ash.core.session import Message, SessionStore, ToolCallRecord
+from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.trust import set_workspace_trusted
 from ash.server.acp import AshACPAgent
 
@@ -66,15 +68,23 @@ class FakeAshClient:
         approval_callback: Any,
     ) -> None:
         self.loop = SimpleNamespace(
-            current_session=SimpleNamespace(session_id=session_id)
+            current_session=SimpleNamespace(session_id=session_id),
+            provider=SimpleNamespace(capabilities=SimpleNamespace(vision=True)),
         )
         self.events = events
         self.approval_callback = approval_callback
         self.prompts: list[str] = []
+        self.prompt_metadata: list[dict[str, Any] | None] = []
         self.closed = False
 
-    async def stream_prompt(self, text: str) -> AsyncIterator[AshEvent]:
+    async def stream_prompt(
+        self,
+        text: str,
+        *,
+        user_metadata: dict[str, Any] | None = None,
+    ) -> AsyncIterator[AshEvent]:
         self.prompts.append(text)
+        self.prompt_metadata.append(user_metadata)
         for event in self.events:
             yield event
 
@@ -141,6 +151,10 @@ async def test_acp_maps_mcp_prompts_events_and_editor_permissions(
     assert initialized.protocol_version == 1
     assert initialized.agent_capabilities is not None
     assert initialized.agent_capabilities.load_session is True
+    assert initialized.agent_capabilities.prompt_capabilities is not None
+    assert initialized.agent_capabilities.prompt_capabilities.image is True
+    assert initialized.agent_capabilities.prompt_capabilities.audio is False
+    assert initialized.agent_capabilities.prompt_capabilities.embedded_context is False
     assert initialized.agent_capabilities.mcp_capabilities is not None
     assert initialized.agent_capabilities.mcp_capabilities.http is True
     assert initialized.agent_capabilities.session_capabilities is not None
@@ -242,6 +256,242 @@ async def test_acp_maps_mcp_prompts_events_and_editor_permissions(
 
     await agent.aclose()
     assert created[0][0].closed
+
+
+@pytest.mark.asyncio
+async def test_acp_forwards_inline_images_as_ephemeral_ash_metadata(
+    tmp_path: Path,
+) -> None:
+    clients: list[FakeAshClient] = []
+
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        client = FakeAshClient(session_id or "image-session", _events(), approval_callback)
+        clients.append(client)
+        return client
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    session = await agent.new_session(str(tmp_path))
+
+    response = await agent.prompt(
+        session.session_id,
+        [
+            text_block("Before image"),
+            ImageContentBlock(type="image", data="YWJj", mime_type="image/png"),
+            text_block("After image"),
+        ],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert clients[0].prompts == ["Before image\n\nAfter image"]
+    metadata = clients[0].prompt_metadata[0]
+    assert metadata is not None
+    assert metadata["content_blocks"] == [
+        {"type": "text", "text": "Before image"},
+        {"type": "image", "media_type": "image/png", "data": "YWJj"},
+        {"type": "text", "text": "After image"},
+    ]
+    assert metadata["images"][0]["media_type"] == "image/png"
+    assert metadata["images"][0]["sha256"]
+    assert "data" not in metadata["images"][0]
+
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_accepts_image_only_prompt(tmp_path: Path) -> None:
+    clients: list[FakeAshClient] = []
+
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        client = FakeAshClient(session_id or "image-only", _events(), approval_callback)
+        clients.append(client)
+        return client
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    session = await agent.new_session(str(tmp_path))
+
+    response = await agent.prompt(
+        session.session_id,
+        [ImageContentBlock(type="image", data="YWJj", mime_type="image/png")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert clients[0].prompts == [""]
+    assert clients[0].prompt_metadata[0]["content_blocks"] == [
+        {"type": "image", "media_type": "image/png", "data": "YWJj"}
+    ]
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_image_prompt_requires_active_model_vision(tmp_path: Path) -> None:
+    class NoVisionProvider(ProviderABC):
+        model_name = "no-vision"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text: str) -> int:
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            raise AssertionError("non-vision image prompt must fail before provider I/O")
+            yield StreamChunk(is_done=True)  # pragma: no cover
+
+    provider = NoVisionProvider()
+    config = AshConfig(
+        model="custom/no-vision",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        return await AshClient.create(
+            config=config,
+            workspace=workspace,
+            provider=provider,
+            approval_callback=approval_callback,
+            workspace_trusted=True,
+            session_id=session_id,
+            additional_mcp_configs=mcp_configs,
+            run_maintenance=False,
+        )
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    session = await agent.new_session(str(tmp_path))
+
+    with pytest.raises(acp.RequestError) as unsupported:
+        await agent.prompt(
+            session.session_id,
+            [ImageContentBlock(type="image", data="YWJj", mime_type="image/png")],
+        )
+
+    assert "vision" in unsupported.value.data["message"].casefold()
+    assert provider.calls == 0
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("data", "mime_type", "message"),
+    [
+        ("secret-not-base64", "image/png", "base64"),
+        ("YWJj", "image/svg+xml", "media type"),
+    ],
+)
+async def test_acp_rejects_invalid_inline_images(
+    tmp_path: Path,
+    data: str,
+    mime_type: str,
+    message: str,
+) -> None:
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        return FakeAshClient(session_id or "invalid-image", _events(), approval_callback)
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    session = await agent.new_session(str(tmp_path))
+    with pytest.raises(acp.RequestError) as invalid:
+        await agent.prompt(
+            session.session_id,
+            [ImageContentBlock(type="image", data=data, mime_type=mime_type)],
+        )
+    assert message in str(invalid.value.data).casefold()
+    assert data not in str(invalid.value.data)
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_rejects_oversized_inline_image(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[FakeAshClient] = []
+
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        client = FakeAshClient(session_id or "oversized", _events(), approval_callback)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("ash.server.acp.MAX_ACP_IMAGE_BYTES", 2, raising=False)
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    session = await agent.new_session(str(tmp_path))
+
+    with pytest.raises(acp.RequestError) as oversized:
+        await agent.prompt(
+            session.session_id,
+            [ImageContentBlock(type="image", data="YWJj", mime_type="image/png")],
+        )
+    assert "image" in oversized.value.data["prompt"].casefold()
+    assert "large" in oversized.value.data["prompt"].casefold()
+    assert clients[0].prompts == []
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_rejects_inline_images_over_total_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[FakeAshClient] = []
+
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        client = FakeAshClient(session_id or "total-limit", _events(), approval_callback)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("ash.server.acp.MAX_ACP_TOTAL_IMAGE_BYTES", 5)
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    session = await agent.new_session(str(tmp_path))
+
+    with pytest.raises(acp.RequestError) as oversized:
+        await agent.prompt(
+            session.session_id,
+            [
+                ImageContentBlock(type="image", data="YWJj", mime_type="image/png"),
+                ImageContentBlock(type="image", data="ZGVm", mime_type="image/png"),
+            ],
+        )
+    assert "total" in oversized.value.data["prompt"].casefold()
+    assert clients[0].prompts == []
+    await agent.aclose()
 
 
 @pytest.mark.asyncio
@@ -519,9 +769,9 @@ async def test_acp_load_replays_and_lists_durable_sessions(
     with pytest.raises(acp.RequestError) as unsupported:
         await agent.prompt(
             stored.session_id,
-            [ImageContentBlock(type="image", data="AA==", mime_type="image/png")],
+            [AudioContentBlock(type="audio", data="AA==", mime_type="audio/wav")],
         )
-    assert unsupported.value.data["prompt"] == "unsupported content type: image"
+    assert unsupported.value.data["prompt"] == "unsupported content type: audio"
 
     await agent.aclose()
     assert clients[0].closed
@@ -807,6 +1057,8 @@ async def test_production_acp_entrypoint_exposes_close_only(
         )
         capabilities = initialized.agent_capabilities
         assert capabilities is not None
+        assert capabilities.prompt_capabilities is not None
+        assert capabilities.prompt_capabilities.image is True
         assert capabilities.session_capabilities is not None
         assert capabilities.session_capabilities.close is not None
         session = await asyncio.wait_for(
@@ -815,7 +1067,14 @@ async def test_production_acp_entrypoint_exposes_close_only(
         prompted = await asyncio.wait_for(
             connection.prompt(
                 session_id=session.session_id,
-                prompt=[text_block("Return the ACP response")],
+                prompt=[
+                    text_block("Return the ACP response"),
+                    ImageContentBlock(
+                        type="image",
+                        data="YWJj",
+                        mime_type="image/png",
+                    ),
+                ],
             ),
             timeout=45,
         )
@@ -859,6 +1118,18 @@ async def test_production_acp_entrypoint_exposes_close_only(
         assert requests[0][0] == "/v1/chat/completions"
         assert requests[0][1]["model"] == "acp-real-model"
         assert requests[0][1]["stream"] is True
+        user_message = next(
+            message
+            for message in requests[0][1]["messages"]
+            if message["role"] == "user"
+        )
+        assert user_message["content"] == [
+            {"type": "text", "text": "Return the ACP response"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,YWJj"},
+            },
+        ]
     finally:
         await connection.close()
         if process.stdin is not None:

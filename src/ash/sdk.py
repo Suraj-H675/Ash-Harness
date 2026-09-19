@@ -35,6 +35,25 @@ from ash.ui.headless import HeadlessUI
 ApprovalCallback = Callable[[str, dict], Awaitable[bool]]
 
 
+def _metadata_has_image_content(user_metadata: dict[str, Any] | None) -> bool:
+    if not isinstance(user_metadata, dict):
+        return False
+    for key in ("image_blocks", "content_blocks"):
+        blocks = user_metadata.get(key)
+        if isinstance(blocks, list) and any(
+            isinstance(block, dict) and block.get("type") == "image"
+            for block in blocks
+        ):
+            return True
+    return False
+
+
+def _prompt_has_content(text: str, user_metadata: dict[str, Any] | None) -> bool:
+    if text.strip():
+        return True
+    return _metadata_has_image_content(user_metadata)
+
+
 @dataclass(frozen=True)
 class AshResult:
     response: str
@@ -252,7 +271,7 @@ class AshClient:
         *,
         user_metadata: dict[str, Any] | None = None,
     ) -> AshResult:
-        if not text.strip():
+        if not _prompt_has_content(text, user_metadata):
             raise ValueError("prompt cannot be empty")
         if not self._started:
             await self._start_unlocked()
@@ -284,7 +303,7 @@ class AshClient:
     ) -> AsyncIterator[AshEvent]:
         """Yield real runtime deltas and one terminal completion/error event."""
 
-        if not text.strip():
+        if not _prompt_has_content(text, user_metadata):
             raise ValueError("prompt cannot be empty")
         async with self._turn_lock:
             ui = self.loop.ui

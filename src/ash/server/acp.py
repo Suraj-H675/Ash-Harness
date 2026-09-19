@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
 import html
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -70,11 +73,18 @@ from ash.core.session import (
     normalize_project_path,
 )
 from ash.mcp.server import MCP_SERVER_NAME, MCPServerConfig
+from ash.providers.messages import (
+    MAX_IMAGE_BASE64_CHARS,
+    SUPPORTED_IMAGE_MEDIA_TYPES,
+    ImageContentBlock as ProviderImageContentBlock,
+)
 
 
 MAX_ACP_SESSIONS = 16
 MAX_ACP_PROMPT_BLOCKS = 64
 MAX_ACP_PROMPT_BYTES = 1_000_000
+MAX_ACP_IMAGE_BYTES = 5_000_000
+MAX_ACP_TOTAL_IMAGE_BYTES = 10_000_000
 MAX_ACP_MCP_SERVERS = 32
 MAX_ACP_MCP_VALUES = 64
 MAX_ACP_MCP_FIELD_BYTES = 64 * 1024
@@ -138,7 +148,7 @@ class AshACPAgent:
             agent_capabilities=AgentCapabilities(
                 load_session=True,
                 prompt_capabilities=PromptCapabilities(
-                    image=False,
+                    image=True,
                     audio=False,
                     embedded_context=False,
                 ),
@@ -287,7 +297,7 @@ class AshACPAgent:
         **kwargs: Any,
     ) -> PromptResponse:
         state = await self._session(session_id)
-        text = _prompt_text(prompt)
+        text, user_metadata = _prompt_payload(prompt)
         current = asyncio.current_task()
         if current is None:
             raise RequestError.internal_error()
@@ -304,7 +314,12 @@ class AshACPAgent:
         failure = ""
         cancelled = False
         try:
-            async for event in state.client.stream_prompt(text):
+            events = (
+                state.client.stream_prompt(text, user_metadata=user_metadata)
+                if user_metadata is not None
+                else state.client.stream_prompt(text)
+            )
+            async for event in events:
                 if event.type == "assistant.delta" and event.data.get("text"):
                     sent_text = True
                 if event.type == "turn.error":
@@ -752,35 +767,93 @@ def _validate_mcp_url(value: str) -> None:
         )
 
 
-def _prompt_text(blocks: list[Any]) -> str:
+def _prompt_payload(blocks: list[Any]) -> tuple[str, dict[str, Any] | None]:
     if not blocks or len(blocks) > MAX_ACP_PROMPT_BLOCKS:
         raise RequestError.invalid_params({"prompt": "must contain 1..64 blocks"})
     rendered: list[str] = []
+    content_blocks: list[dict[str, str]] = []
+    image_descriptors: list[dict[str, str]] = []
+    total_image_bytes = 0
     for block in blocks:
         if isinstance(block, TextContentBlock):
             rendered.append(block.text)
+            content_blocks.append({"type": "text", "text": block.text})
         elif isinstance(block, ResourceContentBlock):
             if len(block.uri) > 4096 or len(block.name) > 512:
                 raise RequestError.invalid_params(
                     {"prompt": "resource link is too long"}
                 )
-            rendered.append(
+            resource_text = (
                 '<resource_link name="'
                 + html.escape(block.name, quote=True)
                 + '" uri="'
                 + html.escape(block.uri, quote=True)
                 + '" />'
             )
+            rendered.append(resource_text)
+            content_blocks.append({"type": "text", "text": resource_text})
+        elif isinstance(block, ImageContentBlock):
+            if block.mime_type not in SUPPORTED_IMAGE_MEDIA_TYPES:
+                raise RequestError.invalid_params(
+                    {"prompt": "unsupported image media type"}
+                )
+            if not block.data:
+                raise RequestError.invalid_params(
+                    {"prompt": "inline image data must not be empty"}
+                )
+            if len(block.data) > MAX_IMAGE_BASE64_CHARS:
+                raise RequestError.invalid_params(
+                    {"prompt": "inline image encoding is too large"}
+                )
+            try:
+                decoded = base64.b64decode(block.data, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise RequestError.invalid_params(
+                    {"prompt": "inline image data must be valid base64"}
+                ) from exc
+            if len(decoded) > MAX_ACP_IMAGE_BYTES:
+                raise RequestError.invalid_params(
+                    {"prompt": "inline image is too large"}
+                )
+            total_image_bytes += len(decoded)
+            if total_image_bytes > MAX_ACP_TOTAL_IMAGE_BYTES:
+                raise RequestError.invalid_params(
+                    {"prompt": "inline images are too large in total"}
+                )
+            try:
+                image = ProviderImageContentBlock(
+                    media_type=block.mime_type,
+                    data=block.data,
+                )
+            except ValueError as exc:
+                raise RequestError.invalid_params(
+                    {"prompt": "invalid inline image"}
+                ) from exc
+            content_blocks.append(image.model_dump(mode="python"))
+            image_descriptors.append(
+                {
+                    "source": "acp-inline",
+                    "media_type": image.media_type,
+                    "sha256": hashlib.sha256(decoded).hexdigest(),
+                }
+            )
         else:
             raise RequestError.invalid_params(
                 {"prompt": f"unsupported content type: {getattr(block, 'type', '')}"}
             )
     text = "\n\n".join(rendered).strip()
-    if not text or len(text.encode("utf-8")) > MAX_ACP_PROMPT_BYTES:
+    if len(text.encode("utf-8")) > MAX_ACP_PROMPT_BYTES:
         raise RequestError.invalid_params(
-            {"prompt": "content is empty or exceeds 1 MB"}
+            {"prompt": "text content exceeds 1 MB"}
         )
-    return text
+    if not text and not image_descriptors:
+        raise RequestError.invalid_params({"prompt": "content is empty"})
+    metadata = (
+        {"content_blocks": content_blocks, "images": image_descriptors}
+        if image_descriptors
+        else None
+    )
+    return text, metadata
 
 
 def _decode_cursor(cursor: str | None) -> int:

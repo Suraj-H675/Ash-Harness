@@ -55,6 +55,36 @@ def test_typed_canonical_messages_round_trip_to_wire_shape() -> None:
     assert wire[3]["tool_call_id"] == "call-1"
 
 
+def test_first_party_encoders_support_image_only_user_content() -> None:
+    messages = [
+        CanonicalMessage(
+            role="user",
+            content=[ImageContentBlock(media_type="image/png", data="YWJj")],
+        )
+    ]
+
+    openai_messages = prepare_openai_messages(messages)
+    system, anthropic_messages = prepare_anthropic_messages(messages)
+
+    assert openai_messages[0]["content"] == [
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,YWJj"},
+        }
+    ]
+    assert system == ""
+    assert anthropic_messages[0]["content"] == [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "YWJj",
+            },
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     ("message", "match"),
     [
