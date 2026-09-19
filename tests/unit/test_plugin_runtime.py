@@ -18,7 +18,7 @@ from ash.plugins.runtime import (
 )
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.guard import SafetyGuard
-from ash.sandbox import SandboxManager
+from ash.sandbox import BubblewrapSandbox, SandboxManager, has_bwrap
 
 
 HOST_SOURCE = r"""
@@ -103,6 +103,7 @@ def _plugin(
     *,
     timeout: float = 1.0,
     schema: dict | None = None,
+    python_executable: str | None = None,
 ) -> DiscoveredPlugin:
     root.mkdir(parents=True, exist_ok=True)
     (root / "runtime.py").write_text(HOST_SOURCE, encoding="utf-8")
@@ -111,7 +112,7 @@ def _plugin(
             "name": "example-plugin",
             "version": "1.2.3",
             "runtime": {
-                "command": [sys.executable, "runtime.py"],
+                "command": [python_executable or sys.executable, "runtime.py"],
                 "timeoutSeconds": timeout,
             },
             "tools": [
@@ -173,6 +174,67 @@ async def test_real_plugin_host_handshake_call_and_close(tmp_path: Path) -> None
     assert tool.client.running is False
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+@pytest.mark.asyncio
+async def test_isolated_plugin_host_pins_root_across_path_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not has_bwrap():
+        pytest.skip("bwrap not installed or usable on this host")
+    python = next(
+        (
+            candidate
+            for candidate in (Path("/usr/bin/python3"), Path("/usr/bin/python"))
+            if candidate.exists()
+        ),
+        None,
+    )
+    if python is None:
+        pytest.skip("no system Python inside Bubblewrap system mounts")
+
+    plugin = _plugin(tmp_path / "plugin", python_executable=str(python))
+    replacement = tmp_path / "replacement"
+    saved = tmp_path / "plugin-saved"
+    replacement.mkdir()
+    replacement_source = HOST_SOURCE.replace(
+        'str(arguments.get("text", os.getpid()))',
+        '"REPLACEMENT"',
+    )
+    assert replacement_source != HOST_SOURCE
+    (replacement / "runtime.py").write_text(replacement_source, encoding="utf-8")
+
+    manager = SandboxManager(
+        workspace_root=plugin.root,
+        workspace_read_only=True,
+        require_read_isolation=True,
+        network=False,
+        backend_preference="native",
+    )
+    assert manager.backend_name == "bubblewrap"
+    original_wrap = BubblewrapSandbox.wrap
+    swapped = False
+
+    def swap_after_wrap(
+        backend: BubblewrapSandbox,
+        command: list[str] | tuple[str, ...],
+        **kwargs: object,
+    ) -> list[str]:
+        nonlocal swapped
+        argv = original_wrap(backend, command, **kwargs)
+        if not swapped:
+            plugin.root.rename(saved)
+            plugin.root.symlink_to(replacement, target_is_directory=True)
+            swapped = True
+        return argv
+
+    monkeypatch.setattr(BubblewrapSandbox, "wrap", swap_after_wrap)
+    client = PluginHostClient(plugin, manager, allow_unisolated=False)
+    try:
+        result = await client.call_tool("echo", {"text": "ORIGINAL"})
+        assert result.output == "ORIGINAL"
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio

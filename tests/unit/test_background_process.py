@@ -2,13 +2,21 @@ import asyncio
 import os
 import shlex
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from ash.safety.guard import SafetyGuard, SafetyViolation
-from ash.sandbox import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable, SandboxInvocation
+from ash.sandbox import (
+    BubblewrapSandbox,
+    SANDBOX_TIER_BWRAP,
+    SandboxBackendUnavailable,
+    SandboxInvocation,
+    SandboxManager,
+    has_bwrap,
+)
 from ash.core.redaction import LONG_TOKEN_WITHHELD_MARKER
 from ash.tools.process import (
     BACKGROUND_OUTPUT_TRUNCATION_MARKER,
@@ -239,11 +247,13 @@ async def test_stopped_background_job_does_not_consume_running_capacity(
 async def test_background_process_uses_sandbox_manager(tmp_path) -> None:
     manager = Mock()
     manager.tier = SANDBOX_TIER_BWRAP
-    manager.prepare.return_value = SandboxInvocation(
-        ("/bin/sh", "-c", "printf isolated"),
-        tmp_path,
-        SANDBOX_TIER_BWRAP,
-        "test-sandbox",
+    manager.prepare_launch.return_value = nullcontext(
+        SandboxInvocation(
+            ("/bin/sh", "-c", "printf isolated"),
+            tmp_path,
+            SANDBOX_TIER_BWRAP,
+            "test-sandbox",
+        )
     )
     tool = BackgroundProcessTool(SafetyGuard(tmp_path), sandbox_manager=manager)
 
@@ -254,7 +264,7 @@ async def test_background_process_uses_sandbox_manager(tmp_path) -> None:
 
     assert "isolated" in polled.output
     assert "[test-sandbox]" in polled.output
-    manager.prepare.assert_called_once_with(
+    manager.prepare_launch.assert_called_once_with(
         ["/bin/sh", "-c", "printf ignored"],
         cwd=tmp_path,
         passthrough_env_names=(),
@@ -268,7 +278,7 @@ async def test_background_process_fails_closed_when_sandbox_disappears(
 ) -> None:
     manager = Mock()
     manager.tier = SANDBOX_TIER_BWRAP
-    manager.prepare.side_effect = SandboxBackendUnavailable("backend stopped")
+    manager.prepare_launch.side_effect = SandboxBackendUnavailable("backend stopped")
     tool = BackgroundProcessTool(SafetyGuard(tmp_path), sandbox_manager=manager)
 
     result = await tool.run(action="start", command="printf unsafe")
@@ -276,6 +286,56 @@ async def test_background_process_fails_closed_when_sandbox_disappears(
     assert result.success is False
     assert "command was not started" in (result.error or "")
     assert not tool.jobs
+
+
+@pytest.mark.asyncio
+async def test_background_process_pins_bwrap_workspace_across_path_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not has_bwrap():
+        pytest.skip("bwrap not installed or usable on this host")
+
+    workspace = tmp_path / "workspace"
+    replacement = tmp_path / "replacement"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    replacement.mkdir()
+    (workspace / "marker.txt").write_text("ORIGINAL", encoding="utf-8")
+    (replacement / "marker.txt").write_text("REPLACEMENT", encoding="utf-8")
+    manager = SandboxManager(
+        workspace_root=workspace,
+        preferred_tier=SANDBOX_TIER_BWRAP,
+        backend_preference="native",
+    )
+    assert manager.backend_name == "bubblewrap"
+    tool = BackgroundProcessTool(SafetyGuard(workspace), sandbox_manager=manager)
+    original_wrap = BubblewrapSandbox.wrap
+    swapped = False
+
+    def swap_after_wrap(
+        backend: BubblewrapSandbox,
+        command: list[str] | tuple[str, ...],
+        **kwargs: object,
+    ) -> list[str]:
+        nonlocal swapped
+        argv = original_wrap(backend, command, **kwargs)
+        if not swapped:
+            workspace.rename(saved)
+            workspace.symlink_to(replacement, target_is_directory=True)
+            swapped = True
+        return argv
+
+    monkeypatch.setattr(BubblewrapSandbox, "wrap", swap_after_wrap)
+
+    started = await tool.run(action="start", command="cat marker.txt")
+    assert started.success is True, started.error
+    job_id = started.output.split()[1]
+    await asyncio.sleep(0.1)
+    polled = await tool.run(action="poll", job_id=job_id)
+
+    assert "ORIGINAL" in polled.output
+    assert "REPLACEMENT" not in polled.output
+    await tool.aclose()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX cwd race regression")

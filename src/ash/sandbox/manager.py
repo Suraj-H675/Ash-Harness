@@ -17,11 +17,14 @@ import asyncio
 import os
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence, TypedDict
 
 from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import ScopedIOError, open_scoped_directory
 from ash.sandbox._base import (
     SANDBOX_TIER_BWRAP,
     SANDBOX_TIER_DOCKER,
@@ -96,6 +99,7 @@ class SandboxInvocation:
     tier: SandboxTier
     backend_name: str
     fallback_used: bool = False
+    pass_fds: tuple[int, ...] = ()
 
 
 class SandboxStatus(TypedDict):
@@ -206,6 +210,9 @@ class SandboxManager:
     backend_preference: str = "auto"
     docker_image: str = DEFAULT_IMAGE
     _selected_backend: str = field(init=False, repr=False, default="scoped")
+    _workspace_identity: tuple[int, int] | None = field(
+        init=False, repr=False, default=None
+    )
 
     def __post_init__(self) -> None:
         if self.preferred_tier not in {
@@ -221,6 +228,14 @@ class SandboxManager:
             )
         if not self.docker_image.strip():
             raise ValueError("docker_image must not be empty")
+        if self.workspace_root is not None:
+            self.workspace_root = Path(self.workspace_root).expanduser().resolve()
+            try:
+                metadata = self.workspace_root.stat()
+            except OSError:
+                pass
+            else:
+                self._workspace_identity = (metadata.st_dev, metadata.st_ino)
         self._available: dict[str, bool] = {"scoped": True}
         self._tier: SandboxTier = self._detect_tier()
 
@@ -332,33 +347,90 @@ class SandboxManager:
             raise ValueError("command must be a non-empty sequence")
 
         deadline = timeout if timeout is not None else self.timeout_seconds
-        invocation = self.prepare(
+        with self.prepare_launch(
             command,
             cwd=cwd,
             passthrough_env_names=passthrough_env_names,
-        )
-        if invocation.tier == SANDBOX_TIER_SCOPED:
-            return await _run_scoped(
-                _ScopedBackend(),
-                invocation.argv,
-                invocation.cwd,
-                deadline,
+        ) as invocation:
+            if invocation.tier == SANDBOX_TIER_SCOPED:
+                return await _run_scoped(
+                    _ScopedBackend(),
+                    invocation.argv,
+                    invocation.cwd,
+                    deadline,
+                    workspace_root=self.workspace_root,
+                    fallback=invocation.fallback_used,
+                    env=env,
+                    stream_callback=stream_callback,
+                )
+
+            return await _run_subprocess(
+                list(invocation.argv),
+                cwd=invocation.cwd,
+                deadline=deadline,
+                tier=invocation.tier,
+                backend_name=invocation.backend_name,
                 workspace_root=self.workspace_root,
-                fallback=invocation.fallback_used,
                 env=env,
                 stream_callback=stream_callback,
+                pass_fds=invocation.pass_fds,
             )
 
-        return await _run_subprocess(
-            list(invocation.argv),
-            cwd=invocation.cwd,
-            deadline=deadline,
-            tier=invocation.tier,
-            backend_name=invocation.backend_name,
-            workspace_root=self.workspace_root,
-            env=env,
-            stream_callback=stream_callback,
-        )
+    @contextmanager
+    def prepare_launch(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        passthrough_env_names: Sequence[str] = (),
+    ) -> Iterator[SandboxInvocation]:
+        """Prepare one spawn while holding any backend security anchors open."""
+
+        if self._selected_backend != "bubblewrap" or self.workspace_root is None:
+            yield self.prepare(
+                command,
+                cwd=cwd,
+                passthrough_env_names=passthrough_env_names,
+            )
+            return
+
+        resolved_cwd = Path(cwd).expanduser().resolve() if cwd is not None else None
+        try:
+            with open_scoped_directory(
+                self.workspace_root,
+                SafetyGuard(self.workspace_root),
+            ) as (_, workspace_fd):
+                opened = os.fstat(workspace_fd)
+                if self._workspace_identity is not None and (
+                    opened.st_dev,
+                    opened.st_ino,
+                ) != self._workspace_identity:
+                    raise SandboxBackendUnavailable(
+                        "sandbox workspace identity changed"
+                    )
+                invocation = self._prepare(
+                    command,
+                    cwd=resolved_cwd,
+                    passthrough_env_names=passthrough_env_names,
+                    workspace_fd=workspace_fd,
+                )
+                if invocation.backend_name != "bubblewrap":
+                    yield invocation
+                    return
+                yield SandboxInvocation(
+                    invocation.argv,
+                    None,
+                    invocation.tier,
+                    invocation.backend_name,
+                    invocation.fallback_used,
+                    (workspace_fd,),
+                )
+        except SandboxBackendUnavailable:
+            raise
+        except (OSError, SafetyViolation, ScopedIOError) as exc:
+            raise SandboxBackendUnavailable(
+                f"sandbox workspace could not be pinned: {exc}"
+            ) from exc
 
     def prepare(
         self,
@@ -367,17 +439,47 @@ class SandboxManager:
         cwd: Path | None = None,
         passthrough_env_names: Sequence[str] = (),
     ) -> SandboxInvocation:
-        """Prepare a command for foreground or managed background execution."""
+        """Prepare argv without retaining launch-time security anchors.
+
+        Callers that will spawn the returned invocation must use
+        :meth:`prepare_launch` so descriptor-backed isolation remains live
+        through process creation.
+        """
+
+        return self._prepare(
+            command,
+            cwd=cwd,
+            passthrough_env_names=passthrough_env_names,
+            workspace_fd=None,
+        )
+
+    def _prepare(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None,
+        passthrough_env_names: Sequence[str],
+        workspace_fd: int | None,
+    ) -> SandboxInvocation:
+        """Prepare argv, optionally binding Bubblewrap to a held workspace FD."""
 
         if not command:
             raise ValueError("command must be a non-empty sequence")
         try:
             backend = self._build_backend(self._tier)
-            wrapped = backend.wrap(
-                command,
-                cwd=cwd,
-                passthrough_env_names=passthrough_env_names,
-            )
+            if isinstance(backend, BubblewrapSandbox):
+                wrapped = backend.wrap(
+                    command,
+                    cwd=cwd,
+                    passthrough_env_names=passthrough_env_names,
+                    workspace_fd=workspace_fd,
+                )
+            else:
+                wrapped = backend.wrap(
+                    command,
+                    cwd=cwd,
+                    passthrough_env_names=passthrough_env_names,
+                )
         except SandboxBackendUnavailable:
             if not self.allow_scoped_fallback:
                 raise
@@ -630,12 +732,13 @@ async def _run_subprocess(
     workspace_root: Path | None,
     env: dict[str, str] | None = None,
     stream_callback: ProcessStreamCallback | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> SandboxResult:
     """Execute a pre-wrapped argv (e.g. bwrap or docker run) directly."""
 
     start = time.monotonic()
     try:
-        process_tree_plan = prepare_process_tree(workspace_root=cwd)
+        process_tree_plan = prepare_process_tree(workspace_root=workspace_root or cwd)
     except ProcessTreeUnavailable as exc:
         raise SandboxBackendUnavailable(str(exc)) from exc
     guard = SafetyGuard(workspace_root or cwd or Path.cwd())
@@ -647,8 +750,9 @@ async def _run_subprocess(
             search_path=(env or {}).get("PATH"),
         ) as launch:
             spawn_options = dict(process_tree_plan.spawn_options)
-            if launch.pass_fds:
-                spawn_options["pass_fds"] = launch.pass_fds
+            inherited_fds = tuple(dict.fromkeys((*pass_fds, *launch.pass_fds)))
+            if inherited_fds:
+                spawn_options["pass_fds"] = inherited_fds
             process = await asyncio.create_subprocess_exec(
                 *launch.argv,
                 cwd=launch.cwd,

@@ -12,6 +12,8 @@ to Tier 1.
 
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -92,6 +94,7 @@ class BubblewrapSandbox(SandboxBackend):
         *,
         cwd: Path | None = None,
         passthrough_env_names: Sequence[str] = (),
+        workspace_fd: int | None = None,
     ) -> list[str]:
         """Build a full ``bwrap … -- command`` argv list."""
 
@@ -120,13 +123,36 @@ class BubblewrapSandbox(SandboxBackend):
         # while executable extensions use a read-only code mount.
         if self.workspace_root is None:
             raise SandboxBackendUnavailable("bubblewrap requires a workspace root")
-        root = Path(self.workspace_root).resolve()
-        if not root.is_dir():
+        if workspace_fd is not None and workspace_fd < 0:
+            raise ValueError("workspace_fd must be non-negative")
+        root = (
+            Path(self.workspace_root).absolute()
+            if workspace_fd is not None
+            else Path(self.workspace_root).resolve()
+        )
+        if workspace_fd is not None:
+            try:
+                workspace_metadata = os.fstat(workspace_fd)
+            except OSError as exc:
+                raise SandboxBackendUnavailable(
+                    "bubblewrap workspace descriptor is unavailable"
+                ) from exc
+            if not stat.S_ISDIR(workspace_metadata.st_mode):
+                raise SandboxBackendUnavailable(
+                    "bubblewrap workspace descriptor is not a directory"
+                )
+        elif not root.is_dir():
             raise SandboxBackendUnavailable(
                 f"workspace root is not a directory: {root}"
             )
-        workspace_bind = "--ro-bind" if self.workspace_read_only else "--bind"
-        args.extend([workspace_bind, str(root), str(root)])
+        if workspace_fd is not None:
+            workspace_bind = (
+                "--ro-bind-fd" if self.workspace_read_only else "--bind-fd"
+            )
+            args.extend([workspace_bind, str(workspace_fd), str(root)])
+        else:
+            workspace_bind = "--ro-bind" if self.workspace_read_only else "--bind"
+            args.extend([workspace_bind, str(root), str(root)])
 
         # Scratch directory for ephemeral writes.
         scratch = Path(self.scratch_dir).resolve() if self.scratch_dir else Path("/tmp")
@@ -153,7 +179,9 @@ class BubblewrapSandbox(SandboxBackend):
 
         # The working directory must already be part of the workspace mount.
         if cwd is not None:
-            cwd_resolved = Path(cwd).resolve()
+            cwd_resolved = (
+                Path(cwd).absolute() if workspace_fd is not None else Path(cwd).resolve()
+            )
             try:
                 cwd_resolved.relative_to(root)
             except ValueError as exc:
@@ -189,23 +217,29 @@ def probe_bwrap(*, workspace_root: Path | None = None) -> str | None:
     path = resolve_host_executable("bwrap", workspace_root=workspace_root)
     if path is None or not sys.platform.startswith("linux"):
         return None
+    descriptor = -1
     try:
+        descriptor = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         result = subprocess.run(
             [
                 path,
                 "--unshare-user-try",
                 "--unshare-pid",
                 "--unshare-net",
-                "--ro-bind",
-                "/",
+                "--ro-bind-fd",
+                str(descriptor),
                 "/",
                 "--",
                 "true",
             ],
+            pass_fds=(descriptor,),
             capture_output=True,
             check=False,
             timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
         return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     return path if result.returncode == 0 else None

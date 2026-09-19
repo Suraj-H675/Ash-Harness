@@ -6,6 +6,7 @@ import asyncio
 import platform
 import uuid
 from collections.abc import Awaitable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -27,7 +28,13 @@ from ash.sandbox.process_utils import (
     prepare_scoped_process_launch,
     terminate_process_tree,
 )
-from ash.sandbox import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable, SandboxManager
+from ash.sandbox import (
+    SANDBOX_TIER_BWRAP,
+    SANDBOX_TIER_SCOPED,
+    SandboxBackendUnavailable,
+    SandboxInvocation,
+    SandboxManager,
+)
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.tools.command import build_scrubbed_command_env
 
@@ -214,21 +221,6 @@ class BackgroundProcessTool(BaseTool):
                 )
             argv = [powershell, "-NoProfile", "-Command", args.command]
         backend_name = "scoped"
-        if self.sandbox_manager is not None:
-            try:
-                invocation = self.sandbox_manager.prepare(
-                    argv,
-                    cwd=Path(cwd),
-                    passthrough_env_names=self.environment_allowlist,
-                )
-            except SandboxBackendUnavailable as exc:
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=f"Sandbox unavailable; command was not started: {exc}",
-                )
-            argv = list(invocation.argv)
-            backend_name = invocation.backend_name
         try:
             process_tree_plan = prepare_process_tree(
                 workspace_root=self.safety_guard.project_root
@@ -239,39 +231,68 @@ class BackgroundProcessTool(BaseTool):
                 output="",
                 error=f"Command was not started: {exc}",
             )
-        if platform.system() != "Windows":
-            try:
-                with prepare_scoped_process_launch(
+        try:
+            invocation_context: AbstractContextManager[SandboxInvocation]
+            if self.sandbox_manager is None:
+                invocation_context = nullcontext(
+                    SandboxInvocation(
+                        tuple(argv),
+                        Path(cwd),
+                        SANDBOX_TIER_SCOPED,
+                        "scoped",
+                    )
+                )
+            else:
+                invocation_context = self.sandbox_manager.prepare_launch(
                     argv,
-                    cwd=cwd,
-                    guard=self.safety_guard,
-                    search_path=environment.get("PATH"),
-                ) as launch:
+                    cwd=Path(cwd),
+                    passthrough_env_names=self.environment_allowlist,
+                )
+            with invocation_context as invocation:
+                backend_name = invocation.backend_name
+                if platform.system() != "Windows":
+                    with prepare_scoped_process_launch(
+                        invocation.argv,
+                        cwd=invocation.cwd,
+                        guard=self.safety_guard,
+                        search_path=environment.get("PATH"),
+                    ) as launch:
+                        inherited_fds = tuple(
+                            dict.fromkeys((*invocation.pass_fds, *launch.pass_fds))
+                        )
+                        spawn_options = dict(process_tree_plan.spawn_options)
+                        if inherited_fds:
+                            spawn_options["pass_fds"] = inherited_fds
+                        process = await asyncio.create_subprocess_exec(
+                            *launch.argv,
+                            cwd=launch.cwd,
+                            env=environment,
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            **spawn_options,
+                        )
+                else:
                     process = await asyncio.create_subprocess_exec(
-                        *launch.argv,
-                        cwd=launch.cwd,
+                        *invocation.argv,
+                        cwd=invocation.cwd,
                         env=environment,
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
-                        pass_fds=launch.pass_fds,
                         **process_tree_plan.spawn_options,
                     )
-            except ProcessTreeUnavailable as exc:
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=f"Command was not started: {exc}",
-                )
-        else:
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=cwd,
-                env=environment,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **process_tree_plan.spawn_options,
+        except SandboxBackendUnavailable as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Sandbox unavailable; command was not started: {exc}",
+            )
+        except ProcessTreeUnavailable as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Command was not started: {exc}",
             )
         job = Job(
             uuid.uuid4().hex[:12],

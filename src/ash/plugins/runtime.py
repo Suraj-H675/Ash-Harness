@@ -186,34 +186,40 @@ class PluginHostClient:
                 "supported sandbox or explicitly set "
                 "ASH_ALLOW_UNSAFE_PLUGIN_RUNTIME=true"
             )
-        try:
-            invocation = self.sandbox_manager.prepare(
-                self.runtime.command,
-                cwd=self.plugin.root,
-            )
-        except SandboxBackendUnavailable as exc:
-            raise PluginRuntimeError(f"plugin sandbox unavailable: {exc}") from exc
-        try:
-            process_tree_plan = prepare_process_tree(workspace_root=self.plugin.root)
-        except ProcessTreeUnavailable as exc:
-            raise PluginRuntimeError(
-                f"plugin process was not started: {exc}"
-            ) from exc
         self._stderr_chunks.clear()
         self._stderr_size = 0
         env = _plugin_environment()
-        self._process_tree_plan = process_tree_plan
         try:
-            self._process = await asyncio.create_subprocess_exec(
-                *invocation.argv,
-                cwd=invocation.cwd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                limit=MAX_PLUGIN_MESSAGE_BYTES + 1,
-                **process_tree_plan.spawn_options,
-            )
+            with self.sandbox_manager.prepare_launch(
+                self.runtime.command,
+                cwd=self.plugin.root,
+            ) as invocation:
+                try:
+                    process_tree_plan = prepare_process_tree(
+                        workspace_root=self.plugin.root
+                    )
+                except ProcessTreeUnavailable as exc:
+                    raise PluginRuntimeError(
+                        f"plugin process was not started: {exc}"
+                    ) from exc
+                self._process_tree_plan = process_tree_plan
+                spawn_options = dict(process_tree_plan.spawn_options)
+                if invocation.pass_fds:
+                    spawn_options["pass_fds"] = invocation.pass_fds
+                self._process = await asyncio.create_subprocess_exec(
+                    *invocation.argv,
+                    cwd=invocation.cwd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                    limit=MAX_PLUGIN_MESSAGE_BYTES + 1,
+                    **spawn_options,
+                )
+        except SandboxBackendUnavailable as exc:
+            self._process = None
+            self._process_tree_plan = None
+            raise PluginRuntimeError(f"plugin sandbox unavailable: {exc}") from exc
         except OSError as exc:
             self._process = None
             self._process_tree_plan = None
