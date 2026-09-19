@@ -17,12 +17,15 @@ from ash.safe_io import (
     strict_json_loads,
 )
 from ash.safety.environment import build_scrubbed_environment
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import ScopedIOError
 from ash.mcp.oauth import MCPOAuthError, canonical_resource_uri
 from ash.sandbox.process_utils import (
     ProcessTreeError,
     ProcessTreePlan,
     ProcessTreeUnavailable,
     prepare_process_tree,
+    prepare_scoped_process_launch,
     terminate_process_tree_sync,
 )
 
@@ -215,26 +218,61 @@ class MCPServerManager:
             raise ValueError(f"Unknown MCP transport: {config.transport}")
 
         env = build_scrubbed_environment(overrides=config.resolved_env)
-        try:
-            process_tree_plan = prepare_process_tree(
-                workspace_root=config.resolved_cwd
-            )
-        except ProcessTreeUnavailable as exc:
-            raise MCPServerLifecycleError(
-                f"MCP stdio server was not started: {exc}"
-            ) from exc
+        resolved_cwd = config.resolved_cwd
+        command = [config.resolved_command, *config.resolved_args]
 
-        # Spawn subprocess. stderr=DEVNULL avoids deadlock when the subprocess
-        # writes to stderr — we never read it, so PIPE would fill and block.
-        proc = subprocess.Popen(
-            [config.resolved_command] + config.resolved_args,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            cwd=config.resolved_cwd,
-            **process_tree_plan.spawn_options,
-        )
+        if resolved_cwd is not None:
+            try:
+                cwd_guard = SafetyGuard(Path(resolved_cwd))
+                with prepare_scoped_process_launch(
+                    command,
+                    cwd=resolved_cwd,
+                    guard=cwd_guard,
+                    search_path=env.get("PATH"),
+                ) as launch:
+                    try:
+                        process_tree_plan = prepare_process_tree(
+                            workspace_root=cwd_guard.project_root
+                        )
+                    except ProcessTreeUnavailable as exc:
+                        raise MCPServerLifecycleError(
+                            f"MCP stdio server was not started: {exc}"
+                        ) from exc
+                    popen_options = dict(process_tree_plan.spawn_options)
+                    if launch.pass_fds:
+                        popen_options["pass_fds"] = launch.pass_fds
+                    proc = subprocess.Popen(
+                        launch.argv,
+                        env=env,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        cwd=launch.cwd,
+                        **popen_options,
+                    )
+            except (ProcessTreeUnavailable, SafetyViolation, ScopedIOError) as exc:
+                raise MCPServerLifecycleError(
+                    f"MCP stdio server was not started: {exc}"
+                ) from exc
+        else:
+            try:
+                process_tree_plan = prepare_process_tree(workspace_root=None)
+            except ProcessTreeUnavailable as exc:
+                raise MCPServerLifecycleError(
+                    f"MCP stdio server was not started: {exc}"
+                ) from exc
+
+            # Spawn subprocess. stderr=DEVNULL avoids deadlock when the subprocess
+            # writes to stderr — we never read it, so PIPE would fill and block.
+            proc = subprocess.Popen(
+                command,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                cwd=resolved_cwd,
+                **process_tree_plan.spawn_options,
+            )
 
         instance = MCPServerInstance(
             name=config.name,

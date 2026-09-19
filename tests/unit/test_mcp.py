@@ -546,6 +546,93 @@ def test_manager_starts_and_stops_server() -> None:
     assert manager.get_server("test-server") is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+def test_stdio_manager_cwd_swap_cannot_escape_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox import process_utils as process_utils_module
+
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    outside.mkdir()
+    cwd_log = tmp_path / "manager-cwd.txt"
+    config = MCPServerConfig(
+        name="cwd-race",
+        command=sys.executable,
+        args=[
+            "-c",
+            (
+                "import os,time; from pathlib import Path; "
+                f"Path({str(cwd_log)!r}).write_text(os.getcwd(), encoding='utf-8'); "
+                "time.sleep(60)"
+            ),
+        ],
+        env={},
+        transport="stdio",
+        cwd=str(workspace),
+    )
+    real_prepare = process_utils_module.prepare_process_tree
+    swapped = False
+
+    def prepare_then_swap(*args, **kwargs):
+        nonlocal swapped
+        plan = real_prepare(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            workspace.rename(saved)
+            try:
+                workspace.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return plan
+
+    monkeypatch.setattr("ash.mcp.server.prepare_process_tree", prepare_then_swap)
+    manager = MCPServerManager()
+    manager.start_server(config)
+    try:
+        for _ in range(50):
+            if cwd_log.exists():
+                break
+            time.sleep(0.02)
+    finally:
+        manager.stop_server("cwd-race")
+
+    assert swapped is True
+    assert cwd_log.exists()
+    assert Path(cwd_log.read_text(encoding="utf-8")).resolve() == saved.resolve()
+
+
+def test_stdio_manager_fails_closed_when_stable_cwd_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox.process_utils import ProcessTreeUnavailable
+
+    config = MCPServerConfig(
+        name="stable-cwd",
+        command=sys.executable,
+        args=["-c", "pass"],
+        env={},
+        transport="stdio",
+        cwd=str(tmp_path),
+    )
+
+    def unavailable(*args, **kwargs):
+        raise ProcessTreeUnavailable("stable cwd unavailable")
+
+    popen = Mock(side_effect=AssertionError("MCP stdio must not launch"))
+    monkeypatch.setattr("ash.mcp.server.prepare_scoped_process_launch", unavailable)
+    monkeypatch.setattr("ash.mcp.server.subprocess.Popen", popen)
+
+    with pytest.raises(MCPServerLifecycleError, match="stable cwd unavailable"):
+        MCPServerManager().start_server(config)
+
+    popen.assert_not_called()
+
+
 def test_stdio_manager_preflights_tree_cleanup_before_spawn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2204,6 +2291,88 @@ async def test_async_client_initializes_lists_and_calls_tools() -> None:
         assert result["content"][0]["text"] == "hello"
     finally:
         await client.disconnect()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_stdio_client_cwd_swap_cannot_escape_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox import process_utils as process_utils_module
+
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    outside.mkdir()
+    cwd_log = tmp_path / "client-cwd.txt"
+    server = (
+        "import os\n"
+        "from pathlib import Path\n"
+        f"Path({str(cwd_log)!r}).write_text(os.getcwd(), encoding='utf-8')\n"
+        + FAKE_MCP_SERVER
+    )
+    config = MCPServerConfig(
+        name="cwd-race",
+        command=sys.executable,
+        args=["-u", "-c", server],
+        env={},
+        cwd=str(workspace),
+    )
+    real_prepare = process_utils_module.prepare_process_tree
+    swapped = False
+
+    def prepare_then_swap(*args, **kwargs):
+        nonlocal swapped
+        plan = real_prepare(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            workspace.rename(saved)
+            try:
+                workspace.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return plan
+
+    monkeypatch.setattr("ash.mcp.client.prepare_process_tree", prepare_then_swap)
+    client = MCPClient(config)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=1)
+    finally:
+        await client.disconnect()
+
+    assert swapped is True
+    assert Path(cwd_log.read_text(encoding="utf-8")).resolve() == saved.resolve()
+
+
+@pytest.mark.asyncio
+async def test_stdio_client_fails_closed_when_stable_cwd_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox.process_utils import ProcessTreeUnavailable
+
+    config = MCPServerConfig(
+        name="stable-cwd",
+        command=sys.executable,
+        args=["-c", "pass"],
+        env={},
+        cwd=str(tmp_path),
+    )
+
+    def unavailable(*args, **kwargs):
+        raise ProcessTreeUnavailable("stable cwd unavailable")
+
+    create = AsyncMock(side_effect=AssertionError("MCP stdio must not launch"))
+    monkeypatch.setattr("ash.mcp.client.prepare_scoped_process_launch", unavailable)
+    monkeypatch.setattr("ash.mcp.client.asyncio.create_subprocess_exec", create)
+    client = MCPClient(config)
+
+    with pytest.raises(MCPProtocolError, match="stable cwd unavailable"):
+        await client.connect()
+
+    create.assert_not_awaited()
 
 
 @pytest.mark.asyncio

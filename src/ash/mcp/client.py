@@ -25,11 +25,14 @@ from ash.mcp.oauth import (
     normalize_oauth_scope,
 )
 from ash.safety.environment import build_scrubbed_environment
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import ScopedIOError
 from ash.sandbox.process_utils import (
     ProcessTreeError,
     ProcessTreeUnavailable,
     ProcessTreePlan,
     prepare_process_tree,
+    prepare_scoped_process_launch,
     terminate_process_tree,
 )
 
@@ -1188,9 +1191,54 @@ class MCPClient:
 
     async def _connect_stdio(self) -> None:
         env = build_scrubbed_environment(overrides=self.config.resolved_env)
+        resolved_cwd = self.config.resolved_cwd
+        command = [self.config.resolved_command, *self.config.resolved_args]
+        if resolved_cwd is not None:
+            try:
+                cwd_guard = SafetyGuard(Path(resolved_cwd))
+                with prepare_scoped_process_launch(
+                    command,
+                    cwd=resolved_cwd,
+                    guard=cwd_guard,
+                    search_path=env.get("PATH"),
+                ) as launch:
+                    try:
+                        process_tree_plan = prepare_process_tree(
+                            workspace_root=cwd_guard.project_root
+                        )
+                    except ProcessTreeUnavailable as exc:
+                        raise MCPProtocolError(
+                            f"MCP stdio server was not started: {exc}"
+                        ) from exc
+                    self._process_tree_plan = process_tree_plan
+                    spawn_options = dict(process_tree_plan.spawn_options)
+                    if launch.pass_fds:
+                        spawn_options["pass_fds"] = launch.pass_fds
+                    try:
+                        self._process = await asyncio.create_subprocess_exec(
+                            *launch.argv,
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            env=env,
+                            cwd=launch.cwd,
+                            limit=MAX_STDIO_MESSAGE_BYTES + 1,
+                            **spawn_options,
+                        )
+                    except BaseException:
+                        self._process_tree_plan = None
+                        raise
+            except (ProcessTreeUnavailable, SafetyViolation, ScopedIOError) as exc:
+                self._process_tree_plan = None
+                raise MCPProtocolError(
+                    f"MCP stdio server was not started: {exc}"
+                ) from exc
+            self._reader_task = asyncio.create_task(self._read_stdio(self._process))
+            self._stderr_task = asyncio.create_task(self._drain_stderr(self._process))
+            return
         try:
             process_tree_plan = prepare_process_tree(
-                workspace_root=self.config.resolved_cwd
+                workspace_root=resolved_cwd
             )
         except ProcessTreeUnavailable as exc:
             raise MCPProtocolError(
@@ -1199,13 +1247,12 @@ class MCPClient:
         self._process_tree_plan = process_tree_plan
         try:
             self._process = await asyncio.create_subprocess_exec(
-                self.config.resolved_command,
-                *self.config.resolved_args,
+                *command,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
-                cwd=self.config.resolved_cwd,
+                cwd=resolved_cwd,
                 limit=MAX_STDIO_MESSAGE_BYTES + 1,
                 **process_tree_plan.spawn_options,
             )
