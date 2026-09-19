@@ -101,6 +101,11 @@ class CatalogOpenAIProvider(OpenAIProvider):
                     continue
                 metadata = select_provider_model_metadata(catalog, canonical_id)
                 if metadata is not None:
+                    if metadata.model_id != canonical_id:
+                        self._dynamic_capabilities = ProviderCapabilities(
+                            local=self._local
+                        )
+                        return self._dynamic_capabilities
                     matched.append(metadata)
 
         if matched:

@@ -637,6 +637,48 @@ async def test_catalog_source_alias_identity_conflict_fails_closed(
 
 
 @pytest.mark.asyncio
+async def test_catalog_followup_alias_identity_conflict_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    monkeypatch.setenv("XAI_API_KEY", "test-key")
+    provider = create_default_provider_registry().build(AshConfig(model="xai/latest"))
+    calls = 0
+
+    def probe(*args, **kwargs):
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        if calls == 1:
+            return (
+                ProviderModelMetadata(
+                    model_id="grok-4-a",
+                    aliases=frozenset({"latest"}),
+                    native_tools=True,
+                    context_window=131_072,
+                ),
+            )
+        return (
+            ProviderModelMetadata(
+                model_id="grok-4-b",
+                aliases=frozenset({"grok-4-a"}),
+                vision=True,
+                max_output_tokens=8192,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata", probe
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities()
+    assert provider.capabilities == ProviderCapabilities()
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
 async def test_together_negotiates_context_without_assuming_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
