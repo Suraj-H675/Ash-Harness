@@ -1947,6 +1947,145 @@ async def test_switch_provider_closes_previous_provider(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_loop_shutdown_waits_for_retired_provider_close(tmp_path):
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class SlowCloseProvider(MockProvider):
+        async def aclose(self):
+            close_started.set()
+            await allow_close.wait()
+            close_finished.set()
+            await super().aclose()
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "retired-provider.db"),
+        SlowCloseProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="ollama/test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+        ),
+    )
+    await loop.start_session()
+
+    with patch("ash.cli._build_provider") as build_provider:
+        build_provider.return_value = MockProvider()
+        loop.switch_provider("openai", "next")
+
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+    shutdown = asyncio.create_task(loop.aclose())
+    await asyncio.sleep(0)
+
+    assert shutdown.done() is False
+    assert close_finished.is_set() is False
+
+    allow_close.set()
+    await asyncio.wait_for(shutdown, timeout=1)
+    assert close_finished.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_loop_shutdown_surfaces_retired_provider_close_failure(tmp_path):
+    close_attempted = asyncio.Event()
+
+    class FailingCloseProvider(MockProvider):
+        async def aclose(self):
+            close_attempted.set()
+            raise RuntimeError("retired provider close failed")
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "retired-provider-error.db"),
+        FailingCloseProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="ollama/test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+        ),
+    )
+    await loop.start_session()
+
+    with patch("ash.cli._build_provider") as build_provider:
+        build_provider.return_value = MockProvider()
+        loop.switch_provider("openai", "next")
+
+    await asyncio.wait_for(close_attempted.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeError, match="failed to close 1 retired provider"):
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_loop_shutdown_waits_for_multiple_rapid_provider_retirements(tmp_path):
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    allow_first = asyncio.Event()
+    allow_second = asyncio.Event()
+    finished: list[str] = []
+
+    class BlockingProvider(MockProvider):
+        def __init__(self, name, started, allowed):
+            self.name = name
+            self.started = started
+            self.allowed = allowed
+
+        async def aclose(self):
+            self.started.set()
+            await self.allowed.wait()
+            finished.append(self.name)
+            await super().aclose()
+
+    first = BlockingProvider("first", first_started, allow_first)
+    second = BlockingProvider("second", second_started, allow_second)
+    third = MockProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "rapid-provider-switch.db"),
+        first,
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="ollama/test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+        ),
+    )
+    await loop.start_session()
+
+    with patch("ash.cli._build_provider") as build_provider:
+        build_provider.side_effect = [second, third]
+        loop.switch_provider("openai", "second")
+        loop.switch_provider("openai", "third")
+
+    shutdown = asyncio.create_task(loop.aclose())
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert shutdown.done() is False
+    assert finished == []
+
+    allow_first.set()
+    await asyncio.sleep(0)
+    assert shutdown.done() is False
+
+    allow_second.set()
+    await asyncio.wait_for(shutdown, timeout=1)
+    assert set(finished) == {"first", "second"}
+
+
+@pytest.mark.asyncio
 async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
     store = SessionStore(tmp_path / "cache-usage.db")
     ui = EventUI()

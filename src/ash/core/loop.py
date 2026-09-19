@@ -646,6 +646,8 @@ class AshLoop:
         self._mcp_reload_lock = asyncio.Lock()
         self._browser_reload_lock = asyncio.Lock()
         self._retired_mcp_runtimes: set[Any] = set()
+        self._retired_provider_close_tasks: set[asyncio.Task[None]] = set()
+        self._retired_provider_close_errors: list[BaseException] = []
         self._closing = False
         self._closed = False
         self._mcp_configs = dict(mcp_configs or {})
@@ -724,6 +726,12 @@ class AshLoop:
                 )
                 if isinstance(outcome, BaseException)
             ]
+            if self._retired_provider_close_tasks:
+                await asyncio.gather(
+                    *tuple(self._retired_provider_close_tasks),
+                    return_exceptions=True,
+                )
+            retired_provider_errors = tuple(self._retired_provider_close_errors)
             provider_error: BaseException | None = None
             try:
                 await self.provider.aclose()
@@ -737,6 +745,11 @@ class AshLoop:
                 raise RuntimeError(
                     f"failed to close {len(tool_failures)} tool(s): {details}"
                 ) from tool_failures[0][1]
+            if retired_provider_errors:
+                raise RuntimeError(
+                    "failed to close "
+                    f"{len(retired_provider_errors)} retired provider(s)"
+                ) from retired_provider_errors[0]
             if provider_error is not None:
                 raise provider_error
             self._closed = True
@@ -3734,12 +3747,26 @@ class AshLoop:
 
     # --- provider switching -------------------------------------------------
 
+    def _retire_provider(self, provider: ProviderABC) -> None:
+        task = asyncio.create_task(provider.aclose())
+        self._retired_provider_close_tasks.add(task)
+
+        def _record_close_result(close_task: asyncio.Task[None]) -> None:
+            self._retired_provider_close_tasks.discard(close_task)
+            if close_task.cancelled():
+                self._retired_provider_close_errors.append(
+                    RuntimeError("retired provider close task was cancelled")
+                )
+                return
+            error = close_task.exception()
+            if error is not None:
+                self._retired_provider_close_errors.append(error)
+
+        task.add_done_callback(_record_close_result)
+
     def switch_provider(self, provider: str, model: str) -> None:
         """Switch to a different provider and model. Rebuilds provider instance."""
         from ash.cli import _build_provider  # lazy import to avoid circular
-
-        async def _close_old_provider(provider: ProviderABC) -> None:
-            await provider.aclose()
 
         if self._config is None:
             raise RuntimeError("AshLoop was not constructed with a config object")
@@ -3762,15 +3789,12 @@ class AshLoop:
                 root_provider=lambda: self.project_root,
             )
         if isinstance(old_provider, ProviderABC):
-            asyncio.create_task(_close_old_provider(old_provider))
+            self._retire_provider(old_provider)
 
     def switch_model(self, model: str) -> None:
         """Switch to a model string. If model contains '/', treat as provider/model.
         Otherwise, prepend the current provider."""
         from ash.cli import _build_provider  # lazy import to avoid circular
-
-        async def _close_old_provider(provider: ProviderABC) -> None:
-            await provider.aclose()
 
         if self._config is None:
             raise RuntimeError("AshLoop was not constructed with a config object")
@@ -3791,7 +3815,7 @@ class AshLoop:
         self._sync_generated_tool_protocol()
         self._fire_config_changed("switch_model", {"model": self._config.model})
         if isinstance(old_provider, ProviderABC):
-            asyncio.create_task(_close_old_provider(old_provider))
+            self._retire_provider(old_provider)
 
     def _fire_config_changed(self, reason: str, changes: dict[str, Any]) -> None:
         if not changes:
