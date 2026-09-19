@@ -1,4 +1,6 @@
 from pathlib import Path
+import time
+from unittest.mock import Mock
 
 import pytest
 from prompt_toolkit.formatted_text import to_formatted_text
@@ -59,6 +61,57 @@ def test_rich_transcript_formatter_renders_markdown_and_caches_cells() -> None:
     assert "print('ok')" in first
     assert second == first
     assert len(formatter._cache) == cache_size == 1
+
+
+def test_cached_redraw_rerenders_only_changed_markdown() -> None:
+    transcript = Transcript(max_entries=1000, max_characters=2_000_000)
+    for index in range(200):
+        transcript.append(
+            "assistant",
+            f"## Entry {index}\n\n" + ("text **bold** `code` " * 8),
+            title="ash",
+        )
+    live = transcript.begin("assistant", title="ash")
+    transcript.append_delta(live, "initial **streaming** content")
+    formatter = RichTranscriptFormatter()
+    formatter.format(transcript.snapshot(), width=100)
+    render_markdown = Mock(wraps=formatter._render_markdown)
+    formatter._render_markdown = render_markdown
+
+    transcript.append_delta(live, " with one update")
+    formatter.format(transcript.snapshot(), width=100)
+
+    assert render_markdown.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("entry_count", "budget_seconds"),
+    [
+        (200, 0.15),
+        (1000, 0.5),
+    ],
+)
+def test_cached_markdown_redraw_latency_remains_bounded(
+    entry_count: int,
+    budget_seconds: float,
+) -> None:
+    transcript = Transcript(max_entries=1000, max_characters=2_000_000)
+    for index in range(entry_count):
+        transcript.append(
+            "assistant",
+            f"## Entry {index}\n\n" + ("text **bold** `code` " * 20),
+            title="ash",
+        )
+    formatter = RichTranscriptFormatter()
+    formatter.format(transcript.snapshot(), width=100)
+
+    durations: list[float] = []
+    for _ in range(5):
+        started = time.perf_counter()
+        formatter.format(transcript.snapshot(), width=100)
+        durations.append(time.perf_counter() - started)
+
+    assert max(durations) < budget_seconds, durations
 
 
 @pytest.mark.asyncio
