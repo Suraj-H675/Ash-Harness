@@ -369,6 +369,94 @@ def test_session_fork_rolls_back_the_entire_child_on_copy_failure(
     assert store.get_session_lineage(root.session_id).children == ()
 
 
+def test_discard_unchanged_leaf_fork_is_narrow_and_fail_closed(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "discard-fork.db")
+    root = store.create_session(str(tmp_path))
+
+    disposable = store.fork_session(root.session_id, branch_name="disposable")
+    assert store.discard_unchanged_leaf_fork(
+        disposable.session_id,
+        parent_session_id=root.session_id,
+        created_at=disposable.created_at,
+        updated_at=disposable.updated_at,
+    ) is True
+    with pytest.raises(KeyError, match="Session not found"):
+        store.load_session(disposable.session_id)
+    assert store.get_session_lineage(root.session_id).children == ()
+
+    modified = store.fork_session(root.session_id, branch_name="modified")
+    store.save_message(
+        modified.session_id,
+        Message(
+            role="user",
+            content="keep me",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    assert store.discard_unchanged_leaf_fork(
+        modified.session_id,
+        parent_session_id=root.session_id,
+        created_at=modified.created_at,
+        updated_at=modified.updated_at,
+    ) is False
+    assert store.load_session(modified.session_id).messages[0].content == "keep me"
+
+    audited = store.fork_session(root.session_id, branch_name="audited")
+    store.append_audit_log(
+        audited.session_id,
+        action_type="command_run",
+        target_resource="rollback-proof",
+        details={"source": "test"},
+        result="SUCCESS",
+    )
+    assert store.discard_unchanged_leaf_fork(
+        audited.session_id,
+        parent_session_id=root.session_id,
+        created_at=audited.created_at,
+        updated_at=audited.updated_at,
+    ) is False
+    assert len(store.list_audit_logs(audited.session_id)) == 1
+
+    tooled = store.fork_session(root.session_id, branch_name="tooled")
+    store.save_tool_call(
+        tooled.session_id,
+        ToolCallRecord(
+            call_id="rollback-proof-call",
+            tool_name="read_file",
+            arguments={"file_path": "README.md"},
+            approved=True,
+            executed=False,
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    assert store.discard_unchanged_leaf_fork(
+        tooled.session_id,
+        parent_session_id=root.session_id,
+        created_at=tooled.created_at,
+        updated_at=tooled.updated_at,
+    ) is False
+    assert store.load_session(tooled.session_id).tool_calls[0].call_id == (
+        "rollback-proof-call"
+    )
+
+    parent = store.fork_session(root.session_id, branch_name="has-child")
+    child = store.fork_session(parent.session_id, branch_name="descendant")
+    assert store.discard_unchanged_leaf_fork(
+        parent.session_id,
+        parent_session_id=root.session_id,
+        created_at=parent.created_at,
+        updated_at=parent.updated_at,
+    ) is False
+    assert store.load_session(child.session_id).parent_session_id == parent.session_id
+
+    assert store.discard_unchanged_leaf_fork(
+        parent.session_id,
+        parent_session_id="wrong-parent",
+        created_at=parent.created_at,
+        updated_at=parent.updated_at,
+    ) is False
+
+
 def test_runtime_event_log_is_ordered_idempotent_and_redacted(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "events.db")
     session = store.create_session(str(tmp_path))

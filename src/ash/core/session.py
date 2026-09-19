@@ -917,6 +917,7 @@ class SessionStore:
         conn: sqlite3.Connection,
         project_path: str,
         *,
+        session_id: str | None = None,
         model: str = "",
         parent_session_id: str | None = None,
         fork_message_count: int | None = None,
@@ -924,7 +925,7 @@ class SessionStore:
         branch_summary: str = "",
     ) -> Session:
         canonical_project_path = normalize_project_path(project_path)
-        session_id = str(uuid4())
+        session_id = session_id or str(uuid4())
         normalized_branch_name, normalized_branch_summary = _normalize_branch_metadata(
             branch_name, branch_summary
         )
@@ -1915,6 +1916,7 @@ class SessionStore:
         message_count: int | None = None,
         branch_name: str = "",
         branch_summary: str = "",
+        _child_session_id: str | None = None,
     ) -> Session:
         """Create a durable child branch at a complete message boundary."""
 
@@ -1954,6 +1956,7 @@ class SessionStore:
                 fork = self._create_session_record(
                     conn,
                     source.project_path,
+                    session_id=_child_session_id,
                     model=source.model,
                     parent_session_id=source.session_id,
                     fork_message_count=count,
@@ -1987,6 +1990,51 @@ class SessionStore:
                 conn.rollback()
                 raise
         return self.load_session(fork.session_id)
+
+    def discard_unchanged_leaf_fork(
+        self,
+        session_id: str,
+        *,
+        parent_session_id: str,
+        created_at: datetime,
+        updated_at: datetime | None,
+    ) -> bool:
+        """Discard one unpublished fork only while its exact creation state is intact."""
+
+        expected_updated_at = updated_at or created_at
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            cursor = conn.execute(
+                "DELETE FROM sessions "
+                "WHERE session_id = ? AND parent_session_id = ? "
+                "AND fork_message_count IS NOT NULL "
+                "AND created_at = ? AND updated_at = ? "
+                "AND (SELECT COUNT(*) FROM messages WHERE session_id = ?) "
+                "= fork_message_count "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM sessions child WHERE child.parent_session_id = ?"
+                ") "
+                "AND NOT EXISTS (SELECT 1 FROM tool_calls WHERE session_id = ?) "
+                "AND NOT EXISTS (SELECT 1 FROM audit_logs WHERE session_id = ?) "
+                "AND NOT EXISTS (SELECT 1 FROM turn_journal WHERE session_id = ?) "
+                "AND NOT EXISTS (SELECT 1 FROM file_checkpoints WHERE session_id = ?) "
+                "AND NOT EXISTS (SELECT 1 FROM runtime_events WHERE session_id = ?) "
+                "AND NOT EXISTS (SELECT 1 FROM sprints WHERE session_id = ?)",
+                (
+                    session_id,
+                    parent_session_id,
+                    _serialize_datetime(created_at),
+                    _serialize_datetime(expected_updated_at),
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                ),
+            )
+            return cursor.rowcount == 1
 
     def get_session_lineage(self, session_id: str) -> SessionLineage:
         """Return one session node and its direct child identifiers."""

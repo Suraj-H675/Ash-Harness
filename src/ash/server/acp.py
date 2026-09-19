@@ -50,8 +50,10 @@ from acp.schema import (
     ResumeSessionResponse,
     SessionCapabilities,
     SessionCloseCapabilities,
+    SessionForkCapabilities,
     SessionInfo,
     SessionListCapabilities,
+    SessionResumeCapabilities,
     SseMcpServer,
     SetSessionConfigOptionResponse,
     SetSessionModeResponse,
@@ -126,6 +128,8 @@ class AshACPAgent:
         self._max_sessions = max_sessions
         self._sessions: dict[str, _ACPSession] = {}
         self._pending_sessions = 0
+        self._pending_session_ids: set[str] = set()
+        self._forking_sessions: set[str] = set()
         self._lock = asyncio.Lock()
         self._connection: ACPClient | None = None
 
@@ -155,6 +159,8 @@ class AshACPAgent:
                 mcp_capabilities=McpCapabilities(http=True, sse=True, acp=False),
                 session_capabilities=SessionCapabilities(
                     list=SessionListCapabilities(),
+                    fork=SessionForkCapabilities(),
+                    resume=SessionResumeCapabilities(),
                     close=SessionCloseCapabilities(),
                 ),
             ),
@@ -211,16 +217,7 @@ class AshACPAgent:
         await self._reserve_session(session_id=session_id)
         client: AshClient | None = None
         try:
-            config = AshConfig.load(workspace_root=workspace)
-            stored = SessionStore(config.db_directory / "sessions.db").load_session(
-                session_id
-            )
-            if normalize_project_path(stored.project_path) != normalize_project_path(
-                workspace
-            ):
-                raise RequestError.invalid_params(
-                    {"sessionId": "session belongs to a different workspace"}
-                )
+            _store, stored = _stored_session_for_workspace(workspace, session_id)
             approval = self._approval_callback(lambda: session_id)
             client = await self._client_factory(
                 workspace, session_id, configs, approval
@@ -245,7 +242,7 @@ class AshACPAgent:
                 self._sessions.pop(session_id, None)
             raise
         finally:
-            await self._release_reservation()
+            await self._release_reservation(session_id=session_id)
 
     async def list_sessions(
         self,
@@ -304,6 +301,13 @@ class AshACPAgent:
         async with self._lock:
             if self._sessions.get(session_id) is not state:
                 raise RequestError.resource_not_found(session_id)
+            if session_id in self._forking_sessions:
+                raise RequestError.invalid_request(
+                    {
+                        "sessionId": session_id,
+                        "reason": "session lifecycle operation is in progress",
+                    }
+                )
             if state.prompt_task is not None and not state.prompt_task.done():
                 raise RequestError.invalid_request(
                     {"sessionId": session_id, "reason": "turn already running"}
@@ -388,7 +392,84 @@ class AshACPAgent:
         mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> ForkSessionResponse:
-        raise RequestError.method_not_found("session/fork")
+        workspace = _workspace(cwd)
+        _reject_additional_directories(additional_directories)
+        configs = _mcp_configs(mcp_servers or [])
+        await self._reserve_session()
+        store: SessionStore | None = None
+        forked: Any = None
+        client: AshClient | None = None
+        state: _ACPSession | None = None
+        fork_source_reserved = False
+        child_id = str(uuid4())
+        child_id_reserved = False
+        try:
+            await self._reserve_fork_source(session_id)
+            fork_source_reserved = True
+            await self._reserve_pending_session_id(child_id)
+            child_id_reserved = True
+            store, _stored = _stored_session_for_workspace(workspace, session_id)
+            if store.started_turns(session_id):
+                raise RequestError.invalid_request(
+                    {
+                        "sessionId": session_id,
+                        "reason": "session has an unfinished turn; resume or load it first",
+                    }
+                )
+            try:
+                forked = store.fork_session(
+                    session_id,
+                    _child_session_id=child_id,
+                )
+            except ValueError as exc:
+                raise RequestError.invalid_request(
+                    {"sessionId": session_id, "reason": str(exc)}
+                ) from exc
+            if forked.session_id != child_id:
+                raise RuntimeError("Ash returned an unexpected forked session ID")
+            approval = self._approval_callback(lambda: child_id)
+            client = await self._client_factory(
+                workspace, child_id, configs, approval
+            )
+            current_session = client.loop.current_session
+            if current_session is None or current_session.session_id != child_id:
+                raise RuntimeError("Ash did not attach the forked ACP session")
+            state = _ACPSession(workspace, client)
+            async with self._lock:
+                if child_id in self._sessions:
+                    raise RuntimeError("Ash returned a duplicate forked session ID")
+                self._sessions[child_id] = state
+            return ForkSessionResponse(session_id=child_id)
+        except BaseException as primary_error:
+            runtime_cleanup_confirmed = client is None
+            if client is not None:
+                try:
+                    await client.close()
+                except BaseException:
+                    primary_error.add_note(
+                        "fork runtime cleanup could not be confirmed; "
+                        "durable child state was preserved"
+                    )
+                else:
+                    runtime_cleanup_confirmed = True
+            if runtime_cleanup_confirmed and state is not None and forked is not None:
+                async with self._lock:
+                    if self._sessions.get(forked.session_id) is state:
+                        self._sessions.pop(forked.session_id, None)
+            if runtime_cleanup_confirmed and store is not None and forked is not None:
+                store.discard_unchanged_leaf_fork(
+                    forked.session_id,
+                    parent_session_id=session_id,
+                    created_at=forked.created_at,
+                    updated_at=forked.updated_at,
+                )
+            raise
+        finally:
+            if child_id_reserved:
+                await self._release_pending_session_id(child_id)
+            if fork_source_reserved:
+                await self._release_fork_source(session_id)
+            await self._release_reservation()
 
     async def resume_session(
         self,
@@ -398,7 +479,48 @@ class AshACPAgent:
         mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> ResumeSessionResponse:
-        raise RequestError.method_not_found("session/resume")
+        workspace = _workspace(cwd)
+        _reject_additional_directories(additional_directories)
+        configs = _mcp_configs(mcp_servers or [])
+        await self._reserve_session(session_id=session_id)
+        client: AshClient | None = None
+        state: _ACPSession | None = None
+        try:
+            _stored_session_for_workspace(workspace, session_id)
+            approval = self._approval_callback(lambda: session_id)
+            client = await self._client_factory(
+                workspace, session_id, configs, approval
+            )
+            current_session = client.loop.current_session
+            if current_session is None or current_session.session_id != session_id:
+                raise RuntimeError("Ash did not resume the requested ACP session")
+            state = _ACPSession(workspace, client)
+            async with self._lock:
+                if session_id in self._sessions:
+                    raise RequestError.invalid_request(
+                        {"sessionId": session_id, "reason": "session already loaded"}
+                    )
+                self._sessions[session_id] = state
+            return ResumeSessionResponse()
+        except BaseException as primary_error:
+            runtime_cleanup_confirmed = client is None
+            if client is not None:
+                try:
+                    await client.close()
+                except BaseException:
+                    primary_error.add_note(
+                        "resume runtime cleanup could not be confirmed; "
+                        "durable session state was preserved"
+                    )
+                else:
+                    runtime_cleanup_confirmed = True
+            if runtime_cleanup_confirmed and state is not None:
+                async with self._lock:
+                    if self._sessions.get(session_id) is state:
+                        self._sessions.pop(session_id, None)
+            raise
+        finally:
+            await self._release_reservation(session_id=session_id)
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         raise RequestError.method_not_found(f"_{method}")
@@ -597,9 +719,19 @@ class AshACPAgent:
 
     async def _reserve_session(self, *, session_id: str = "") -> None:
         async with self._lock:
-            if session_id and session_id in self._sessions:
+            if session_id and (
+                session_id in self._sessions
+                or session_id in self._pending_session_ids
+            ):
                 raise RequestError.invalid_request(
                     {"sessionId": session_id, "reason": "session already loaded"}
+                )
+            if session_id and session_id in self._forking_sessions:
+                raise RequestError.invalid_request(
+                    {
+                        "sessionId": session_id,
+                        "reason": "session lifecycle operation is in progress",
+                    }
                 )
             if len(self._sessions) + self._pending_sessions >= self._max_sessions:
                 raise RequestError(
@@ -608,10 +740,57 @@ class AshACPAgent:
                     {"maximum": self._max_sessions},
                 )
             self._pending_sessions += 1
+            if session_id:
+                self._pending_session_ids.add(session_id)
 
-    async def _release_reservation(self) -> None:
+    async def _release_reservation(self, *, session_id: str = "") -> None:
         async with self._lock:
             self._pending_sessions = max(0, self._pending_sessions - 1)
+            if session_id:
+                self._pending_session_ids.discard(session_id)
+
+    async def _reserve_pending_session_id(self, session_id: str) -> None:
+        async with self._lock:
+            if (
+                session_id in self._sessions
+                or session_id in self._pending_session_ids
+                or session_id in self._forking_sessions
+            ):
+                raise RequestError.invalid_request(
+                    {"sessionId": session_id, "reason": "session already loaded"}
+                )
+            self._pending_session_ids.add(session_id)
+
+    async def _release_pending_session_id(self, session_id: str) -> None:
+        async with self._lock:
+            self._pending_session_ids.discard(session_id)
+
+    async def _reserve_fork_source(self, session_id: str) -> None:
+        async with self._lock:
+            if (
+                session_id in self._forking_sessions
+                or session_id in self._pending_session_ids
+            ):
+                raise RequestError.invalid_request(
+                    {
+                        "sessionId": session_id,
+                        "reason": "session lifecycle operation is in progress",
+                    }
+                )
+            state = self._sessions.get(session_id)
+            if (
+                state is not None
+                and state.prompt_task is not None
+                and not state.prompt_task.done()
+            ):
+                raise RequestError.invalid_request(
+                    {"sessionId": session_id, "reason": "turn already running"}
+                )
+            self._forking_sessions.add(session_id)
+
+    async def _release_fork_source(self, session_id: str) -> None:
+        async with self._lock:
+            self._forking_sessions.discard(session_id)
 
 
 async def run_acp_agent() -> None:
@@ -640,6 +819,23 @@ async def _create_ash_client(
         additional_mcp_configs=mcp_configs,
         run_maintenance=False,
     )
+
+
+def _stored_session_for_workspace(
+    workspace: Path,
+    session_id: str,
+) -> tuple[SessionStore, Any]:
+    config = AshConfig.load(workspace_root=workspace)
+    store = SessionStore(config.db_directory / "sessions.db")
+    try:
+        stored = store.load_session(session_id)
+    except KeyError as exc:
+        raise RequestError.resource_not_found(session_id) from exc
+    if normalize_project_path(stored.project_path) != normalize_project_path(workspace):
+        raise RequestError.invalid_params(
+            {"sessionId": "session belongs to a different workspace"}
+        )
+    return store, stored
 
 
 def _workspace(value: str) -> Path:

@@ -379,7 +379,7 @@ Ash exposes or consumes the following integration surfaces:
 
 | Surface | Capability |
 | --- | --- |
-| ACP v1 | Stdio editor/agent host integration with session lifecycle, prompts, cancellation, tool progress, usage, text, bounded inline images, resource links, and stdio/HTTP/SSE MCP support |
+| ACP v1 | Stdio editor/agent host integration with new/load/list/close plus durable fork/resume session lifecycle, prompts, cancellation, tool progress, usage, text, bounded inline images, resource links, and stdio/HTTP/SSE MCP support |
 | A2A 1.0 | Authenticated Agent Card, JSON-RPC, HTTP+JSON routes, task polling, streaming, cancellation, context continuation, inspection, and outbound delegation |
 | HTTP API | Authenticated synchronous turns, live SSE turn events, session fork, and session tree endpoints |
 | JSON-RPC | Structured runtime and session integration for external hosts |
@@ -449,8 +449,9 @@ they are complete:
 
 - subscription-based provider authentication is not included;
 - remote browser CDP and direct takeover of pre-existing tabs are not exposed;
-- ACP audio/embedded-resource and advanced session capabilities are not
-  advertised until their full behavior is implemented;
+- ACP audio/embedded-resource, session delete, additional directories, modes,
+  terminal/filesystem callbacks, and registry publication are not advertised
+  until their full behavior is implemented;
 - A2A push notifications, file/data modalities, extended cards, gRPC, and
   signed-card trust policy are not currently advertised;
 - LSP rename and code actions are not exposed; and

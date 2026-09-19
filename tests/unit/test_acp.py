@@ -159,6 +159,8 @@ async def test_acp_maps_mcp_prompts_events_and_editor_permissions(
     assert initialized.agent_capabilities.mcp_capabilities.http is True
     assert initialized.agent_capabilities.session_capabilities is not None
     assert initialized.agent_capabilities.session_capabilities.close is not None
+    assert initialized.agent_capabilities.session_capabilities.fork is not None
+    assert initialized.agent_capabilities.session_capabilities.resume is not None
 
     session = await agent.new_session(
         str(tmp_path),
@@ -778,6 +780,613 @@ async def test_acp_load_replays_and_lists_durable_sessions(
 
 
 @pytest.mark.asyncio
+async def test_acp_fork_creates_independent_durable_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    parent = store.create_session(str(workspace), model="test")
+    store.save_message(
+        parent.session_id,
+        Message(
+            role="user",
+            content="fork this",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    clients: list[FakeAshClient] = []
+    configs_seen: list[dict[str, Any]] = []
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        client = FakeAshClient(session_id or "new", _events(), approval_callback)
+        clients.append(client)
+        configs_seen.append(mcp_configs)
+        return client
+
+    connection = FakeACPConnection()
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(connection)  # type: ignore[arg-type]
+    await agent.load_session(str(workspace), parent.session_id)
+    connection.updates.clear()
+
+    forked = await agent.fork_session(
+        parent.session_id,
+        str(workspace),
+        mcp_servers=[
+            HttpMcpServer(
+                type="http",
+                name="fork-docs",
+                url="https://mcp.example.test/fork",
+                headers=[],
+            )
+        ],
+    )
+    child = store.load_session(forked.session_id)
+
+    assert forked.session_id != parent.session_id
+    assert child.parent_session_id == parent.session_id
+    assert [message.content for message in child.messages] == ["fork this"]
+    assert clients[0].closed is False
+    assert clients[0].loop.current_session.session_id == parent.session_id
+    assert clients[1].loop.current_session.session_id == forked.session_id
+    assert configs_seen[1]["fork-docs"].url == "https://mcp.example.test/fork"
+
+    await agent.prompt(parent.session_id, [text_block("parent still works")])
+    await agent.prompt(forked.session_id, [text_block("child works")])
+    assert clients[0].prompts == ["parent still works"]
+    assert clients[1].prompts == ["child works"]
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_resume_attaches_without_replaying_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    stored = store.create_session(str(workspace), model="test")
+    store.save_message(
+        stored.session_id,
+        Message(
+            role="assistant",
+            content="do not replay",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    clients: list[FakeAshClient] = []
+    configs_seen: list[dict[str, Any]] = []
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        client = FakeAshClient(session_id or "new", _events(), approval_callback)
+        clients.append(client)
+        configs_seen.append(mcp_configs)
+        return client
+
+    connection = FakeACPConnection()
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(connection)  # type: ignore[arg-type]
+
+    await agent.resume_session(
+        stored.session_id,
+        str(workspace),
+        mcp_servers=[
+            McpServerStdio(
+                name="resume-tools",
+                command="server",
+                args=["--stdio"],
+                env=[],
+            )
+        ],
+    )
+    assert connection.updates == []
+    assert clients[0].loop.current_session.session_id == stored.session_id
+    assert configs_seen[0]["resume-tools"].command == "server"
+
+    with pytest.raises(acp.RequestError) as duplicate:
+        await agent.resume_session(stored.session_id, str(workspace))
+    assert duplicate.value.data["reason"] == "session already loaded"
+
+    await agent.prompt(stored.session_id, [text_block("continue")])
+    assert clients[0].prompts == ["continue"]
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_resume_preserves_primary_error_when_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    stored = store.create_session(str(workspace), model="test")
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    class UncleanClient(FakeAshClient):
+        async def close(self) -> None:
+            self.closed = True
+            raise RuntimeError("runtime cleanup failed")
+
+    client: UncleanClient | None = None
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        nonlocal client
+        client = UncleanClient("wrong-session", _events(), approval_callback)
+        return client
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="did not resume"):
+        await agent.resume_session(stored.session_id, str(workspace))
+
+    assert client is not None and client.closed is True
+    assert store.load_session(stored.session_id).session_id == stored.session_id
+
+
+@pytest.mark.asyncio
+async def test_acp_fork_and_resume_reject_additional_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    extra = tmp_path / "extra"
+    workspace.mkdir()
+    extra.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    stored = store.create_session(str(workspace), model="test")
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    agent = AshACPAgent()  # factory must never be reached
+    for operation in (
+        lambda: agent.fork_session(
+            stored.session_id,
+            str(workspace),
+            additional_directories=[str(extra)],
+        ),
+        lambda: agent.resume_session(
+            stored.session_id,
+            str(workspace),
+            additional_directories=[str(extra)],
+        ),
+    ):
+        with pytest.raises(acp.RequestError) as unsupported:
+            await operation()
+        assert "additionalDirectories" in unsupported.value.data
+
+
+@pytest.mark.asyncio
+async def test_acp_concurrent_resume_reserves_session_id_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    stored = store.create_session(str(workspace), model="test")
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    attach_started = asyncio.Event()
+    release_attach = asyncio.Event()
+    clients: list[FakeAshClient] = []
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        attach_started.set()
+        await release_attach.wait()
+        client = FakeAshClient(session_id or "new", _events(), approval_callback)
+        clients.append(client)
+        return client
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    first = asyncio.create_task(agent.resume_session(stored.session_id, str(workspace)))
+    await asyncio.wait_for(attach_started.wait(), timeout=2)
+
+    with pytest.raises(acp.RequestError) as duplicate:
+        await agent.resume_session(stored.session_id, str(workspace))
+    assert duplicate.value.data["reason"] == "session already loaded"
+    assert clients == []
+
+    release_attach.set()
+    await asyncio.wait_for(first, timeout=2)
+    assert len(clients) == 1
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_fork_blocks_parent_prompt_until_child_is_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    parent = store.create_session(str(workspace), model="test")
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    child_attach_started = asyncio.Event()
+    release_child = asyncio.Event()
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        if session_id != parent.session_id:
+            child_attach_started.set()
+            await release_child.wait()
+        return FakeAshClient(session_id or "new", _events(), approval_callback)
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    await agent.load_session(str(workspace), parent.session_id)
+
+    fork_task = asyncio.create_task(agent.fork_session(parent.session_id, str(workspace)))
+    await asyncio.wait_for(child_attach_started.wait(), timeout=2)
+    child_ids = [
+        item.session_id
+        for item in store.list_sessions()
+        if item.session_id != parent.session_id
+    ]
+    assert len(child_ids) == 1
+    with pytest.raises(acp.RequestError) as child_pending:
+        await asyncio.wait_for(
+            agent.resume_session(child_ids[0], str(workspace)),
+            timeout=0.5,
+        )
+    assert child_pending.value.data["reason"] == "session already loaded"
+    with pytest.raises(acp.RequestError) as blocked:
+        await agent.prompt(parent.session_id, [text_block("race")])
+    assert "lifecycle" in str(blocked.value.data).casefold()
+
+    release_child.set()
+    forked = await asyncio.wait_for(fork_task, timeout=2)
+    await agent.prompt(parent.session_id, [text_block("after fork")])
+    assert store.load_session(forked.session_id).parent_session_id == parent.session_id
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_fork_fails_before_side_effect_at_session_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    parent = store.create_session(str(workspace), model="test")
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        return FakeAshClient(session_id or "new", _events(), approval_callback)
+
+    agent = AshACPAgent(client_factory=factory, max_sessions=1)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    await agent.load_session(str(workspace), parent.session_id)
+    before = [item.session_id for item in store.list_sessions()]
+
+    with pytest.raises(acp.RequestError, match="session limit"):
+        await agent.fork_session(parent.session_id, str(workspace))
+
+    assert [item.session_id for item in store.list_sessions()] == before
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_fork_cancellation_discards_unpublished_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    parent = store.create_session(str(workspace), model="test")
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    attach_started = asyncio.Event()
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        assert session_id is not None
+        attach_started.set()
+        await asyncio.Event().wait()
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    task = asyncio.create_task(agent.fork_session(parent.session_id, str(workspace)))
+    await asyncio.wait_for(attach_started.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [item.session_id for item in store.list_sessions()] == [parent.session_id]
+
+
+@pytest.mark.asyncio
+async def test_acp_fork_failure_preserves_child_with_durable_activity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    parent = store.create_session(str(workspace), model="test")
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        assert session_id is not None
+        store.append_audit_log(
+            session_id,
+            action_type="command_run",
+            target_resource="factory-side-effect",
+            details={"source": "test"},
+            result="FAILURE",
+        )
+        raise RuntimeError("factory failed after durable activity")
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="factory failed"):
+        await agent.fork_session(parent.session_id, str(workspace))
+
+    children = [
+        item for item in store.list_sessions() if item.session_id != parent.session_id
+    ]
+    assert len(children) == 1
+    assert children[0].parent_session_id == parent.session_id
+    assert len(store.list_audit_logs(children[0].session_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_acp_fork_preserves_child_when_runtime_cleanup_is_unconfirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    parent = store.create_session(str(workspace), model="test")
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    class UncleanClient(FakeAshClient):
+        async def close(self) -> None:
+            self.closed = True
+            raise RuntimeError("runtime cleanup failed")
+
+    client: UncleanClient | None = None
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        nonlocal client
+        client = UncleanClient("wrong-session", _events(), approval_callback)
+        return client
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="did not attach"):
+        await agent.fork_session(parent.session_id, str(workspace))
+
+    assert client is not None and client.closed is True
+    children = [
+        item for item in store.list_sessions() if item.session_id != parent.session_id
+    ]
+    assert len(children) == 1
+    assert children[0].parent_session_id == parent.session_id
+
+
+@pytest.mark.asyncio
+async def test_acp_fork_and_resume_enforce_workspace_and_complete_turns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    other_workspace = tmp_path / "other"
+    workspace.mkdir()
+    other_workspace.mkdir()
+    base_config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(base_config.db_directory / "sessions.db")
+    stored = store.create_session(str(workspace), model="test")
+    interrupted = store.create_session(str(workspace), model="test")
+    store.start_turn(interrupted.session_id, "turn-started", "unfinished")
+    store.save_message(
+        interrupted.session_id,
+        Message(
+            role="user",
+            content="unfinished",
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id="turn-started",
+    )
+
+    def load_config(cls: type[AshConfig], **kwargs: Any) -> AshConfig:
+        selected = kwargs.get("workspace_root") or workspace
+        return base_config.model_copy(update={"workspace_root": selected})
+
+    monkeypatch.setattr(AshConfig, "load", classmethod(load_config))
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        return FakeAshClient(session_id or "new", _events(), approval_callback)
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+
+    for operation in (
+        lambda: agent.fork_session(stored.session_id, str(other_workspace)),
+        lambda: agent.resume_session(stored.session_id, str(other_workspace)),
+    ):
+        with pytest.raises(acp.RequestError) as mismatch:
+            await operation()
+        assert "different workspace" in str(mismatch.value.data).casefold()
+
+    with pytest.raises(acp.RequestError) as unfinished:
+        await agent.fork_session(interrupted.session_id, str(workspace))
+    assert "unfinished" in str(unfinished.value.data).casefold()
+    assert {item.session_id for item in store.list_sessions()} == {
+        stored.session_id,
+        interrupted.session_id,
+    }
+
+
+@pytest.mark.asyncio
 async def test_acp_load_does_not_succeed_after_concurrent_session_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -979,7 +1588,7 @@ async def test_acp_official_sdk_wire_round_trip(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_production_acp_entrypoint_exposes_close_only(
+async def test_production_acp_entrypoint_exposes_fork_resume_and_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Exercise the shipped ACP process through the official client wire."""
@@ -1061,6 +1670,8 @@ async def test_production_acp_entrypoint_exposes_close_only(
         assert capabilities.prompt_capabilities.image is True
         assert capabilities.session_capabilities is not None
         assert capabilities.session_capabilities.close is not None
+        assert capabilities.session_capabilities.fork is not None
+        assert capabilities.session_capabilities.resume is not None
         session = await asyncio.wait_for(
             connection.new_session(cwd=str(workspace), mcp_servers=[]), timeout=30
         )
@@ -1085,18 +1696,53 @@ async def test_production_acp_entrypoint_exposes_close_only(
             for _, update in wire_client.updates
         )
 
-        for unsupported in (
+        forked = await asyncio.wait_for(
             connection.fork_session(
                 session.session_id, cwd=str(workspace), mcp_servers=[]
             ),
+            timeout=30,
+        )
+        assert forked.session_id != session.session_id
+        child_prompted = await asyncio.wait_for(
+            connection.prompt(
+                session_id=forked.session_id,
+                prompt=[text_block("Continue on the child branch")],
+            ),
+            timeout=45,
+        )
+        parent_prompted = await asyncio.wait_for(
+            connection.prompt(
+                session_id=session.session_id,
+                prompt=[text_block("Continue on the parent branch")],
+            ),
+            timeout=45,
+        )
+        assert child_prompted.stop_reason == "end_turn"
+        assert parent_prompted.stop_reason == "end_turn"
+
+        await asyncio.wait_for(
+            connection.close_session(session.session_id), timeout=15
+        )
+        wire_client.updates.clear()
+        await asyncio.wait_for(
             connection.resume_session(
                 session.session_id, cwd=str(workspace), mcp_servers=[]
             ),
-        ):
-            with pytest.raises(acp.RequestError) as error:
-                await asyncio.wait_for(unsupported, timeout=10)
-            assert error.value.code == -32601
+            timeout=30,
+        )
+        assert wire_client.updates == []
+        resumed = await asyncio.wait_for(
+            connection.prompt(
+                session_id=session.session_id,
+                prompt=[text_block("Continue after resume")],
+            ),
+            timeout=45,
+        )
+        assert resumed.stop_reason == "end_turn"
 
+        await asyncio.wait_for(
+            connection.close_session(forked.session_id), timeout=15
+        )
         await asyncio.wait_for(
             connection.close_session(session.session_id), timeout=15
         )
@@ -1114,7 +1760,7 @@ async def test_production_acp_entrypoint_exposes_close_only(
                 timeout=10,
             )
         assert missing.value.code == -32002
-        assert len(requests) == 1
+        assert len(requests) == 4
         assert requests[0][0] == "/v1/chat/completions"
         assert requests[0][1]["model"] == "acp-real-model"
         assert requests[0][1]["stream"] is True
