@@ -10,6 +10,8 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -131,6 +133,28 @@ async def test_subprocess_runner_rejects_oversized_prompt_before_client_start(
         )
 
 
+@pytest.mark.asyncio
+async def test_subprocess_runner_resolves_relative_workspace_from_child_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr("ash.automation.runner.is_workspace_trusted", lambda path: True)
+    config = AshConfig(workspace_root=Path("."))
+
+    with pytest.raises(ValueError, match="prompt exceeds"):
+        await execute_automation_subprocess_request(
+            {
+                "config": config.model_dump(mode="json"),
+                "workspace": ".",
+                "prompt": "x" * (MAX_AUTOMATION_PROMPT_BYTES + 1),
+                "user_metadata": None,
+            }
+        )
+
+
 def test_automation_runner_rejects_oversized_protocol_input(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -192,6 +216,101 @@ async def test_automation_subprocess_runner_uses_isolated_python(
         "-m",
         "ash.automation.runner",
     )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_automation_subprocess_cwd_swap_cannot_escape_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.automation.worker as worker_module
+    from ash.automation.worker import _SubprocessAutomationClient
+    from ash.sandbox import process_utils as process_utils_module
+
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    outside.mkdir()
+    cwd_log = tmp_path / "automation-cwd.txt"
+    wrapper = tmp_path / "automation-python"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "request=json.loads(sys.stdin.read())\n"
+        f"Path({str(cwd_log)!r}).write_text(json.dumps({{'cwd': os.getcwd(), "
+        "'workspace': request['workspace'], 'config_workspace': "
+        "request['config']['workspace_root']}), encoding='utf-8')\n"
+        "payload={'ok': True, 'result': {'response': 'ok', 'session_id': 'session', "
+        "'model': 'fake/model', 'context_tokens': 1}}\n"
+        "print('ASH_AUTOMATION_RESULT=' + json.dumps(payload), flush=True)\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(worker_module, "sys", SimpleNamespace(executable=str(wrapper)))
+    real_prepare = process_utils_module.prepare_process_tree
+    swapped = False
+
+    def prepare_then_swap(*args, **kwargs):
+        nonlocal swapped
+        plan = real_prepare(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            workspace.rename(saved)
+            try:
+                workspace.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return plan
+
+    monkeypatch.setattr("ash.automation.worker.prepare_process_tree", prepare_then_swap)
+    client = _SubprocessAutomationClient(
+        AshConfig(workspace_root=workspace),
+        workspace,
+    )
+
+    result = await client.prompt("run")
+
+    assert result.response == "ok"
+    assert swapped is True
+    launch = json.loads(cwd_log.read_text(encoding="utf-8"))
+    assert Path(launch["cwd"]).resolve() == saved.resolve()
+    assert launch["workspace"] == "."
+    assert launch["config_workspace"] == "."
+
+
+@pytest.mark.asyncio
+async def test_automation_subprocess_fails_closed_without_stable_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.automation.worker import _SubprocessAutomationClient
+    from ash.sandbox.process_utils import ProcessTreeUnavailable
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def unavailable(*args, **kwargs):
+        raise ProcessTreeUnavailable("stable cwd unavailable")
+
+    create = AsyncMock(side_effect=AssertionError("automation must not launch"))
+    monkeypatch.setattr(
+        "ash.automation.worker.prepare_scoped_process_launch", unavailable
+    )
+    monkeypatch.setattr(
+        "ash.automation.worker.asyncio.create_subprocess_exec", create
+    )
+    client = _SubprocessAutomationClient(
+        AshConfig(workspace_root=workspace),
+        workspace,
+    )
+
+    with pytest.raises(AutomationError, match="stable cwd unavailable"):
+        await client.prompt("run")
+
+    create.assert_not_awaited()
 
 
 @pytest.mark.asyncio

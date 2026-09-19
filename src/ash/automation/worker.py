@@ -24,6 +24,8 @@ from ash.automation.store import (
 )
 from ash.config import AshConfig
 from ash.core.redaction import redact_text
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.scoped_io import ScopedIOError
 from ash.safety.trust import is_workspace_trusted
 from ash.sandbox.process_utils import (
     INHERIT_PROCESS_GROUP_ENV,
@@ -33,6 +35,7 @@ from ash.sandbox.process_utils import (
     ProcessTreeUnavailable,
     communicate_process,
     prepare_process_tree,
+    prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
@@ -93,7 +96,8 @@ class _SubprocessAutomationClient:
 
     def __init__(self, config: AshConfig, workspace: Path) -> None:
         self._config = config
-        self._workspace = workspace
+        self._guard = SafetyGuard(workspace)
+        self._workspace = self._guard.project_root
         self._process: asyncio.subprocess.Process | None = None
         self._process_tree_plan: ProcessTreePlan | None = None
 
@@ -105,33 +109,49 @@ class _SubprocessAutomationClient:
     ) -> AshResult:
         if self._process is not None:
             raise RuntimeError("automation subprocess client only supports one prompt")
+        child_config = self._config.model_dump(mode="json")
+        child_config["workspace_root"] = "."
         request = {
-            "config": self._config.model_dump(mode="json"),
-            "workspace": str(self._workspace),
+            "config": child_config,
+            "workspace": ".",
             "prompt": text,
             "user_metadata": user_metadata,
         }
         environment = dict(os.environ)
         environment["PYTHONUNBUFFERED"] = "1"
         environment[INHERIT_PROCESS_GROUP_ENV] = "1"
+        command = [sys.executable, "-I", "-m", "ash.automation.runner"]
         try:
-            process_tree_plan = prepare_process_tree(workspace_root=self._workspace)
-        except ProcessTreeUnavailable as exc:
+            with prepare_scoped_process_launch(
+                command,
+                cwd=self._workspace,
+                guard=self._guard,
+                search_path=environment.get("PATH"),
+            ) as launch:
+                try:
+                    process_tree_plan = prepare_process_tree(
+                        workspace_root=self._guard.project_root
+                    )
+                except ProcessTreeUnavailable as exc:
+                    raise AutomationError(
+                        f"automation subprocess was not started: {exc}"
+                    ) from exc
+                spawn_options = dict(process_tree_plan.spawn_options)
+                if launch.pass_fds:
+                    spawn_options["pass_fds"] = launch.pass_fds
+                process = await asyncio.create_subprocess_exec(
+                    *launch.argv,
+                    cwd=launch.cwd,
+                    env=environment,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    **spawn_options,
+                )
+        except (ProcessTreeUnavailable, SafetyViolation, ScopedIOError) as exc:
             raise AutomationError(
                 f"automation subprocess was not started: {exc}"
             ) from exc
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-I",
-            "-m",
-            "ash.automation.runner",
-            cwd=self._workspace,
-            env=environment,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **process_tree_plan.spawn_options,
-        )
         self._process = process
         self._process_tree_plan = process_tree_plan
         cleanup_error: ProcessTreeError | None = None
