@@ -596,6 +596,40 @@ def test_bubblewrap_can_mount_workspace_from_held_descriptor(tmp_path: Path) -> 
     assert argv[fd_index + 1] == str(tmp_path)
 
 
+def test_bubblewrap_can_mount_extra_read_only_path_from_held_descriptor(
+    tmp_path: Path,
+) -> None:
+    if not sys.platform.startswith("linux"):
+        pytest.skip("bubblewrap backend is Linux-only")
+    fake = tmp_path / "bwrap"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    workspace = tmp_path / "workspace"
+    extra = tmp_path / "extra"
+    workspace.mkdir()
+    extra.mkdir()
+    backend = BubblewrapSandbox(
+        workspace_root=workspace,
+        read_only_paths=(extra,),
+        bwrap_path=str(fake),
+    )
+
+    extra_fd = os.open(extra, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        argv = backend.wrap(
+            ["echo", "hi"],
+            cwd=workspace,
+            read_only_fds=((extra_fd, extra),),
+        )
+    finally:
+        os.close(extra_fd)
+
+    fd_index = argv.index(str(extra_fd))
+    assert argv[fd_index - 1] == "--ro-bind-fd"
+    assert argv[fd_index + 1] == str(extra)
+    assert "--ro-bind" not in argv[fd_index - 1 : fd_index + 2]
+
+
 # ---------------------------------------------------------------------------
 # Docker argv construction
 # ---------------------------------------------------------------------------
@@ -944,6 +978,72 @@ def test_run_with_real_bwrap_pins_workspace_across_path_swap(
 
     assert result.exit_code == 0, result.stderr
     assert result.stdout == "ORIGINAL"
+
+
+def test_run_with_real_bwrap_pins_extra_read_only_path_across_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extra host reads must remain bound to the validated directory inode."""
+
+    if not has_bwrap():
+        pytest.skip("bwrap not installed or usable on this host")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external_root = Path(
+        tempfile.mkdtemp(prefix=".ash-bwrap-readonly-", dir=Path.home())
+    )
+    extra = external_root / "extra"
+    replacement = external_root / "replacement"
+    saved = external_root / "extra-saved"
+    extra.mkdir()
+    replacement.mkdir()
+    (extra / "marker.txt").write_text("ORIGINAL", encoding="utf-8")
+    (replacement / "marker.txt").write_text("REPLACEMENT", encoding="utf-8")
+    manager = SandboxManager(
+        workspace_root=workspace,
+        preferred_tier=SANDBOX_TIER_BWRAP,
+        backend_preference="native",
+        extra_read_only_paths=(extra,),
+    )
+    assert manager.backend_name == "bubblewrap"
+
+    original_wrap = BubblewrapSandbox.wrap
+    swapped = False
+
+    def swap_after_wrap(
+        backend: BubblewrapSandbox,
+        command: list[str] | tuple[str, ...],
+        **kwargs: object,
+    ) -> list[str]:
+        nonlocal swapped
+        argv = original_wrap(backend, command, **kwargs)
+        if not swapped:
+            extra.rename(saved)
+            extra.symlink_to(replacement, target_is_directory=True)
+            swapped = True
+        return argv
+
+    monkeypatch.setattr(BubblewrapSandbox, "wrap", swap_after_wrap)
+    try:
+        result = asyncio.run(
+            manager.run(
+                ["/bin/cat", str(extra / "marker.txt")],
+                cwd=workspace,
+                timeout=15,
+            )
+        )
+
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout == "ORIGINAL"
+    finally:
+        if extra.is_symlink():
+            extra.unlink()
+        for path in (saved, replacement):
+            marker = path / "marker.txt"
+            marker.unlink(missing_ok=True)
+            path.rmdir()
+        external_root.rmdir()
 
 
 

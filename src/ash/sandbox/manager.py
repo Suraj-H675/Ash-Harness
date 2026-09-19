@@ -18,7 +18,7 @@ import os
 import sys
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence, TypedDict
@@ -213,6 +213,9 @@ class SandboxManager:
     _workspace_identity: tuple[int, int] | None = field(
         init=False, repr=False, default=None
     )
+    _read_only_identities: tuple[tuple[Path, tuple[int, int]], ...] = field(
+        init=False, repr=False, default=()
+    )
 
     def __post_init__(self) -> None:
         if self.preferred_tier not in {
@@ -236,6 +239,17 @@ class SandboxManager:
                 pass
             else:
                 self._workspace_identity = (metadata.st_dev, metadata.st_ino)
+        read_only_identities: list[tuple[Path, tuple[int, int]]] = []
+        for raw_path in self.extra_read_only_paths:
+            resolved = Path(raw_path).expanduser().resolve()
+            try:
+                metadata = resolved.stat()
+            except OSError:
+                continue
+            read_only_identities.append(
+                (resolved, (metadata.st_dev, metadata.st_ino))
+            )
+        self._read_only_identities = tuple(read_only_identities)
         self._available: dict[str, bool] = {"scoped": True}
         self._tier: SandboxTier = self._detect_tier()
 
@@ -396,10 +410,13 @@ class SandboxManager:
 
         resolved_cwd = Path(cwd).expanduser().resolve() if cwd is not None else None
         try:
-            with open_scoped_directory(
-                self.workspace_root,
-                SafetyGuard(self.workspace_root),
-            ) as (_, workspace_fd):
+            with ExitStack() as stack:
+                _, workspace_fd = stack.enter_context(
+                    open_scoped_directory(
+                        self.workspace_root,
+                        SafetyGuard(self.workspace_root),
+                    )
+                )
                 opened = os.fstat(workspace_fd)
                 if self._workspace_identity is not None and (
                     opened.st_dev,
@@ -408,11 +425,24 @@ class SandboxManager:
                     raise SandboxBackendUnavailable(
                         "sandbox workspace identity changed"
                     )
+                read_only_fds: list[tuple[int, Path]] = []
+                for path, expected_identity in self._read_only_identities:
+                    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                    flags |= getattr(os, "O_NOFOLLOW", 0)
+                    descriptor = os.open(path, flags)
+                    stack.callback(os.close, descriptor)
+                    metadata = os.fstat(descriptor)
+                    if (metadata.st_dev, metadata.st_ino) != expected_identity:
+                        raise SandboxBackendUnavailable(
+                            f"sandbox read-only path identity changed: {path}"
+                        )
+                    read_only_fds.append((descriptor, path))
                 invocation = self._prepare(
                     command,
                     cwd=resolved_cwd,
                     passthrough_env_names=passthrough_env_names,
                     workspace_fd=workspace_fd,
+                    read_only_fds=tuple(read_only_fds),
                 )
                 if invocation.backend_name != "bubblewrap":
                     yield invocation
@@ -423,7 +453,11 @@ class SandboxManager:
                     invocation.tier,
                     invocation.backend_name,
                     invocation.fallback_used,
-                    (workspace_fd,),
+                    tuple(
+                        dict.fromkeys(
+                            (workspace_fd, *(fd for fd, _ in read_only_fds))
+                        )
+                    ),
                 )
         except SandboxBackendUnavailable:
             raise
@@ -451,6 +485,7 @@ class SandboxManager:
             cwd=cwd,
             passthrough_env_names=passthrough_env_names,
             workspace_fd=None,
+            read_only_fds=None,
         )
 
     def _prepare(
@@ -460,6 +495,7 @@ class SandboxManager:
         cwd: Path | None,
         passthrough_env_names: Sequence[str],
         workspace_fd: int | None,
+        read_only_fds: tuple[tuple[int, Path], ...] | None,
     ) -> SandboxInvocation:
         """Prepare argv, optionally binding Bubblewrap to a held workspace FD."""
 
@@ -473,6 +509,7 @@ class SandboxManager:
                     cwd=cwd,
                     passthrough_env_names=passthrough_env_names,
                     workspace_fd=workspace_fd,
+                    read_only_fds=read_only_fds,
                 )
             else:
                 wrapped = backend.wrap(

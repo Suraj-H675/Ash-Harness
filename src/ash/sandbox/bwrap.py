@@ -95,6 +95,7 @@ class BubblewrapSandbox(SandboxBackend):
         cwd: Path | None = None,
         passthrough_env_names: Sequence[str] = (),
         workspace_fd: int | None = None,
+        read_only_fds: Sequence[tuple[int, Path]] | None = None,
     ) -> list[str]:
         """Build a full ``bwrap … -- command`` argv list."""
 
@@ -166,12 +167,20 @@ class BubblewrapSandbox(SandboxBackend):
             scratch.mkdir(parents=True, exist_ok=True)
             args.extend(["--bind", str(scratch), str(scratch)])
 
-        # Additional read-only paths the caller wants to expose.
-        for ro_entry in self.read_only_paths:
-            ro_resolved: Path = Path(str(ro_entry)).resolve()
-            if ro_resolved.exists():
-                ro_str = str(ro_resolved)
-                args.extend(["--ro-bind", ro_str, ro_str])
+        # Additional read-only paths the caller wants to expose. Launching
+        # callers can bind held descriptors so the host pathname cannot be
+        # swapped after validation; plain argv previews retain legacy paths.
+        if read_only_fds is not None:
+            for descriptor, destination in read_only_fds:
+                if descriptor < 0:
+                    raise ValueError("read-only descriptor must be non-negative")
+                args.extend(["--ro-bind-fd", str(descriptor), str(destination)])
+        else:
+            for ro_entry in self.read_only_paths:
+                ro_resolved: Path = Path(str(ro_entry)).resolve()
+                if ro_resolved.exists():
+                    ro_str = str(ro_resolved)
+                    args.extend(["--ro-bind", ro_str, ro_str])
 
         if not self.network:
             # Block all network namespaces by clearing net namespace.
