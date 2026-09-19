@@ -2745,6 +2745,10 @@ def main(argv: list[str] | None = None) -> int:
     mcp_list.add_argument("--json", action="store_true")
     mcp_status = mcp_action_subparsers.add_parser("status")
     mcp_status.add_argument("--json", action="store_true")
+    mcp_probe = mcp_action_subparsers.add_parser("probe")
+    mcp_probe.add_argument("server_name")
+    mcp_probe.add_argument("--timeout", type=float, default=30.0)
+    mcp_probe.add_argument("--json", action="store_true")
     mcp_add = mcp_action_subparsers.add_parser("add")
     mcp_add.add_argument("server_name")
     mcp_add.add_argument(
@@ -4146,6 +4150,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "mcp":
         from ash.commands.mcp import (
             parse_key_value_options,
+            probe_mcp_server,
+            render_mcp_probe,
             render_mcp_servers,
         )
         from ash.mcp.server import MCPServerConfig, load_mcp_servers, save_mcp_servers
@@ -4163,6 +4169,43 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.action in {"list", "status"}:
             print(render_mcp_servers(servers, json_output=args.json))
+            return 0
+        if args.action == "probe":
+            if (
+                not math.isfinite(args.timeout)
+                or args.timeout <= 0
+                or args.timeout > 300
+            ):
+                print(
+                    "Error: --timeout must be greater than 0 and at most 300 seconds.",
+                    file=sys.stderr,
+                )
+                return 2
+            mcp_config = servers.get(args.server_name)
+            if mcp_config is None:
+                print(
+                    f"Error: MCP server {args.server_name!r} is not configured.",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                result = asyncio.run(
+                    probe_mcp_server(
+                        mcp_config,
+                        workspace=Path.cwd(),
+                        timeout=args.timeout,
+                    )
+                )
+            except KeyboardInterrupt:
+                return 130
+            except Exception as exc:  # noqa: BLE001 - stable MCP probe boundary
+                print(
+                    f"Error: MCP probe failed for {args.server_name}: "
+                    f"{safe_mcp_diagnostic(exc)}",
+                    file=sys.stderr,
+                )
+                return 1
+            print(render_mcp_probe(result, json_output=args.json))
             return 0
         if not args.server_name:
             print("Error: server name is required.", file=sys.stderr)

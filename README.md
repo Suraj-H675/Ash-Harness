@@ -277,7 +277,8 @@ remain intentionally unsupported.
 Ash connects local and remote Model Context Protocol servers over stdio,
 Streamable HTTP, and the SSE configuration alias. MCP support includes:
 
-- server add, remove, list, status, login, logout, and targeted refresh;
+- server add, remove, list, status, live connection/capability probing, login,
+  logout, and targeted refresh;
 - live tools, resources, resource templates, prompts, and task operations;
 - OAuth 2.1 discovery, protected-resource metadata, S256 PKCE, resource
   indicators, callback-state validation, and dynamic client registration;

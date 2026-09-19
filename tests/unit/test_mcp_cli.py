@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+import pytest
+
 from ash.cli import main
+from ash.commands.mcp import probe_mcp_server
+from ash.mcp.client import MCPProtocolError
 from ash.mcp.oauth import (
     MCPOAuthTokenStore,
     OAuthBundle,
@@ -12,7 +18,7 @@ from ash.mcp.oauth import (
     OAuthDiscovery,
     OAuthTokens,
 )
-from ash.mcp.server import load_mcp_servers
+from ash.mcp.server import MCPServerConfig, load_mcp_servers
 
 
 def _oauth_bundle(resource: str) -> OAuthBundle:
@@ -337,3 +343,244 @@ def test_mcp_cli_status_reports_safe_oauth_credential_state(
     output = capsys.readouterr().out
     assert "credentials=unavailable" in output
     assert "access-token" not in output
+
+
+def test_mcp_cli_probe_live_stdio_server_reports_safe_capabilities(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    secret = "probe-secret-value"
+    server = r'''
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    params = message.get("params", {})
+    if method == "server/discover":
+        caps = params.get("_meta", {}).get("io.modelcontextprotocol/clientCapabilities", {})
+        assert "roots" in caps
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {
+                "tools": {"listChanged": True},
+                "resources": {"listChanged": True, "subscribe": True},
+                "prompts": {},
+            },
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "probe-server",
+                    "version": "1.2.3",
+                }
+            },
+        }
+    elif method == "tools/list":
+        result = {
+            "resultType": "complete",
+            "tools": [
+                {"name": "one", "inputSchema": {"type": "object"}},
+                {"name": "two", "inputSchema": {"type": "object"}},
+            ],
+        }
+    else:
+        result = {"resultType": "complete"}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+'''
+    assert (
+        main(
+            [
+                "mcp",
+                "add",
+                "probe",
+                "--env",
+                f"PROBE_SECRET={secret}",
+                "--",
+                sys.executable,
+                "-u",
+                "-c",
+                server,
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert main(["mcp", "probe", "probe", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload == {
+        "name": "probe",
+        "transport": "stdio",
+        "protocol_version": "2026-07-28",
+        "server": {"name": "probe-server", "version": "1.2.3"},
+        "capabilities": {
+            "tools": True,
+            "resources": True,
+            "prompts": True,
+            "tasks": False,
+            "resource_subscribe": True,
+            "list_changed": {
+                "tools": True,
+                "resources": True,
+                "prompts": False,
+            },
+        },
+        "tools": 2,
+    }
+    assert secret not in json.dumps(payload)
+
+
+def test_mcp_cli_probe_human_output_is_concise(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    server = r'''
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {}},
+            "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "human", "version": "1"}},
+        }
+    elif method == "tools/list":
+        result = {"resultType": "complete", "tools": []}
+    else:
+        result = {"resultType": "complete"}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+'''
+    assert main(["mcp", "add", "human", "--", sys.executable, "-u", "-c", server]) == 0
+    capsys.readouterr()
+
+    assert main(["mcp", "probe", "human"]) == 0
+    output = capsys.readouterr().out
+    assert "human: connected" in output
+    assert "protocol=2026-07-28" in output
+    assert "tools=0" in output
+    assert "resources=no" in output
+    assert "prompts=no" in output
+
+
+def test_mcp_cli_probe_rejects_missing_server_and_invalid_timeout(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["mcp", "probe", "missing"]) == 2
+    assert "not configured" in capsys.readouterr().err
+
+    assert main(["mcp", "probe", "missing", "--timeout", "nan"]) == 2
+    assert "timeout" in capsys.readouterr().err.casefold()
+
+
+def test_mcp_cli_probe_connection_failure_is_redacted(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    secret = "super-secret-probe-token"
+    assert (
+        main(
+            [
+                "mcp",
+                "add",
+                "broken",
+                "--env",
+                f"TOKEN={secret}",
+                "--",
+                str(tmp_path / "missing-mcp-server"),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert main(["mcp", "probe", "broken", "--timeout", "0.1"]) == 1
+    captured = capsys.readouterr()
+    assert "probe failed" in captured.err.casefold()
+    assert secret not in captured.err
+
+
+@pytest.mark.asyncio
+async def test_mcp_probe_cancellation_disconnects_client(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    started = asyncio.Event()
+    disconnected = asyncio.Event()
+
+    class BlockingClient:
+        protocol_version = "2026-07-28"
+        server_info = {"name": "blocked", "version": "1"}
+        server_capabilities = {"tools": {}}
+
+        def __init__(self, config, *, timeout, roots) -> None:
+            assert roots == (tmp_path,)
+
+        def supports_server_capability(self, name: str) -> bool:
+            return name == "tools"
+
+        async def connect(self) -> None:
+            return None
+
+        async def list_tools(self):
+            started.set()
+            await asyncio.Event().wait()
+
+        async def disconnect(self) -> None:
+            disconnected.set()
+
+    monkeypatch.setattr("ash.commands.mcp.MCPClient", BlockingClient)
+    config = MCPServerConfig(name="blocked", command="server", args=[], env={})
+    task = asyncio.create_task(
+        probe_mcp_server(config, workspace=tmp_path, timeout=1.0)
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert disconnected.is_set()
+
+
+@pytest.mark.asyncio
+async def test_mcp_probe_cleanup_failure_does_not_mask_primary_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class FailingClient:
+        protocol_version = "2026-07-28"
+        server_info = {"name": "failing", "version": "1"}
+        server_capabilities = {"tools": {}}
+
+        def __init__(self, config, *, timeout, roots) -> None:
+            return None
+
+        def supports_server_capability(self, name: str) -> bool:
+            return name == "tools"
+
+        async def connect(self) -> None:
+            return None
+
+        async def list_tools(self):
+            raise MCPProtocolError("primary probe failure")
+
+        async def disconnect(self) -> None:
+            raise RuntimeError("cleanup failure")
+
+    monkeypatch.setattr("ash.commands.mcp.MCPClient", FailingClient)
+    config = MCPServerConfig(name="failing", command="server", args=[], env={})
+
+    with pytest.raises(MCPProtocolError, match="primary probe failure") as failure:
+        await probe_mcp_server(config, workspace=tmp_path, timeout=1.0)
+    assert any("cleanup failure" in note for note in failure.value.__notes__)
