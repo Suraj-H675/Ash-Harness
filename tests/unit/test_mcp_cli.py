@@ -119,6 +119,20 @@ def test_mcp_cli_rejects_invalid_env_option(
     assert "--env must use KEY=VALUE syntax" in capsys.readouterr().err
 
 
+def test_mcp_cli_add_rejects_server_name_its_loader_would_reject(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["mcp", "add", "bad name", "--", "server"]) == 2
+
+    captured = capsys.readouterr()
+    assert "invalid MCP server name" in captured.err
+    assert not (tmp_path / ".mcp.json").exists()
+
+
 def test_mcp_cli_classifies_malformed_config_without_traceback(
     tmp_path: Path,
     monkeypatch,
@@ -133,6 +147,34 @@ def test_mcp_cli_classifies_malformed_config_without_traceback(
     payload = json.loads(captured.out)
     assert payload["error"]["category"] == "config"
     assert "Traceback" not in captured.out
+
+
+def test_mcp_cli_config_error_escapes_terminal_controls(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "demo": {
+                    "command": "server",
+                    "args": [],
+                    "env": {},
+                    "transport": "stdio\nFORGED_ERROR\x1b[31m",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["mcp", "list"]) == 2
+    captured = capsys.readouterr()
+
+    assert "stdio\\x0aFORGED_ERROR\\x1b[31m" in captured.err
+    assert "\x1b" not in captured.err
+    assert captured.err.count("\n") == 2
 
 
 def test_mcp_cli_rejects_oauth_options_without_oauth_mode(
@@ -345,6 +387,32 @@ def test_mcp_cli_status_reports_safe_oauth_credential_state(
     assert "access-token" not in output
 
 
+def test_mcp_cli_status_escapes_terminal_controls_from_config(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "demo": {
+                    "command": "python\nFORGED_STATUS\x1b[31m",
+                    "args": [],
+                    "env": {},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["mcp", "status"]) == 0
+    output = capsys.readouterr().out
+
+    assert output == "demo [stdio]: python\\x0aFORGED_STATUS\\x1b[31m\n"
+    assert "\x1b" not in output
+
+
 def test_mcp_cli_probe_live_stdio_server_reports_safe_capabilities(
     tmp_path: Path,
     monkeypatch,
@@ -509,6 +577,53 @@ def test_mcp_cli_probe_connection_failure_is_redacted(
     captured = capsys.readouterr()
     assert "probe failed" in captured.err.casefold()
     assert secret not in captured.err
+
+
+def test_mcp_cli_probe_escapes_terminal_controls_from_server_error(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    server = r'''
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {}},
+            "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "probe", "version": "1"}},
+        }
+        reply = {"jsonrpc": "2.0", "id": message["id"], "result": result}
+    elif method == "tools/list":
+        reply = {
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "error": {
+                "code": -32001,
+                "message": "boom\nFORGED_PROBE\u001b[31m",
+            },
+        }
+    else:
+        reply = {
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {"resultType": "complete"},
+        }
+    print(json.dumps(reply), flush=True)
+'''
+    assert main(["mcp", "add", "probe", "--", sys.executable, "-u", "-c", server]) == 0
+    capsys.readouterr()
+
+    assert main(["mcp", "probe", "probe"]) == 1
+    captured = capsys.readouterr()
+
+    assert "boom\\x0aFORGED_PROBE\\x1b[31m" in captured.err
+    assert "\x1b" not in captured.err
+    assert captured.err.count("\n") == 1
 
 
 @pytest.mark.asyncio

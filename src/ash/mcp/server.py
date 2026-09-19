@@ -63,6 +63,8 @@ class MCPServerConfig:
     oauth: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not MCP_SERVER_NAME.fullmatch(self.name):
+            raise ValueError(f"invalid MCP server name: {self.name!r}")
         if self.transport not in {"stdio", "http", "sse"}:
             raise ValueError(f"Unknown MCP transport: {self.transport}")
         if self.auth not in {"none", "oauth"}:

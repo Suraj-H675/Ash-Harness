@@ -6,6 +6,7 @@ from collections.abc import Mapping
 import json
 
 from ash.core.redaction import redact_text, redact_value
+from ash.ui.safe_text import terminal_safe_text
 
 
 MAX_MCP_DIAGNOSTIC_CHARS = 512
@@ -22,6 +23,7 @@ def safe_mcp_diagnostic(
     if max_chars < 1:
         raise ValueError("max_chars must be positive")
     rendered = redact_text(str(value)).strip() or type(value).__name__
+    rendered = terminal_safe_text(rendered, single_line=True)
     if len(rendered) > max_chars:
         return rendered[: max_chars - 3] + "..."
     return rendered

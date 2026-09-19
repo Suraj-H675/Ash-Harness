@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any
 
 from ash.core.redaction import redact_text
+from ash.ui.safe_text import terminal_safe_text
 
 
 class ErrorCategory(str, Enum):
@@ -217,7 +218,9 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
 def format_error(info: ErrorInfo) -> str:
     """Render a concise human-readable error with an actionable next step."""
 
-    return f"Error [{info.category.value}]: {info.message}\nRemedy: {info.remedy}"
+    message = terminal_safe_text(info.message, single_line=True)
+    remedy = terminal_safe_text(info.remedy, single_line=True)
+    return f"Error [{info.category.value}]: {message}\nRemedy: {remedy}"
 
 
 def _message(exc: BaseException) -> str:

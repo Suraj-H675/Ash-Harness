@@ -86,7 +86,12 @@ def render_mcp_servers(
             extras.append(f"credentials={state}")
         auth = " oauth" if item["auth"] == "oauth" else ""
         suffix = f" ({'; '.join(extras)})" if extras else ""
-        lines.append(f"{item['name']} [{item['transport']}{auth}]: {target}{suffix}")
+        lines.append(
+            terminal_safe_text(
+                f"{item['name']} [{item['transport']}{auth}]: {target}{suffix}",
+                single_line=True,
+            )
+        )
     return "\n".join(lines)
 
 
