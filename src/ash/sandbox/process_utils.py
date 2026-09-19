@@ -7,12 +7,17 @@ import os
 import signal
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ash.safe_io import descriptor_path
 from ash.safety.environment import resolve_host_executable
+from ash.safety.guard import SafetyGuard
+from ash.safety.path_scope import is_relative_to
+from ash.safety.scoped_io import open_scoped_directory
 
 
 ProcessStreamCallback = Callable[[str, str], None]
@@ -20,6 +25,14 @@ INHERIT_PROCESS_GROUP_ENV = "ASH_INTERNAL_INHERIT_PROCESS_GROUP"
 WINDOWS_TASKKILL_TIMEOUT_SECONDS = 5.0
 _KILLPG = getattr(os, "killpg", None)
 _SIGKILL = getattr(signal, "SIGKILL", None)
+_FCHDIR_EXEC = (
+    "import os,sys;"
+    "fd=int(sys.argv[1]);"
+    "argv=sys.argv[2:];"
+    "os.fchdir(fd);"
+    "os.close(fd);"
+    "os.execvpe(argv[0],argv,os.environ)"
+)
 
 
 class ProcessTreeError(RuntimeError):
@@ -46,6 +59,15 @@ class ProcessTreePlan:
     @property
     def is_windows(self) -> bool:
         return self.platform == "win32"
+
+
+@dataclass(frozen=True)
+class ScopedProcessLaunch:
+    """A subprocess argv/cwd pair anchored to a held workspace directory."""
+
+    argv: tuple[str, ...]
+    cwd: str | None
+    pass_fds: tuple[int, ...] = ()
 
 
 def prepare_process_tree(
@@ -100,6 +122,106 @@ def process_group_options() -> dict[str, Any]:
     if sys.platform == "win32":
         return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
     return {"start_new_session": True}
+
+
+@contextmanager
+def prepare_scoped_process_launch(
+    command: Sequence[str],
+    *,
+    cwd: str | Path | None,
+    guard: SafetyGuard,
+    search_path: str | None = None,
+) -> Iterator[ScopedProcessLaunch]:
+    """Prepare a subprocess launch whose POSIX cwd cannot be pathname-swapped."""
+
+    if not command:
+        raise ValueError("command must not be empty")
+    if cwd is None or os.name != "posix":
+        yield ScopedProcessLaunch(
+            tuple(command),
+            str(cwd) if cwd is not None else None,
+        )
+        return
+    with open_scoped_directory(cwd, guard) as (_, directory_fd):
+        yield _prepare_posix_cwd_launch(
+            directory_fd,
+            command,
+            guard=guard,
+            search_path=search_path,
+        )
+
+
+def _prepare_posix_cwd_launch(
+    directory_fd: int,
+    command: Sequence[str],
+    *,
+    guard: SafetyGuard,
+    search_path: str | None,
+) -> ScopedProcessLaunch:
+    """Select the platform-specific launch form for one held cwd descriptor."""
+
+    if sys.platform.startswith("linux"):
+        scoped_cwd = descriptor_path(directory_fd)
+        if scoped_cwd is None:
+            raise ProcessTreeUnavailable(
+                "race-resistant cwd descriptors are unavailable on this platform"
+            )
+        return ScopedProcessLaunch(tuple(command), scoped_cwd, (directory_fd,))
+
+    python = _resolve_trusted_python_launcher(
+        guard.project_root,
+        search_path=search_path,
+    )
+    if python is None:
+        raise ProcessTreeUnavailable(
+            "race-resistant cwd launch requires a trusted host Python interpreter"
+        )
+    return ScopedProcessLaunch(
+        (
+            python,
+            "-I",
+            "-S",
+            "-c",
+            _FCHDIR_EXEC,
+            str(directory_fd),
+            *command,
+        ),
+        None,
+        (directory_fd,),
+    )
+
+
+def _resolve_trusted_python_launcher(
+    workspace_root: Path,
+    *,
+    search_path: str | None,
+) -> str | None:
+    """Resolve a Python interpreter whose canonical path is outside the workspace."""
+
+    workspace = workspace_root.expanduser().resolve()
+    try:
+        current = Path(sys.executable).expanduser().resolve()
+    except OSError:
+        current = None
+    if (
+        current is not None
+        and current.is_file()
+        and os.access(current, os.X_OK)
+        and not is_relative_to(current, workspace)
+    ):
+        return str(current)
+
+    names = [Path(sys.executable).name, "python3", "python"]
+    for name in dict.fromkeys(names):
+        resolved = resolve_host_executable(
+            name,
+            workspace_root=workspace,
+            cwd=workspace,
+            search_path=search_path,
+        )
+        if resolved is not None:
+            return resolved
+    return None
 
 
 async def terminate_process_tree(

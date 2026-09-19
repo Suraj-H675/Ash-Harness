@@ -20,10 +20,12 @@ from ash.sandbox.process_utils import (
     communicate_process,
     _descendant_pids,
     prepare_process_tree,
+    prepare_scoped_process_launch,
     process_group_options,
     terminate_process_tree,
     terminate_process_tree_sync,
 )
+from ash.safety.guard import SafetyGuard
 
 
 def _pinned_popen(pid: int) -> subprocess.Popen[object]:
@@ -54,6 +56,107 @@ def test_process_group_options_can_inherit_automation_group(
 ) -> None:
     monkeypatch.setenv(INHERIT_PROCESS_GROUP_ENV, "1")
     assert process_group_options() == {}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")
+def test_non_linux_posix_cwd_launch_skips_workspace_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    host_bin = tmp_path / "host-bin"
+    cwd = workspace / "work"
+    workspace.mkdir()
+    host_bin.mkdir()
+    cwd.mkdir()
+    workspace_python = workspace / "python3"
+    host_python = host_bin / "python3"
+    workspace_python.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    host_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    workspace_python.chmod(0o755)
+    host_python.chmod(0o755)
+
+    monkeypatch.setattr("ash.sandbox.process_utils.sys.platform", "darwin")
+    monkeypatch.setattr("ash.sandbox.process_utils.sys.executable", str(workspace_python))
+
+    with prepare_scoped_process_launch(
+        ["/bin/sh", "-c", "true"],
+        cwd=cwd,
+        guard=SafetyGuard(workspace),
+        search_path=os.pathsep.join((str(workspace), str(host_bin))),
+    ) as launch:
+        assert launch.cwd is None
+        assert launch.argv[0] == str(host_python.resolve())
+        assert launch.argv[1:4] == ("-I", "-S", "-c")
+        assert launch.argv[-3:] == ("/bin/sh", "-c", "true")
+        assert len(launch.pass_fds) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")
+def test_non_linux_posix_cwd_launch_fails_without_trusted_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    cwd = workspace / "work"
+    workspace.mkdir()
+    cwd.mkdir()
+    workspace_python = workspace / "python3"
+    workspace_python.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    workspace_python.chmod(0o755)
+
+    monkeypatch.setattr("ash.sandbox.process_utils.sys.platform", "darwin")
+    monkeypatch.setattr("ash.sandbox.process_utils.sys.executable", str(workspace_python))
+
+    with pytest.raises(ProcessTreeUnavailable, match="trusted host Python"):
+        with prepare_scoped_process_launch(
+            ["/bin/sh", "-c", "true"],
+            cwd=cwd,
+            guard=SafetyGuard(workspace),
+            search_path=str(workspace),
+        ):
+            pytest.fail("untrusted workspace Python must not be used")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")
+def test_non_linux_posix_cwd_launch_uses_held_inode_after_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    cwd = workspace / "work"
+    saved = workspace / "work-saved"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    cwd.mkdir()
+    outside.mkdir()
+    monkeypatch.setattr("ash.sandbox.process_utils.sys.platform", "darwin")
+
+    with prepare_scoped_process_launch(
+        ["/bin/sh", "-c", "printf safe > marker.txt; pwd"],
+        cwd=cwd,
+        guard=SafetyGuard(workspace),
+        search_path=os.environ.get("PATH"),
+    ) as launch:
+        cwd.rename(saved)
+        try:
+            cwd.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"Symlink creation is unavailable: {exc}")
+        completed = subprocess.run(
+            launch.argv,
+            cwd=launch.cwd,
+            env={"PATH": os.defpath},
+            pass_fds=launch.pass_fds,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+    assert completed.returncode == 0
+    assert not (outside / "marker.txt").exists()
+    assert (saved / "marker.txt").read_text(encoding="utf-8") == "safe"
+    assert Path(completed.stdout.strip()).resolve() == saved.resolve()
 
 
 @pytest.mark.asyncio

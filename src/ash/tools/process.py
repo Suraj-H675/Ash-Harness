@@ -17,15 +17,14 @@ from ash.core.redaction import (
     StreamingRedactor,
     redact_text,
 )
-from ash.safe_io import descriptor_path
 from ash.safety.environment import resolve_host_executable
 from ash.safety.guard import SafetyGuard
-from ash.safety.scoped_io import open_scoped_directory
 from ash.sandbox.process_utils import (
     ProcessTreeError,
     ProcessTreePlan,
     ProcessTreeUnavailable,
     prepare_process_tree,
+    prepare_scoped_process_launch,
     terminate_process_tree,
 )
 from ash.sandbox import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable, SandboxManager
@@ -241,26 +240,28 @@ class BackgroundProcessTool(BaseTool):
                 error=f"Command was not started: {exc}",
             )
         if platform.system() != "Windows":
-            with open_scoped_directory(cwd, self.safety_guard) as (_, directory_fd):
-                scoped_cwd = descriptor_path(directory_fd)
-                if scoped_cwd is None:
-                    return ToolResult(
-                        success=False,
-                        output="",
-                        error=(
-                            "Command was not started: race-resistant cwd descriptors "
-                            "are unavailable on this platform."
-                        ),
+            try:
+                with prepare_scoped_process_launch(
+                    argv,
+                    cwd=cwd,
+                    guard=self.safety_guard,
+                    search_path=environment.get("PATH"),
+                ) as launch:
+                    process = await asyncio.create_subprocess_exec(
+                        *launch.argv,
+                        cwd=launch.cwd,
+                        env=environment,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        pass_fds=launch.pass_fds,
+                        **process_tree_plan.spawn_options,
                     )
-                process = await asyncio.create_subprocess_exec(
-                    *argv,
-                    cwd=scoped_cwd,
-                    env=environment,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    pass_fds=(directory_fd,),
-                    **process_tree_plan.spawn_options,
+            except ProcessTreeUnavailable as exc:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Command was not started: {exc}",
                 )
         else:
             process = await asyncio.create_subprocess_exec(

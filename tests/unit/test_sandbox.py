@@ -84,7 +84,9 @@ async def test_manager_run_uses_held_cwd_after_path_is_swapped(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from ash.safe_io import descriptor_path as real_descriptor_path
+    from ash.sandbox import process_utils as process_utils_module
+
+    real_prepare = process_utils_module._prepare_posix_cwd_launch
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -95,7 +97,7 @@ async def test_manager_run_uses_held_cwd_after_path_is_swapped(
     outside.mkdir()
     swapped = False
 
-    def descriptor_after_swap(directory_fd: int) -> str | None:
+    def prepare_after_swap(*args, **kwargs):
         nonlocal swapped
         if not swapped:
             swapped = True
@@ -104,11 +106,12 @@ async def test_manager_run_uses_held_cwd_after_path_is_swapped(
                 cwd.symlink_to(outside, target_is_directory=True)
             except OSError as exc:
                 pytest.skip(f"Symlink creation is unavailable: {exc}")
-        return real_descriptor_path(directory_fd)
+        return real_prepare(*args, **kwargs)
 
     monkeypatch.setattr(
-        "ash.sandbox.manager.descriptor_path",
-        descriptor_after_swap,
+        process_utils_module,
+        "_prepare_posix_cwd_launch",
+        prepare_after_swap,
     )
     manager = SandboxManager(workspace_root=workspace, backend_preference="direct")
 

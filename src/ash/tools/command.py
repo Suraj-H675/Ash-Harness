@@ -11,10 +11,8 @@ from typing import Any, Iterable
 from pydantic import BaseModel, Field
 
 from ash.core.redaction import StreamingRedactor
-from ash.safe_io import descriptor_path
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.safety.guard import SafetyGuard, SafetyViolation
-from ash.safety.scoped_io import open_scoped_directory
 from ash.sandbox._base import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable
 from ash.sandbox.manager import SandboxManager, SandboxResult
 from ash.sandbox.process_utils import (
@@ -23,6 +21,7 @@ from ash.sandbox.process_utils import (
     ProcessTreeUnavailable,
     communicate_process,
     prepare_process_tree,
+    prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
@@ -356,28 +355,27 @@ class RunCommandTool(BaseTool):
                 )
             else:
                 cwd_target = Path(cwd) if cwd is not None else workspace
-                with open_scoped_directory(
-                    cwd_target,
-                    self.safety_guard,
-                ) as (_, directory_fd):
-                    scoped_cwd = descriptor_path(directory_fd)
-                    if scoped_cwd is None:
-                        return ToolResult(
-                            success=False,
-                            output="",
-                            error=(
-                                "Error: command was not started: race-resistant "
-                                "cwd descriptors are unavailable on this platform."
-                            ),
+                try:
+                    with prepare_scoped_process_launch(
+                        ["/bin/sh", "-c", command_line],
+                        cwd=cwd_target,
+                        guard=self.safety_guard,
+                        search_path=env.get("PATH"),
+                    ) as launch:
+                        process = await asyncio.create_subprocess_exec(
+                            *launch.argv,
+                            cwd=launch.cwd,
+                            env=env,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            pass_fds=launch.pass_fds,
+                            **process_tree_plan.spawn_options,
                         )
-                    process = await asyncio.create_subprocess_shell(
-                        command_line,
-                        cwd=scoped_cwd,
-                        env=env,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        pass_fds=(directory_fd,),
-                        **process_tree_plan.spawn_options,
+                except ProcessTreeUnavailable as exc:
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error=f"Error: command was not started: {exc}",
                     )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 communicate_process(

@@ -329,7 +329,9 @@ async def test_background_process_uses_held_cwd_after_path_is_swapped(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from ash.safe_io import descriptor_path as real_descriptor_path
+    from ash.sandbox import process_utils as process_utils_module
+
+    real_prepare = process_utils_module._prepare_posix_cwd_launch
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -340,7 +342,7 @@ async def test_background_process_uses_held_cwd_after_path_is_swapped(
     saved = workspace / "work-saved"
     swapped = False
 
-    def descriptor_after_swap(directory_fd: int) -> str | None:
+    def prepare_after_swap(*args, **kwargs):
         nonlocal swapped
         if not swapped:
             swapped = True
@@ -349,11 +351,12 @@ async def test_background_process_uses_held_cwd_after_path_is_swapped(
                 cwd.symlink_to(outside, target_is_directory=True)
             except OSError as exc:
                 pytest.skip(f"symlink creation is unavailable: {exc}")
-        return real_descriptor_path(directory_fd)
+        return real_prepare(*args, **kwargs)
 
     monkeypatch.setattr(
-        "ash.tools.process.descriptor_path",
-        descriptor_after_swap,
+        process_utils_module,
+        "_prepare_posix_cwd_launch",
+        prepare_after_swap,
     )
     tool = BackgroundProcessTool(SafetyGuard(workspace))
 
@@ -378,7 +381,17 @@ async def test_background_process_fails_closed_without_descriptor_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("ash.tools.process.descriptor_path", lambda _fd: None)
+    from ash.sandbox import process_utils as process_utils_module
+    from ash.sandbox.process_utils import ProcessTreeUnavailable
+
+    def unavailable(*args, **kwargs):
+        raise ProcessTreeUnavailable("race-resistant cwd launch unavailable")
+
+    monkeypatch.setattr(
+        process_utils_module,
+        "_prepare_posix_cwd_launch",
+        unavailable,
+    )
     monkeypatch.setattr(
         "ash.tools.process.asyncio.create_subprocess_exec",
         AsyncMock(side_effect=AssertionError("command must not launch")),
@@ -388,7 +401,7 @@ async def test_background_process_fails_closed_without_descriptor_cwd(
     result = await tool.run(action="start", command="printf unsafe")
 
     assert result.success is False
-    assert "race-resistant cwd descriptors are unavailable" in (result.error or "")
+    assert "race-resistant cwd launch unavailable" in (result.error or "")
     assert not tool.jobs
 
 
