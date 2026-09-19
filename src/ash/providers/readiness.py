@@ -76,6 +76,15 @@ class ProviderVerification:
     connection: ProviderConnection
     models: tuple[str, ...]
     selected_model_available: bool
+    completion_attempted: bool = False
+    completion_verified: bool = False
+    completion_error: str | None = None
+
+    @property
+    def ready_to_use(self) -> bool:
+        """Whether catalog discovery and an explicit completion probe both passed."""
+
+        return self.selected_model_available and self.completion_verified
 
 
 @dataclass(frozen=True)

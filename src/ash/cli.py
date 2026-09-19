@@ -2060,7 +2060,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     providers_list.add_argument("--json", action="store_true")
     providers_test = providers_subparsers.add_parser(
-        "test", help="Verify a configured route and discover its models"
+        "test",
+        help="Verify a configured route, discover its models, and run a minimal completion",
     )
     providers_test.add_argument(
         "model",
@@ -2788,7 +2789,7 @@ def main(argv: list[str] | None = None) -> int:
             print(provider_test_error(exc, json_output=args.json), file=sys.stderr)
             return 2
         print(render_provider_test(verification, json_output=args.json))
-        return 0 if verification.selected_model_available else 1
+        return 0 if verification.ready_to_use else 1
 
     if args.command == "doctor":
         from ash.commands.doctor import render_doctor, run_doctor

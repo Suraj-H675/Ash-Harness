@@ -54,7 +54,8 @@ Supported built-in routes include:
 The provider layer also provides:
 
 - model strings in `provider/model` form;
-- live model discovery and endpoint readiness checks;
+- live model discovery plus explicit bounded completion verification through
+  `ash providers test`, with catalog and model-call readiness reported separately;
 - provider and model capability metadata for native tools, vision,
   reasoning, locality, context, and output budgets;
 - isolated named profiles for separate model, provider, credential, and local
