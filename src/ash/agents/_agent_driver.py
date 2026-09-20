@@ -129,6 +129,9 @@ async def _run_durable_task(spec: dict[str, Any]) -> int:
     custom_agents = _custom_agents_from_spec(spec.get("custom_agent"))
     max_return_chars = _optional_positive_int(spec, "max_return_chars", 20_000)
     max_turn_iterations = _optional_positive_int(spec, "max_turn_iterations", 12)
+    require_dispatchable = spec.get("require_dispatchable", False)
+    if type(require_dispatchable) is not bool:
+        raise ValueError("subagent require_dispatchable must be boolean")
 
     shared_state = SharedState(Path(db_path))
     tool = SpawnAgentTool(
@@ -145,7 +148,7 @@ async def _run_durable_task(spec: dict[str, Any]) -> int:
     try:
         result = await tool.run_queued_task(
             task_id,
-            require_dispatchable=False,
+            require_dispatchable=require_dispatchable,
             wait=True,
         )
         return 0 if result.success else 1

@@ -13,6 +13,7 @@ from ash.safety.grants import PermissionRule
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy
 from ash.tools.agent import SpawnAgentTool
+from ash.tools.base import ToolResult
 
 
 class FakeProvider(ProviderABC):
@@ -125,6 +126,361 @@ async def test_foreground_read_only_agent_can_run_provider_in_subprocess(
         assert durable[0].result is not None
         assert durable[0].result["summary"] == "child evidence"
     finally:
+        await tool.aclose()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_background_agent_runs_provider_in_subprocess(tmp_path, monkeypatch) -> None:
+    requests: list[tuple[str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            requests.append((self.path, self.headers.get("Authorization", "")))
+            body = (
+                'data: {"id":"background-child","choices":[{"delta":{"content":"background evidence"},'
+                '"finish_reason":null}]}\n\n'
+                'data: {"id":"background-child","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    parent_factory_calls = 0
+
+    def parent_factory() -> ProviderABC:
+        nonlocal parent_factory_calls
+        parent_factory_calls += 1
+        raise AssertionError("background subprocess must not call parent factory")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "background-secret")
+    monkeypatch.setenv(
+        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
+    )
+    state = SharedState(tmp_path / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/background-model",
+        agent_execution_mode="subprocess",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        parent_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+    try:
+        started = await tool.run(
+            role="reviewer",
+            task="inspect tests",
+            agent_id="background-process-reviewer",
+            background=True,
+        )
+        assert started.success is True
+        assert "Started subagent background-process-reviewer" in started.output
+
+        durable = state.tasks.list_tasks()[0]
+        terminal = await asyncio.wait_for(
+            tool.wait_for_tasks([durable.task_id]),
+            timeout=5,
+        )
+        assert terminal[0].state == "succeeded"
+        assert terminal[0].owner_agent_id == "background-process-reviewer"
+        assert terminal[0].result is not None
+        assert terminal[0].result["summary"] == "background evidence"
+        assert parent_factory_calls == 0
+        assert requests == [
+            ("/v1/chat/completions", "Bearer background-secret")
+        ]
+        for _ in range(50):
+            if "background-process-reviewer" not in tool._subprocess_tasks:
+                break
+            await asyncio.sleep(0.01)
+        assert "background-process-reviewer" not in tool._subprocess_tasks
+    finally:
+        await tool.aclose()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_subprocess_dispatcher_reserves_task_before_child_claim(
+    tmp_path, monkeypatch
+) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        agent_execution_mode="subprocess",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        FakeProvider,
+        config=config,
+        provider_config_backed=True,
+    )
+    durable = state.tasks.create_task(
+        "inspect tests",
+        role="reviewer",
+        task_id="dispatch-reservation",
+        metadata={
+            "agent_id": "reserved-reviewer",
+            "dispatchable": True,
+            "isolation": "shared",
+            "workspace": str(tmp_path.resolve()),
+        },
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def delayed_execute(**kwargs) -> ToolResult:
+        nonlocal calls
+        calls += 1
+        assert kwargs["durable_task"].task_id == durable.task_id
+        started.set()
+        await release.wait()
+        state.tasks.cancel_task(durable.task_id, reason="reservation probe complete")
+        return ToolResult(success=False, output="", error="reservation probe complete")
+
+    monkeypatch.setattr(tool, "_execute_subprocess_task", delayed_execute)
+    try:
+        tool.ensure_dispatcher()
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await asyncio.sleep(0.35)
+
+        assert state.tasks.get_task(durable.task_id).state == "queued"
+        assert calls == 1
+
+        release.set()
+        await asyncio.wait_for(tool.wait_for_tasks([durable.task_id]), timeout=2)
+        assert state.tasks.get_task(durable.task_id).state == "cancelled"
+    finally:
+        release.set()
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_subprocess_stop_cancels_durable_task(
+    tmp_path, monkeypatch
+) -> None:
+    request_started = threading.Event()
+    release_response = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            request_started.set()
+            release_response.wait(timeout=5)
+            body = (
+                'data: {"id":"slow-child","choices":[{"delta":{"content":"late"},'
+                '"finish_reason":null}]}\n\n'
+                'data: {"id":"slow-child","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            ).encode()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    def forbidden_parent_factory() -> ProviderABC:
+        raise AssertionError("background subprocess must not call parent factory")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "slow-secret")
+    monkeypatch.setenv(
+        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
+    )
+    state = SharedState(tmp_path / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        model="openai/slow-child",
+        agent_execution_mode="subprocess",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        forbidden_parent_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+    try:
+        started = await tool.run(
+            role="reviewer",
+            task="inspect tests",
+            agent_id="slow-process-reviewer",
+            background=True,
+        )
+        assert started.success is True
+        assert await asyncio.to_thread(request_started.wait, 5)
+
+        durable = state.tasks.list_tasks()[0]
+        active = state.tasks.get_task(durable.task_id)
+        assert active is not None and active.state == "running"
+
+        assert await tool.stop("slow-process-reviewer") is True
+
+        stopped = state.tasks.get_task(durable.task_id)
+        assert stopped is not None and stopped.state == "cancelled"
+        assert stopped.error == "stopped by persisted message"
+        stop_messages = [
+            message
+            for message in state.fetch_messages(
+                "slow-process-reviewer",
+                undelivered_only=False,
+            )
+            if message.message_type == "stop"
+        ]
+        assert len(stop_messages) == 1
+        assert stop_messages[0].delivered is True
+        assert "slow-process-reviewer" not in tool._subprocess_tasks
+    finally:
+        release_response.set()
+        await tool.aclose()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_background_subprocess_stop_cleans_coder_worktree(
+    tmp_path, monkeypatch
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    (repository / "file.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+    request_started = threading.Event()
+    release_response = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            request_started.set()
+            release_response.wait(timeout=5)
+            body = (
+                'data: {"id":"coder-child","choices":[{"delta":{"content":"late"},'
+                '"finish_reason":null}]}\n\n'
+                'data: {"id":"coder-child","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            ).encode()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    def forbidden_parent_factory() -> ProviderABC:
+        raise AssertionError("coder subprocess must not call parent factory")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "coder-secret")
+    monkeypatch.setenv(
+        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
+    )
+    state = SharedState(tmp_path / "state" / "agents.db")
+    config = AshConfig(
+        workspace_root=repository,
+        db_directory=tmp_path / "state",
+        model="openai/coder-child",
+        agent_execution_mode="subprocess",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(repository),
+        state,
+        forbidden_parent_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+    try:
+        started = await tool.run(
+            role="coder",
+            task="inspect before editing",
+            agent_id="coder-process",
+            background=True,
+        )
+        assert started.success is True
+        assert await asyncio.to_thread(request_started.wait, 5)
+
+        before = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert before.count("worktree ") == 2
+
+        assert await tool.stop("coder-process") is True
+
+        after = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert after.count("worktree ") == 1
+        branches = subprocess.run(
+            ["git", "branch", "--list", "ash-agent/coder-process"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert branches.strip() == ""
+    finally:
+        release_response.set()
         await tool.aclose()
         server.shutdown()
         server.server_close()

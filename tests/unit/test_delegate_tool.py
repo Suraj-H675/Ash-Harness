@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -189,6 +191,204 @@ def _tools(tmp_path: Path, *, max_concurrency: int = 2):
         config,
     )
     return config, spawn, delegate
+
+
+@pytest.mark.asyncio
+async def test_delegate_agents_runs_provider_in_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[tuple[str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            requests.append((self.path, self.headers.get("Authorization", "")))
+            body = (
+                'data: {"id":"delegate-child","choices":[{"delta":{"content":"delegated evidence"},'
+                '"finish_reason":null}]}\n\n'
+                'data: {"id":"delegate-child","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    parent_factory_calls = 0
+
+    def parent_factory() -> ProviderABC:
+        nonlocal parent_factory_calls
+        parent_factory_calls += 1
+        raise AssertionError("delegated subprocess must not call parent factory")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "delegate-secret")
+    monkeypatch.setenv(
+        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
+    )
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/delegate-child",
+        agent_execution_mode="subprocess",
+        max_concurrent_agents=2,
+        agent_token_budget=100,
+        agent_time_budget_seconds=10,
+        memory_backend="off",
+    )
+    db_path = config.db_directory / "agents.db"
+    spawn = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        parent_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+    delegate = DelegateAgentsTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        spawn,
+        config,
+    )
+    try:
+        result = await delegate.run(
+            goal="inspect implementation",
+            tasks=[
+                {
+                    "key": "review",
+                    "role": "reviewer",
+                    "task": "inspect tests",
+                    "isolation": "shared",
+                }
+            ],
+        )
+
+        assert result.success is True, result.error
+        assert parent_factory_calls == 0
+        assert requests == [
+            ("/v1/chat/completions", "Bearer delegate-secret")
+        ]
+        tasks = spawn._shared_state.tasks.list_tasks()
+        assert len(tasks) == 1
+        assert tasks[0].state == "succeeded"
+        assert tasks[0].owner_agent_id is not None
+        assert tasks[0].owner_agent_id.endswith("-review-a1")
+        assert tasks[0].result is not None
+        assert tasks[0].result["summary"] == "delegated evidence"
+    finally:
+        await spawn.aclose()
+        delegate._shared_state.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_delegate_subprocess_retry_survives_failed_child_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            nonlocal requests
+            requests += 1
+            if requests == 1:
+                body = b'{"error":{"message":"first attempt failed"}}'
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = (
+                'data: {"id":"retry-child","choices":[{"delta":{"content":"retry succeeded"},'
+                '"finish_reason":null}]}\n\n'
+                'data: {"id":"retry-child","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    def forbidden_parent_factory() -> ProviderABC:
+        raise AssertionError("delegated subprocess must not call parent factory")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "retry-secret")
+    monkeypatch.setenv(
+        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
+    )
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/retry-child",
+        agent_execution_mode="subprocess",
+        provider_max_attempts=1,
+        provider_retry_base_delay=0,
+        provider_retry_max_delay=0,
+        max_concurrent_agents=1,
+        agent_token_budget=100,
+        agent_time_budget_seconds=10,
+        memory_backend="off",
+    )
+    db_path = config.db_directory / "agents.db"
+    spawn = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        forbidden_parent_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+    delegate = DelegateAgentsTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        spawn,
+        config,
+    )
+    try:
+        result = await delegate.run(
+            goal="retry subprocess",
+            tasks=[
+                {
+                    "key": "retry",
+                    "role": "reviewer",
+                    "task": "retry task",
+                    "isolation": "shared",
+                    "max_attempts": 2,
+                }
+            ],
+        )
+
+        assert result.success is True, result.error
+        assert requests == 2
+        task = spawn._shared_state.tasks.list_tasks()[0]
+        assert task.state == "succeeded"
+        assert task.attempt == 2
+        assert task.owner_agent_id is not None
+        assert task.owner_agent_id.endswith("-a2")
+        assert task.result is not None
+        assert task.result["summary"] == "retry succeeded"
+        assert "agent.task.retrying" in {
+            event.event["type"] for event in spawn._shared_state.tasks.list_events()
+        }
+    finally:
+        await spawn.aclose()
+        delegate._shared_state.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
 
 
 @pytest.mark.asyncio

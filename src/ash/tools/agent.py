@@ -31,7 +31,11 @@ from ash.safety.guard import SafetyGuard
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.policy import PermissionPolicy, PolicyAction
 from ash.sandbox import SandboxManager
-from ash.sandbox.process_utils import prepare_process_tree, terminate_process_tree
+from ash.sandbox.process_utils import (
+    ProcessTreeError,
+    prepare_process_tree,
+    terminate_process_tree,
+)
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.ui.headless import HeadlessUI
 
@@ -126,6 +130,8 @@ class SpawnAgentTool(BaseTool):
         if self._custom_agents:
             self._update_description()
         self._tasks: dict[str, asyncio.Task[AgentReport]] = {}
+        self._subprocess_tasks: dict[str, asyncio.Task[ToolResult]] = {}
+        self._subprocess_task_ids: set[str] = set()
         self._dispatcher_task: asyncio.Task[None] | None = None
 
     def set_custom_agents(self, agents: dict[str, "AgentDefinition"]) -> None:
@@ -162,15 +168,20 @@ class SpawnAgentTool(BaseTool):
         mode = self._config.safety_tier if self._config is not None else "auto_approve"
         return PermissionPolicy(mode)
 
+    def _subprocess_enabled(self) -> bool:
+        return bool(
+            self._config is not None
+            and self._config.agent_execution_mode == "subprocess"
+            and self._provider_config_backed
+        )
+
     def _foreground_subprocess_policy(
         self,
         *,
         execution_role: str,
     ) -> PermissionPolicy | None:
         if (
-            self._config is None
-            or self._config.agent_execution_mode != "subprocess"
-            or not self._provider_config_backed
+            not self._subprocess_enabled()
             or execution_role not in {"researcher", "reviewer", "general"}
         ):
             return None
@@ -212,13 +223,14 @@ class SpawnAgentTool(BaseTool):
             "allowed_tools": list(definition.allowed_tools),
         }
 
-    async def _run_foreground_subprocess_task(
+    def _subprocess_spec(
         self,
         *,
         durable_task: AgentTask,
         policy: PermissionPolicy,
         agent_definition: "AgentDefinition | None",
-    ) -> ToolResult:
+        require_dispatchable: bool,
+    ) -> bytes:
         assert self._config is not None
         from ash.providers.identifiers import parse_model_string
         from ash.providers.readiness import provider_runtime_environment
@@ -253,78 +265,27 @@ class SpawnAgentTool(BaseTool):
             "custom_agent": self._custom_agent_payload(agent_definition),
             "max_return_chars": self._max_return_chars,
             "max_turn_iterations": self._max_turn_iterations,
+            "require_dispatchable": require_dispatchable,
         }
-        try:
-            encoded_spec = encode_subprocess_spec(spec)
-            plan = prepare_process_tree(workspace_root=self.safety_guard.project_root)
-            process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-I",
-                "-m",
-                "ash.agents._agent_driver",
-                "--spec-stdin",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                env=build_scrubbed_environment(
-                    overrides={
-                        "ASH_WORKSPACE_ROOT": str(
-                            Path(self.safety_guard.project_root).resolve()
-                        )
-                    }
-                ),
-                **plan.spawn_options,
-            )
-        except (OSError, ValueError) as exc:
-            self._shared_state.tasks.cancel_task(
-                durable_task.task_id,
-                reason=f"subagent subprocess could not start: {exc}",
-            )
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Could not start subagent subprocess: {exc}",
-            )
+        return encode_subprocess_spec(spec)
 
-        try:
-            await process.communicate(encoded_spec)
-        except asyncio.CancelledError as cancellation:
-            try:
-                await terminate_process_tree(process, plan=plan)
-            except BaseException as cleanup_error:
-                cancellation.add_note(
-                    f"subagent subprocess cleanup failed: {cleanup_error}"
-                )
-            current = self._shared_state.tasks.get_task(durable_task.task_id)
-            if current is not None and current.state not in {
-                "succeeded",
-                "failed",
-                "cancelled",
-            }:
-                self._shared_state.tasks.cancel_task(
-                    durable_task.task_id,
-                    reason="subagent subprocess cancelled",
-                )
-            raise
+    def _cancel_active_subprocess_task(self, task_id: str, *, reason: str) -> None:
+        current = self._shared_state.tasks.get_task(task_id)
+        if current is not None and current.state not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+        }:
+            self._shared_state.tasks.cancel_task(task_id, reason=reason)
 
-        current = self._shared_state.tasks.get_task(durable_task.task_id)
+    def _subprocess_task_result(self, task_id: str) -> ToolResult:
+        current = self._shared_state.tasks.get_task(task_id)
         if current is None:
             return ToolResult(
                 success=False,
                 output="",
                 error="Subagent subprocess lost its durable task record.",
             )
-        if process.returncode != 0 and current.state not in {
-            "succeeded",
-            "failed",
-            "cancelled",
-        }:
-            self._shared_state.tasks.cancel_task(
-                durable_task.task_id,
-                reason=f"subagent subprocess exited with status {process.returncode}",
-            )
-            current = self._shared_state.tasks.get_task(durable_task.task_id) or current
-
         raw_result = current.result or {}
         summary = raw_result.get("summary")
         if not isinstance(summary, str):
@@ -347,6 +308,167 @@ class SpawnAgentTool(BaseTool):
             output=summary if raw_result else "",
             token_count=count_output_tokens(summary) if summary else 0,
             error=error,
+        )
+
+    async def _execute_subprocess_task(
+        self,
+        *,
+        durable_task: AgentTask,
+        policy: PermissionPolicy,
+        agent_definition: "AgentDefinition | None",
+        require_dispatchable: bool,
+    ) -> ToolResult:
+        try:
+            encoded_spec = self._subprocess_spec(
+                durable_task=durable_task,
+                policy=policy,
+                agent_definition=agent_definition,
+                require_dispatchable=require_dispatchable,
+            )
+            plan = prepare_process_tree(workspace_root=self.safety_guard.project_root)
+            environment = build_scrubbed_environment(
+                overrides={
+                    "ASH_WORKSPACE_ROOT": str(
+                        Path(self.safety_guard.project_root).resolve()
+                    )
+                }
+            )
+        except (OSError, ValueError, ProcessTreeError) as exc:
+            self._cancel_active_subprocess_task(
+                durable_task.task_id,
+                reason=f"subagent subprocess could not start: {exc}",
+            )
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Could not start subagent subprocess: {exc}",
+            )
+
+        launch = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                sys.executable,
+                "-I",
+                "-m",
+                "ash.agents._agent_driver",
+                "--spec-stdin",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=environment,
+                **plan.spawn_options,
+            ),
+            name=f"ash-subagent-process-launch-{durable_task.task_id}",
+        )
+        process: asyncio.subprocess.Process | None = None
+        try:
+            process = await asyncio.shield(launch)
+        except asyncio.CancelledError as cancellation:
+            launch_error, launch_interrupted = await _settle_spawn_cleanup_task(launch)
+            if launch_interrupted:
+                cancellation.add_note("subagent process launch cleanup was interrupted")
+            if launch_error is None:
+                process = launch.result()
+                try:
+                    await terminate_process_tree(process, plan=plan)
+                except BaseException as cleanup_error:
+                    cancellation.add_note(
+                        f"subagent subprocess cleanup failed: {cleanup_error}"
+                    )
+            self._cancel_active_subprocess_task(
+                durable_task.task_id,
+                reason="subagent subprocess cancelled during launch",
+            )
+            raise
+        except OSError as exc:
+            self._cancel_active_subprocess_task(
+                durable_task.task_id,
+                reason=f"subagent subprocess could not start: {exc}",
+            )
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Could not start subagent subprocess: {exc}",
+            )
+
+        assert process is not None
+        try:
+            await process.communicate(encoded_spec)
+        except asyncio.CancelledError as cancellation:
+            try:
+                await terminate_process_tree(process, plan=plan)
+            except BaseException as cleanup_error:
+                cancellation.add_note(
+                    f"subagent subprocess cleanup failed: {cleanup_error}"
+                )
+            self._cancel_active_subprocess_task(
+                durable_task.task_id,
+                reason="subagent subprocess cancelled",
+            )
+            raise
+
+        current = self._shared_state.tasks.get_task(durable_task.task_id)
+        if (
+            process.returncode != 0
+            and current is not None
+            and current.state in {"leased", "running"}
+        ):
+            self._cancel_active_subprocess_task(
+                durable_task.task_id,
+                reason=f"subagent subprocess exited with status {process.returncode}",
+            )
+        return self._subprocess_task_result(durable_task.task_id)
+
+    async def _run_subprocess_task(
+        self,
+        *,
+        durable_task: AgentTask,
+        agent_id: str,
+        policy: PermissionPolicy,
+        agent_definition: "AgentDefinition | None",
+        require_dispatchable: bool,
+        wait: bool,
+    ) -> ToolResult:
+        if wait:
+            return await self._execute_subprocess_task(
+                durable_task=durable_task,
+                policy=policy,
+                agent_definition=agent_definition,
+                require_dispatchable=require_dispatchable,
+            )
+        if durable_task.task_id in self._subprocess_task_ids:
+            return ToolResult(
+                success=True,
+                output=(
+                    f"Started subagent {agent_id} in background "
+                    f"(task {durable_task.task_id})."
+                ),
+            )
+        monitor = asyncio.create_task(
+            self._execute_subprocess_task(
+                durable_task=durable_task,
+                policy=policy,
+                agent_definition=agent_definition,
+                require_dispatchable=require_dispatchable,
+            ),
+            name=f"ash-subagent-process-{agent_id}",
+        )
+        self._subprocess_tasks[agent_id] = monitor
+        self._subprocess_task_ids.add(durable_task.task_id)
+
+        def finish_subprocess(completed: asyncio.Task[ToolResult]) -> None:
+            self._finish_subprocess_task(
+                agent_id,
+                durable_task.task_id,
+                completed,
+            )
+
+        monitor.add_done_callback(finish_subprocess)
+        return ToolResult(
+            success=True,
+            output=(
+                f"Started subagent {agent_id} in background "
+                f"(task {durable_task.task_id})."
+            ),
         )
 
     def supports_role(self, role: str) -> bool:
@@ -402,6 +524,15 @@ class SpawnAgentTool(BaseTool):
                 success=False,
                 output="",
                 error=f"Task {task_id!r} has invalid dispatch metadata: {exc}",
+            )
+        if self._subprocess_enabled():
+            return await self._run_subprocess_task(
+                durable_task=durable_task,
+                agent_id=attempt_agent_id,
+                policy=self._worker_permission_policy(),
+                agent_definition=self._custom_agents.get(durable_task.role),
+                require_dispatchable=require_dispatchable,
+                wait=wait,
             )
         return await self._run_args(
             args,
@@ -464,6 +595,7 @@ class SpawnAgentTool(BaseTool):
                 for task in self._shared_state.tasks.list_ready_tasks(limit=1000)
                 if task.metadata.get("dispatchable") is True
                 and task.metadata.get("workspace") == workspace
+                and task.task_id not in self._subprocess_task_ids
             ]
             self._shared_state.retire_stale_approval_requests()
             for task in ready:
@@ -637,15 +769,27 @@ class SpawnAgentTool(BaseTool):
                 output="",
                 error=f"Task {durable_task.task_id!r} is {durable_task.state}, not queued.",
             )
+        if created_here and args.background and self._subprocess_enabled():
+            return await self._run_subprocess_task(
+                durable_task=durable_task,
+                agent_id=agent_id,
+                policy=self._worker_permission_policy(),
+                agent_definition=agent_definition,
+                require_dispatchable=False,
+                wait=False,
+            )
         if created_here and not args.background:
             subprocess_policy = self._foreground_subprocess_policy(
                 execution_role=execution_role
             )
             if subprocess_policy is not None:
-                return await self._run_foreground_subprocess_task(
+                return await self._run_subprocess_task(
                     durable_task=durable_task,
+                    agent_id=agent_id,
                     policy=subprocess_policy,
                     agent_definition=agent_definition,
+                    require_dispatchable=False,
+                    wait=True,
                 )
         task_token_budget = durable_task.token_budget
         task_time_budget = durable_task.time_budget_seconds
@@ -1528,9 +1672,20 @@ class SpawnAgentTool(BaseTool):
             await asyncio.gather(self._dispatcher_task, return_exceptions=True)
             self._dispatcher_task = None
         tasks = list(self._tasks.values())
-        for task in tasks:
-            task.cancel()
+        for agent_task in tasks:
+            agent_task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        subprocess_tasks = list(self._subprocess_tasks.items())
+        if subprocess_tasks:
+            await asyncio.gather(
+                *(
+                    self._stop_subprocess_monitor(agent_id, subprocess_task)
+                    for agent_id, subprocess_task in subprocess_tasks
+                ),
+                return_exceptions=True,
+            )
+        self._subprocess_tasks.clear()
+        self._subprocess_task_ids.clear()
         self._shared_state.close()
 
     def _finish_background_task(
@@ -1549,15 +1704,92 @@ class SpawnAgentTool(BaseTool):
                 current_task=f"background worker failed: {error}",
             )
 
-    async def stop(self, agent_id: str) -> bool:
-        task = self._tasks.get(agent_id)
-        if task is None:
-            return False
+    def _finish_subprocess_task(
+        self,
+        agent_id: str,
+        task_id: str,
+        task: asyncio.Task[ToolResult],
+    ) -> None:
+        if self._subprocess_tasks.get(agent_id) is task:
+            self._subprocess_tasks.pop(agent_id, None)
+        self._subprocess_task_ids.discard(task_id)
+        if task.cancelled():
+            return
+        try:
+            result = task.result()
+        except BaseException as exc:
+            failure = f"subagent subprocess failed: {exc}"
+        else:
+            if result.success:
+                return
+            failure = result.error or "subagent subprocess failed"
+        status = self._shared_state.get_status(agent_id)
+        if status is None:
+            durable = self._shared_state.tasks.get_task(task_id)
+            if durable is None:
+                return
+            self._shared_state.register_agent(
+                agent_id,
+                role=durable.role,
+                metadata={
+                    "task": durable.description,
+                    "durable_task_id": durable.task_id,
+                    "workspace": durable.metadata.get("workspace"),
+                },
+            )
+            status = self._shared_state.get_status(agent_id)
+        if status is not None and status.status in {"idle", "working"}:
+            self._shared_state.update_status(
+                agent_id,
+                "failed",
+                current_task=failure[:200],
+            )
+
+    async def _stop_subprocess_monitor(
+        self,
+        agent_id: str,
+        task: asyncio.Task[ToolResult],
+        *,
+        grace_seconds: float = 2.0,
+    ) -> None:
+        await self._shared_state.send_message_async(
+            "lead",
+            agent_id,
+            "stop",
+            {},
+        )
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=grace_seconds)
+            return
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        except Exception:
+            return
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        self._shared_state.update_status(
-            agent_id, "failed", current_task="stopped by user"
-        )
+
+    async def stop(self, agent_id: str) -> bool:
+        task = self._tasks.get(agent_id)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self._shared_state.update_status(
+                agent_id, "failed", current_task="stopped by user"
+            )
+            return True
+        subprocess_task = self._subprocess_tasks.get(agent_id)
+        if subprocess_task is None:
+            return False
+        await self._stop_subprocess_monitor(agent_id, subprocess_task)
+        status = self._shared_state.get_status(agent_id)
+        if status is not None and status.status in {"idle", "working"}:
+            self._shared_state.update_status(
+                agent_id, "failed", current_task="stopped by user"
+            )
         return True
 
     async def resume(self, agent_id: str) -> ToolResult:
