@@ -5874,14 +5874,16 @@ async def test_modern_task_extension_drives_input_update_and_completion() -> Non
     result = await client.call_tool("long", {})
 
     assert result["content"][0]["text"] == "finished"
-    assert [method for method, _, _ in seen] == [
+    task_requests = [entry for entry in seen if entry[0] != "subscriptions/listen"]
+    assert [method for method, _, _ in task_requests] == [
         "server/discover",
         "tools/call",
         "tasks/get",
         "tasks/update",
         "tasks/get",
     ]
-    for method, headers, _ in seen[2:]:
+    assert any(method == "subscriptions/listen" for method, _, _ in seen)
+    for method, headers, _ in task_requests[2:]:
         assert headers["Mcp-Method"] == method
         assert headers["Mcp-Name"] == task_id
     await client.disconnect()
@@ -6199,6 +6201,173 @@ for line in sys.stdin:
     try:
         result = await client.call_tool("long", {})
         assert result["content"][0]["text"] == "task complete"
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modern_task_notification_completes_without_polling_over_stdio() -> None:
+    server = r"""
+import json, sys
+listen_id = None
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    params = message.get("params", {})
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {
+                "tools": {},
+                "extensions": {"io.modelcontextprotocol/tasks": {}},
+            },
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "tools/call":
+        result = {
+            "resultType": "task",
+            "taskId": "notify-task",
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60000,
+            "pollIntervalMs": 100000,
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "subscriptions/listen":
+        listen_id = message["id"]
+        assert params["notifications"] == {"taskIds": ["notify-task"]}
+        meta = {"io.modelcontextprotocol/subscriptionId": listen_id}
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {"notifications": {"taskIds": ["notify-task"]}, "_meta": meta},
+        }), flush=True)
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/tasks",
+            "params": {
+                "taskId": "notify-task",
+                "status": "completed",
+                "createdAt": "2026-09-20T00:00:00Z",
+                "lastUpdatedAt": "2026-09-20T00:00:02Z",
+                "ttlMs": 60000,
+                "pollIntervalMs": 100000,
+                "result": {
+                    "content": [{"type": "text", "text": "notified"}],
+                    "isError": False,
+                },
+                "_meta": meta,
+            },
+        }), flush=True)
+    elif method == "tasks/get":
+        result = {
+            "resultType": "complete",
+            "taskId": "notify-task",
+            "status": "completed",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:03Z",
+            "ttlMs": 60000,
+            "result": {"content": [{"type": "text", "text": "polled"}]},
+        }
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    elif method == "notifications/cancelled":
+        assert message["params"]["requestId"] == listen_id
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": listen_id,
+            "result": {
+                "resultType": "complete",
+                "_meta": {"io.modelcontextprotocol/subscriptionId": listen_id},
+            },
+        }), flush=True)
+"""
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern-task-notify",
+            command=sys.executable,
+            args=["-u", "-c", server],
+            env={},
+        )
+    )
+    await client.connect()
+    try:
+        result = await asyncio.wait_for(client.call_tool("long", {}), timeout=1)
+        assert result["content"][0]["text"] == "notified"
+        assert client._task_subscription_tasks == {}
+        assert client._task_subscription_request_ids == {}
+        assert client._modern_task_updates == {}
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modern_task_subscription_decline_falls_back_to_polling() -> None:
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    params = message.get("params", {})
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {
+                "tools": {},
+                "extensions": {"io.modelcontextprotocol/tasks": {}},
+            },
+        }
+    elif method == "tools/call":
+        result = {
+            "resultType": "task",
+            "taskId": "poll-task",
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60000,
+            "pollIntervalMs": 10,
+        }
+    elif method == "subscriptions/listen":
+        listen_id = message["id"]
+        assert params["notifications"] == {"taskIds": ["poll-task"]}
+        meta = {"io.modelcontextprotocol/subscriptionId": listen_id}
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {"notifications": {}, "_meta": meta},
+        }), flush=True)
+        result = {"resultType": "complete", "_meta": meta}
+    elif method == "tasks/get":
+        result = {
+            "resultType": "complete",
+            "taskId": "poll-task",
+            "status": "completed",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:02Z",
+            "ttlMs": 60000,
+            "result": {"content": [{"type": "text", "text": "polled"}]},
+        }
+    else:
+        result = {"resultType": "complete"}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"""
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern-task-poll",
+            command=sys.executable,
+            args=["-u", "-c", server],
+            env={},
+        )
+    )
+    await client.connect()
+    try:
+        result = await asyncio.wait_for(client.call_tool("long", {}), timeout=1)
+        assert result["content"][0]["text"] == "polled"
+        assert client._task_subscription_tasks == {}
+        assert client._task_subscription_request_ids == {}
+        assert client._modern_task_updates == {}
     finally:
         await client.disconnect()
 

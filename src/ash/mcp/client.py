@@ -85,6 +85,7 @@ SUBSCRIPTION_CHANGE_FILTERS = {
     "notifications/resources/list_changed": "resourcesListChanged",
 }
 SUBSCRIPTION_RESOURCE_UPDATED_METHOD = "notifications/resources/updated"
+MODERN_TASK_NOTIFICATION = "notifications/tasks"
 
 
 async def _settle_task_after_cancellation(
@@ -277,6 +278,15 @@ class MCPClient:
         self._resource_subscription_stopping: set[str] = set()
         self._watched_resources: set[str] = set()
         self._resource_subscription_lock = asyncio.Lock()
+        self._task_subscription_tasks: dict[str, asyncio.Task[None]] = {}
+        self._task_subscription_request_ids: dict[str, int] = {}
+        self._task_subscription_ids_by_request: dict[int, str] = {}
+        self._task_subscription_acks: dict[str, asyncio.Event] = {}
+        self._task_subscription_errors: dict[str, BaseException] = {}
+        self._task_subscription_honored: set[str] = set()
+        self._task_subscription_stopping: set[str] = set()
+        self._modern_task_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._modern_task_updates: dict[str, dict[str, Any]] = {}
         self._pending_initialize_session_id = ""
         self._session_generation = 0
         self._session_recovery_lock = asyncio.Lock()
@@ -598,6 +608,7 @@ class MCPClient:
             method != SUBSCRIPTION_ACK_METHOD
             and method not in SUBSCRIPTION_CHANGE_FILTERS
             and method != SUBSCRIPTION_RESOURCE_UPDATED_METHOD
+            and method != MODERN_TASK_NOTIFICATION
         ):
             return False
         params = message.get("params")
@@ -612,6 +623,11 @@ class MCPClient:
             if resource_uri is not None:
                 return self._handle_modern_resource_subscription_notification(
                     resource_uri, subscription_id, method, params
+                )
+            task_id = self._task_subscription_ids_by_request.get(subscription_id)
+            if task_id is not None:
+                return self._handle_modern_task_subscription_notification(
+                    task_id, subscription_id, method, params
                 )
         request_id = self._subscription_request_id
         if request_id is None or subscription_id != request_id:
@@ -900,6 +916,169 @@ class MCPClient:
         if uri not in self._resource_subscription_honored:
             return True
         return params.get("uri") != uri
+
+    def _start_modern_task_subscription(self, task_id: str) -> None:
+        """Start a best-effort task-status subscription without delaying polling."""
+
+        if (
+            self.protocol_version != MODERN_PROTOCOL_VERSION
+            or not self._supports_modern_tasks()
+            or task_id in self._task_subscription_tasks
+        ):
+            return
+        request_id = self._next_id
+        self._next_id += 1
+        self._task_subscription_request_ids[task_id] = request_id
+        self._task_subscription_ids_by_request[request_id] = task_id
+        self._task_subscription_acks[task_id] = asyncio.Event()
+        self._task_subscription_errors.pop(task_id, None)
+        task = asyncio.create_task(
+            self._run_modern_task_subscription(task_id, request_id),
+            name=f"ash-mcp-task-watch-{self.config.name}-{task_id}",
+        )
+        self._task_subscription_tasks[task_id] = task
+
+    async def _run_modern_task_subscription(
+        self, task_id: str, request_id: int
+    ) -> None:
+        requested: dict[str, Any] = {"taskIds": [task_id]}
+        failure: BaseException | None = None
+        try:
+            if self.config.transport == "stdio":
+                await self._run_modern_stdio_subscription(request_id, requested)
+            elif self.config.transport == "http":
+                await self._run_modern_http_subscription(request_id, requested)
+            else:
+                return
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            failure = exc
+        else:
+            if task_id not in self._task_subscription_stopping:
+                failure = MCPProtocolError(
+                    f"MCP task subscription for {task_id!r} ended unexpectedly"
+                )
+        if failure is None or task_id in self._task_subscription_stopping:
+            return
+        self._task_subscription_errors[task_id] = failure
+        self._task_subscription_honored.discard(task_id)
+        ack = self._task_subscription_acks.get(task_id)
+        if ack is not None:
+            ack.set()
+
+    def _handle_modern_task_subscription_notification(
+        self,
+        task_id: str,
+        request_id: int,
+        method: str,
+        params: dict[str, Any],
+    ) -> bool:
+        if method == SUBSCRIPTION_ACK_METHOD:
+            ack = self._task_subscription_acks.get(task_id)
+            if ack is None:
+                return True
+            raw_honored = params.get("notifications")
+            if not isinstance(raw_honored, dict):
+                self._task_subscription_errors[task_id] = MCPProtocolError(
+                    "MCP task subscription acknowledgment omitted its notification filter"
+                )
+                ack.set()
+                return True
+            for field, value in raw_honored.items():
+                if field == "taskIds":
+                    if value != [task_id]:
+                        self._task_subscription_errors[task_id] = MCPProtocolError(
+                            "MCP task subscription acknowledgment did not match the taskId"
+                        )
+                        ack.set()
+                        return True
+                    continue
+                if field in {
+                    "toolsListChanged",
+                    "promptsListChanged",
+                    "resourcesListChanged",
+                } and value is False:
+                    continue
+                if field == "resourceSubscriptions" and value == []:
+                    continue
+                self._task_subscription_errors[task_id] = MCPProtocolError(
+                    f"MCP task subscription acknowledged unrequested filter {field!r}"
+                )
+                ack.set()
+                return True
+            if raw_honored.get("taskIds") != [task_id]:
+                self._task_subscription_errors[task_id] = MCPProtocolError(
+                    "MCP server did not honor task status notifications"
+                )
+                ack.set()
+                return True
+            self._task_subscription_honored.add(task_id)
+            ack.set()
+            return True
+        if method != MODERN_TASK_NOTIFICATION:
+            return True
+        if task_id not in self._task_subscription_honored:
+            return True
+        try:
+            task = self._validate_modern_task_state(
+                params,
+                method=MODERN_TASK_NOTIFICATION,
+            )
+        except MCPProtocolError:
+            return True
+        if task["taskId"] != task_id:
+            return True
+        self._modern_task_updates[task_id] = task
+        waiter = self._modern_task_waiters.get(task_id)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(task)
+        return True
+
+    async def _stop_modern_task_subscription(self, task_id: str) -> None:
+        task = self._task_subscription_tasks.get(task_id)
+        request_id = self._task_subscription_request_ids.get(task_id)
+        self._task_subscription_stopping.add(task_id)
+        if (
+            task is not None
+            and not task.done()
+            and request_id is not None
+            and self.config.transport == "stdio"
+            and self._process is not None
+        ):
+            try:
+                await self.notify(
+                    "notifications/cancelled",
+                    {
+                        "requestId": request_id,
+                        "reason": "Ash stopped watching the MCP task",
+                    },
+                    _allow_session_recovery=False,
+                )
+            except (MCPProtocolError, OSError):
+                pass
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._clear_modern_task_subscription_state(task_id)
+
+    async def _stop_all_modern_task_subscriptions(self) -> None:
+        for task_id in tuple(self._task_subscription_tasks):
+            await self._stop_modern_task_subscription(task_id)
+
+    def _clear_modern_task_subscription_state(self, task_id: str) -> None:
+        request_id = self._task_subscription_request_ids.pop(task_id, None)
+        if request_id is not None:
+            self._task_subscription_ids_by_request.pop(request_id, None)
+        self._task_subscription_tasks.pop(task_id, None)
+        self._task_subscription_acks.pop(task_id, None)
+        self._task_subscription_errors.pop(task_id, None)
+        self._task_subscription_honored.discard(task_id)
+        self._task_subscription_stopping.discard(task_id)
+        waiter = self._modern_task_waiters.pop(task_id, None)
+        if waiter is not None and not waiter.done():
+            waiter.cancel()
+        self._modern_task_updates.pop(task_id, None)
 
     async def _stop_modern_resource_subscription(self, uri: str) -> None:
         task = self._resource_subscription_tasks.get(uri)
@@ -1345,6 +1524,10 @@ class MCPClient:
             if not waiter.done():
                 waiter.set_exception(error)
         self._task_waiters.clear()
+        for waiter in self._modern_task_waiters.values():
+            if not waiter.done():
+                waiter.set_exception(error)
+        self._modern_task_waiters.clear()
 
     def _dispatch_incoming(
         self, message: dict[str, Any], *, associated: bool | None = None
@@ -2550,6 +2733,7 @@ class MCPClient:
         answered_inputs: dict[str, str] = {}
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        self._start_modern_task_subscription(task_id)
         try:
             while task["status"] in {"working", "input_required"}:
                 if task["status"] == "input_required":
@@ -2604,8 +2788,34 @@ class MCPClient:
                 if remaining <= 0:
                     raise asyncio.TimeoutError
                 delay = min(self._modern_task_poll_delay(task), remaining)
-                if delay > 0:
-                    await asyncio.sleep(delay)
+                notified = self._modern_task_updates.pop(task_id, None)
+                if notified is None and delay > 0:
+                    waiter = loop.create_future()
+                    self._modern_task_waiters[task_id] = waiter
+                    notified = self._modern_task_updates.pop(task_id, None)
+                    if notified is not None and not waiter.done():
+                        waiter.set_result(notified)
+                    try:
+                        notified = await asyncio.wait_for(
+                            asyncio.shield(waiter), delay
+                        )
+                    except asyncio.TimeoutError:
+                        notified = None
+                    finally:
+                        if self._modern_task_waiters.get(task_id) is waiter:
+                            self._modern_task_waiters.pop(task_id, None)
+                        if not waiter.done():
+                            waiter.cancel()
+                if notified is not None:
+                    task = self._validate_modern_task_state(
+                        notified,
+                        method=MODERN_TASK_NOTIFICATION,
+                    )
+                    if task["taskId"] != task_id:
+                        raise MCPProtocolError(
+                            "MCP task notification returned another taskId"
+                        )
+                    continue
                 if loop.time() >= deadline:
                     raise asyncio.TimeoutError
                 task = self._validate_modern_task_state(
@@ -2662,6 +2872,8 @@ class MCPClient:
             if cancel_interrupted:
                 cancellation.add_note("MCP task cancellation was interrupted")
             raise
+        finally:
+            await self._stop_modern_task_subscription(task_id)
 
     async def _cancel_mcp_task(self, task_id: str) -> None:
         try:
@@ -3006,6 +3218,7 @@ class MCPClient:
             raise
 
     async def _disconnect_impl(self) -> None:
+        await self._stop_all_modern_task_subscriptions()
         await self._stop_all_modern_resource_subscriptions()
         await self._stop_modern_subscription()
         self._initialized = False
@@ -3072,6 +3285,7 @@ class MCPClient:
                 self._stderr_task,
                 *self._server_tasks,
                 *self._resource_subscription_tasks.values(),
+                *self._task_subscription_tasks.values(),
             )
             if task is not None and task is not current
         ]
@@ -3100,6 +3314,15 @@ class MCPClient:
         self._resource_subscription_honored.clear()
         self._resource_subscription_stopping.clear()
         self._watched_resources.clear()
+        self._task_subscription_tasks.clear()
+        self._task_subscription_request_ids.clear()
+        self._task_subscription_ids_by_request.clear()
+        self._task_subscription_acks.clear()
+        self._task_subscription_errors.clear()
+        self._task_subscription_honored.clear()
+        self._task_subscription_stopping.clear()
+        self._modern_task_waiters.clear()
+        self._modern_task_updates.clear()
         self.protocol_version = ""
         self.server_capabilities = {}
         self.server_info = {}
