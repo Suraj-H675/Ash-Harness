@@ -61,6 +61,7 @@ class OAuthDiscovery:
     authorization_endpoint: str
     token_endpoint: str
     registration_endpoint: str = ""
+    client_id_metadata_document_supported: bool = False
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,12 @@ class MCPOAuthTokenStore:
                 isinstance(item, str) for item in scopes_raw
             ):
                 raise ValueError("discovery scopes must be a list of strings")
+            cimd_supported_raw = discovery_raw.get(
+                "client_id_metadata_document_supported",
+                False,
+            )
+            if not isinstance(cimd_supported_raw, bool):
+                raise ValueError("client metadata support flag must be boolean")
             discovery = OAuthDiscovery(
                 resource=_required_text(discovery_raw, "resource"),
                 scopes=tuple(scopes_raw),
@@ -161,6 +168,7 @@ class MCPOAuthTokenStore:
                 registration_endpoint=_optional_text(
                     discovery_raw, "registration_endpoint"
                 ),
+                client_id_metadata_document_supported=cimd_supported_raw,
             )
             client = OAuthClient(
                 client_id=_required_text(client_raw, "client_id"),
@@ -196,6 +204,9 @@ class MCPOAuthTokenStore:
                 "authorization_endpoint": bundle.discovery.authorization_endpoint,
                 "token_endpoint": bundle.discovery.token_endpoint,
                 "registration_endpoint": bundle.discovery.registration_endpoint,
+                "client_id_metadata_document_supported": (
+                    bundle.discovery.client_id_metadata_document_supported
+                ),
             },
             "client": {
                 "client_id": bundle.client.client_id,
@@ -399,7 +410,13 @@ async def authorize_mcp_server(
             challenged_scope=str(config.get("scope", "")),
         )
         registered = _configured_client(config)
+        client_metadata_url = _configured_client_metadata_url(config)
+        if registered is not None and client_metadata_url:
+            raise MCPOAuthError(
+                "configured OAuth client_id and client metadata URL are mutually exclusive"
+            )
         configured_issuer = _configured_issuer(config)
+        existing_bundle: OAuthBundle | None = None
         if registered is not None and not configured_issuer:
             existing_bundle = token_store.load(resource)
             if existing_bundle is None:
@@ -413,12 +430,24 @@ async def authorize_mcp_server(
                 "configured OAuth issuer did not match discovered authorization server"
             )
         if registered is None:
-            registered = await register_oauth_client(
-                client,
-                discovery,
-                redirect_uri,
-                client_name=str(config.get("client_name", "Ash")),
-            )
+            existing_bundle = existing_bundle or token_store.load(resource)
+            if (
+                existing_bundle is not None
+                and existing_bundle.discovery.issuer == discovery.issuer
+            ):
+                registered = existing_bundle.client
+            elif (
+                discovery.client_id_metadata_document_supported
+                and client_metadata_url
+            ):
+                registered = OAuthClient(client_metadata_url)
+            else:
+                registered = await register_oauth_client(
+                    client,
+                    discovery,
+                    redirect_uri,
+                    client_name=str(config.get("client_name", "Ash")),
+                )
         verifier = _b64url(secrets.token_bytes(64))
         challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
         scope = explicit_scope or " ".join(discovery.scopes)
@@ -555,7 +584,7 @@ async def discover_oauth(
         break
     if protected is None:
         raise MCPOAuthError("MCP server did not provide protected resource metadata")
-    discovered_server: tuple[str, str, str, str] | None = None
+    discovered_server: tuple[str, str, str, str, bool] | None = None
     for url in authorization_metadata_urls(issuer_hint):
         try:
             metadata = await _request_json(
@@ -592,6 +621,14 @@ async def discover_oauth(
             registration_endpoint = (
                 _validate_oauth_url(registration_value) if registration_value else ""
             )
+            cimd_supported = metadata.get(
+                "client_id_metadata_document_supported",
+                False,
+            )
+            if not isinstance(cimd_supported, bool):
+                raise MCPOAuthError(
+                    "authorization server client metadata support flag is invalid"
+                )
         except (httpx.HTTPError, MCPOAuthError):
             continue
         discovered_server = (
@@ -599,13 +636,18 @@ async def discover_oauth(
             authorization_endpoint,
             token_endpoint,
             registration_endpoint,
+            cimd_supported,
         )
         break
     if discovered_server is None:
         raise MCPOAuthError("authorization server metadata discovery failed")
-    issuer, authorization_endpoint, token_endpoint, registration_endpoint = (
-        discovered_server
-    )
+    (
+        issuer,
+        authorization_endpoint,
+        token_endpoint,
+        registration_endpoint,
+        cimd_supported,
+    ) = discovered_server
     challenge_scope = bearer_challenge_parameters(challenge_header).get("scope", "")
     selected_scope = normalize_oauth_scope(
         challenge_scope or challenged_scope,
@@ -631,6 +673,7 @@ async def discover_oauth(
         authorization_endpoint,
         token_endpoint,
         registration_endpoint,
+        cimd_supported,
     )
 
 
@@ -855,6 +898,8 @@ def _validate_bundle(bundle: OAuthBundle) -> None:
         _validate_oauth_url(endpoint)
     if bundle.discovery.registration_endpoint:
         _validate_oauth_url(bundle.discovery.registration_endpoint)
+    if not isinstance(bundle.discovery.client_id_metadata_document_supported, bool):
+        raise MCPOAuthError("OAuth client metadata support flag is invalid")
     if not bundle.client.client_id or len(bundle.client.client_id) > 2048:
         raise MCPOAuthError("OAuth client_id is missing or too long")
     if len(bundle.client.client_secret) > 64 * 1024:
@@ -898,6 +943,20 @@ def _configured_issuer(config: dict[str, Any]) -> str:
     if issuer_value != issuer_value.strip():
         raise MCPOAuthError("OAuth issuer configuration is invalid")
     return _validate_oauth_url(issuer_value)
+
+
+def _configured_client_metadata_url(config: dict[str, Any]) -> str:
+    value = config.get("client_metadata_url", "")
+    if not isinstance(value, str):
+        raise MCPOAuthError("OAuth client metadata URL configuration is invalid")
+    if not value:
+        return ""
+    if value != value.strip():
+        raise MCPOAuthError("OAuth client metadata URL configuration is invalid")
+    validated = _validate_oauth_url(value)
+    if urlparse(validated).path in {"", "/"}:
+        raise MCPOAuthError("OAuth client metadata URL must use a non-root path")
+    return validated
 
 
 async def _handle_callback(

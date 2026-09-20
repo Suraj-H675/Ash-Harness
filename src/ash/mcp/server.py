@@ -568,6 +568,7 @@ def _validate_oauth_data(name: str, auth: str, oauth: dict[str, Any]) -> None:
     allowed_oauth_keys = {
         "client_id",
         "client_secret",
+        "client_metadata_url",
         "issuer",
         "scope",
         "redirect_port",
@@ -605,6 +606,34 @@ def _validate_oauth_data(name: str, auth: str, oauth: dict[str, Any]) -> None:
         raise ValueError(f"MCP server {name!r} oauth client_id is too long")
     if client_secret and not client_id:
         raise ValueError(f"MCP server {name!r} oauth client_secret requires client_id")
+    client_metadata_url = str(oauth.get("client_metadata_url", ""))
+    if client_metadata_url:
+        try:
+            parsed_metadata = urlparse(client_metadata_url)
+            metadata_port = parsed_metadata.port
+        except ValueError as exc:
+            raise ValueError(
+                f"MCP server {name!r} oauth client metadata URL is invalid"
+            ) from exc
+        if (
+            client_metadata_url != client_metadata_url.strip()
+            or len(client_metadata_url) > 4096
+            or parsed_metadata.scheme != "https"
+            or not parsed_metadata.hostname
+            or parsed_metadata.username
+            or parsed_metadata.password
+            or parsed_metadata.fragment
+            or parsed_metadata.path in {"", "/"}
+            or (metadata_port is not None and not 0 < metadata_port <= 65535)
+        ):
+            raise ValueError(
+                f"MCP server {name!r} oauth client metadata URL must be an HTTPS "
+                "URL with a non-root path and no credentials or fragment"
+            )
+    if client_id and client_metadata_url:
+        raise ValueError(
+            f"MCP server {name!r} oauth client_id and client_metadata_url are mutually exclusive"
+        )
     issuer = str(oauth.get("issuer", ""))
     if issuer:
         if issuer != issuer.strip() or len(issuer) > 4096:

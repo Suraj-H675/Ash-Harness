@@ -362,6 +362,17 @@ def test_mcp_oauth_constructor_rejects_invalid_options_before_save() -> None:
             auth="oauth",
             oauth={"issuer": "http://auth.example.test"},
         )
+    with pytest.raises(ValueError, match="client metadata URL"):
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+            auth="oauth",
+            oauth={"client_metadata_url": "https://client.example.test/"},
+        )
 
 
 def test_mcp_oauth_rejects_stdio_transport() -> None:

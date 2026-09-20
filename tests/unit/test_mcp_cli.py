@@ -282,6 +282,38 @@ def test_mcp_cli_requires_issuer_for_preregistered_oauth_client(
     assert not (tmp_path / ".mcp.json").exists()
 
 
+def test_mcp_cli_adds_cimd_client_metadata_url(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    metadata_url = "https://client.example.test/oauth/metadata.json"
+
+    status = main(
+        [
+            "mcp",
+            "add",
+            "protected",
+            "--transport",
+            "http",
+            "--url",
+            "https://mcp.example.test/rpc",
+            "--auth",
+            "oauth",
+            "--oauth-client-metadata-url",
+            metadata_url,
+            "--json",
+        ]
+    )
+
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["servers"][0]["oauth_client_configured"] is True
+    loaded = load_mcp_servers(tmp_path / ".mcp.json")["protected"]
+    assert loaded.oauth == {"client_metadata_url": metadata_url}
+
+
 def test_mcp_cli_login_is_explicit_and_logout_removes_credentials(
     tmp_path: Path,
     monkeypatch,

@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -458,6 +459,21 @@ def test_oauth_store_rejects_coerced_credential_types(tmp_path: Path) -> None:
         store.load(resource)
 
 
+def test_oauth_store_loads_pre_cimd_version_one_record(tmp_path: Path) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    bundle = _bundle(resource)
+    store.save(bundle)
+    record = json.loads(store.path.read_text(encoding="utf-8"))
+    record["discovery"].pop("client_id_metadata_document_supported")
+    store.path.write_text(json.dumps(record), encoding="utf-8")
+
+    loaded = store.load(resource)
+    assert loaded == bundle
+    assert loaded is not None
+    assert loaded.discovery.client_id_metadata_document_supported is False
+
+
 def test_oauth_store_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     resource = "https://mcp.example.test/rpc"
     store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
@@ -673,6 +689,244 @@ async def test_configured_oauth_client_refuses_discovered_issuer_mismatch(
 
 
 @pytest.mark.asyncio
+async def test_oauth_login_prefers_cimd_over_dynamic_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    metadata_url = "https://mcp.example.test/oauth-resource"
+    client_metadata_url = "https://client.example.test/oauth/metadata.json"
+    callback_handler: dict[str, Any] = {}
+    registration_requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal registration_requests
+        if request.url == httpx.URL(resource):
+            return httpx.Response(
+                401,
+                headers={
+                    "WWW-Authenticate": f'Bearer resource_metadata="{metadata_url}"'
+                },
+            )
+        if request.url == httpx.URL(metadata_url):
+            return httpx.Response(
+                200,
+                json={
+                    "resource": resource,
+                    "authorization_servers": ["https://auth.example.test"],
+                },
+            )
+        if request.url == httpx.URL(
+            "https://auth.example.test/.well-known/oauth-authorization-server"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://auth.example.test",
+                    "authorization_endpoint": "https://auth.example.test/authorize",
+                    "token_endpoint": "https://auth.example.test/token",
+                    "registration_endpoint": "https://auth.example.test/register",
+                    "code_challenge_methods_supported": ["S256"],
+                    "client_id_metadata_document_supported": True,
+                },
+            )
+        if request.url == httpx.URL("https://auth.example.test/register"):
+            registration_requests += 1
+            return httpx.Response(500)
+        if request.url == httpx.URL("https://auth.example.test/token"):
+            form = parse_qs(request.content.decode("ascii"))
+            assert form["client_id"] == [client_metadata_url]
+            assert "client_secret" not in form
+            return httpx.Response(
+                200,
+                json={"access_token": "cimd-token", "token_type": "Bearer"},
+            )
+        raise AssertionError(f"unexpected OAuth request: {request.method} {request.url}")
+
+    class FakeSocket:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43123)
+
+    class FakeServer:
+        sockets = [FakeSocket()]
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def start_server(handler: Any, host: str, port: int) -> FakeServer:
+        assert host == "127.0.0.1"
+        assert port == 0
+        callback_handler["handler"] = handler
+        return FakeServer()
+
+    monkeypatch.setattr(asyncio, "start_server", start_server)
+
+    def opener(url: str) -> bool:
+        query = parse_qs(urlparse(url).query)
+        assert query["client_id"] == [client_metadata_url]
+
+        async def callback() -> None:
+            reader = asyncio.StreamReader()
+            target = "/callback?" + urlencode(
+                {
+                    "code": "authorization-code",
+                    "state": query["state"][0],
+                    "iss": "https://auth.example.test",
+                }
+            )
+            reader.feed_data(f"GET {target} HTTP/1.1\r\n\r\n".encode())
+            reader.feed_eof()
+            writer = type(
+                "Writer",
+                (),
+                {
+                    "write": lambda self, data: None,
+                    "drain": lambda self: asyncio.sleep(0),
+                    "close": lambda self: None,
+                    "wait_closed": lambda self: asyncio.sleep(0),
+                },
+            )()
+            await callback_handler["handler"](reader, writer)
+
+        asyncio.create_task(callback())
+        return True
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        bundle = await authorize_mcp_server(
+            "remote",
+            resource,
+            oauth_config={"client_metadata_url": client_metadata_url},
+            store=MCPOAuthTokenStore("remote", tmp_path / "tokens"),
+            http_client=http,
+            open_browser=opener,
+            announce=lambda message: None,
+            timeout_seconds=5,
+        )
+    finally:
+        await http.aclose()
+
+    assert bundle.client == OAuthClient(client_metadata_url)
+    assert registration_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_oauth_login_reuses_stored_client_before_cimd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource))
+    callback_handler: dict[str, Any] = {}
+
+    async def discover(
+        client: httpx.AsyncClient,
+        server_url: str,
+        *,
+        challenged_scope: str = "",
+    ) -> OAuthDiscovery:
+        del client, challenged_scope
+        assert server_url == resource
+        return OAuthDiscovery(
+            resource,
+            (),
+            "https://auth.example.test",
+            "https://auth.example.test/authorize",
+            "https://auth.example.test/token",
+            "https://auth.example.test/register",
+            True,
+        )
+
+    class FakeSocket:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43123)
+
+    class FakeServer:
+        sockets = [FakeSocket()]
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def start_server(handler: Any, host: str, port: int) -> FakeServer:
+        assert host == "127.0.0.1"
+        assert port == 0
+        callback_handler["handler"] = handler
+        return FakeServer()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == httpx.URL("https://auth.example.test/token")
+        form = parse_qs(request.content.decode("ascii"))
+        assert form["client_id"] == ["client-id"]
+        assert form["client_secret"] == ["client-secret"]
+        return httpx.Response(
+            200,
+            json={"access_token": "new-access", "token_type": "Bearer"},
+        )
+
+    monkeypatch.setattr(asyncio, "start_server", start_server)
+    monkeypatch.setattr("ash.mcp.oauth.discover_oauth", discover)
+    registration = AsyncMock(side_effect=AssertionError("DCR must not run"))
+    monkeypatch.setattr("ash.mcp.oauth.register_oauth_client", registration)
+
+    def opener(url: str) -> bool:
+        query = parse_qs(urlparse(url).query)
+        assert query["client_id"] == ["client-id"]
+
+        async def callback() -> None:
+            reader = asyncio.StreamReader()
+            target = "/callback?" + urlencode(
+                {
+                    "code": "authorization-code",
+                    "state": query["state"][0],
+                    "iss": "https://auth.example.test",
+                }
+            )
+            reader.feed_data(f"GET {target} HTTP/1.1\r\n\r\n".encode())
+            reader.feed_eof()
+            writer = type(
+                "Writer",
+                (),
+                {
+                    "write": lambda self, data: None,
+                    "drain": lambda self: asyncio.sleep(0),
+                    "close": lambda self: None,
+                    "wait_closed": lambda self: asyncio.sleep(0),
+                },
+            )()
+            await callback_handler["handler"](reader, writer)
+
+        asyncio.create_task(callback())
+        return True
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        bundle = await authorize_mcp_server(
+            "remote",
+            resource,
+            oauth_config={
+                "client_metadata_url": "https://client.example.test/oauth/metadata.json"
+            },
+            store=store,
+            http_client=http,
+            open_browser=opener,
+            announce=lambda message: None,
+            timeout_seconds=5,
+        )
+    finally:
+        await http.aclose()
+
+    assert bundle.client == OAuthClient("client-id", "client-secret")
+    registration.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -805,7 +1059,10 @@ async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
     bundle = await authorize_mcp_server(
         "remote",
         resource,
-        oauth_config={"scope": "configured:scope"},
+        oauth_config={
+            "scope": "configured:scope",
+            "client_metadata_url": "https://client.example.test/oauth/metadata.json",
+        },
         store=store,
         http_client=http,
         open_browser=opener,

@@ -38,7 +38,10 @@ def mcp_servers_payload(servers: dict[str, MCPServerConfig]) -> dict:
                 "env_keys": sorted(config.env),
                 "header_keys": sorted(config.headers or {}),
                 "auth": config.auth,
-                "oauth_client_configured": bool((config.oauth or {}).get("client_id")),
+                "oauth_client_configured": bool(
+                    (config.oauth or {}).get("client_id")
+                    or (config.oauth or {}).get("client_metadata_url")
+                ),
             }
             for name, config in sorted(servers.items())
         ]
