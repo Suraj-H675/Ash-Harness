@@ -62,12 +62,14 @@ class OAuthDiscovery:
     token_endpoint: str
     registration_endpoint: str = ""
     client_id_metadata_document_supported: bool = False
+    authorization_server_scopes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class OAuthClient:
     client_id: str
     client_secret: str = ""
+    grant_types: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -157,6 +159,14 @@ class MCPOAuthTokenStore:
             )
             if not isinstance(cimd_supported_raw, bool):
                 raise ValueError("client metadata support flag must be boolean")
+            authorization_scopes_raw = discovery_raw.get(
+                "authorization_server_scopes",
+                [],
+            )
+            if not isinstance(authorization_scopes_raw, list) or not all(
+                isinstance(item, str) for item in authorization_scopes_raw
+            ):
+                raise ValueError("authorization server scopes must be strings")
             discovery = OAuthDiscovery(
                 resource=_required_text(discovery_raw, "resource"),
                 scopes=tuple(scopes_raw),
@@ -169,10 +179,17 @@ class MCPOAuthTokenStore:
                     discovery_raw, "registration_endpoint"
                 ),
                 client_id_metadata_document_supported=cimd_supported_raw,
+                authorization_server_scopes=tuple(authorization_scopes_raw),
             )
+            grant_types_raw = client_raw.get("grant_types", [])
+            if not isinstance(grant_types_raw, list) or not all(
+                isinstance(item, str) for item in grant_types_raw
+            ):
+                raise ValueError("OAuth client grant_types must be strings")
             client = OAuthClient(
                 client_id=_required_text(client_raw, "client_id"),
                 client_secret=_optional_text(client_raw, "client_secret"),
+                grant_types=tuple(grant_types_raw),
             )
             tokens = OAuthTokens(
                 access_token=_required_text(tokens_raw, "access_token"),
@@ -207,10 +224,14 @@ class MCPOAuthTokenStore:
                 "client_id_metadata_document_supported": (
                     bundle.discovery.client_id_metadata_document_supported
                 ),
+                "authorization_server_scopes": list(
+                    bundle.discovery.authorization_server_scopes
+                ),
             },
             "client": {
                 "client_id": bundle.client.client_id,
                 "client_secret": bundle.client.client_secret,
+                "grant_types": list(bundle.client.grant_types),
             },
             "tokens": {
                 "access_token": bundle.tokens.access_token,
@@ -450,7 +471,18 @@ async def authorize_mcp_server(
                 )
         verifier = _b64url(secrets.token_bytes(64))
         challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
-        scope = explicit_scope or " ".join(discovery.scopes)
+        scope_parts = (explicit_scope or " ".join(discovery.scopes)).split()
+        offline_access_supported = (
+            "offline_access" in discovery.authorization_server_scopes
+        )
+        if not offline_access_supported:
+            scope_parts = [scope for scope in scope_parts if scope != "offline_access"]
+        elif (
+            "refresh_token" in registered.grant_types
+            and "offline_access" not in scope_parts
+        ):
+            scope_parts.append("offline_access")
+        scope = " ".join(scope_parts)
         query: dict[str, str] = {
             "response_type": "code",
             "client_id": registered.client_id,
@@ -462,6 +494,8 @@ async def authorize_mcp_server(
         }
         if scope:
             query["scope"] = scope
+        if "offline_access" in scope_parts:
+            query["prompt"] = "consent"
         authorization_url = (
             discovery.authorization_endpoint
             + ("&" if "?" in discovery.authorization_endpoint else "?")
@@ -584,7 +618,7 @@ async def discover_oauth(
         break
     if protected is None:
         raise MCPOAuthError("MCP server did not provide protected resource metadata")
-    discovered_server: tuple[str, str, str, str, bool] | None = None
+    discovered_server: tuple[str, str, str, str, bool, tuple[str, ...]] | None = None
     for url in authorization_metadata_urls(issuer_hint):
         try:
             metadata = await _request_json(
@@ -629,6 +663,14 @@ async def discover_oauth(
                 raise MCPOAuthError(
                     "authorization server client metadata support flag is invalid"
                 )
+            authorization_scopes_raw = metadata.get("scopes_supported", [])
+            if not isinstance(authorization_scopes_raw, list) or not all(
+                isinstance(item, str) for item in authorization_scopes_raw
+            ):
+                raise MCPOAuthError(
+                    "authorization server scopes_supported is invalid"
+                )
+            authorization_scopes = tuple(authorization_scopes_raw)
         except (httpx.HTTPError, MCPOAuthError):
             continue
         discovered_server = (
@@ -637,6 +679,7 @@ async def discover_oauth(
             token_endpoint,
             registration_endpoint,
             cimd_supported,
+            authorization_scopes,
         )
         break
     if discovered_server is None:
@@ -647,6 +690,7 @@ async def discover_oauth(
         token_endpoint,
         registration_endpoint,
         cimd_supported,
+        authorization_scopes,
     ) = discovered_server
     challenge_scope = bearer_challenge_parameters(challenge_header).get("scope", "")
     selected_scope = normalize_oauth_scope(
@@ -674,6 +718,7 @@ async def discover_oauth(
         token_endpoint,
         registration_endpoint,
         cimd_supported,
+        authorization_scopes,
     )
 
 
@@ -712,7 +757,11 @@ async def register_oauth_client(
         raise MCPOAuthError("dynamic client registration omitted a valid client_id")
     if len(client_secret) > 64 * 1024:
         raise MCPOAuthError("dynamic client registration client_secret is too long")
-    return OAuthClient(client_id, client_secret)
+    return OAuthClient(
+        client_id,
+        client_secret,
+        ("authorization_code", "refresh_token"),
+    )
 
 
 def protected_resource_metadata_urls(
@@ -900,10 +949,16 @@ def _validate_bundle(bundle: OAuthBundle) -> None:
         _validate_oauth_url(bundle.discovery.registration_endpoint)
     if not isinstance(bundle.discovery.client_id_metadata_document_supported, bool):
         raise MCPOAuthError("OAuth client metadata support flag is invalid")
+    if not all(
+        isinstance(scope, str) for scope in bundle.discovery.authorization_server_scopes
+    ):
+        raise MCPOAuthError("OAuth authorization server scopes are invalid")
     if not bundle.client.client_id or len(bundle.client.client_id) > 2048:
         raise MCPOAuthError("OAuth client_id is missing or too long")
     if len(bundle.client.client_secret) > 64 * 1024:
         raise MCPOAuthError("OAuth client_secret is too long")
+    if not all(isinstance(grant, str) for grant in bundle.client.grant_types):
+        raise MCPOAuthError("OAuth client grant_types are invalid")
     if not bundle.tokens.access_token or len(bundle.tokens.access_token) > 64 * 1024:
         raise MCPOAuthError("OAuth access token is missing or too long")
     if len(bundle.tokens.refresh_token) > 64 * 1024:

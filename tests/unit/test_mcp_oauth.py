@@ -466,12 +466,16 @@ def test_oauth_store_loads_pre_cimd_version_one_record(tmp_path: Path) -> None:
     store.save(bundle)
     record = json.loads(store.path.read_text(encoding="utf-8"))
     record["discovery"].pop("client_id_metadata_document_supported")
+    record["discovery"].pop("authorization_server_scopes")
+    record["client"].pop("grant_types")
     store.path.write_text(json.dumps(record), encoding="utf-8")
 
     loaded = store.load(resource)
     assert loaded == bundle
     assert loaded is not None
     assert loaded.discovery.client_id_metadata_document_supported is False
+    assert loaded.discovery.authorization_server_scopes == ()
+    assert loaded.client.grant_types == ()
 
 
 def test_oauth_store_rejects_duplicate_json_keys(tmp_path: Path) -> None:
@@ -967,6 +971,7 @@ async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
                     "token_endpoint": "https://auth.example.test/token",
                     "registration_endpoint": "https://auth.example.test/register",
                     "code_challenge_methods_supported": ["S256"],
+                    "scopes_supported": ["challenge:read", "offline_access"],
                 },
             )
         if request.url == httpx.URL("https://auth.example.test/register"):
@@ -1073,12 +1078,17 @@ async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
 
     assert bundle.client.client_id == "dynamic-client"
     assert bundle.discovery.scopes == ("challenge:read",)
-    assert observed["authorization"]["scope"] == ["challenge:read"]
+    assert observed["authorization"]["scope"] == ["challenge:read offline_access"]
+    assert observed["authorization"]["prompt"] == ["consent"]
     assert observed["authorization"]["resource"] == [resource]
     assert observed["registration"]["application_type"] == "native"
     assert observed["registration"]["redirect_uris"][0].startswith("http://127.0.0.1:")
     assert observed["token_form"]["resource"] == [resource]
-    assert store.load(resource).tokens.access_token == "access-token"  # type: ignore[union-attr]
+    persisted = store.load(resource)
+    assert persisted is not None
+    assert persisted.tokens.access_token == "access-token"
+    assert persisted.client.grant_types == ("authorization_code", "refresh_token")
+    assert "offline_access" in persisted.discovery.authorization_server_scopes
 
 
 @pytest.mark.asyncio
@@ -1309,7 +1319,7 @@ async def test_explicit_step_up_scope_overrides_initial_challenge(
         open_browser=opener,
         announce=lambda message: None,
         timeout_seconds=5,
-        requested_scope="files:read files:write",
+        requested_scope="files:read offline_access files:write",
     )
 
     assert observed["scope"] == ["files:read files:write"]
