@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -189,6 +190,36 @@ class MCPServerConfig:
             auth=data.get("auth", "none"),
             oauth=data.get("oauth", {}),
         )
+
+
+def mcp_server_fingerprint(
+    config: MCPServerConfig,
+    server_info: dict[str, Any] | None = None,
+) -> str:
+    """Return a non-secret digest binding a durable task to one MCP server."""
+
+    payload = {
+        "name": config.name,
+        "transport": config.transport,
+        "command": config.resolved_command,
+        "args": config.resolved_args,
+        "env": config.resolved_env,
+        "url": config.resolved_url,
+        "headers": config.resolved_headers,
+        "cwd": config.resolved_cwd,
+        "cwd_identity": list(config.cwd_identity) if config.cwd_identity else None,
+        "auth": config.auth,
+        "oauth": config.resolved_oauth,
+        "server_info": server_info or {},
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)

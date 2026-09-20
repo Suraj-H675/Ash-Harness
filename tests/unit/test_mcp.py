@@ -5,6 +5,7 @@ import io
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -12,7 +13,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 import httpx
 from ash.core.loop import AshLoop
-from ash.core.session import SessionStore
+from ash.core.session import SessionStore, ToolCallRecord
 from ash.core.secret_middleware import SecretRedactionMiddleware
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.guard import SafetyGuard
@@ -41,6 +42,7 @@ from ash.mcp.server import (
     MAX_MCP_CONFIG_BYTES,
     load_mcp_servers,
     load_mcp_server_sources,
+    mcp_server_fingerprint,
     save_mcp_servers,
     expand_env_vars,
 )
@@ -955,6 +957,8 @@ class StubMCPClient:
     def __init__(self, result: dict) -> None:
         self.result = result
         self.calls: list[tuple[str, dict]] = []
+        self.config = MCPServerConfig(name="stub", command="fake", args=[], env={})
+        self.server_info: dict[str, Any] = {}
 
     async def call_tool(
         self,
@@ -2769,6 +2773,7 @@ async def test_loop_persists_mcp_task_only_for_active_tool_call(
         "server_name": "server",
         "remote_tool_name": "slow",
         "contract_fingerprint": "contract",
+        "server_fingerprint": "server-fingerprint",
         "protocol_version": "2026-07-28",
         "task": {
             "taskId": "task-1",
@@ -2793,6 +2798,550 @@ async def test_loop_persists_mcp_task_only_for_active_tool_call(
         assert len(store.list_mcp_tasks(session.session_id)) == 1
     finally:
         loop.turn_context = None
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_loop_resumes_persisted_mcp_task_without_replaying_tool_call(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-crash"
+    call_id = "call-crash"
+    store.start_turn(session.session_id, turn_id, "run long MCP task")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id=call_id,
+            tool_name="mcp__server__long",
+            arguments={},
+            approved=True,
+            executed=False,
+            dispatched=True,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+    task_id = "durable-task"
+    methods: list[str] = []
+    definition = {
+        "name": "long",
+        "description": "Long-running durable task",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    }
+
+    first_client = MCPClient(
+        MCPServerConfig(name="server", command="fake", args=[], env={})
+    )
+    first_client.protocol_version = "2026-07-28"
+    first_client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+
+    async def first_request(method: str, params: dict, **kwargs: Any) -> dict:
+        del kwargs
+        methods.append(method)
+        assert method == "tools/call"
+        assert params == {"name": "long", "arguments": {}}
+        return {
+            "resultType": "task",
+            "taskId": task_id,
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60_000,
+            "pollIntervalMs": 0,
+        }
+
+    first_client.request = first_request  # type: ignore[method-assign]
+
+    async def persist_then_crash(payload: dict[str, Any]) -> None:
+        task = payload["task"]
+        store.save_mcp_task(
+            task_id=task["taskId"],
+            session_id=session.session_id,
+            turn_id=turn_id,
+            call_id=payload["call_id"],
+            server_name=payload["server_name"],
+            remote_tool_name=payload["remote_tool_name"],
+            contract_fingerprint=payload["contract_fingerprint"],
+            server_fingerprint=payload["server_fingerprint"],
+            protocol_version=payload["protocol_version"],
+            task=task,
+            answered_inputs=payload["answered_inputs"],
+        )
+        raise SystemExit("simulated process crash")
+
+    first_tool = MCPTool(
+        SafetyGuard(tmp_path),
+        client=first_client,
+        server_name="server",
+        definition=definition,
+        protocol_version="2026-07-28",
+        task_state_handler=persist_then_crash,
+    )
+    with first_tool.event_context({"call_id": call_id}):
+        with pytest.raises(SystemExit, match="simulated process crash"):
+            await first_tool.run()
+
+    rows = store.list_mcp_tasks(session.session_id)
+    assert len(rows) == 1
+    assert rows[0]["task_id"] == task_id
+    assert methods == ["tools/call"]
+
+    recovery_client = MCPClient(
+        MCPServerConfig(name="server", command="fake", args=[], env={})
+    )
+    recovery_client.protocol_version = "2026-07-28"
+    recovery_client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+
+    async def recovery_request(method: str, params: dict, **kwargs: Any) -> dict:
+        del kwargs
+        methods.append(method)
+        assert method == "tasks/get"
+        assert params == {"taskId": task_id}
+        return {
+            "resultType": "complete",
+            "taskId": task_id,
+            "status": "completed",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:02Z",
+            "ttlMs": 60_000,
+            "result": {
+                "content": [{"type": "text", "text": "recovered result"}],
+                "isError": False,
+            },
+        }
+
+    recovery_client.request = recovery_request  # type: ignore[method-assign]
+    guard = SafetyGuard(tmp_path)
+    recovery_tool = MCPTool(
+        guard,
+        client=recovery_client,
+        server_name="server",
+        definition=definition,
+        protocol_version="2026-07-28",
+    )
+    runtime = MCPRuntime({}, guard)
+    runtime.clients["server"] = recovery_client
+    loop = AshLoop(
+        session_store=store,
+        provider=IdleProvider(),
+        safety_guard=guard,
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+    )
+    loop._mcp_runtime = runtime
+    loop.tools[recovery_tool.name] = recovery_tool
+    try:
+        recovered = await loop.start_session(session.session_id)
+
+        assert methods == ["tools/call", "tasks/get"]
+        assert store.list_mcp_tasks(session.session_id) == []
+        recovered_call = next(
+            call for call in recovered.tool_calls if call.call_id == call_id
+        )
+        assert recovered_call.executed is True
+        assert recovered_call.error is None
+        assert "recovered result" in (recovered_call.result or "")
+        tool_messages = [
+            message
+            for message in recovered.messages
+            if message.role == "tool" and message.metadata.get("call_id") == call_id
+        ]
+        assert len(tool_messages) == 1
+        assert "recovered result" in tool_messages[0].content
+
+        recovered_again = await loop.start_session(session.session_id)
+        repeated = [
+            message
+            for message in recovered_again.messages
+            if message.role == "tool" and message.metadata.get("call_id") == call_id
+        ]
+        assert len(repeated) == 1
+        assert methods == ["tools/call", "tasks/get"]
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_loop_preserves_deferred_mcp_task_until_server_returns(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-deferred"
+    call_id = "call-deferred"
+    task_id = "task-deferred"
+    definition = {
+        "name": "long",
+        "description": "Long-running durable task",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    }
+    probe_tool = MCPTool(
+        SafetyGuard(tmp_path),
+        client=StubMCPClient({"content": []}),  # type: ignore[arg-type]
+        server_name="server",
+        definition=definition,
+        protocol_version="2026-07-28",
+    )
+    recovery_config = MCPServerConfig(name="server", command="fake", args=[], env={})
+    store.start_turn(session.session_id, turn_id, "resume durable task")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id=call_id,
+            tool_name="mcp__server__long",
+            arguments={},
+            approved=True,
+            executed=False,
+            dispatched=True,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+    store.save_mcp_task(
+        task_id=task_id,
+        session_id=session.session_id,
+        turn_id=turn_id,
+        call_id=call_id,
+        server_name="server",
+        remote_tool_name="long",
+        contract_fingerprint=probe_tool.contract_fingerprint(),
+        server_fingerprint=mcp_server_fingerprint(recovery_config, {}),
+        protocol_version="2026-07-28",
+        task={
+            "taskId": task_id,
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60_000,
+            "pollIntervalMs": 0,
+        },
+        answered_inputs={},
+    )
+
+    guard = SafetyGuard(tmp_path)
+    loop = AshLoop(
+        session_store=store,
+        provider=IdleProvider(),
+        safety_guard=guard,
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+    )
+    with pytest.raises(RuntimeError, match="waiting for durable MCP task recovery"):
+        await loop.start_session(session.session_id)
+
+    assert loop.current_session is None
+    assert len(store.list_mcp_tasks(session.session_id)) == 1
+    pending = store.tool_call_for_recovery(session.session_id, turn_id, call_id)
+    assert pending is not None
+    assert bool(pending["executed"]) is False
+    assert pending["error"] is None
+
+    methods: list[str] = []
+    client = MCPClient(recovery_config)
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+
+    async def request(method: str, params: dict, **kwargs: Any) -> dict:
+        del kwargs
+        methods.append(method)
+        assert method == "tasks/get"
+        assert params == {"taskId": task_id}
+        return {
+            "resultType": "complete",
+            "taskId": task_id,
+            "status": "completed",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:02Z",
+            "ttlMs": 60_000,
+            "result": {
+                "content": [{"type": "text", "text": "eventually recovered"}],
+                "isError": False,
+            },
+        }
+
+    client.request = request  # type: ignore[method-assign]
+    runtime = MCPRuntime({}, guard)
+    runtime.clients["server"] = client
+    recovery_tool = MCPTool(
+        guard,
+        client=client,
+        server_name="server",
+        definition=definition,
+        protocol_version="2026-07-28",
+    )
+    loop._mcp_runtime = runtime
+    loop.tools[recovery_tool.name] = recovery_tool
+    try:
+        recovered = await loop.start_session(session.session_id)
+        assert methods == ["tasks/get"]
+        assert store.list_mcp_tasks(session.session_id) == []
+        assert any(
+            message.role == "tool"
+            and message.metadata.get("call_id") == call_id
+            and "eventually recovered" in message.content
+            for message in recovered.messages
+        )
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_loop_never_resumes_task_on_repointed_mcp_server_alias(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-repointed"
+    call_id = "call-repointed"
+    task_id = "task-repointed"
+    definition = {
+        "name": "long",
+        "description": "Long-running durable task",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    }
+    original_config = MCPServerConfig(
+        name="server",
+        command="original-server",
+        args=[],
+        env={"TENANT": "original"},
+    )
+    replacement_config = MCPServerConfig(
+        name="server",
+        command="replacement-server",
+        args=[],
+        env={"TENANT": "replacement"},
+    )
+    replacement_client = MCPClient(replacement_config)
+    replacement_client.protocol_version = "2026-07-28"
+    replacement_client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+    replacement_client.request = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("replacement server must not receive task ID")
+    )
+    guard = SafetyGuard(tmp_path)
+    replacement_tool = MCPTool(
+        guard,
+        client=replacement_client,
+        server_name="server",
+        definition=definition,
+        protocol_version="2026-07-28",
+    )
+    store.start_turn(session.session_id, turn_id, "resume durable task")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id=call_id,
+            tool_name=replacement_tool.name,
+            arguments={},
+            approved=True,
+            executed=False,
+            dispatched=True,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+    store.save_mcp_task(
+        task_id=task_id,
+        session_id=session.session_id,
+        turn_id=turn_id,
+        call_id=call_id,
+        server_name="server",
+        remote_tool_name="long",
+        contract_fingerprint=replacement_tool.contract_fingerprint(),
+        server_fingerprint=mcp_server_fingerprint(original_config, {}),
+        protocol_version="2026-07-28",
+        task={
+            "taskId": task_id,
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60_000,
+            "pollIntervalMs": 0,
+        },
+        answered_inputs={},
+    )
+    assert mcp_server_fingerprint(original_config, {}) != mcp_server_fingerprint(
+        replacement_config,
+        {},
+    )
+
+    runtime = MCPRuntime({}, guard)
+    runtime.clients["server"] = replacement_client
+    loop = AshLoop(
+        session_store=store,
+        provider=IdleProvider(),
+        safety_guard=guard,
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+    )
+    loop._mcp_runtime = runtime
+    loop.tools[replacement_tool.name] = replacement_tool
+    try:
+        with pytest.raises(RuntimeError, match="waiting for durable MCP task recovery"):
+            await loop.start_session(session.session_id)
+
+        replacement_client.request.assert_not_awaited()  # type: ignore[attr-defined]
+        assert len(store.list_mcp_tasks(session.session_id)) == 1
+        pending = store.tool_call_for_recovery(session.session_id, turn_id, call_id)
+        assert pending is not None
+        assert bool(pending["executed"]) is False
+        assert pending["error"] is None
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_loop_falls_back_to_unknown_for_legacy_v12_mcp_task(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-v12"
+    call_id = "call-v12"
+    task_id = "task-v12"
+    store.start_turn(session.session_id, turn_id, "legacy durable task")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id=call_id,
+            tool_name="mcp__server__long",
+            arguments={},
+            approved=True,
+            executed=False,
+            dispatched=True,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+    store.save_mcp_task(
+        task_id=task_id,
+        session_id=session.session_id,
+        turn_id=turn_id,
+        call_id=call_id,
+        server_name="server",
+        remote_tool_name="long",
+        contract_fingerprint="legacy-contract",
+        server_fingerprint="",
+        protocol_version="2026-07-28",
+        task={
+            "taskId": task_id,
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60_000,
+        },
+        answered_inputs={},
+    )
+
+    loop = AshLoop(
+        session_store=store,
+        provider=IdleProvider(),
+        safety_guard=SafetyGuard(tmp_path),
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+    )
+    try:
+        recovered = await loop.start_session(session.session_id)
+
+        assert store.list_mcp_tasks(session.session_id) == []
+        call = next(call for call in recovered.tool_calls if call.call_id == call_id)
+        assert call.executed is True
+        assert call.error is not None
+        assert "outcome is unknown" in call.error
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_loop_recovers_locally_finalized_mcp_call_without_server_or_duplicates(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-local-final"
+    call_id = "call-local-final"
+    task_id = "task-local-final"
+    store.start_turn(session.session_id, turn_id, "finish local persistence")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id=call_id,
+            tool_name="mcp__server__long",
+            arguments={},
+            approved=True,
+            executed=True,
+            dispatched=True,
+            result="already persisted result",
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+
+    task = {
+        "taskId": task_id,
+        "status": "completed",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:02Z",
+        "ttlMs": 60_000,
+        "result": {
+            "content": [{"type": "text", "text": "wire result"}],
+            "isError": False,
+        },
+    }
+
+    def persist_stale_task() -> None:
+        store.save_mcp_task(
+            task_id=task_id,
+            session_id=session.session_id,
+            turn_id=turn_id,
+            call_id=call_id,
+            server_name="server",
+            remote_tool_name="long",
+            contract_fingerprint="old-contract",
+            server_fingerprint="",
+            protocol_version="2026-07-28",
+            task=task,
+            answered_inputs={},
+        )
+
+    persist_stale_task()
+    loop = AshLoop(
+        session_store=store,
+        provider=IdleProvider(),
+        safety_guard=SafetyGuard(tmp_path),
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+    )
+    try:
+        recovered = await loop.start_session(session.session_id)
+        messages = [
+            message
+            for message in recovered.messages
+            if message.role == "tool" and message.metadata.get("call_id") == call_id
+        ]
+        assert len(messages) == 1
+        assert "already persisted result" in messages[0].content
+        assert store.list_mcp_tasks(session.session_id) == []
+
+        persist_stale_task()
+        recovered_again = await loop.start_session(session.session_id)
+        messages_again = [
+            message
+            for message in recovered_again.messages
+            if message.role == "tool" and message.metadata.get("call_id") == call_id
+        ]
+        assert len(messages_again) == 1
+        assert store.list_mcp_tasks(session.session_id) == []
+    finally:
         await loop.aclose()
 
 
@@ -6135,6 +6684,179 @@ async def test_modern_task_persistence_failure_requests_cancellation() -> None:
         "tasks/cancel",
         {"taskId": "durability-failed"},
     )
+
+
+@pytest.mark.asyncio
+async def test_resume_modern_task_uses_task_id_without_replaying_tool_call() -> None:
+    client = MCPClient(MCPServerConfig(name="modern", command="fake", args=[], env={}))
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+    methods: list[str] = []
+    task_id = "resume-me"
+
+    async def request(method: str, params: dict, **kwargs: Any) -> dict:
+        del kwargs
+        methods.append(method)
+        assert params == {"taskId": task_id}
+        if method != "tasks/get":
+            raise AssertionError(method)
+        return {
+            "resultType": "complete",
+            "taskId": task_id,
+            "status": "completed",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:02Z",
+            "ttlMs": 60_000,
+            "result": {
+                "content": [{"type": "text", "text": "recovered"}],
+                "isError": False,
+            },
+        }
+
+    client.request = request  # type: ignore[method-assign]
+    persisted = {
+        "taskId": task_id,
+        "status": "working",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:01Z",
+        "ttlMs": 60_000,
+        "pollIntervalMs": 0,
+    }
+
+    result = await client.resume_modern_task(persisted, {})
+
+    assert result["content"][0]["text"] == "recovered"
+    assert methods == ["tasks/get"]
+
+
+@pytest.mark.asyncio
+async def test_resume_modern_task_timeout_preserves_remote_task() -> None:
+    client = MCPClient(MCPServerConfig(name="modern", command="fake", args=[], env={}))
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+    task_id = "still-working"
+    methods: list[str] = []
+    client._start_modern_task_subscription = Mock()  # type: ignore[method-assign]
+    client._stop_modern_task_subscription = AsyncMock()  # type: ignore[method-assign]
+
+    async def request(method: str, params: dict, **kwargs: Any) -> dict:
+        del kwargs
+        methods.append(method)
+        assert params == {"taskId": task_id}
+        if method != "tasks/get":
+            raise AssertionError(method)
+        return {
+            "resultType": "complete",
+            "taskId": task_id,
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60_000,
+            "pollIntervalMs": 1000,
+        }
+
+    client.request = request  # type: ignore[method-assign]
+    persisted = {
+        "taskId": task_id,
+        "status": "working",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:01Z",
+        "ttlMs": 60_000,
+        "pollIntervalMs": 1000,
+    }
+
+    with pytest.raises(MCPTaskTimeout):
+        await client.resume_modern_task(persisted, {}, timeout=0.001)
+
+    assert "tasks/cancel" not in methods
+    assert "tools/call" not in methods
+
+
+@pytest.mark.asyncio
+async def test_resume_modern_task_does_not_repeat_answered_input_request() -> None:
+    client = MCPClient(MCPServerConfig(name="modern", command="fake", args=[], env={}))
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+    task_id = "resume-input"
+    methods: list[str] = []
+    gets = 0
+    input_request = {
+        "method": "elicitation/create",
+        "params": {
+            "mode": "form",
+            "message": "Approve?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {"approved": {"type": "boolean"}},
+                "required": ["approved"],
+            },
+        },
+    }
+    fingerprint = json.dumps(
+        input_request,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+    async def request(method: str, params: dict, **kwargs: Any) -> dict:
+        nonlocal gets
+        del kwargs
+        methods.append(method)
+        assert params == {"taskId": task_id}
+        assert method == "tasks/get"
+        gets += 1
+        if gets == 1:
+            return {
+                "resultType": "complete",
+                "taskId": task_id,
+                "status": "input_required",
+                "createdAt": "2026-09-20T00:00:00Z",
+                "lastUpdatedAt": "2026-09-20T00:00:02Z",
+                "ttlMs": 60_000,
+                "pollIntervalMs": 0,
+                "inputRequests": {"approve": input_request},
+            }
+        return {
+            "resultType": "complete",
+            "taskId": task_id,
+            "status": "completed",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:03Z",
+            "ttlMs": 60_000,
+            "result": {
+                "content": [{"type": "text", "text": "approved earlier"}],
+                "isError": False,
+            },
+        }
+
+    client.request = request  # type: ignore[method-assign]
+    client._start_modern_task_subscription = Mock()  # type: ignore[method-assign]
+    client._stop_modern_task_subscription = AsyncMock()  # type: ignore[method-assign]
+    persisted = {
+        "taskId": task_id,
+        "status": "working",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:01Z",
+        "ttlMs": 60_000,
+        "pollIntervalMs": 0,
+    }
+
+    result = await client.resume_modern_task(
+        persisted,
+        {"approve": fingerprint},
+    )
+
+    assert result["content"][0]["text"] == "approved earlier"
+    assert methods == ["tasks/get", "tasks/get"]
+    assert "tasks/update" not in methods
 
 
 @pytest.mark.asyncio

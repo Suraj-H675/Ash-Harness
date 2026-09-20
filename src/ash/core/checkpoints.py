@@ -150,9 +150,12 @@ def recover_interrupted_turns(
     store: SessionStore,
     guard: SafetyGuard,
     session_id: str,
+    *,
+    deferred_call_ids: set[str] | None = None,
 ) -> RecoverySummary:
     """Compensate provably interrupted direct edits and flag unknown effects."""
 
+    deferred_call_ids = deferred_call_ids or set()
     turns = store.started_turns(session_id)
     compensated_calls: list[str] = []
     compensated_files: list[Path] = []
@@ -173,6 +176,8 @@ def recover_interrupted_turns(
 
         for call in pending:
             call_id = str(call["call_id"])
+            if call_id in deferred_call_ids:
+                continue
             tool_name = str(call["tool_name"])
             dispatched = bool(call["dispatched"])
             if not dispatched:

@@ -22,7 +22,7 @@ from ash.mcp.diagnostics import (
     safe_mcp_diagnostic,
     safe_mcp_error_payload,
 )
-from ash.mcp.server import MCPServerConfig
+from ash.mcp.server import MCPServerConfig, mcp_server_fingerprint
 from ash.core.redaction import redact_text
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
@@ -678,6 +678,10 @@ class MCPTool(BaseTool):
                             "server_name": self.server_name,
                             "remote_tool_name": self.remote_name,
                             "contract_fingerprint": self._contract_fingerprint,
+                            "server_fingerprint": mcp_server_fingerprint(
+                                self.client.config,
+                                self.client.server_info,
+                            ),
                             "protocol_version": self.protocol_version,
                             "task": task,
                             "answered_inputs": answered_inputs,
@@ -733,6 +737,11 @@ class MCPTool(BaseTool):
                 token_count=count_output_tokens(output),
                 outcome=ToolExecutionOutcome.UNKNOWN,
             )
+        return await self.result_from_wire(result)
+
+    async def result_from_wire(self, result: Any) -> ToolResult:
+        """Validate and normalize one raw MCP tool result."""
+
         if not isinstance(result, dict):
             try:
                 raw_result = _json_dump(result)

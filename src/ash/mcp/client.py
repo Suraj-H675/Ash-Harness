@@ -158,6 +158,10 @@ class MCPTaskTimeout(MCPProtocolError):
     """A task-augmented operation exceeded the configured task wait limit."""
 
 
+class MCPTaskTerminalError(MCPProtocolError):
+    """A durable MCP task reached a non-success terminal state."""
+
+
 def _append_bounded_paginated_items(
     output: list[dict[str, Any]],
     values: list[dict[str, Any]],
@@ -2725,6 +2729,9 @@ class MCPClient:
         *,
         timeout: float,
         state_callback: ModernTaskStateCallback | None = None,
+        answered_inputs: dict[str, str] | None = None,
+        cancel_on_timeout: bool = True,
+        cancel_on_cancellation: bool = True,
     ) -> dict[str, Any]:
         """Drive one server-directed 2026-07-28 task to a terminal result."""
 
@@ -2737,7 +2744,7 @@ class MCPClient:
             raise ValueError("MCP task timeout must be positive")
         task = self._validate_modern_task_state(initial, method="tools/call")
         task_id = task["taskId"]
-        answered_inputs: dict[str, str] = {}
+        answered_inputs = dict(answered_inputs or {})
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         await self._persist_modern_task_state(
@@ -2745,7 +2752,9 @@ class MCPClient:
             task,
             answered_inputs,
         )
-        self._start_modern_task_subscription(task_id)
+        subscription_started = task["status"] in {"working", "input_required"}
+        if subscription_started:
+            self._start_modern_task_subscription(task_id)
         try:
             while task["status"] in {"working", "input_required"}:
                 if task["status"] == "input_required":
@@ -2874,33 +2883,81 @@ class MCPClient:
                 ):
                     raise MCPProtocolError("MCP failed task returned an invalid error")
                 data = error.get("data", _MISSING)
-                raise MCPProtocolError(
+                raise MCPTaskTerminalError(
                     f"MCP tool task failed ({code}): {message}",
                     code=code,
                     data=data,
                 )
             detail = f": {task['statusMessage']}" if task.get("statusMessage") else ""
-            raise MCPProtocolError(f"MCP tool task {task['status']}{detail}")
+            raise MCPTaskTerminalError(
+                f"MCP tool task {task['status']}{detail}"
+            )
         except asyncio.TimeoutError as exc:
-            await self._cancel_mcp_task(task_id)
+            if cancel_on_timeout:
+                await self._cancel_mcp_task(task_id)
             raise MCPTaskTimeout(
                 f"MCP tool task timed out after {timeout} seconds"
             ) from exc
         except asyncio.CancelledError as cancellation:
-            cancel_task = asyncio.create_task(
-                self._cancel_mcp_task(task_id),
-                name=f"ash-mcp-cancel-modern-task-{task_id}",
-            )
-            cancel_error, cancel_interrupted = (
-                await _settle_task_after_cancellation(cancel_task)
-            )
-            if cancel_error is not None:
-                cancellation.add_note("MCP task cancellation could not be sent")
-            if cancel_interrupted:
-                cancellation.add_note("MCP task cancellation was interrupted")
+            if cancel_on_cancellation:
+                cancel_task = asyncio.create_task(
+                    self._cancel_mcp_task(task_id),
+                    name=f"ash-mcp-cancel-modern-task-{task_id}",
+                )
+                cancel_error, cancel_interrupted = (
+                    await _settle_task_after_cancellation(cancel_task)
+                )
+                if cancel_error is not None:
+                    cancellation.add_note("MCP task cancellation could not be sent")
+                if cancel_interrupted:
+                    cancellation.add_note("MCP task cancellation was interrupted")
             raise
         finally:
-            await self._stop_modern_task_subscription(task_id)
+            if subscription_started:
+                await self._stop_modern_task_subscription(task_id)
+
+    async def resume_modern_task(
+        self,
+        persisted_task: dict[str, Any],
+        answered_inputs: dict[str, str],
+        *,
+        timeout: float | None = None,
+        state_callback: ModernTaskStateCallback | None = None,
+        cancel_on_timeout: bool = False,
+        cancel_on_cancellation: bool = False,
+    ) -> dict[str, Any]:
+        """Resume one persisted 2026-07-28 task without replaying ``tools/call``."""
+
+        if self.protocol_version != MODERN_PROTOCOL_VERSION:
+            raise MCPProtocolError("persisted MCP tasks require protocol 2026-07-28")
+        if not self._supports_modern_tasks():
+            raise MCPProtocolError(
+                f"MCP server does not advertise the {MODERN_TASKS_EXTENSION} extension"
+            )
+        task = self._validate_modern_task_state(
+            persisted_task,
+            method="persisted MCP task",
+        )
+        task_id = task["taskId"]
+        if task["status"] not in {"completed", "failed", "cancelled"}:
+            task = self._validate_modern_task_state(
+                await self.request(
+                    "tasks/get",
+                    {"taskId": task_id},
+                    _allow_session_recovery=False,
+                ),
+                method="tasks/get",
+            )
+            if task["taskId"] != task_id:
+                raise MCPProtocolError("MCP tasks/get returned another taskId")
+        return await self._await_modern_tool_task(
+            task,
+            timeout=timeout if timeout is not None else self.timeout,
+            state_callback=state_callback,
+            answered_inputs=answered_inputs,
+            cancel_on_timeout=cancel_on_timeout,
+            cancel_on_cancellation=cancel_on_cancellation,
+        )
 
     async def _persist_modern_task_state(
         self,

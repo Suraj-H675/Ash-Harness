@@ -61,7 +61,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
     with get_db_connection(db_path) as conn:
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 12
+            == 13
         )
         assert "mcp_tasks" in table_names
         assert {
@@ -126,6 +126,7 @@ def test_mcp_task_state_is_durable_and_updatable(tmp_path: Path) -> None:
         server_name="server",
         remote_tool_name="slow",
         contract_fingerprint="contract",
+        server_fingerprint="server-fingerprint",
         protocol_version="2026-07-28",
         task=initial,
         answered_inputs={},
@@ -149,6 +150,7 @@ def test_mcp_task_state_is_durable_and_updatable(tmp_path: Path) -> None:
         server_name="server",
         remote_tool_name="slow",
         contract_fingerprint="contract",
+        server_fingerprint="server-fingerprint",
         protocol_version="2026-07-28",
         task=completed,
         answered_inputs={"approve": "fingerprint"},
@@ -163,6 +165,7 @@ def test_mcp_task_state_is_durable_and_updatable(tmp_path: Path) -> None:
     assert row["server_name"] == "server"
     assert row["remote_tool_name"] == "slow"
     assert row["contract_fingerprint"] == "contract"
+    assert row["server_fingerprint"] == "server-fingerprint"
     assert row["protocol_version"] == "2026-07-28"
     assert row["task_json"] == json.dumps(
         completed, ensure_ascii=False, sort_keys=True
@@ -200,6 +203,7 @@ def test_mcp_task_ids_are_namespaced_by_server_and_cannot_be_reassigned(
             server_name=server_name,
             remote_tool_name="slow",
             contract_fingerprint="contract",
+            server_fingerprint=f"fingerprint-{server_name}",
             protocol_version="2026-07-28",
             task=task,
             answered_inputs={},
@@ -217,6 +221,7 @@ def test_mcp_task_ids_are_namespaced_by_server_and_cannot_be_reassigned(
             server_name="alpha",
             remote_tool_name="slow",
             contract_fingerprint="contract",
+            server_fingerprint="fingerprint-alpha",
             protocol_version="2026-07-28",
             task=task,
             answered_inputs={},
@@ -228,19 +233,65 @@ def test_v12_migration_adds_mcp_task_table_with_backup(tmp_path: Path) -> None:
     SessionStore(db_path)
     with get_db_connection(db_path) as conn, conn:
         conn.execute("DROP TABLE mcp_tasks")
-        conn.execute("DELETE FROM schema_migrations WHERE version = 12")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 12")
 
     SessionStore(db_path)
 
-    assert len(list(tmp_path.glob("v11.db.before-v12-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v11.db.before-v13-migration.*.backup"))) == 1
     with get_db_connection(db_path) as conn:
         assert conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 12
+        ).fetchone()[0] == 13
         assert conn.execute(
             "SELECT COUNT(*) FROM sqlite_master "
             "WHERE type = 'table' AND name = 'mcp_tasks'"
         ).fetchone()[0] == 1
+        assert "server_fingerprint" in {
+            row["name"] for row in conn.execute("PRAGMA table_info(mcp_tasks)")
+        }
+
+
+def test_v13_migration_binds_existing_mcp_task_table_to_server_identity(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "v12.db"
+    SessionStore(db_path)
+    with get_db_connection(db_path) as conn, conn:
+        conn.execute("DROP TABLE mcp_tasks")
+        conn.executescript(
+            """
+            CREATE TABLE mcp_tasks (
+                task_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                remote_tool_name TEXT NOT NULL,
+                contract_fingerprint TEXT NOT NULL,
+                protocol_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                task_json TEXT NOT NULL,
+                answered_inputs_json TEXT NOT NULL DEFAULT '{}',
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL,
+                PRIMARY KEY(server_name, task_id),
+                UNIQUE(session_id, call_id)
+            );
+            """
+        )
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 13")
+
+    SessionStore(db_path)
+
+    assert len(list(tmp_path.glob("v12.db.before-v13-migration.*.backup"))) == 1
+    with get_db_connection(db_path) as conn:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(mcp_tasks)")
+        }
+        assert "server_fingerprint" in columns
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 13
 
 
 def test_session_store_rejects_linked_database_file_and_parent(tmp_path: Path) -> None:
@@ -293,7 +344,7 @@ def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     store = SessionStore(db_path)
 
     assert store.load_session("legacy").session_id == "legacy"
-    backups = list(tmp_path.glob("legacy.db.before-v12-migration.*.backup"))
+    backups = list(tmp_path.glob("legacy.db.before-v13-migration.*.backup"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as conn:
         assert conn.execute("SELECT session_id FROM sessions").fetchone()[0] == "legacy"
@@ -351,7 +402,7 @@ def test_v7_migration_preserves_checkpoints_and_adds_call_granularity(
         call_id="call-2",
     )
     assert len(migrated.file_checkpoints_for_turns(session.session_id, ["turn-1"])) == 2
-    assert len(list(tmp_path.glob("v6.db.before-v12-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v6.db.before-v13-migration.*.backup"))) == 1
 
 
 def test_session_forks_form_a_durable_redacted_tree(tmp_path: Path) -> None:

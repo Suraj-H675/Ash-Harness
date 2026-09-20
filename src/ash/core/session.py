@@ -35,7 +35,7 @@ AuditAction = Literal[
     "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 13
 
 
 class SessionStorageError(RuntimeError):
@@ -180,6 +180,17 @@ def _serialize_datetime(value: datetime) -> str:
 
 def _deserialize_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _tool_result_message_exists(rows: list[sqlite3.Row], call_id: str) -> bool:
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(metadata, dict) and metadata.get("call_id") == call_id:
+            return True
+    return False
 
 
 def _canonical_json(value: Any) -> str:
@@ -413,6 +424,8 @@ class SessionStore:
                 self._migrate_v11(conn)
             if from_version < 12:
                 self._migrate_v12(conn)
+            if from_version < 13:
+                self._migrate_v13(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -740,6 +753,20 @@ class SessionStore:
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
             "VALUES (?, ?)",
             (12, _serialize_datetime(_utc_now())),
+        )
+
+    def _migrate_v13(self, conn: sqlite3.Connection) -> None:
+        """Bind durable MCP task handles to the originating server identity."""
+
+        if not _column_exists(conn, "mcp_tasks", "server_fingerprint"):
+            conn.execute(
+                "ALTER TABLE mcp_tasks ADD COLUMN server_fingerprint TEXT "
+                "NOT NULL DEFAULT ''"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (13, _serialize_datetime(_utc_now())),
         )
 
     def backup(
@@ -2376,6 +2403,7 @@ class SessionStore:
         server_name: str,
         remote_tool_name: str,
         contract_fingerprint: str,
+        server_fingerprint: str,
         protocol_version: str,
         task: dict[str, Any],
         answered_inputs: dict[str, str],
@@ -2409,10 +2437,11 @@ class SessionStore:
                 """
                 INSERT INTO mcp_tasks (
                     task_id, session_id, turn_id, call_id, server_name,
-                    remote_tool_name, contract_fingerprint, protocol_version,
+                    remote_tool_name, contract_fingerprint, server_fingerprint,
+                    protocol_version,
                     status, task_json, answered_inputs_json, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(server_name, task_id) DO UPDATE SET
                     session_id = excluded.session_id,
                     turn_id = excluded.turn_id,
@@ -2420,6 +2449,7 @@ class SessionStore:
                     server_name = excluded.server_name,
                     remote_tool_name = excluded.remote_tool_name,
                     contract_fingerprint = excluded.contract_fingerprint,
+                    server_fingerprint = excluded.server_fingerprint,
                     protocol_version = excluded.protocol_version,
                     status = excluded.status,
                     task_json = excluded.task_json,
@@ -2434,6 +2464,7 @@ class SessionStore:
                     server_name,
                     remote_tool_name,
                     contract_fingerprint,
+                    server_fingerprint,
                     protocol_version,
                     status,
                     json.dumps(task, ensure_ascii=False, sort_keys=True),
@@ -2461,6 +2492,121 @@ class SessionStore:
                 "ORDER BY created_at, task_id",
                 (session_id,),
             ).fetchall()
+
+    def delete_mcp_task_for_call(self, session_id: str, call_id: str) -> None:
+        """Drop a durable MCP handle after its Ash tool result is committed."""
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            conn.execute(
+                "DELETE FROM mcp_tasks WHERE session_id = ? AND call_id = ?",
+                (session_id, call_id),
+            )
+
+    def tool_call_for_recovery(
+        self, session_id: str, turn_id: str, call_id: str
+    ) -> sqlite3.Row | None:
+        """Return one persisted tool call bound to a recovery task."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            return conn.execute(
+                "SELECT * FROM tool_calls WHERE session_id = ? AND turn_id = ? "
+                "AND call_id = ?",
+                (session_id, turn_id, call_id),
+            ).fetchone()
+
+    def finalize_mcp_task_recovery(
+        self,
+        *,
+        server_name: str,
+        task_id: str,
+        session_id: str,
+        turn_id: str,
+        call_id: str,
+        tool_name: str,
+        success: bool,
+        result: str,
+        error: str | None,
+        message: Message,
+        audit_details: dict[str, Any],
+    ) -> bool:
+        """Atomically finalize one resumed task and its model-visible result.
+
+        Returns ``True`` when this transaction inserted the tool-result message.
+        """
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            call = conn.execute(
+                "SELECT executed, error FROM tool_calls WHERE session_id = ? "
+                "AND turn_id = ? AND call_id = ?",
+                (session_id, turn_id, call_id),
+            ).fetchone()
+            if call is None:
+                conn.execute(
+                    "DELETE FROM mcp_tasks WHERE server_name = ? AND task_id = ?",
+                    (server_name, task_id),
+                )
+                return False
+            already_terminal = bool(call["executed"]) or call["error"] is not None
+            if not already_terminal:
+                conn.execute(
+                    "UPDATE tool_calls SET executed = 1, result = ?, error = ? "
+                    "WHERE session_id = ? AND turn_id = ? AND call_id = ?",
+                    (result, error, session_id, turn_id, call_id),
+                )
+                self._append_audit_log_in_connection(
+                    conn,
+                    session_id,
+                    action_type=(
+                        "command_run"
+                        if tool_name == "run_command"
+                        else "file_write"
+                        if tool_name
+                        in {
+                            "write_file",
+                            "whole_edit",
+                            "replace_file_content",
+                            "replace_file_edits",
+                            "apply_patch",
+                        }
+                        else "tool_call"
+                    ),
+                    target_resource=tool_name,
+                    details={**audit_details, "recovered": True, "replayed": False},
+                    result="SUCCESS" if success else "FAILURE",
+                )
+
+            message_rows = conn.execute(
+                "SELECT metadata_json FROM messages WHERE session_id = ? "
+                "AND turn_id = ? AND role = 'tool' ORDER BY message_id",
+                (session_id, turn_id),
+            ).fetchall()
+            inserted = not _tool_result_message_exists(message_rows, call_id)
+            if inserted:
+                conn.execute(
+                    """
+                    INSERT INTO messages (
+                        session_id, role, content, timestamp, metadata_json,
+                        token_count, prompt_tokens, completion_tokens, turn_id
+                    ) VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)
+                    """,
+                    (
+                        session_id,
+                        message.role,
+                        message.content,
+                        _serialize_datetime(message.timestamp),
+                        json.dumps(message.metadata),
+                        turn_id,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                    (_serialize_datetime(message.timestamp), session_id),
+                )
+            conn.execute(
+                "DELETE FROM mcp_tasks WHERE server_name = ? AND task_id = ?",
+                (server_name, task_id),
+            )
+            return inserted
 
     def append_audit_log(
         self,

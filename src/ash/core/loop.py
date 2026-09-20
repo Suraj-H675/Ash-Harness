@@ -80,6 +80,7 @@ from ash.tools.base import (
     ToolMiddlewareSkip,
     ToolReplayPolicy,
     ToolResult,
+    count_output_tokens,
 )
 from ash.tools.git import auto_commit_turn, git_dirty_paths
 from ash.ui.parser import Event, StreamingXMLParser
@@ -922,14 +923,21 @@ class AshLoop:
 
         if session_id is not None:
             self.session_store.require_session_project(session_id, self.project_root)
-            self.current_session = self.session_store.load_session(session_id)
             from ash.core.checkpoints import recover_interrupted_turns
 
+            deferred_mcp_calls = await self._recover_persisted_mcp_tasks(session_id)
             self.recovery_summary = recover_interrupted_turns(
                 self.session_store,
                 self.safety_guard,
                 session_id,
+                deferred_call_ids=deferred_mcp_calls,
             )
+            if deferred_mcp_calls:
+                raise RuntimeError(
+                    "Session resume is waiting for durable MCP task recovery; "
+                    "the task handle was preserved and no tool call was replayed."
+                )
+            self.current_session = self.session_store.load_session(session_id)
             self.recovered_turns = self.recovery_summary.interrupted_turns
             if self.recovered_turns:
                 self._emit_recovered_tool_events(self.recovery_summary)
@@ -1277,12 +1285,242 @@ class AshLoop:
             server_name=str(payload["server_name"]),
             remote_tool_name=str(payload["remote_tool_name"]),
             contract_fingerprint=str(payload["contract_fingerprint"]),
+            server_fingerprint=str(payload["server_fingerprint"]),
             protocol_version=str(payload["protocol_version"]),
             task=task,
             answered_inputs={
                 str(key): str(value) for key, value in answered_inputs.items()
             },
         )
+
+    async def _recover_persisted_mcp_tasks(self, session_id: str) -> set[str]:
+        """Resume durable MCP tasks without replaying their original tool calls.
+
+        Returns call IDs that must stay out of generic interrupted-tool recovery
+        because their durable server task could not be resumed safely yet.
+        """
+
+        from ash.mcp.client import MCPTaskTerminalError
+        from ash.mcp.diagnostics import safe_mcp_diagnostic
+        from ash.mcp.runtime import MCPTool
+        from ash.mcp.server import mcp_server_fingerprint
+
+        deferred: set[str] = set()
+        rows = self.session_store.list_mcp_tasks(session_id)
+        for row in rows:
+            server_name = str(row["server_name"])
+            task_id = str(row["task_id"])
+            turn_id = str(row["turn_id"])
+            call_id = str(row["call_id"])
+            remote_tool_name = str(row["remote_tool_name"])
+            persisted_contract = str(row["contract_fingerprint"])
+            persisted_server_fingerprint = str(row["server_fingerprint"])
+            persisted_protocol = str(row["protocol_version"])
+            expected_tool_name = f"mcp__{server_name}__{remote_tool_name}"
+            call = self.session_store.tool_call_for_recovery(
+                session_id,
+                turn_id,
+                call_id,
+            )
+            if call is None:
+                self.session_store.delete_mcp_task(server_name, task_id)
+                continue
+            tool_name = str(call["tool_name"])
+            stored_output = str(call["result"] or "")
+            stored_error = str(call["error"]) if call["error"] is not None else None
+            if bool(call["executed"]) or stored_error is not None:
+                result_payload = {
+                    "success": stored_error is None,
+                    "output": stored_output,
+                    "error": stored_error,
+                    "truncated": False,
+                    "token_count": count_output_tokens(stored_output),
+                }
+                message = Message(
+                    role="tool",
+                    content=_render_tool_response(
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        result=result_payload,
+                    ),
+                    timestamp=_utc_now(),
+                    metadata={"call_id": call_id},
+                )
+                self.session_store.finalize_mcp_task_recovery(
+                    server_name=server_name,
+                    task_id=task_id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    success=stored_error is None,
+                    result=stored_output,
+                    error=stored_error,
+                    message=message,
+                    audit_details={
+                        "call_id": call_id,
+                        "server": server_name,
+                        "task_id": task_id,
+                        "local_outcome_already_persisted": True,
+                    },
+                )
+                continue
+
+            if tool_name != expected_tool_name or not bool(call["dispatched"]):
+                self.session_store.delete_mcp_task(server_name, task_id)
+                continue
+            if not persisted_server_fingerprint:
+                # v12 rows predate server-identity binding.  Do not send their
+                # task IDs to any current server; generic recovery will mark
+                # the dispatched call outcome unknown without replaying it.
+                self.session_store.delete_mcp_task(server_name, task_id)
+                continue
+
+            try:
+                persisted_task = json.loads(str(row["task_json"]))
+                answered_inputs = json.loads(str(row["answered_inputs_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                self.session_store.delete_mcp_task(server_name, task_id)
+                continue
+            if (
+                not isinstance(persisted_task, dict)
+                or persisted_task.get("taskId") != task_id
+                or not isinstance(answered_inputs, dict)
+                or not all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in answered_inputs.items()
+                )
+            ):
+                self.session_store.delete_mcp_task(server_name, task_id)
+                continue
+
+            tool = self.tools.get(expected_tool_name)
+            runtime = self._mcp_runtime
+            client = runtime.clients.get(server_name) if runtime is not None else None
+            current_server_fingerprint = (
+                mcp_server_fingerprint(client.config, client.server_info)
+                if client is not None
+                else ""
+            )
+            if (
+                not isinstance(tool, MCPTool)
+                or client is None
+                or tool.client is not client
+                or current_server_fingerprint != persisted_server_fingerprint
+                or tool.protocol_version != persisted_protocol
+                or tool.contract_fingerprint() != persisted_contract
+            ):
+                deferred.add(call_id)
+                continue
+
+            async def persist_recovery_state(
+                task: dict[str, Any],
+                inputs: dict[str, str],
+                *,
+                _server_name: str = server_name,
+                _task_id: str = task_id,
+                _turn_id: str = turn_id,
+                _call_id: str = call_id,
+                _remote_tool_name: str = remote_tool_name,
+                _contract: str = persisted_contract,
+                _server_fingerprint: str = persisted_server_fingerprint,
+                _protocol: str = persisted_protocol,
+            ) -> None:
+                if task.get("taskId") != _task_id:
+                    raise RuntimeError("resumed MCP task changed taskId")
+                self.session_store.save_mcp_task(
+                    task_id=_task_id,
+                    session_id=session_id,
+                    turn_id=_turn_id,
+                    call_id=_call_id,
+                    server_name=_server_name,
+                    remote_tool_name=_remote_tool_name,
+                    contract_fingerprint=_contract,
+                    server_fingerprint=_server_fingerprint,
+                    protocol_version=_protocol,
+                    task=task,
+                    answered_inputs=inputs,
+                )
+
+            try:
+                wire_result = await client.resume_modern_task(
+                    persisted_task,
+                    {str(key): str(value) for key, value in answered_inputs.items()},
+                    state_callback=persist_recovery_state,
+                    cancel_on_timeout=False,
+                    cancel_on_cancellation=False,
+                )
+            except MCPTaskTerminalError as exc:
+                output = ""
+                error = safe_mcp_diagnostic(exc)
+                tool_result = ToolResult(
+                    success=False,
+                    output=output,
+                    error=error,
+                    token_count=0,
+                )
+            except asyncio.CancelledError:
+                deferred.add(call_id)
+                raise
+            except Exception as exc:  # noqa: BLE001 - preserve durable handle
+                _log.warning(
+                    "Could not resume MCP task %s on %s: %s",
+                    task_id,
+                    server_name,
+                    safe_mcp_diagnostic(exc),
+                )
+                deferred.add(call_id)
+                continue
+            else:
+                tool_result = await tool.result_from_wire(wire_result)
+
+            result_payload = {
+                "success": tool_result.success,
+                "output": tool_result.output,
+                "error": tool_result.error,
+                "truncated": tool_result.truncated,
+                "token_count": tool_result.token_count,
+                **(
+                    {"diagnostics": tool_result.diagnostics}
+                    if tool_result.diagnostics
+                    else {}
+                ),
+                **(
+                    {"diagnostic_summary": tool_result.diagnostic_summary}
+                    if tool_result.diagnostic_summary
+                    else {}
+                ),
+                **({"citations": tool_result.citations} if tool_result.citations else {}),
+            }
+            message = Message(
+                role="tool",
+                content=_render_tool_response(
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    result=result_payload,
+                ),
+                timestamp=_utc_now(),
+                metadata={"call_id": call_id},
+            )
+            self.session_store.finalize_mcp_task_recovery(
+                server_name=server_name,
+                task_id=task_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                call_id=call_id,
+                tool_name=tool_name,
+                success=tool_result.success,
+                result=tool_result.output,
+                error=tool_result.error,
+                message=message,
+                audit_details={
+                    "call_id": call_id,
+                    "server": server_name,
+                    "task_id": task_id,
+                    "resumed_server_task": True,
+                },
+            )
+        return deferred
 
     async def _publish_mcp_runtime(
         self, configs: dict[str, MCPServerConfig]
@@ -1956,6 +2194,10 @@ class AshLoop:
                     session.session_id,
                     tool_message,
                     turn_id=self.turn_context.turn_id,
+                )
+                self.session_store.delete_mcp_task_for_call(
+                    session.session_id,
+                    call["call_id"],
                 )
                 session.messages.append(tool_message)
 
