@@ -37,7 +37,14 @@ from ash.config import AshConfig
 from ash.core.session import Message, SessionStore, ToolCallRecord
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.trust import set_workspace_trusted
-from ash.server.acp import AshACPAgent
+from ash.server.acp import AshACPAgent, _tool_kind
+
+
+def test_acp_classifies_browser_tab_tools_by_effect() -> None:
+    assert _tool_kind("browser_tabs") == "read"
+    assert _tool_kind("browser_open_tab") == "fetch"
+    assert _tool_kind("browser_focus_tab") == "other"
+    assert _tool_kind("browser_close_tab") == "other"
 
 
 class FakeACPConnection:

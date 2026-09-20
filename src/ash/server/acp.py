@@ -1078,7 +1078,13 @@ def _encode_cursor(offset: int) -> str:
 
 
 def _tool_kind(tool_name: str) -> ToolKind:
-    if tool_name in {"read_file", "list_directory", "glob_files", "find_symbol"}:
+    if tool_name in {
+        "read_file",
+        "list_directory",
+        "glob_files",
+        "find_symbol",
+        "browser_tabs",
+    }:
         return "read"
     if tool_name in {
         "write_file",
@@ -1090,7 +1096,12 @@ def _tool_kind(tool_name: str) -> ToolKind:
         return "edit"
     if tool_name in {"search_text", "find_references", "search_tools"}:
         return "search"
-    if tool_name in {"web_fetch", "web_search", "browser_navigate"}:
+    if tool_name in {
+        "web_fetch",
+        "web_search",
+        "browser_navigate",
+        "browser_open_tab",
+    }:
         return "fetch"
     if tool_name in {"run_command", "background_process"}:
         return "execute"
