@@ -223,6 +223,16 @@ _BUILTIN_CONNECTIONS: dict[str, tuple[str, str, CatalogFormat, AuthMode]] = {
     ),
 }
 
+def builtin_provider_catalog_format(provider_id: str) -> CatalogFormat:
+    """Return the canonical model-catalog shape for one built-in provider route."""
+
+    normalized = provider_id.strip().casefold()
+    connection = _BUILTIN_CONNECTIONS.get(normalized)
+    if connection is None:
+        raise ProviderConfigurationError(f"unknown built-in provider: {provider_id!r}")
+    return connection[2]
+
+
 _BUILTIN_KEY_ENVS = {
     descriptor.id: descriptor.key_envs
     for descriptor in BUILTIN_PROVIDERS

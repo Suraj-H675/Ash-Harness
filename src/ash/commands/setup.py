@@ -760,13 +760,14 @@ def _flow_openai_compatible_builtin(
     base_url_override = _prompt_optional_url(base_env, descriptor.base_url)
     base_url = base_url_override or descriptor.base_url
     _require_secure_provider_transport(base_url, descriptor.id, api_key)
-    catalog_format: CatalogFormat = (
-        "lmstudio" if descriptor.id == "lmstudio" else "openai"
+    from ash.providers.readiness import (
+        GOOGLE_API_CLIENT_HEADER,
+        builtin_provider_catalog_format,
     )
+
+    catalog_format = builtin_provider_catalog_format(descriptor.id)
     extra_headers: Mapping[str, str] | None = None
     if descriptor.id == "google":
-        from ash.providers.readiness import GOOGLE_API_CLIENT_HEADER
-
         extra_headers = {"x-goog-api-client": GOOGLE_API_CLIENT_HEADER}
     models, verified = _discover_models(
         descriptor.name,

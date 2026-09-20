@@ -271,19 +271,28 @@ class TestOpenAIFlow:
 
 
 @pytest.mark.parametrize(
-    ("provider_id", "key_env", "base_url", "model"),
+    ("provider_id", "key_env", "base_url", "model", "catalog_format"),
     [
         (
             "google",
             "GOOGLE_API_KEY",
             "https://generativelanguage.googleapis.com/v1beta/openai",
             "gemini-test",
+            "openai",
         ),
         (
             "nvidia",
             "NVIDIA_API_KEY",
             "https://integrate.api.nvidia.com/v1",
             "nvidia/test-model",
+            "openai",
+        ),
+        (
+            "together",
+            "TOGETHER_API_KEY",
+            "https://api.together.xyz/v1",
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "together",
         ),
     ],
 )
@@ -292,6 +301,7 @@ def test_openai_compatible_builtin_provider_onboarding(
     key_env: str,
     base_url: str,
     model: str,
+    catalog_format: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from ash.commands.setup import ModelProbe, _flow_openai_compatible_builtin
@@ -324,7 +334,7 @@ def test_openai_compatible_builtin_provider_onboarding(
     probe.assert_called_once_with(
         base_url,
         "provider-secret",
-        catalog_format="openai",
+        catalog_format=catalog_format,
         extra_headers=expected_headers,
     )
     assert save.call_args.args[0] == {
