@@ -370,7 +370,7 @@ async def authorize_mcp_server(
     owns_client = client is None
     if client is None:
         client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-    callback_future: asyncio.Future[tuple[str, str]] = (
+    callback_future: asyncio.Future[tuple[str, str, str]] = (
         asyncio.get_running_loop().create_future()
     )
     state = secrets.token_urlsafe(32)
@@ -439,11 +439,15 @@ async def authorize_mcp_server(
                 expected_state=state,
                 announce=announce,
             )
-        code, returned_state = await asyncio.wait_for(
+        code, returned_state, returned_issuer = await asyncio.wait_for(
             callback_future, timeout=timeout_seconds
         )
         if not secrets.compare_digest(returned_state, state):
             raise MCPOAuthError("OAuth callback state did not match")
+        if returned_issuer and returned_issuer != discovery.issuer:
+            raise MCPOAuthError(
+                "OAuth authorization response issuer did not match discovery issuer"
+            )
         data = {
             "grant_type": "authorization_code",
             "code": code,
@@ -869,7 +873,7 @@ def _configured_client(config: dict[str, Any]) -> OAuthClient | None:
 async def _handle_callback(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
-    future: asyncio.Future[tuple[str, str]],
+    future: asyncio.Future[tuple[str, str, str]],
     *,
     expected_state: str,
 ) -> None:
@@ -883,6 +887,7 @@ async def _handle_callback(
         query = parse_qs(parsed.query)
         code = query.get("code", [""])[0]
         state = query.get("state", [""])[0]
+        issuer = query.get("iss", [""])[0]
         error = query.get("error", [""])[0]
         if (
             parsed.path == "/callback"
@@ -900,7 +905,7 @@ async def _handle_callback(
             and secrets.compare_digest(state, expected_state)
         ):
             if not future.done():
-                future.set_result((code, state))
+                future.set_result((code, state, issuer))
             status = "200 OK"
             message = "Authorization complete. You may close this window."
     except (asyncio.TimeoutError, OSError, ValueError):
@@ -949,7 +954,7 @@ def normalize_oauth_scope(value: str, label: str = "OAuth scope") -> str:
 
 
 def _start_manual_callback_reader(
-    future: asyncio.Future[tuple[str, str]],
+    future: asyncio.Future[tuple[str, str, str]],
     *,
     expected_state: str,
     announce: Callable[[str], None],
@@ -974,6 +979,7 @@ def _start_manual_callback_reader(
             query = parse_qs(parsed.query)
             code = query.get("code", [""])[0]
             state = query.get("state", [""])[0]
+            issuer = query.get("iss", [""])[0]
             if (
                 parsed.path != "/callback"
                 or not code
@@ -984,7 +990,7 @@ def _start_manual_callback_reader(
 
             def accept() -> None:
                 if not future.done():
-                    future.set_result((code, state))
+                    future.set_result((code, state, issuer))
 
             loop.call_soon_threadsafe(accept)
             return

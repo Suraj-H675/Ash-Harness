@@ -740,6 +740,122 @@ async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
 
 
 @pytest.mark.asyncio
+async def test_oauth_login_rejects_mismatched_authorization_response_issuer_before_token_exchange(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    token_requests = 0
+    callback_handler: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_requests
+        if request.url == httpx.URL(resource):
+            return httpx.Response(
+                401,
+                headers={
+                    "WWW-Authenticate": (
+                        'Bearer resource_metadata="https://mcp.example.test/oauth"'
+                    )
+                },
+            )
+        if request.url == httpx.URL("https://mcp.example.test/oauth"):
+            return httpx.Response(
+                200,
+                json={
+                    "resource": resource,
+                    "authorization_servers": ["https://auth.example.test"],
+                },
+            )
+        if request.url == httpx.URL(
+            "https://auth.example.test/.well-known/oauth-authorization-server"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://auth.example.test",
+                    "authorization_endpoint": "https://auth.example.test/authorize",
+                    "token_endpoint": "https://auth.example.test/token",
+                    "code_challenge_methods_supported": ["S256"],
+                },
+            )
+        if request.url == httpx.URL("https://auth.example.test/token"):
+            token_requests += 1
+            return httpx.Response(
+                200,
+                json={"access_token": "must-not-be-used", "token_type": "Bearer"},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    class FakeSocket:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43123)
+
+    class FakeServer:
+        sockets = [FakeSocket()]
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def start_server(handler: Any, host: str, port: int) -> FakeServer:
+        assert host == "127.0.0.1"
+        assert port == 0
+        callback_handler["handler"] = handler
+        return FakeServer()
+
+    monkeypatch.setattr(asyncio, "start_server", start_server)
+
+    def opener(url: str) -> bool:
+        query = parse_qs(urlparse(url).query)
+
+        async def callback() -> None:
+            reader = asyncio.StreamReader()
+            target = "/callback?" + urlencode(
+                {
+                    "code": "authorization-code",
+                    "state": query["state"][0],
+                    "iss": "https://attacker.example.test",
+                }
+            )
+            reader.feed_data(f"GET {target} HTTP/1.1\r\n\r\n".encode())
+            reader.feed_eof()
+            writer = type(
+                "Writer",
+                (),
+                {
+                    "write": lambda self, data: None,
+                    "drain": lambda self: asyncio.sleep(0),
+                    "close": lambda self: None,
+                    "wait_closed": lambda self: asyncio.sleep(0),
+                },
+            )()
+            await callback_handler["handler"](reader, writer)
+
+        asyncio.create_task(callback())
+        return True
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(MCPOAuthError, match="issuer"):
+            await authorize_mcp_server(
+                "remote",
+                resource,
+                oauth_config={"client_id": "registered"},
+                store=MCPOAuthTokenStore("remote", tmp_path / "tokens"),
+                http_client=http,
+                open_browser=opener,
+                announce=lambda message: None,
+                timeout_seconds=5,
+            )
+        assert token_requests == 0
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_explicit_step_up_scope_overrides_initial_challenge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
