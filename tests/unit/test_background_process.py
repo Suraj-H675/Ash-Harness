@@ -259,7 +259,9 @@ async def test_background_process_uses_sandbox_manager(tmp_path) -> None:
 
     started = await tool.run(action="start", command="printf ignored")
     job_id = started.output.split()[1]
-    await asyncio.sleep(0.05)
+    job = tool.jobs[job_id]
+    await job.process.wait()
+    await asyncio.gather(*job.readers)
     polled = await tool.run(action="poll", job_id=job_id)
 
     assert "isolated" in polled.output
