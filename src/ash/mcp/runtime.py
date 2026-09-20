@@ -16,7 +16,7 @@ from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
 from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from pydantic import BaseModel, Field
 
-from ash.mcp.client import MCPClient, MCPProtocolError
+from ash.mcp.client import MCPClient, MCPProtocolError, MODERN_PROTOCOL_VERSION
 from ash.mcp.diagnostics import (
     MAX_MCP_DIAGNOSTICS,
     safe_mcp_diagnostic,
@@ -95,10 +95,11 @@ def _schema_validator(
     *,
     label: str,
     protocol_version: str,
+    require_object_root: bool = True,
 ) -> str:
     """Check a bounded MCP JSON Schema and return its effective dialect."""
 
-    if schema.get("type") != "object":
+    if require_object_root and schema.get("type") != "object":
         raise ValueError(f"{label} root type must be object")
     try:
         encoded = _json_dump(schema).encode("utf-8")
@@ -595,6 +596,7 @@ class MCPTool(BaseTool):
                 self._output_schema,
                 label=f"MCP tool {self.remote_name!r} outputSchema",
                 protocol_version=protocol_version,
+                require_object_root=protocol_version < MODERN_PROTOCOL_VERSION,
             )
             if self._output_schema is not None
             else None
@@ -748,8 +750,11 @@ class MCPTool(BaseTool):
                     ),
                     token_count=count_output_tokens(safe_raw_result),
                 )
-        if "structuredContent" in result and not isinstance(
-            result["structuredContent"], dict
+        has_structured_content = "structuredContent" in result
+        if (
+            has_structured_content
+            and self.protocol_version < MODERN_PROTOCOL_VERSION
+            and not isinstance(result["structuredContent"], dict)
         ):
             return ToolResult(
                 success=False,
@@ -785,7 +790,7 @@ class MCPTool(BaseTool):
         )
 
         if self._output_schema is not None:
-            if structured_content is None:
+            if not has_structured_content:
                 return ToolResult(
                     success=False,
                     output=safe_mcp_diagnostic(output),

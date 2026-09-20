@@ -1245,6 +1245,74 @@ async def test_mcp_tool_preserves_rich_result_and_validates_output_schema(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_schema", "structured_content"),
+    [
+        ({"type": "array", "items": {"type": "integer"}}, [1, 2]),
+        ({"type": "string"}, "value"),
+        ({"type": "number"}, 1.5),
+        ({"type": "boolean"}, True),
+        ({"type": "null"}, None),
+    ],
+)
+async def test_modern_mcp_tool_accepts_arbitrary_json_structured_content(
+    tmp_path: Path,
+    output_schema: dict,
+    structured_content: object,
+) -> None:
+    remote_result = {
+        "content": [{"type": "text", "text": "modern structured result"}],
+        "structuredContent": structured_content,
+    }
+    tool = _mcp_tool(
+        tmp_path,
+        StubMCPClient(remote_result),
+        input_schema={"type": "object"},
+        output_schema=output_schema,
+        protocol_version="2026-07-28",
+    )
+
+    result = await tool.run()
+
+    assert result.success is True
+    assert json.loads(result.output)["structuredContent"] == structured_content
+
+
+@pytest.mark.asyncio
+async def test_modern_mcp_tool_validates_non_object_structured_content_schema(
+    tmp_path: Path,
+) -> None:
+    remote_result = {
+        "content": [{"type": "text", "text": "invalid array"}],
+        "structuredContent": [1, "two"],
+    }
+    tool = _mcp_tool(
+        tmp_path,
+        StubMCPClient(remote_result),
+        input_schema={"type": "object"},
+        output_schema={"type": "array", "items": {"type": "integer"}},
+        protocol_version="2026-07-28",
+    )
+
+    result = await tool.run()
+
+    assert result.success is False
+    assert result.error is not None and "invalid MCP structured result" in result.error
+    assert json.loads(result.output)["structuredContent"] == [1, "two"]
+
+
+def test_legacy_mcp_tool_still_requires_object_output_schema(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="outputSchema root type must be object"):
+        _mcp_tool(
+            tmp_path,
+            StubMCPClient({"content": []}),
+            input_schema={"type": "object"},
+            output_schema={"type": "array", "items": {"type": "integer"}},
+            protocol_version="2025-11-25",
+        )
+
+
+@pytest.mark.asyncio
 async def test_mcp_tool_preserves_annotated_text_block_envelope(tmp_path: Path) -> None:
     remote_result = {
         "content": [
