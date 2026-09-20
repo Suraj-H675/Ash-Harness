@@ -253,6 +253,10 @@ async def test_automation_subprocess_runner_uses_isolated_python(
     )
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="signed webhook child secret-isolation success path is Linux-only",
+)
 @pytest.mark.asyncio
 async def test_automation_subprocess_isolates_only_webhook_secret(
     tmp_path: Path,
