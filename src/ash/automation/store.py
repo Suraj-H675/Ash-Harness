@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
 from ash.automation.models import (
+    AutomationDelivery,
+    AutomationDeliveryLease,
+    AutomationDeliveryStatus,
     AutomationJob,
     AutomationRun,
     AutomationRunLease,
@@ -26,6 +29,7 @@ from ash.automation.models import (
     UsageSource,
 )
 from ash.automation.schedules import first_fire_time, next_fire_time
+from ash.automation.delivery import normalize_webhook_settings
 from ash.core.events import EventContext, envelope_event
 from ash.core.redaction import redact_text
 from ash.safe_io import validate_unlinked_file_path
@@ -36,7 +40,7 @@ MAX_PROMPT_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_ERROR_BYTES = 16 * 1024
 MAX_EVENT_BYTES = 128 * 1024
-AUTOMATION_SCHEMA_VERSION = 2
+AUTOMATION_SCHEMA_VERSION = 3
 
 _V2_RUN_COLUMNS = {
     "cache_read_tokens": "INTEGER NOT NULL DEFAULT 0",
@@ -48,6 +52,11 @@ _V2_RUN_COLUMNS = {
     "estimated_prompt_tokens": "INTEGER NOT NULL DEFAULT 0",
     "estimated_completion_tokens": "INTEGER NOT NULL DEFAULT 0",
     "estimated_cost_usd": "REAL NOT NULL DEFAULT 0",
+}
+
+_V3_JOB_COLUMNS = {
+    "webhook_url": "TEXT",
+    "webhook_secret_env": "TEXT",
 }
 
 
@@ -152,6 +161,8 @@ class AutomationStore:
                         CHECK(misfire_grace_seconds BETWEEN 0 AND 2592000),
                     timeout_seconds REAL NOT NULL CHECK(timeout_seconds BETWEEN 1 AND 86400),
                     token_budget INTEGER NOT NULL CHECK(token_budget BETWEEN 1 AND 10000000),
+                    webhook_url TEXT,
+                    webhook_secret_env TEXT,
                     last_run_at REAL,
                     last_run_status TEXT CHECK(last_run_status IS NULL OR last_run_status IN
                         ('running','succeeded','failed','cancelled','interrupted','skipped')),
@@ -206,6 +217,32 @@ class AutomationStore:
                     ON automation_runs(job_id, scheduled_for)
                     WHERE trigger = 'scheduled';
 
+                CREATE TABLE IF NOT EXISTS automation_deliveries (
+                    delivery_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL UNIQUE
+                        REFERENCES automation_runs(run_id) ON DELETE CASCADE,
+                    job_id TEXT NOT NULL REFERENCES automation_jobs(job_id),
+                    webhook_url TEXT NOT NULL,
+                    webhook_secret_env TEXT,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('pending','delivering','delivered','failed','ambiguous')),
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    worker_id TEXT,
+                    lease_token_hash TEXT,
+                    lease_expires_at REAL,
+                    recovery_safe INTEGER NOT NULL DEFAULT 1
+                        CHECK(recovery_safe IN (0,1)),
+                    response_status INTEGER,
+                    last_error TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    finished_at REAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_automation_deliveries_pending
+                    ON automation_deliveries(status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_automation_deliveries_job
+                    ON automation_deliveries(job_id, created_at DESC);
+
                 CREATE TABLE IF NOT EXISTS automation_workers (
                     worker_id TEXT PRIMARY KEY,
                     workspace TEXT NOT NULL,
@@ -232,6 +269,8 @@ class AutomationStore:
             )
             if schema_version < 2:
                 self._migrate_runs_to_v2()
+            if schema_version < 3:
+                self._migrate_jobs_to_v3()
             self._conn.execute(f"PRAGMA user_version = {AUTOMATION_SCHEMA_VERSION}")
 
     def _migrate_runs_to_v2(self) -> None:
@@ -246,6 +285,20 @@ class AutomationStore:
                 continue
             self._conn.execute(
                 f"ALTER TABLE automation_runs ADD COLUMN {name} {declaration}"
+            )
+
+    def _migrate_jobs_to_v3(self) -> None:
+        existing = {
+            str(row["name"])
+            for row in self._conn.execute(
+                "PRAGMA table_info(automation_jobs)"
+            ).fetchall()
+        }
+        for name, declaration in _V3_JOB_COLUMNS.items():
+            if name in existing:
+                continue
+            self._conn.execute(
+                f"ALTER TABLE automation_jobs ADD COLUMN {name} {declaration}"
             )
 
     def _restrict_file_permissions(self) -> None:
@@ -270,6 +323,8 @@ class AutomationStore:
         misfire_grace_seconds: int = 86_400,
         timeout_seconds: float = 1800.0,
         token_budget: int = 100_000,
+        webhook_url: str | None = None,
+        webhook_secret_env: str | None = None,
     ) -> AutomationJob:
         normalized_name = _bounded_text(name, "job name", MAX_JOB_NAME_BYTES)
         normalized_prompt = _bounded_text(prompt, "job prompt", MAX_PROMPT_BYTES)
@@ -292,6 +347,9 @@ class AutomationStore:
         grace = misfire_grace_seconds
         timeout = float(timeout_seconds)
         budget = token_budget
+        normalized_webhook_url, normalized_webhook_secret_env = (
+            normalize_webhook_settings(webhook_url, webhook_secret_env)
+        )
         now = self._clock()
         next_run = first_fire_time(schedule, now=_from_epoch(now)) if enabled else None
         with self._transaction():
@@ -302,8 +360,8 @@ class AutomationStore:
                         job_id, workspace, name, prompt, schedule_kind, schedule_value,
                         schedule_timezone, schedule_anchor_at, enabled, next_run_at,
                         misfire_grace_seconds, timeout_seconds, token_budget,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        webhook_url, webhook_secret_env, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         identifier,
@@ -319,6 +377,8 @@ class AutomationStore:
                         grace,
                         timeout,
                         budget,
+                        normalized_webhook_url,
+                        normalized_webhook_secret_env,
                         now,
                         now,
                     ),
@@ -754,6 +814,7 @@ class AutomationStore:
                 estimated_completion_tokens=estimated_completion_tokens,
                 estimated_cost_usd=estimated_cost_usd,
             )
+            self._enqueue_delivery_locked(job_id, identifier, now)
         return self._required_run(identifier)
 
     def interrupt_run(self, run_id: str, token: str, *, error: str) -> AutomationRun:
@@ -805,6 +866,7 @@ class AutomationStore:
                 reason="worker_execution_abandoned",
                 error=normalized_error,
             )
+            self._enqueue_delivery_locked(job_id, identifier, now)
         return self._required_run(identifier)
 
     def get_run(self, run_id: str) -> AutomationRun | None:
@@ -843,6 +905,290 @@ class AutomationStore:
                 tuple(params),
             ).fetchall()
         return [_run_from_row(row) for row in rows]
+
+    def get_delivery(
+        self,
+        delivery_id: str,
+        *,
+        workspace: Path | str,
+    ) -> AutomationDelivery | None:
+        identifier = _identifier(delivery_id, "delivery id")
+        root = _workspace(workspace)
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT deliveries.* FROM automation_deliveries AS deliveries
+                JOIN automation_jobs AS jobs ON jobs.job_id = deliveries.job_id
+                WHERE deliveries.delivery_id = ? AND jobs.workspace = ?
+                """,
+                (identifier, root),
+            ).fetchone()
+        return _delivery_from_row(row) if row is not None else None
+
+    def list_deliveries(
+        self,
+        *,
+        workspace: Path | str,
+        job_id: str | None = None,
+        limit: int = 100,
+    ) -> list[AutomationDelivery]:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        root = _workspace(workspace)
+        params: list[Any] = [root]
+        job_clause = ""
+        if job_id is not None:
+            job_clause = " AND deliveries.job_id = ?"
+            params.append(_identifier(job_id, "job id"))
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT deliveries.* FROM automation_deliveries AS deliveries
+                JOIN automation_jobs AS jobs ON jobs.job_id = deliveries.job_id
+                WHERE jobs.workspace = ?
+                """
+                + job_clause
+                + " ORDER BY deliveries.created_at DESC, deliveries.delivery_id DESC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        return [_delivery_from_row(row) for row in rows]
+
+    def claim_pending_deliveries(
+        self,
+        *,
+        workspace: Path | str,
+        worker_id: str,
+        lease_seconds: float = 60.0,
+        limit: int = 4,
+    ) -> list[AutomationDeliveryLease]:
+        root = _workspace(workspace)
+        owner = _identifier(worker_id, "worker id")
+        lease = _lease_seconds(lease_seconds)
+        if type(limit) is not int or not 1 <= limit <= 32:
+            raise ValueError("limit must be between 1 and 32")
+        claimed: list[tuple[str, str]] = []
+        with self._transaction():
+            now = self._clock()
+            self._recover_expired_deliveries_locked(now, workspace=root)
+            rows = self._conn.execute(
+                """
+                SELECT deliveries.delivery_id
+                FROM automation_deliveries AS deliveries
+                JOIN automation_jobs AS jobs ON jobs.job_id = deliveries.job_id
+                WHERE jobs.workspace = ? AND deliveries.status = 'pending'
+                ORDER BY deliveries.created_at, deliveries.delivery_id
+                LIMIT ?
+                """,
+                (root, limit),
+            ).fetchall()
+            for row in rows:
+                delivery_id = str(row["delivery_id"])
+                token = secrets.token_urlsafe(32)
+                updated = self._conn.execute(
+                    """
+                    UPDATE automation_deliveries
+                    SET status = 'delivering', attempt = attempt + 1, worker_id = ?,
+                        lease_token_hash = ?, lease_expires_at = ?,
+                        recovery_safe = 1, updated_at = ?
+                    WHERE delivery_id = ? AND status = 'pending'
+                    """,
+                    (
+                        owner,
+                        _token_hash(token),
+                        now + lease,
+                        now,
+                        delivery_id,
+                    ),
+                )
+                if not updated.rowcount:
+                    continue
+                delivery_row = self._conn.execute(
+                    "SELECT job_id, run_id FROM automation_deliveries WHERE delivery_id = ?",
+                    (delivery_id,),
+                ).fetchone()
+                assert delivery_row is not None
+                self._record_event_locked(
+                    "automation.delivery.started",
+                    job_id=str(delivery_row["job_id"]),
+                    run_id=str(delivery_row["run_id"]),
+                    now=now,
+                    delivery_id=delivery_id,
+                    attempt=int(
+                        self._conn.execute(
+                            "SELECT attempt FROM automation_deliveries WHERE delivery_id = ?",
+                            (delivery_id,),
+                        ).fetchone()["attempt"]
+                    ),
+                )
+                claimed.append((delivery_id, token))
+        return [
+            self._delivery_lease_from_ids(delivery_id, token)
+            for delivery_id, token in claimed
+        ]
+
+    def claim_delivery_for_run(
+        self,
+        run_id: str,
+        *,
+        workspace: Path | str,
+        worker_id: str,
+        lease_seconds: float = 60.0,
+    ) -> AutomationDeliveryLease | None:
+        run_identifier = _identifier(run_id, "run id")
+        root = _workspace(workspace)
+        owner = _identifier(worker_id, "worker id")
+        lease = _lease_seconds(lease_seconds)
+        claimed: tuple[str, str] | None = None
+        with self._transaction():
+            now = self._clock()
+            self._recover_expired_deliveries_locked(now, workspace=root)
+            row = self._conn.execute(
+                """
+                SELECT deliveries.delivery_id
+                FROM automation_deliveries AS deliveries
+                JOIN automation_jobs AS jobs ON jobs.job_id = deliveries.job_id
+                WHERE jobs.workspace = ? AND deliveries.run_id = ?
+                  AND deliveries.status = 'pending'
+                LIMIT 1
+                """,
+                (root, run_identifier),
+            ).fetchone()
+            if row is None:
+                return None
+            delivery_id = str(row["delivery_id"])
+            token = secrets.token_urlsafe(32)
+            updated = self._conn.execute(
+                """
+                UPDATE automation_deliveries
+                SET status = 'delivering', attempt = attempt + 1, worker_id = ?,
+                    lease_token_hash = ?, lease_expires_at = ?,
+                    recovery_safe = 1, updated_at = ?
+                WHERE delivery_id = ? AND status = 'pending'
+                """,
+                (
+                    owner,
+                    _token_hash(token),
+                    now + lease,
+                    now,
+                    delivery_id,
+                ),
+            )
+            if not updated.rowcount:
+                return None
+            delivery_row = self._conn.execute(
+                """
+                SELECT job_id, run_id, attempt
+                FROM automation_deliveries
+                WHERE delivery_id = ?
+                """,
+                (delivery_id,),
+            ).fetchone()
+            assert delivery_row is not None
+            self._record_event_locked(
+                "automation.delivery.started",
+                job_id=str(delivery_row["job_id"]),
+                run_id=str(delivery_row["run_id"]),
+                now=now,
+                delivery_id=delivery_id,
+                attempt=int(delivery_row["attempt"]),
+            )
+            claimed = (delivery_id, token)
+        assert claimed is not None
+        return self._delivery_lease_from_ids(*claimed)
+
+    def mark_delivery_dispatch_started(
+        self, delivery_id: str, token: str
+    ) -> AutomationDelivery:
+        identifier = _identifier(delivery_id, "delivery id")
+        with self._transaction():
+            now = self._clock()
+            row = self._owned_delivery_locked(identifier, token, now)
+            self._conn.execute(
+                """
+                UPDATE automation_deliveries
+                SET recovery_safe = 0, updated_at = ?
+                WHERE delivery_id = ? AND status = 'delivering'
+                """,
+                (now, identifier),
+            )
+            self._record_event_locked(
+                "automation.delivery.dispatch_started",
+                job_id=str(row["job_id"]),
+                run_id=str(row["run_id"]),
+                now=now,
+                delivery_id=identifier,
+            )
+        return self._required_delivery(identifier)
+
+    def finish_delivery(
+        self,
+        delivery_id: str,
+        token: str,
+        *,
+        status: Literal["delivered", "failed", "ambiguous"],
+        response_status: int | None = None,
+        error: str | None = None,
+    ) -> AutomationDelivery:
+        identifier = _identifier(delivery_id, "delivery id")
+        if response_status is not None and (
+            type(response_status) is not int or not 100 <= response_status <= 599
+        ):
+            raise ValueError("response_status must be an HTTP status code")
+        if status == "delivered" and (
+            response_status is None or not 200 <= response_status <= 299
+        ):
+            raise ValueError("delivered webhook requires a 2xx response_status")
+        if status == "failed" and (
+            response_status is not None and 200 <= response_status <= 299
+        ):
+            raise ValueError("failed webhook cannot use a 2xx response_status")
+        if status == "ambiguous" and response_status is not None:
+            raise ValueError("ambiguous webhook cannot include response_status")
+        normalized_error = _optional_bounded_text(error, MAX_ERROR_BYTES)
+        with self._transaction():
+            now = self._clock()
+            row = self._owned_delivery_locked(identifier, token, now)
+            if status in {"delivered", "ambiguous"} and bool(row["recovery_safe"]):
+                raise AutomationError(
+                    f"automation delivery {identifier!r} has not crossed its dispatch fence"
+                )
+            self._conn.execute(
+                """
+                UPDATE automation_deliveries
+                SET status = ?, response_status = ?, last_error = ?,
+                    lease_token_hash = NULL, lease_expires_at = NULL,
+                    updated_at = ?, finished_at = ?
+                WHERE delivery_id = ? AND status = 'delivering'
+                """,
+                (
+                    status,
+                    response_status,
+                    normalized_error,
+                    now,
+                    now,
+                    identifier,
+                ),
+            )
+            self._record_event_locked(
+                f"automation.delivery.{status}",
+                job_id=str(row["job_id"]),
+                run_id=str(row["run_id"]),
+                now=now,
+                delivery_id=identifier,
+                response_status=response_status,
+                error=normalized_error,
+            )
+        return self._required_delivery(identifier)
+
+    def recover_expired_deliveries(
+        self, *, workspace: Path | str | None = None
+    ) -> list[str]:
+        root = _workspace(workspace) if workspace is not None else None
+        with self._transaction():
+            return self._recover_expired_deliveries_locked(
+                self._clock(), workspace=root
+            )
 
     def recover_expired(
         self, *, workspace: Path | str | None = None
@@ -983,6 +1329,11 @@ class AutomationStore:
                         )
                       AND status <> 'running' AND finished_at IS NOT NULL
                       AND finished_at < ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM automation_deliveries AS deliveries
+                          WHERE deliveries.run_id = automation_runs.run_id
+                            AND deliveries.status IN ('pending','delivering')
+                      )
                 )
                 """,
                 (root, cutoff),
@@ -994,6 +1345,11 @@ class AutomationStore:
                         SELECT job_id FROM automation_jobs WHERE workspace = ?
                     )
                   AND status <> 'running' AND finished_at IS NOT NULL AND finished_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM automation_deliveries AS deliveries
+                      WHERE deliveries.run_id = automation_runs.run_id
+                        AND deliveries.status IN ('pending','delivering')
+                  )
                 """,
                 (root, cutoff),
             )
@@ -1119,6 +1475,7 @@ class AutomationStore:
                 scheduled_for=_from_epoch(scheduled_for).isoformat(),
                 reason="misfire_grace_exceeded",
             )
+            self._enqueue_delivery_locked(job.job_id, run_id, now)
 
     def _recover_expired_locked(
         self, now: float, *, workspace: str | None = None
@@ -1168,7 +1525,121 @@ class AutomationStore:
                 now=now,
                 reason="lease_expired",
             )
+            self._enqueue_delivery_locked(job_id, run_id, now)
             recovered.append(run_id)
+        return recovered
+
+    def _enqueue_delivery_locked(self, job_id: str, run_id: str, now: float) -> None:
+        job_row = self._conn.execute(
+            """
+            SELECT webhook_url, webhook_secret_env
+            FROM automation_jobs
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        assert job_row is not None
+        webhook_url = str(job_row["webhook_url"] or "")
+        if not webhook_url:
+            return
+        delivery_id = self._delivery_id(run_id)
+        inserted = self._conn.execute(
+            """
+            INSERT OR IGNORE INTO automation_deliveries (
+                delivery_id, run_id, job_id, webhook_url, webhook_secret_env,
+                status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                delivery_id,
+                run_id,
+                job_id,
+                webhook_url,
+                (
+                    str(job_row["webhook_secret_env"])
+                    if job_row["webhook_secret_env"]
+                    else None
+                ),
+                now,
+                now,
+            ),
+        )
+        if inserted.rowcount:
+            self._record_event_locked(
+                "automation.delivery.queued",
+                job_id=job_id,
+                run_id=run_id,
+                now=now,
+                delivery_id=delivery_id,
+            )
+
+    def _recover_expired_deliveries_locked(
+        self, now: float, *, workspace: str | None = None
+    ) -> list[str]:
+        workspace_clause = " AND jobs.workspace = ?" if workspace is not None else ""
+        parameters: tuple[Any, ...] = (
+            (now, workspace) if workspace is not None else (now,)
+        )
+        rows = self._conn.execute(
+            """
+            SELECT deliveries.*
+            FROM automation_deliveries AS deliveries
+            JOIN automation_jobs AS jobs ON jobs.job_id = deliveries.job_id
+            WHERE deliveries.status = 'delivering'
+              AND deliveries.lease_expires_at IS NOT NULL
+              AND deliveries.lease_expires_at <= ?
+            """
+            + workspace_clause
+            + " ORDER BY deliveries.lease_expires_at, deliveries.delivery_id",
+            parameters,
+        ).fetchall()
+        recovered: list[str] = []
+        for row in rows:
+            delivery_id = str(row["delivery_id"])
+            job_id = str(row["job_id"])
+            run_id = str(row["run_id"])
+            if bool(row["recovery_safe"]):
+                self._conn.execute(
+                    """
+                    UPDATE automation_deliveries
+                    SET status = 'pending', worker_id = NULL,
+                        lease_token_hash = NULL, lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE delivery_id = ? AND status = 'delivering'
+                    """,
+                    (now, delivery_id),
+                )
+                event_type = "automation.delivery.requeued"
+                payload = {"reason": "lease_expired_before_dispatch"}
+            else:
+                error = (
+                    "automation webhook delivery lease expired after dispatch "
+                    "started; outcome is ambiguous"
+                )
+                self._conn.execute(
+                    """
+                    UPDATE automation_deliveries
+                    SET status = 'ambiguous', lease_token_hash = NULL,
+                        lease_expires_at = NULL, last_error = ?,
+                        updated_at = ?, finished_at = ?
+                    WHERE delivery_id = ? AND status = 'delivering'
+                    """,
+                    (error, now, now, delivery_id),
+                )
+                event_type = "automation.delivery.ambiguous"
+                payload = {
+                    "reason": "lease_expired_after_dispatch",
+                    "error": error,
+                }
+            self._record_event_locked(
+                event_type,
+                job_id=job_id,
+                run_id=run_id,
+                now=now,
+                delivery_id=delivery_id,
+                **payload,
+            )
+            recovered.append(delivery_id)
         return recovered
 
     def _owned_run_locked(self, run_id: str, token: str, now: float) -> sqlite3.Row:
@@ -1187,6 +1658,31 @@ class AutomationStore:
             raise AutomationError(f"automation run {run_id!r} belongs to another lease")
         return row
 
+    def _owned_delivery_locked(
+        self, delivery_id: str, token: str, now: float
+    ) -> sqlite3.Row:
+        row = self._conn.execute(
+            "SELECT * FROM automation_deliveries WHERE delivery_id = ?",
+            (delivery_id,),
+        ).fetchone()
+        if row is None:
+            raise AutomationError(f"automation delivery not found: {delivery_id}")
+        if str(row["status"]) != "delivering":
+            raise AutomationError(
+                f"automation delivery {delivery_id!r} is not delivering"
+            )
+        if row["lease_expires_at"] is None or float(row["lease_expires_at"]) <= now:
+            raise AutomationError(
+                f"automation delivery {delivery_id!r} lease expired"
+            )
+        if not secrets.compare_digest(
+            str(row["lease_token_hash"] or ""), _token_hash(token)
+        ):
+            raise AutomationError(
+                f"automation delivery {delivery_id!r} belongs to another lease"
+            )
+        return row
+
     def _required_job(self, reference: str, *, workspace: Path | str) -> AutomationJob:
         job = self.get_job(reference, workspace=workspace)
         if job is None:
@@ -1199,6 +1695,21 @@ class AutomationStore:
             raise AutomationError(f"automation run not found: {run_id}")
         return run
 
+    def _delivery_unscoped(self, delivery_id: str) -> AutomationDelivery | None:
+        identifier = _identifier(delivery_id, "delivery id")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM automation_deliveries WHERE delivery_id = ?",
+                (identifier,),
+            ).fetchone()
+        return _delivery_from_row(row) if row is not None else None
+
+    def _required_delivery(self, delivery_id: str) -> AutomationDelivery:
+        delivery = self._delivery_unscoped(delivery_id)
+        if delivery is None:  # pragma: no cover - internal invariant
+            raise AutomationError(f"automation delivery not found: {delivery_id}")
+        return delivery
+
     def _lease_from_ids(self, run_id: str, token: str) -> AutomationRunLease:
         run = self._required_run(run_id)
         with self._lock:
@@ -1210,9 +1721,33 @@ class AutomationStore:
         job = self._required_job(run.job_id, workspace=str(row["workspace"]))
         return AutomationRunLease(job=job, run=run, token=token)
 
+    def _delivery_lease_from_ids(
+        self, delivery_id: str, token: str
+    ) -> AutomationDeliveryLease:
+        delivery = self._required_delivery(delivery_id)
+        run = self._required_run(delivery.run_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM automation_jobs WHERE job_id = ?",
+                (delivery.job_id,),
+            ).fetchone()
+        assert row is not None
+        job = _job_from_row(row)
+        return AutomationDeliveryLease(
+            job=job,
+            run=run,
+            delivery=delivery,
+            token=token,
+        )
+
     def _scheduled_run_id(self, job_id: str, scheduled_for: float) -> str:
         key = f"ash-automation:{job_id}:{scheduled_for:.6f}"
         return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+
+    def _delivery_id(self, run_id: str) -> str:
+        return str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"ash-automation-delivery:{run_id}")
+        )
 
     def _record_event_locked(
         self,
@@ -1299,6 +1834,10 @@ def _job_from_row(row: sqlite3.Row) -> AutomationJob:
         misfire_grace_seconds=int(row["misfire_grace_seconds"]),
         timeout_seconds=float(row["timeout_seconds"]),
         token_budget=int(row["token_budget"]),
+        webhook_url=str(row["webhook_url"]) if row["webhook_url"] else None,
+        webhook_secret_env=(
+            str(row["webhook_secret_env"]) if row["webhook_secret_env"] else None
+        ),
         created_at=_from_epoch(float(row["created_at"])),
         updated_at=_from_epoch(float(row["updated_at"])),
         last_run_at=_optional_from_epoch(row["last_run_at"]),
@@ -1337,6 +1876,30 @@ def _run_from_row(row: sqlite3.Row) -> AutomationRun:
         estimated_completion_tokens=int(row["estimated_completion_tokens"]),
         estimated_cost_usd=float(row["estimated_cost_usd"]),
         trigger=str(row["trigger"]),  # type: ignore[arg-type]
+    )
+
+
+def _delivery_from_row(row: sqlite3.Row) -> AutomationDelivery:
+    return AutomationDelivery(
+        delivery_id=str(row["delivery_id"]),
+        run_id=str(row["run_id"]),
+        job_id=str(row["job_id"]),
+        webhook_url=str(row["webhook_url"]),
+        webhook_secret_env=(
+            str(row["webhook_secret_env"]) if row["webhook_secret_env"] else None
+        ),
+        status=cast(AutomationDeliveryStatus, str(row["status"])),
+        attempt=int(row["attempt"]),
+        created_at=_from_epoch(float(row["created_at"])),
+        updated_at=_from_epoch(float(row["updated_at"])),
+        worker_id=str(row["worker_id"]) if row["worker_id"] else None,
+        lease_expires_at=_optional_from_epoch(row["lease_expires_at"]),
+        recovery_safe=bool(row["recovery_safe"]),
+        response_status=(
+            int(row["response_status"]) if row["response_status"] is not None else None
+        ),
+        last_error=str(row["last_error"]) if row["last_error"] else None,
+        finished_at=_optional_from_epoch(row["finished_at"]),
     )
 
 

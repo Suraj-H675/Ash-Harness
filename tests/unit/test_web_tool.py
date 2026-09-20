@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import socket
+import threading
 
 import httpx
 import pytest
 
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy, PolicyAction
-from ash.tools.web import WebFetchTool, _resolve_public_addresses, _validate_public_url
+from ash.tools.web import (
+    WebFetchTool,
+    _PinnedPublicTransport,
+    _resolve_public_addresses,
+    _resolve_public_addresses_with_timeout,
+    _validate_public_url,
+)
 
 
 @pytest.fixture
@@ -156,6 +163,56 @@ def test_web_fetch_rejects_private_and_non_http_hosts(monkeypatch) -> None:
 def test_web_fetch_rejects_shared_address_space(literal: str) -> None:
     with pytest.raises(ValueError, match="non-public"):
         _resolve_public_addresses(literal)
+
+
+@pytest.mark.asyncio
+async def test_public_dns_resolution_timeout_does_not_block_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+
+    def stalled_resolver(hostname: str) -> tuple[str, ...]:
+        del hostname
+        release.wait(1)
+        return ("93.184.216.34",)
+
+    monkeypatch.setattr("ash.tools.web._resolve_public_addresses", stalled_resolver)
+    try:
+        with pytest.raises(ValueError, match="DNS resolution timed out"):
+            await _resolve_public_addresses_with_timeout(
+                "stalled.example", timeout_seconds=0.01
+            )
+    finally:
+        release.set()
+
+
+@pytest.mark.asyncio
+async def test_pinned_transport_reuses_preflight_addresses_without_dns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _PinnedPublicTransport(pinned_addresses=("93.184.216.34",))
+    observed: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(request)
+        return httpx.Response(204)
+
+    transport._transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses",
+        lambda hostname: (_ for _ in ()).throw(AssertionError(f"unexpected DNS: {hostname}")),
+    )
+    try:
+        response = await transport.handle_async_request(
+            httpx.Request("POST", "https://example.com/hook")
+        )
+    finally:
+        await transport.aclose()
+
+    assert response.status_code == 204
+    assert len(observed) == 1
+    assert observed[0].url.host == "93.184.216.34"
+    assert observed[0].headers["host"] == "example.com"
 
 
 def test_web_fetch_accepts_global_ipv4_and_ipv6() -> None:

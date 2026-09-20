@@ -169,6 +169,88 @@ def test_cron_cli_requires_trust_and_reports_machine_readable_errors(
     assert "limit must be between 1 and 1000" in invalid_limit["error"]
 
 
+def test_cron_cli_webhook_configuration_and_delivery_history(
+    cron_environment: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace, db_directory = cron_environment
+    set_workspace_trusted(workspace, True)
+
+    assert (
+        main(
+            _cron(
+                db_directory,
+                "add",
+                "delivered job",
+                "--prompt",
+                "Report result",
+                "--every",
+                "1h",
+                "--webhook-url",
+                "https://example.com/ash-hook",
+                "--webhook-secret-env",
+                "ASH_WEBHOOK_SECRET",
+                "--json",
+            )
+        )
+        == 0
+    )
+    created = json.loads(capsys.readouterr().out)
+    assert created["webhook"] == {
+        "target": "https://example.com/…",
+        "secret_env": "ASH_WEBHOOK_SECRET",
+    }
+
+    with AutomationStore(db_directory / "automation.db") as store:
+        claim = store.claim_manual(
+            created["job_id"],
+            workspace=workspace,
+            worker_id="cli-test-worker",
+        )
+        store.finish_run(
+            claim.run.run_id,
+            claim.token,
+            status="succeeded",
+            response="complete",
+        )
+
+    assert (
+        main(
+            _cron(
+                db_directory,
+                "deliveries",
+                created["job_id"],
+                "--json",
+            )
+        )
+        == 0
+    )
+    deliveries = json.loads(capsys.readouterr().out)
+    assert len(deliveries) == 1
+    assert deliveries[0]["status"] == "pending"
+    assert deliveries[0]["webhook_target"] == "https://example.com/…"
+    assert deliveries[0]["webhook_secret_env"] == "ASH_WEBHOOK_SECRET"
+
+    assert (
+        main(
+            _cron(
+                db_directory,
+                "add",
+                "bad webhook",
+                "--prompt",
+                "No",
+                "--every",
+                "1h",
+                "--webhook-url",
+                "http://example.com/insecure",
+                "--json",
+            )
+        )
+        == 2
+    )
+    assert "must use https" in json.loads(capsys.readouterr().out)["error"]
+
+
 def test_cron_cli_disabled_mode_blocks_enabling_operations(
     cron_environment: tuple[Path, Path],
     capsys: pytest.CaptureFixture[str],

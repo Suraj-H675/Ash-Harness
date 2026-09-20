@@ -8,7 +8,9 @@ import signal
 from collections.abc import Callable
 from typing import Any
 
+from ash.automation.delivery import webhook_display_target
 from ash.automation.models import (
+    AutomationDelivery,
     AutomationJob,
     AutomationRun,
     AutomationWorkerSummary,
@@ -76,6 +78,14 @@ def job_payload(job: AutomationJob, *, include_prompt: bool = False) -> dict[str
         "misfire_grace_seconds": job.misfire_grace_seconds,
         "timeout_seconds": job.timeout_seconds,
         "token_budget": job.token_budget,
+        "webhook": (
+            {
+                "target": webhook_display_target(job.webhook_url),
+                "secret_env": job.webhook_secret_env,
+            }
+            if job.webhook_url is not None
+            else None
+        ),
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
     }
@@ -151,6 +161,13 @@ def render_job(job: AutomationJob, *, json_output: bool = False) -> str:
         lines.append(f"Last run: {job.last_run_status} at {payload['last_run_at']}")
     if job.last_error:
         lines.append(f"Last error: {job.last_error}")
+    if job.webhook_url:
+        signing = (
+            f" (HMAC secret: ${job.webhook_secret_env})"
+            if job.webhook_secret_env
+            else ""
+        )
+        lines.append(f"Webhook: {webhook_display_target(job.webhook_url)}{signing}")
     return "\n".join(lines)
 
 
@@ -170,6 +187,60 @@ def render_runs(runs: list[AutomationRun], *, json_output: bool = False) -> str:
         )
         if run.error:
             lines.append(f"  error: {run.error}")
+    return "\n".join(lines)
+
+
+def delivery_payload(delivery: AutomationDelivery) -> dict[str, Any]:
+    return {
+        "delivery_id": delivery.delivery_id,
+        "run_id": delivery.run_id,
+        "job_id": delivery.job_id,
+        "status": delivery.status,
+        "attempt": delivery.attempt,
+        "webhook_target": webhook_display_target(delivery.webhook_url),
+        "webhook_secret_env": delivery.webhook_secret_env,
+        "worker_id": delivery.worker_id,
+        "lease_expires_at": (
+            delivery.lease_expires_at.isoformat()
+            if delivery.lease_expires_at is not None
+            else None
+        ),
+        "recovery_safe": delivery.recovery_safe,
+        "response_status": delivery.response_status,
+        "last_error": delivery.last_error,
+        "created_at": delivery.created_at.isoformat(),
+        "updated_at": delivery.updated_at.isoformat(),
+        "finished_at": (
+            delivery.finished_at.isoformat()
+            if delivery.finished_at is not None
+            else None
+        ),
+    }
+
+
+def render_deliveries(
+    deliveries: list[AutomationDelivery], *, json_output: bool = False
+) -> str:
+    if json_output:
+        return json.dumps(
+            [delivery_payload(delivery) for delivery in deliveries],
+            sort_keys=True,
+        )
+    if not deliveries:
+        return "No automation webhook deliveries found."
+    lines: list[str] = []
+    for delivery in deliveries:
+        status = (
+            f" http={delivery.response_status}"
+            if delivery.response_status is not None
+            else ""
+        )
+        lines.append(
+            f"{delivery.delivery_id}  {delivery.status}  "
+            f"run={delivery.run_id} attempts={delivery.attempt}{status}"
+        )
+        if delivery.last_error:
+            lines.append(f"  error: {delivery.last_error}")
     return "\n".join(lines)
 
 
@@ -280,6 +351,8 @@ def create_job_from_cli(
     misfire_grace_seconds: int,
     timeout_seconds: float,
     token_budget: int,
+    webhook_url: str | None = None,
+    webhook_secret_env: str | None = None,
 ) -> AutomationJob:
     schedule = build_schedule(
         at=at,
@@ -296,4 +369,6 @@ def create_job_from_cli(
             misfire_grace_seconds=misfire_grace_seconds,
             timeout_seconds=timeout_seconds,
             token_budget=token_budget,
+            webhook_url=webhook_url,
+            webhook_secret_env=webhook_secret_env,
         )

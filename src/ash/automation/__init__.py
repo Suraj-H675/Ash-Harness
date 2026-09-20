@@ -1,6 +1,9 @@
 """Durable unattended automation for Ash."""
 
 from ash.automation.models import (
+    AutomationDelivery,
+    AutomationDeliveryLease,
+    AutomationDeliveryStatus,
     AutomationJob,
     AutomationRun,
     AutomationRunLease,
@@ -19,6 +22,9 @@ from ash.automation.store import (
 
 __all__ = [
     "AutomationError",
+    "AutomationDelivery",
+    "AutomationDeliveryLease",
+    "AutomationDeliveryStatus",
     "AutomationJob",
     "AutomationRun",
     "AutomationRunLease",

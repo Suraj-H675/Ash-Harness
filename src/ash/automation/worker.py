@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
 import time
+import threading
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol
 
 from ash.automation.models import (
+    AutomationDeliveryLease,
     AutomationRun,
     AutomationRunLease,
     AutomationWorkerSummary,
+)
+from ash.automation.delivery import (
+    post_webhook,
+    prepare_webhook,
 )
 from ash.automation.store import (
     AutomationError,
@@ -24,6 +31,8 @@ from ash.automation.store import (
 )
 from ash.config import AshConfig
 from ash.core.redaction import redact_text
+from ash.providers.readiness import provider_runtime_environment
+from ash.safety.environment import SAFE_ENV_KEYS, SAFE_ENV_PREFIXES
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import ScopedIOError
 from ash.safety.trust import is_workspace_trusted
@@ -96,6 +105,131 @@ def _directory_identity(path: Path) -> tuple[int, int] | None:
     return (metadata.st_dev, metadata.st_ino)
 
 
+_PROCESS_DUMPABLE_LOCK = threading.Lock()
+_PROCESS_DUMPABLE_USERS = 0
+_PROCESS_DUMPABLE_ORIGINAL: int | None = None
+
+
+def _linux_process_dumpable(*, value: int | None = None) -> int:
+    """Read or set Linux process dumpability without a hard ctypes dependency elsewhere."""
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    operation = 3 if value is None else 4  # PR_GET_DUMPABLE / PR_SET_DUMPABLE
+    argument = 0 if value is None else value
+    result = int(libc.prctl(operation, argument, 0, 0, 0))
+    if result == -1:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    return result
+
+
+@contextlib.contextmanager
+def _protect_worker_parent_environment(
+    enabled: bool,
+    *,
+    platform_name: str | None = None,
+):
+    """Hide a webhook-bearing worker's environment from Linux child ``/proc`` reads.
+
+    Automation preserves its historical runtime environment for compatibility, while
+    the webhook signing variable itself is removed from the model child. On Linux the
+    child could otherwise still read the worker parent's initial environment through
+    ``/proc/<pid>/environ``. Process dumpability is global, so concurrent webhook jobs
+    share a ref-counted guard and the original state is restored only for the last one.
+    """
+
+    if not enabled:
+        yield
+        return
+    platform = sys.platform if platform_name is None else platform_name
+    if not platform.startswith("linux"):
+        raise AutomationError(
+            "signed automation webhooks require parent-process environment "
+            "isolation that is currently supported only on Linux"
+        )
+
+    global _PROCESS_DUMPABLE_USERS, _PROCESS_DUMPABLE_ORIGINAL
+    with _PROCESS_DUMPABLE_LOCK:
+        if _PROCESS_DUMPABLE_USERS == 0:
+            try:
+                original = _linux_process_dumpable()
+                if original != 0:
+                    _linux_process_dumpable(value=0)
+            except OSError as exc:
+                raise AutomationError(
+                    "automation subprocess was not started: could not protect the "
+                    "worker environment from child process inspection"
+                ) from exc
+            _PROCESS_DUMPABLE_ORIGINAL = original
+        _PROCESS_DUMPABLE_USERS += 1
+    try:
+        yield
+    finally:
+        with _PROCESS_DUMPABLE_LOCK:
+            _PROCESS_DUMPABLE_USERS -= 1
+            if _PROCESS_DUMPABLE_USERS == 0:
+                restore = _PROCESS_DUMPABLE_ORIGINAL
+                _PROCESS_DUMPABLE_ORIGINAL = None
+                if restore is not None and restore != 0:
+                    try:
+                        _linux_process_dumpable(value=restore)
+                    except OSError as exc:
+                        _log.warning(
+                            "automation worker could not restore Linux process "
+                            "dumpability: {}",
+                            redact_text(str(exc)),
+                        )
+
+
+_AUTOMATION_CHILD_CAPABILITY_ENV_NAMES = frozenset(
+    {
+        "ASH_A2A_TOKEN",
+        "ASH_ENABLE_TIKTOKEN_DOWNLOAD",
+        "BRAVE_SEARCH_API_KEY",
+        "TAVILY_API_KEY",
+    }
+)
+
+
+def _environment_name_key(name: str, *, platform_name: str | None = None) -> str:
+    platform = os.name if platform_name is None else platform_name
+    return name.casefold() if platform == "nt" else name
+
+
+def _environment_names_overlap(
+    first: set[str] | frozenset[str],
+    second: set[str] | frozenset[str],
+    *,
+    platform_name: str | None = None,
+) -> bool:
+    left = {
+        _environment_name_key(name, platform_name=platform_name) for name in first
+    }
+    right = {
+        _environment_name_key(name, platform_name=platform_name) for name in second
+    }
+    return not left.isdisjoint(right)
+
+
+def _webhook_secret_conflicts_with_child_runtime(
+    config: AshConfig, secret_name: str
+) -> bool:
+    required_names = set(SAFE_ENV_KEYS)
+    required_names.update(_AUTOMATION_CHILD_CAPABILITY_ENV_NAMES)
+    required_names.update(config.command_env_allowlist)
+    required_names.update(provider_runtime_environment(config))
+    required_names.update({"PYTHONUNBUFFERED", INHERIT_PROCESS_GROUP_ENV})
+    secret_key = _environment_name_key(secret_name)
+    if any(
+        secret_key.startswith(_environment_name_key(prefix))
+        for prefix in SAFE_ENV_PREFIXES
+    ):
+        return True
+    return _environment_names_overlap({secret_name}, required_names)
+
+
 class _SubprocessAutomationClient:
     """Run one unattended turn in a killable process group."""
 
@@ -108,6 +242,7 @@ class _SubprocessAutomationClient:
         workspace: Path,
         *,
         expected_workspace_identity: tuple[int, int] | None = None,
+        blocked_environment_names: frozenset[str] = frozenset(),
     ) -> None:
         self._config = config
         self._guard = SafetyGuard(workspace)
@@ -117,6 +252,7 @@ class _SubprocessAutomationClient:
             if expected_workspace_identity is not None
             else _directory_identity(self._workspace)
         )
+        self._blocked_environment_names = blocked_environment_names
         self._process: asyncio.subprocess.Process | None = None
         self._process_tree_plan: ProcessTreePlan | None = None
 
@@ -136,9 +272,37 @@ class _SubprocessAutomationClient:
             "prompt": text,
             "user_metadata": user_metadata,
         }
-        environment = dict(os.environ)
+        for blocked_name in self._blocked_environment_names:
+            if _webhook_secret_conflicts_with_child_runtime(
+                self._config, blocked_name
+            ):
+                raise AutomationError(
+                    "webhook signing environment variable is required by the automation "
+                    "subprocess; use a dedicated webhook secret variable"
+                )
+        blocked_keys = {
+            _environment_name_key(name) for name in self._blocked_environment_names
+        }
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if _environment_name_key(key) not in blocked_keys
+        }
         environment["PYTHONUNBUFFERED"] = "1"
         environment[INHERIT_PROCESS_GROUP_ENV] = "1"
+        if any(_environment_name_key(key) in blocked_keys for key in environment):
+            raise AutomationError(
+                "webhook signing environment variable could not be isolated from the "
+                "automation subprocess"
+            )
+        with _protect_worker_parent_environment(bool(self._blocked_environment_names)):
+            return await self._prompt_subprocess(request, environment)
+
+    async def _prompt_subprocess(
+        self,
+        request: dict[str, Any],
+        environment: dict[str, str],
+    ) -> AshResult:
         command = [sys.executable, "-I", "-m", "ash.automation.runner"]
         try:
             with prepare_scoped_process_launch(
@@ -353,6 +517,8 @@ class AutomationWorkerService:
                     _log.info("automation worker resumed after: {}", paused_reason)
                     paused_reason = None
                 self._heartbeat()
+                await self._deliver_pending_batch()
+                self._heartbeat()
                 if not self._tasks:
                     await self._run_maintenance()
                     self._heartbeat()
@@ -378,6 +544,12 @@ class AutomationWorkerService:
                     self._claims[claim.run.run_id] = claim
                 if once:
                     await self._wait_for_once_batch(summary)
+                    await self._deliver_run_webhooks(
+                        [
+                            *(run.run_id for run in skipped),
+                            *(claim.run.run_id for claim in claims),
+                        ]
+                    )
                     return summary
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self.poll_seconds)
@@ -401,7 +573,9 @@ class AutomationWorkerService:
                 worker_id=self.worker_id,
                 lease_seconds=self.lease_seconds,
             )
-            return await self.execute(claim)
+            run = await self.execute(claim)
+            await self._deliver_run_webhooks([run.run_id])
+            return run
         finally:
             self.store.remove_worker(self.worker_id)
 
@@ -428,6 +602,11 @@ class AutomationWorkerService:
                     config,
                     self.workspace,
                     expected_workspace_identity=self._workspace_identity,
+                    blocked_environment_names=(
+                        frozenset({claim.job.webhook_secret_env})
+                        if claim.job.webhook_secret_env
+                        else frozenset()
+                    ),
                 )
             else:
                 candidate = await self._client_factory(config, self.workspace)
@@ -838,6 +1017,99 @@ class AutomationWorkerService:
                 self._on_run_finished(run)
             except Exception:
                 pass
+
+    async def _deliver_pending_batch(self) -> None:
+        claims = self.store.claim_pending_deliveries(
+            workspace=self.workspace,
+            worker_id=self.worker_id,
+            lease_seconds=max(self.lease_seconds, 30.0),
+            limit=min(self.max_concurrent_runs, 4),
+        )
+        if not claims:
+            return
+        await self._deliver_claims(claims)
+
+    async def _deliver_run_webhooks(self, run_ids: list[str]) -> None:
+        claims: list[AutomationDeliveryLease] = []
+        for run_id in dict.fromkeys(run_ids):
+            claim = self.store.claim_delivery_for_run(
+                run_id,
+                workspace=self.workspace,
+                worker_id=self.worker_id,
+                lease_seconds=max(self.lease_seconds, 30.0),
+            )
+            if claim is not None:
+                claims.append(claim)
+        if claims:
+            await self._deliver_claims(claims)
+
+    async def _deliver_claims(
+        self, claims: list[AutomationDeliveryLease]
+    ) -> None:
+        results = await asyncio.gather(
+            *(self._deliver_webhook(claim) for claim in claims),
+            return_exceptions=True,
+        )
+        for claim, result in zip(claims, results, strict=True):
+            if isinstance(result, BaseException):
+                _log.warning(
+                    "automation webhook delivery {} did not settle: {}",
+                    claim.delivery.delivery_id,
+                    redact_text(str(result)),
+                )
+
+    async def _deliver_webhook(self, claim: AutomationDeliveryLease) -> None:
+        delivery_id = claim.delivery.delivery_id
+        try:
+            prepared = await prepare_webhook(claim)
+        except Exception as exc:  # noqa: BLE001 - pre-dispatch is safe to fail
+            try:
+                self.store.finish_delivery(
+                    delivery_id,
+                    claim.token,
+                    status="failed",
+                    error=redact_text(str(exc)),
+                )
+            except AutomationError:
+                pass
+            return
+        try:
+            self.store.mark_delivery_dispatch_started(delivery_id, claim.token)
+        except AutomationError:
+            return
+        try:
+            status_code = await post_webhook(prepared)
+        except Exception as exc:  # noqa: BLE001 - every post-fence error is ambiguous
+            try:
+                self.store.finish_delivery(
+                    delivery_id,
+                    claim.token,
+                    status="ambiguous",
+                    error=redact_text(str(exc)),
+                )
+            except AutomationError:
+                pass
+            return
+        try:
+            if 200 <= status_code <= 299:
+                self.store.finish_delivery(
+                    delivery_id,
+                    claim.token,
+                    status="delivered",
+                    response_status=status_code,
+                )
+            else:
+                self.store.finish_delivery(
+                    delivery_id,
+                    claim.token,
+                    status="failed",
+                    response_status=status_code,
+                    error=f"automation webhook returned HTTP {status_code}",
+                )
+        except AutomationError:
+            # A response arrived after our durable lease expired. Recovery owns
+            # the now-unsafe delivery and will classify it as ambiguous.
+            return
 
     async def _cancel_task(
         self,

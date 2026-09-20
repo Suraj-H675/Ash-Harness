@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+import threading
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -202,12 +203,27 @@ def _host_allowed(hostname: str, allowed_domains: tuple[str, ...]) -> bool:
 class _PinnedPublicTransport(httpx.AsyncBaseTransport):
     """Resolve and pin each outbound connection to a vetted public address."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        pinned_addresses: tuple[str, ...] | None = None,
+    ) -> None:
         self._transport = httpx.AsyncHTTPTransport()
+        if pinned_addresses is None:
+            self._pinned_addresses = None
+        else:
+            normalized: list[str] = []
+            for address in pinned_addresses:
+                normalized.extend(_resolve_public_addresses(address))
+            self._pinned_addresses = tuple(dict.fromkeys(normalized))
+            if not self._pinned_addresses:
+                raise ValueError("pinned public transport requires at least one address")
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         hostname = request.url.host
-        addresses = await asyncio.to_thread(_resolve_public_addresses, hostname)
+        addresses = self._pinned_addresses
+        if addresses is None:
+            addresses = await asyncio.to_thread(_resolve_public_addresses, hostname)
         last_error: httpx.ConnectError | httpx.ConnectTimeout | None = None
         for address in addresses:
             extensions = dict(request.extensions)
@@ -228,6 +244,67 @@ class _PinnedPublicTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self) -> None:
         await self._transport.aclose()
+
+
+async def _resolve_public_addresses_with_timeout(
+    hostname: str,
+    *,
+    timeout_seconds: float,
+) -> tuple[str, ...]:
+    """Resolve a public host without allowing libc DNS to stall the event loop.
+
+    ``socket.getaddrinfo`` has no portable per-call timeout. Run it in a daemon
+    thread so a stuck resolver cannot keep the Ash process alive, and bound the
+    caller's wait explicitly. The thread may finish later, but it cannot block
+    worker shutdown.
+    """
+
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int | float)
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("DNS timeout must be positive")
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[tuple[str, ...]] = loop.create_future()
+
+    def publish_result(
+        result: tuple[str, ...] | None,
+        error: BaseException | None,
+    ) -> None:
+        if future.done():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            assert result is not None
+            future.set_result(result)
+
+    def resolve() -> None:
+        try:
+            result = _resolve_public_addresses(hostname)
+        except BaseException as exc:
+            try:
+                loop.call_soon_threadsafe(publish_result, None, exc)
+            except RuntimeError:
+                pass
+        else:
+            try:
+                loop.call_soon_threadsafe(publish_result, result, None)
+            except RuntimeError:
+                pass
+
+    threading.Thread(
+        target=resolve,
+        name="ash-public-dns",
+        daemon=True,
+    ).start()
+    try:
+        async with asyncio.timeout(float(timeout_seconds)):
+            return await future
+    except TimeoutError as exc:
+        future.cancel()
+        raise ValueError(f"DNS resolution timed out for host {hostname!r}") from exc
 
 
 def _resolve_public_addresses(hostname: str) -> tuple[str, ...]:

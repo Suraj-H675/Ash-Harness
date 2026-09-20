@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import io
 import json
 import os
 import sqlite3
+import subprocess
 import stat
 import sys
 from contextlib import contextmanager
@@ -13,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from ash.automation.schedules import (
@@ -21,7 +25,13 @@ from ash.automation.schedules import (
     next_fire_time,
     parse_duration,
 )
-from ash.automation.models import AutomationWorkerSummary
+from ash.automation.models import AutomationJob, AutomationWorkerSummary, ScheduleSpec
+from ash.automation.delivery import (
+    PreparedWebhook,
+    WebhookDeliveryError,
+    post_webhook,
+    prepare_webhook,
+)
 from ash.automation.runner import (
     MAX_AUTOMATION_PROMPT_BYTES,
     _execute as execute_automation_subprocess_request,
@@ -63,6 +73,30 @@ def test_schedule_validation_and_named_timezone() -> None:
         build_schedule(cron="0 9 * * 1", now=now)
     with pytest.raises(ValueError, match="future"):
         build_schedule(at=now.isoformat(), now=now)
+
+
+def test_automation_job_preserves_legacy_constructor_contract() -> None:
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    job = AutomationJob(
+        "job-id",
+        "nightly",
+        "Review project health",
+        "/workspace",
+        ScheduleSpec("every", "1h"),
+        True,
+        None,
+        86_400,
+        1800.0,
+        100_000,
+        now,
+        now,
+    )
+
+    assert job.created_at == now
+    assert job.updated_at == now
+    assert job.webhook_url is None
+    assert job.webhook_secret_env is None
 
 
 def test_automation_store_rejects_linked_database_file_and_parent(
@@ -216,6 +250,214 @@ async def test_automation_subprocess_runner_uses_isolated_python(
         "-I",
         "-m",
         "ash.automation.runner",
+    )
+
+
+@pytest.mark.asyncio
+async def test_automation_subprocess_isolates_only_webhook_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.automation.worker import (
+        _SubprocessAutomationClient,
+        _linux_process_dumpable,
+    )
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    captured: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+    async def fake_spawn(*args, **kwargs):
+        del args
+        captured["env"] = kwargs["env"]
+        if sys.platform.startswith("linux"):
+            captured["dumpable_during_spawn"] = _linux_process_dumpable()
+        return Process()
+
+    async def fake_communicate(*args, **kwargs):
+        del args, kwargs
+        return (
+            b'ASH_AUTOMATION_RESULT={"ok":true,"result":{"response":"ok",'
+            b'"session_id":"session","model":"fake/model","context_tokens":1}}\n',
+            b"",
+        )
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "provider-secret")
+    monkeypatch.setenv("ASH_AUTOMATION_WEBHOOK_SECRET", "webhook-secret")
+    monkeypatch.setenv("ASH_TOOL_TOKEN", "tool-token")
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "search-secret")
+    monkeypatch.setenv("ASH_A2A_TOKEN", "a2a-secret")
+    monkeypatch.setenv("MCP_TOKEN", "mcp-secret")
+    monkeypatch.setenv("UNRELATED_PARENT_SECRET", "unrelated-secret")
+    monkeypatch.setattr(
+        "ash.automation.worker.asyncio.create_subprocess_exec", fake_spawn
+    )
+    monkeypatch.setattr("ash.automation.worker.communicate_process", fake_communicate)
+    client = _SubprocessAutomationClient(
+        AshConfig(
+            workspace_root=workspace,
+            model="openrouter/vendor/agent",
+            command_env_allowlist=["ASH_TOOL_TOKEN"],
+        ),
+        workspace,
+        blocked_environment_names=frozenset({"ASH_AUTOMATION_WEBHOOK_SECRET"}),
+    )
+
+    dumpable_before = (
+        _linux_process_dumpable() if sys.platform.startswith("linux") else None
+    )
+    result = await client.prompt("run")
+
+    assert result.response == "ok"
+    if sys.platform.startswith("linux"):
+        assert captured["dumpable_during_spawn"] == 0
+        assert _linux_process_dumpable() == dumpable_before
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    assert environment["OPENROUTER_API_KEY"] == "provider-secret"
+    assert environment["ASH_TOOL_TOKEN"] == "tool-token"
+    assert environment["BRAVE_SEARCH_API_KEY"] == "search-secret"
+    assert environment["ASH_A2A_TOKEN"] == "a2a-secret"
+    assert environment["MCP_TOKEN"] == "mcp-secret"
+    assert environment["UNRELATED_PARENT_SECRET"] == "unrelated-secret"
+    assert "ASH_AUTOMATION_WEBHOOK_SECRET" not in environment
+
+
+@pytest.mark.asyncio
+async def test_automation_subprocess_rejects_webhook_secret_provider_overlap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.automation.worker import _SubprocessAutomationClient
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "shared-secret")
+    create = AsyncMock(side_effect=AssertionError("automation must not launch"))
+    monkeypatch.setattr(
+        "ash.automation.worker.asyncio.create_subprocess_exec", create
+    )
+    client = _SubprocessAutomationClient(
+        AshConfig(workspace_root=workspace, model="openrouter/vendor/agent"),
+        workspace,
+        blocked_environment_names=frozenset({"OPENROUTER_API_KEY"}),
+    )
+
+    with pytest.raises(AutomationError, match="required by the automation subprocess"):
+        await client.prompt("run")
+
+    create.assert_not_awaited()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Linux parent-environment protection regression",
+)
+@pytest.mark.asyncio
+async def test_automation_subprocess_fails_closed_when_parent_env_cannot_be_protected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.automation.worker import _SubprocessAutomationClient
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    create = AsyncMock(side_effect=AssertionError("automation must not launch"))
+    monkeypatch.setattr(
+        "ash.automation.worker._linux_process_dumpable",
+        lambda **kwargs: (_ for _ in ()).throw(OSError("prctl unavailable")),
+    )
+    monkeypatch.setattr(
+        "ash.automation.worker.asyncio.create_subprocess_exec", create
+    )
+    client = _SubprocessAutomationClient(
+        AshConfig(workspace_root=workspace),
+        workspace,
+        blocked_environment_names=frozenset({"ASH_AUTOMATION_WEBHOOK_SECRET"}),
+    )
+
+    with pytest.raises(AutomationError, match="could not protect the worker environment"):
+        await client.prompt("run")
+
+    create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_automation_subprocess_rejects_operational_webhook_secret_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.automation.worker import _SubprocessAutomationClient
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    create = AsyncMock(side_effect=AssertionError("automation must not launch"))
+    monkeypatch.setattr(
+        "ash.automation.worker.asyncio.create_subprocess_exec", create
+    )
+    client = _SubprocessAutomationClient(
+        AshConfig(workspace_root=workspace),
+        workspace,
+        blocked_environment_names=frozenset({"HOME"}),
+    )
+
+    with pytest.raises(AutomationError, match="required by the automation subprocess"):
+        await client.prompt("run")
+
+    create.assert_not_awaited()
+
+
+def test_signed_automation_webhook_fails_closed_without_parent_env_isolation() -> None:
+    from ash.automation.worker import _protect_worker_parent_environment
+
+    with pytest.raises(AutomationError, match="currently supported only on Linux"):
+        with _protect_worker_parent_environment(True, platform_name="darwin"):
+            pytest.fail("unsupported platform must not enter protected scope")
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Linux /proc environment privacy regression",
+)
+def test_automation_parent_environment_is_hidden_from_child_proc_reads() -> None:
+    from ash.automation.worker import _protect_worker_parent_environment
+
+    parent_environ = f"/proc/{os.getpid()}/environ"
+    probe = (
+        "import pathlib,sys; "
+        "path=pathlib.Path(sys.argv[1]); "
+        "\ntry: path.open('rb').read(1)"
+        "\nexcept PermissionError: raise SystemExit(13)"
+        "\nexcept OSError: raise SystemExit(12)"
+        "\nraise SystemExit(0)"
+    )
+
+    def probe_parent() -> int:
+        return subprocess.run(
+            [sys.executable, "-c", probe, parent_environ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+
+    if probe_parent() != 0:
+        pytest.skip("parent /proc environment is already unreadable")
+    with _protect_worker_parent_environment(True):
+        assert probe_parent() == 13
+    assert probe_parent() == 0
+
+
+def test_automation_environment_name_matching_is_case_insensitive_on_windows() -> None:
+    from ash.automation.worker import _environment_names_overlap
+
+    assert _environment_names_overlap(
+        {"openai_api_key"}, {"OPENAI_API_KEY"}, platform_name="nt"
+    )
+    assert not _environment_names_overlap(
+        {"openai_api_key"}, {"OPENAI_API_KEY"}, platform_name="posix"
     )
 
 
@@ -1166,7 +1408,7 @@ def test_store_migrates_true_v1_run_rows_to_v2(tmp_path: Path) -> None:
         }
         version = int(migrated._conn.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == AUTOMATION_SCHEMA_VERSION == 2
+    assert version == AUTOMATION_SCHEMA_VERSION == 3
     assert {
         "cache_read_tokens",
         "cache_write_tokens",
@@ -1180,6 +1422,808 @@ def test_store_migrates_true_v1_run_rows_to_v2(tmp_path: Path) -> None:
     assert runs[0].completion_tokens == 3
     assert runs[0].usage_source == "unavailable"
     assert runs[0].cache_read_tokens == 0
+
+
+def test_store_migrates_true_v2_jobs_to_v3(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-v2.db"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    with AutomationStore(database) as initial:
+        job = initial.create_job(
+            name="legacy job",
+            prompt="Keep me",
+            workspace=workspace,
+            schedule=build_schedule(every="1h"),
+            enabled=False,
+        )
+
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            PRAGMA foreign_keys=OFF;
+            DROP TABLE automation_deliveries;
+            ALTER TABLE automation_jobs RENAME TO automation_jobs_v3;
+            CREATE TABLE automation_jobs (
+                job_id TEXT PRIMARY KEY,
+                workspace TEXT NOT NULL,
+                name TEXT NOT NULL COLLATE NOCASE,
+                prompt TEXT NOT NULL,
+                schedule_kind TEXT NOT NULL CHECK(schedule_kind IN ('at','every','cron')),
+                schedule_value TEXT NOT NULL,
+                schedule_timezone TEXT NOT NULL,
+                schedule_anchor_at REAL,
+                enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+                next_run_at REAL,
+                misfire_grace_seconds INTEGER NOT NULL
+                    CHECK(misfire_grace_seconds BETWEEN 0 AND 2592000),
+                timeout_seconds REAL NOT NULL CHECK(timeout_seconds BETWEEN 1 AND 86400),
+                token_budget INTEGER NOT NULL CHECK(token_budget BETWEEN 1 AND 10000000),
+                last_run_at REAL,
+                last_run_status TEXT,
+                last_error TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                deleted_at REAL
+            );
+            INSERT INTO automation_jobs
+            SELECT job_id, workspace, name, prompt, schedule_kind, schedule_value,
+                   schedule_timezone, schedule_anchor_at, enabled, next_run_at,
+                   misfire_grace_seconds, timeout_seconds, token_budget,
+                   last_run_at, last_run_status, last_error, consecutive_failures,
+                   created_at, updated_at, deleted_at
+            FROM automation_jobs_v3;
+            DROP TABLE automation_jobs_v3;
+            PRAGMA user_version=2;
+            """
+        )
+
+    with AutomationStore(database) as migrated:
+        loaded = migrated.get_job(job.job_id, workspace=workspace)
+        job_columns = {
+            str(row["name"])
+            for row in migrated._conn.execute(
+                "PRAGMA table_info(automation_jobs)"
+            ).fetchall()
+        }
+        delivery_table = migrated._conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name='automation_deliveries'"
+        ).fetchone()[0]
+        version = int(migrated._conn.execute("PRAGMA user_version").fetchone()[0])
+
+    assert version == AUTOMATION_SCHEMA_VERSION == 3
+    assert {"webhook_url", "webhook_secret_env"} <= job_columns
+    assert delivery_table == 1
+    assert loaded is not None
+    assert loaded.prompt == "Keep me"
+    assert loaded.webhook_url is None
+    assert loaded.webhook_secret_env is None
+
+
+def test_webhook_job_configuration_is_validated_and_persisted(
+    tmp_path: Path, store: AutomationStore
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    with pytest.raises(ValueError, match="must use https"):
+        store.create_job(
+            name="bad webhook",
+            prompt="No",
+            workspace=workspace,
+            schedule=build_schedule(every="1h"),
+            webhook_url="http://example.com/hook",
+        )
+    with pytest.raises(ValueError, match="query string"):
+        store.create_job(
+            name="query secret",
+            prompt="No",
+            workspace=workspace,
+            schedule=build_schedule(every="1h"),
+            webhook_url="https://example.com/hook?token=secret",
+        )
+    with pytest.raises(ValueError, match="requires webhook_url"):
+        store.create_job(
+            name="orphan secret",
+            prompt="No",
+            workspace=workspace,
+            schedule=build_schedule(every="1h"),
+            webhook_secret_env="ASH_WEBHOOK_SECRET",
+        )
+    with pytest.raises(ValueError, match="control characters"):
+        store.create_job(
+            name="header injection",
+            prompt="No",
+            workspace=workspace,
+            schedule=build_schedule(every="1h"),
+            webhook_url="https://example.com/ok\r\nX-Test: injected",
+        )
+
+    job = store.create_job(
+        name="webhook",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+        webhook_secret_env="ASH_WEBHOOK_SECRET",
+    )
+
+    assert job.webhook_url == "https://example.com/hook"
+    assert job.webhook_secret_env == "ASH_WEBHOOK_SECRET"
+
+
+def test_webhook_delivery_recovery_never_replays_ambiguous_dispatch(
+    tmp_path: Path, clock: list[float], store: AutomationStore
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="delivery",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+    )
+    run_claim = store.claim_manual(
+        job.job_id,
+        workspace=workspace,
+        worker_id="run-worker",
+        lease_seconds=5,
+    )
+    finished = store.finish_run(
+        run_claim.run.run_id,
+        run_claim.token,
+        status="succeeded",
+        response="done",
+    )
+    deliveries = store.list_deliveries(workspace=workspace)
+    assert len(deliveries) == 1
+    assert deliveries[0].run_id == finished.run_id
+    assert deliveries[0].status == "pending"
+    assert deliveries[0].attempt == 0
+
+    first = store.claim_pending_deliveries(
+        workspace=workspace,
+        worker_id="delivery-worker",
+        lease_seconds=5,
+    )
+    assert len(first) == 1
+    assert first[0].delivery.status == "delivering"
+    assert first[0].delivery.recovery_safe is True
+    assert first[0].delivery.attempt == 1
+
+    clock[0] += 6
+    assert store.recover_expired_deliveries(workspace=workspace) == [
+        first[0].delivery.delivery_id
+    ]
+    recovered = store.get_delivery(first[0].delivery.delivery_id, workspace=workspace)
+    assert recovered is not None
+    assert recovered.status == "pending"
+    assert recovered.attempt == 1
+
+    second = store.claim_pending_deliveries(
+        workspace=workspace,
+        worker_id="delivery-worker-2",
+        lease_seconds=5,
+    )
+    assert len(second) == 1
+    fenced = store.mark_delivery_dispatch_started(
+        second[0].delivery.delivery_id, second[0].token
+    )
+    assert fenced.recovery_safe is False
+
+    clock[0] += 6
+    assert store.recover_expired_deliveries(workspace=workspace) == [
+        fenced.delivery_id
+    ]
+    ambiguous = store.get_delivery(fenced.delivery_id, workspace=workspace)
+    assert ambiguous is not None
+    assert ambiguous.status == "ambiguous"
+    assert "outcome is ambiguous" in (ambiguous.last_error or "")
+    assert (
+        store.claim_pending_deliveries(
+            workspace=workspace,
+            worker_id="delivery-worker-3",
+            lease_seconds=5,
+        )
+        == []
+    )
+
+
+def test_webhook_delivery_getter_is_workspace_scoped(
+    tmp_path: Path, store: AutomationStore
+) -> None:
+    workspace = tmp_path / "repo"
+    other_workspace = tmp_path / "other"
+    workspace.mkdir()
+    other_workspace.mkdir()
+    job = store.create_job(
+        name="scoped delivery",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+    )
+    run_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker"
+    )
+    store.finish_run(run_claim.run.run_id, run_claim.token, status="succeeded")
+    delivery = store.list_deliveries(workspace=workspace)[0]
+
+    assert store.get_delivery(delivery.delivery_id, workspace=workspace) == delivery
+    assert store.get_delivery(delivery.delivery_id, workspace=other_workspace) is None
+
+
+def test_webhook_delivery_terminal_success_requires_dispatch_fence(
+    tmp_path: Path, store: AutomationStore
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="fenced terminal state",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+    )
+    run_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker"
+    )
+    store.finish_run(run_claim.run.run_id, run_claim.token, status="succeeded")
+    delivery_claim = store.claim_pending_deliveries(
+        workspace=workspace, worker_id="delivery-worker"
+    )[0]
+    delivery_id = delivery_claim.delivery.delivery_id
+
+    with pytest.raises(AutomationError, match="dispatch fence"):
+        store.finish_delivery(
+            delivery_id,
+            delivery_claim.token,
+            status="delivered",
+            response_status=204,
+        )
+    with pytest.raises(AutomationError, match="dispatch fence"):
+        store.finish_delivery(
+            delivery_id,
+            delivery_claim.token,
+            status="ambiguous",
+            error="unknown outcome",
+        )
+
+    still_owned = store.get_delivery(delivery_id, workspace=workspace)
+    assert still_owned is not None
+    assert still_owned.status == "delivering"
+    assert still_owned.recovery_safe is True
+
+    with pytest.raises(ValueError, match="failed webhook cannot use a 2xx"):
+        store.finish_delivery(
+            delivery_id,
+            delivery_claim.token,
+            status="failed",
+            response_status=204,
+        )
+    with pytest.raises(ValueError, match="ambiguous webhook cannot include"):
+        store.finish_delivery(
+            delivery_id,
+            delivery_claim.token,
+            status="ambiguous",
+            response_status=503,
+        )
+
+    failed = store.finish_delivery(
+        delivery_id,
+        delivery_claim.token,
+        status="failed",
+        error="pre-dispatch validation failed",
+    )
+    assert failed.status == "failed"
+    assert failed.recovery_safe is True
+
+
+def test_webhook_delivery_claim_is_atomic_across_store_connections(
+    tmp_path: Path, clock: list[float], store: AutomationStore
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="single owner delivery",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+    )
+    run_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker"
+    )
+    store.finish_run(run_claim.run.run_id, run_claim.token, status="succeeded")
+
+    second_store = AutomationStore(store.db_path, clock=lambda: clock[0])
+    try:
+        first = store.claim_pending_deliveries(
+            workspace=workspace, worker_id="delivery-worker-a"
+        )
+        second = second_store.claim_pending_deliveries(
+            workspace=workspace, worker_id="delivery-worker-b"
+        )
+    finally:
+        second_store.close()
+
+    assert len(first) == 1
+    assert second == []
+    assert first[0].delivery.attempt == 1
+
+
+def test_run_retention_preserves_pending_webhook_outbox(
+    tmp_path: Path, clock: list[float], store: AutomationStore
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="retained delivery",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+    )
+    run_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker"
+    )
+    finished = store.finish_run(
+        run_claim.run.run_id,
+        run_claim.token,
+        status="succeeded",
+    )
+    clock[0] += 2 * 86_400
+
+    assert store.prune_runs(workspace=workspace, older_than_days=1) == 0
+    assert store.get_run(finished.run_id) is not None
+
+    delivery_claim = store.claim_pending_deliveries(
+        workspace=workspace,
+        worker_id="delivery-worker",
+    )[0]
+    store.mark_delivery_dispatch_started(
+        delivery_claim.delivery.delivery_id,
+        delivery_claim.token,
+    )
+    store.finish_delivery(
+        delivery_claim.delivery.delivery_id,
+        delivery_claim.token,
+        status="delivered",
+        response_status=204,
+    )
+
+    assert store.prune_runs(workspace=workspace, older_than_days=1) == 1
+    assert store.get_run(finished.run_id) is None
+
+
+def test_webhook_delivery_survives_job_removal(
+    tmp_path: Path, store: AutomationStore
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="removed delivery",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+    )
+    run_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker"
+    )
+    finished = store.finish_run(
+        run_claim.run.run_id,
+        run_claim.token,
+        status="succeeded",
+    )
+    store.remove_job(job.job_id, workspace=workspace)
+
+    claimed = store.claim_pending_deliveries(
+        workspace=workspace,
+        worker_id="delivery-worker",
+    )
+
+    assert len(claimed) == 1
+    assert claimed[0].job.job_id == job.job_id
+    assert claimed[0].run.run_id == finished.run_id
+    assert claimed[0].delivery.run_id == finished.run_id
+
+
+def test_webhook_delivery_can_target_new_run_without_draining_older_backlog(
+    tmp_path: Path, store: AutomationStore
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="targeted delivery",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+    )
+    first_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker-1"
+    )
+    first_run = store.finish_run(
+        first_claim.run.run_id,
+        first_claim.token,
+        status="succeeded",
+    )
+    second_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker-2"
+    )
+    second_run = store.finish_run(
+        second_claim.run.run_id,
+        second_claim.token,
+        status="succeeded",
+    )
+
+    targeted = store.claim_delivery_for_run(
+        second_run.run_id,
+        workspace=workspace,
+        worker_id="delivery-worker",
+    )
+
+    assert targeted is not None
+    assert targeted.run.run_id == second_run.run_id
+    deliveries = store.list_deliveries(workspace=workspace)
+    by_run = {delivery.run_id: delivery for delivery in deliveries}
+    assert by_run[first_run.run_id].status == "pending"
+    assert by_run[second_run.run_id].status == "delivering"
+
+
+@pytest.mark.asyncio
+async def test_webhook_preflight_builds_stable_signed_payload(
+    tmp_path: Path,
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="signed delivery",
+        prompt="TOP SECRET PROMPT",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+        webhook_secret_env="ASH_WEBHOOK_SECRET",
+    )
+    run_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker"
+    )
+    store.finish_run(
+        run_claim.run.run_id,
+        run_claim.token,
+        status="succeeded",
+        response="safe result",
+        prompt_tokens=7,
+        completion_tokens=3,
+    )
+    delivery_claim = store.claim_pending_deliveries(
+        workspace=workspace,
+        worker_id="delivery-worker",
+    )[0]
+    monkeypatch.setattr(
+        "ash.automation.delivery._resolve_public_addresses_with_timeout",
+        AsyncMock(return_value=("93.184.216.34",)),
+    )
+
+    prepared = await prepare_webhook(
+        delivery_claim,
+        environ={"ASH_WEBHOOK_SECRET": "signing-secret"},
+    )
+
+    payload = json.loads(prepared.body)
+    assert prepared.headers["Idempotency-Key"] == delivery_claim.delivery.delivery_id
+    assert prepared.headers["X-Ash-Delivery-Id"] == delivery_claim.delivery.delivery_id
+    expected = hmac.new(
+        b"signing-secret", prepared.body, hashlib.sha256
+    ).hexdigest()
+    assert prepared.headers["X-Ash-Signature"] == f"sha256={expected}"
+    assert payload["job"] == {"job_id": job.job_id, "name": "signed delivery"}
+    assert payload["run"]["response"] == "safe result"
+    assert payload["run"]["prompt_tokens"] == 7
+    assert "prompt" not in payload["job"]
+    assert "workspace" not in payload["job"]
+
+
+@pytest.mark.asyncio
+async def test_webhook_preflight_rejects_private_target(
+    tmp_path: Path,
+    store: AutomationStore,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="private webhook",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://127.0.0.1/hook",
+    )
+    run_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker"
+    )
+    store.finish_run(run_claim.run.run_id, run_claim.token, status="succeeded")
+    delivery_claim = store.claim_pending_deliveries(
+        workspace=workspace,
+        worker_id="delivery-worker",
+    )[0]
+
+    with pytest.raises(WebhookDeliveryError, match="non-public"):
+        await prepare_webhook(delivery_claim)
+
+
+@pytest.mark.asyncio
+async def test_webhook_sender_does_not_follow_redirects() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            302,
+            headers={"location": "https://other.example/redirected"},
+        )
+
+    prepared = PreparedWebhook(
+        url="https://example.com/hook",
+        body=b'{"ok":true}',
+        headers={
+            "Content-Type": "application/json",
+            "Idempotency-Key": "delivery-id",
+        },
+    )
+
+    status = await post_webhook(
+        prepared,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert status == 302
+    assert len(requests) == 1
+    assert str(requests[0].url) == "https://example.com/hook"
+
+
+@pytest.mark.asyncio
+async def test_worker_fences_webhook_before_network_dispatch(
+    tmp_path: Path,
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="fenced webhook",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+    )
+    run_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker"
+    )
+    store.finish_run(run_claim.run.run_id, run_claim.token, status="succeeded")
+    delivery_claim = store.claim_pending_deliveries(
+        workspace=workspace,
+        worker_id="delivery-worker",
+    )[0]
+    monkeypatch.setattr(
+        "ash.automation.delivery._resolve_public_addresses_with_timeout",
+        AsyncMock(return_value=("93.184.216.34",)),
+    )
+    observed: dict[str, bool] = {}
+
+    async def fake_post(prepared) -> int:
+        del prepared
+        current = store.get_delivery(delivery_claim.delivery.delivery_id, workspace=workspace)
+        assert current is not None
+        observed["recovery_safe"] = current.recovery_safe
+        return 204
+
+    monkeypatch.setattr("ash.automation.worker.post_webhook", fake_post)
+    service = AutomationWorkerService(store, workspace)
+
+    await service._deliver_webhook(delivery_claim)
+
+    finished = store.get_delivery(delivery_claim.delivery.delivery_id, workspace=workspace)
+    assert observed == {"recovery_safe": False}
+    assert finished is not None
+    assert finished.status == "delivered"
+    assert finished.response_status == 204
+
+
+@pytest.mark.asyncio
+async def test_worker_marks_uncertain_webhook_transport_ambiguous(
+    tmp_path: Path,
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="uncertain webhook",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+    )
+    run_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker"
+    )
+    store.finish_run(run_claim.run.run_id, run_claim.token, status="succeeded")
+    delivery_claim = store.claim_pending_deliveries(
+        workspace=workspace,
+        worker_id="delivery-worker",
+    )[0]
+    monkeypatch.setattr(
+        "ash.automation.delivery._resolve_public_addresses_with_timeout",
+        AsyncMock(return_value=("93.184.216.34",)),
+    )
+
+    async def fail_post(prepared) -> int:
+        del prepared
+        raise WebhookDeliveryError("transport outcome unknown")
+
+    monkeypatch.setattr("ash.automation.worker.post_webhook", fail_post)
+    service = AutomationWorkerService(store, workspace)
+
+    await service._deliver_webhook(delivery_claim)
+
+    finished = store.get_delivery(delivery_claim.delivery.delivery_id, workspace=workspace)
+    assert finished is not None
+    assert finished.status == "ambiguous"
+    assert finished.recovery_safe is False
+    assert finished.last_error == "transport outcome unknown"
+    assert (
+        store.claim_pending_deliveries(
+            workspace=workspace,
+            worker_id="another-worker",
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_dns_preflight_timeout_fails_before_dispatch_fence(
+    tmp_path: Path,
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="dns timeout",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+    )
+    run_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker"
+    )
+    store.finish_run(run_claim.run.run_id, run_claim.token, status="succeeded")
+    delivery_claim = store.claim_pending_deliveries(
+        workspace=workspace, worker_id="delivery-worker"
+    )[0]
+    monkeypatch.setattr(
+        "ash.automation.delivery._resolve_public_addresses_with_timeout",
+        AsyncMock(side_effect=ValueError("DNS resolution timed out for host 'example.com'")),
+    )
+    post = AsyncMock(return_value=204)
+    monkeypatch.setattr("ash.automation.worker.post_webhook", post)
+
+    await AutomationWorkerService(store, workspace)._deliver_webhook(delivery_claim)
+
+    post.assert_not_awaited()
+    finished = store.get_delivery(
+        delivery_claim.delivery.delivery_id, workspace=workspace
+    )
+    assert finished is not None
+    assert finished.status == "failed"
+    assert finished.recovery_safe is True
+    assert "DNS resolution timed out" in (finished.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_dispatch_when_webhook_signing_secret_is_missing(
+    tmp_path: Path,
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="missing signing secret",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+        webhook_secret_env="ASH_MISSING_WEBHOOK_SECRET",
+    )
+    run_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker"
+    )
+    store.finish_run(run_claim.run.run_id, run_claim.token, status="succeeded")
+    delivery_claim = store.claim_pending_deliveries(
+        workspace=workspace, worker_id="delivery-worker"
+    )[0]
+    monkeypatch.setattr(
+        "ash.automation.delivery._resolve_public_addresses_with_timeout",
+        AsyncMock(return_value=("93.184.216.34",)),
+    )
+    post = AsyncMock(return_value=204)
+    monkeypatch.setattr("ash.automation.worker.post_webhook", post)
+
+    await AutomationWorkerService(store, workspace)._deliver_webhook(delivery_claim)
+
+    post.assert_not_awaited()
+    finished = store.get_delivery(delivery_claim.delivery.delivery_id, workspace=workspace)
+    assert finished is not None
+    assert finished.status == "failed"
+    assert finished.recovery_safe is True
+    assert "ASH_MISSING_WEBHOOK_SECRET" in (finished.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_replay_known_non_success_webhook_response(
+    tmp_path: Path,
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="known webhook failure",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+    )
+    run_claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker"
+    )
+    store.finish_run(run_claim.run.run_id, run_claim.token, status="succeeded")
+    delivery_claim = store.claim_pending_deliveries(
+        workspace=workspace, worker_id="delivery-worker"
+    )[0]
+    monkeypatch.setattr(
+        "ash.automation.delivery._resolve_public_addresses_with_timeout",
+        AsyncMock(return_value=("93.184.216.34",)),
+    )
+    post = AsyncMock(return_value=503)
+    monkeypatch.setattr("ash.automation.worker.post_webhook", post)
+
+    await AutomationWorkerService(store, workspace)._deliver_webhook(delivery_claim)
+
+    post.assert_awaited_once()
+    finished = store.get_delivery(delivery_claim.delivery.delivery_id, workspace=workspace)
+    assert finished is not None
+    assert finished.status == "failed"
+    assert finished.response_status == 503
+    assert finished.recovery_safe is False
+    assert (
+        store.claim_pending_deliveries(
+            workspace=workspace, worker_id="another-worker"
+        )
+        == []
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are unavailable")
@@ -1272,6 +2316,60 @@ class _FakeClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_worker_blocks_webhook_secret_from_default_automation_child(
+    tmp_path: Path,
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="secret isolation",
+        prompt="Run safely",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+        webhook_secret_env="ASH_AUTOMATION_WEBHOOK_SECRET",
+    )
+    claim = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="worker"
+    )
+    captured: dict[str, object] = {}
+    fake = _FakeClient()
+
+    class FakeSubprocessClient:
+        def __init__(
+            self,
+            config,
+            child_workspace,
+            *,
+            expected_workspace_identity=None,
+            blocked_environment_names=frozenset(),
+        ) -> None:
+            del config, child_workspace, expected_workspace_identity
+            captured["blocked"] = blocked_environment_names
+
+        async def prompt(self, text: str, *, user_metadata=None) -> AshResult:
+            return await fake.prompt(text, user_metadata=user_metadata)
+
+        async def close(self) -> None:
+            await fake.close()
+
+    monkeypatch.setattr("ash.automation.worker.is_workspace_trusted", lambda path: True)
+    monkeypatch.setattr(
+        "ash.automation.worker._SubprocessAutomationClient", FakeSubprocessClient
+    )
+    worker = AutomationWorkerService(store, workspace)
+
+    result = await worker.execute(claim)
+
+    assert result.status == "succeeded"
+    assert captured["blocked"] == frozenset({"ASH_AUTOMATION_WEBHOOK_SECRET"})
+    assert fake.closed is True
 
 
 class _GatedClient(_FakeClient):
@@ -2204,13 +3302,18 @@ async def test_automation_tools_separate_read_and_mutating_policy(
         name="nightly review",
         prompt="Review project health",
         every="1h",
+        webhook_url="https://example.com/tool-hook",
+        webhook_secret_env="ASH_TOOL_WEBHOOK_SECRET",
     )
     assert created.success is True
+    created_payload = json.loads(created.output)
+    assert created_payload["webhook_target"] == "https://example.com/…"
+    assert created_payload["webhook_secret_env"] == "ASH_TOOL_WEBHOOK_SECRET"
     listed = await list_tool.run(include_disabled=False)
     assert listed.success is True
     assert "nightly review" in listed.output
 
-    payload = json.loads(created.output)
+    payload = created_payload
     paused = await manage_tool.run(action="pause", job=payload["job_id"])
     assert paused.success is True
     assert json.loads(paused.output)["enabled"] is False

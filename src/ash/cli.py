@@ -2405,6 +2405,14 @@ def main(argv: list[str] | None = None) -> int:
         default=100_000,
         help="Aggregate prompt and completion budget, 1..10000000",
     )
+    cron_add.add_argument(
+        "--webhook-url",
+        help="HTTPS webhook that receives terminal automation run results",
+    )
+    cron_add.add_argument(
+        "--webhook-secret-env",
+        help="Environment variable containing the optional webhook HMAC secret",
+    )
     cron_add.add_argument("--json", action="store_true")
     cron_show = cron_subparsers.add_parser(
         "show", help="Show a schedule and its stored prompt"
@@ -2435,6 +2443,12 @@ def main(argv: list[str] | None = None) -> int:
     cron_history.add_argument("job", nargs="?")
     cron_history.add_argument("--limit", type=int, default=100)
     cron_history.add_argument("--json", action="store_true")
+    cron_deliveries = cron_subparsers.add_parser(
+        "deliveries", help="Show durable webhook delivery status"
+    )
+    cron_deliveries.add_argument("job", nargs="?")
+    cron_deliveries.add_argument("--limit", type=int, default=100)
+    cron_deliveries.add_argument("--json", action="store_true")
     cron_cancel = cron_subparsers.add_parser(
         "cancel", help="Request cancellation of one active run"
     )
@@ -3358,6 +3372,7 @@ def main(argv: list[str] | None = None) -> int:
             automation_store,
             create_job_from_cli,
             job_payload,
+            render_deliveries,
             render_job,
             render_jobs,
             render_runs,
@@ -3462,6 +3477,8 @@ def main(argv: list[str] | None = None) -> int:
                         misfire_grace_seconds=args.misfire_grace,
                         timeout_seconds=args.timeout,
                         token_budget=args.token_budget,
+                        webhook_url=args.webhook_url,
+                        webhook_secret_env=args.webhook_secret_env,
                     )
                     print(
                         json.dumps(
@@ -3551,6 +3568,24 @@ def main(argv: list[str] | None = None) -> int:
                         limit=args.limit,
                     )
                     print(render_runs(runs, json_output=json_output))
+                    return 0
+                if args.cron_action == "deliveries":
+                    job_id = None
+                    if args.job:
+                        delivery_job = cron_store.get_job(
+                            args.job,
+                            workspace=config.workspace_root,
+                            include_deleted=True,
+                        )
+                        if delivery_job is None:
+                            raise AutomationError(f"automation not found: {args.job}")
+                        job_id = delivery_job.job_id
+                    deliveries = cron_store.list_deliveries(
+                        workspace=config.workspace_root,
+                        job_id=job_id,
+                        limit=args.limit,
+                    )
+                    print(render_deliveries(deliveries, json_output=json_output))
                     return 0
                 if args.cron_action == "cancel":
                     run = cron_store.get_run(args.run_id)

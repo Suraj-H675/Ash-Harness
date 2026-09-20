@@ -16,6 +16,13 @@ AutomationRunStatus = Literal[
     "interrupted",
     "skipped",
 ]
+AutomationDeliveryStatus = Literal[
+    "pending",
+    "delivering",
+    "delivered",
+    "failed",
+    "ambiguous",
+]
 UsageSource = Literal["unavailable", "provider", "estimated", "mixed"]
 
 
@@ -47,6 +54,8 @@ class AutomationJob:
     last_run_status: AutomationRunStatus | None = None
     last_error: str | None = None
     consecutive_failures: int = 0
+    webhook_url: str | None = None
+    webhook_secret_env: str | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +90,33 @@ class AutomationRun:
 class AutomationRunLease:
     job: AutomationJob
     run: AutomationRun
+    token: str
+
+
+@dataclass(frozen=True)
+class AutomationDelivery:
+    delivery_id: str
+    run_id: str
+    job_id: str
+    webhook_url: str
+    webhook_secret_env: str | None
+    status: AutomationDeliveryStatus
+    attempt: int
+    created_at: datetime
+    updated_at: datetime
+    worker_id: str | None = None
+    lease_expires_at: datetime | None = None
+    recovery_safe: bool = True
+    response_status: int | None = None
+    last_error: str | None = None
+    finished_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AutomationDeliveryLease:
+    job: AutomationJob
+    run: AutomationRun
+    delivery: AutomationDelivery
     token: str
 
 

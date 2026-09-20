@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, cast
 from ash.agents.shared_state import SharedState
 from ash.agents.tasks import AgentArtifact, AgentTask, AgentTaskEvent, TaskState
 from ash.automation.models import (
+    AutomationDelivery,
     AutomationJob,
     AutomationRun,
     AutomationRunLease,
@@ -418,6 +419,8 @@ class AshClient:
         misfire_grace_seconds: int = 86_400,
         timeout_seconds: float = 1800.0,
         token_budget: int = 100_000,
+        webhook_url: str | None = None,
+        webhook_secret_env: str | None = None,
     ) -> AutomationJob:
         """Create a validated schedule for unattended execution by an Ash worker."""
 
@@ -438,6 +441,8 @@ class AshClient:
                 misfire_grace_seconds=misfire_grace_seconds,
                 timeout_seconds=timeout_seconds,
                 token_budget=token_budget,
+                webhook_url=webhook_url,
+                webhook_secret_env=webhook_secret_env,
             )
 
     def pause_automation(self, reference: str) -> AutomationJob:
@@ -487,6 +492,31 @@ class AshClient:
                     raise AutomationError(f"automation not found: {automation}")
                 job_id = job.job_id
             return store.list_runs(
+                workspace=self.loop.project_root,
+                job_id=job_id,
+                limit=limit,
+            )
+
+    def automation_deliveries(
+        self,
+        automation: str | None = None,
+        *,
+        limit: int = 100,
+    ) -> list[AutomationDelivery]:
+        """Return newest-first webhook delivery state for this workspace."""
+
+        with self._automation_store() as store:
+            job_id = None
+            if automation is not None:
+                job = store.get_job(
+                    automation,
+                    workspace=self.loop.project_root,
+                    include_deleted=True,
+                )
+                if job is None:
+                    raise AutomationError(f"automation not found: {automation}")
+                job_id = job.job_id
+            return store.list_deliveries(
                 workspace=self.loop.project_root,
                 job_id=job_id,
                 limit=limit,

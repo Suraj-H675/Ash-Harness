@@ -41,8 +41,12 @@ def test_sdk_manages_and_claims_workspace_automation(
         misfire_grace_seconds=120,
         timeout_seconds=90,
         token_budget=5000,
+        webhook_url="https://example.com/sdk-hook",
+        webhook_secret_env="ASH_WEBHOOK_SECRET",
     )
 
+    assert created.webhook_url == "https://example.com/sdk-hook"
+    assert created.webhook_secret_env == "ASH_WEBHOOK_SECRET"
     assert client.automation(created.job_id) == created
     assert client.automation("repository REVIEW") == created
     assert client.automations() == [created]
@@ -68,6 +72,10 @@ def test_sdk_manages_and_claims_workspace_automation(
             status="cancelled",
             error="cancelled by SDK test",
         )
+    deliveries = client.automation_deliveries(created.name)
+    assert len(deliveries) == 1
+    assert deliveries[0].run_id == finished.run_id
+    assert deliveries[0].status == "pending"
     assert client.automation_runs(limit=1) == [finished]
 
     removed = client.remove_automation(created.job_id)

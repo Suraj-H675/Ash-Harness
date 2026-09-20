@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from ash.automation.delivery import webhook_display_target
 from ash.automation.schedules import build_schedule, render_schedule
 from ash.automation.store import AutomationError, AutomationStore
 from ash.safety.guard import SafetyGuard
@@ -80,6 +81,8 @@ class ManageAutomationArgs(BaseModel):
     misfire_grace_seconds: int = Field(86_400, ge=0, le=2_592_000)
     timeout_seconds: float = Field(1800, ge=1, le=86_400)
     token_budget: int = Field(100_000, ge=1, le=10_000_000)
+    webhook_url: str | None = Field(None, max_length=2048)
+    webhook_secret_env: str | None = Field(None, max_length=256)
 
     @model_validator(mode="after")
     def validate_action_fields(self) -> "ManageAutomationArgs":
@@ -139,6 +142,8 @@ class ManageAutomationTool(BaseTool):
                         misfire_grace_seconds=args.misfire_grace_seconds,
                         timeout_seconds=args.timeout_seconds,
                         token_budget=args.token_budget,
+                        webhook_url=args.webhook_url,
+                        webhook_secret_env=args.webhook_secret_env,
                     )
                 elif args.action == "pause":
                     job = store.set_enabled(
@@ -160,6 +165,12 @@ class ManageAutomationTool(BaseTool):
                     "next_run_at": (
                         job.next_run_at.isoformat() if job.next_run_at else None
                     ),
+                    "webhook_target": (
+                        webhook_display_target(job.webhook_url)
+                        if job.webhook_url
+                        else None
+                    ),
+                    "webhook_secret_env": job.webhook_secret_env,
                 },
                 ensure_ascii=False,
                 sort_keys=True,

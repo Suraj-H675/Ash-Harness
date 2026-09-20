@@ -25,6 +25,13 @@ ash cron add health-review --prompt 'Review project health' --every 6h
 # Five-field cron in an IANA time zone. Weekdays use names, not numbers.
 ash cron add weekday-review --prompt 'Review open risks' \
   --cron '30 9 * * mon-fri' --timezone Asia/Kolkata
+
+# Deliver terminal run results to one HTTPS webhook. The signing secret is
+# read from the worker environment when delivery happens and is not stored.
+export ASH_AUTOMATION_WEBHOOK_SECRET='replace-me'
+ash cron add release-watch --prompt 'Check release status' --every 30m \
+  --webhook-url 'https://hooks.example.com/ash/result' \
+  --webhook-secret-env ASH_AUTOMATION_WEBHOOK_SECRET
 ```
 
 Use either the job ID or its case-insensitive name:
@@ -36,6 +43,7 @@ ash cron pause weekday-review
 ash cron resume weekday-review
 ash cron run weekday-review
 ash cron history weekday-review --limit 20
+ash cron deliveries weekday-review --limit 20
 ash cron cancel RUN_ID
 ash cron remove weekday-review --yes
 ```
@@ -43,6 +51,51 @@ ash cron remove weekday-review --yes
 Every command that reads or changes structured state also supports `--json`.
 Prompts can be read from standard input with `--prompt -`. Active jobs have a
 case-insensitive unique name within one workspace.
+
+### Webhook result delivery
+
+Webhook delivery is an optional durable outbox attached to a job. Ash snapshots
+the configured target when a run becomes terminal, so a worker restart after
+the model turn does not silently lose a result notification. The public
+contract is intentionally narrow:
+
+- targets must use HTTPS and a public host;
+- embedded URL credentials, query strings, and fragments are rejected;
+- redirects are not followed;
+- DNS is resolved with a bounded pre-dispatch deadline and the connection is
+  pinned to those accepted public addresses, preventing private-address and
+  DNS-rebinding pivots after the dispatch fence;
+- request bodies are bounded JSON and never include the stored automation
+  prompt or local workspace path;
+- `Idempotency-Key` and `X-Ash-Delivery-Id` carry one stable delivery ID;
+- `--webhook-secret-env NAME` adds
+  `X-Ash-Signature: sha256=<HMAC-SHA256(body)>` using the value of `NAME` from
+  the worker environment. Only the environment-variable name is stored. Use a
+  dedicated secret variable: Ash removes that variable from the unattended model
+  child's environment and fails closed for collisions with known provider, command,
+  and built-in runtime variables the child must preserve. On Linux, while that
+  child is alive, the
+  worker also disables process dumpability so the child cannot recover the
+  signing secret from the worker parent via `/proc/<pid>/environ`. Because Ash
+  does not yet have an equivalent parent-process environment isolation primitive
+  on macOS or Windows, unattended jobs configured with `--webhook-secret-env`
+  fail closed there; unsigned webhook delivery remains cross-platform. Do not
+  reuse the signing variable for provider, command, web search, A2A, MCP, plugin,
+  or other tool credentials.
+
+Webhook URLs themselves are stored verbatim because the worker needs the exact
+target. Treat them as sensitive configuration: some providers encode tokens in
+the URL path. Routine CLI and model-facing output therefore shows only the
+redacted target origin/path marker rather than echoing the full path.
+
+Ash does **not** assume that receiving servers honor the idempotency header.
+Immediately before the POST, the worker persists a dispatch fence. If the
+worker dies, times out, or loses the connection after that fence without a
+provable HTTP response, delivery becomes `ambiguous` and is not automatically
+replayed. A lease that expires before the fence is safe to requeue. Known 2xx
+responses become `delivered`; known non-2xx responses become `failed`.
+`ash cron deliveries [JOB]` shows these states. Delivery state never rewrites
+the underlying automation run's success or failure.
 
 ## Run a worker
 
@@ -146,6 +199,12 @@ stored verbatim, so do not put credentials in them. Bounded redacted responses,
 usage, errors, and lifecycle events are also persisted. Credentials are loaded
 at execution and are never copied into a job record.
 
+Webhook signing secrets follow the same rule: the database stores only their
+environment-variable name. Pending or actively leased webhook outbox rows keep
+their terminal run row from being removed by retention maintenance; once
+delivery is terminal (`delivered`, `failed`, or `ambiguous`), ordinary run
+retention applies.
+
 ## Timing and recovery contract
 
 - Intervals are elapsed-time schedules anchored at creation. If several fires
@@ -192,10 +251,13 @@ job = client.create_automation(
     "Review open risks",
     cron="30 9 * * mon-fri",
     timezone="Asia/Kolkata",
+    webhook_url="https://hooks.example.com/ash/result",
+    webhook_secret_env="ASH_AUTOMATION_WEBHOOK_SECRET",
 )
 client.pause_automation(job.job_id)
 client.resume_automation(job.job_id)
 runs = client.automation_runs(job.job_id, limit=20)
+deliveries = client.automation_deliveries(job.job_id, limit=20)
 ```
 
 `claim_automation()` is the low-level external-executor API. It returns a
