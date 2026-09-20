@@ -229,6 +229,45 @@ def test_subprocess_agent_spawn_subprocess_publishes_report(tmp_path: Path) -> N
         ss.close()
 
 
+def test_subprocess_agent_spawn_preserves_worker_contract(tmp_path: Path) -> None:
+    ss = SharedState(tmp_path / "state.db")
+    try:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        agent = SubprocessAgent(
+            agent_id="custom-child",
+            role="docs-specialist",
+            task="inspect docs",
+            shared_state=ss,
+            runner=make_simple_text_task("unused in child"),
+            tool_allowlist=("read_file", "search_text"),
+            token_budget=1234,
+            return_budget=567,
+            metadata={"origin": "integration", "priority": 3},
+            sandbox_tier=2,
+            workspace_root=workspace,
+            allow_custom_role=True,
+        )
+
+        process = agent.spawn_subprocess()
+        stdout, stderr = process.communicate(timeout=10)
+
+        assert process.returncode == 0, stderr or stdout
+        status = ss.get_status("custom-child")
+        assert status is not None
+        assert status.role == "docs-specialist"
+        assert status.status == "completed"
+        assert status.metadata["tool_allowlist"] == ["read_file", "search_text"]
+        assert status.metadata["token_budget"] == 1234
+        assert status.metadata["return_budget"] == 567
+        assert status.metadata["origin"] == "integration"
+        assert status.metadata["priority"] == 3
+        assert status.metadata["sandbox_tier"] == 2
+        assert status.metadata["workspace"] == str(workspace)
+    finally:
+        ss.close()
+
+
 def test_subprocess_agent_rejects_unknown_role(tmp_path: Path) -> None:
     ss = SharedState(tmp_path / "state.db")
     try:

@@ -1,7 +1,13 @@
 # tests/unit/test_subprocess_agent.py
-import pytest
 from unittest.mock import Mock
-from ash.agents.subprocess_agent import SubprocessAgent, make_simple_text_task
+
+import pytest
+
+from ash.agents.subprocess_agent import (
+    MAX_SUBPROCESS_SPEC_BYTES,
+    SubprocessAgent,
+    make_simple_text_task,
+)
 from ash.agents.shared_state import SharedState
 from ash.sandbox._base import SANDBOX_TIER_SCOPED
 import tempfile
@@ -71,9 +77,38 @@ def test_spawn_subprocess_does_not_inherit_provider_secrets(
 
     environment = captured["env"]
     assert captured["command"][1:4] == ["-I", "-m", "ash.agents._agent_driver"]
+    assert "test task" not in captured["command"]
     assert "OPENROUTER_API_KEY" not in environment
     assert "ASH_MODEL" not in environment
     assert environment["ASH_WORKSPACE_ROOT"] == str(workspace)
+
+
+def test_spawn_subprocess_rejects_unserializable_metadata(shared_state) -> None:
+    agent = SubprocessAgent(
+        agent_id="bad-metadata",
+        role="general",
+        task="test task",
+        shared_state=shared_state,
+        runner=make_simple_text_task("done"),
+        metadata={"invalid": object()},
+    )
+
+    with pytest.raises(ValueError, match="not JSON-serializable"):
+        agent.spawn_subprocess()
+
+
+def test_spawn_subprocess_rejects_oversized_spec(shared_state) -> None:
+    agent = SubprocessAgent(
+        agent_id="oversized",
+        role="general",
+        task="test task",
+        shared_state=shared_state,
+        runner=make_simple_text_task("done"),
+        metadata={"large": "x" * MAX_SUBPROCESS_SPEC_BYTES},
+    )
+
+    with pytest.raises(ValueError, match="specification exceeds"):
+        agent.spawn_subprocess()
 
 
 def test_subagent_spec_sandbox_tier_default():

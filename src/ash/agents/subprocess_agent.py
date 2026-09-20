@@ -20,9 +20,11 @@ so the orchestrator can poll without blocking. It also pushes a final
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +64,7 @@ class AgentReport:
 # A task is just an async callable that takes a context dict and
 # returns either a string (summary) or a full AgentReport.
 TaskFn = Callable[[dict[str, Any]], Awaitable[AgentReport | str]]
+MAX_SUBPROCESS_SPEC_BYTES = 256 * 1024
 
 
 # --- the agent class ------------------------------------------------------
@@ -154,6 +157,12 @@ class SubprocessAgent:
                 "tool_allowlist": list(self.tool_allowlist),
                 "token_budget": self.token_budget,
                 "return_budget": self.return_budget,
+                "sandbox_tier": self.sandbox_tier,
+                **(
+                    {"workspace": str(self.workspace_root)}
+                    if self.workspace_root is not None
+                    else {}
+                ),
                 **self._metadata,
             },
         )
@@ -236,19 +245,43 @@ class SubprocessAgent:
         rather than stdout.
         """
 
+        spec = {
+            "version": 1,
+            "agent_id": self.agent_id,
+            "db_path": str(self.shared_state.db_path),
+            "role": self.role,
+            "task": self.task,
+            "tool_allowlist": list(self.tool_allowlist),
+            "token_budget": self.token_budget,
+            "return_budget": self.return_budget,
+            "metadata": dict(self._metadata),
+            "sandbox_tier": self.sandbox_tier,
+            "workspace_root": (
+                str(self.workspace_root) if self.workspace_root is not None else ""
+            ),
+            "allow_custom_role": self.role not in AGENT_ROLES,
+        }
+        try:
+            encoded_spec = json.dumps(
+                spec,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("subagent subprocess metadata is not JSON-serializable") from exc
+        if len(encoded_spec) > MAX_SUBPROCESS_SPEC_BYTES:
+            raise ValueError(
+                f"subagent subprocess specification exceeds {MAX_SUBPROCESS_SPEC_BYTES} bytes"
+            )
+
         cmd: list[str] = [
             python_executable or sys.executable,
             "-I",
             "-m",
             "ash.agents._agent_driver",
-            "--agent-id",
-            self.agent_id,
-            "--db-path",
-            self.shared_state.db_path,
-            "--role",
-            self.role,
-            "--task",
-            self.task,
+            "--spec-stdin",
         ]
         cmd.extend(extra_args)
         env = build_scrubbed_environment(
@@ -258,13 +291,17 @@ class SubprocessAgent:
                 else None
             )
         )
-        return subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-        )
+        with tempfile.TemporaryFile(mode="w+b") as spec_stream:
+            spec_stream.write(encoded_spec)
+            spec_stream.seek(0)
+            return subprocess.Popen(
+                cmd,
+                stdin=spec_stream,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
 
     # --- reporting helpers ---------------------------------------------
 
