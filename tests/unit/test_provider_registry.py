@@ -111,9 +111,11 @@ def test_default_registry_exposes_builtins_without_constructing_them() -> None:
         "cerebras",
         "deepseek",
         "fireworks",
+        "google",
         "groq",
         "lmstudio",
         "mistral",
+        "nvidia",
         "ollama",
         "openai",
         "openai-compatible",
@@ -128,11 +130,17 @@ def test_default_registry_exposes_builtins_without_constructing_them() -> None:
     ("provider", "key", "base_url"),
     [
         ("openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1"),
+        (
+            "google",
+            "GEMINI_API_KEY",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        ),
         ("mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1"),
         ("xai", "XAI_API_KEY", "https://api.x.ai/v1"),
         ("together", "TOGETHER_API_KEY", "https://api.together.xyz/v1"),
         ("fireworks", "FIREWORKS_API_KEY", "https://api.fireworks.ai/inference/v1"),
         ("cerebras", "CEREBRAS_API_KEY", "https://api.cerebras.ai/v1"),
+        ("nvidia", "NVIDIA_API_KEY", "https://integrate.api.nvidia.com/v1"),
     ],
 )
 def test_openai_compatible_catalog_providers_build_with_their_route(
@@ -153,6 +161,30 @@ def test_openai_compatible_catalog_providers_build_with_their_route(
         assert result.capabilities.vision is False
         assert callable(getattr(result, "detect_capabilities", None))
     assert result._base_url == base_url
+
+
+def test_google_runtime_client_identifies_ash_without_affecting_nvidia(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers import readiness
+
+    calls: list[dict[str, Any]] = []
+
+    def openai_client(**kwargs: Any) -> object:
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr("ash.providers.openai.openai.AsyncOpenAI", openai_client)
+    monkeypatch.setenv("GEMINI_API_KEY", "google-key")
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvidia-key")
+
+    create_default_provider_registry().build(AshConfig(model="google/gemini-test"))
+    create_default_provider_registry().build(AshConfig(model="nvidia/nvidia/test-model"))
+
+    assert calls[0]["default_headers"] == {
+        "x-goog-api-client": readiness.GOOGLE_API_CLIENT_HEADER
+    }
+    assert "default_headers" not in calls[1]
 
 
 def test_openrouter_capabilities_are_not_assumed_from_openai_wire_protocol(

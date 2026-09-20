@@ -182,6 +182,8 @@ def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderAB
         "lmstudio",
         "vllm",
         "openai-compatible",
+        "google",
+        "nvidia",
         "xai",
         "together",
         "fireworks",
@@ -223,6 +225,7 @@ def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderAB
             additional_catalog_sources=additional_catalog_sources,
             allow_anonymous=connection.auth_mode == "none",
             local=connection.provider in {"lmstudio", "vllm"},
+            default_headers=connection.client_headers,
         )
     else:
         provider = OpenAIProvider(

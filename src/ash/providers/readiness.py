@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from ash import __version__
 from ash.safe_io import strict_json_loads
 from ash.providers.identifiers import parse_model_string
 
@@ -34,6 +35,7 @@ CatalogFormat = Literal[
 AuthMode = Literal["bearer", "anthropic", "none"]
 MAX_PROVIDER_CATALOG_BYTES = 2_000_000
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
+GOOGLE_API_CLIENT_HEADER = f"ash-harness-oai/{__version__}"
 
 
 @dataclass(frozen=True)
@@ -50,15 +52,25 @@ class ProviderConnection:
     uses_default_base_url: bool = False
 
     @property
-    def headers(self) -> dict[str, str]:
-        if self.auth_mode == "bearer" and self.api_key:
-            return {"Authorization": f"Bearer {self.api_key}"}
-        if self.auth_mode == "anthropic" and self.api_key:
-            return {
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-            }
+    def client_headers(self) -> dict[str, str]:
+        if self.provider == "google":
+            return {"x-goog-api-client": GOOGLE_API_CLIENT_HEADER}
         return {}
+
+    @property
+    def headers(self) -> dict[str, str]:
+        headers = self.client_headers
+        if self.auth_mode == "bearer" and self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+            return headers
+        if self.auth_mode == "anthropic" and self.api_key:
+            headers.update(
+                {
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                }
+            )
+        return headers
 
     @property
     def credential_description(self) -> str:
@@ -130,6 +142,12 @@ _BUILTIN_CONNECTIONS: dict[str, tuple[str, str, CatalogFormat, AuthMode]] = {
         "openai",
         "bearer",
     ),
+    "google": (
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "GOOGLE_API_BASE",
+        "openai",
+        "bearer",
+    ),
     "openai-compatible": (
         "https://api.openai.com/v1",
         "OPENAI_API_BASE",
@@ -184,6 +202,12 @@ _BUILTIN_CONNECTIONS: dict[str, tuple[str, str, CatalogFormat, AuthMode]] = {
         "openai",
         "bearer",
     ),
+    "nvidia": (
+        "https://integrate.api.nvidia.com/v1",
+        "NVIDIA_API_BASE",
+        "openai",
+        "bearer",
+    ),
     "lmstudio": (
         "http://localhost:1234/v1",
         "LMSTUDIO_API_BASE",
@@ -202,6 +226,7 @@ _BUILTIN_KEY_ENV = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
     "openai-compatible": "OPENAI_API_KEY",
+    "google": "GEMINI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "groq": "GROQ_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
@@ -210,6 +235,7 @@ _BUILTIN_KEY_ENV = {
     "together": "TOGETHER_API_KEY",
     "fireworks": "FIREWORKS_API_KEY",
     "cerebras": "CEREBRAS_API_KEY",
+    "nvidia": "NVIDIA_API_KEY",
 }
 
 

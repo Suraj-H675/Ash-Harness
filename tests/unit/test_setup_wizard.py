@@ -270,6 +270,126 @@ class TestOpenAIFlow:
         }
 
 
+@pytest.mark.parametrize(
+    ("provider_id", "key_env", "base_url", "model"),
+    [
+        (
+            "google",
+            "GEMINI_API_KEY",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "gemini-test",
+        ),
+        (
+            "nvidia",
+            "NVIDIA_API_KEY",
+            "https://integrate.api.nvidia.com/v1",
+            "nvidia/test-model",
+        ),
+    ],
+)
+def test_openai_compatible_builtin_provider_onboarding(
+    provider_id: str,
+    key_env: str,
+    base_url: str,
+    model: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import ModelProbe, _flow_openai_compatible_builtin
+    from ash.provider_catalog import get_provider_descriptor
+    from ash.providers.readiness import GOOGLE_API_CLIENT_HEADER
+
+    descriptor = get_provider_descriptor(provider_id)
+    assert descriptor is not None
+    monkeypatch.delenv(key_env, raising=False)
+    monkeypatch.setattr(
+        "ash.commands.setup.getpass.getpass",
+        _FakeGetpass("provider-secret"),
+    )
+    monkeypatch.setattr("builtins.input", _fake_input(["", "1"]))
+
+    with (
+        patch(
+            "ash.commands.setup._probe_models_detailed",
+            return_value=ModelProbe(models=(model,)),
+        ) as probe,
+        patch("ash.commands.setup.save_env_values") as save,
+    ):
+        _flow_openai_compatible_builtin(descriptor, "")
+
+    expected_headers = (
+        {"x-goog-api-client": GOOGLE_API_CLIENT_HEADER}
+        if provider_id == "google"
+        else None
+    )
+    probe.assert_called_once_with(
+        base_url,
+        "provider-secret",
+        catalog_format="openai",
+        extra_headers=expected_headers,
+    )
+    assert save.call_args.args[0] == {
+        "ASH_MODEL": f"{provider_id}/{model}",
+        key_env: "provider-secret",
+    }
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "key_env", "base_env", "model"),
+    [
+        ("google", "GEMINI_API_KEY", "GOOGLE_API_BASE", "gemini-test"),
+        ("nvidia", "NVIDIA_API_KEY", "NVIDIA_API_BASE", "nvidia/test-model"),
+    ],
+)
+def test_openai_compatible_builtin_provider_saves_base_override(
+    provider_id: str,
+    key_env: str,
+    base_env: str,
+    model: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import ModelProbe, _flow_openai_compatible_builtin
+    from ash.provider_catalog import get_provider_descriptor
+    from ash.providers.readiness import GOOGLE_API_CLIENT_HEADER
+
+    descriptor = get_provider_descriptor(provider_id)
+    assert descriptor is not None
+    monkeypatch.delenv(key_env, raising=False)
+    monkeypatch.setattr(
+        "ash.commands.setup.getpass.getpass",
+        _FakeGetpass("provider-secret"),
+    )
+    monkeypatch.setattr(
+        "builtins.input",
+        _fake_input(["https://gateway.example/v1/", "1"]),
+    )
+
+    with (
+        patch(
+            "ash.commands.setup._probe_models_detailed",
+            return_value=ModelProbe(models=(model,)),
+        ) as probe,
+        patch("ash.commands.setup.save_env_values") as save,
+    ):
+        _flow_openai_compatible_builtin(descriptor, "")
+
+    expected_headers = (
+        {"x-goog-api-client": GOOGLE_API_CLIENT_HEADER}
+        if provider_id == "google"
+        else None
+    )
+    probe.assert_called_once_with(
+        "https://gateway.example/v1",
+        "provider-secret",
+        catalog_format="openai",
+        extra_headers=expected_headers,
+    )
+    assert save.call_args.args[0] == {
+        "ASH_MODEL": f"{provider_id}/{model}",
+        key_env: "provider-secret",
+        base_env: "https://gateway.example/v1",
+    }
+
+
 class TestDiscoveryRecovery:
     def test_probe_can_retry_then_verify(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from ash.commands.setup import ModelProbe, _discover_models
@@ -587,6 +707,31 @@ class TestProbeModels:
 
         assert result.models == ("model-a", "model-b")
         assert result.error is None
+
+    def test_openai_probe_merges_non_secret_client_headers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands.setup import _probe_models_detailed
+
+        requests = patch_catalog_client(
+            monkeypatch,
+            lambda request: httpx.Response(
+                200,
+                json={"data": [{"id": "model-a"}]},
+                request=request,
+            ),
+        )
+
+        result = _probe_models_detailed(
+            "https://gateway.example/v1",
+            "sk-test",
+            extra_headers={"x-goog-api-client": "ash-test-oai/1.0"},
+        )
+
+        assert result.models == ("model-a",)
+        request, _ = requests[0]
+        assert request.headers["authorization"] == "Bearer sk-test"
+        assert request.headers["x-goog-api-client"] == "ash-test-oai/1.0"
 
     def test_anthropic_probe_uses_shared_catalog_probe(
         self, monkeypatch: pytest.MonkeyPatch

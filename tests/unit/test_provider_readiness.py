@@ -82,6 +82,30 @@ def test_provider_runtime_environment_is_provider_scoped(monkeypatch) -> None:
     }
 
 
+def test_provider_runtime_environment_includes_google_and_nvidia_routes(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "google-secret")
+    monkeypatch.setenv(
+        "GOOGLE_API_BASE",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+    )
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvidia-secret")
+    monkeypatch.setenv("NVIDIA_API_BASE", "https://integrate.api.nvidia.com/v1")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-cross")
+
+    config = SimpleNamespace(
+        model="google/gemini-test",
+        fallback_models=["nvidia/vendor/model"],
+        custom_providers={},
+    )
+
+    assert readiness.provider_runtime_environment(config) == {
+        "GEMINI_API_KEY": "google-secret",
+        "GOOGLE_API_BASE": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "NVIDIA_API_BASE": "https://integrate.api.nvidia.com/v1",
+        "NVIDIA_API_KEY": "nvidia-secret",
+    }
+
+
 def test_provider_runtime_environment_honors_custom_key_env(monkeypatch) -> None:
     monkeypatch.setenv("PRIVATE_GATEWAY_TOKEN", "custom-secret")
     monkeypatch.setenv("OTHER_TOKEN", "must-not-cross")
@@ -565,6 +589,87 @@ def test_together_connection_uses_native_catalog_shape(monkeypatch) -> None:
 
     assert connection.catalog_format == "together"
     assert connection.catalog_endpoint == "https://api.together.xyz/v1/models"
+
+
+@pytest.mark.parametrize(
+    ("model", "key_env", "base_url"),
+    [
+        (
+            "google/gemini-test",
+            "GEMINI_API_KEY",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        ),
+        (
+            "nvidia/nvidia/test-model",
+            "NVIDIA_API_KEY",
+            "https://integrate.api.nvidia.com/v1",
+        ),
+    ],
+)
+def test_new_openai_compatible_provider_connections_use_bearer_catalog(
+    model: str,
+    key_env: str,
+    base_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(key_env, "test-secret")
+
+    connection = readiness.resolve_provider_connection(_config(model))
+
+    assert connection.base_url == base_url
+    assert connection.catalog_endpoint == f"{base_url}/models"
+    assert connection.catalog_format == "openai"
+    assert connection.auth_mode == "bearer"
+    expected_headers = {"Authorization": "Bearer test-secret"}
+    if model.startswith("google/"):
+        expected_headers["x-goog-api-client"] = readiness.GOOGLE_API_CLIENT_HEADER
+    assert connection.headers == expected_headers
+
+
+def test_google_catalog_request_identifies_ash(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests = patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"data": [{"id": "gemini-test"}]},
+            request=request,
+        ),
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "google-secret")
+
+    result = verify_provider_connection(_config("google/gemini-test"))
+
+    assert result.selected_model_available is True
+    assert len(requests) == 1
+    request, _ = requests[0]
+    assert request.headers["authorization"] == "Bearer google-secret"
+    assert (
+        request.headers["x-goog-api-client"]
+        == readiness.GOOGLE_API_CLIENT_HEADER
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "key_env", "base_env"),
+    [
+        ("google/gemini-test", "GEMINI_API_KEY", "GOOGLE_API_BASE"),
+        ("nvidia/nvidia/test-model", "NVIDIA_API_KEY", "NVIDIA_API_BASE"),
+    ],
+)
+def test_new_openai_compatible_provider_base_url_overrides(
+    model: str,
+    key_env: str,
+    base_env: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(key_env, "test-secret")
+    monkeypatch.setenv(base_env, "https://gateway.example/v1")
+
+    connection = readiness.resolve_provider_connection(_config(model))
+
+    assert connection.base_url == "https://gateway.example/v1"
+    assert connection.catalog_endpoint == "https://gateway.example/v1/models"
+    assert connection.uses_default_base_url is False
 
 
 def test_lmstudio_connection_uses_native_capability_catalog() -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, AsyncGenerator
 import httpx
 import openai  # type: ignore[import-not-found]
@@ -115,6 +115,7 @@ class OpenAIProvider(ProviderABC):
         base_url: str | None = None,
         allow_anonymous: bool = False,
         token_counter: TokenCounterLike | None = None,
+        default_headers: Mapping[str, str] | None = None,
         client: Any | None = None,
     ) -> None:
         if not api_key and not allow_anonymous:
@@ -137,6 +138,8 @@ class OpenAIProvider(ProviderABC):
             "base_url": base_url,
             "max_retries": 0,
         }
+        if default_headers:
+            client_options["default_headers"] = dict(default_headers)
         if allow_anonymous and client is None:
             client_options["http_client"] = httpx.AsyncClient(
                 event_hooks={"request": [_strip_authorization_header]}

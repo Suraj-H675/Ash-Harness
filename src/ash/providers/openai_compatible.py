@@ -32,6 +32,7 @@ class CatalogOpenAIProvider(OpenAIProvider):
         ] = (),
         allow_anonymous: bool = False,
         local: bool = False,
+        default_headers: Mapping[str, str] | None = None,
         client: Any | None = None,
     ) -> None:
         super().__init__(
@@ -39,6 +40,7 @@ class CatalogOpenAIProvider(OpenAIProvider):
             api_key=api_key,
             base_url=base_url,
             allow_anonymous=allow_anonymous,
+            default_headers=default_headers,
             client=client,
         )
         self.provider_family = provider_family

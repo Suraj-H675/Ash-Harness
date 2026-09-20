@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from pathlib import Path
@@ -755,10 +755,18 @@ def _flow_openai_compatible_builtin(
     catalog_format: CatalogFormat = (
         "lmstudio" if descriptor.id == "lmstudio" else "openai"
     )
+    extra_headers: Mapping[str, str] | None = None
+    if descriptor.id == "google":
+        from ash.providers.readiness import GOOGLE_API_CLIENT_HEADER
+
+        extra_headers = {"x-goog-api-client": GOOGLE_API_CLIENT_HEADER}
     models, verified = _discover_models(
         descriptor.name,
         lambda: _probe_models_detailed(
-            base_url, api_key or None, catalog_format=catalog_format
+            base_url,
+            api_key or None,
+            catalog_format=catalog_format,
+            extra_headers=extra_headers,
         ),
         fallback=[current] if current else [],
         guidance=(
@@ -1085,6 +1093,7 @@ def _probe_models_detailed(
     api_key: Optional[str],
     *,
     catalog_format: CatalogFormat = "openai",
+    extra_headers: Mapping[str, str] | None = None,
 ) -> ModelProbe:
     from ash.providers.readiness import (
         ProviderVerificationError,
@@ -1093,7 +1102,9 @@ def _probe_models_detailed(
     )
 
     endpoint = provider_catalog_endpoint(base_url.rstrip("/"), catalog_format)
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    headers = dict(extra_headers or {})
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     try:
         models = probe_model_catalog(
             endpoint,

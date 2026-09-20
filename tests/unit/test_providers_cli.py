@@ -100,7 +100,7 @@ def test_provider_catalog_is_secret_free_and_includes_local_and_gateway_routes()
     payload = provider_catalog_payload()
     provider_ids = {item["id"] for item in payload["providers"]}
 
-    assert {"openrouter", "lmstudio", "vllm"} <= provider_ids
+    assert {"google", "nvidia", "openrouter", "lmstudio", "vllm"} <= provider_ids
     assert all("API_KEY" not in json.dumps(item) or item["key_env"] for item in payload["providers"])
     rendered = render_provider_catalog()
     assert "Ash provider catalog" in rendered

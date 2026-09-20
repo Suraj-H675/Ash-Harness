@@ -50,6 +50,14 @@ BUILTIN_PROVIDERS: tuple[ProviderDescriptor, ...] = (
         "OPENAI_API_KEY",
     ),
     ProviderDescriptor(
+        "google",
+        "Google Gemini",
+        "Cloud API",
+        "Gemini models via Google's OpenAI-compatible Gemini API",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "GEMINI_API_KEY",
+    ),
+    ProviderDescriptor(
         "openrouter",
         "OpenRouter",
         "Gateway",
@@ -112,6 +120,14 @@ BUILTIN_PROVIDERS: tuple[ProviderDescriptor, ...] = (
         "Fast hosted models via an OpenAI-compatible endpoint",
         "https://api.cerebras.ai/v1",
         "CEREBRAS_API_KEY",
+    ),
+    ProviderDescriptor(
+        "nvidia",
+        "NVIDIA API Catalog",
+        "Cloud API",
+        "Hosted models via NVIDIA's OpenAI-compatible API Catalog",
+        "https://integrate.api.nvidia.com/v1",
+        "NVIDIA_API_KEY",
     ),
     ProviderDescriptor(
         "ollama",
