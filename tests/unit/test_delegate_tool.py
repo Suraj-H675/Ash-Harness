@@ -888,6 +888,187 @@ async def test_delegate_agents_retries_with_new_lease_and_agent_attempt(
 
 
 @pytest.mark.asyncio
+async def test_delegate_agents_can_retry_after_read_only_tool(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "input.txt").write_text("safe read\n", encoding="utf-8")
+
+    class ReadThenFailProvider(ProviderABC):
+        model_name = "read-then-fail"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+        calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del temperature
+            type(self).calls += 1
+            assert tools is not None
+            if type(self).calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "read-safe",
+                            "name": "read_file",
+                            "arguments": {"file_path": "input.txt"},
+                        }
+                    ],
+                    is_done=True,
+                )
+                return
+            if type(self).calls == 2:
+                assert any(message.get("role") == "tool" for message in messages)
+                raise RuntimeError("provider failed after safe read")
+            yield StreamChunk(content="safe retry succeeded", is_done=True)
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        safety_tier="auto_approve",
+        provider_max_attempts=1,
+        provider_retry_base_delay=0,
+        provider_retry_max_delay=0,
+        agent_token_budget=100,
+        agent_time_budget_seconds=10,
+        memory_backend="off",
+    )
+    db_path = config.db_directory / "agents.db"
+    spawn = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        ReadThenFailProvider,
+        config=config,
+    )
+    delegate = DelegateAgentsTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        spawn,
+        config,
+    )
+    try:
+        result = await delegate.run(
+            goal="retry safe reads",
+            tasks=[
+                {
+                    "key": "safe-retry",
+                    "role": "reviewer",
+                    "task": "read then retry",
+                    "isolation": "shared",
+                    "max_attempts": 2,
+                }
+            ],
+        )
+
+        assert result.success is True
+        assert ReadThenFailProvider.calls == 3
+        task = spawn._shared_state.tasks.list_tasks()[0]
+        assert task.state == "succeeded"
+        assert task.attempt == 2
+        assert "agent.task.retrying" in {
+            event.event["type"] for event in spawn._shared_state.tasks.list_events()
+        }
+    finally:
+        await delegate.aclose()
+        await spawn.aclose()
+
+
+@pytest.mark.asyncio
+async def test_delegate_agents_does_not_retry_after_dispatched_tool(
+    tmp_path: Path,
+) -> None:
+    class ToolThenFailProvider(ProviderABC):
+        model_name = "tool-then-fail"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+        calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del temperature
+            type(self).calls += 1
+            assert tools is not None
+            if type(self).calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "write-once",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "side-effect.txt",
+                                "content": "side effect\n",
+                                "overwrite": True,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+                return
+            if type(self).calls == 2:
+                assert any(
+                    message.get("role") == "tool"
+                    for message in messages
+                )
+                raise RuntimeError("provider failed after dispatched tool")
+            yield StreamChunk(content="unexpected replay", is_done=True)
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        safety_tier="auto_approve",
+        provider_max_attempts=1,
+        provider_retry_base_delay=0,
+        provider_retry_max_delay=0,
+        agent_token_budget=100,
+        agent_time_budget_seconds=10,
+        memory_backend="off",
+    )
+    db_path = config.db_directory / "agents.db"
+    spawn = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        ToolThenFailProvider,
+        config=config,
+    )
+    delegate = DelegateAgentsTool(
+        SafetyGuard(tmp_path),
+        SharedState(db_path),
+        spawn,
+        config,
+    )
+    try:
+        result = await delegate.run(
+            goal="do not replay side effects",
+            tasks=[
+                {
+                    "key": "unsafe-retry",
+                    "role": "coder",
+                    "task": "write once then stop",
+                    "isolation": "shared",
+                    "max_attempts": 2,
+                }
+            ],
+        )
+
+        assert result.success is False
+        assert ToolThenFailProvider.calls == 2
+        assert (tmp_path / "side-effect.txt").read_text(encoding="utf-8") == (
+            "side effect\n"
+        )
+        task = spawn._shared_state.tasks.list_tasks()[0]
+        assert task.state == "failed"
+        assert task.attempt == 1
+        assert "provider failed after dispatched tool" in (task.error or "")
+        assert "agent.task.retrying" not in {
+            event.event["type"] for event in spawn._shared_state.tasks.list_events()
+        }
+    finally:
+        await delegate.aclose()
+        await spawn.aclose()
+
+
+@pytest.mark.asyncio
 async def test_external_graph_cancellation_stops_active_provider_turn(
     tmp_path: Path,
 ) -> None:
