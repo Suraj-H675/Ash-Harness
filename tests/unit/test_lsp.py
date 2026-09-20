@@ -313,6 +313,32 @@ async def test_lsp_client_launches_resolved_host_command(
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
 @pytest.mark.asyncio
+async def test_lsp_client_refuses_root_replaced_before_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    client = LSPClient(
+        fake_config(tmp_path / "lsp.jsonl"),
+        workspace,
+        diagnostics_callback=AsyncMock(return_value=None),
+    )
+    workspace.rename(saved)
+    workspace.mkdir()
+    create = AsyncMock(side_effect=AssertionError("LSP server must not launch"))
+    monkeypatch.setattr("ash.lsp.client.asyncio.create_subprocess_exec", create)
+
+    with pytest.raises(LSPError, match="working directory identity changed"):
+        await client.start()
+
+    create.assert_not_awaited()
+    assert client.process is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
 async def test_lsp_client_cwd_swap_cannot_escape_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

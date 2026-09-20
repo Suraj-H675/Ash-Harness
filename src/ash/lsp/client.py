@@ -72,6 +72,12 @@ class LSPClient:
         self.config = config
         self.root = root.resolve()
         self._guard = SafetyGuard(self.root)
+        try:
+            root_metadata = os.stat(self.root)
+        except OSError:
+            self._root_identity: tuple[int, int] | None = None
+        else:
+            self._root_identity = (root_metadata.st_dev, root_metadata.st_ino)
         self._diagnostics_callback = diagnostics_callback
         self.process: asyncio.subprocess.Process | None = None
         self._process_tree_plan: ProcessTreePlan | None = None
@@ -111,6 +117,7 @@ class LSPClient:
                 cwd=self.root,
                 guard=self._guard,
                 search_path=environment.get("PATH"),
+                expected_cwd_identity=self._root_identity,
             ) as launch:
                 try:
                     process_tree_plan = prepare_process_tree(workspace_root=self.root)
