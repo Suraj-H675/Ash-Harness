@@ -224,6 +224,8 @@ def test_mcp_cli_adds_oauth_without_persisting_client_secret(
             "oauth",
             "--oauth-client-id",
             "registered-client",
+            "--oauth-issuer",
+            "https://auth.example.test",
             "--oauth-client-secret-env",
             "MCP_CLIENT_SECRET",
             "--oauth-scope",
@@ -245,10 +247,39 @@ def test_mcp_cli_adds_oauth_without_persisting_client_secret(
     assert loaded.oauth == {
         "client_id": "registered-client",
         "client_secret": "${MCP_CLIENT_SECRET}",
+        "issuer": "https://auth.example.test",
         "redirect_port": 43123,
         "scope": "files:read files:write",
     }
     assert loaded.resolved_oauth["client_secret"] == "resolved-secret"
+
+
+def test_mcp_cli_requires_issuer_for_preregistered_oauth_client(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    status = main(
+        [
+            "mcp",
+            "add",
+            "protected",
+            "--transport",
+            "http",
+            "--url",
+            "https://mcp.example.test/rpc",
+            "--auth",
+            "oauth",
+            "--oauth-client-id",
+            "registered-client",
+        ]
+    )
+
+    assert status == 2
+    assert "--oauth-issuer" in capsys.readouterr().err
+    assert not (tmp_path / ".mcp.json").exists()
 
 
 def test_mcp_cli_login_is_explicit_and_logout_removes_credentials(

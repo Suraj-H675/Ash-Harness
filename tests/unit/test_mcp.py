@@ -351,6 +351,17 @@ def test_mcp_oauth_constructor_rejects_invalid_options_before_save() -> None:
             auth="oauth",
             oauth={"redirect_port": True},
         )
+    with pytest.raises(ValueError, match="issuer must be an HTTPS URL"):
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+            auth="oauth",
+            oauth={"issuer": "http://auth.example.test"},
+        )
 
 
 def test_mcp_oauth_rejects_stdio_transport() -> None:

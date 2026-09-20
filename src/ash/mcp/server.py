@@ -568,6 +568,7 @@ def _validate_oauth_data(name: str, auth: str, oauth: dict[str, Any]) -> None:
     allowed_oauth_keys = {
         "client_id",
         "client_secret",
+        "issuer",
         "scope",
         "redirect_port",
         "client_name",
@@ -604,6 +605,27 @@ def _validate_oauth_data(name: str, auth: str, oauth: dict[str, Any]) -> None:
         raise ValueError(f"MCP server {name!r} oauth client_id is too long")
     if client_secret and not client_id:
         raise ValueError(f"MCP server {name!r} oauth client_secret requires client_id")
+    issuer = str(oauth.get("issuer", ""))
+    if issuer:
+        if issuer != issuer.strip() or len(issuer) > 4096:
+            raise ValueError(f"MCP server {name!r} oauth issuer is invalid")
+        try:
+            parsed_issuer = urlparse(issuer)
+            issuer_port = parsed_issuer.port
+        except ValueError as exc:
+            raise ValueError(f"MCP server {name!r} oauth issuer is invalid") from exc
+        if (
+            parsed_issuer.scheme != "https"
+            or not parsed_issuer.hostname
+            or parsed_issuer.username
+            or parsed_issuer.password
+            or parsed_issuer.fragment
+            or (issuer_port is not None and not 0 < issuer_port <= 65535)
+        ):
+            raise ValueError(
+                f"MCP server {name!r} oauth issuer must be an HTTPS URL "
+                "without credentials or fragments"
+            )
     scope = str(oauth.get("scope", "")).strip()
     if scope and (len(scope) > 8192 or MCP_OAUTH_SCOPE.fullmatch(scope) is None):
         raise ValueError(f"MCP server {name!r} oauth scope is invalid")

@@ -270,6 +270,11 @@ class MCPOAuthSession:
             bundle = self.store.load(self.resource)
             if bundle is None:
                 raise MCPAuthorizationRequired(self._login_guidance())
+            configured_issuer = _configured_issuer(self.oauth_config)
+            if configured_issuer and bundle.discovery.issuer != configured_issuer:
+                raise MCPAuthorizationRequired(
+                    self._login_guidance("configured OAuth issuer changed")
+                )
             configured_client = _configured_client(self.oauth_config)
             if configured_client is not None:
                 if configured_client.client_id != bundle.client.client_id:
@@ -394,6 +399,19 @@ async def authorize_mcp_server(
             challenged_scope=str(config.get("scope", "")),
         )
         registered = _configured_client(config)
+        configured_issuer = _configured_issuer(config)
+        if registered is not None and not configured_issuer:
+            existing_bundle = token_store.load(resource)
+            if existing_bundle is None:
+                raise MCPOAuthError(
+                    "configured OAuth client requires an issuer binding; "
+                    "set oauth.issuer and authorize again"
+                )
+            configured_issuer = existing_bundle.discovery.issuer
+        if configured_issuer and discovery.issuer != configured_issuer:
+            raise MCPOAuthError(
+                "configured OAuth issuer did not match discovered authorization server"
+            )
         if registered is None:
             registered = await register_oauth_client(
                 client,
@@ -869,6 +887,17 @@ def _configured_client(config: dict[str, Any]) -> OAuthClient | None:
     if len(client_secret) > 64 * 1024:
         raise MCPOAuthError("OAuth client_secret is too long")
     return OAuthClient(client_id, client_secret)
+
+
+def _configured_issuer(config: dict[str, Any]) -> str:
+    issuer_value = config.get("issuer", "")
+    if not isinstance(issuer_value, str):
+        raise MCPOAuthError("OAuth issuer configuration is invalid")
+    if not issuer_value:
+        return ""
+    if issuer_value != issuer_value.strip():
+        raise MCPOAuthError("OAuth issuer configuration is invalid")
+    return _validate_oauth_url(issuer_value)
 
 
 async def _handle_callback(

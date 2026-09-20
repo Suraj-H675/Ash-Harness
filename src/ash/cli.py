@@ -2761,6 +2761,7 @@ def main(argv: list[str] | None = None) -> int:
     mcp_add.add_argument("--header", action="append", default=[])
     mcp_add.add_argument("--auth", choices=["none", "oauth"], default="none")
     mcp_add.add_argument("--oauth-client-id", default="")
+    mcp_add.add_argument("--oauth-issuer", default="")
     mcp_add.add_argument("--oauth-client-secret-env", default="")
     mcp_add.add_argument("--oauth-scope", default="")
     mcp_add.add_argument("--oauth-redirect-port", type=int, default=0)
@@ -4308,11 +4309,16 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     "--oauth-client-secret-env must be an environment variable name"
                 )
+            oauth_client_id = args.oauth_client_id.strip()
+            oauth_issuer = args.oauth_issuer.strip()
+            if oauth_client_id and not oauth_issuer:
+                raise ValueError("--oauth-client-id requires --oauth-issuer")
             oauth = {
                 key: value
                 for key, value in {
-                    "client_id": args.oauth_client_id,
+                    "client_id": oauth_client_id,
                     "client_secret": f"${{{secret_env}}}" if secret_env else "",
+                    "issuer": oauth_issuer,
                     "scope": args.oauth_scope,
                     "redirect_port": args.oauth_redirect_port,
                 }.items()

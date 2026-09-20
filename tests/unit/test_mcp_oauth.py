@@ -589,6 +589,90 @@ async def test_explicit_oauth_login_rejects_non_finite_timeout(timeout: float) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("binding_source", ["config", "store"])
+async def test_configured_oauth_client_refuses_discovered_issuer_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    binding_source: str,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    browser_opened = False
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    oauth_config = {
+        "client_id": "registered-client",
+        "client_secret": "configured-secret",
+    }
+    if binding_source == "config":
+        oauth_config["issuer"] = "https://auth.example.test"
+    else:
+        store.save(_bundle(resource))
+
+    class FakeSocket:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43123)
+
+    class FakeServer:
+        sockets = [FakeSocket()]
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def start_server(handler: Any, host: str, port: int) -> FakeServer:
+        del handler
+        assert host == "127.0.0.1"
+        assert port == 0
+        return FakeServer()
+
+    async def discover(
+        client: httpx.AsyncClient,
+        server_url: str,
+        *,
+        challenged_scope: str = "",
+    ) -> OAuthDiscovery:
+        del client, challenged_scope
+        assert server_url == resource
+        return OAuthDiscovery(
+            resource,
+            (),
+            "https://replacement-auth.example.test",
+            "https://replacement-auth.example.test/authorize",
+            "https://replacement-auth.example.test/token",
+        )
+
+    def opener(url: str) -> bool:
+        nonlocal browser_opened
+        del url
+        browser_opened = True
+        return True
+
+    def unexpected_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected OAuth request: {request.url}")
+
+    monkeypatch.setattr(asyncio, "start_server", start_server)
+    monkeypatch.setattr("ash.mcp.oauth.discover_oauth", discover)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(unexpected_request))
+    try:
+        with pytest.raises(MCPOAuthError, match="issuer"):
+            await authorize_mcp_server(
+                "remote",
+                resource,
+                oauth_config=oauth_config,
+                store=store,
+                http_client=http,
+                open_browser=opener,
+                announce=lambda message: None,
+                timeout_seconds=0.01,
+            )
+    finally:
+        await http.aclose()
+
+    assert browser_opened is False
+
+
+@pytest.mark.asyncio
 async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -844,7 +928,10 @@ async def test_oauth_login_rejects_mismatched_authorization_response_issuer_befo
             await authorize_mcp_server(
                 "remote",
                 resource,
-                oauth_config={"client_id": "registered"},
+                oauth_config={
+                    "client_id": "registered",
+                    "issuer": "https://auth.example.test",
+                },
                 store=MCPOAuthTokenStore("remote", tmp_path / "tokens"),
                 http_client=http,
                 open_browser=opener,
@@ -956,7 +1043,10 @@ async def test_explicit_step_up_scope_overrides_initial_challenge(
     await authorize_mcp_server(
         "remote",
         resource,
-        oauth_config={"client_id": "registered"},
+        oauth_config={
+            "client_id": "registered",
+            "issuer": "https://auth.example.test",
+        },
         store=MCPOAuthTokenStore("remote", tmp_path / "tokens"),
         http_client=http,
         open_browser=opener,
@@ -1000,6 +1090,34 @@ async def test_oauth_session_refreshes_rotates_and_persists(tmp_path: Path) -> N
     assert persisted.tokens.refresh_token == "rotated-refresh"
     assert persisted.tokens.expires_at > 0
     await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_oauth_session_refuses_configured_issuer_change(tmp_path: Path) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource, expired=True))
+
+    def unexpected_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected OAuth request: {request.url}")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(unexpected_request))
+    session = MCPOAuthSession(
+        "remote",
+        resource,
+        oauth_config={
+            "client_id": "client-id",
+            "issuer": "https://replacement-auth.example.test",
+        },
+        store=store,
+        http_client=http,
+    )
+
+    try:
+        with pytest.raises(MCPAuthorizationRequired, match="issuer changed"):
+            await session.authorization_header()
+    finally:
+        await http.aclose()
 
 
 @pytest.mark.asyncio
