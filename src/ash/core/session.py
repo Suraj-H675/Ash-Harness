@@ -35,7 +35,7 @@ AuditAction = Literal[
     "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 11
+CURRENT_SCHEMA_VERSION = 12
 
 
 class SessionStorageError(RuntimeError):
@@ -411,6 +411,8 @@ class SessionStore:
                 self._migrate_v10(conn)
             if from_version < 11:
                 self._migrate_v11(conn)
+            if from_version < 12:
+                self._migrate_v12(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -701,6 +703,43 @@ class SessionStore:
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
             "VALUES (?, ?)",
             (11, _serialize_datetime(_utc_now())),
+        )
+
+    def _migrate_v12(self, conn: sqlite3.Connection) -> None:
+        """Persist MCP 2026 task handles for crash-safe continuation."""
+
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS mcp_tasks (
+                task_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                remote_tool_name TEXT NOT NULL,
+                contract_fingerprint TEXT NOT NULL,
+                protocol_version TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'working', 'input_required', 'completed', 'cancelled', 'failed'
+                )),
+                task_json TEXT NOT NULL,
+                answered_inputs_json TEXT NOT NULL DEFAULT '{}',
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+                PRIMARY KEY(server_name, task_id),
+                UNIQUE(session_id, call_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mcp_tasks_session_status
+                ON mcp_tasks(session_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_mcp_tasks_session_turn
+                ON mcp_tasks(session_id, turn_id);
+            """
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (12, _serialize_datetime(_utc_now())),
         )
 
     def backup(
@@ -2326,6 +2365,102 @@ class SessionStore:
                     turn_id,
                 ),
             )
+
+    def save_mcp_task(
+        self,
+        *,
+        task_id: str,
+        session_id: str,
+        turn_id: str,
+        call_id: str,
+        server_name: str,
+        remote_tool_name: str,
+        contract_fingerprint: str,
+        protocol_version: str,
+        task: dict[str, Any],
+        answered_inputs: dict[str, str],
+    ) -> None:
+        """Persist the latest durable state for one MCP task-backed tool call."""
+
+        status = task.get("status")
+        if status not in {
+            "working",
+            "input_required",
+            "completed",
+            "cancelled",
+            "failed",
+        }:
+            raise ValueError("invalid MCP task status")
+        now = _serialize_datetime(_utc_now())
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            existing = conn.execute(
+                "SELECT session_id, call_id FROM mcp_tasks "
+                "WHERE server_name = ? AND task_id = ?",
+                (server_name, task_id),
+            ).fetchone()
+            if existing is not None and (
+                str(existing["session_id"]) != session_id
+                or str(existing["call_id"]) != call_id
+            ):
+                raise ValueError(
+                    "MCP server reused a durable taskId for another Ash tool call"
+                )
+            conn.execute(
+                """
+                INSERT INTO mcp_tasks (
+                    task_id, session_id, turn_id, call_id, server_name,
+                    remote_tool_name, contract_fingerprint, protocol_version,
+                    status, task_json, answered_inputs_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(server_name, task_id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    turn_id = excluded.turn_id,
+                    call_id = excluded.call_id,
+                    server_name = excluded.server_name,
+                    remote_tool_name = excluded.remote_tool_name,
+                    contract_fingerprint = excluded.contract_fingerprint,
+                    protocol_version = excluded.protocol_version,
+                    status = excluded.status,
+                    task_json = excluded.task_json,
+                    answered_inputs_json = excluded.answered_inputs_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    task_id,
+                    session_id,
+                    turn_id,
+                    call_id,
+                    server_name,
+                    remote_tool_name,
+                    contract_fingerprint,
+                    protocol_version,
+                    status,
+                    json.dumps(task, ensure_ascii=False, sort_keys=True),
+                    json.dumps(answered_inputs, ensure_ascii=False, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+
+    def delete_mcp_task(self, server_name: str, task_id: str) -> None:
+        """Drop one MCP task handle after Ash no longer needs to resume it."""
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            conn.execute(
+                "DELETE FROM mcp_tasks WHERE server_name = ? AND task_id = ?",
+                (server_name, task_id),
+            )
+
+    def list_mcp_tasks(self, session_id: str) -> list[sqlite3.Row]:
+        """Return durable MCP task records for one session oldest-first."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            return conn.execute(
+                "SELECT * FROM mcp_tasks WHERE session_id = ? "
+                "ORDER BY created_at, task_id",
+                (session_id,),
+            ).fetchall()
 
     def append_audit_log(
         self,

@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -992,6 +992,67 @@ def _mcp_tool(
         definition=definition,
         protocol_version=protocol_version,
     )
+
+
+@pytest.mark.asyncio
+async def test_modern_mcp_tool_binds_task_state_to_ash_call_identity(
+    tmp_path: Path,
+) -> None:
+    persisted: list[dict[str, Any]] = []
+    client = StubMCPClient({"content": [{"type": "text", "text": "done"}]})
+
+    async def call_tool(
+        name: str,
+        arguments: dict,
+        **kwargs: Any,
+    ) -> dict:
+        assert name == "durable"
+        assert arguments == {}
+        callback = kwargs.get("modern_task_state_callback")
+        assert callback is not None
+        await callback(
+            {
+                "taskId": "task-1",
+                "status": "working",
+                "createdAt": "2026-09-20T00:00:00Z",
+                "lastUpdatedAt": "2026-09-20T00:00:01Z",
+                "ttlMs": None,
+            },
+            {"approve": "fingerprint"},
+        )
+        return {"content": [{"type": "text", "text": "done"}]}
+
+    client.call_tool = call_tool  # type: ignore[method-assign]
+
+    async def persist(payload: dict[str, Any]) -> None:
+        persisted.append(payload)
+
+    tool = MCPTool(
+        SafetyGuard(tmp_path),
+        client=client,  # type: ignore[arg-type]
+        server_name="durable-server",
+        definition={
+            "name": "durable",
+            "description": "durable task",
+            "inputSchema": {"type": "object"},
+        },
+        protocol_version="2026-07-28",
+        task_state_handler=persist,
+    )
+
+    with tool.event_context({"call_id": "call-123"}):
+        result = await tool.run()
+
+    assert result.success is True
+    assert len(persisted) == 1
+    payload = persisted[0]
+    assert payload["call_id"] == "call-123"
+    assert payload["server_name"] == "durable-server"
+    assert payload["remote_tool_name"] == "durable"
+    assert payload["protocol_version"] == "2026-07-28"
+    assert isinstance(payload["contract_fingerprint"], str)
+    assert payload["task"]["taskId"] == "task-1"
+    assert payload["answered_inputs"] == {"approve": "fingerprint"}
 
 
 @pytest.mark.asyncio
@@ -2684,6 +2745,55 @@ async def test_loop_reloads_mcp_tools_without_restarting_session(
     assert errors == {}
     assert "mcp__fake__echo" not in loop.tools
     await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_loop_persists_mcp_task_only_for_active_tool_call(
+    tmp_path: Path,
+) -> None:
+    from ash.context.turn import TurnContext
+
+    store = SessionStore(tmp_path / "sessions.db")
+    loop = AshLoop(
+        session_store=store,
+        provider=IdleProvider(),
+        safety_guard=SafetyGuard(tmp_path),
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+    )
+    session = await loop.start_session()
+    loop.turn_context = TurnContext(session.session_id, "turn-1")
+    loop.turn_context.set("tool_call_id", "call-1")
+    payload = {
+        "call_id": "call-1",
+        "server_name": "server",
+        "remote_tool_name": "slow",
+        "contract_fingerprint": "contract",
+        "protocol_version": "2026-07-28",
+        "task": {
+            "taskId": "task-1",
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": None,
+        },
+        "answered_inputs": {},
+    }
+    try:
+        await loop._persist_mcp_task_state(payload)
+        rows = store.list_mcp_tasks(session.session_id)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == "task-1"
+        assert rows[0]["call_id"] == "call-1"
+        assert rows[0]["turn_id"] == "turn-1"
+
+        loop.turn_context.set("tool_call_id", "another-call")
+        with pytest.raises(RuntimeError, match="does not match active tool"):
+            await loop._persist_mcp_task_state(payload)
+        assert len(store.list_mcp_tasks(session.session_id)) == 1
+    finally:
+        loop.turn_context = None
+        await loop.aclose()
 
 
 @pytest.mark.asyncio
@@ -5839,6 +5949,7 @@ async def test_http_modern_requests_use_stateless_routing_headers() -> None:
 @pytest.mark.asyncio
 async def test_modern_task_extension_drives_input_update_and_completion() -> None:
     seen: list[tuple[str, httpx.Headers, dict]] = []
+    persisted: list[tuple[str, dict[str, str]]] = []
     task_gets = 0
     task_id = "task-123"
 
@@ -5935,6 +6046,11 @@ async def test_modern_task_extension_drives_input_update_and_completion() -> Non
         assert params["message"] == "Approve?"
         return {"action": "accept", "content": {"approved": True}}
 
+    async def persist_task_state(
+        task: dict[str, Any], answered_inputs: dict[str, str]
+    ) -> None:
+        persisted.append((str(task["status"]), dict(answered_inputs)))
+
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = MCPClient(
         MCPServerConfig(
@@ -5950,7 +6066,11 @@ async def test_modern_task_extension_drives_input_update_and_completion() -> Non
     )
     await client.connect()
 
-    result = await client.call_tool("long", {})
+    result = await client.call_tool(
+        "long",
+        {},
+        modern_task_state_callback=persist_task_state,
+    )
 
     assert result["content"][0]["text"] == "finished"
     task_requests = [entry for entry in seen if entry[0] != "subscriptions/listen"]
@@ -5965,8 +6085,56 @@ async def test_modern_task_extension_drives_input_update_and_completion() -> Non
     for method, headers, _ in task_requests[2:]:
         assert headers["Mcp-Method"] == method
         assert headers["Mcp-Name"] == task_id
+    assert [status for status, _ in persisted] == [
+        "working",
+        "input_required",
+        "input_required",
+        "completed",
+    ]
+    assert persisted[0][1] == {}
+    assert persisted[1][1] == {}
+    assert set(persisted[2][1]) == {"approve"}
+    assert persisted[3][1] == persisted[2][1]
     await client.disconnect()
     await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_modern_task_persistence_failure_requests_cancellation() -> None:
+    client = MCPClient(MCPServerConfig(name="modern", command="fake", args=[], env={}))
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+    request = AsyncMock(return_value={"resultType": "complete"})
+    client.request = request  # type: ignore[method-assign]
+    initial = {
+        "resultType": "task",
+        "taskId": "durability-failed",
+        "status": "working",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:01Z",
+        "ttlMs": None,
+    }
+
+    async def fail_persistence(
+        task: dict[str, Any], answered_inputs: dict[str, str]
+    ) -> None:
+        del task, answered_inputs
+        raise OSError("database unavailable")
+
+    with pytest.raises(MCPProtocolError, match="could not be persisted"):
+        await client._await_modern_tool_task(
+            initial,
+            timeout=1,
+            state_callback=fail_persistence,
+        )
+
+    assert request.await_count == 1
+    assert request.await_args.args == (
+        "tasks/cancel",
+        {"taskId": "durability-failed"},
+    )
 
 
 @pytest.mark.asyncio

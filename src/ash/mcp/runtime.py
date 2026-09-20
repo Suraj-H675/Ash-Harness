@@ -59,6 +59,7 @@ TOOL_REFRESH_DEBOUNCE_SECONDS = 0.05
 TOOL_REFRESH_QUIET_PERIOD_SECONDS = TOOL_REFRESH_DEBOUNCE_SECONDS * 2
 
 MCPInteractionHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+MCPTaskStateHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 async def _settle_task_after_cancellation(
@@ -543,10 +544,13 @@ class MCPTool(BaseTool):
         server_name: str,
         definition: dict[str, Any],
         protocol_version: str = "2025-11-25",
+        task_state_handler: MCPTaskStateHandler | None = None,
     ) -> None:
         super().__init__(safety_guard)
         self.client = client
+        self.server_name = server_name
         self.protocol_version = protocol_version
+        self._task_state_handler = task_state_handler
         self._contract_fingerprint = (
             f"{protocol_version}\0{_json_dump(deepcopy(definition))}"
         )
@@ -654,12 +658,43 @@ class MCPTool(BaseTool):
                     f"MCP tool {self.remote_name!r} no longer matches "
                     "the active verified server contract"
                 )
+            modern_task_state_callback = None
+            event_context = self.event_context_data()
+            call_id = event_context.get("call_id")
+            if (
+                self.protocol_version == MODERN_PROTOCOL_VERSION
+                and self._task_state_handler is not None
+                and isinstance(call_id, str)
+                and call_id
+            ):
+                handler = self._task_state_handler
+
+                async def modern_task_state_callback(
+                    task: dict[str, Any], answered_inputs: dict[str, str]
+                ) -> None:
+                    await handler(
+                        {
+                            "call_id": call_id,
+                            "server_name": self.server_name,
+                            "remote_tool_name": self.remote_name,
+                            "contract_fingerprint": self._contract_fingerprint,
+                            "protocol_version": self.protocol_version,
+                            "task": task,
+                            "answered_inputs": answered_inputs,
+                        }
+                    )
+
+            call_options: dict[str, Any] = {
+                "expected_contract": self._contract_fingerprint,
+                "as_task": getattr(self, "_task_support", "forbidden") == "required",
+                "header_annotations": self._header_annotations,
+            }
+            if modern_task_state_callback is not None:
+                call_options["modern_task_state_callback"] = modern_task_state_callback
             result = await self.client.call_tool(
                 self.remote_name,
                 dict(kwargs),
-                expected_contract=self._contract_fingerprint,
-                as_task=getattr(self, "_task_support", "forbidden") == "required",
-                header_annotations=self._header_annotations,
+                **call_options,
             )
         except MCPProtocolError as exc:
             message = safe_mcp_diagnostic(exc)
@@ -973,6 +1008,7 @@ class MCPRuntime:
         defer_notifications: bool = False,
         sampling_handler: MCPInteractionHandler | None = None,
         elicitation_handler: MCPInteractionHandler | None = None,
+        task_state_handler: MCPTaskStateHandler | None = None,
     ) -> None:
         self.configs = configs
         self.safety_guard = safety_guard
@@ -984,6 +1020,7 @@ class MCPRuntime:
         self._defer_notifications = defer_notifications
         self._sampling_handler = sampling_handler
         self._elicitation_handler = elicitation_handler
+        self._task_state_handler = task_state_handler
         self._refresh_locks: dict[str, asyncio.Lock] = {}
         self._recovery_reconcile_locks: dict[str, asyncio.Lock] = {}
         self._refresh_owners: dict[str, asyncio.Task[Any]] = {}
@@ -1535,6 +1572,7 @@ class MCPRuntime:
                     server_name=server_name,
                     definition=definition,
                     protocol_version=getattr(client, "protocol_version", "2025-11-25"),
+                    task_state_handler=self._task_state_handler,
                 )
                 if tool.name in tools:
                     raise ValueError(f"duplicate generated MCP tool name {tool.name!r}")

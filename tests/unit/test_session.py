@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,8 +61,13 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
     with get_db_connection(db_path) as conn:
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 11
+            == 12
         )
+        assert "mcp_tasks" in table_names
+        assert {
+            "idx_mcp_tasks_session_status",
+            "idx_mcp_tasks_session_turn",
+        }.issubset(index_names)
         audit_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(audit_logs)")
         }
@@ -99,6 +105,142 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
         assert "call_id" in {
             row["name"] for row in conn.execute("PRAGMA table_info(file_checkpoints)")
         }
+
+
+def test_mcp_task_state_is_durable_and_updatable(tmp_path: Path) -> None:
+    db_path = tmp_path / "session_store.db"
+    store = SessionStore(db_path)
+    session = store.create_session(project_path=str(tmp_path))
+    initial = {
+        "taskId": "task-1",
+        "status": "working",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:01Z",
+        "ttlMs": 60_000,
+    }
+    store.save_mcp_task(
+        task_id="task-1",
+        session_id=session.session_id,
+        turn_id="turn-1",
+        call_id="call-1",
+        server_name="server",
+        remote_tool_name="slow",
+        contract_fingerprint="contract",
+        protocol_version="2026-07-28",
+        task=initial,
+        answered_inputs={},
+    )
+    with get_db_connection(db_path) as conn:
+        created_at = conn.execute(
+            "SELECT created_at FROM mcp_tasks WHERE task_id = 'task-1'"
+        ).fetchone()[0]
+
+    completed = {
+        **initial,
+        "status": "completed",
+        "lastUpdatedAt": "2026-09-20T00:00:02Z",
+        "result": {"content": [{"type": "text", "text": "done"}]},
+    }
+    store.save_mcp_task(
+        task_id="task-1",
+        session_id=session.session_id,
+        turn_id="turn-1",
+        call_id="call-1",
+        server_name="server",
+        remote_tool_name="slow",
+        contract_fingerprint="contract",
+        protocol_version="2026-07-28",
+        task=completed,
+        answered_inputs={"approve": "fingerprint"},
+    )
+
+    rows = store.list_mcp_tasks(session.session_id)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["task_id"] == "task-1"
+    assert row["status"] == "completed"
+    assert row["created_at"] == created_at
+    assert row["server_name"] == "server"
+    assert row["remote_tool_name"] == "slow"
+    assert row["contract_fingerprint"] == "contract"
+    assert row["protocol_version"] == "2026-07-28"
+    assert row["task_json"] == json.dumps(
+        completed, ensure_ascii=False, sort_keys=True
+    )
+    assert row["answered_inputs_json"] == json.dumps(
+        {"approve": "fingerprint"}, ensure_ascii=False, sort_keys=True
+    )
+
+    store.delete_mcp_task("server", "task-1")
+    assert store.list_mcp_tasks(session.session_id) == []
+
+
+def test_mcp_task_ids_are_namespaced_by_server_and_cannot_be_reassigned(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    first = store.create_session(project_path=str(tmp_path))
+    second = store.create_session(project_path=str(tmp_path))
+    task = {
+        "taskId": "shared-id",
+        "status": "working",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:01Z",
+        "ttlMs": None,
+    }
+    for server_name, session_id, call_id in (
+        ("alpha", first.session_id, "call-a"),
+        ("beta", second.session_id, "call-b"),
+    ):
+        store.save_mcp_task(
+            task_id="shared-id",
+            session_id=session_id,
+            turn_id=f"turn-{call_id}",
+            call_id=call_id,
+            server_name=server_name,
+            remote_tool_name="slow",
+            contract_fingerprint="contract",
+            protocol_version="2026-07-28",
+            task=task,
+            answered_inputs={},
+        )
+
+    assert len(store.list_mcp_tasks(first.session_id)) == 1
+    assert len(store.list_mcp_tasks(second.session_id)) == 1
+
+    with pytest.raises(ValueError, match="reused a durable taskId"):
+        store.save_mcp_task(
+            task_id="shared-id",
+            session_id=second.session_id,
+            turn_id="turn-other",
+            call_id="call-other",
+            server_name="alpha",
+            remote_tool_name="slow",
+            contract_fingerprint="contract",
+            protocol_version="2026-07-28",
+            task=task,
+            answered_inputs={},
+        )
+
+
+def test_v12_migration_adds_mcp_task_table_with_backup(tmp_path: Path) -> None:
+    db_path = tmp_path / "v11.db"
+    SessionStore(db_path)
+    with get_db_connection(db_path) as conn, conn:
+        conn.execute("DROP TABLE mcp_tasks")
+        conn.execute("DELETE FROM schema_migrations WHERE version = 12")
+
+    SessionStore(db_path)
+
+    assert len(list(tmp_path.glob("v11.db.before-v12-migration.*.backup"))) == 1
+    with get_db_connection(db_path) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 12
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'mcp_tasks'"
+        ).fetchone()[0] == 1
 
 
 def test_session_store_rejects_linked_database_file_and_parent(tmp_path: Path) -> None:
@@ -151,7 +293,7 @@ def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     store = SessionStore(db_path)
 
     assert store.load_session("legacy").session_id == "legacy"
-    backups = list(tmp_path.glob("legacy.db.before-v11-migration.*.backup"))
+    backups = list(tmp_path.glob("legacy.db.before-v12-migration.*.backup"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as conn:
         assert conn.execute("SELECT session_id FROM sessions").fetchone()[0] == "legacy"
@@ -209,7 +351,7 @@ def test_v7_migration_preserves_checkpoints_and_adds_call_granularity(
         call_id="call-2",
     )
     assert len(migrated.file_checkpoints_for_turns(session.session_id, ["turn-1"])) == 2
-    assert len(list(tmp_path.glob("v6.db.before-v11-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v6.db.before-v12-migration.*.backup"))) == 1
 
 
 def test_session_forks_form_a_durable_redacted_tree(tmp_path: Path) -> None:

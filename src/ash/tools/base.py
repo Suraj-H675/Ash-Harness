@@ -108,6 +108,11 @@ class BaseTool(ABC):
         context = self._event_context.get() or {}
         self._event_sink({**context, **payload})
 
+    def event_context_data(self) -> dict[str, Any]:
+        """Return a copy of the current per-invocation event context."""
+
+        return dict(self._event_context.get() or {})
+
 
 class ToolMiddleware(ABC):
     """Hook called before and after every tool execution."""

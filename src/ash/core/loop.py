@@ -1247,6 +1247,43 @@ class AshLoop:
                 raise RuntimeError("cannot start MCP servers after loop shutdown")
             await self._publish_mcp_runtime(self._mcp_configs)
 
+    async def _persist_mcp_task_state(self, payload: dict[str, Any]) -> None:
+        """Bind one durable MCP task state to the active Ash tool call."""
+
+        session = self.current_session
+        turn_context = self.turn_context
+        if session is None or turn_context is None:
+            raise RuntimeError("MCP task was created outside an active Ash turn")
+        call_id = payload.get("call_id")
+        active_call_id = turn_context.get("tool_call_id")
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or active_call_id != call_id
+        ):
+            raise RuntimeError("MCP task call identity does not match active tool")
+        task = payload.get("task")
+        answered_inputs = payload.get("answered_inputs")
+        if not isinstance(task, dict) or not isinstance(answered_inputs, dict):
+            raise RuntimeError("MCP task persistence payload is invalid")
+        task_id = task.get("taskId")
+        if not isinstance(task_id, str) or not task_id:
+            raise RuntimeError("MCP task persistence payload has no taskId")
+        self.session_store.save_mcp_task(
+            task_id=task_id,
+            session_id=session.session_id,
+            turn_id=turn_context.turn_id,
+            call_id=call_id,
+            server_name=str(payload["server_name"]),
+            remote_tool_name=str(payload["remote_tool_name"]),
+            contract_fingerprint=str(payload["contract_fingerprint"]),
+            protocol_version=str(payload["protocol_version"]),
+            task=task,
+            answered_inputs={
+                str(key): str(value) for key, value in answered_inputs.items()
+            },
+        )
+
     async def _publish_mcp_runtime(
         self, configs: dict[str, MCPServerConfig]
     ) -> dict[str, str]:
@@ -1284,6 +1321,7 @@ class AshLoop:
                 if interactions is not None and interactions.supports_elicitation
                 else None
             ),
+            task_state_handler=self._persist_mcp_task_state,
         )
         try:
             tools = await runtime.start()

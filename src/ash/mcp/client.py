@@ -46,6 +46,9 @@ SUPPORTED_PROTOCOL_VERSIONS = frozenset(
 MODERN_HEADER_MISMATCH_ERROR = -32020
 MODERN_MISSING_CAPABILITY_ERROR = -32021
 MODERN_UNSUPPORTED_VERSION_ERROR = -32022
+ModernTaskStateCallback = Callable[
+    [dict[str, Any], dict[str, str]], Awaitable[None]
+]
 MAX_PAGINATION_PAGES = 100
 MAX_PAGINATION_SESSION_RESTARTS = 1
 # A server can legally split a catalog across many pages. Bound the complete
@@ -2540,6 +2543,7 @@ class MCPClient:
         task_ttl_ms: int | None = None,
         task_timeout: float | None = None,
         header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
+        modern_task_state_callback: ModernTaskStateCallback | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"name": name, "arguments": arguments}
         if self.protocol_version == MODERN_PROTOCOL_VERSION:
@@ -2560,6 +2564,7 @@ class MCPClient:
             return await self._await_modern_tool_task(
                 result,
                 timeout=task_timeout if task_timeout is not None else self.timeout,
+                state_callback=modern_task_state_callback,
             )
         if not as_task:
             return await self.request(
@@ -2719,6 +2724,7 @@ class MCPClient:
         initial: dict[str, Any],
         *,
         timeout: float,
+        state_callback: ModernTaskStateCallback | None = None,
     ) -> dict[str, Any]:
         """Drive one server-directed 2026-07-28 task to a terminal result."""
 
@@ -2734,6 +2740,11 @@ class MCPClient:
         answered_inputs: dict[str, str] = {}
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        await self._persist_modern_task_state(
+            state_callback,
+            task,
+            answered_inputs,
+        )
         self._start_modern_task_subscription(task_id)
         try:
             while task["status"] in {"working", "input_required"}:
@@ -2784,6 +2795,11 @@ class MCPClient:
                                 separators=(",", ":"),
                                 allow_nan=False,
                             )
+                        await self._persist_modern_task_state(
+                            state_callback,
+                            task,
+                            answered_inputs,
+                        )
 
                 remaining = deadline - loop.time()
                 if remaining <= 0:
@@ -2816,6 +2832,11 @@ class MCPClient:
                         raise MCPProtocolError(
                             "MCP task notification returned another taskId"
                         )
+                    await self._persist_modern_task_state(
+                        state_callback,
+                        task,
+                        answered_inputs,
+                    )
                     continue
                 if loop.time() >= deadline:
                     raise asyncio.TimeoutError
@@ -2829,6 +2850,11 @@ class MCPClient:
                 )
                 if task["taskId"] != task_id:
                     raise MCPProtocolError("MCP tasks/get returned another taskId")
+                await self._persist_modern_task_state(
+                    state_callback,
+                    task,
+                    answered_inputs,
+                )
 
             if task["status"] == "completed":
                 result = task.get("result")
@@ -2875,6 +2901,22 @@ class MCPClient:
             raise
         finally:
             await self._stop_modern_task_subscription(task_id)
+
+    async def _persist_modern_task_state(
+        self,
+        callback: ModernTaskStateCallback | None,
+        task: dict[str, Any],
+        answered_inputs: dict[str, str],
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            await callback(dict(task), dict(answered_inputs))
+        except Exception as exc:
+            await self._cancel_mcp_task(task["taskId"])
+            raise MCPProtocolError(
+                "MCP task state could not be persisted; cancellation was requested"
+            ) from exc
 
     async def _cancel_mcp_task(self, task_id: str) -> None:
         try:
