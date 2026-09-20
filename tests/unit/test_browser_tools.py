@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 from pathlib import Path
@@ -12,17 +13,24 @@ import pytest
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy, PolicyAction
 from ash.tools.browser import (
+    MAX_BROWSER_TABS,
+    MAX_SNAPSHOT_CHARS,
     BrowserSession,
     BrowserUnavailableError,
     BrowserBackTool,
+    BrowserCloseTabTool,
     BrowserUploadTool,
     BrowserDownloadTool,
     BrowserScreenshotTool,
     BrowserClickTool,
+    BrowserFocusTabTool,
     BrowserNavigateTool,
+    BrowserOpenTabTool,
     BrowserScrollTool,
     BrowserSnapshotTool,
+    BrowserTabsTool,
     BrowserTypeTool,
+    _redact_browser_url,
     _validate_browser_url,
     _validate_cdp_url,
     build_browser_tools,
@@ -42,6 +50,22 @@ class FakeBrowserSession:
     async def snapshot(self) -> str:
         self.calls.append(("snapshot", None))
         return "current snapshot"
+
+    async def list_tabs(self) -> str:
+        self.calls.append(("tabs", None))
+        return '{"tabs":[]}'
+
+    async def open_tab(self, url: str, wait_until: str) -> str:
+        self.calls.append(("open_tab", (url, wait_until)))
+        return "new tab snapshot"
+
+    async def focus_tab(self, tab_id: str) -> str:
+        self.calls.append(("focus_tab", tab_id))
+        return "focused tab snapshot"
+
+    async def close_tab(self, tab_id: str) -> str:
+        self.calls.append(("close_tab", tab_id))
+        return '{"tabs":[]}'
 
     async def click(self, ref: str) -> str:
         self.calls.append(("click", ref))
@@ -146,6 +170,7 @@ class _UploadPage:
 
 def _upload_session(chooser: _UploadChooser) -> BrowserSession:
     session = BrowserSession(timeout_seconds=1)
+    session._session_token = "deadbeef"
     session.ensure_started = AsyncMock(  # type: ignore[method-assign]
         return_value=_UploadPage(chooser)
     )
@@ -164,6 +189,10 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
     tools = [
         BrowserNavigateTool(guard, session),  # type: ignore[arg-type]
         BrowserSnapshotTool(guard, session),  # type: ignore[arg-type]
+        BrowserTabsTool(guard, session),  # type: ignore[arg-type]
+        BrowserOpenTabTool(guard, session),  # type: ignore[arg-type]
+        BrowserFocusTabTool(guard, session),  # type: ignore[arg-type]
+        BrowserCloseTabTool(guard, session),  # type: ignore[arg-type]
         BrowserClickTool(guard, session),  # type: ignore[arg-type]
         BrowserTypeTool(guard, session),  # type: ignore[arg-type]
         BrowserScrollTool(guard, session),  # type: ignore[arg-type]
@@ -176,18 +205,27 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
     results = [
         await tools[0].run(url="https://example.com", wait_until="load"),
         await tools[1].run(),
-        await tools[2].run(ref="e2"),
-        await tools[3].run(ref="e3", text="hello", submit=True, clear=False),
-        await tools[4].run(direction="up", amount=250),
-        await tools[5].run(),
-        await tools[6].run(max_bytes=1_000_000),
+        await tools[2].run(),
+        await tools[3].run(url="https://example.org", wait_until="domcontentloaded"),
+        await tools[4].run(tab_id="tdeadbeef-2"),
+        await tools[5].run(tab_id="tdeadbeef-2"),
+        await tools[6].run(ref="tdeadbeef-1:s1:e2"),
         await tools[7].run(
-            ref="e4",
+            ref="tdeadbeef-1:s1:e3",
+            text="hello",
+            submit=True,
+            clear=False,
+        ),
+        await tools[8].run(direction="up", amount=250),
+        await tools[9].run(),
+        await tools[10].run(max_bytes=1_000_000),
+        await tools[11].run(
+            ref="tdeadbeef-1:s1:e4",
             file_path="docs/report.pdf",
             max_bytes=2_000_000,
         ),
-        await tools[8].run(
-            ref="e5",
+        await tools[12].run(
+            ref="tdeadbeef-1:s1:e5",
             file_path="downloads/report.pdf",
             max_bytes=4_000_000,
         ),
@@ -198,17 +236,694 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
     assert session.calls == [
         ("navigate", ("https://example.com", "load")),
         ("snapshot", None),
-        ("click", "e2"),
-        ("type", ("e3", "hello", True, False)),
+        ("tabs", None),
+        ("open_tab", ("https://example.org", "domcontentloaded")),
+        ("focus_tab", "tdeadbeef-2"),
+        ("close_tab", "tdeadbeef-2"),
+        ("click", "tdeadbeef-1:s1:e2"),
+        ("type", ("tdeadbeef-1:s1:e3", "hello", True, False)),
         ("scroll", ("up", 250)),
         ("back", None),
         ("screenshot", 1_000_000),
-        ("upload", ("e4", "docs/report.pdf", 2_000_000)),
-        ("download", ("e5", "downloads/report.pdf", 4_000_000, False)),
+        ("upload", ("tdeadbeef-1:s1:e4", "docs/report.pdf", 2_000_000)),
+        (
+            "download",
+            ("tdeadbeef-1:s1:e5", "downloads/report.pdf", 4_000_000, False),
+        ),
     ]
     assert session.closed == 1
-    assert results[6].images[0]["sha256"] == "a" * 64
-    assert results[6].image_blocks[0]["data"] == "cG5nLWRhdGE="
+    assert results[10].images[0]["sha256"] == "a" * 64
+    assert results[10].image_blocks[0]["data"] == "cG5nLWRhdGE="
+
+
+@pytest.mark.asyncio
+async def test_browser_session_tab_handles_are_stable_and_selection_is_explicit() -> None:
+    class FakePage:
+        def __init__(self, title: str, url: str) -> None:
+            self._title = title
+            self.url = url
+            self.closed = False
+            self.front_calls = 0
+            self.wait_for_load_state = AsyncMock()
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        async def title(self) -> str:
+            return self._title
+
+        async def bring_to_front(self) -> None:
+            self.front_calls += 1
+
+        async def close(self) -> None:
+            self.closed = True
+
+    first = FakePage("First", "https://first.example/")
+    second = FakePage("Second", "https://second.example/")
+
+    class FakeContext:
+        pages = [first, second]
+
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "deadbeef"
+    session._context = FakeContext()
+    session._page = first
+    session.snapshot = AsyncMock(return_value="snapshot")  # type: ignore[method-assign]
+
+    first_listing = json.loads(await session.list_tabs())
+    second_listing = json.loads(await session.list_tabs())
+
+    assert first_listing == second_listing
+    assert first_listing["tabs"] == [
+        {
+            "tab_id": "tdeadbeef-1",
+            "active": True,
+            "title": "First",
+            "url": "https://first.example/",
+        },
+        {
+            "tab_id": "tdeadbeef-2",
+            "active": False,
+            "title": "Second",
+            "url": "https://second.example/",
+        },
+    ]
+
+    await session.focus_tab("tdeadbeef-2")
+    assert session._page is second
+    assert second.front_calls == 1
+
+    await session._settle(first)
+    assert session._page is first
+
+    closed = json.loads(await session.close_tab("tdeadbeef-2"))
+    assert closed["tabs"] == [
+        {
+            "tab_id": "tdeadbeef-1",
+            "active": True,
+            "title": "First",
+            "url": "https://first.example/",
+        }
+    ]
+    with pytest.raises(ValueError, match="stale or missing"):
+        await session.focus_tab("tdeadbeef-2")
+    with pytest.raises(ValueError, match="last live tab"):
+        await session.close_tab("tdeadbeef-1")
+
+
+@pytest.mark.asyncio
+async def test_browser_open_tab_failure_restores_previous_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        def __init__(self, *, fail: bool = False) -> None:
+            self.url = "about:blank"
+            self.closed = False
+            self.fail = fail
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        async def goto(self, url: str, **kwargs: Any) -> None:
+            del kwargs
+            self.url = url
+            if self.fail:
+                raise RuntimeError("navigation failed")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    first = FakePage()
+    created = FakePage(fail=True)
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages = [first]
+
+        async def new_page(self) -> FakePage:
+            self.pages.append(created)
+            return created
+
+    monkeypatch.setattr(
+        "ash.tools.browser._validate_browser_url",
+        lambda url, _allowed_domains: url,
+    )
+    session = BrowserSession(timeout_seconds=1)
+    session._context = FakeContext()
+    session._page = first
+
+    with pytest.raises(RuntimeError, match="navigation failed"):
+        await session.open_tab("https://example.com", "load")
+
+    assert created.closed is True
+    assert session._page is first
+    assert list(session._tab_pages.values()) == [first]
+
+
+@pytest.mark.asyncio
+async def test_browser_open_tab_enforces_live_tab_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        url = "about:blank"
+
+        def is_closed(self) -> bool:
+            return False
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages = [FakePage() for _ in range(32)]
+            self.new_page = AsyncMock()
+
+    monkeypatch.setattr(
+        "ash.tools.browser._validate_browser_url",
+        lambda url, _allowed_domains: url,
+    )
+    context = FakeContext()
+    session = BrowserSession(timeout_seconds=1)
+    session._context = context
+    session._page = context.pages[0]
+
+    with pytest.raises(ValueError, match="tab limit reached"):
+        await session.open_tab("https://example.com", "load")
+
+    context.new_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_browser_popup_admission_closes_overflow_tab() -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.closed = False
+            self.url = "about:blank"
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        async def close(self) -> None:
+            self.closed = True
+
+    pages = [FakePage() for _ in range(MAX_BROWSER_TABS)]
+    overflow = FakePage()
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages = [*pages, overflow]
+
+    session = BrowserSession(timeout_seconds=1)
+    session._context = FakeContext()
+    session._page = pages[0]
+
+    await session._admit_page(overflow)
+
+    assert overflow.closed is True
+    assert len(session._live_pages()) == MAX_BROWSER_TABS
+
+
+@pytest.mark.asyncio
+async def test_browser_cancelled_tab_listing_still_finishes_popup_admission() -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class FakePage:
+        def __init__(self, *, slow_close: bool = False) -> None:
+            self.closed = False
+            self.url = "about:blank"
+            self.slow_close = slow_close
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        async def close(self) -> None:
+            if self.slow_close:
+                close_started.set()
+                await release_close.wait()
+            self.closed = True
+
+    pages = [FakePage() for _ in range(MAX_BROWSER_TABS)]
+    overflow = FakePage(slow_close=True)
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages = [*pages, overflow]
+
+    session = BrowserSession(timeout_seconds=1)
+    session._context = FakeContext()
+    session._page = pages[0]
+    session._on_page_created(overflow)
+
+    listing = asyncio.create_task(session.list_tabs())
+    await close_started.wait()
+    listing.cancel()
+    release_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await listing
+
+    assert overflow.closed is True
+    assert len(session._live_pages()) == MAX_BROWSER_TABS
+    assert not session._page_tasks
+
+
+@pytest.mark.asyncio
+async def test_browser_tab_mutations_are_serialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.closed = False
+            self.url = "about:blank"
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        async def goto(self, url: str, **kwargs: Any) -> None:
+            del kwargs
+            self.url = url
+
+        async def close(self) -> None:
+            await asyncio.sleep(0)
+            self.closed = True
+
+    class FakeContext:
+        def __init__(self, pages: list[FakePage]) -> None:
+            self.pages = pages
+
+        async def new_page(self) -> FakePage:
+            await asyncio.sleep(0)
+            page = FakePage()
+            self.pages.append(page)
+            return page
+
+    monkeypatch.setattr(
+        "ash.tools.browser._validate_browser_url",
+        lambda url, _allowed_domains: url,
+    )
+    pages = [FakePage() for _ in range(MAX_BROWSER_TABS - 1)]
+    context = FakeContext(pages)
+    session = BrowserSession(timeout_seconds=1)
+    session._context = context
+    session._page = pages[0]
+    session.snapshot = AsyncMock(return_value="snapshot")  # type: ignore[method-assign]
+
+    opened = await asyncio.gather(
+        session.open_tab("https://one.example", "load"),
+        session.open_tab("https://two.example", "load"),
+        return_exceptions=True,
+    )
+
+    assert sum(result == "snapshot" for result in opened) == 1
+    assert sum(isinstance(result, ValueError) for result in opened) == 1
+    assert len(session._live_pages()) == MAX_BROWSER_TABS
+
+    first = FakePage()
+    second = FakePage()
+    context = FakeContext([first, second])
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "deadbeef"
+    session._context = context
+    session._page = first
+    first_id = session._remember_tab(first)
+    second_id = session._remember_tab(second)
+    session._list_tabs_unlocked = AsyncMock(  # type: ignore[method-assign]
+        return_value='{"tabs":[]}'
+    )
+
+    closed = await asyncio.gather(
+        session.close_tab(first_id),
+        session.close_tab(second_id),
+        return_exceptions=True,
+    )
+
+    assert sum(result == '{"tabs":[]}' for result in closed) == 1
+    assert sum(isinstance(result, ValueError) for result in closed) == 1
+    assert len(session._live_pages()) == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_open_tab_cancellation_rolls_back_new_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.closed = False
+            self.url = "about:blank"
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        async def goto(self, url: str, **kwargs: Any) -> None:
+            del kwargs
+            self.url = url
+
+        async def close(self) -> None:
+            self.closed = True
+
+    previous = FakePage()
+    created = FakePage()
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages = [previous]
+
+        async def new_page(self) -> FakePage:
+            self.pages.append(created)
+            return created
+
+    monkeypatch.setattr(
+        "ash.tools.browser._validate_browser_url",
+        lambda url, _allowed_domains: url,
+    )
+    session = BrowserSession(timeout_seconds=1)
+    session._context = FakeContext()
+    session._page = previous
+    session.snapshot = AsyncMock(  # type: ignore[method-assign]
+        side_effect=asyncio.CancelledError
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await session.open_tab("https://example.com", "load")
+
+    assert created.closed is True
+    assert session._page is previous
+
+
+@pytest.mark.asyncio
+async def test_browser_open_tab_cancellation_during_creation_closes_created_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.closed = False
+            self.url = "about:blank"
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        async def close(self) -> None:
+            self.closed = True
+
+    previous = FakePage()
+    created = FakePage()
+    created_event = asyncio.Event()
+    release_event = asyncio.Event()
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages = [previous]
+
+        async def new_page(self) -> FakePage:
+            self.pages.append(created)
+            created_event.set()
+            await release_event.wait()
+            return created
+
+    monkeypatch.setattr(
+        "ash.tools.browser._validate_browser_url",
+        lambda url, _allowed_domains: url,
+    )
+    session = BrowserSession(timeout_seconds=1)
+    session._context = FakeContext()
+    session._page = previous
+
+    task = asyncio.create_task(session.open_tab("https://example.com", "load"))
+    await created_event.wait()
+    task.cancel()
+    release_event.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert created.closed is True
+    assert session._page is previous
+    assert session._live_pages() == [previous]
+
+
+@pytest.mark.asyncio
+async def test_browser_open_tab_preserves_navigation_error_when_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        def __init__(self, *, fail_navigation: bool = False) -> None:
+            self.closed = False
+            self.url = "about:blank"
+            self.fail_navigation = fail_navigation
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        async def goto(self, url: str, **kwargs: Any) -> None:
+            del kwargs
+            self.url = url
+            if self.fail_navigation:
+                raise ValueError("navigation failed")
+
+        async def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    previous = FakePage()
+    created = FakePage(fail_navigation=True)
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages = [previous]
+
+        async def new_page(self) -> FakePage:
+            self.pages.append(created)
+            return created
+
+    monkeypatch.setattr(
+        "ash.tools.browser._validate_browser_url",
+        lambda url, _allowed_domains: url,
+    )
+    session = BrowserSession(timeout_seconds=1)
+    session._context = FakeContext()
+    session._page = previous
+
+    with pytest.raises(ValueError, match="navigation failed"):
+        await session.open_tab("https://example.com", "load")
+
+    assert session._page is None
+    assert session._context is None
+
+
+def test_browser_tab_ids_do_not_alias_across_sessions() -> None:
+    class FakePage:
+        def is_closed(self) -> bool:
+            return False
+
+    old_page = FakePage()
+    new_page = FakePage()
+    old_session = BrowserSession(timeout_seconds=1)
+    old_session._session_token = "deadbeef"
+    old_session._context = type("Context", (), {"pages": [old_page]})()
+    old_session._page = old_page
+    old_id = old_session._remember_tab(old_page)
+
+    new_session = BrowserSession(timeout_seconds=1)
+    new_session._session_token = "feedface"
+    new_session._context = type("Context", (), {"pages": [new_page]})()
+    new_session._page = new_page
+    new_session._remember_tab(new_page)
+
+    with pytest.raises(ValueError, match="stale or missing"):
+        new_session._resolve_tab(old_id)
+
+
+@pytest.mark.asyncio
+async def test_closed_browser_session_cannot_be_restarted() -> None:
+    session = BrowserSession(timeout_seconds=1)
+    tool = BrowserSnapshotTool(
+        SafetyGuard(Path.cwd()),
+        session,
+    )
+
+    await session.close()
+
+    with pytest.raises(BrowserUnavailableError, match="session is closed"):
+        await session.ensure_started()
+    result = await tool.run()
+    assert result.success is False
+    assert result.error == "browser session is closed"
+
+
+@pytest.mark.asyncio
+async def test_browser_element_refs_are_bound_to_their_tab() -> None:
+    class FakeLocator:
+        async def count(self) -> int:
+            return 1
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        def locator(self, _selector: str) -> FakeLocator:
+            return FakeLocator()
+
+    first = FakePage()
+    second = FakePage()
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "deadbeef"
+    session._context = type("Context", (), {"pages": [first, second]})()
+    first_id = session._remember_tab(first)
+    second_id = session._remember_tab(second)
+    session._snapshot_versions[first_id] = 1
+    session._snapshot_versions[second_id] = 1
+    session._page = second
+
+    with pytest.raises(ValueError, match="belongs to another tab"):
+        await session._locator(f"{first_id}:s1:e1")
+
+    locator = await session._locator(f"{second_id}:s1:e1")
+    assert isinstance(locator, FakeLocator)
+
+    session._snapshot_versions[second_id] = 2
+    with pytest.raises(ValueError, match="is stale"):
+        await session._locator(f"{second_id}:s1:e1")
+
+
+@pytest.mark.asyncio
+async def test_browser_snapshot_redacts_page_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        url = "https://example.com/"
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def title(self) -> str:
+            return "Dashboard title-secret"
+
+        async def eval_on_selector_all(self, selector: str, *_args: Any) -> list[Any]:
+            del selector
+            return []
+
+        async def aria_snapshot(self, **_kwargs: Any) -> str:
+            return "main"
+
+    monkeypatch.setattr(
+        "ash.tools.browser.redact_text",
+        lambda value: value.replace("title-secret", "[REDACTED]"),
+    )
+    page = FakePage()
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "deadbeef"
+    session._context = type("Context", (), {"pages": [page]})()
+    session._page = page
+
+    snapshot = await session.snapshot()
+
+    assert "title-secret" not in snapshot
+    assert "Page: Dashboard [REDACTED]" in snapshot
+
+
+@pytest.mark.asyncio
+async def test_browser_tab_listing_recovers_active_close_race_and_is_bounded() -> None:
+    class FakePage:
+        def __init__(
+            self,
+            title: str,
+            url: str,
+            *,
+            close_during_title: bool = False,
+        ) -> None:
+            self._title = title
+            self.url = url
+            self.closed = False
+            self.close_during_title = close_during_title
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        async def close(self) -> None:
+            self.closed = True
+
+        async def title(self) -> str:
+            if self.close_during_title:
+                self.closed = True
+            return self._title
+
+    closing = FakePage(
+        "closing",
+        "https://closing.example/",
+        close_during_title=True,
+    )
+    backup = FakePage("backup", "https://backup.example/")
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "deadbeef"
+    session._context = type("Context", (), {"pages": [closing, backup]})()
+    session._page = closing
+
+    raced = json.loads(await session.list_tabs())
+
+    assert raced["tabs"] == [
+        {
+            "tab_id": "tdeadbeef-2",
+            "active": True,
+            "title": "backup",
+            "url": "https://backup.example/",
+        }
+    ]
+
+    popup = FakePage("popup", "https://popup.example/")
+
+    class MutatingPage(FakePage):
+        def __init__(self, context: Any) -> None:
+            super().__init__("first", "https://first.example/")
+            self._context = context
+            self._mutated = False
+
+        async def title(self) -> str:
+            if not self._mutated:
+                self._mutated = True
+                self._context.pages.append(popup)
+            return await super().title()
+
+    context = type("Context", (), {"pages": []})()
+    first = MutatingPage(context)
+    context.pages = [
+        first,
+        *[
+            FakePage(f"page-{index}", f"https://{index}.example/")
+            for index in range(MAX_BROWSER_TABS - 1)
+        ],
+    ]
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "cafebabe"
+    session._context = context
+    session._page = first
+
+    popup_race = json.loads(await session.list_tabs())
+
+    assert popup.closed is True
+    assert popup_race["total"] == MAX_BROWSER_TABS
+    assert len(popup_race["tabs"]) == MAX_BROWSER_TABS
+    assert popup_race["truncated"] is False
+
+    pages = [
+        FakePage(
+            "x" * 200,
+            "https://example.com/?" + ("a" * 2_000),
+        )
+        for _ in range(MAX_BROWSER_TABS)
+    ]
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "feedface"
+    session._context = type("Context", (), {"pages": pages})()
+    session._page = pages[0]
+
+    output = await session.list_tabs()
+    bounded = json.loads(output)
+
+    assert len(output) <= MAX_SNAPSHOT_CHARS
+    assert bounded["total"] == MAX_BROWSER_TABS
+    assert bounded["truncated"] is True
+    assert len(bounded["tabs"]) < MAX_BROWSER_TABS
+    assert sum(bool(item["active"]) for item in bounded["tabs"]) == 1
 
 
 @pytest.mark.asyncio
@@ -483,17 +1198,72 @@ def test_browser_url_policy_blocks_private_non_http_and_disallowed_hosts(
         _validate_browser_url("https://blocked.example/page", ("docs.example",))
 
 
+def test_browser_url_output_redacts_oauth_query_and_fragment_credentials() -> None:
+    redacted = _redact_browser_url(
+        "https://login.example/callback?"
+        "code=authorization-value&next=%2Fhome&api_key=provider-secret"
+        "#access_token=browser-token&section=profile"
+    )
+
+    assert "authorization-value" not in redacted
+    assert "provider-secret" not in redacted
+    assert "browser-token" not in redacted
+    assert "code=[REDACTED]" in redacted
+    assert "api_key=[REDACTED]" in redacted
+    assert "access_token=[REDACTED]" in redacted
+    assert "next=%2Fhome" in redacted
+    assert "section=profile" in redacted
+
+    spa = _redact_browser_url(
+        "https://user:password@login.example/app"
+        "#/callback?code=spa-code&view=complete"
+    )
+    assert "user:password@" not in spa
+    assert "#/callback?code=[REDACTED]&view=complete" in spa
+
+    camel_case = _redact_browser_url(
+        "https://login.example/callback?"
+        "accessToken=browser-token&clientSecret=client-secret&"
+        "apikey=plain-api-key&APIKey=upper-api-key&view=complete"
+    )
+    assert "browser-token" not in camel_case
+    assert "client-secret" not in camel_case
+    assert "plain-api-key" not in camel_case
+    assert "upper-api-key" not in camel_case
+    assert "accessToken=[REDACTED]" in camel_case
+    assert "clientSecret=[REDACTED]" in camel_case
+    assert "apikey=[REDACTED]" in camel_case
+    assert "APIKey=[REDACTED]" in camel_case
+    assert "view=complete" in camel_case
+
+
 def test_browser_tools_share_one_lazy_session_and_permissions(tmp_path) -> None:
     tools = build_browser_tools(SafetyGuard(tmp_path))
 
     assert len({id(tool.session) for tool in tools}) == 1
+    assert {tool.name for tool in tools} >= {
+        "browser_tabs",
+        "browser_open_tab",
+        "browser_focus_tab",
+        "browser_close_tab",
+    }
     assert (
         PermissionPolicy("interactive").evaluate("browser_snapshot", {}).action
         == PolicyAction.ALLOW
     )
     assert (
+        PermissionPolicy("interactive").evaluate("browser_tabs", {}).action
+        == PolicyAction.ALLOW
+    )
+    assert (
         PermissionPolicy("interactive")
         .evaluate("browser_navigate", {"url": "https://example.com"})
+        .action
+        == PolicyAction.ASK
+    )
+    assert (
+        PermissionPolicy("interactive")
+        .evaluate("browser_focus_tab", {"tab_id": "tdeadbeef-2"})
         .action
         == PolicyAction.ASK
     )
@@ -519,10 +1289,27 @@ async def test_browser_tool_reports_stale_refs_without_raising(tmp_path) -> None
         StaleSession(),  # type: ignore[arg-type]
     )
 
-    result = await tool.run(ref="e1")
+    result = await tool.run(ref="tdeadbeef-1:s1:e1")
 
     assert result.success is False
     assert "stale or missing" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_tool_propagates_json_truncation_metadata(tmp_path) -> None:
+    class TruncatedSession(FakeBrowserSession):
+        async def list_tabs(self) -> str:
+            return '{"tabs":[],"total":32,"truncated":true}'
+
+    tool = BrowserTabsTool(
+        SafetyGuard(tmp_path),
+        TruncatedSession(),  # type: ignore[arg-type]
+    )
+
+    result = await tool.run()
+
+    assert result.success is True
+    assert result.truncated is True
 
 
 def test_browser_cdp_url_is_loopback_only_and_credential_free() -> None:

@@ -10,10 +10,11 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -30,10 +31,16 @@ from ash.tools.web import _normalize_allowed_domains, _validate_public_url
 MAX_SNAPSHOT_CHARS = 30_000
 MAX_INTERACTIVE_ELEMENTS = 150
 MAX_CDP_STORAGE_STATE_BYTES = 4 * 1024 * 1024
+MAX_BROWSER_TABS = 32
+TAB_ID_PATTERN = r"t[0-9a-f]{8}-[1-9][0-9]{0,8}"
 BROWSER_TOOL_NAMES = frozenset(
     {
         "browser_navigate",
         "browser_snapshot",
+        "browser_tabs",
+        "browser_open_tab",
+        "browser_focus_tab",
+        "browser_close_tab",
         "browser_click",
         "browser_type",
         "browser_scroll",
@@ -43,7 +50,39 @@ BROWSER_TOOL_NAMES = frozenset(
         "browser_download",
     }
 )
-ELEMENT_REF = re.compile(r"^e[1-9][0-9]{0,3}$")
+ELEMENT_REF = re.compile(
+    rf"^(?P<tab_id>{TAB_ID_PATTERN}):s(?P<snapshot>[1-9][0-9]{{0,8}}):"
+    r"e[1-9][0-9]{0,3}$"
+)
+TAB_ID = re.compile(rf"^{TAB_ID_PATTERN}$")
+SENSITIVE_BROWSER_URL_FIELDS = frozenset(
+    {
+        "access_token",
+        "apikey",
+        "api_key",
+        "auth",
+        "authorization",
+        "authorization_code",
+        "client_secret",
+        "code",
+        "code_verifier",
+        "credential",
+        "credentials",
+        "id_token",
+        "jwt",
+        "key",
+        "oauth_code",
+        "password",
+        "refresh_token",
+        "saml_response",
+        "secret",
+        "session",
+        "session_id",
+        "state",
+        "ticket",
+        "token",
+    }
+)
 INTERACTIVE_SELECTOR = ",".join(
     (
         "a[href]",
@@ -109,10 +148,17 @@ class BrowserSession:
             else None
         )
         self._lock = asyncio.Lock()
+        self._tab_lock = asyncio.Lock()
+        self._closed = False
         self._playwright: Any | None = None
         self._browser: Any | None = None
         self._context: Any | None = None
         self._page: Any | None = None
+        self._tab_pages: dict[str, Any] = {}
+        self._snapshot_versions: dict[str, int] = {}
+        self._session_token = secrets.token_hex(4)
+        self._next_tab_id = 1
+        self._page_tasks: set[asyncio.Task[None]] = set()
         self._proxy: BrowserPolicyProxy | None = None
 
     @property
@@ -122,11 +168,15 @@ class BrowserSession:
 
     async def ensure_started(self) -> Any:
         async with self._lock:
+            if self._closed:
+                raise BrowserUnavailableError("browser session is closed")
             if self._page is not None and not self._page.is_closed():
+                self._remember_tab(self._page)
                 return self._page
             if self._context is not None:
                 self._page = self._latest_page()
                 if self._page is not None and not self._page.is_closed():
+                    self._remember_tab(self._page)
                     return self._page
             try:
                 from playwright.async_api import async_playwright
@@ -249,7 +299,11 @@ class BrowserSession:
                 self._context.set_default_navigation_timeout(self.timeout_ms)
                 await self._context.route("**/*", self._route_request)
                 await self._context.route_web_socket("**/*", self._route_websocket)
+                on_event = getattr(self._context, "on", None)
+                if callable(on_event):
+                    on_event("page", self._on_page_created)
                 self._page = await self._context.new_page()
+                self._remember_tab(self._page)
                 return self._page
             except asyncio.CancelledError:
                 cleanup_task = asyncio.create_task(
@@ -299,26 +353,27 @@ class BrowserSession:
         )
         page = await self.ensure_started()
         await page.goto(validated, wait_until=wait_until, timeout=self.timeout_ms)
-        self._page = self._latest_page()
         return await self.snapshot()
 
     async def snapshot(self) -> str:
         page = await self.ensure_started()
-        self._page = self._latest_page()
-        page = self._page
-        title = await page.title()
+        tab_id = self._remember_tab(page)
+        snapshot_version = self._snapshot_versions.get(tab_id, 0) + 1
+        self._snapshot_versions[tab_id] = snapshot_version
+        ref_prefix = f"{tab_id}:s{snapshot_version}"
+        title = redact_text(_single_line(str(await page.title())))[:200]
         elements = await page.eval_on_selector_all(
             INTERACTIVE_SELECTOR,
-            """(nodes, maxItems) => {
+            """(nodes, options) => {
               let refIndex = 0;
               return nodes.flatMap((node) => {
-                if (refIndex >= maxItems) return [];
+                if (refIndex >= options.maxItems) return [];
                 const style = window.getComputedStyle(node);
                 const rect = node.getBoundingClientRect();
                 if (style.visibility === 'hidden' || style.display === 'none' ||
                     rect.width <= 0 || rect.height <= 0) return [];
                 refIndex += 1;
-                const ref = `e${refIndex}`;
+                const ref = options.refPrefix + ':e' + refIndex;
                 node.setAttribute('data-ash-ref', ref);
                 const role = node.getAttribute('role') || node.tagName.toLowerCase();
                 const text = node.getAttribute('aria-label') ||
@@ -328,7 +383,7 @@ class BrowserSession:
                     disabled: Boolean(node.disabled) || node.getAttribute('aria-disabled') === 'true'}];
               });
             }""",
-            MAX_INTERACTIVE_ELEMENTS,
+            {"maxItems": MAX_INTERACTIVE_ELEMENTS, "refPrefix": ref_prefix},
         )
         aria = await page.aria_snapshot(timeout=self.timeout_ms)
         password_values = await page.eval_on_selector_all(
@@ -336,7 +391,13 @@ class BrowserSession:
             """nodes => nodes.slice(0, 100).map(node => String(node.value || '').slice(0, 10000)).filter(Boolean)""",
         )
         aria = _redact_literals(aria, password_values)
-        lines = [f"Page: {title}", f"URL: {page.url}", "", "Interactive elements:"]
+        lines = [
+            f"Tab: {tab_id}",
+            f"Page: {title}",
+            f"URL: {_redact_browser_url(str(page.url))}",
+            "",
+            "Interactive elements:",
+        ]
         for item in elements:
             label = _single_line(str(item.get("text", "")))[:200]
             disabled = " disabled" if item.get("disabled") else ""
@@ -351,7 +412,6 @@ class BrowserSession:
 
     async def screenshot(self, *, max_bytes: int) -> "BrowserScreenshot":
         page = await self.ensure_started()
-        self._page = self._latest_page()
         payload = await page.screenshot(type="png", full_page=False)
         if len(payload) > max_bytes:
             raise ValueError(
@@ -380,7 +440,6 @@ class BrowserSession:
         if input_type != "file":
             raise ValueError("browser_upload target must be a file input")
         page = await self.ensure_started()
-        self._page = self._latest_page()
         validated_path, payload = await asyncio.to_thread(
             read_scoped_bytes,
             file_path,
@@ -494,10 +553,197 @@ class BrowserSession:
         await page.go_back(wait_until="domcontentloaded", timeout=self.timeout_ms)
         return await self.snapshot()
 
+    async def list_tabs(self) -> str:
+        await self.ensure_started()
+        await self._drain_page_tasks()
+        async with self._tab_lock:
+            await self._enforce_tab_limit_unlocked()
+            return await self._list_tabs_unlocked()
+
+    async def _list_tabs_unlocked(self) -> str:
+        pages = self._live_pages()
+        self._prune_tab_pages(pages)
+        if self._page is None or self._page.is_closed() or not any(
+            self._page is page for page in pages
+        ):
+            self._page = pages[-1] if pages else None
+        tabs: list[dict[str, Any]] = []
+        for page in pages:
+            tab_id = self._remember_tab(page)
+            try:
+                title = _single_line(str(await page.title()))[:200]
+            except Exception:
+                if page.is_closed():
+                    continue
+                title = ""
+            tabs.append(
+                {
+                    "tab_id": tab_id,
+                    "active": page is self._page,
+                    "title": redact_text(title),
+                    "url": _redact_browser_url(str(page.url))[:2048],
+                }
+            )
+        await self._enforce_tab_limit_unlocked()
+        live_pages = self._live_pages()
+        tabs = [
+            item
+            for item in tabs
+            if any(
+                self._tab_pages.get(str(item["tab_id"])) is page
+                for page in live_pages
+            )
+        ]
+        if self._page is None or self._page.is_closed() or not any(
+            self._page is page for page in live_pages
+        ):
+            self._page = live_pages[-1] if live_pages else None
+        for item in tabs:
+            item["active"] = self._tab_pages.get(str(item["tab_id"])) is self._page
+        total = len(live_pages)
+        truncated = len(tabs) < total
+        payload = {"tabs": tabs, "total": total, "truncated": truncated}
+        output = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        while len(output) > MAX_SNAPSHOT_CHARS and len(tabs) > 1:
+            removable = next(
+                (
+                    index
+                    for index in range(len(tabs) - 1, -1, -1)
+                    if not bool(tabs[index]["active"])
+                ),
+                len(tabs) - 1,
+            )
+            tabs.pop(removable)
+            truncated = True
+            payload = {"tabs": tabs, "total": total, "truncated": truncated}
+            output = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(output) > MAX_SNAPSHOT_CHARS:
+            raise ValueError("browser tab listing exceeds the bounded output limit")
+        return output
+
+    async def open_tab(self, url: str, wait_until: str) -> str:
+        validated = await asyncio.to_thread(
+            _validate_browser_url, url, self.allowed_domains
+        )
+        await self.ensure_started()
+        async with self._tab_lock:
+            if self._context is None:
+                raise BrowserUnavailableError("browser context is unavailable")
+            await self._enforce_tab_limit_unlocked()
+            if len(self._live_pages()) >= MAX_BROWSER_TABS:
+                raise ValueError(
+                    f"browser tab limit reached ({MAX_BROWSER_TABS}); close a tab first"
+                )
+            previous = self._page
+            page_task = asyncio.create_task(
+                self._context.new_page(),
+                name="ash-browser-open-tab-create",
+            )
+            page, page_error, creation_interrupted = await _settle_browser_value_task(
+                page_task
+            )
+            if page_error is not None:
+                if creation_interrupted:
+                    raise asyncio.CancelledError
+                raise page_error
+            if page is None:
+                raise BrowserUnavailableError("browser did not create a new tab")
+            self._remember_tab(page)
+            self._page = page
+            if creation_interrupted:
+                await self._rollback_open_tab(page, previous)
+                raise asyncio.CancelledError
+            try:
+                await page.goto(
+                    validated,
+                    wait_until=wait_until,
+                    timeout=self.timeout_ms,
+                )
+                return await self.snapshot()
+            except BaseException as primary:
+                cleanup_error, cleanup_interrupted = await self._rollback_open_tab(
+                    page, previous
+                )
+                if cleanup_error is not None:
+                    primary.add_note(f"browser tab rollback failed: {cleanup_error}")
+                if cleanup_interrupted:
+                    primary.add_note("browser tab rollback was interrupted")
+                raise
+
+    async def _rollback_open_tab(
+        self,
+        page: Any,
+        previous: Any | None,
+    ) -> tuple[BaseException | None, bool]:
+        cleanup_task = asyncio.create_task(
+            page.close(),
+            name="ash-browser-open-tab-cleanup",
+        )
+        cleanup_error, interrupted = await _settle_browser_cleanup_task(cleanup_task)
+        if cleanup_error is not None or not page.is_closed():
+            teardown_task = asyncio.create_task(
+                self._close_unlocked(),
+                name="ash-browser-open-tab-teardown",
+            )
+            teardown_error, teardown_interrupted = await _settle_browser_cleanup_task(
+                teardown_task
+            )
+            interrupted = interrupted or teardown_interrupted
+            error = cleanup_error or BrowserUnavailableError(
+                "browser could not close a failed new tab"
+            )
+            if teardown_error is not None:
+                error.add_note(f"browser session teardown failed: {teardown_error}")
+            return error, interrupted
+        self._prune_tab_pages()
+        if previous is not None and not previous.is_closed():
+            self._page = previous
+        else:
+            self._page = self._latest_page()
+        return None, interrupted
+
+    async def focus_tab(self, tab_id: str) -> str:
+        await self.ensure_started()
+        await self._drain_page_tasks()
+        async with self._tab_lock:
+            page = self._resolve_tab(tab_id)
+            await page.bring_to_front()
+            self._page = page
+            return await self.snapshot()
+
+    async def close_tab(self, tab_id: str) -> str:
+        await self.ensure_started()
+        await self._drain_page_tasks()
+        async with self._tab_lock:
+            page = self._resolve_tab(tab_id)
+            pages = self._live_pages()
+            if len(pages) <= 1:
+                raise ValueError("browser_close_tab refuses to close the last live tab")
+            was_active = page is self._page
+            await page.close()
+            self._prune_tab_pages()
+            if was_active:
+                self._page = self._latest_page()
+            return await self._list_tabs_unlocked()
+
     async def _locator(self, ref: str) -> Any:
-        if not ELEMENT_REF.fullmatch(ref):
-            raise ValueError("browser element ref must look like e1")
+        match = ELEMENT_REF.fullmatch(ref)
+        if match is None:
+            raise ValueError(
+                "browser element ref must look like <tab-id>:s<snapshot>:e1"
+            )
         page = await self.ensure_started()
+        active_tab_id = self._remember_tab(page)
+        if match.group("tab_id") != active_tab_id:
+            raise ValueError(
+                f"browser element {ref!r} belongs to another tab; "
+                "focus that tab and take a new snapshot"
+            )
+        snapshot_version = self._snapshot_versions.get(active_tab_id)
+        if snapshot_version is None or int(match.group("snapshot")) != snapshot_version:
+            raise ValueError(
+                f"browser element {ref!r} is stale; take a new snapshot"
+            )
         locator = page.locator(f'[data-ash-ref="{ref}"]')
         count = await locator.count()
         if count != 1:
@@ -510,18 +756,145 @@ class BrowserSession:
         try:
             await page.wait_for_load_state("domcontentloaded", timeout=2000)
         except Exception:
+            pass
+        await self._drain_page_tasks()
+        if not page.is_closed():
+            self._page = page
+            self._remember_tab(page)
+        else:
+            self._page = self._latest_page()
+            if self._page is not None:
+                self._remember_tab(self._page)
+        self._prune_tab_pages()
+
+    def _on_page_created(self, page: Any) -> None:
+        task = asyncio.create_task(
+            self._admit_page(page),
+            name="ash-browser-page-admission",
+        )
+        self._page_tasks.add(task)
+        task.add_done_callback(self._page_task_done)
+
+    def _page_task_done(self, task: asyncio.Task[None]) -> None:
+        self._page_tasks.discard(task)
+        try:
+            task.result()
+        except BaseException:
+            pass
+
+    async def _drain_page_tasks(self) -> None:
+        interrupted = False
+        while True:
+            pending = [task for task in self._page_tasks if not task.done()]
+            if not pending:
+                break
+            waiter = asyncio.gather(*pending, return_exceptions=True)
+            while not waiter.done():
+                try:
+                    await asyncio.shield(waiter)
+                except asyncio.CancelledError:
+                    interrupted = True
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.uncancel()
+                except BaseException:
+                    break
+        if interrupted:
+            raise asyncio.CancelledError
+
+    async def _admit_page(self, page: Any) -> None:
+        async with self._tab_lock:
+            if page.is_closed():
+                return
+            self._remember_tab(page)
+            try:
+                await self._enforce_tab_limit_unlocked()
+            except BrowserUnavailableError:
+                if not page.is_closed():
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                self._prune_tab_pages()
+
+    async def _enforce_tab_limit_unlocked(self) -> None:
+        pages = self._live_pages()
+        if len(pages) <= MAX_BROWSER_TABS:
+            self._prune_tab_pages(pages)
             return
-        self._page = self._latest_page()
+        keep = pages[:MAX_BROWSER_TABS]
+        if (
+            self._page is not None
+            and any(self._page is page for page in pages)
+            and not any(self._page is page for page in keep)
+        ):
+            keep[-1] = self._page
+        overflow = [
+            page
+            for page in pages
+            if not any(page is kept_page for kept_page in keep)
+        ]
+        for page in overflow:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        remaining = self._live_pages()
+        self._prune_tab_pages(remaining)
+        if len(remaining) > MAX_BROWSER_TABS:
+            raise BrowserUnavailableError(
+                "browser could not enforce the live-tab resource limit"
+            )
+
+    def _live_pages(self) -> list[Any]:
+        if self._context is None:
+            return []
+        return [page for page in self._context.pages if not page.is_closed()]
+
+    def _remember_tab(self, page: Any) -> str:
+        for tab_id, known_page in self._tab_pages.items():
+            if known_page is page:
+                return tab_id
+        tab_id = f"t{self._session_token}-{self._next_tab_id}"
+        self._next_tab_id += 1
+        self._tab_pages[tab_id] = page
+        return tab_id
+
+    def _prune_tab_pages(self, pages: list[Any] | None = None) -> None:
+        live = pages if pages is not None else self._live_pages()
+        self._tab_pages = {
+            tab_id: page
+            for tab_id, page in self._tab_pages.items()
+            if any(page is live_page for live_page in live)
+        }
+        self._snapshot_versions = {
+            tab_id: version
+            for tab_id, version in self._snapshot_versions.items()
+            if tab_id in self._tab_pages
+        }
+
+    def _resolve_tab(self, tab_id: str) -> Any:
+        if not TAB_ID.fullmatch(tab_id):
+            raise ValueError("browser tab id must look like t1234abcd-1")
+        self._prune_tab_pages()
+        page = self._tab_pages.get(tab_id)
+        if page is None or page.is_closed():
+            raise ValueError(
+                f"browser tab {tab_id!r} is stale or missing; list tabs again"
+            )
+        return page
 
     def _latest_page(self) -> Any:
-        if self._context is not None:
-            live = [page for page in self._context.pages if not page.is_closed()]
-            if live:
-                return live[-1]
+        live = self._live_pages()
+        if live:
+            return live[-1]
         return self._page
 
     async def close(self) -> None:
         async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             cleanup_task = asyncio.create_task(
                 self._close_unlocked(),
                 name="ash-browser-close",
@@ -535,6 +908,12 @@ class BrowserSession:
                 raise asyncio.CancelledError
 
     async def _close_unlocked(self) -> None:
+        page_tasks = list(self._page_tasks)
+        for task in page_tasks:
+            task.cancel()
+        if page_tasks:
+            await asyncio.gather(*page_tasks, return_exceptions=True)
+        self._page_tasks.clear()
         for resource in (self._context, self._browser):
             if resource is not None:
                 try:
@@ -552,6 +931,8 @@ class BrowserSession:
             except Exception:
                 pass
         self._page = None
+        self._tab_pages.clear()
+        self._snapshot_versions.clear()
         self._context = None
         self._browser = None
         self._playwright = None
@@ -572,11 +953,35 @@ async def _settle_browser_cleanup_task(
             current = asyncio.current_task()
             if current is not None:
                 current.uncancel()
+        except BaseException:
+            break
     try:
         task.result()
     except BaseException as exc:
         return exc, interrupted
     return None, interrupted
+
+
+async def _settle_browser_value_task(
+    task: asyncio.Task[Any],
+) -> tuple[Any | None, BaseException | None, bool]:
+    """Settle one value-producing browser task despite caller cancellation."""
+
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        except BaseException:
+            break
+    try:
+        return task.result(), None, interrupted
+    except BaseException as exc:
+        return None, exc, interrupted
 
 
 def _validate_cdp_url(url: str) -> str:
@@ -637,6 +1042,66 @@ def _validate_browser_url(url: str, allowed_domains: tuple[str, ...]) -> str:
     return _validate_public_url(url, allowed_domains=allowed_domains)
 
 
+def _redact_browser_url(url: str) -> str:
+    parsed = urlparse(url)
+
+    def redact_component(value: str) -> str:
+        if not value or "=" not in value:
+            return redact_text(value)
+        pairs = parse_qsl(value, keep_blank_values=True)
+        redacted_pairs = []
+        for name, field_value in pairs:
+            normalized = re.sub(
+                r"(?<=[a-z0-9])(?=[A-Z])",
+                "_",
+                name,
+            ).casefold().replace("-", "_")
+            sensitive = (
+                normalized in SENSITIVE_BROWSER_URL_FIELDS
+                or normalized.endswith("_token")
+                or normalized.endswith("_secret")
+                or normalized.endswith("_password")
+                or normalized.endswith("_api_key")
+            )
+            redacted_pairs.append(
+                (
+                    name,
+                    (
+                        "[REDACTED]"
+                        if sensitive and field_value
+                        else redact_text(field_value)
+                    ),
+                )
+            )
+        return urlencode(redacted_pairs, safe="[]")
+
+    netloc = parsed.netloc
+    if parsed.username is not None or parsed.password is not None:
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        netloc = host
+        if parsed.port is not None:
+            netloc = f"{netloc}:{parsed.port}"
+    fragment = parsed.fragment
+    if "?" in fragment:
+        fragment_path, fragment_query = fragment.split("?", 1)
+        fragment = (
+            f"{redact_text(fragment_path)}?{redact_component(fragment_query)}"
+        )
+    else:
+        fragment = redact_component(fragment)
+    return urlunparse(
+        parsed._replace(
+            netloc=netloc,
+            path=redact_text(parsed.path),
+            params=redact_text(parsed.params),
+            query=redact_component(parsed.query),
+            fragment=fragment,
+        )
+    )
+
+
 def _single_line(value: str) -> str:
     return " ".join(value.split())
 
@@ -690,14 +1155,25 @@ class NavigateArgs(BaseModel):
     )
 
 
+class TabArgs(BaseModel):
+    tab_id: str = Field(..., min_length=11, max_length=19)
+
+    @field_validator("tab_id")
+    @classmethod
+    def validate_tab_id(cls, value: str) -> str:
+        if not TAB_ID.fullmatch(value):
+            raise ValueError("browser tab id must look like t1234abcd-1")
+        return value
+
+
 class ElementArgs(BaseModel):
-    ref: str = Field(..., min_length=2, max_length=5)
+    ref: str = Field(..., min_length=17, max_length=40)
 
     @field_validator("ref")
     @classmethod
     def validate_ref(cls, value: str) -> str:
         if not ELEMENT_REF.fullmatch(value):
-            raise ValueError("browser element ref must look like e1")
+            raise ValueError("browser element ref must look like t1234abcd-1:s1:e1")
         return value
 
 
@@ -769,7 +1245,11 @@ class _BrowserTool(BaseTool):
             success=True,
             output=output,
             token_count=count_output_tokens(output),
-            truncated="[browser snapshot truncated]" in output,
+            truncated=(
+                "[browser snapshot truncated]" in output
+                or output.startswith('{"tabs":')
+                and '"truncated":true' in output
+            ),
         )
 
 
@@ -791,6 +1271,58 @@ class BrowserSnapshotTool(_BrowserTool):
     async def run(self, **kwargs: Any) -> ToolResult:
         EmptyArgs(**kwargs)
         return await self._result(self.session.snapshot())
+
+
+class BrowserTabsTool(_BrowserTool):
+    name = "browser_tabs"
+    description = (
+        "List live tabs in the isolated browser with stable session-local tab IDs "
+        "and the currently active tab."
+    )
+    args_schema = EmptyArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        EmptyArgs(**kwargs)
+        return await self._result(self.session.list_tabs())
+
+
+class BrowserOpenTabTool(_BrowserTool):
+    name = "browser_open_tab"
+    description = (
+        "Open a public HTTP(S) URL in a new isolated-browser tab, make it active, "
+        "and return its bounded snapshot."
+    )
+    args_schema = NavigateArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = NavigateArgs(**kwargs)
+        return await self._result(self.session.open_tab(args.url, args.wait_until))
+
+
+class BrowserFocusTabTool(_BrowserTool):
+    name = "browser_focus_tab"
+    description = (
+        "Focus one live isolated-browser tab by its stable tab ID and return its "
+        "bounded snapshot."
+    )
+    args_schema = TabArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = TabArgs(**kwargs)
+        return await self._result(self.session.focus_tab(args.tab_id))
+
+
+class BrowserCloseTabTool(_BrowserTool):
+    name = "browser_close_tab"
+    description = (
+        "Close one live isolated-browser tab by its stable tab ID; the final live "
+        "tab is protected from closure."
+    )
+    args_schema = TabArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = TabArgs(**kwargs)
+        return await self._result(self.session.close_tab(args.tab_id))
 
 
 class BrowserClickTool(_BrowserTool):
@@ -949,6 +1481,10 @@ def build_browser_tools(
     return [
         BrowserNavigateTool(safety_guard, session),
         BrowserSnapshotTool(safety_guard, session),
+        BrowserTabsTool(safety_guard, session),
+        BrowserOpenTabTool(safety_guard, session),
+        BrowserFocusTabTool(safety_guard, session),
+        BrowserCloseTabTool(safety_guard, session),
         BrowserClickTool(safety_guard, session),
         BrowserTypeTool(safety_guard, session),
         BrowserScrollTool(safety_guard, session),

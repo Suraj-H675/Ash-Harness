@@ -44,6 +44,7 @@ READ_ONLY_TOOLS = frozenset(
         "remote_agent_task_status",
         "list_automations",
         "browser_snapshot",
+        "browser_tabs",
         "ask_user",
         "test_slow_read",
         "test_cancellable_read",

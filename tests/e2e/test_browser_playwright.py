@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 
 import pytest
 
@@ -49,16 +51,34 @@ async def test_real_chromium_snapshot_fill_click_and_private_fetch_block() -> No
             """
         )
         initial = await session.snapshot()
-        assert "[e1] input 'Name'" in initial
-        assert "[e2] button 'Greet'" in initial
+        name_match = re.search(r"\[([^]]+)] input 'Name'", initial)
+        greet_match = re.search(r"\[([^]]+)] button 'Greet'", initial)
+        password_match = re.search(r"\[([^]]+)] input 'Password'", initial)
+        assert name_match is not None
+        assert greet_match is not None
+        assert password_match is not None
         assert "must-not-leak" not in initial
 
-        await session.type_text("e1", "Ash", submit=False, clear=True)
-        clicked = await session.click("e2")
+        typed = await session.type_text(
+            name_match.group(1),
+            "Ash",
+            submit=False,
+            clear=True,
+        )
+        fresh_greet = re.search(r"\[([^]]+)] button 'Greet'", typed)
+        assert fresh_greet is not None
+        clicked = await session.click(fresh_greet.group(1))
         assert "Hello Ash" in clicked
 
+        fresh_password = re.search(r"\[([^]]+)] input 'Password'", clicked)
+        assert fresh_password is not None
         with pytest.raises(ValueError, match="password"):
-            await session.type_text("e3", "secret", submit=False, clear=True)
+            await session.type_text(
+                fresh_password.group(1),
+                "secret",
+                submit=False,
+                clear=True,
+            )
 
         blocked = await page.evaluate(
             """async () => {
@@ -67,6 +87,58 @@ async def test_real_chromium_snapshot_fill_click_and_private_fetch_block() -> No
             }"""
         )
         assert blocked is True
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_real_chromium_popup_tabs_are_explicitly_selectable() -> None:
+    session = BrowserSession(timeout_seconds=15)
+    page = await session.ensure_started()
+    try:
+        await page.set_content(
+            """
+            <title>first-tab</title>
+            <main>
+              <a href="about:blank" target="_blank">Open second tab</a>
+            </main>
+            """
+        )
+        initial = await session.snapshot()
+        first_tab_match = re.search(r"^Tab: (\S+)$", initial, re.MULTILINE)
+        link_match = re.search(r"\[([^]]+)] a 'Open second tab'", initial)
+        assert first_tab_match is not None
+        assert link_match is not None
+        first_tab_id = first_tab_match.group(1)
+
+        async with session._context.expect_page() as page_info:
+            clicked = await session.click(link_match.group(1))
+        second = await page_info.value
+        await second.set_content("<title>second-tab</title><main>second</main>")
+
+        assert f"Tab: {first_tab_id}" in clicked
+        assert "Page: first-tab" in clicked
+
+        tabs = json.loads(await session.list_tabs())["tabs"]
+        assert len(tabs) == 2
+        assert tabs[0]["tab_id"] == first_tab_id
+        assert tabs[0]["active"] is True
+        assert tabs[1]["active"] is False
+        second_tab_id = tabs[1]["tab_id"]
+
+        focused = await session.focus_tab(second_tab_id)
+        assert f"Tab: {second_tab_id}" in focused
+        assert "Page: second-tab" in focused
+
+        remaining = json.loads(await session.close_tab(second_tab_id))["tabs"]
+        assert remaining == [
+            {
+                "tab_id": first_tab_id,
+                "active": True,
+                "title": "first-tab",
+                "url": "about:blank",
+            }
+        ]
     finally:
         await session.close()
 
@@ -86,10 +158,11 @@ async def test_real_chromium_upload_uses_approved_in_memory_payload(tmp_path) ->
             """
         )
         initial = await session.snapshot()
-        assert "[e1] input 'Attachment'" in initial
+        upload_match = re.search(r"\[([^]]+)] input 'Attachment'", initial)
+        assert upload_match is not None
 
         await session.upload_file(
-            "e1",
+            upload_match.group(1),
             str(approved),
             safety_guard=SafetyGuard(tmp_path),
             max_bytes=1_000,
