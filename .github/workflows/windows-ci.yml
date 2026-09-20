@@ -2,6 +2,18 @@ name: Windows Compatibility
 
 on:
   workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Windows test slice"
+        required: true
+        default: "full"
+        type: choice
+        options:
+          - full
+          - first-failure
+          - providers
+          - agents
+          - automation
 
 permissions:
   contents: read
@@ -22,7 +34,29 @@ jobs:
       - run: uv sync --group dev --extra server --extra browser --extra acp --extra a2a
       - run: uv run ruff check src tests
       - run: uv run mypy src/ash
-      - run: uv run pytest -v --timeout=120 --timeout-method=thread
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $mode = "${{ inputs.test_mode }}"
+          if (-not $mode) { $mode = "full" }
+          switch ($mode) {
+            "first-failure" {
+              uv run pytest -x -vv --tb=long --timeout=120 --timeout-method=thread
+            }
+            "providers" {
+              uv run pytest -vv --tb=long --timeout=120 --timeout-method=thread tests/e2e/test_anthropic_provider_process.py tests/e2e/test_builtin_cloud_provider_process.py tests/e2e/test_local_openai_compatible_process.py
+            }
+            "agents" {
+              uv run pytest -vv --tb=long --timeout=120 --timeout-method=thread tests/integration/test_subagents.py tests/unit/test_agent_tool.py tests/unit/test_agent_worktree.py
+            }
+            "automation" {
+              uv run pytest -vv --tb=long --timeout=120 --timeout-method=thread tests/unit/test_automation.py
+            }
+            default {
+              uv run pytest -v --timeout=120 --timeout-method=thread
+            }
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - run: uv build
       - name: Installed CLI smoke test
         shell: bash
