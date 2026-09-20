@@ -667,17 +667,22 @@ def test_stdio_manager_cwd_swap_cannot_escape_workspace(
     monkeypatch.setattr("ash.mcp.server.prepare_process_tree", prepare_then_swap)
     manager = MCPServerManager()
     manager.start_server(config)
+    recorded_cwd = ""
     try:
         for _ in range(50):
-            if cwd_log.exists():
+            try:
+                recorded_cwd = cwd_log.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                recorded_cwd = ""
+            if recorded_cwd:
                 break
             time.sleep(0.02)
     finally:
         manager.stop_server("cwd-race")
 
     assert swapped is True
-    assert cwd_log.exists()
-    assert Path(cwd_log.read_text(encoding="utf-8")).resolve() == saved.resolve()
+    assert recorded_cwd
+    assert Path(recorded_cwd).resolve() == saved.resolve()
 
 
 def test_stdio_manager_fails_closed_when_stable_cwd_is_unavailable(
