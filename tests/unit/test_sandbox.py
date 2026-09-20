@@ -81,6 +81,65 @@ def test_resolve_host_executable_skips_workspace_shadow(
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")
 @pytest.mark.asyncio
+async def test_manager_run_refuses_replaced_workspace_root(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    replacement = tmp_path / "replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+    manager = SandboxManager(workspace_root=workspace, backend_preference="direct")
+    workspace.rename(saved)
+    replacement.rename(workspace)
+
+    with pytest.raises(
+        SandboxBackendUnavailable,
+        match="working directory identity changed",
+    ):
+        await manager.run(
+            ["/bin/sh", "-c", "printf unsafe > marker.txt"],
+            cwd=workspace,
+            timeout=5,
+        )
+
+    assert not (saved / "marker.txt").exists()
+    assert not (workspace / "marker.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")
+@pytest.mark.asyncio
+async def test_manager_run_refuses_workspace_root_replaced_by_symlink(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    manager = SandboxManager(workspace_root=workspace, backend_preference="direct")
+    workspace.rename(saved)
+    try:
+        workspace.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+
+    with pytest.raises(
+        SandboxBackendUnavailable,
+        match="working directory identity changed",
+    ):
+        await manager.run(
+            ["/bin/sh", "-c", "printf unsafe > marker.txt"],
+            cwd=workspace,
+            timeout=5,
+        )
+
+    assert not (saved / "marker.txt").exists()
+    assert not (outside / "marker.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")
+@pytest.mark.asyncio
 async def test_manager_run_uses_held_cwd_after_path_is_swapped(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

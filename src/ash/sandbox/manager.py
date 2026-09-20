@@ -364,6 +364,21 @@ class SandboxManager:
             raise ValueError("command must be a non-empty sequence")
 
         deadline = timeout if timeout is not None else self.timeout_seconds
+        expected_cwd_identity: tuple[int, int] | None = None
+        if cwd is not None:
+            try:
+                metadata = os.stat(cwd)
+            except OSError:
+                pass
+            else:
+                expected_cwd_identity = (metadata.st_dev, metadata.st_ino)
+            if self.workspace_root is not None:
+                lexical_cwd = Path(os.path.abspath(Path(cwd).expanduser()))
+                if (
+                    lexical_cwd == self.workspace_root
+                    and self._workspace_identity is not None
+                ):
+                    expected_cwd_identity = self._workspace_identity
         with self.prepare_launch(
             command,
             cwd=cwd,
@@ -379,6 +394,7 @@ class SandboxManager:
                     fallback=invocation.fallback_used,
                     env=env,
                     stream_callback=stream_callback,
+                    expected_cwd_identity=expected_cwd_identity,
                 )
 
             return await _run_subprocess(
@@ -391,6 +407,7 @@ class SandboxManager:
                 env=env,
                 stream_callback=stream_callback,
                 pass_fds=invocation.pass_fds,
+                expected_cwd_identity=expected_cwd_identity,
             )
 
     @contextmanager
@@ -758,6 +775,7 @@ async def _run_scoped(
     fallback: bool,
     env: dict[str, str] | None = None,
     stream_callback: ProcessStreamCallback | None = None,
+    expected_cwd_identity: tuple[int, int] | None = None,
 ) -> SandboxResult:
     """Execute the command directly via asyncio.create_subprocess_exec."""
 
@@ -774,6 +792,7 @@ async def _run_scoped(
             cwd=cwd,
             guard=guard,
             search_path=child_env.get("PATH"),
+            expected_cwd_identity=expected_cwd_identity,
         ) as launch:
             spawn_options = dict(process_tree_plan.spawn_options)
             if launch.pass_fds:
@@ -868,6 +887,7 @@ async def _run_subprocess(
     env: dict[str, str] | None = None,
     stream_callback: ProcessStreamCallback | None = None,
     pass_fds: tuple[int, ...] = (),
+    expected_cwd_identity: tuple[int, int] | None = None,
 ) -> SandboxResult:
     """Execute a pre-wrapped argv (e.g. bwrap or docker run) directly."""
 
@@ -883,6 +903,7 @@ async def _run_subprocess(
             cwd=cwd,
             guard=guard,
             search_path=(env or {}).get("PATH"),
+            expected_cwd_identity=expected_cwd_identity,
         ) as launch:
             spawn_options = dict(process_tree_plan.spawn_options)
             inherited_fds = tuple(dict.fromkeys((*pass_fds, *launch.pass_fds)))

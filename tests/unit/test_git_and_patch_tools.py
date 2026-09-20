@@ -281,6 +281,73 @@ async def test_run_git_uses_supplied_sandbox_manager(
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
 @pytest.mark.asyncio
+async def test_run_git_refuses_workspace_swap_during_executable_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.git as git_module
+
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    replacement = tmp_path / "replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+    await _init_repo(workspace)
+    await _init_repo(replacement)
+    real_resolve = git_module.resolve_host_executable
+    swapped = False
+
+    def resolve_then_swap(name: str, *, workspace_root: Path, cwd: Path):
+        nonlocal swapped
+        resolved = real_resolve(name, workspace_root=workspace_root, cwd=cwd)
+        if not swapped:
+            swapped = True
+            workspace.rename(saved)
+            replacement.rename(workspace)
+        return resolved
+
+    monkeypatch.setattr(git_module, "resolve_host_executable", resolve_then_swap)
+
+    code, stdout, stderr = await _run_git(
+        workspace,
+        ["rev-parse", "--show-toplevel"],
+    )
+
+    assert swapped is True
+    assert code == 126
+    assert stdout == ""
+    assert "working directory identity changed" in stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_run_git_with_manager_refuses_replaced_workspace_root(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    replacement = tmp_path / "replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+    await _init_repo(workspace)
+    await _init_repo(replacement)
+    manager = SandboxManager(workspace_root=workspace, backend_preference="direct")
+    workspace.rename(saved)
+    replacement.rename(workspace)
+
+    code, stdout, stderr = await _run_git(
+        workspace,
+        ["rev-parse", "--show-toplevel"],
+        sandbox_manager=manager,
+    )
+
+    assert code == 126
+    assert stdout == ""
+    assert "working directory identity changed" in stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
 async def test_run_git_cwd_swap_cannot_escape_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -316,6 +383,52 @@ async def test_run_git_cwd_swap_cannot_escape_workspace(
     assert swapped is True
     assert code == 0, stderr
     assert Path(stdout.strip()).resolve() == saved.resolve()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_git_apply_refuses_workspace_swap_during_executable_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.patch as patch_module
+
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    replacement = tmp_path / "replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+    await _init_repo(workspace)
+    await _init_repo(replacement)
+    real_resolve = patch_module.resolve_host_executable
+    swapped = False
+
+    def resolve_then_swap(name: str, *, workspace_root: Path, cwd: Path):
+        nonlocal swapped
+        resolved = real_resolve(name, workspace_root=workspace_root, cwd=cwd)
+        if not swapped:
+            swapped = True
+            workspace.rename(saved)
+            replacement.rename(workspace)
+        return resolved
+
+    monkeypatch.setattr(patch_module, "resolve_host_executable", resolve_then_swap)
+    patch_text = """diff --git a/marker.txt b/marker.txt
+new file mode 100644
+--- /dev/null
++++ b/marker.txt
+@@ -0,0 +1 @@
++unsafe
+"""
+
+    code, stdout, stderr = await _git_apply(workspace, patch_text, check=False)
+
+    assert swapped is True
+    assert code == 126
+    assert stdout == ""
+    assert "working directory identity changed" in stderr
+    assert not (saved / "marker.txt").exists()
+    assert not (workspace / "marker.txt").exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")

@@ -127,6 +127,13 @@ def _normalize_patch_path(path: str) -> str:
 
 
 async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, str]:
+    expected_cwd_identity: tuple[int, int] | None = None
+    try:
+        metadata = os.stat(cwd)
+    except OSError:
+        pass
+    else:
+        expected_cwd_identity = (metadata.st_dev, metadata.st_ino)
     git = resolve_host_executable("git", workspace_root=cwd, cwd=cwd)
     if git is None:
         return 127, "", "git is unavailable outside the workspace"
@@ -141,6 +148,7 @@ async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, s
             cwd=cwd,
             guard=cwd_guard,
             search_path=os.environ.get("PATH"),
+            expected_cwd_identity=expected_cwd_identity,
         ) as launch:
             try:
                 process_tree_plan = prepare_process_tree(

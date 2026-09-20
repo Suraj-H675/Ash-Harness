@@ -736,6 +736,13 @@ async def _run_git(
 ) -> tuple[int, str, str]:
     """Run ``git <args>`` in ``cwd`` and return (exit, stdout, stderr)."""
 
+    expected_cwd_identity: tuple[int, int] | None = None
+    try:
+        metadata = os.stat(cwd)
+    except OSError:
+        pass
+    else:
+        expected_cwd_identity = (metadata.st_dev, metadata.st_ino)
     git = resolve_host_executable("git", workspace_root=cwd, cwd=cwd)
     if git is None:
         return 127, "", "git is unavailable outside the workspace"
@@ -775,6 +782,7 @@ async def _run_git(
             cwd=cwd,
             guard=cwd_guard,
             search_path=environment.get("PATH"),
+            expected_cwd_identity=expected_cwd_identity,
         ) as launch:
             try:
                 process_tree_plan = prepare_process_tree(
