@@ -546,6 +546,57 @@ def test_manager_starts_and_stops_server() -> None:
     assert manager.get_server("test-server") is None
 
 
+def test_mcp_config_snapshots_existing_cwd_identity(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    metadata = workspace.stat()
+
+    existing = MCPServerConfig(
+        name="existing-cwd",
+        command="server",
+        args=[],
+        env={},
+        cwd=str(workspace),
+    )
+    missing = MCPServerConfig(
+        name="missing-cwd",
+        command="server",
+        args=[],
+        env={},
+        cwd=str(tmp_path / "missing"),
+    )
+
+    assert existing.cwd_identity == (metadata.st_dev, metadata.st_ino)
+    assert missing.cwd_identity is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd identity regression")
+def test_stdio_manager_refuses_cwd_replaced_after_config_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    config = MCPServerConfig(
+        name="config-cwd-race",
+        command=sys.executable,
+        args=["-c", "pass"],
+        env={},
+        transport="stdio",
+        cwd=str(workspace),
+    )
+    workspace.rename(saved)
+    workspace.mkdir()
+    popen = Mock(side_effect=AssertionError("MCP stdio must not launch"))
+    monkeypatch.setattr("ash.mcp.server.subprocess.Popen", popen)
+
+    with pytest.raises(MCPServerLifecycleError, match="working directory identity changed"):
+        MCPServerManager().start_server(config)
+
+    popen.assert_not_called()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
 def test_stdio_manager_cwd_swap_cannot_escape_workspace(
     tmp_path: Path,
@@ -2359,6 +2410,34 @@ async def test_async_client_initializes_lists_and_calls_tools() -> None:
         assert result["content"][0]["text"] == "hello"
     finally:
         await client.disconnect()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd identity regression")
+@pytest.mark.asyncio
+async def test_stdio_client_refuses_cwd_replaced_after_config_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    config = MCPServerConfig(
+        name="config-cwd-race",
+        command=sys.executable,
+        args=["-c", "pass"],
+        env={},
+        cwd=str(workspace),
+    )
+    workspace.rename(saved)
+    workspace.mkdir()
+    create = AsyncMock(side_effect=AssertionError("MCP stdio must not launch"))
+    monkeypatch.setattr("ash.mcp.client.asyncio.create_subprocess_exec", create)
+    client = MCPClient(config)
+
+    with pytest.raises(MCPProtocolError, match="working directory identity changed"):
+        await client.connect()
+
+    create.assert_not_awaited()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")

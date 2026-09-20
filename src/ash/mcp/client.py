@@ -1389,6 +1389,7 @@ class MCPClient:
                     cwd=resolved_cwd,
                     guard=cwd_guard,
                     search_path=env.get("PATH"),
+                    expected_cwd_identity=self.config.cwd_identity,
                 ) as launch:
                     try:
                         process_tree_plan = prepare_process_tree(

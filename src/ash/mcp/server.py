@@ -6,7 +6,7 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -64,6 +64,12 @@ class MCPServerConfig:
     cwd: str = ""
     auth: str = "none"
     oauth: dict[str, Any] | None = None
+    cwd_identity: tuple[int, int] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not MCP_SERVER_NAME.fullmatch(self.name):
@@ -109,6 +115,18 @@ class MCPServerConfig:
         if self.oauth is not None and not isinstance(self.oauth, dict):
             raise ValueError("MCP oauth configuration must be an object")
         _validate_oauth_data(self.name, self.auth, self.oauth or {})
+        resolved_cwd = self.resolved_cwd
+        if resolved_cwd is not None:
+            try:
+                metadata = os.stat(resolved_cwd)
+            except OSError:
+                pass
+            else:
+                object.__setattr__(
+                    self,
+                    "cwd_identity",
+                    (metadata.st_dev, metadata.st_ino),
+                )
 
     @property
     def resolved_command(self) -> str:
@@ -229,6 +247,7 @@ class MCPServerManager:
                     cwd=resolved_cwd,
                     guard=cwd_guard,
                     search_path=env.get("PATH"),
+                    expected_cwd_identity=config.cwd_identity,
                 ) as launch:
                     try:
                         process_tree_plan = prepare_process_tree(
