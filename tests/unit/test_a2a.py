@@ -3,6 +3,8 @@ from __future__ import annotations
 # ruff: noqa: E402 - optional protocol dependency is checked before importing it
 
 import asyncio
+import json
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +41,8 @@ from a2a.utils.errors import TaskNotFoundError
 
 from ash.sdk import AshEvent
 from ash.agents.a2a_remote import (
+    DelegateRemoteAgentTool,
+    ListRemoteAgentTasksTool,
     ListRemoteAgentsTool,
     RemoteAgentConfig,
     RemoteAgentTaskCancelTool,
@@ -49,6 +53,7 @@ from ash.agents.a2a_remote import (
     send_remote_agent,
     validate_agent_card_origins,
 )
+from ash.agents.a2a_tasks import RemoteTaskStore
 from ash.config import AshConfig
 from ash.safety.guard import SafetyGuard
 from ash.server.a2a import (
@@ -188,6 +193,222 @@ async def _start_blocking_remote_call(
     )
     await asyncio.wait_for(client.task_observed.wait(), timeout=1)
     return call
+
+
+@pytest.mark.asyncio
+async def test_remote_task_handle_is_durable_before_delegation_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _BlockingRemoteClient()
+    _patch_remote_client(monkeypatch, client)
+    store = RemoteTaskStore(tmp_path / "remote-tasks.db", tmp_path)
+    config = RemoteAgentConfig(name="remote", url="https://example.test")
+    tool = DelegateRemoteAgentTool(
+        SafetyGuard(tmp_path),
+        {"remote": config},
+        store,
+    )
+    call = asyncio.create_task(
+        tool.run(
+            agent="remote",
+            prompt="prompt",
+        )
+    )
+    try:
+        await asyncio.wait_for(client.task_observed.wait(), timeout=1)
+        for _ in range(50):
+            handles = store.list()
+            if handles:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("remote task handle was not persisted while delegation was active")
+
+        assert not call.done()
+        assert len(handles) == 1
+        assert handles[0].agent == "remote"
+        assert handles[0].endpoint == "https://example.test"
+        assert handles[0].task_id == "remote-task"
+        assert handles[0].context_id == "remote-context"
+        assert handles[0].state == "TASK_STATE_WORKING"
+
+        call.cancel()
+        await asyncio.wait_for(client.cancel_started.wait(), timeout=1)
+        client.cancel_release.set()
+        await asyncio.wait_for(client.close_started.wait(), timeout=1)
+        client.close_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(call, timeout=1)
+    finally:
+        client.cancel_release.set()
+        client.close_release.set()
+        if not call.done():
+            call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_remote_task_persistence_failure_cancels_known_remote_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _BlockingRemoteClient()
+    _patch_remote_client(monkeypatch, client)
+
+    async def fail_persistence(_result: Any) -> None:
+        raise RuntimeError("durable state unavailable")
+
+    call = asyncio.create_task(
+        send_remote_agent(
+            RemoteAgentConfig(name="remote", url="https://example.test"),
+            "prompt",
+            task_observer=fail_persistence,
+        )
+    )
+    await asyncio.wait_for(client.cancel_started.wait(), timeout=1)
+    assert client.cancel_calls == ["remote-task"]
+    client.cancel_release.set()
+    await asyncio.wait_for(client.close_started.wait(), timeout=1)
+    client.close_release.set()
+
+    with pytest.raises(RuntimeError, match="durable state unavailable"):
+        await asyncio.wait_for(call, timeout=1)
+    assert client.cancel_finished.is_set()
+    assert client.close_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_remote_task_store_recovers_across_restart_and_refuses_rebinding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "db" / "remote-tasks.db"
+    original = RemoteTaskStore(database, workspace)
+    original.save(
+        agent="review",
+        endpoint="https://old.example.test",
+        task_id="task-1",
+        context_id="context-1",
+        state="TASK_STATE_WORKING",
+    )
+    original.close()
+
+    reopened = RemoteTaskStore(database, workspace)
+    changed = RemoteAgentConfig(name="review", url="https://new.example.test")
+    list_tool = ListRemoteAgentTasksTool(
+        SafetyGuard(workspace),
+        {"review": changed},
+        reopened,
+    )
+    status_tool = RemoteAgentTaskStatusTool(
+        SafetyGuard(workspace),
+        {"review": changed},
+        reopened,
+    )
+    network_calls = 0
+
+    async def forbidden_status(*args: Any, **kwargs: Any) -> Any:
+        nonlocal network_calls
+        del args, kwargs
+        network_calls += 1
+        raise AssertionError("endpoint-rebound handle must not reach the network")
+
+    monkeypatch.setattr("ash.agents.a2a_remote.get_remote_agent_task", forbidden_status)
+    try:
+        listed = await list_tool.run()
+        assert listed.success is True
+        payload = json.loads(listed.output)
+        assert payload == [
+            {
+                "agent": "review",
+                "task_id": "task-1",
+                "context_id": "context-1",
+                "state": "TASK_STATE_WORKING",
+                "binding": "endpoint_changed",
+                "updated_at": payload[0]["updated_at"],
+            }
+        ]
+
+        refused = await status_tool.run(agent="review", task_id="task-1")
+        assert refused.success is False
+        assert "different configured endpoint" in (refused.error or "")
+        assert network_calls == 0
+
+        reopened.save(
+            agent="review",
+            endpoint="https://new.example.test",
+            task_id="task-1",
+            context_id="context-new",
+            state="TASK_STATE_WORKING",
+        )
+        assert (
+            reopened.conflicting_endpoint(
+                agent="review",
+                endpoint="https://new.example.test",
+                task_id="task-1",
+            )
+            is None
+        )
+    finally:
+        await list_tool.aclose()
+
+
+def test_remote_task_store_is_workspace_scoped_and_rejects_symlinked_database(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "db" / "remote-tasks.db"
+    first_workspace = tmp_path / "first"
+    second_workspace = tmp_path / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    first = RemoteTaskStore(database, first_workspace)
+    first.save(
+        agent="review",
+        endpoint="https://agent.example.test",
+        task_id="task-1",
+        context_id="",
+        state="TASK_STATE_SUBMITTED",
+    )
+    first.save(
+        agent="review",
+        endpoint="https://agent.example.test",
+        task_id="task-2",
+        context_id="",
+        state="TASK_STATE_WORKING",
+    )
+    second = RemoteTaskStore(database, second_workspace)
+    try:
+        assert len(first.list()) == 2
+        assert len(first.list(limit=1)) == 1
+        with pytest.raises(ValueError, match="limit must be between 1 and 500"):
+            first.list(limit=501)
+        assert second.list() == []
+    finally:
+        first.close()
+        second.close()
+
+    target = tmp_path / "outside.db"
+    target.touch()
+    linked = tmp_path / "linked.db"
+    linked.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink|junction"):
+        RemoteTaskStore(linked, first_workspace)
+
+
+def test_remote_task_store_rejects_newer_schema(tmp_path: Path) -> None:
+    database = tmp_path / "remote-tasks.db"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA user_version = 99")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="schema v99 is newer than supported"):
+        RemoteTaskStore(database, tmp_path)
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -16,6 +17,7 @@ from uuid import uuid4
 import httpx
 from pydantic import BaseModel, Field
 
+from ash.agents.a2a_tasks import RemoteTaskStore
 from ash.core.redaction import redact_text
 from ash.safe_io import strict_json_loads
 from ash.safety.guard import SafetyGuard
@@ -87,6 +89,67 @@ class RemoteAgentTaskArgs(BaseModel):
     task_id: str = Field(..., min_length=1, max_length=512)
 
 
+class ListRemoteAgentTasksArgs(BaseModel):
+    agent: str = Field(default="", max_length=64)
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+RemoteTaskObserver = Callable[[RemoteAgentResult], Awaitable[None]]
+
+
+class _RemoteTaskStoreTool(BaseTool):
+    def __init__(
+        self,
+        safety_guard: SafetyGuard,
+        agents: dict[str, RemoteAgentConfig],
+        task_store: RemoteTaskStore | None,
+    ) -> None:
+        super().__init__(safety_guard)
+        self.agents = dict(agents)
+        self.task_store = task_store
+
+    async def aclose(self) -> None:
+        if self.task_store is not None:
+            self.task_store.close()
+
+    async def _check_binding(self, config: RemoteAgentConfig, task_id: str) -> None:
+        if self.task_store is None:
+            return
+        try:
+            conflict = await asyncio.to_thread(
+                self.task_store.conflicting_endpoint,
+                agent=config.name,
+                endpoint=config.url,
+                task_id=task_id,
+            )
+        except Exception as exc:
+            raise RuntimeError("could not read durable A2A remote task state") from exc
+        if conflict is not None:
+            raise ValueError(
+                f"remote task {task_id!r} for agent {config.name!r} is bound to "
+                "a different configured endpoint"
+            )
+
+    async def _remember(
+        self,
+        config: RemoteAgentConfig,
+        result: RemoteAgentResult,
+    ) -> None:
+        if self.task_store is None or not result.task_id:
+            return
+        try:
+            await asyncio.to_thread(
+                self.task_store.save,
+                agent=config.name,
+                endpoint=config.url,
+                task_id=result.task_id,
+                context_id=result.context_id,
+                state=result.state,
+            )
+        except Exception as exc:
+            raise RuntimeError("could not persist A2A remote task handle") from exc
+
+
 class ListRemoteAgentsTool(BaseTool):
     name = "list_remote_agents"
     description = (
@@ -128,7 +191,7 @@ class ListRemoteAgentsTool(BaseTool):
         )
 
 
-class DelegateRemoteAgentTool(BaseTool):
+class DelegateRemoteAgentTool(_RemoteTaskStoreTool):
     name = "delegate_remote_agent"
     description = (
         "Delegate a bounded text task to an explicitly configured A2A remote agent; "
@@ -137,10 +200,12 @@ class DelegateRemoteAgentTool(BaseTool):
     args_schema = DelegateRemoteAgentArgs
 
     def __init__(
-        self, safety_guard: SafetyGuard, agents: dict[str, RemoteAgentConfig]
+        self,
+        safety_guard: SafetyGuard,
+        agents: dict[str, RemoteAgentConfig],
+        task_store: RemoteTaskStore | None = None,
     ) -> None:
-        super().__init__(safety_guard)
-        self.agents = dict(agents)
+        super().__init__(safety_guard, agents, task_store)
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = self.validate_args(**kwargs)
@@ -153,10 +218,14 @@ class DelegateRemoteAgentTool(BaseTool):
                 error=f"unknown remote agent: {args.agent}",
             )
         try:
+            async def remember(result: RemoteAgentResult) -> None:
+                await self._remember(config, result)
+
             result = await send_remote_agent(
                 config,
                 args.prompt,
                 context_id=args.context_id,
+                task_observer=remember,
             )
         except ModuleNotFoundError as exc:
             if exc.name == "a2a" or (exc.name or "").startswith("a2a."):
@@ -202,16 +271,18 @@ class DelegateRemoteAgentTool(BaseTool):
         )
 
 
-class RemoteAgentTaskStatusTool(BaseTool):
+class RemoteAgentTaskStatusTool(_RemoteTaskStoreTool):
     name = "remote_agent_task_status"
     description = "Fetch the current state and bounded text output of an A2A task."
     args_schema = RemoteAgentTaskArgs
 
     def __init__(
-        self, safety_guard: SafetyGuard, agents: dict[str, RemoteAgentConfig]
+        self,
+        safety_guard: SafetyGuard,
+        agents: dict[str, RemoteAgentConfig],
+        task_store: RemoteTaskStore | None = None,
     ) -> None:
-        super().__init__(safety_guard)
-        self.agents = dict(agents)
+        super().__init__(safety_guard, agents, task_store)
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = self.validate_args(**kwargs)
@@ -224,7 +295,9 @@ class RemoteAgentTaskStatusTool(BaseTool):
                 error=f"unknown remote agent: {args.agent}",
             )
         try:
+            await self._check_binding(config, args.task_id)
             result = await get_remote_agent_task(config, args.task_id)
+            await self._remember(config, result)
         except ModuleNotFoundError as exc:
             if exc.name == "a2a" or (exc.name or "").startswith("a2a."):
                 from ash.install import pipx_install_command
@@ -267,16 +340,18 @@ class RemoteAgentTaskStatusTool(BaseTool):
         )
 
 
-class RemoteAgentTaskCancelTool(BaseTool):
+class RemoteAgentTaskCancelTool(_RemoteTaskStoreTool):
     name = "remote_agent_task_cancel"
     description = "Cancel a known A2A remote task and return its resulting state."
     args_schema = RemoteAgentTaskArgs
 
     def __init__(
-        self, safety_guard: SafetyGuard, agents: dict[str, RemoteAgentConfig]
+        self,
+        safety_guard: SafetyGuard,
+        agents: dict[str, RemoteAgentConfig],
+        task_store: RemoteTaskStore | None = None,
     ) -> None:
-        super().__init__(safety_guard)
-        self.agents = dict(agents)
+        super().__init__(safety_guard, agents, task_store)
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = self.validate_args(**kwargs)
@@ -289,7 +364,9 @@ class RemoteAgentTaskCancelTool(BaseTool):
                 error=f"unknown remote agent: {args.agent}",
             )
         try:
+            await self._check_binding(config, args.task_id)
             result = await cancel_remote_agent_task(config, args.task_id)
+            await self._remember(config, result)
         except ModuleNotFoundError as exc:
             if exc.name == "a2a" or (exc.name or "").startswith("a2a."):
                 from ash.install import pipx_install_command
@@ -328,6 +405,61 @@ class RemoteAgentTaskCancelTool(BaseTool):
             success=True,
             output=payload,
             token_count=count_output_tokens(payload),
+        )
+
+
+class ListRemoteAgentTasksTool(_RemoteTaskStoreTool):
+    name = "list_remote_agent_tasks"
+    description = (
+        "List durable outbound A2A task handles for this workspace without network use."
+    )
+    args_schema = ListRemoteAgentTasksArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = self.validate_args(**kwargs)
+        assert isinstance(args, ListRemoteAgentTasksArgs)
+        if self.task_store is None:
+            rows: list[Any] = []
+        else:
+            try:
+                rows = await asyncio.to_thread(
+                    self.task_store.list,
+                    agent=args.agent or None,
+                    limit=args.limit,
+                )
+            except Exception as exc:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=redact_text(
+                        f"could not read durable A2A remote task state: {exc}"
+                    ),
+                )
+        payload = []
+        for row in rows:
+            configured = self.agents.get(row.agent)
+            binding = (
+                "current"
+                if configured is not None and configured.url == row.endpoint
+                else "agent_unconfigured"
+                if configured is None
+                else "endpoint_changed"
+            )
+            payload.append(
+                {
+                    "agent": row.agent,
+                    "task_id": row.task_id,
+                    "context_id": row.context_id or None,
+                    "state": row.state,
+                    "binding": binding,
+                    "updated_at": row.updated_at,
+                }
+            )
+        output = json.dumps(payload)
+        return ToolResult(
+            success=True,
+            output=output,
+            token_count=count_output_tokens(output),
         )
 
 
@@ -377,6 +509,7 @@ async def send_remote_agent(
     *,
     context_id: str = "",
     transport: httpx.AsyncBaseTransport | None = None,
+    task_observer: RemoteTaskObserver | None = None,
 ) -> RemoteAgentResult:
     from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
     from a2a.types.a2a_pb2 import (
@@ -457,6 +590,29 @@ async def send_remote_agent(
                         chunks,
                         output_bytes,
                     )
+                if task_id and task_observer is not None:
+                    try:
+                        await task_observer(
+                            RemoteAgentResult(
+                                response="",
+                                task_id=task_id,
+                                context_id=resolved_context,
+                                state=state or "UNKNOWN",
+                            )
+                        )
+                    except Exception as observer_error:
+                        cancel_task = asyncio.create_task(
+                            client.cancel_task(CancelTaskRequest(id=task_id))
+                        )
+                        cleanup_error = await _settle_cleanup_task_after_cancellation(
+                            cancel_task
+                        )
+                        if cleanup_error is not None:
+                            observer_error.add_note(
+                                "remote task cancellation after durable-state failure "
+                                f"also failed: {cleanup_error}"
+                            )
+                        raise
         except asyncio.CancelledError:
             if task_id:
                 cancel_task = asyncio.create_task(

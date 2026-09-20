@@ -35,6 +35,7 @@ def test_structural_navigation_tools_are_read_only(tool_name: str) -> None:
 def test_remote_task_status_is_read_only_but_cancel_is_not() -> None:
     policy = PermissionPolicy("plan")
 
+    assert policy.evaluate("list_remote_agent_tasks", {}).action == PolicyAction.ALLOW
     assert (
         policy.evaluate(
             "remote_agent_task_status",

@@ -232,22 +232,46 @@ def build_tools(
     )
     from ash.agents.a2a_remote import (
         DelegateRemoteAgentTool,
+        ListRemoteAgentTasksTool,
         ListRemoteAgentsTool,
         RemoteAgentTaskCancelTool,
         RemoteAgentTaskStatusTool,
         load_remote_agent_configs,
     )
+    from ash.agents.a2a_tasks import RemoteTaskStore
 
     remote_agents = load_remote_agent_configs(
         root, include_project=allow_project_extensions
     )
     if remote_agents:
+        remote_task_store = (
+            RemoteTaskStore(runtime_config.db_directory / "a2a_remote_tasks.db", root)
+            if runtime_config is not None
+            else None
+        )
         tools.extend(
             [
                 ListRemoteAgentsTool(safety_guard, remote_agents),
-                DelegateRemoteAgentTool(safety_guard, remote_agents),
-                RemoteAgentTaskStatusTool(safety_guard, remote_agents),
-                RemoteAgentTaskCancelTool(safety_guard, remote_agents),
+                DelegateRemoteAgentTool(
+                    safety_guard,
+                    remote_agents,
+                    remote_task_store,
+                ),
+                ListRemoteAgentTasksTool(
+                    safety_guard,
+                    remote_agents,
+                    remote_task_store,
+                ),
+                RemoteAgentTaskStatusTool(
+                    safety_guard,
+                    remote_agents,
+                    remote_task_store,
+                ),
+                RemoteAgentTaskCancelTool(
+                    safety_guard,
+                    remote_agents,
+                    remote_task_store,
+                ),
             ]
         )
     if provider_factory is not None and agent_db_path is not None:
