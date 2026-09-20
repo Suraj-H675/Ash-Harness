@@ -61,6 +61,46 @@ def test_verify_provider_connection_reports_missing_selected_model(
     assert result.selected_model_available is False
 
 
+def test_provider_runtime_environment_is_provider_scoped(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://openai.example/v1")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
+    monkeypatch.setenv("GROQ_API_BASE", "https://groq.example/v1")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-cross")
+
+    config = SimpleNamespace(
+        model="openai/main",
+        fallback_models=["groq/fallback"],
+        custom_providers={},
+    )
+
+    assert readiness.provider_runtime_environment(config) == {
+        "GROQ_API_BASE": "https://groq.example/v1",
+        "GROQ_API_KEY": "groq-secret",
+        "OPENAI_API_BASE": "https://openai.example/v1",
+        "OPENAI_API_KEY": "openai-secret",
+    }
+
+
+def test_provider_runtime_environment_honors_custom_key_env(monkeypatch) -> None:
+    monkeypatch.setenv("PRIVATE_GATEWAY_TOKEN", "custom-secret")
+    monkeypatch.setenv("OTHER_TOKEN", "must-not-cross")
+    config = SimpleNamespace(
+        model="private/model",
+        fallback_models=[],
+        custom_providers={
+            "private": {
+                "base_url": "https://gateway.example/v1",
+                "key_env": "PRIVATE_GATEWAY_TOKEN",
+            }
+        },
+    )
+
+    assert readiness.provider_runtime_environment(config) == {
+        "PRIVATE_GATEWAY_TOKEN": "custom-secret"
+    }
+
+
 def test_probe_model_catalog_metadata_preserves_openrouter_capability_fields(
     monkeypatch,
 ) -> None:

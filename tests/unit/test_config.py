@@ -765,6 +765,7 @@ def test_project_config_cannot_override_user_owned_controls(
                 "agent_token_budget = 999999",
                 "agent_time_budget_seconds = 86400",
                 "agent_lease_seconds = 3600",
+                'agent_execution_mode = "subprocess"',
                 "allow_unsafe_auto_approve = true",
                 "allow_unsafe_plugin_runtime = true",
                 'sandbox_backend = "direct"',
@@ -809,6 +810,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.agent_token_budget == 4000
     assert config.agent_time_budget_seconds == 900
     assert config.agent_lease_seconds == 30
+    assert config.agent_execution_mode == "in_process"
     assert config.allow_unsafe_auto_approve is False
     assert config.allow_unsafe_plugin_runtime is False
     assert config.sandbox_backend == "auto"
@@ -835,6 +837,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "agent_token_budget" in diagnostics
     assert "agent_time_budget_seconds" in diagnostics
     assert "agent_lease_seconds" in diagnostics
+    assert "agent_execution_mode" in diagnostics
     assert "allow_unsafe_auto_approve" in diagnostics
     assert "allow_unsafe_plugin_runtime" in diagnostics
     assert "sandbox_backend" in diagnostics

@@ -168,6 +168,96 @@ def verify_installed_openai_first_turn(*, workspace: Path, env: dict[str, str]) 
         worker.join(timeout=5)
 
 
+def verify_installed_subagent_subprocess(*, workspace: Path, root: Path) -> None:
+    """Exercise a real provider-backed subagent in an installed child process."""
+
+    from ash.agents.shared_state import SharedState
+    from ash.config import AshConfig
+    from ash.providers.base import ProviderABC
+    from ash.safety.guard import SafetyGuard
+    from ash.tools.agent import SpawnAgentTool
+
+    requests: list[tuple[str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - HTTP handler API
+            requests.append((self.path, self.headers.get("Authorization", "")))
+            body = (
+                'data: {"id":"wheel-child","choices":[{"delta":{"content":"CHILD"},'
+                '"finish_reason":null}]}\n\n'
+                'data: {"id":"wheel-child","choices":[{"delta":{},'
+                '"finish_reason":"stop"}]}\n\n'
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    previous_key = os.environ.get("OPENAI_API_KEY")
+    previous_base = os.environ.get("OPENAI_API_BASE")
+    os.environ["OPENAI_API_KEY"] = "wheel-child-secret"
+    os.environ["OPENAI_API_BASE"] = f"http://127.0.0.1:{server.server_port}/v1"
+    state = SharedState(root / "provider-agents.db")
+    config = AshConfig(
+        workspace_root=workspace,
+        db_directory=root / "provider-db",
+        model="openai/wheel-child",
+        agent_execution_mode="subprocess",
+        memory_backend="off",
+    )
+
+    def forbidden_parent_factory() -> ProviderABC:
+        raise AssertionError("installed subprocess must rebuild provider in child")
+
+    tool = SpawnAgentTool(
+        SafetyGuard(workspace),
+        state,
+        forbidden_parent_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+
+    async def run() -> None:
+        try:
+            result = await tool.run(
+                role="reviewer",
+                task="installed subprocess provider smoke",
+                agent_id="wheel-provider-child",
+            )
+            assert result.success is True, result.error
+            assert result.output == "CHILD"
+            task = state.tasks.list_tasks()[0]
+            assert task.state == "succeeded"
+            assert task.owner_agent_id == "wheel-provider-child"
+        finally:
+            await tool.aclose()
+
+    try:
+        asyncio.run(run())
+        assert requests == [
+            ("/v1/chat/completions", "Bearer wheel-child-secret")
+        ]
+    finally:
+        if previous_key is None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        else:
+            os.environ["OPENAI_API_KEY"] = previous_key
+        if previous_base is None:
+            os.environ.pop("OPENAI_API_BASE", None)
+        else:
+            os.environ["OPENAI_API_BASE"] = previous_base
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
+
+
 def main() -> None:
     import ash
     from ash.agents.shared_state import SharedState
@@ -365,6 +455,8 @@ def main() -> None:
             assert status is not None and status.status == "completed"
         finally:
             shared_state.close()
+
+        verify_installed_subagent_subprocess(workspace=workspace, root=root)
 
         version = run_ash("--version", cwd=workspace, env=env)
         assert version.stdout.strip().startswith("ash ")

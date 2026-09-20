@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import io
 import json
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,15 +16,22 @@ from pydantic import BaseModel, Field
 
 from ash.agents.shared_state import SharedState
 from ash.agents.tasks import AgentTask, AgentTaskBudgetExceeded, AgentTaskError
-from ash.agents.subprocess_agent import AGENT_ROLES, AgentReport, SubprocessAgent
+from ash.agents.subprocess_agent import (
+    AGENT_ROLES,
+    AgentReport,
+    SubprocessAgent,
+    encode_subprocess_spec,
+)
 from ash.agents.worktree import WorktreeError, WorktreeLease, WorktreeManager
 from ash.core.loop import AshLoop
 from ash.core.redaction import redact_text, redact_value
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC
 from ash.safety.guard import SafetyGuard
+from ash.safety.environment import build_scrubbed_environment
 from ash.safety.policy import PermissionPolicy, PolicyAction
 from ash.sandbox import SandboxManager
+from ash.sandbox.process_utils import prepare_process_tree, terminate_process_tree
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.ui.headless import HeadlessUI
 
@@ -99,12 +107,14 @@ class SpawnAgentTool(BaseTool):
         config: "AshConfig | None" = None,
         max_turn_iterations: int = 12,
         custom_agents: dict[str, "AgentDefinition"] | None = None,
+        provider_config_backed: bool = False,
     ) -> None:
         super().__init__(safety_guard)
         self._shared_state = shared_state
         self._provider_factory = provider_factory
         self._max_return_chars = max_return_chars
         self._config = config
+        self._provider_config_backed = provider_config_backed
         self._max_turn_iterations = max_turn_iterations
         self._max_concurrency = config.max_concurrent_agents if config else 4
         self._task_token_budget = config.agent_token_budget if config else 4000
@@ -152,6 +162,193 @@ class SpawnAgentTool(BaseTool):
         mode = self._config.safety_tier if self._config is not None else "auto_approve"
         return PermissionPolicy(mode)
 
+    def _foreground_subprocess_policy(
+        self,
+        *,
+        execution_role: str,
+    ) -> PermissionPolicy | None:
+        if (
+            self._config is None
+            or self._config.agent_execution_mode != "subprocess"
+            or not self._provider_config_backed
+            or execution_role not in {"researcher", "reviewer", "general"}
+        ):
+            return None
+        policy = self._worker_permission_policy()
+        if any(
+            rule.effect.value == "ask"
+            for rule in (
+                *policy.managed_rules,
+                *policy.session_rules,
+                *policy.persistent_rules,
+            )
+        ):
+            return None
+        return policy
+
+    @staticmethod
+    def _permission_policy_payload(policy: PermissionPolicy) -> dict[str, Any]:
+        return {
+            "mode": policy.mode.value,
+            "managed_rules": [rule.as_payload() for rule in policy.managed_rules],
+            "persistent_rules": [
+                rule.as_payload() for rule in policy.persistent_rules
+            ],
+            "session_rules": [rule.as_payload() for rule in policy.session_rules],
+        }
+
+    @staticmethod
+    def _custom_agent_payload(
+        definition: "AgentDefinition | None",
+    ) -> dict[str, Any] | None:
+        if definition is None:
+            return None
+        return {
+            "name": definition.name,
+            "description": definition.description,
+            "instructions": definition.instructions,
+            "path": str(definition.path),
+            "base_role": definition.base_role,
+            "allowed_tools": list(definition.allowed_tools),
+        }
+
+    async def _run_foreground_subprocess_task(
+        self,
+        *,
+        durable_task: AgentTask,
+        policy: PermissionPolicy,
+        agent_definition: "AgentDefinition | None",
+    ) -> ToolResult:
+        assert self._config is not None
+        from ash.providers.identifiers import parse_model_string
+        from ash.providers.readiness import provider_runtime_environment
+
+        selected_providers = {
+            parse_model_string(model)[0]
+            for model in (self._config.model, *self._config.fallback_models)
+        }
+        child_custom_providers = {
+            name: value
+            for name, value in self._config.custom_providers.items()
+            if name in selected_providers
+        }
+        child_config = self._config.model_copy(
+            update={
+                "agent_execution_mode": "in_process",
+                "custom_providers": child_custom_providers,
+            }
+        )
+        spec = {
+            "version": 1,
+            "kind": "durable_task",
+            "db_path": str(self._shared_state.db_path),
+            "task_id": durable_task.task_id,
+            "workspace_root": str(Path(self.safety_guard.project_root).resolve()),
+            "config": child_config.model_dump(
+                mode="json",
+                exclude={"openai_api_key"},
+            ),
+            "provider_env": provider_runtime_environment(self._config),
+            "permission_policy": self._permission_policy_payload(policy),
+            "custom_agent": self._custom_agent_payload(agent_definition),
+            "max_return_chars": self._max_return_chars,
+            "max_turn_iterations": self._max_turn_iterations,
+        }
+        try:
+            encoded_spec = encode_subprocess_spec(spec)
+            plan = prepare_process_tree(workspace_root=self.safety_guard.project_root)
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-I",
+                "-m",
+                "ash.agents._agent_driver",
+                "--spec-stdin",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=build_scrubbed_environment(
+                    overrides={
+                        "ASH_WORKSPACE_ROOT": str(
+                            Path(self.safety_guard.project_root).resolve()
+                        )
+                    }
+                ),
+                **plan.spawn_options,
+            )
+        except (OSError, ValueError) as exc:
+            self._shared_state.tasks.cancel_task(
+                durable_task.task_id,
+                reason=f"subagent subprocess could not start: {exc}",
+            )
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Could not start subagent subprocess: {exc}",
+            )
+
+        try:
+            await process.communicate(encoded_spec)
+        except asyncio.CancelledError as cancellation:
+            try:
+                await terminate_process_tree(process, plan=plan)
+            except BaseException as cleanup_error:
+                cancellation.add_note(
+                    f"subagent subprocess cleanup failed: {cleanup_error}"
+                )
+            current = self._shared_state.tasks.get_task(durable_task.task_id)
+            if current is not None and current.state not in {
+                "succeeded",
+                "failed",
+                "cancelled",
+            }:
+                self._shared_state.tasks.cancel_task(
+                    durable_task.task_id,
+                    reason="subagent subprocess cancelled",
+                )
+            raise
+
+        current = self._shared_state.tasks.get_task(durable_task.task_id)
+        if current is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Subagent subprocess lost its durable task record.",
+            )
+        if process.returncode != 0 and current.state not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+        }:
+            self._shared_state.tasks.cancel_task(
+                durable_task.task_id,
+                reason=f"subagent subprocess exited with status {process.returncode}",
+            )
+            current = self._shared_state.tasks.get_task(durable_task.task_id) or current
+
+        raw_result = current.result or {}
+        summary = raw_result.get("summary")
+        if not isinstance(summary, str):
+            summary = current.error or "Subagent subprocess did not return a report."
+        if current.state == "succeeded":
+            artifacts = raw_result.get("artifacts")
+            if isinstance(artifacts, dict):
+                branch = artifacts.get("branch")
+                commit = artifacts.get("commit")
+                if isinstance(branch, str) and isinstance(commit, str):
+                    summary += f"\nIsolated changes: branch={branch} commit={commit}"
+            return ToolResult(
+                success=True,
+                output=summary,
+                token_count=count_output_tokens(summary),
+            )
+        error = current.error or summary
+        return ToolResult(
+            success=False,
+            output=summary if raw_result else "",
+            token_count=count_output_tokens(summary) if summary else 0,
+            error=error,
+        )
+
     def supports_role(self, role: str) -> bool:
         return role in AGENT_ROLES or role in self._custom_agents
 
@@ -163,7 +360,13 @@ class SpawnAgentTool(BaseTool):
         args = SpawnAgentArgs(**kwargs)
         return await self._run_args(args)
 
-    async def run_queued_task(self, task_id: str) -> ToolResult:
+    async def run_queued_task(
+        self,
+        task_id: str,
+        *,
+        require_dispatchable: bool = True,
+        wait: bool = False,
+    ) -> ToolResult:
         """Claim and launch one dispatcher-owned durable task."""
 
         durable_task = self._shared_state.tasks.get_task(task_id)
@@ -171,13 +374,20 @@ class SpawnAgentTool(BaseTool):
             return ToolResult(
                 success=False, output="", error=f"Unknown task: {task_id}"
             )
-        validation_error = self._queued_task_error(durable_task)
+        validation_error = self._queued_task_error(
+            durable_task,
+            require_dispatchable=require_dispatchable,
+        )
         if validation_error is not None:
             return ToolResult(success=False, output="", error=validation_error)
         metadata = durable_task.metadata
         attempt_suffix = f"-a{durable_task.attempt + 1}"
         base_agent_id = str(metadata.get("agent_id") or f"worker-{task_id[:32]}")
-        attempt_agent_id = base_agent_id[: 64 - len(attempt_suffix)] + attempt_suffix
+        attempt_agent_id = (
+            base_agent_id[: 64 - len(attempt_suffix)] + attempt_suffix
+            if require_dispatchable
+            else base_agent_id
+        )
         try:
             args = SpawnAgentArgs(
                 role=durable_task.role,
@@ -193,7 +403,11 @@ class SpawnAgentTool(BaseTool):
                 output="",
                 error=f"Task {task_id!r} has invalid dispatch metadata: {exc}",
             )
-        return await self._run_args(args, durable_task=durable_task)
+        return await self._run_args(
+            args,
+            durable_task=durable_task,
+            wait_background=wait,
+        )
 
     async def start(self) -> None:
         self.ensure_dispatcher()
@@ -278,10 +492,15 @@ class SpawnAgentTool(BaseTool):
                 return
             await asyncio.sleep(0.1)
 
-    def _queued_task_error(self, task: AgentTask) -> str | None:
+    def _queued_task_error(
+        self,
+        task: AgentTask,
+        *,
+        require_dispatchable: bool = True,
+    ) -> str | None:
         metadata = task.metadata
         expected_workspace = str(Path(self.safety_guard.project_root).resolve())
-        if metadata.get("dispatchable") is not True:
+        if require_dispatchable and metadata.get("dispatchable") is not True:
             return f"Task {task.task_id!r} is not marked for automatic dispatch."
         if metadata.get("workspace") != expected_workspace:
             return f"Task {task.task_id!r} belongs to another workspace."
@@ -357,6 +576,7 @@ class SpawnAgentTool(BaseTool):
         args: SpawnAgentArgs,
         *,
         durable_task: AgentTask | None = None,
+        wait_background: bool = False,
     ) -> ToolResult:
         created_here = durable_task is None
         agent_definition = self._custom_agents.get(args.role)
@@ -392,6 +612,7 @@ class SpawnAgentTool(BaseTool):
                     metadata={
                         "agent_id": agent_id,
                         "background": args.background,
+                        "isolation": args.isolation,
                         "workspace": str(
                             Path(self.safety_guard.project_root).resolve()
                         ),
@@ -416,6 +637,16 @@ class SpawnAgentTool(BaseTool):
                 output="",
                 error=f"Task {durable_task.task_id!r} is {durable_task.state}, not queued.",
             )
+        if created_here and not args.background:
+            subprocess_policy = self._foreground_subprocess_policy(
+                execution_role=execution_role
+            )
+            if subprocess_policy is not None:
+                return await self._run_foreground_subprocess_task(
+                    durable_task=durable_task,
+                    policy=subprocess_policy,
+                    agent_definition=agent_definition,
+                )
         task_token_budget = durable_task.token_budget
         task_time_budget = durable_task.time_budget_seconds
         durable_lease = self._shared_state.tasks.claim_task(
@@ -790,6 +1021,19 @@ class SpawnAgentTool(BaseTool):
                         pass
 
         if args.background:
+            if wait_background:
+                report = await execute_agent()
+                output = report.summary
+                branch = report.artifacts.get("branch")
+                commit = report.artifacts.get("commit")
+                if branch and commit:
+                    output += f"\nIsolated changes: branch={branch} commit={commit}"
+                return ToolResult(
+                    success=report.success,
+                    output=output,
+                    token_count=count_output_tokens(output),
+                    error=None if report.success else report.summary,
+                )
             task = asyncio.create_task(execute_agent())
             self._tasks[agent_id] = task
 

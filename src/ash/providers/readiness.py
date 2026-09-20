@@ -213,6 +213,43 @@ _BUILTIN_KEY_ENV = {
 }
 
 
+def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
+    """Return only provider-specific environment needed to rebuild a route.
+
+    Subprocess workers must not inherit the parent's general environment. This
+    helper intentionally snapshots only the API-key/base-URL variables used by
+    the selected model and configured fallbacks. Custom provider routes keep
+    their base URL in config and may opt into one explicit ``key_env``.
+    """
+
+    models = [
+        str(config.model),
+        *[str(item) for item in getattr(config, "fallback_models", ())],
+    ]
+    keys: set[str] = set()
+    custom_providers = getattr(config, "custom_providers", {})
+    for model in models:
+        provider, _ = parse_model_string(model)
+        if provider == "ollama":
+            keys.add("OLLAMA_API_BASE")
+        builtin = _BUILTIN_CONNECTIONS.get(provider)
+        if builtin is not None:
+            keys.add(builtin[1])
+        key_env = _BUILTIN_KEY_ENV.get(provider)
+        if key_env is not None:
+            keys.add(key_env)
+        custom = (
+            custom_providers.get(provider)
+            if isinstance(custom_providers, dict)
+            else None
+        )
+        if isinstance(custom, dict):
+            declared_key_env = str(custom.get("key_env") or "").strip()
+            if declared_key_env:
+                keys.add(declared_key_env)
+    return {key: os.environ[key] for key in sorted(keys) if key in os.environ}
+
+
 def normalize_provider_base_url(value: object, *, provider: str) -> str:
     base_url = str(value or "").strip().rstrip("/")
     try:

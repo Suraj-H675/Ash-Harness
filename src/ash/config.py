@@ -599,6 +599,12 @@ class AshConfig(BaseSettings):
         le=3600.0,
         description="Renewable durable ownership lease for a live subagent task.",
     )
+    agent_execution_mode: str = Field(
+        "in_process",
+        description=(
+            "Provider-backed subagent execution boundary: in_process or subprocess."
+        ),
+    )
     allow_unsafe_auto_approve: bool = Field(
         False,
         description="Allow full auto mode without an OS-level sandbox.",
@@ -899,6 +905,16 @@ class AshConfig(BaseSettings):
         normalized = value.strip().casefold()
         if normalized not in {"auto", "native", "docker", "direct"}:
             raise ValueError("sandbox_backend must be auto, native, docker, or direct")
+        return normalized
+
+    @field_validator("agent_execution_mode")
+    @classmethod
+    def validate_agent_execution_mode(cls, value: str) -> str:
+        normalized = value.strip().casefold().replace("-", "_")
+        if normalized not in {"in_process", "subprocess"}:
+            raise ValueError(
+                "agent_execution_mode must be in_process or subprocess"
+            )
         return normalized
 
     @field_validator("sandbox_docker_image")

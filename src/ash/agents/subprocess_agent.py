@@ -67,6 +67,26 @@ TaskFn = Callable[[dict[str, Any]], Awaitable[AgentReport | str]]
 MAX_SUBPROCESS_SPEC_BYTES = 256 * 1024
 
 
+def encode_subprocess_spec(spec: dict[str, Any]) -> bytes:
+    """Serialize one bounded child-process specification."""
+
+    try:
+        encoded = json.dumps(
+            spec,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("subagent subprocess metadata is not JSON-serializable") from exc
+    if len(encoded) > MAX_SUBPROCESS_SPEC_BYTES:
+        raise ValueError(
+            f"subagent subprocess specification exceeds {MAX_SUBPROCESS_SPEC_BYTES} bytes"
+        )
+    return encoded
+
+
 # --- the agent class ------------------------------------------------------
 
 
@@ -247,6 +267,7 @@ class SubprocessAgent:
 
         spec = {
             "version": 1,
+            "kind": "simple",
             "agent_id": self.agent_id,
             "db_path": str(self.shared_state.db_path),
             "role": self.role,
@@ -261,20 +282,7 @@ class SubprocessAgent:
             ),
             "allow_custom_role": self.role not in AGENT_ROLES,
         }
-        try:
-            encoded_spec = json.dumps(
-                spec,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise ValueError("subagent subprocess metadata is not JSON-serializable") from exc
-        if len(encoded_spec) > MAX_SUBPROCESS_SPEC_BYTES:
-            raise ValueError(
-                f"subagent subprocess specification exceeds {MAX_SUBPROCESS_SPEC_BYTES} bytes"
-            )
+        encoded_spec = encode_subprocess_spec(spec)
 
         cmd: list[str] = [
             python_executable or sys.executable,

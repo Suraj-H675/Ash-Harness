@@ -79,6 +79,7 @@ def build_tools(
     sandbox_manager: Any | None = None,
     allow_project_extensions: bool = False,
     provider_factory: Any | None = None,
+    provider_factory_config_backed: bool = False,
     agent_db_path: Path | None = None,
     allowed_web_domains: list[str] | tuple[str, ...] | None = None,
     repo_map: Any | None = None,
@@ -252,6 +253,7 @@ def build_tools(
             provider_factory,
             config=runtime_config,
             custom_agents=agent_definitions,
+            provider_config_backed=provider_factory_config_backed,
         )
         tools.append(spawn_tool)
         if runtime_config is not None:
@@ -412,6 +414,7 @@ def build_runtime(
             if agent_provider_factory is not None
             else lambda: get_provider_registry().build(config)
         ),
+        provider_factory_config_backed=agent_provider_factory is None,
         agent_db_path=config.db_directory / "agents.db",
         allowed_web_domains=config.allowed_web_domains,
         repo_map=repo_map,

@@ -1,6 +1,9 @@
-import pytest
 import asyncio
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
 
 from ash.agents.shared_state import SharedState
 from ash.config import AshConfig
@@ -47,6 +50,121 @@ async def test_spawn_agent_uses_provider_and_persists_report(tmp_path) -> None:
     ]
     assert all(event["task_id"] == durable[0].task_id for event in emitted)
     await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_foreground_read_only_agent_can_run_provider_in_subprocess(
+    tmp_path, monkeypatch
+) -> None:
+    requests: list[tuple[str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            requests.append((self.path, self.headers.get("Authorization", "")))
+            body = (
+                'data: {"id":"child","choices":[{"delta":{"content":"child evidence"},'
+                '"finish_reason":null}]}\n\n'
+                'data: {"id":"child","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    parent_factory_calls = 0
+
+    def parent_factory() -> ProviderABC:
+        nonlocal parent_factory_calls
+        parent_factory_calls += 1
+        raise AssertionError("config-backed subprocess must not call parent factory")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "child-secret")
+    monkeypatch.setenv(
+        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
+    )
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-cross")
+    state = SharedState(tmp_path / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/child-model",
+        agent_execution_mode="subprocess",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        parent_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+    try:
+        result = await tool.run(
+            role="reviewer",
+            task="inspect tests",
+            agent_id="process-reviewer",
+        )
+
+        assert result.success is True, result.error
+        assert result.output == "child evidence"
+        assert parent_factory_calls == 0
+        assert requests == [
+            ("/v1/chat/completions", "Bearer child-secret")
+        ]
+        durable = state.tasks.list_tasks()
+        assert len(durable) == 1
+        assert durable[0].state == "succeeded"
+        assert durable[0].owner_agent_id == "process-reviewer"
+        assert durable[0].result is not None
+        assert durable[0].result["summary"] == "child evidence"
+    finally:
+        await tool.aclose()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_subprocess_mode_preserves_opaque_python_provider_factory(tmp_path) -> None:
+    calls = 0
+
+    def provider_factory() -> ProviderABC:
+        nonlocal calls
+        calls += 1
+        return FakeProvider()
+
+    state = SharedState(tmp_path / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        agent_execution_mode="subprocess",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        provider_factory,
+        config=config,
+    )
+    try:
+        result = await tool.run(
+            role="reviewer",
+            task="inspect tests",
+            agent_id="sdk-reviewer",
+        )
+
+        assert result.success is True
+        assert result.output == "evidence: tests pass"
+        assert calls == 1
+        assert state.tasks.list_tasks()[0].owner_agent_id == "sdk-reviewer"
+    finally:
+        await tool.aclose()
 
 
 @pytest.mark.asyncio
