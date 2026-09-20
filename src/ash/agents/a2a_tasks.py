@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import os
 import sqlite3
 import threading
@@ -13,7 +14,7 @@ from ash.core.session import normalize_project_path
 from ash.safe_io import validate_unlinked_file_path
 
 
-REMOTE_TASK_SCHEMA_VERSION = 1
+REMOTE_TASK_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,14 @@ class RemoteTaskHandle:
     task_id: str
     context_id: str
     state: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class RemoteTaskIntent:
+    agent: str
+    endpoint: str
+    context_id: str
     updated_at: str
 
 
@@ -73,6 +82,17 @@ class RemoteTaskStore:
                     );
                     CREATE INDEX IF NOT EXISTS idx_remote_agent_tasks_workspace
                         ON remote_agent_tasks(workspace, updated_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS remote_agent_task_intents (
+                        workspace TEXT NOT NULL,
+                        agent TEXT NOT NULL,
+                        endpoint TEXT NOT NULL,
+                        context_id TEXT NOT NULL,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (workspace, agent, endpoint, context_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_remote_agent_task_intents_workspace
+                        ON remote_agent_task_intents(workspace, updated_at DESC);
                     """
                 )
                 self._conn.execute(
@@ -129,6 +149,15 @@ class RemoteTaskStore:
                 """,
                 (self.workspace, values[0], values[1], values[2]),
             ).fetchone()
+            if values[3]:
+                self._conn.execute(
+                    """
+                    DELETE FROM remote_agent_task_intents
+                    WHERE workspace = ? AND agent = ? AND endpoint = ?
+                        AND context_id = ?
+                    """,
+                    (self.workspace, values[0], values[1], values[3]),
+                )
         assert row is not None
         self._restrict_file_permissions()
         return self._row(row)
@@ -158,6 +187,115 @@ class RemoteTaskStore:
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [self._row(row) for row in rows]
+
+    def save_intent(
+        self,
+        *,
+        agent: str,
+        endpoint: str,
+        context_id: str,
+    ) -> RemoteTaskIntent:
+        self._require_open()
+        normalized_agent = self._bounded(agent, "remote agent name", 64)
+        normalized_endpoint = self._bounded(endpoint, "remote agent endpoint", 4096)
+        normalized_context = self._bounded(context_id, "remote context ID", 512)
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO remote_agent_task_intents
+                    (workspace, agent, endpoint, context_id)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(workspace, agent, endpoint, context_id) DO UPDATE SET
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    self.workspace,
+                    normalized_agent,
+                    normalized_endpoint,
+                    normalized_context,
+                ),
+            )
+            row = self._conn.execute(
+                """
+                SELECT agent, endpoint, context_id, updated_at
+                FROM remote_agent_task_intents
+                WHERE workspace = ? AND agent = ? AND endpoint = ?
+                    AND context_id = ?
+                """,
+                (
+                    self.workspace,
+                    normalized_agent,
+                    normalized_endpoint,
+                    normalized_context,
+                ),
+            ).fetchone()
+        assert row is not None
+        self._restrict_file_permissions()
+        return self._intent_row(row)
+
+    def list_intents(
+        self,
+        *,
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> builtins.list[RemoteTaskIntent]:
+        self._require_open()
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("remote task intent list limit must be between 1 and 500")
+        params: tuple[str | int, ...]
+        query = (
+            "SELECT agent, endpoint, context_id, updated_at "
+            "FROM remote_agent_task_intents WHERE workspace = ?"
+        )
+        if agent is None:
+            params = (self.workspace,)
+        else:
+            normalized_agent = self._bounded(agent, "remote agent name", 64)
+            query += " AND agent = ?"
+            params = (self.workspace, normalized_agent)
+        query += " ORDER BY updated_at DESC, agent, context_id LIMIT ?"
+        params = (*params, limit)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [self._intent_row(row) for row in rows]
+
+    def get_intent_endpoint(self, *, agent: str, context_id: str) -> str | None:
+        self._require_open()
+        normalized_agent = self._bounded(agent, "remote agent name", 64)
+        normalized_context = self._bounded(context_id, "remote context ID", 512)
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT endpoint FROM remote_agent_task_intents
+                WHERE workspace = ? AND agent = ? AND context_id = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (self.workspace, normalized_agent, normalized_context),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._bounded(
+            str(row["endpoint"]), "stored remote agent endpoint", 4096
+        )
+
+    def delete_intent(self, *, agent: str, endpoint: str, context_id: str) -> None:
+        self._require_open()
+        normalized_agent = self._bounded(agent, "remote agent name", 64)
+        normalized_endpoint = self._bounded(endpoint, "remote agent endpoint", 4096)
+        normalized_context = self._bounded(context_id, "remote context ID", 512)
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                DELETE FROM remote_agent_task_intents
+                WHERE workspace = ? AND agent = ? AND endpoint = ? AND context_id = ?
+                """,
+                (
+                    self.workspace,
+                    normalized_agent,
+                    normalized_endpoint,
+                    normalized_context,
+                ),
+            )
 
     def conflicting_endpoint(
         self,
@@ -219,6 +357,20 @@ class RemoteTaskStore:
             ),
             state=self._bounded(
                 str(row["state"]), "stored remote task state", 128, allow_empty=True
+            ),
+            updated_at=self._bounded(
+                str(row["updated_at"]), "stored remote task timestamp", 128
+            ),
+        )
+
+    def _intent_row(self, row: sqlite3.Row) -> RemoteTaskIntent:
+        return RemoteTaskIntent(
+            agent=self._bounded(str(row["agent"]), "stored remote agent name", 64),
+            endpoint=self._bounded(
+                str(row["endpoint"]), "stored remote agent endpoint", 4096
+            ),
+            context_id=self._bounded(
+                str(row["context_id"]), "stored remote context ID", 512
             ),
             updated_at=self._bounded(
                 str(row["updated_at"]), "stored remote task timestamp", 128

@@ -1010,11 +1010,13 @@ def test_runtime_registers_only_trusted_configured_remote_agents(
         "list_remote_agents",
         "delegate_remote_agent",
         "list_remote_agent_tasks",
+        "recover_remote_agent_task",
         "remote_agent_task_status",
         "remote_agent_task_cancel",
     } <= untrusted.loop.tools.keys()
     assert set(untrusted.loop.tools["list_remote_agents"].agents) == {"review"}
     assert set(untrusted.loop.tools["list_remote_agent_tasks"].agents) == {"review"}
+    assert set(untrusted.loop.tools["recover_remote_agent_task"].agents) == {"review"}
     assert set(untrusted.loop.tools["remote_agent_task_status"].agents) == {"review"}
     assert set(untrusted.loop.tools["remote_agent_task_cancel"].agents) == {"review"}
 

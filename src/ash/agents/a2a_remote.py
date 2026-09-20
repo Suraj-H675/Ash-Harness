@@ -94,7 +94,13 @@ class ListRemoteAgentTasksArgs(BaseModel):
     limit: int = Field(default=100, ge=1, le=500)
 
 
+class RecoverRemoteAgentTaskArgs(BaseModel):
+    agent: str = Field(..., min_length=1, max_length=64)
+    context_id: str = Field(..., min_length=1, max_length=512)
+
+
 RemoteTaskObserver = Callable[[RemoteAgentResult], Awaitable[None]]
+RemoteRequestObserver = Callable[[str], Awaitable[None]]
 
 
 class _RemoteTaskStoreTool(BaseTool):
@@ -148,6 +154,64 @@ class _RemoteTaskStoreTool(BaseTool):
             )
         except Exception as exc:
             raise RuntimeError("could not persist A2A remote task handle") from exc
+
+    async def _remember_intent(
+        self,
+        config: RemoteAgentConfig,
+        context_id: str,
+    ) -> None:
+        if self.task_store is None:
+            return
+        try:
+            await asyncio.to_thread(
+                self.task_store.save_intent,
+                agent=config.name,
+                endpoint=config.url,
+                context_id=context_id,
+            )
+        except Exception as exc:
+            raise RuntimeError("could not persist pending A2A remote task") from exc
+
+    async def _forget_intent(
+        self,
+        config: RemoteAgentConfig,
+        context_id: str,
+    ) -> None:
+        if self.task_store is None or not context_id:
+            return
+        try:
+            await asyncio.to_thread(
+                self.task_store.delete_intent,
+                agent=config.name,
+                endpoint=config.url,
+                context_id=context_id,
+            )
+        except Exception as exc:
+            raise RuntimeError("could not update pending A2A remote task") from exc
+
+    async def _check_intent_binding(
+        self,
+        config: RemoteAgentConfig,
+        context_id: str,
+    ) -> bool:
+        if self.task_store is None:
+            return False
+        try:
+            endpoint = await asyncio.to_thread(
+                self.task_store.get_intent_endpoint,
+                agent=config.name,
+                context_id=context_id,
+            )
+        except Exception as exc:
+            raise RuntimeError("could not read pending A2A remote task state") from exc
+        if endpoint is None:
+            return False
+        if endpoint != config.url:
+            raise ValueError(
+                f"pending remote context {context_id!r} for agent {config.name!r} "
+                "is bound to a different configured endpoint"
+            )
+        return True
 
 
 class ListRemoteAgentsTool(BaseTool):
@@ -217,7 +281,13 @@ class DelegateRemoteAgentTool(_RemoteTaskStoreTool):
                 output="",
                 error=f"unknown remote agent: {args.agent}",
             )
+        pending_context = ""
         try:
+            async def remember_request(context_id: str) -> None:
+                nonlocal pending_context
+                pending_context = context_id
+                await self._remember_intent(config, context_id)
+
             async def remember(result: RemoteAgentResult) -> None:
                 await self._remember(config, result)
 
@@ -225,8 +295,13 @@ class DelegateRemoteAgentTool(_RemoteTaskStoreTool):
                 config,
                 args.prompt,
                 context_id=args.context_id,
+                request_observer=(
+                    remember_request if self.task_store is not None else None
+                ),
                 task_observer=remember,
             )
+            if pending_context and (result.task_id or result.state == "MESSAGE"):
+                await self._forget_intent(config, pending_context)
         except ModuleNotFoundError as exc:
             if exc.name == "a2a" or (exc.name or "").startswith("a2a."):
                 from ash.install import pipx_install_command
@@ -420,10 +495,16 @@ class ListRemoteAgentTasksTool(_RemoteTaskStoreTool):
         assert isinstance(args, ListRemoteAgentTasksArgs)
         if self.task_store is None:
             rows: list[Any] = []
+            intents: list[Any] = []
         else:
             try:
                 rows = await asyncio.to_thread(
                     self.task_store.list,
+                    agent=args.agent or None,
+                    limit=args.limit,
+                )
+                intents = await asyncio.to_thread(
+                    self.task_store.list_intents,
                     agent=args.agent or None,
                     limit=args.limit,
                 )
@@ -435,7 +516,7 @@ class ListRemoteAgentTasksTool(_RemoteTaskStoreTool):
                         f"could not read durable A2A remote task state: {exc}"
                     ),
                 )
-        payload = []
+        payload: list[tuple[str, dict[str, Any]]] = []
         for row in rows:
             configured = self.agents.get(row.agent)
             binding = (
@@ -446,20 +527,121 @@ class ListRemoteAgentTasksTool(_RemoteTaskStoreTool):
                 else "endpoint_changed"
             )
             payload.append(
-                {
-                    "agent": row.agent,
-                    "task_id": row.task_id,
-                    "context_id": row.context_id or None,
-                    "state": row.state,
-                    "binding": binding,
-                    "updated_at": row.updated_at,
-                }
+                (
+                    row.updated_at,
+                    {
+                        "agent": row.agent,
+                        "task_id": row.task_id,
+                        "context_id": row.context_id or None,
+                        "state": row.state,
+                        "binding": binding,
+                        "updated_at": row.updated_at,
+                    },
+                )
             )
-        output = json.dumps(payload)
+        for row in intents:
+            configured = self.agents.get(row.agent)
+            binding = (
+                "current"
+                if configured is not None and configured.url == row.endpoint
+                else "agent_unconfigured"
+                if configured is None
+                else "endpoint_changed"
+            )
+            payload.append(
+                (
+                    row.updated_at,
+                    {
+                        "agent": row.agent,
+                        "task_id": None,
+                        "context_id": row.context_id,
+                        "state": "PENDING_REMOTE_ACCEPTANCE",
+                        "binding": binding,
+                        "updated_at": row.updated_at,
+                    },
+                )
+            )
+        payload.sort(key=lambda item: item[0], reverse=True)
+        output = json.dumps([item for _, item in payload[: args.limit]])
         return ToolResult(
             success=True,
             output=output,
             token_count=count_output_tokens(output),
+        )
+
+
+class RecoverRemoteAgentTaskTool(_RemoteTaskStoreTool):
+    name = "recover_remote_agent_task"
+    description = (
+        "Resolve a pending durable A2A context to its remote task after an "
+        "interrupted new delegation."
+    )
+    args_schema = RecoverRemoteAgentTaskArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = self.validate_args(**kwargs)
+        assert isinstance(args, RecoverRemoteAgentTaskArgs)
+        config = self.agents.get(args.agent)
+        if config is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"unknown remote agent: {args.agent}",
+            )
+        try:
+            known = await self._check_intent_binding(config, args.context_id)
+            if not known:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(
+                        f"unknown pending remote context for agent {args.agent}: "
+                        f"{args.context_id}"
+                    ),
+                )
+            result = await recover_remote_agent_task(config, args.context_id)
+            if result is not None:
+                await self._remember(config, result)
+        except ModuleNotFoundError as exc:
+            if exc.name == "a2a" or (exc.name or "").startswith("a2a."):
+                from ash.install import pipx_install_command
+
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(f"A2A support requires `{pipx_install_command('a2a')}`."),
+                )
+            raise
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=redact_text(str(exc)),
+            )
+        except Exception as exc:
+            from a2a.utils.errors import A2AError
+
+            if not isinstance(exc, A2AError):
+                raise
+            return ToolResult(
+                success=False,
+                output="",
+                error=redact_text(str(exc)),
+            )
+        payload = json.dumps(
+            {
+                "agent": config.name,
+                "task_id": result.task_id if result is not None else None,
+                "context_id": args.context_id,
+                "state": (
+                    result.state if result is not None else "PENDING_REMOTE_ACCEPTANCE"
+                ),
+            }
+        )
+        return ToolResult(
+            success=True,
+            output=payload,
+            token_count=count_output_tokens(payload),
         )
 
 
@@ -509,6 +691,7 @@ async def send_remote_agent(
     *,
     context_id: str = "",
     transport: httpx.AsyncBaseTransport | None = None,
+    request_observer: RemoteRequestObserver | None = None,
     task_observer: RemoteTaskObserver | None = None,
 ) -> RemoteAgentResult:
     from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
@@ -527,6 +710,8 @@ async def send_remote_agent(
         raise ValueError("remote-agent prompt must be non-empty and at most 1 MB")
     if context_id and len(context_id.encode("utf-8")) > 512:
         raise ValueError("remote-agent context ID exceeds 512 bytes")
+    generated_context = not context_id and request_observer is not None
+    resolved_context = str(uuid4()) if generated_context else context_id
     token = os.environ.get(config.token_env, "")
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     async with httpx.AsyncClient(
@@ -549,20 +734,21 @@ async def send_remote_agent(
             )
         ).create(card)
         task_id = ""
-        resolved_context = context_id
         state = ""
         chunks: list[str] = []
         output_bytes = 0
         event_count = 0
         client_closed = False
         try:
+            if generated_context and request_observer is not None:
+                await request_observer(resolved_context)
             message = Message(
                 message_id=str(uuid4()),
                 role=Role.ROLE_USER,
                 parts=[Part(text=prompt)],
             )
-            if context_id:
-                message.context_id = context_id
+            if resolved_context:
+                message.context_id = resolved_context
             async for event in client.send_message(SendMessageRequest(message=message)):
                 event_count += 1
                 if event_count > MAX_A2A_REMOTE_EVENTS:
@@ -632,6 +818,54 @@ async def send_remote_agent(
         context_id=resolved_context,
         state=state or "UNKNOWN",
     )
+
+
+async def recover_remote_agent_task(
+    config: RemoteAgentConfig,
+    context_id: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> RemoteAgentResult | None:
+    from a2a.types.a2a_pb2 import ListTasksRequest, TaskState
+
+    _validate_remote_context_id(context_id)
+    http, client = await _open_remote_agent_client(config, transport=transport)
+    closed = False
+    try:
+        response = await client.list_tasks(
+            ListTasksRequest(
+                context_id=context_id,
+                page_size=2,
+                history_length=0,
+                include_artifacts=False,
+            )
+        )
+        tasks = list(response.tasks)
+        if not tasks:
+            return None
+        if len(tasks) != 1 or response.next_page_token:
+            raise RuntimeError(
+                "pending A2A context resolved to multiple remote tasks; refusing to guess"
+            )
+        task = tasks[0]
+        _validate_remote_task_id(task.id)
+        if task.context_id != context_id:
+            raise RuntimeError("remote A2A task recovery returned a mismatched context")
+        return RemoteAgentResult(
+            response="",
+            task_id=task.id,
+            context_id=task.context_id,
+            state=TaskState.Name(task.status.state),
+        )
+    except asyncio.CancelledError:
+        close_task = asyncio.create_task(client.close())
+        await _settle_cleanup_task_after_cancellation(close_task)
+        closed = True
+        raise
+    finally:
+        if not closed:
+            await client.close()
+        await http.aclose()
 
 
 async def get_remote_agent_task(
@@ -742,6 +976,13 @@ async def _open_remote_agent_client(
 def _validate_remote_task_id(task_id: str) -> None:
     if not task_id or len(task_id.encode("utf-8")) > 512:
         raise ValueError("remote-agent task ID must be non-empty and at most 512 bytes")
+
+
+def _validate_remote_context_id(context_id: str) -> None:
+    if not context_id or len(context_id.encode("utf-8")) > 512:
+        raise ValueError(
+            "remote-agent context ID must be non-empty and at most 512 bytes"
+        )
 
 
 def _parse_agent_config(name: str, raw: Any, path: Path) -> RemoteAgentConfig:

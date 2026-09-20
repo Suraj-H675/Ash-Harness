@@ -28,6 +28,7 @@ from a2a.types.a2a_pb2 import (
     AgentInterface,
     GetTaskRequest,
     ListTasksRequest,
+    ListTasksResponse,
     Message,
     Part,
     Role,
@@ -44,12 +45,14 @@ from ash.agents.a2a_remote import (
     DelegateRemoteAgentTool,
     ListRemoteAgentTasksTool,
     ListRemoteAgentsTool,
+    RecoverRemoteAgentTaskTool,
     RemoteAgentConfig,
     RemoteAgentTaskCancelTool,
     RemoteAgentTaskStatusTool,
     cancel_remote_agent_task,
     get_remote_agent_task,
     load_remote_agent_configs,
+    recover_remote_agent_task,
     send_remote_agent,
     validate_agent_card_origins,
 )
@@ -113,9 +116,11 @@ class _BlockingRemoteClient:
         *,
         emit_task: bool = True,
         cancel_error: BaseException | None = None,
+        recovery_task: Task | None = None,
     ) -> None:
         self.emit_task = emit_task
         self.cancel_error = cancel_error
+        self.recovery_task = recovery_task
         self.send_started = asyncio.Event()
         self.task_observed = asyncio.Event()
         self.cancel_started = asyncio.Event()
@@ -125,6 +130,7 @@ class _BlockingRemoteClient:
         self.close_finished = asyncio.Event()
         self.close_release = asyncio.Event()
         self.cancel_calls: list[str] = []
+        self.list_requests: list[ListTasksRequest] = []
         self.cancel_task_instance: asyncio.Task[Any] | None = None
         self.close_task_instance: asyncio.Task[Any] | None = None
 
@@ -142,6 +148,15 @@ class _BlockingRemoteClient:
         self.cancel_finished.set()
         if self.cancel_error is not None:
             raise self.cancel_error
+
+    async def list_tasks(self, request: ListTasksRequest) -> ListTasksResponse:
+        self.list_requests.append(request)
+        tasks = [self.recovery_task] if self.recovery_task is not None else []
+        return ListTasksResponse(
+            tasks=tasks,
+            page_size=request.page_size,
+            total_size=len(tasks),
+        )
 
     async def close(self) -> None:
         self.close_task_instance = asyncio.current_task()
@@ -247,6 +262,166 @@ async def test_remote_task_handle_is_durable_before_delegation_finishes(
             call.cancel()
             await asyncio.gather(call, return_exceptions=True)
         await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_remote_task_intent_recovers_before_first_stream_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _BlockingRemoteClient(emit_task=False)
+    _patch_remote_client(monkeypatch, client)
+    database = tmp_path / "remote-tasks.db"
+    config = RemoteAgentConfig(name="remote", url="https://example.test")
+    store = RemoteTaskStore(database, tmp_path)
+    tool = DelegateRemoteAgentTool(
+        SafetyGuard(tmp_path),
+        {"remote": config},
+        store,
+    )
+    call = asyncio.create_task(tool.run(agent="remote", prompt="prompt"))
+    try:
+        await asyncio.wait_for(client.send_started.wait(), timeout=1)
+        intents = store.list_intents()
+        assert not call.done()
+        assert store.list() == []
+        assert len(intents) == 1
+        assert intents[0].agent == "remote"
+        assert intents[0].endpoint == "https://example.test"
+        assert intents[0].context_id
+
+        listed = await ListRemoteAgentTasksTool(
+            SafetyGuard(tmp_path),
+            {"remote": config},
+            store,
+        ).run()
+        pending = json.loads(listed.output)
+        assert pending[0]["task_id"] is None
+        assert pending[0]["context_id"] == intents[0].context_id
+        assert pending[0]["state"] == "PENDING_REMOTE_ACCEPTANCE"
+
+        call.cancel()
+        await asyncio.wait_for(client.close_started.wait(), timeout=1)
+        client.close_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(call, timeout=1)
+    finally:
+        client.close_release.set()
+        if not call.done():
+            call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+        await tool.aclose()
+
+    recovered_store = RemoteTaskStore(database, tmp_path)
+    context_id = recovered_store.list_intents()[0].context_id
+    recovery_client = _BlockingRemoteClient(
+        emit_task=False,
+    )
+    recovery_client.close_release.set()
+    _patch_remote_client(monkeypatch, recovery_client)
+    changed_tool = RecoverRemoteAgentTaskTool(
+        SafetyGuard(tmp_path),
+        {
+            "remote": RemoteAgentConfig(
+                name="remote",
+                url="https://changed.example.test",
+            )
+        },
+        recovered_store,
+    )
+    refused = await changed_tool.run(agent="remote", context_id=context_id)
+    assert refused.success is False
+    assert "different configured endpoint" in (refused.error or "")
+    assert recovery_client.list_requests == []
+
+    recovery_tool = RecoverRemoteAgentTaskTool(
+        SafetyGuard(tmp_path),
+        {"remote": config},
+        recovered_store,
+    )
+    try:
+        pending_result = await recovery_tool.run(
+            agent="remote",
+            context_id=context_id,
+        )
+        assert pending_result.success is True
+        pending_payload = json.loads(pending_result.output)
+        assert pending_payload["task_id"] is None
+        assert pending_payload["state"] == "PENDING_REMOTE_ACCEPTANCE"
+        assert len(recovered_store.list_intents()) == 1
+
+        recovery_client.recovery_task = Task(
+            id="recovered-task",
+            context_id=context_id,
+            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+        )
+        recovered = await recovery_tool.run(
+            agent="remote",
+            context_id=context_id,
+        )
+        assert recovered.success is True
+        payload = json.loads(recovered.output)
+        assert payload == {
+            "agent": "remote",
+            "task_id": "recovered-task",
+            "context_id": context_id,
+            "state": "TASK_STATE_WORKING",
+        }
+        assert len(recovery_client.list_requests) == 2
+        assert all(
+            request.context_id == context_id
+            for request in recovery_client.list_requests
+        )
+        assert all(request.page_size == 2 for request in recovery_client.list_requests)
+        assert recovered_store.list_intents() == []
+        handles = recovered_store.list()
+        assert len(handles) == 1
+        assert handles[0].task_id == "recovered-task"
+        assert handles[0].context_id == context_id
+    finally:
+        await recovery_tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_remote_task_recovery_refuses_ambiguous_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context_id = "pending-context"
+    client = _BlockingRemoteClient(
+        emit_task=False,
+        recovery_task=Task(
+            id="task-1",
+            context_id=context_id,
+            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+        ),
+    )
+    client.close_release.set()
+    _patch_remote_client(monkeypatch, client)
+
+    async def ambiguous_list(_request: ListTasksRequest) -> ListTasksResponse:
+        return ListTasksResponse(
+            tasks=[
+                Task(
+                    id="task-1",
+                    context_id=context_id,
+                    status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+                ),
+                Task(
+                    id="task-2",
+                    context_id=context_id,
+                    status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+                ),
+            ],
+            page_size=2,
+            total_size=2,
+        )
+
+    client.list_tasks = ambiguous_list  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="multiple remote tasks"):
+        await recover_remote_agent_task(
+            RemoteAgentConfig(name="remote", url="https://example.test"),
+            context_id,
+        )
 
 
 @pytest.mark.asyncio
@@ -409,6 +584,48 @@ def test_remote_task_store_rejects_newer_schema(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="schema v99 is newer than supported"):
         RemoteTaskStore(database, tmp_path)
+
+
+def test_remote_task_store_migrates_v1_pending_intents(tmp_path: Path) -> None:
+    database = tmp_path / "remote-tasks.db"
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE remote_agent_tasks (
+                workspace TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                context_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (workspace, agent, endpoint, task_id)
+            );
+            PRAGMA user_version = 1;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = RemoteTaskStore(database, tmp_path)
+    try:
+        intent = store.save_intent(
+            agent="remote",
+            endpoint="https://example.test",
+            context_id="generated-context",
+        )
+        assert intent.context_id == "generated-context"
+        assert store.list_intents() == [intent]
+    finally:
+        store.close()
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    finally:
+        connection.close()
 
 
 @pytest.mark.asyncio

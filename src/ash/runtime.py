@@ -234,6 +234,7 @@ def build_tools(
         DelegateRemoteAgentTool,
         ListRemoteAgentTasksTool,
         ListRemoteAgentsTool,
+        RecoverRemoteAgentTaskTool,
         RemoteAgentTaskCancelTool,
         RemoteAgentTaskStatusTool,
         load_remote_agent_configs,
@@ -258,6 +259,11 @@ def build_tools(
                     remote_task_store,
                 ),
                 ListRemoteAgentTasksTool(
+                    safety_guard,
+                    remote_agents,
+                    remote_task_store,
+                ),
+                RecoverRemoteAgentTaskTool(
                     safety_guard,
                     remote_agents,
                     remote_task_store,
