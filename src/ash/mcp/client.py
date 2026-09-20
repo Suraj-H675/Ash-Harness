@@ -2730,6 +2730,7 @@ class MCPClient:
         timeout: float,
         state_callback: ModernTaskStateCallback | None = None,
         answered_inputs: dict[str, str] | None = None,
+        allow_new_input_requests: bool = True,
         cancel_on_timeout: bool = True,
         cancel_on_cancellation: bool = True,
     ) -> dict[str, Any]:
@@ -2790,6 +2791,10 @@ class MCPClient:
                             continue
                         pending[key] = embedded
                     if pending:
+                        if not allow_new_input_requests:
+                            raise MCPProtocolError(
+                                "MCP task requires new input during recovery"
+                            )
                         responses = await self._fulfill_modern_input_requests(pending)
                         await self.request(
                             "tasks/update",
@@ -2955,6 +2960,7 @@ class MCPClient:
             timeout=timeout if timeout is not None else self.timeout,
             state_callback=state_callback,
             answered_inputs=answered_inputs,
+            allow_new_input_requests=False,
             cancel_on_timeout=cancel_on_timeout,
             cancel_on_cancellation=cancel_on_cancellation,
         )

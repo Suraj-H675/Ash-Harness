@@ -2802,6 +2802,51 @@ async def test_loop_persists_mcp_task_only_for_active_tool_call(
 
 
 @pytest.mark.asyncio
+async def test_resume_modern_task_refuses_new_input_during_recovery() -> None:
+    client = MCPClient(MCPServerConfig(name="server", command="fake", args=[], env={}))
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+    methods: list[str] = []
+
+    async def request(method: str, params: dict, **kwargs: Any) -> dict:
+        del params, kwargs
+        methods.append(method)
+        assert method == "tasks/get"
+        return {
+            "taskId": "task-recovery-input",
+            "status": "input_required",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60_000,
+            "pollIntervalMs": 0,
+            "inputRequests": {"request": {}},
+        }
+
+    client.request = request  # type: ignore[method-assign]
+    client._fulfill_modern_input_requests = AsyncMock(return_value={"request": {}})  # type: ignore[method-assign]
+    client._start_modern_task_subscription = Mock()  # type: ignore[method-assign]
+    client._stop_modern_task_subscription = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(MCPProtocolError, match="requires new input during recovery"):
+        await client.resume_modern_task(
+            {
+                "taskId": "task-recovery-input",
+                "status": "working",
+                "createdAt": "2026-09-20T00:00:00Z",
+                "lastUpdatedAt": "2026-09-20T00:00:00Z",
+                "ttlMs": 60_000,
+                "pollIntervalMs": 0,
+            },
+            {},
+        )
+
+    assert methods == ["tasks/get"]
+    client._fulfill_modern_input_requests.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_loop_resumes_persisted_mcp_task_without_replaying_tool_call(
     tmp_path: Path,
 ) -> None:
