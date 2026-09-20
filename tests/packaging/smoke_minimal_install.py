@@ -328,6 +328,7 @@ def main() -> None:
             not in {
                 "ANTHROPIC_API_KEY",
                 "DEEPSEEK_API_KEY",
+                "GOOGLE_API_KEY",
                 "GEMINI_API_KEY",
                 "GROQ_API_KEY",
                 "NVIDIA_API_KEY",

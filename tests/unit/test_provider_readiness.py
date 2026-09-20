@@ -83,6 +83,7 @@ def test_provider_runtime_environment_is_provider_scoped(monkeypatch) -> None:
 
 
 def test_provider_runtime_environment_includes_google_and_nvidia_routes(monkeypatch) -> None:
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-primary-secret")
     monkeypatch.setenv("GEMINI_API_KEY", "google-secret")
     monkeypatch.setenv(
         "GOOGLE_API_BASE",
@@ -101,6 +102,7 @@ def test_provider_runtime_environment_includes_google_and_nvidia_routes(monkeypa
     assert readiness.provider_runtime_environment(config) == {
         "GEMINI_API_KEY": "google-secret",
         "GOOGLE_API_BASE": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "GOOGLE_API_KEY": "google-primary-secret",
         "NVIDIA_API_BASE": "https://integrate.api.nvidia.com/v1",
         "NVIDIA_API_KEY": "nvidia-secret",
     }
@@ -596,7 +598,7 @@ def test_together_connection_uses_native_catalog_shape(monkeypatch) -> None:
     [
         (
             "google/gemini-test",
-            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
             "https://generativelanguage.googleapis.com/v1beta/openai",
         ),
         (
@@ -635,7 +637,7 @@ def test_google_catalog_request_identifies_ash(monkeypatch: pytest.MonkeyPatch) 
             request=request,
         ),
     )
-    monkeypatch.setenv("GEMINI_API_KEY", "google-secret")
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-secret")
 
     result = verify_provider_connection(_config("google/gemini-test"))
 
@@ -649,10 +651,41 @@ def test_google_catalog_request_identifies_ash(monkeypatch: pytest.MonkeyPatch) 
     )
 
 
+def test_google_key_precedence_and_gemini_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOOGLE_API_KEY", "preferred-google-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "fallback-gemini-key")
+
+    connection = readiness.resolve_provider_connection(_config("google/gemini-test"))
+
+    assert connection.api_key == "preferred-google-key"
+    assert connection.headers["Authorization"] == "Bearer preferred-google-key"
+
+    monkeypatch.delenv("GOOGLE_API_KEY")
+    fallback = readiness.resolve_provider_connection(_config("google/gemini-test"))
+
+    assert fallback.api_key == "fallback-gemini-key"
+    assert fallback.headers["Authorization"] == "Bearer fallback-gemini-key"
+
+
+def test_google_missing_key_error_names_both_supported_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    with pytest.raises(
+        readiness.ProviderConfigurationError,
+        match="GOOGLE_API_KEY or GEMINI_API_KEY",
+    ):
+        readiness.resolve_provider_connection(_config("google/gemini-test"))
+
+
 @pytest.mark.parametrize(
     ("model", "key_env", "base_env"),
     [
-        ("google/gemini-test", "GEMINI_API_KEY", "GOOGLE_API_BASE"),
+        ("google/gemini-test", "GOOGLE_API_KEY", "GOOGLE_API_BASE"),
         ("nvidia/nvidia/test-model", "NVIDIA_API_KEY", "NVIDIA_API_BASE"),
     ],
 )

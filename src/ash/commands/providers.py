@@ -47,6 +47,7 @@ def provider_catalog_payload() -> dict[str, Any]:
                 "base_url": descriptor.base_url,
                 "auth": "none" if descriptor.local else "api-key",
                 "key_env": descriptor.key_env,
+                "key_envs": list(descriptor.key_envs),
                 "local": descriptor.local,
             }
             for descriptor in BUILTIN_PROVIDERS
@@ -71,14 +72,18 @@ def render_provider_catalog(*, json_output: bool = False) -> str:
     table.add_column("Provider", style="bold")
     table.add_column("Route")
     table.add_column("Protocol")
-    table.add_column("Authentication")
+    table.add_column("Authentication", overflow="fold")
     table.add_column("Default endpoint")
     for descriptor in BUILTIN_PROVIDERS:
         table.add_row(
             descriptor.id,
             descriptor.category,
             descriptor.protocol,
-            "none" if descriptor.local else descriptor.key_env or "api key",
+            (
+                "none"
+                if descriptor.local
+                else " / ".join(descriptor.key_envs) or "api key"
+            ),
             descriptor.base_url,
         )
     console.print(table)

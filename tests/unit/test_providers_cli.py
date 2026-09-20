@@ -102,10 +102,15 @@ def test_provider_catalog_is_secret_free_and_includes_local_and_gateway_routes()
 
     assert {"google", "nvidia", "openrouter", "lmstudio", "vllm"} <= provider_ids
     assert all("API_KEY" not in json.dumps(item) or item["key_env"] for item in payload["providers"])
+    google = next(item for item in payload["providers"] if item["id"] == "google")
+    assert google["key_env"] == "GOOGLE_API_KEY"
+    assert google["key_envs"] == ["GOOGLE_API_KEY", "GEMINI_API_KEY"]
     rendered = render_provider_catalog()
     assert "Ash provider catalog" in rendered
     assert "openrouter" in rendered
     assert "lmstudio" in rendered
+    assert "GOOGLE_API_KEY" in rendered
+    assert "GEMINI_API_KEY" in rendered
 
 
 def test_provider_test_rendering_never_includes_credentials() -> None:

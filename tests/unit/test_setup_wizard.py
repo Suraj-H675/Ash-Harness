@@ -275,7 +275,7 @@ class TestOpenAIFlow:
     [
         (
             "google",
-            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
             "https://generativelanguage.googleapis.com/v1beta/openai",
             "gemini-test",
         ),
@@ -333,10 +333,58 @@ def test_openai_compatible_builtin_provider_onboarding(
     }
 
 
+def test_google_onboarding_uses_documented_key_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import ModelProbe, _flow_openai_compatible_builtin
+    from ash.provider_catalog import get_provider_descriptor
+    from ash.providers.readiness import GOOGLE_API_CLIENT_HEADER
+
+    descriptor = get_provider_descriptor("google")
+    assert descriptor is not None
+    monkeypatch.setenv("GOOGLE_API_KEY", "preferred-google-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "fallback-gemini-key")
+    monkeypatch.setattr("builtins.input", _fake_input(["n", "", "1"]))
+
+    with (
+        patch(
+            "ash.commands.setup._probe_models_detailed",
+            return_value=ModelProbe(models=("gemini-test",)),
+        ) as probe,
+        patch("ash.commands.setup.save_env_values") as save,
+    ):
+        _flow_openai_compatible_builtin(descriptor, "")
+
+    probe.assert_called_once_with(
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "preferred-google-key",
+        catalog_format="openai",
+        extra_headers={"x-goog-api-client": GOOGLE_API_CLIENT_HEADER},
+    )
+    assert save.call_args.args[0] == {
+        "ASH_MODEL": "google/gemini-test",
+        "GOOGLE_API_KEY": "preferred-google-key",
+    }
+
+
+def test_google_setup_status_accepts_gemini_api_key_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import _provider_status
+    from ash.provider_catalog import get_provider_descriptor
+
+    descriptor = get_provider_descriptor("google")
+    assert descriptor is not None
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "fallback-gemini-key")
+
+    assert _provider_status(object(), descriptor) == "key detected"
+
+
 @pytest.mark.parametrize(
     ("provider_id", "key_env", "base_env", "model"),
     [
-        ("google", "GEMINI_API_KEY", "GOOGLE_API_BASE", "gemini-test"),
+        ("google", "GOOGLE_API_KEY", "GOOGLE_API_BASE", "gemini-test"),
         ("nvidia", "NVIDIA_API_KEY", "NVIDIA_API_BASE", "nvidia/test-model"),
     ],
 )

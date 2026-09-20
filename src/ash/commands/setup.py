@@ -143,7 +143,11 @@ def _provider_status(config, descriptor: ProviderDescriptor) -> str:
 
     if descriptor.local:
         return "available to test"
-    return "key detected" if descriptor.key_env and get_env_value(descriptor.key_env) else "needs key"
+    return (
+        "key detected"
+        if any(get_env_value(name) for name in descriptor.key_envs)
+        else "needs key"
+    )
 
 
 def _setup_status_payload(config) -> dict[str, Any]:
@@ -746,7 +750,11 @@ def _flow_openai_compatible_builtin(
     _print_header(f"{descriptor.name} Configuration")
     api_key = ""
     if descriptor.key_env is not None:
-        api_key = _prompt_api_key(descriptor.key_env, f"{descriptor.name} API key")
+        api_key = _prompt_api_key(
+            descriptor.key_env,
+            f"{descriptor.name} API key",
+            descriptor.key_env_aliases,
+        )
 
     base_env = f"{descriptor.id.upper().replace('-', '_')}_API_BASE"
     base_url_override = _prompt_optional_url(base_env, descriptor.base_url)
@@ -1422,15 +1430,19 @@ def _preserve_or_stage_env(
 def _prompt_api_key(
     env_var: str,
     desc: str,
-    env_var_legacy: str | None = None,
+    env_var_fallbacks: tuple[str, ...] = (),
 ) -> str:
     """Prompt for an API key, with blank input returning to provider selection."""
     # Check existing env
-    existing = get_env_value(env_var)
-    if env_var_legacy:
-        existing = existing or get_env_value(env_var_legacy)
+    existing = None
+    existing_env = env_var
+    for candidate in (env_var, *env_var_fallbacks):
+        existing = get_env_value(candidate)
+        if existing:
+            existing_env = candidate
+            break
     if existing:
-        print(f"  Found existing {desc}: {mask_key(env_var)}")
+        print(f"  Found existing {desc}: {mask_key(existing_env)}")
         resp = input("    Rotate? [y/N, b back, c cancel] ").strip().casefold()
         if resp in {"c", "cancel", "q", "quit"}:
             raise SetupCancelled

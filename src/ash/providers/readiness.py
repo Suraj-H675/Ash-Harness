@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from ash import __version__
+from ash.provider_catalog import BUILTIN_PROVIDERS
 from ash.safe_io import strict_json_loads
 from ash.providers.identifiers import parse_model_string
 
@@ -222,21 +223,20 @@ _BUILTIN_CONNECTIONS: dict[str, tuple[str, str, CatalogFormat, AuthMode]] = {
     ),
 }
 
-_BUILTIN_KEY_ENV = {
-    "anthropic": "ANTHROPIC_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "openai-compatible": "OPENAI_API_KEY",
-    "google": "GEMINI_API_KEY",
-    "deepseek": "DEEPSEEK_API_KEY",
-    "groq": "GROQ_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
-    "mistral": "MISTRAL_API_KEY",
-    "xai": "XAI_API_KEY",
-    "together": "TOGETHER_API_KEY",
-    "fireworks": "FIREWORKS_API_KEY",
-    "cerebras": "CEREBRAS_API_KEY",
-    "nvidia": "NVIDIA_API_KEY",
+_BUILTIN_KEY_ENVS = {
+    descriptor.id: descriptor.key_envs
+    for descriptor in BUILTIN_PROVIDERS
+    if descriptor.key_envs
 }
+_BUILTIN_KEY_ENVS["openai-compatible"] = ("OPENAI_API_KEY",)
+
+
+def _first_environment_value(names: tuple[str, ...]) -> str:
+    for name in names:
+        value = os.environ.get(name, "")
+        if value:
+            return value
+    return ""
 
 
 def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
@@ -261,9 +261,8 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
         builtin = _BUILTIN_CONNECTIONS.get(provider)
         if builtin is not None:
             keys.add(builtin[1])
-        key_env = _BUILTIN_KEY_ENV.get(provider)
-        if key_env is not None:
-            keys.add(key_env)
+        key_envs = _BUILTIN_KEY_ENVS.get(provider, ())
+        keys.update(key_envs)
         custom = (
             custom_providers.get(provider)
             if isinstance(custom_providers, dict)
@@ -377,12 +376,16 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
         default, base_env, catalog_format, auth_mode = builtin
         supplied = os.environ.get(base_env)
         base_url = normalize_provider_base_url(supplied or default, provider=provider)
-        key_env = _BUILTIN_KEY_ENV.get(provider)
+        key_envs = _BUILTIN_KEY_ENVS.get(provider, ())
         if auth_mode == "none":
             api_key = ""
         else:
-            assert key_env is not None
-            api_key = _require_key(provider, key_env, os.environ.get(key_env, ""))
+            assert key_envs
+            api_key = _require_key(
+                provider,
+                " or ".join(key_envs),
+                _first_environment_value(key_envs),
+            )
             require_secure_provider_transport(base_url, provider=provider)
         return ProviderConnection(
             provider=provider,

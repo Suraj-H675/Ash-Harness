@@ -22,10 +22,19 @@ class ProviderDescriptor:
     key_env: str | None = None
     protocol: str = "openai"
     local: bool = False
+    key_env_aliases: tuple[str, ...] = ()
 
     @property
     def key_required(self) -> bool:
         return self.key_env is not None
+
+    @property
+    def key_envs(self) -> tuple[str, ...]:
+        """Return accepted credential variables in precedence order."""
+
+        if self.key_env is None:
+            return ()
+        return (self.key_env, *self.key_env_aliases)
 
 
 # Keep this list intentionally descriptor-only. Providers that speak the same
@@ -55,7 +64,8 @@ BUILTIN_PROVIDERS: tuple[ProviderDescriptor, ...] = (
         "Cloud API",
         "Gemini models via Google's OpenAI-compatible Gemini API",
         "https://generativelanguage.googleapis.com/v1beta/openai",
-        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        key_env_aliases=("GEMINI_API_KEY",),
     ),
     ProviderDescriptor(
         "openrouter",

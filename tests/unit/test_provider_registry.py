@@ -132,7 +132,7 @@ def test_default_registry_exposes_builtins_without_constructing_them() -> None:
         ("openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1"),
         (
             "google",
-            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
             "https://generativelanguage.googleapis.com/v1beta/openai",
         ),
         ("mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1"),
@@ -175,7 +175,7 @@ def test_google_runtime_client_identifies_ash_without_affecting_nvidia(
         return object()
 
     monkeypatch.setattr("ash.providers.openai.openai.AsyncOpenAI", openai_client)
-    monkeypatch.setenv("GEMINI_API_KEY", "google-key")
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
     monkeypatch.setenv("NVIDIA_API_KEY", "nvidia-key")
 
     create_default_provider_registry().build(AshConfig(model="google/gemini-test"))
@@ -185,6 +185,19 @@ def test_google_runtime_client_identifies_ash_without_affecting_nvidia(
         "x-goog-api-client": readiness.GOOGLE_API_CLIENT_HEADER
     }
     assert "default_headers" not in calls[1]
+
+
+def test_google_registry_accepts_gemini_api_key_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "legacy-compatible-key")
+
+    provider = create_default_provider_registry().build(
+        AshConfig(model="google/gemini-test")
+    )
+
+    assert provider._api_key == "legacy-compatible-key"
 
 
 def test_openrouter_capabilities_are_not_assumed_from_openai_wire_protocol(
