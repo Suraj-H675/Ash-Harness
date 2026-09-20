@@ -13,6 +13,22 @@ from typing import Any, Iterator, TextIO
 from ash.safety.path_scope import lexical_target_path, path_has_link_component
 
 
+def _directory_open_flag() -> int:
+    """Return POSIX ``O_DIRECTORY`` when available without exposing it on Windows."""
+
+    value = getattr(os, "O_DIRECTORY", 0)
+    return value if isinstance(value, int) else 0
+
+
+def _fchmod_descriptor(descriptor: int, mode: int) -> None:
+    """Apply descriptor permissions when the host exposes ``fchmod``."""
+
+    fchmod = getattr(os, "fchmod", None)
+    if not callable(fchmod):
+        raise OSError("descriptor chmod is unavailable on this platform")
+    fchmod(descriptor, mode)
+
+
 def strict_json_loads(value: str | bytes | bytearray) -> Any:
     """Parse JSON while rejecting duplicate object keys and invalid constants."""
 
@@ -133,7 +149,7 @@ def create_unlinked_regular_file(
             _verify_path_identity(target, descriptor, label=label)
         _require_regular_descriptor(descriptor, target, label=label)
         if hasattr(os, "fchmod") and os.name != "nt":
-            os.fchmod(descriptor, mode)
+            _fchmod_descriptor(descriptor, mode)
         yield descriptor
         completed = True
     finally:
@@ -392,7 +408,7 @@ def create_anchored_regular_file(
         try:
             _require_regular_descriptor(descriptor, target, label=label)
             if hasattr(os, "fchmod") and os.name != "nt":
-                os.fchmod(descriptor, mode)
+                _fchmod_descriptor(descriptor, mode)
             yield descriptor
             completed = True
         finally:
@@ -702,7 +718,7 @@ def _atomic_write_anchored_bytes(
         try:
             _require_regular_descriptor(descriptor, target, label=label)
             if hasattr(os, "fchmod") and os.name != "nt":
-                os.fchmod(descriptor, mode)
+                _fchmod_descriptor(descriptor, mode)
             view = memoryview(payload)
             while view:
                 written = os.write(descriptor, view)
@@ -787,7 +803,7 @@ def ensure_anchored_directory(
             target.chmod(mode)
         return target
 
-    flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+    flags = os.O_RDONLY | _directory_open_flag() | _close_on_exec_flag() | _nofollow_flag()
     descriptor = os.open(root, flags)
     try:
         for component in parts:
@@ -813,7 +829,7 @@ def ensure_anchored_directory(
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
             raise ValueError(f"refusing to use non-directory {label}: {target}")
         if hasattr(os, "fchmod") and os.name != "nt":
-            os.fchmod(descriptor, mode)
+            _fchmod_descriptor(descriptor, mode)
         _verify_anchored_directory_identity(
             target,
             descriptor,
@@ -930,7 +946,7 @@ def list_anchored_directory(
         trusted_root=root,
         label=label,
     ) as (parent_descriptor, name, _target):
-        flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+        flags = os.O_RDONLY | _directory_open_flag() | _close_on_exec_flag() | _nofollow_flag()
         directory_descriptor = _open_anchored_directory_component(
             parent_descriptor,
             name,
@@ -979,7 +995,7 @@ def create_anchored_directory(
         label=label,
     ) as (parent_descriptor, name, _target):
         os.mkdir(name, mode, dir_fd=parent_descriptor)
-        flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+        flags = os.O_RDONLY | _directory_open_flag() | _close_on_exec_flag() | _nofollow_flag()
         descriptor = _open_anchored_directory_component(
             parent_descriptor,
             name,
@@ -989,7 +1005,7 @@ def create_anchored_directory(
         )
         try:
             if hasattr(os, "fchmod") and os.name != "nt":
-                os.fchmod(descriptor, mode)
+                _fchmod_descriptor(descriptor, mode)
             opened = os.fstat(descriptor)
             observed = os.stat(
                 name,
@@ -1027,7 +1043,7 @@ def remove_anchored_directory_tree(
         trusted_root=root,
         label=label,
     ) as (parent_descriptor, name, _target):
-        flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+        flags = os.O_RDONLY | _directory_open_flag() | _close_on_exec_flag() | _nofollow_flag()
         descriptor = _open_anchored_directory_component(
             parent_descriptor,
             name,
@@ -1113,7 +1129,7 @@ def remove_anchored_path(
 
 
 def _remove_directory_contents(descriptor: int, *, target: Path, label: str) -> None:
-    flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+    flags = os.O_RDONLY | _directory_open_flag() | _close_on_exec_flag() | _nofollow_flag()
     for entry_name in os.listdir(descriptor):
         observed = os.stat(entry_name, dir_fd=descriptor, follow_symlinks=False)
         if stat.S_ISDIR(observed.st_mode):
@@ -1201,13 +1217,13 @@ def chmod_unlinked_directory(
         return target
     flags = os.O_RDONLY | _close_on_exec_flag()
     if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
+        flags |= _directory_open_flag()
     flags |= _nofollow_flag()
     descriptor = os.open(target, flags)
     try:
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
             raise ValueError(f"refusing to chmod non-directory {label}: {target}")
-        os.fchmod(descriptor, mode)
+        _fchmod_descriptor(descriptor, mode)
     finally:
         os.close(descriptor)
     return target
@@ -1217,7 +1233,7 @@ def _supports_anchored_path_io() -> bool:
     supports_dir_fd = getattr(os, "supports_dir_fd", ())
     return bool(
         os.name == "posix"
-        and hasattr(os, "O_DIRECTORY")
+        and _directory_open_flag() != 0
         and hasattr(os, "O_NOFOLLOW")
         and os.open in supports_dir_fd
         and os.mkdir in supports_dir_fd
@@ -1258,7 +1274,7 @@ def _open_anchored_parent(
         trusted_root=trusted_root,
         label=label,
     )
-    flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+    flags = os.O_RDONLY | _directory_open_flag() | _close_on_exec_flag() | _nofollow_flag()
     descriptor = os.open(root, flags)
     try:
         for component in parts[:-1]:
@@ -1311,7 +1327,7 @@ def _verify_anchored_directory_identity(
         trusted_root=trusted_root,
         label=label,
     )
-    flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+    flags = os.O_RDONLY | _directory_open_flag() | _close_on_exec_flag() | _nofollow_flag()
     visible_descriptor = os.open(root, flags)
     try:
         for component in parts:
@@ -1382,7 +1398,7 @@ def _open_parent_directory(target: Path) -> int:
         or not hasattr(os, "O_NOFOLLOW")
     ):
         return -1
-    flags = os.O_RDONLY | os.O_DIRECTORY | _close_on_exec_flag() | _nofollow_flag()
+    flags = os.O_RDONLY | _directory_open_flag() | _close_on_exec_flag() | _nofollow_flag()
     return os.open(target.parent, flags)
 
 

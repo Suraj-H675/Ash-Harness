@@ -10,7 +10,7 @@ import tempfile
 from collections import deque
 from contextlib import AbstractContextManager, nullcontext, suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, cast
 
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from jsonschema.exceptions import ValidationError  # type: ignore[import-untyped]
@@ -348,11 +348,14 @@ class PluginHostClient:
             ) from exc
         try:
             with tempfile.TemporaryFile(prefix="ash-plugin-runtime-") as archive:
-                uid = os.getuid() if sys.platform != "win32" and hasattr(os, "getuid") else 0
-                gid = os.getgid() if sys.platform != "win32" and hasattr(os, "getgid") else 0
-                snapshot.write_tar(archive, uid=uid, gid=gid)
-                archive.flush()
-                return await self.sandbox_manager.stage_docker_workspace(archive)
+                getuid: Any = getattr(os, "getuid", None)
+                getgid: Any = getattr(os, "getgid", None)
+                uid = int(getuid()) if sys.platform != "win32" and callable(getuid) else 0
+                gid = int(getgid()) if sys.platform != "win32" and callable(getgid) else 0
+                archive_stream = cast(BinaryIO, archive)
+                snapshot.write_tar(archive_stream, uid=uid, gid=gid)
+                archive_stream.flush()
+                return await self.sandbox_manager.stage_docker_workspace(archive_stream)
         except (OSError, PluginSnapshotError, SandboxBackendUnavailable) as exc:
             raise PluginRuntimeError(f"plugin Docker staging failed: {exc}") from exc
         finally:
