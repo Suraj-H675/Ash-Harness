@@ -438,17 +438,7 @@ async def authorize_mcp_server(
         )
         socket_value = callback_server.sockets[0].getsockname()
         redirect_uri = f"http://127.0.0.1:{socket_value[1]}/callback"
-        discovery = await discover_oauth(
-            client,
-            resource,
-            challenged_scope=str(config.get("scope", "")),
-        )
         registered = _configured_client(config)
-        client_metadata_url = _configured_client_metadata_url(config)
-        if registered is not None and client_metadata_url:
-            raise MCPOAuthError(
-                "configured OAuth client_id and client metadata URL are mutually exclusive"
-            )
         configured_issuer = _configured_issuer(config)
         existing_bundle: OAuthBundle | None = None
         if registered is not None and not configured_issuer:
@@ -459,6 +449,17 @@ async def authorize_mcp_server(
                     "set oauth.issuer and authorize again"
                 )
             configured_issuer = existing_bundle.discovery.issuer
+        discovery = await discover_oauth(
+            client,
+            resource,
+            challenged_scope=str(config.get("scope", "")),
+            preferred_issuer=configured_issuer,
+        )
+        client_metadata_url = _configured_client_metadata_url(config)
+        if registered is not None and client_metadata_url:
+            raise MCPOAuthError(
+                "configured OAuth client_id and client metadata URL are mutually exclusive"
+            )
         if configured_issuer and discovery.issuer != configured_issuer:
             raise MCPOAuthError(
                 "configured OAuth issuer did not match discovered authorization server"
@@ -602,6 +603,7 @@ async def discover_oauth(
     server_url: str,
     *,
     challenged_scope: str = "",
+    preferred_issuer: str = "",
 ) -> OAuthDiscovery:
     resource = canonical_resource_uri(server_url)
     challenge_header = ""
@@ -643,12 +645,22 @@ async def discover_oauth(
             if (
                 not isinstance(auth_servers, list)
                 or not auth_servers
-                or not isinstance(auth_servers[0], str)
+                or not all(isinstance(item, str) for item in auth_servers)
             ):
                 raise MCPOAuthError(
                     "protected resource metadata omitted authorization_servers"
                 )
-            issuer_hint = _validate_oauth_url(auth_servers[0])
+            validated_auth_servers = tuple(
+                _validate_oauth_url(item) for item in auth_servers
+            )
+            if preferred_issuer:
+                if preferred_issuer not in validated_auth_servers:
+                    raise MCPOAuthError(
+                        "configured OAuth issuer is not advertised by protected resource"
+                    )
+                issuer_hint = preferred_issuer
+            else:
+                issuer_hint = validated_auth_servers[0]
         except (httpx.HTTPError, MCPOAuthError):
             continue
         protected = candidate

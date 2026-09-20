@@ -653,9 +653,11 @@ async def test_configured_oauth_client_refuses_discovered_issuer_mismatch(
         server_url: str,
         *,
         challenged_scope: str = "",
+        preferred_issuer: str = "",
     ) -> OAuthDiscovery:
         del client, challenged_scope
         assert server_url == resource
+        assert preferred_issuer == "https://auth.example.test"
         return OAuthDiscovery(
             resource,
             (),
@@ -692,6 +694,142 @@ async def test_configured_oauth_client_refuses_discovered_issuer_mismatch(
         await http.aclose()
 
     assert browser_opened is False
+
+
+@pytest.mark.asyncio
+async def test_oauth_login_selects_configured_issuer_from_multiple_servers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    metadata_url = "https://mcp.example.test/oauth-resource"
+    callback_handler: dict[str, Any] = {}
+    first_issuer_requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal first_issuer_requests
+        if request.url == httpx.URL(resource):
+            return httpx.Response(
+                401,
+                headers={
+                    "WWW-Authenticate": f'Bearer resource_metadata="{metadata_url}"'
+                },
+            )
+        if request.url == httpx.URL(metadata_url):
+            return httpx.Response(
+                200,
+                json={
+                    "resource": resource,
+                    "authorization_servers": [
+                        "https://first-auth.example.test",
+                        "https://chosen-auth.example.test",
+                    ],
+                },
+            )
+        if request.url == httpx.URL(
+            "https://first-auth.example.test/.well-known/oauth-authorization-server"
+        ):
+            first_issuer_requests += 1
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://first-auth.example.test",
+                    "authorization_endpoint": "https://first-auth.example.test/authorize",
+                    "token_endpoint": "https://first-auth.example.test/token",
+                    "code_challenge_methods_supported": ["S256"],
+                },
+            )
+        if request.url == httpx.URL(
+            "https://chosen-auth.example.test/.well-known/oauth-authorization-server"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://chosen-auth.example.test",
+                    "authorization_endpoint": "https://chosen-auth.example.test/authorize",
+                    "token_endpoint": "https://chosen-auth.example.test/token",
+                    "code_challenge_methods_supported": ["S256"],
+                },
+            )
+        if request.url == httpx.URL("https://chosen-auth.example.test/token"):
+            return httpx.Response(
+                200,
+                json={"access_token": "chosen-token", "token_type": "Bearer"},
+            )
+        raise AssertionError(f"unexpected OAuth request: {request.method} {request.url}")
+
+    class FakeSocket:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43123)
+
+    class FakeServer:
+        sockets = [FakeSocket()]
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def start_server(handler: Any, host: str, port: int) -> FakeServer:
+        assert host == "127.0.0.1"
+        assert port == 0
+        callback_handler["handler"] = handler
+        return FakeServer()
+
+    monkeypatch.setattr(asyncio, "start_server", start_server)
+
+    def opener(url: str) -> bool:
+        parsed = urlparse(url)
+        assert parsed.hostname == "chosen-auth.example.test"
+        query = parse_qs(parsed.query)
+
+        async def callback() -> None:
+            reader = asyncio.StreamReader()
+            target = "/callback?" + urlencode(
+                {
+                    "code": "authorization-code",
+                    "state": query["state"][0],
+                    "iss": "https://chosen-auth.example.test",
+                }
+            )
+            reader.feed_data(f"GET {target} HTTP/1.1\r\n\r\n".encode())
+            reader.feed_eof()
+            writer = type(
+                "Writer",
+                (),
+                {
+                    "write": lambda self, data: None,
+                    "drain": lambda self: asyncio.sleep(0),
+                    "close": lambda self: None,
+                    "wait_closed": lambda self: asyncio.sleep(0),
+                },
+            )()
+            await callback_handler["handler"](reader, writer)
+
+        asyncio.create_task(callback())
+        return True
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        bundle = await authorize_mcp_server(
+            "remote",
+            resource,
+            oauth_config={
+                "client_id": "registered-client",
+                "issuer": "https://chosen-auth.example.test",
+            },
+            store=MCPOAuthTokenStore("remote", tmp_path / "tokens"),
+            http_client=http,
+            open_browser=opener,
+            announce=lambda message: None,
+            timeout_seconds=5,
+        )
+    finally:
+        await http.aclose()
+
+    assert bundle.discovery.issuer == "https://chosen-auth.example.test"
+    assert first_issuer_requests == 0
 
 
 @pytest.mark.asyncio
@@ -834,9 +972,11 @@ async def test_oauth_login_reuses_stored_client_before_cimd(
         server_url: str,
         *,
         challenged_scope: str = "",
+        preferred_issuer: str = "",
     ) -> OAuthDiscovery:
         del client, challenged_scope
         assert server_url == resource
+        assert preferred_issuer == ""
         return OAuthDiscovery(
             resource,
             (),
