@@ -636,6 +636,7 @@ async def register_oauth_client(
         json_body={
             "client_name": client_name[:100] or "Ash",
             "redirect_uris": [redirect_uri],
+            "application_type": "native",
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",

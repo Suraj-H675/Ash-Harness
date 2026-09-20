@@ -734,6 +734,7 @@ async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
     assert bundle.discovery.scopes == ("challenge:read",)
     assert observed["authorization"]["scope"] == ["challenge:read"]
     assert observed["authorization"]["resource"] == [resource]
+    assert observed["registration"]["application_type"] == "native"
     assert observed["registration"]["redirect_uris"][0].startswith("http://127.0.0.1:")
     assert observed["token_form"]["resource"] == [resource]
     assert store.load(resource).tokens.access_token == "access-token"  # type: ignore[union-attr]
