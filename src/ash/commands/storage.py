@@ -26,6 +26,11 @@ from ash.safe_io import (
     validate_unlinked_file_path,
 )
 from ash.safety.environment import resolve_host_executable
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.sandbox.process_utils import (
+    ProcessTreeUnavailable,
+    prepare_scoped_process_launch,
+)
 from ash.ui.safe_text import terminal_safe_text
 
 
@@ -308,26 +313,10 @@ def render_storage_check(check: StorageCheck, *, json_output: bool = False) -> s
 def create_debug_bundle(config, destination: str | Path | None = None) -> Path:
     """Create a bounded, redacted JSON diagnostics bundle."""
 
+    workspace = Path(config.workspace_root).expanduser().resolve()
     database = config.db_directory / "sessions.db"
     check = check_database(database)
-    try:
-        git = resolve_host_executable(
-            "git", workspace_root=config.workspace_root, cwd=config.workspace_root
-        )
-        git_revision = redact_text(
-            subprocess.run(
-                [git, "rev-parse", "--short", "HEAD"],
-                cwd=config.workspace_root,
-                capture_output=True,
-                text=True,
-                timeout=2,
-                check=False,
-            ).stdout.strip()
-            if git is not None
-            else ""
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        git_revision = ""
+    git_revision = _debug_bundle_git_revision(workspace)
 
     payload = {
         "schema_version": 1,
@@ -343,7 +332,7 @@ def create_debug_bundle(config, destination: str | Path | None = None) -> Path:
             "platform": platform.system(),
             "platform_release": platform.release(),
             "python_version": platform.python_version(),
-            "workspace": str(Path(config.workspace_root).resolve()),
+            "workspace": str(workspace),
             "git_revision": git_revision,
         },
         "storage": {
@@ -388,6 +377,50 @@ def create_debug_bundle(config, destination: str | Path | None = None) -> Path:
     finally:
         temporary.unlink(missing_ok=True)
     return destination_path
+
+
+def _debug_bundle_git_revision(workspace: Path) -> str:
+    try:
+        opened = os.stat(workspace)
+        expected_identity = (opened.st_dev, opened.st_ino)
+        guard = SafetyGuard(workspace)
+        git = resolve_host_executable("git", workspace_root=workspace, cwd=workspace)
+        if git is None:
+            return ""
+        with prepare_scoped_process_launch(
+            [git, "rev-parse", "--short", "HEAD"],
+            cwd=workspace,
+            guard=guard,
+            expected_cwd_identity=expected_identity,
+        ) as launch:
+            if launch.pass_fds:
+                result = subprocess.run(
+                    list(launch.argv),
+                    cwd=launch.cwd,
+                    pass_fds=launch.pass_fds,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+            else:
+                result = subprocess.run(
+                    list(launch.argv),
+                    cwd=launch.cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+        return redact_text(result.stdout.strip())
+    except (
+        OSError,
+        ValueError,
+        SafetyViolation,
+        ProcessTreeUnavailable,
+        subprocess.SubprocessError,
+    ):
+        return ""
 
 
 def render_local_metrics(summary: dict, *, json_output: bool = False) -> str:

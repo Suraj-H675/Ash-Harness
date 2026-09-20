@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import json
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -403,6 +404,78 @@ def test_debug_bundle_rejects_symlinked_destination(tmp_path: Path) -> None:
         create_debug_bundle(config, linked)
 
     assert victim.read_text(encoding="utf-8") == "keep"
+
+
+def test_debug_bundle_refuses_workspace_swap_for_git_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.commands.storage as storage_module
+    from ash.commands.storage import create_debug_bundle
+    from ash.config import AshConfig
+
+    workspace = tmp_path / "workspace"
+    replacement = tmp_path / "replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+
+    def initialize_repo(path: Path, marker: str) -> str:
+        subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "ash@example.test"],
+            cwd=path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Ash Test"],
+            cwd=path,
+            check=True,
+        )
+        (path / "marker.txt").write_text(marker, encoding="utf-8")
+        subprocess.run(["git", "add", "marker.txt"], cwd=path, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", marker], cwd=path, check=True
+        )
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    original_revision = initialize_repo(workspace, "original")
+    replacement_revision = initialize_repo(replacement, "replacement")
+    config = AshConfig(
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    configured_workspace = str(config.workspace_root)
+    real_resolve = storage_module.resolve_host_executable
+    swapped = False
+
+    def resolve_and_swap(name: str, *, workspace_root: Path, cwd: Path):
+        nonlocal swapped
+        resolved = real_resolve(name, workspace_root=workspace_root, cwd=cwd)
+        if not swapped:
+            swapped = True
+            workspace.rename(tmp_path / "moved-original")
+            workspace.symlink_to(replacement, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(
+        storage_module,
+        "resolve_host_executable",
+        resolve_and_swap,
+    )
+
+    created = create_debug_bundle(config, tmp_path / "bundle.json")
+    payload = json.loads(created.read_text(encoding="utf-8"))
+
+    assert original_revision != replacement_revision
+    assert payload["runtime"]["workspace"] == configured_workspace
+    assert payload["runtime"]["git_revision"] == ""
 
 
 def test_metrics_cli_reports_local_only_aggregate(
