@@ -1081,6 +1081,7 @@ def _tool_kind(tool_name: str) -> ToolKind:
     if tool_name in {
         "read_file",
         "list_directory",
+        "list_dir",
         "glob_files",
         "find_symbol",
         "browser_tabs",

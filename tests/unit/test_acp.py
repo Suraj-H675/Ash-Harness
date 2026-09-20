@@ -40,6 +40,13 @@ from ash.safety.trust import set_workspace_trusted
 from ash.server.acp import AshACPAgent, _tool_kind
 
 
+def test_acp_classifies_core_read_tool_names() -> None:
+    assert _tool_kind("list_dir") == "read"
+    # Preserve historical replay/display compatibility if an older event used
+    # the pre-runtime alias.
+    assert _tool_kind("list_directory") == "read"
+
+
 def test_acp_classifies_browser_tab_tools_by_effect() -> None:
     assert _tool_kind("browser_tabs") == "read"
     assert _tool_kind("browser_open_tab") == "fetch"
