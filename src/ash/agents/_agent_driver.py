@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from ash.safe_io import strict_json_loads
+from ash.agents.approval_channel import (
+    ApprovalChannelError,
+    ApprovalEndpoint,
+    request_foreground_approval,
+)
 from ash.agents.shared_state import SharedState
 from ash.agents.subprocess_agent import (
     MAX_SUBPROCESS_SPEC_BYTES,
@@ -132,8 +137,25 @@ async def _run_durable_task(spec: dict[str, Any]) -> int:
     require_dispatchable = spec.get("require_dispatchable", False)
     if type(require_dispatchable) is not bool:
         raise ValueError("subagent require_dispatchable must be boolean")
+    raw_approval_endpoint = spec.get("approval_channel")
+    approval_endpoint = (
+        ApprovalEndpoint.from_payload(raw_approval_endpoint)
+        if raw_approval_endpoint is not None
+        else None
+    )
 
     shared_state = SharedState(Path(db_path))
+    if approval_endpoint is not None:
+        durable_task = shared_state.tasks.get_task(task_id)
+        if durable_task is None:
+            raise ValueError("subagent approval endpoint task does not exist")
+        if (
+            approval_endpoint.task_id != task_id
+            or durable_task.metadata.get("agent_id") != approval_endpoint.agent_id
+            or approval_endpoint.attempt != durable_task.attempt + 1
+        ):
+            raise ValueError("subagent approval endpoint does not match durable task")
+
     tool = SpawnAgentTool(
         SafetyGuard(workspace),
         shared_state,
@@ -145,11 +167,38 @@ async def _run_durable_task(spec: dict[str, Any]) -> int:
         provider_config_backed=False,
     )
     tool.set_permission_policy_provider(lambda: policy)
+
+    if approval_endpoint is not None:
+        async def approve_foreground_tool(
+            agent_id: str,
+            tool_name: str,
+            arguments: dict[str, Any],
+        ) -> bool | str:
+            if agent_id != approval_endpoint.agent_id:
+                return "Foreground approval identity mismatch."
+            try:
+                decision = await request_foreground_approval(
+                    approval_endpoint,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
+            except ApprovalChannelError as exc:
+                return f"Foreground approval failed closed: {exc}"
+            for delta in decision.rules:
+                rules = getattr(policy, delta.category)
+                if all(existing.rule_id != delta.rule.rule_id for existing in rules):
+                    rules.append(delta.rule)
+            if decision.approved:
+                return True
+            return decision.feedback or False
+
+        tool.set_foreground_approval_broker(approve_foreground_tool)
     try:
         result = await tool.run_queued_task(
             task_id,
             require_dispatchable=require_dispatchable,
             wait=True,
+            approval_mode="live" if approval_endpoint is not None else "durable",
         )
         return 0 if result.success else 1
     finally:

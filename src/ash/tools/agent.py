@@ -10,11 +10,18 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
 
 from pydantic import BaseModel, Field
 
 from ash.agents.shared_state import SharedState
+from ash.agents.approval_channel import (
+    ApprovalChannelError,
+    ApprovalDecision,
+    ApprovalEndpoint,
+    ApprovalRuleDelta,
+    ForegroundApprovalServer,
+)
 from ash.agents.tasks import AgentTask, AgentTaskBudgetExceeded, AgentTaskError
 from ash.agents.subprocess_agent import (
     AGENT_ROLES,
@@ -50,6 +57,7 @@ _PERSISTED_STOP_REASON = "stopped by persisted message"
 SubagentApprovalBroker = Callable[
     [str, str, dict[str, Any]], Awaitable[bool | str | tuple[bool, str]]
 ]
+ApprovalMode = Literal["auto", "live", "durable"]
 
 
 async def _settle_spawn_cleanup_task(
@@ -180,22 +188,28 @@ class SpawnAgentTool(BaseTool):
         *,
         execution_role: str,
     ) -> PermissionPolicy | None:
-        if (
-            not self._subprocess_enabled()
-            or execution_role not in {"researcher", "reviewer", "general"}
-        ):
+        if not self._subprocess_enabled():
             return None
         policy = self._worker_permission_policy()
-        if any(
+        has_explicit_ask = any(
             rule.effect.value == "ask"
             for rule in (
                 *policy.managed_rules,
                 *policy.session_rules,
                 *policy.persistent_rules,
             )
-        ):
+        )
+        if self._foreground_approval_broker is not None:
+            return policy
+        if has_explicit_ask:
             return None
-        return policy
+        if execution_role in {"researcher", "reviewer", "general"}:
+            return policy
+        if policy.mode.value in {"auto_approve", "plan", "dry_run"}:
+            return policy
+        if policy.mode.value == "auto_edit" and execution_role == "coder":
+            return policy
+        return None
 
     @staticmethod
     def _permission_policy_payload(policy: PermissionPolicy) -> dict[str, Any]:
@@ -230,6 +244,7 @@ class SpawnAgentTool(BaseTool):
         policy: PermissionPolicy,
         agent_definition: "AgentDefinition | None",
         require_dispatchable: bool,
+        approval_endpoint: ApprovalEndpoint | None = None,
     ) -> bytes:
         assert self._config is not None
         from ash.providers.identifiers import parse_model_string
@@ -266,8 +281,57 @@ class SpawnAgentTool(BaseTool):
             "max_return_chars": self._max_return_chars,
             "max_turn_iterations": self._max_turn_iterations,
             "require_dispatchable": require_dispatchable,
+            "approval_channel": (
+                approval_endpoint.as_payload() if approval_endpoint is not None else None
+            ),
         }
         return encode_subprocess_spec(spec)
+
+    async def _live_subprocess_approval(
+        self,
+        agent_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> ApprovalDecision:
+        broker = self._foreground_approval_broker
+        if broker is None:
+            return ApprovalDecision(False, "Foreground approval broker is unavailable.")
+        parent_policy = (
+            self._permission_policy_provider()
+            if self._permission_policy_provider is not None
+            else None
+        )
+        before = (
+            {
+                category: {
+                    rule.rule_id for rule in getattr(parent_policy, category)
+                }
+                for category in ("session_rules", "persistent_rules")
+            }
+            if parent_policy is not None
+            else {}
+        )
+        result = await broker(agent_id, tool_name, arguments)
+        if isinstance(result, str):
+            approved = False
+            feedback = result.strip()
+        elif isinstance(result, tuple):
+            approved = bool(result[0])
+            feedback = str(result[1]).strip() if len(result) > 1 else ""
+        else:
+            approved = bool(result)
+            feedback = ""
+        deltas: list[ApprovalRuleDelta] = []
+        if parent_policy is not None:
+            for category in ("session_rules", "persistent_rules"):
+                previous = before[category]
+                for rule in getattr(parent_policy, category):
+                    if (
+                        rule.rule_id not in previous
+                        and rule.matches(tool_name, arguments)
+                    ):
+                        deltas.append(ApprovalRuleDelta(category, rule))
+        return ApprovalDecision(approved, feedback[:500], tuple(deltas))
 
     def _cancel_active_subprocess_task(self, task_id: str, *, reason: str) -> None:
         current = self._shared_state.tasks.get_task(task_id)
@@ -314,16 +378,33 @@ class SpawnAgentTool(BaseTool):
         self,
         *,
         durable_task: AgentTask,
+        agent_id: str,
         policy: PermissionPolicy,
         agent_definition: "AgentDefinition | None",
         require_dispatchable: bool,
+        live_approval: bool = False,
     ) -> ToolResult:
+        approval_server: ForegroundApprovalServer | None = None
         try:
+            approval_endpoint = None
+            if live_approval:
+                approval_server = ForegroundApprovalServer(
+                    task_id=durable_task.task_id,
+                    agent_id=agent_id,
+                    attempt=durable_task.attempt + 1,
+                    handler=lambda tool_name, arguments: self._live_subprocess_approval(
+                        agent_id,
+                        tool_name,
+                        arguments,
+                    ),
+                )
+                approval_endpoint = await approval_server.start()
             encoded_spec = self._subprocess_spec(
                 durable_task=durable_task,
                 policy=policy,
                 agent_definition=agent_definition,
                 require_dispatchable=require_dispatchable,
+                approval_endpoint=approval_endpoint,
             )
             plan = prepare_process_tree(workspace_root=self.safety_guard.project_root)
             environment = build_scrubbed_environment(
@@ -333,15 +414,52 @@ class SpawnAgentTool(BaseTool):
                     )
                 }
             )
-        except (OSError, ValueError, ProcessTreeError) as exc:
+        except asyncio.CancelledError as cancellation:
+            self._cancel_active_subprocess_task(
+                durable_task.task_id,
+                reason="subagent subprocess cancelled before launch",
+            )
+            if approval_server is not None:
+                close_task = asyncio.create_task(
+                    approval_server.aclose(),
+                    name="ash-subagent-approval-close-before-launch",
+                )
+                approval_cleanup_error, cleanup_interrupted = await _settle_spawn_cleanup_task(
+                    close_task
+                )
+                if approval_cleanup_error is not None:
+                    cancellation.add_note(
+                        f"subagent approval cleanup failed: {approval_cleanup_error}"
+                    )
+                if cleanup_interrupted:
+                    cancellation.add_note(
+                        "subagent approval cleanup was interrupted"
+                    )
+            raise
+        except (OSError, ValueError, ProcessTreeError, ApprovalChannelError) as exc:
             self._cancel_active_subprocess_task(
                 durable_task.task_id,
                 reason=f"subagent subprocess could not start: {exc}",
             )
+            cleanup_note = ""
+            if approval_server is not None:
+                close_task = asyncio.create_task(
+                    approval_server.aclose(),
+                    name="ash-subagent-approval-close-start-error",
+                )
+                approval_cleanup_error, cleanup_interrupted = await _settle_spawn_cleanup_task(
+                    close_task
+                )
+                if approval_cleanup_error is not None:
+                    cleanup_note = (
+                        f"; approval cleanup failed: {approval_cleanup_error}"
+                    )
+                elif cleanup_interrupted:
+                    raise asyncio.CancelledError
             return ToolResult(
                 success=False,
                 output="",
-                error=f"Could not start subagent subprocess: {exc}",
+                error=f"Could not start subagent subprocess: {exc}{cleanup_note}",
             )
 
         launch = asyncio.create_task(
@@ -370,53 +488,90 @@ class SpawnAgentTool(BaseTool):
                 process = launch.result()
                 try:
                     await terminate_process_tree(process, plan=plan)
-                except BaseException as cleanup_error:
+                except BaseException as process_tree_cleanup_error:
                     cancellation.add_note(
-                        f"subagent subprocess cleanup failed: {cleanup_error}"
+                        "subagent subprocess cleanup failed: "
+                        f"{process_tree_cleanup_error}"
                     )
             self._cancel_active_subprocess_task(
                 durable_task.task_id,
                 reason="subagent subprocess cancelled during launch",
             )
+            if approval_server is not None:
+                close_task = asyncio.create_task(
+                    approval_server.aclose(),
+                    name="ash-subagent-approval-close-launch-cancel",
+                )
+                approval_cleanup_error, cleanup_interrupted = await _settle_spawn_cleanup_task(
+                    close_task
+                )
+                if approval_cleanup_error is not None:
+                    cancellation.add_note(
+                        f"subagent approval cleanup failed: {approval_cleanup_error}"
+                    )
+                if cleanup_interrupted:
+                    cancellation.add_note(
+                        "subagent approval cleanup was interrupted"
+                    )
             raise
         except OSError as exc:
             self._cancel_active_subprocess_task(
                 durable_task.task_id,
                 reason=f"subagent subprocess could not start: {exc}",
             )
+            cleanup_note = ""
+            if approval_server is not None:
+                close_task = asyncio.create_task(
+                    approval_server.aclose(),
+                    name="ash-subagent-approval-close-launch-error",
+                )
+                approval_cleanup_error, cleanup_interrupted = await _settle_spawn_cleanup_task(
+                    close_task
+                )
+                if approval_cleanup_error is not None:
+                    cleanup_note = (
+                        f"; approval cleanup failed: {approval_cleanup_error}"
+                    )
+                elif cleanup_interrupted:
+                    raise asyncio.CancelledError
             return ToolResult(
                 success=False,
                 output="",
-                error=f"Could not start subagent subprocess: {exc}",
+                error=f"Could not start subagent subprocess: {exc}{cleanup_note}",
             )
 
         assert process is not None
         try:
-            await process.communicate(encoded_spec)
-        except asyncio.CancelledError as cancellation:
             try:
-                await terminate_process_tree(process, plan=plan)
-            except BaseException as cleanup_error:
-                cancellation.add_note(
-                    f"subagent subprocess cleanup failed: {cleanup_error}"
+                await process.communicate(encoded_spec)
+            except asyncio.CancelledError as cancellation:
+                try:
+                    await terminate_process_tree(process, plan=plan)
+                except BaseException as process_tree_cleanup_error:
+                    cancellation.add_note(
+                        "subagent subprocess cleanup failed: "
+                        f"{process_tree_cleanup_error}"
+                    )
+                self._cancel_active_subprocess_task(
+                    durable_task.task_id,
+                    reason="subagent subprocess cancelled",
                 )
-            self._cancel_active_subprocess_task(
-                durable_task.task_id,
-                reason="subagent subprocess cancelled",
-            )
-            raise
+                raise
 
-        current = self._shared_state.tasks.get_task(durable_task.task_id)
-        if (
-            process.returncode != 0
-            and current is not None
-            and current.state in {"leased", "running"}
-        ):
-            self._cancel_active_subprocess_task(
-                durable_task.task_id,
-                reason=f"subagent subprocess exited with status {process.returncode}",
-            )
-        return self._subprocess_task_result(durable_task.task_id)
+            current = self._shared_state.tasks.get_task(durable_task.task_id)
+            if (
+                process.returncode != 0
+                and current is not None
+                and current.state in {"leased", "running"}
+            ):
+                self._cancel_active_subprocess_task(
+                    durable_task.task_id,
+                    reason=f"subagent subprocess exited with status {process.returncode}",
+                )
+            return self._subprocess_task_result(durable_task.task_id)
+        finally:
+            if approval_server is not None:
+                await approval_server.aclose()
 
     async def _run_subprocess_task(
         self,
@@ -427,13 +582,16 @@ class SpawnAgentTool(BaseTool):
         agent_definition: "AgentDefinition | None",
         require_dispatchable: bool,
         wait: bool,
+        live_approval: bool = False,
     ) -> ToolResult:
         if wait:
             return await self._execute_subprocess_task(
                 durable_task=durable_task,
+                agent_id=agent_id,
                 policy=policy,
                 agent_definition=agent_definition,
                 require_dispatchable=require_dispatchable,
+                live_approval=live_approval,
             )
         if durable_task.task_id in self._subprocess_task_ids:
             return ToolResult(
@@ -446,9 +604,11 @@ class SpawnAgentTool(BaseTool):
         monitor = asyncio.create_task(
             self._execute_subprocess_task(
                 durable_task=durable_task,
+                agent_id=agent_id,
                 policy=policy,
                 agent_definition=agent_definition,
                 require_dispatchable=require_dispatchable,
+                live_approval=live_approval,
             ),
             name=f"ash-subagent-process-{agent_id}",
         )
@@ -488,6 +648,7 @@ class SpawnAgentTool(BaseTool):
         *,
         require_dispatchable: bool = True,
         wait: bool = False,
+        approval_mode: ApprovalMode = "auto",
     ) -> ToolResult:
         """Claim and launch one dispatcher-owned durable task."""
 
@@ -538,6 +699,7 @@ class SpawnAgentTool(BaseTool):
             args,
             durable_task=durable_task,
             wait_background=wait,
+            approval_mode=approval_mode,
         )
 
     async def start(self) -> None:
@@ -709,7 +871,10 @@ class SpawnAgentTool(BaseTool):
         *,
         durable_task: AgentTask | None = None,
         wait_background: bool = False,
+        approval_mode: ApprovalMode = "auto",
     ) -> ToolResult:
+        if approval_mode not in {"auto", "live", "durable"}:
+            raise ValueError(f"unsupported subagent approval mode: {approval_mode}")
         created_here = durable_task is None
         agent_definition = self._custom_agents.get(args.role)
         if args.role not in AGENT_ROLES and agent_definition is None:
@@ -790,6 +955,7 @@ class SpawnAgentTool(BaseTool):
                     agent_definition=agent_definition,
                     require_dispatchable=False,
                     wait=True,
+                    live_approval=self._foreground_approval_broker is not None,
                 )
         task_token_budget = durable_task.token_budget
         task_time_budget = durable_task.time_budget_seconds
@@ -917,12 +1083,19 @@ class SpawnAgentTool(BaseTool):
 
         branch_state: dict[str, str | None] = {"commit": None}
         cleanup_state = {"done": False}
-        foreground_approval_broker = (
-            self._foreground_approval_broker
-            if created_here and not args.background
-            else None
-        )
-        durable_approval = bool(args.background)
+        if approval_mode == "live":
+            foreground_approval_broker = self._foreground_approval_broker
+            durable_approval = False
+        elif approval_mode == "durable":
+            foreground_approval_broker = None
+            durable_approval = True
+        else:
+            foreground_approval_broker = (
+                self._foreground_approval_broker
+                if created_here and not args.background
+                else None
+            )
+            durable_approval = bool(args.background)
 
         async def provider_runner(context: dict[str, Any]) -> AgentReport:
             started = datetime.now(timezone.utc)

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,7 +10,7 @@ from ash.agents.shared_state import SharedState
 from ash.config import AshConfig
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
-from ash.safety.grants import PermissionRule
+from ash.safety.grants import PermissionRule, build_exact_scope_matchers
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy
 from ash.tools.agent import SpawnAgentTool
@@ -133,6 +134,555 @@ async def test_foreground_read_only_agent_can_run_provider_in_subprocess(
 
 
 @pytest.mark.asyncio
+async def test_foreground_coder_subprocess_uses_live_approval_and_syncs_rule(
+    tmp_path, monkeypatch
+) -> None:
+    requests = 0
+
+    def tool_response(response_id: str, call_id: str, arguments: dict) -> bytes:
+        first = {
+            "id": response_id,
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": call_id,
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json.dumps(arguments),
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        terminal = {
+            "id": response_id,
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+        }
+        return (
+            f"data: {json.dumps(first)}\n\ndata: {json.dumps(terminal)}\n\n"
+        ).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            nonlocal requests
+            requests += 1
+            if requests == 1:
+                payload = tool_response(
+                    "approval-child-1",
+                    "write-first",
+                    {
+                        "file_path": "first.txt",
+                        "content": "first\n",
+                        "overwrite": True,
+                    },
+                )
+            elif requests == 2:
+                payload = tool_response(
+                    "approval-child-2",
+                    "write-second",
+                    {
+                        "file_path": "second.txt",
+                        "content": "second\n",
+                        "overwrite": True,
+                    },
+                )
+            else:
+                payload = (
+                    'data: {"id":"approval-child-3","choices":[{"delta":'
+                    '{"content":"writes completed"},"finish_reason":null}]}\n\n'
+                    'data: {"id":"approval-child-3","choices":[{"delta":{},'
+                    '"finish_reason":"stop"}]}\n\n'
+                ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    def forbidden_parent_factory() -> ProviderABC:
+        raise AssertionError("foreground coder subprocess must rebuild provider in child")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "approval-secret")
+    monkeypatch.setenv(
+        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
+    )
+    state = SharedState(tmp_path / "state" / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/approval-child",
+        agent_execution_mode="subprocess",
+        safety_tier="interactive",
+        memory_backend="off",
+    )
+    parent_policy = PermissionPolicy("interactive")
+    broker_calls: list[tuple[str, str, dict]] = []
+
+    async def broker(agent_id: str, tool_name: str, arguments: dict) -> bool:
+        broker_calls.append((agent_id, tool_name, dict(arguments)))
+        parent_policy.add_session_rule(PermissionRule.create("allow", "write_file"))
+        return True
+
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        forbidden_parent_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+    tool.set_permission_policy_provider(lambda: parent_policy)
+    tool.set_foreground_approval_broker(broker)
+    try:
+        result = await tool.run(
+            role="coder",
+            task="write two files",
+            agent_id="approval-coder",
+            isolation="shared",
+        )
+
+        assert result.success is True, result.error
+        assert result.output == "writes completed"
+        assert requests == 3
+        assert len(broker_calls) == 1
+        assert broker_calls[0][0:2] == ("approval-coder", "write_file")
+        assert broker_calls[0][2]["file_path"] == "first.txt"
+        assert (tmp_path / "first.txt").read_text(encoding="utf-8") == "first\n"
+        assert (tmp_path / "second.txt").read_text(encoding="utf-8") == "second\n"
+        assert state.fetch_messages(
+            "lead",
+            undelivered_only=False,
+            message_type="approval_request",
+        ) == []
+        durable = state.tasks.list_tasks()
+        assert len(durable) == 1
+        assert durable[0].state == "succeeded"
+        assert durable[0].owner_agent_id == "approval-coder"
+    finally:
+        await tool.aclose()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_foreground_coder_subprocess_exact_scope_does_not_cross_call(
+    tmp_path, monkeypatch
+) -> None:
+    requests = 0
+
+    def tool_response(response_id: str, call_id: str, arguments: dict) -> bytes:
+        first = {
+            "id": response_id,
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": call_id,
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json.dumps(arguments),
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        terminal = {
+            "id": response_id,
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+        }
+        return (
+            f"data: {json.dumps(first)}\n\ndata: {json.dumps(terminal)}\n\n"
+        ).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            nonlocal requests
+            requests += 1
+            if requests == 1:
+                payload = tool_response(
+                    "scope-child-1",
+                    "write-scope-first",
+                    {
+                        "file_path": "scope-first.txt",
+                        "content": "first\n",
+                        "overwrite": True,
+                    },
+                )
+            elif requests == 2:
+                payload = tool_response(
+                    "scope-child-2",
+                    "write-scope-second",
+                    {
+                        "file_path": "scope-second.txt",
+                        "content": "second\n",
+                        "overwrite": True,
+                    },
+                )
+            else:
+                payload = (
+                    'data: {"id":"scope-child-3","choices":[{"delta":'
+                    '{"content":"scoped writes completed"},"finish_reason":null}]}\n\n'
+                    'data: {"id":"scope-child-3","choices":[{"delta":{},'
+                    '"finish_reason":"stop"}]}\n\n'
+                ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    def forbidden_parent_factory() -> ProviderABC:
+        raise AssertionError("foreground coder subprocess must rebuild provider in child")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "scope-secret")
+    monkeypatch.setenv(
+        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
+    )
+    state = SharedState(tmp_path / "scope-state" / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "scope-db",
+        model="openai/scope-child",
+        agent_execution_mode="subprocess",
+        safety_tier="interactive",
+        memory_backend="off",
+    )
+    parent_policy = PermissionPolicy("interactive")
+    broker_calls: list[dict] = []
+
+    async def broker(agent_id: str, tool_name: str, arguments: dict) -> bool:
+        del agent_id
+        broker_calls.append(dict(arguments))
+        parent_policy.add_session_rule(
+            PermissionRule.create(
+                "allow",
+                tool_name,
+                build_exact_scope_matchers(arguments),
+            )
+        )
+        return True
+
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        forbidden_parent_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+    tool.set_permission_policy_provider(lambda: parent_policy)
+    tool.set_foreground_approval_broker(broker)
+    try:
+        result = await tool.run(
+            role="coder",
+            task="write two differently scoped files",
+            agent_id="scope-coder",
+            isolation="shared",
+        )
+
+        assert result.success is True, result.error
+        assert result.output == "scoped writes completed"
+        assert requests == 3
+        assert [call["file_path"] for call in broker_calls] == [
+            "scope-first.txt",
+            "scope-second.txt",
+        ]
+        assert (
+            tmp_path / "scope-first.txt"
+        ).read_text(encoding="utf-8") == "first\n"
+        assert (
+            tmp_path / "scope-second.txt"
+        ).read_text(encoding="utf-8") == "second\n"
+    finally:
+        await tool.aclose()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_live_approval_capability_is_not_in_subprocess_environment(
+    tmp_path, monkeypatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        returncode = 1
+
+        async def communicate(self, encoded_spec: bytes):
+            captured["spec"] = json.loads(encoded_spec)
+            return (b"", b"")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["argv"] = args
+        captured["env"] = dict(kwargs["env"])
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+    state = SharedState(tmp_path / "cap-state" / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "cap-db",
+        model="openai/capability-child",
+        agent_execution_mode="subprocess",
+        safety_tier="interactive",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        lambda: FakeProvider(),
+        config=config,
+        provider_config_backed=True,
+    )
+    tool.set_foreground_approval_broker(
+        lambda *_args: asyncio.sleep(0, result=True)
+    )
+    try:
+        result = await tool.run(
+            role="coder",
+            task="inspect capability transport",
+            agent_id="cap-coder",
+            isolation="shared",
+        )
+
+        assert result.success is False
+        spec = captured["spec"]
+        assert isinstance(spec, dict)
+        channel = spec["approval_channel"]
+        assert isinstance(channel, dict)
+        token = channel["token"]
+        assert isinstance(token, str)
+        environment = captured["env"]
+        assert isinstance(environment, dict)
+        assert token not in environment
+        assert token not in environment.values()
+        assert all("APPROVAL" not in key for key in environment)
+        provider_env = spec["provider_env"]
+        assert isinstance(provider_env, dict)
+        assert provider_env["OPENAI_API_KEY"] == "provider-secret"
+        assert token not in provider_env
+        assert token not in provider_env.values()
+        assert all("APPROVAL" not in key for key in provider_env)
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_live_approval_server_closes_when_subprocess_launch_fails(
+    tmp_path, monkeypatch
+) -> None:
+    import ash.tools.agent as agent_module
+
+    endpoints = []
+    original_server = agent_module.ForegroundApprovalServer
+
+    class TrackingApprovalServer(original_server):
+        async def start(self):
+            endpoint = await super().start()
+            endpoints.append(endpoint)
+            return endpoint
+
+    async def fail_create_subprocess_exec(*_args, **_kwargs):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(
+        agent_module,
+        "ForegroundApprovalServer",
+        TrackingApprovalServer,
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        fail_create_subprocess_exec,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "launch-failure-secret")
+    state = SharedState(tmp_path / "launch-state" / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "launch-db",
+        model="openai/launch-failure-child",
+        agent_execution_mode="subprocess",
+        safety_tier="interactive",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        lambda: FakeProvider(),
+        config=config,
+        provider_config_backed=True,
+    )
+    tool.set_foreground_approval_broker(
+        lambda *_args: asyncio.sleep(0, result=True)
+    )
+    try:
+        result = await tool.run(
+            role="coder",
+            task="exercise launch cleanup",
+            agent_id="launch-failure-coder",
+            isolation="shared",
+        )
+
+        assert result.success is False
+        assert "spawn failed" in (result.error or "")
+        assert len(endpoints) == 1
+        endpoint = endpoints[0]
+        with pytest.raises(OSError):
+            await asyncio.open_connection(endpoint.host, endpoint.port)
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_foreground_subprocess_cancel_during_live_approval_fails_closed(
+    tmp_path, monkeypatch
+) -> None:
+    def tool_response(arguments: dict) -> bytes:
+        first = {
+            "id": "cancel-approval-child",
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "cancel-write",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json.dumps(arguments),
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        terminal = {
+            "id": "cancel-approval-child",
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+        }
+        return (
+            f"data: {json.dumps(first)}\n\ndata: {json.dumps(terminal)}\n\n"
+        ).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            payload = tool_response(
+                {
+                    "file_path": "must-not-write.txt",
+                    "content": "blocked\n",
+                    "overwrite": True,
+                }
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    def forbidden_parent_factory() -> ProviderABC:
+        raise AssertionError("foreground subprocess must rebuild provider in child")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "cancel-approval-secret")
+    monkeypatch.setenv(
+        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
+    )
+    state = SharedState(tmp_path / "cancel-state" / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "cancel-db",
+        model="openai/cancel-approval-child",
+        agent_execution_mode="subprocess",
+        safety_tier="interactive",
+        memory_backend="off",
+    )
+    broker_started = asyncio.Event()
+    broker_cancelled = asyncio.Event()
+
+    async def broker(agent_id: str, tool_name: str, arguments: dict) -> bool:
+        del agent_id, tool_name, arguments
+        broker_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            broker_cancelled.set()
+            raise
+
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        forbidden_parent_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+    tool.set_foreground_approval_broker(broker)
+    run_task = asyncio.create_task(
+        tool.run(
+            role="coder",
+            task="attempt one blocked write",
+            agent_id="cancel-approval-coder",
+            isolation="shared",
+        )
+    )
+    try:
+        await asyncio.wait_for(broker_started.wait(), timeout=5)
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run_task, timeout=5)
+        await asyncio.wait_for(broker_cancelled.wait(), timeout=2)
+
+        durable = state.tasks.list_tasks()
+        assert len(durable) == 1
+        current = state.tasks.get_task(durable[0].task_id)
+        assert current is not None
+        assert current.state == "cancelled"
+        assert not (tmp_path / "must-not-write.txt").exists()
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+        await tool.aclose()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_background_agent_runs_provider_in_subprocess(tmp_path, monkeypatch) -> None:
     requests: list[tuple[str, str]] = []
 
@@ -210,6 +760,165 @@ async def test_background_agent_runs_provider_in_subprocess(tmp_path, monkeypatc
                 break
             await asyncio.sleep(0.01)
         assert "background-process-reviewer" not in tool._subprocess_tasks
+    finally:
+        await tool.aclose()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_background_coder_subprocess_keeps_durable_approval_path(
+    tmp_path, monkeypatch
+) -> None:
+    requests = 0
+
+    def tool_response(response_id: str, call_id: str, arguments: dict) -> bytes:
+        first = {
+            "id": response_id,
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": call_id,
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json.dumps(arguments),
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        terminal = {
+            "id": response_id,
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+        }
+        return (
+            f"data: {json.dumps(first)}\n\ndata: {json.dumps(terminal)}\n\n"
+        ).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            nonlocal requests
+            requests += 1
+            if requests == 1:
+                payload = tool_response(
+                    "durable-child-1",
+                    "write-durable",
+                    {
+                        "file_path": "durable-child.txt",
+                        "content": "durable\n",
+                        "overwrite": True,
+                    },
+                )
+            else:
+                payload = (
+                    'data: {"id":"durable-child-2","choices":[{"delta":'
+                    '{"content":"durable write completed"},"finish_reason":null}]}\n\n'
+                    'data: {"id":"durable-child-2","choices":[{"delta":{},'
+                    '"finish_reason":"stop"}]}\n\n'
+                ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    def forbidden_parent_factory() -> ProviderABC:
+        raise AssertionError("background coder subprocess must rebuild provider in child")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "durable-approval-secret")
+    monkeypatch.setenv(
+        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
+    )
+    state = SharedState(tmp_path / "state" / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/durable-child",
+        agent_execution_mode="subprocess",
+        safety_tier="interactive",
+        memory_backend="off",
+    )
+    live_broker_calls = 0
+
+    async def forbidden_live_broker(
+        agent_id: str, tool_name: str, arguments: dict
+    ) -> bool:
+        nonlocal live_broker_calls
+        del agent_id, tool_name, arguments
+        live_broker_calls += 1
+        return True
+
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        forbidden_parent_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+    tool.set_foreground_approval_broker(forbidden_live_broker)
+    try:
+        started = await tool.run(
+            role="coder",
+            task="write with durable approval",
+            agent_id="durable-coder",
+            isolation="shared",
+            background=True,
+        )
+        assert started.success is True
+
+        request = None
+        for _ in range(100):
+            approvals = state.fetch_messages(
+                "lead",
+                undelivered_only=True,
+                limit=100,
+                message_type="approval_request",
+            )
+            request = next(
+                (
+                    message
+                    for message in approvals
+                    if message.sender_id == "durable-coder"
+                ),
+                None,
+            )
+            if request is not None:
+                break
+            await asyncio.sleep(0.02)
+        assert request is not None
+        assert live_broker_calls == 0
+
+        resolved = state.resolve_approval_request(
+            request.message_id,
+            approved=True,
+        )
+        assert resolved["approved"] is True
+
+        durable = state.tasks.list_tasks()[0]
+        terminal = await asyncio.wait_for(
+            tool.wait_for_tasks([durable.task_id]),
+            timeout=5,
+        )
+        assert terminal[0].state == "succeeded"
+        assert requests == 2
+        assert live_broker_calls == 0
+        assert (
+            tmp_path / "durable-child.txt"
+        ).read_text(encoding="utf-8") == "durable\n"
     finally:
         await tool.aclose()
         server.shutdown()
@@ -519,6 +1228,51 @@ async def test_subprocess_mode_preserves_opaque_python_provider_factory(tmp_path
         assert result.output == "evidence: tests pass"
         assert calls == 1
         assert state.tasks.list_tasks()[0].owner_agent_id == "sdk-reviewer"
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_interactive_coder_subprocess_without_live_broker_falls_back_in_process(
+    tmp_path,
+) -> None:
+    calls = 0
+
+    class LocalProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            assert tools is not None
+            yield StreamChunk(content="local fallback", is_done=True)
+
+    def provider_factory() -> ProviderABC:
+        nonlocal calls
+        calls += 1
+        return LocalProvider()
+
+    state = SharedState(tmp_path / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        agent_execution_mode="subprocess",
+        safety_tier="interactive",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        provider_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+    try:
+        result = await tool.run(
+            role="coder",
+            task="inspect tests",
+            agent_id="interactive-local-coder",
+            isolation="shared",
+        )
+
+        assert result.success is True
+        assert result.output == "local fallback"
+        assert calls == 1
     finally:
         await tool.aclose()
 
