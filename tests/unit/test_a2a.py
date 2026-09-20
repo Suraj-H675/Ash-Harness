@@ -41,6 +41,10 @@ from ash.sdk import AshEvent
 from ash.agents.a2a_remote import (
     ListRemoteAgentsTool,
     RemoteAgentConfig,
+    RemoteAgentTaskCancelTool,
+    RemoteAgentTaskStatusTool,
+    cancel_remote_agent_task,
+    get_remote_agent_task,
     load_remote_agent_configs,
     send_remote_agent,
     validate_agent_card_origins,
@@ -630,12 +634,13 @@ async def test_a2a_official_client_streams_and_resumes_durable_context(
             assert any(event.HasField("artifact_update") for event in second_events)
 
             monkeypatch.setenv("REMOTE_A2A_TOKEN", "0123456789abcdef")
+            remote_config = RemoteAgentConfig(
+                name="local",
+                url="https://testserver",
+                token_env="REMOTE_A2A_TOKEN",
+            )
             delegated = await send_remote_agent(
-                RemoteAgentConfig(
-                    name="local",
-                    url="https://testserver",
-                    token_env="REMOTE_A2A_TOKEN",
-                ),
+                remote_config,
                 "delegated task",
                 context_id="delegated-context",
                 transport=transport,
@@ -643,6 +648,15 @@ async def test_a2a_official_client_streams_and_resumes_durable_context(
             assert delegated.response == "hello"
             assert delegated.context_id == "delegated-context"
             assert delegated.state == "TASK_STATE_COMPLETED"
+            managed = await get_remote_agent_task(
+                remote_config,
+                delegated.task_id,
+                transport=transport,
+            )
+            assert managed.task_id == delegated.task_id
+            assert managed.context_id == "delegated-context"
+            assert managed.state == "TASK_STATE_COMPLETED"
+            assert managed.response == "hello"
 
             unsupported = SendMessageRequest(
                 message=Message(
@@ -728,6 +742,42 @@ async def test_a2a_official_client_streams_and_resumes_durable_context(
         ),
     ]
     assert all(client.closed for _, client in created)
+
+
+@pytest.mark.asyncio
+async def test_remote_task_tools_return_protocol_errors_as_tool_failures(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = RemoteAgentConfig(name="local", url="https://agent.example.com")
+
+    async def missing_task(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise TaskNotFoundError("remote task not found")
+
+    monkeypatch.setattr("ash.agents.a2a_remote.get_remote_agent_task", missing_task)
+    monkeypatch.setattr(
+        "ash.agents.a2a_remote.cancel_remote_agent_task",
+        missing_task,
+    )
+    status_tool = RemoteAgentTaskStatusTool(
+        SafetyGuard(tmp_path),
+        {"local": config},
+    )
+    cancel_tool = RemoteAgentTaskCancelTool(
+        SafetyGuard(tmp_path),
+        {"local": config},
+    )
+
+    status = await status_tool.run(agent="local", task_id="missing-task")
+    cancelled = await cancel_tool.run(agent="local", task_id="missing-task")
+
+    assert status.success is False
+    assert status.output == ""
+    assert status.error == "remote task not found"
+    assert cancelled.success is False
+    assert cancelled.output == ""
+    assert cancelled.error == "remote task not found"
 
 
 def test_a2a_remote_config_respects_trust_and_rejects_duplicates(
@@ -1130,7 +1180,7 @@ async def test_a2a_cancel_preempts_active_ash_turn(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
     app = create_a2a_app(
         config,
-        public_url="http://testserver",
+        public_url="https://testserver",
         bearer_token="0123456789abcdef",
         task_store=InMemoryTaskStore(),
     )
@@ -1138,7 +1188,7 @@ async def test_a2a_cancel_preempts_active_ash_turn(tmp_path: Path, monkeypatch) 
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=transport,
-            base_url="http://testserver",
+            base_url="https://testserver",
             headers={"Authorization": "Bearer 0123456789abcdef"},
         ) as http:
             client = await ClientFactory(
@@ -1149,7 +1199,7 @@ async def test_a2a_cancel_preempts_active_ash_turn(tmp_path: Path, monkeypatch) 
                     supported_protocol_bindings=[TransportProtocol.JSONRPC],
                     accepted_output_modes=["text/plain"],
                 )
-            ).create_from_url("http://testserver")
+            ).create_from_url("https://testserver")
             response = [
                 event
                 async for event in client.send_message(
@@ -1164,8 +1214,17 @@ async def test_a2a_cancel_preempts_active_ash_turn(tmp_path: Path, monkeypatch) 
             ][0]
             assert response.HasField("task")
             await asyncio.wait_for(started.wait(), timeout=2)
+            monkeypatch.setenv("REMOTE_A2A_TOKEN", "0123456789abcdef")
             cancel_request = asyncio.create_task(
-                client.cancel_task(CancelTaskRequest(id=response.task.id))
+                cancel_remote_agent_task(
+                    RemoteAgentConfig(
+                        name="local",
+                        url="https://testserver",
+                        token_env="REMOTE_A2A_TOKEN",
+                    ),
+                    response.task.id,
+                    transport=transport,
+                )
             )
             await asyncio.wait_for(close_started.wait(), timeout=2)
             # The A2A SDK can publish the cancelled task from its consumer
@@ -1175,6 +1234,7 @@ async def test_a2a_cancel_preempts_active_ash_turn(tmp_path: Path, monkeypatch) 
             assert not closed.is_set()
             close_release.set()
             cancelled = await asyncio.wait_for(cancel_request, timeout=2)
-            assert cancelled.status.state == TaskState.TASK_STATE_CANCELED
+            assert cancelled.state == "TASK_STATE_CANCELED"
+            assert cancelled.task_id == response.task.id
             await asyncio.wait_for(closed.wait(), timeout=2)
             await client.close()

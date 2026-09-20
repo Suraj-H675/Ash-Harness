@@ -233,6 +233,8 @@ def build_tools(
     from ash.agents.a2a_remote import (
         DelegateRemoteAgentTool,
         ListRemoteAgentsTool,
+        RemoteAgentTaskCancelTool,
+        RemoteAgentTaskStatusTool,
         load_remote_agent_configs,
     )
 
@@ -244,6 +246,8 @@ def build_tools(
             [
                 ListRemoteAgentsTool(safety_guard, remote_agents),
                 DelegateRemoteAgentTool(safety_guard, remote_agents),
+                RemoteAgentTaskStatusTool(safety_guard, remote_agents),
+                RemoteAgentTaskCancelTool(safety_guard, remote_agents),
             ]
         )
     if provider_factory is not None and agent_db_path is not None:

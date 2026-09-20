@@ -32,6 +32,25 @@ def test_structural_navigation_tools_are_read_only(tool_name: str) -> None:
     assert decision.action == PolicyAction.ALLOW
 
 
+def test_remote_task_status_is_read_only_but_cancel_is_not() -> None:
+    policy = PermissionPolicy("plan")
+
+    assert (
+        policy.evaluate(
+            "remote_agent_task_status",
+            {"agent": "review", "task_id": "task-1"},
+        ).action
+        == PolicyAction.ALLOW
+    )
+    assert (
+        policy.evaluate(
+            "remote_agent_task_cancel",
+            {"agent": "review", "task_id": "task-1"},
+        ).action
+        == PolicyAction.DENY
+    )
+
+
 def test_auto_edit_allows_edits_but_asks_for_commands() -> None:
     policy = PermissionPolicy("auto_edit")
     assert policy.evaluate("replace_file_content", {}).action == PolicyAction.ALLOW

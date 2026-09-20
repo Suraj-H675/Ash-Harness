@@ -82,6 +82,11 @@ class DelegateRemoteAgentArgs(BaseModel):
     context_id: str = Field(default="", max_length=512)
 
 
+class RemoteAgentTaskArgs(BaseModel):
+    agent: str = Field(..., min_length=1, max_length=64)
+    task_id: str = Field(..., min_length=1, max_length=512)
+
+
 class ListRemoteAgentsTool(BaseTool):
     name = "list_remote_agents"
     description = (
@@ -194,6 +199,135 @@ class DelegateRemoteAgentTool(BaseTool):
             output=payload if success else "",
             error=None if success else f"remote task ended in {result.state}",
             token_count=count_output_tokens(payload) if success else 0,
+        )
+
+
+class RemoteAgentTaskStatusTool(BaseTool):
+    name = "remote_agent_task_status"
+    description = "Fetch the current state and bounded text output of an A2A task."
+    args_schema = RemoteAgentTaskArgs
+
+    def __init__(
+        self, safety_guard: SafetyGuard, agents: dict[str, RemoteAgentConfig]
+    ) -> None:
+        super().__init__(safety_guard)
+        self.agents = dict(agents)
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = self.validate_args(**kwargs)
+        assert isinstance(args, RemoteAgentTaskArgs)
+        config = self.agents.get(args.agent)
+        if config is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"unknown remote agent: {args.agent}",
+            )
+        try:
+            result = await get_remote_agent_task(config, args.task_id)
+        except ModuleNotFoundError as exc:
+            if exc.name == "a2a" or (exc.name or "").startswith("a2a."):
+                from ash.install import pipx_install_command
+
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(f"A2A support requires `{pipx_install_command('a2a')}`."),
+                )
+            raise
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=redact_text(str(exc)),
+            )
+        except Exception as exc:
+            from a2a.utils.errors import A2AError
+
+            if not isinstance(exc, A2AError):
+                raise
+            return ToolResult(
+                success=False,
+                output="",
+                error=redact_text(str(exc)),
+            )
+        payload = json.dumps(
+            {
+                "agent": config.name,
+                "task_id": result.task_id,
+                "context_id": result.context_id or None,
+                "state": result.state,
+                "response": result.response,
+            }
+        )
+        return ToolResult(
+            success=True,
+            output=payload,
+            token_count=count_output_tokens(payload),
+        )
+
+
+class RemoteAgentTaskCancelTool(BaseTool):
+    name = "remote_agent_task_cancel"
+    description = "Cancel a known A2A remote task and return its resulting state."
+    args_schema = RemoteAgentTaskArgs
+
+    def __init__(
+        self, safety_guard: SafetyGuard, agents: dict[str, RemoteAgentConfig]
+    ) -> None:
+        super().__init__(safety_guard)
+        self.agents = dict(agents)
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = self.validate_args(**kwargs)
+        assert isinstance(args, RemoteAgentTaskArgs)
+        config = self.agents.get(args.agent)
+        if config is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"unknown remote agent: {args.agent}",
+            )
+        try:
+            result = await cancel_remote_agent_task(config, args.task_id)
+        except ModuleNotFoundError as exc:
+            if exc.name == "a2a" or (exc.name or "").startswith("a2a."):
+                from ash.install import pipx_install_command
+
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(f"A2A support requires `{pipx_install_command('a2a')}`."),
+                )
+            raise
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=redact_text(str(exc)),
+            )
+        except Exception as exc:
+            from a2a.utils.errors import A2AError
+
+            if not isinstance(exc, A2AError):
+                raise
+            return ToolResult(
+                success=False,
+                output="",
+                error=redact_text(str(exc)),
+            )
+        payload = json.dumps(
+            {
+                "agent": config.name,
+                "task_id": result.task_id,
+                "context_id": result.context_id or None,
+                "state": result.state,
+            }
+        )
+        return ToolResult(
+            success=True,
+            output=payload,
+            token_count=count_output_tokens(payload),
         )
 
 
@@ -342,6 +476,116 @@ async def send_remote_agent(
         context_id=resolved_context,
         state=state or "UNKNOWN",
     )
+
+
+async def get_remote_agent_task(
+    config: RemoteAgentConfig,
+    task_id: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> RemoteAgentResult:
+    from a2a.types.a2a_pb2 import GetTaskRequest, TaskState
+
+    _validate_remote_task_id(task_id)
+    http, client = await _open_remote_agent_client(config, transport=transport)
+    closed = False
+    try:
+        task = await client.get_task(GetTaskRequest(id=task_id))
+        chunks: list[str] = []
+        output_bytes = 0
+        for artifact in task.artifacts:
+            output_bytes = _append_text_parts(
+                artifact.parts,
+                chunks,
+                output_bytes,
+            )
+        return RemoteAgentResult(
+            response="".join(chunks),
+            task_id=task.id,
+            context_id=task.context_id,
+            state=TaskState.Name(task.status.state),
+        )
+    except asyncio.CancelledError:
+        close_task = asyncio.create_task(client.close())
+        await _settle_cleanup_task_after_cancellation(close_task)
+        closed = True
+        raise
+    finally:
+        if not closed:
+            await client.close()
+        await http.aclose()
+
+
+async def cancel_remote_agent_task(
+    config: RemoteAgentConfig,
+    task_id: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> RemoteAgentResult:
+    from a2a.types.a2a_pb2 import CancelTaskRequest, TaskState
+
+    _validate_remote_task_id(task_id)
+    http, client = await _open_remote_agent_client(config, transport=transport)
+    closed = False
+    try:
+        task = await client.cancel_task(CancelTaskRequest(id=task_id))
+        return RemoteAgentResult(
+            response="",
+            task_id=task.id,
+            context_id=task.context_id,
+            state=TaskState.Name(task.status.state),
+        )
+    except asyncio.CancelledError:
+        close_task = asyncio.create_task(client.close())
+        await _settle_cleanup_task_after_cancellation(close_task)
+        closed = True
+        raise
+    finally:
+        if not closed:
+            await client.close()
+        await http.aclose()
+
+
+async def _open_remote_agent_client(
+    config: RemoteAgentConfig,
+    *,
+    transport: httpx.AsyncBaseTransport | None,
+) -> tuple[httpx.AsyncClient, Any]:
+    from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
+    from a2a.utils.constants import TransportProtocol
+
+    _validate_remote_url(config.url)
+    token = os.environ.get(config.token_env, "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    http = httpx.AsyncClient(
+        headers=headers,
+        timeout=httpx.Timeout(
+            config.timeout_seconds,
+            connect=min(config.timeout_seconds, 15),
+        ),
+        follow_redirects=False,
+        transport=transport,
+    )
+    try:
+        card = await A2ACardResolver(http, config.url).get_agent_card()
+        validate_agent_card_origins(config.url, card.supported_interfaces)
+        client = ClientFactory(
+            ClientConfig(
+                httpx_client=http,
+                streaming=True,
+                supported_protocol_bindings=[TransportProtocol.JSONRPC],
+                accepted_output_modes=["text/plain"],
+            )
+        ).create(card)
+    except BaseException:
+        await http.aclose()
+        raise
+    return http, client
+
+
+def _validate_remote_task_id(task_id: str) -> None:
+    if not task_id or len(task_id.encode("utf-8")) > 512:
+        raise ValueError("remote-agent task ID must be non-empty and at most 512 bytes")
 
 
 def _parse_agent_config(name: str, raw: Any, path: Path) -> RemoteAgentConfig:
