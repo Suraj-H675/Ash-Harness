@@ -5593,7 +5593,7 @@ for line in sys.stdin:
         meta = params.get("_meta", {})
         caps = meta.get("io.modelcontextprotocol/clientCapabilities", {})
         assert meta.get("io.modelcontextprotocol/protocolVersion") == "2026-07-28"
-        assert "tasks" not in caps
+        assert caps.get("extensions", {}).get("io.modelcontextprotocol/tasks") == {}
         result = {
             "resultType": "complete",
             "supportedVersions": ["2026-07-28"],
@@ -5687,6 +5687,452 @@ async def test_http_modern_requests_use_stateless_routing_headers() -> None:
     assert [method for method, _, _ in seen] == ["server/discover", "tools/call"]
     await client.disconnect()
     await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_modern_task_extension_drives_input_update_and_completion() -> None:
+    seen: list[tuple[str, httpx.Headers, dict]] = []
+    task_gets = 0
+    task_id = "task-123"
+
+    def task_state(status: str, **extra: object) -> dict:
+        return {
+            "taskId": task_id,
+            "status": status,
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60_000,
+            "pollIntervalMs": 0,
+            **extra,
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal task_gets
+        payload = json.loads(request.content)
+        method = payload["method"]
+        params = payload.get("params", {})
+        seen.append((method, request.headers, payload))
+        capabilities = params.get("_meta", {}).get(
+            "io.modelcontextprotocol/clientCapabilities", {}
+        )
+        assert capabilities.get("extensions", {}).get(
+            "io.modelcontextprotocol/tasks"
+        ) == {}
+        if method == "server/discover":
+            result = {
+                "resultType": "complete",
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {
+                    "tools": {},
+                    "extensions": {"io.modelcontextprotocol/tasks": {}},
+                },
+            }
+        elif method == "tools/call":
+            result = {"resultType": "task", **task_state("working")}
+        elif method == "tasks/get":
+            assert request.headers["Mcp-Name"] == task_id
+            task_gets += 1
+            if task_gets == 1:
+                result = {
+                    "resultType": "complete",
+                    **task_state(
+                        "input_required",
+                        inputRequests={
+                            "approve": {
+                                "method": "elicitation/create",
+                                "params": {
+                                    "mode": "form",
+                                    "message": "Approve?",
+                                    "requestedSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "approved": {"type": "boolean"}
+                                        },
+                                        "required": ["approved"],
+                                    },
+                                },
+                            }
+                        },
+                    ),
+                }
+            else:
+                result = {
+                    "resultType": "complete",
+                    **task_state(
+                        "completed",
+                        result={
+                            "content": [{"type": "text", "text": "finished"}],
+                            "isError": False,
+                        },
+                    ),
+                }
+        elif method == "tasks/update":
+            assert request.headers["Mcp-Name"] == task_id
+            assert params["taskId"] == task_id
+            assert params["inputResponses"] == {
+                "approve": {
+                    "action": "accept",
+                    "content": {"approved": True},
+                }
+            }
+            result = {"resultType": "complete"}
+        else:
+            raise AssertionError(method)
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+            request=request,
+        )
+
+    async def elicit(params: dict) -> dict:
+        assert params["message"] == "Approve?"
+        return {"action": "accept", "content": {"approved": True}}
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern-task",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+        elicitation_handler=elicit,
+    )
+    await client.connect()
+
+    result = await client.call_tool("long", {})
+
+    assert result["content"][0]["text"] == "finished"
+    assert [method for method, _, _ in seen] == [
+        "server/discover",
+        "tools/call",
+        "tasks/get",
+        "tasks/update",
+        "tasks/get",
+    ]
+    for method, headers, _ in seen[2:]:
+        assert headers["Mcp-Method"] == method
+        assert headers["Mcp-Name"] == task_id
+    await client.disconnect()
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_modern_task_result_requires_server_extension() -> None:
+    client = MCPClient(MCPServerConfig(name="modern", command="fake", args=[], env={}))
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {"tools": {}}
+
+    with pytest.raises(MCPProtocolError, match="without advertising"):
+        await client._resolve_modern_result(
+            "tools/call",
+            {"name": "long", "arguments": {}},
+            {
+                "resultType": "task",
+                "taskId": "task-1",
+                "status": "working",
+                "createdAt": "2026-09-20T00:00:00Z",
+                "lastUpdatedAt": "2026-09-20T00:00:01Z",
+                "ttlMs": None,
+            },
+            input_required_round=0,
+            expected_tool_contract=None,
+            header_annotations=[],
+        )
+
+
+@pytest.mark.asyncio
+async def test_modern_task_cancel_returns_acknowledgement_and_routes_task_id() -> None:
+    seen: list[tuple[str, httpx.Headers]] = []
+    task_id = "cancel-me"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        method = payload["method"]
+        seen.append((method, request.headers))
+        if method == "server/discover":
+            result = {
+                "resultType": "complete",
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {
+                    "extensions": {"io.modelcontextprotocol/tasks": {}}
+                },
+            }
+        elif method == "tasks/cancel":
+            assert payload["params"]["taskId"] == task_id
+            result = {"resultType": "complete"}
+        else:
+            raise AssertionError(method)
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+            request=request,
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern-task",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    await client.connect()
+
+    result = await client.cancel_mcp_task(task_id)
+
+    assert result == {"taskId": task_id, "acknowledged": True}
+    assert seen[-1][1]["Mcp-Method"] == "tasks/cancel"
+    assert seen[-1][1]["Mcp-Name"] == task_id
+    await client.disconnect()
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_modern_task_deduplicates_repeated_input_request_keys() -> None:
+    client = MCPClient(
+        MCPServerConfig(name="modern", command="fake", args=[], env={}),
+        elicitation_handler=AsyncMock(
+            return_value={"action": "accept", "content": {"ok": True}}
+        ),
+    )
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+    input_request = {
+        "confirm": {
+            "method": "elicitation/create",
+            "params": {
+                "mode": "form",
+                "message": "Continue?",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                },
+            },
+        }
+    }
+    responses = iter(
+        [
+            {"resultType": "complete"},
+            {
+                "taskId": "dedupe",
+                "status": "input_required",
+                "createdAt": "2026-09-20T00:00:00Z",
+                "lastUpdatedAt": "2026-09-20T00:00:01Z",
+                "ttlMs": None,
+                "pollIntervalMs": 0,
+                "inputRequests": input_request,
+            },
+            {
+                "taskId": "dedupe",
+                "status": "completed",
+                "createdAt": "2026-09-20T00:00:00Z",
+                "lastUpdatedAt": "2026-09-20T00:00:02Z",
+                "ttlMs": None,
+                "result": {"content": [{"type": "text", "text": "done"}]},
+            },
+        ]
+    )
+
+    async def request(method: str, params: dict, **_: object) -> dict:
+        if method == "tasks/update":
+            return next(responses)
+        if method == "tasks/get":
+            return next(responses)
+        raise AssertionError(method)
+
+    client.request = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+    initial = {
+        "resultType": "task",
+        "taskId": "dedupe",
+        "status": "input_required",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:01Z",
+        "ttlMs": None,
+        "pollIntervalMs": 0,
+        "inputRequests": input_request,
+    }
+
+    result = await client._await_modern_tool_task(initial, timeout=1)
+
+    assert result["content"][0]["text"] == "done"
+    assert client.elicitation_handler.await_count == 1
+    assert [call.args[0] for call in client.request.await_args_list] == [
+        "tasks/update",
+        "tasks/get",
+        "tasks/get",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_modern_task_failure_preserves_jsonrpc_error() -> None:
+    client = MCPClient(MCPServerConfig(name="modern", command="fake", args=[], env={}))
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+    failed = {
+        "resultType": "task",
+        "taskId": "failed-task",
+        "status": "failed",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:01Z",
+        "ttlMs": None,
+        "error": {
+            "code": -32044,
+            "message": "remote execution failed",
+            "data": {"kind": "upstream"},
+        },
+    }
+
+    with pytest.raises(MCPProtocolError, match="remote execution failed") as caught:
+        await client._await_modern_tool_task(failed, timeout=1)
+
+    assert caught.value.code == -32044
+    assert caught.value.has_data is True
+    assert caught.value.data == {"kind": "upstream"}
+
+
+@pytest.mark.asyncio
+async def test_modern_task_timeout_cancels_without_post_deadline_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MCPClient(MCPServerConfig(name="modern", command="fake", args=[], env={}))
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+    monkeypatch.setattr(client, "_modern_task_poll_delay", lambda task: 1.0)
+    request = AsyncMock(return_value={})
+    client.request = request  # type: ignore[method-assign]
+    initial = {
+        "resultType": "task",
+        "taskId": "slow-task",
+        "status": "working",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:01Z",
+        "ttlMs": None,
+        "pollIntervalMs": 1000,
+    }
+
+    with pytest.raises(MCPTaskTimeout):
+        await client._await_modern_tool_task(initial, timeout=0.01)
+
+    assert [call.args[0] for call in request.await_args_list] == ["tasks/cancel"]
+    assert request.await_args.args[1] == {"taskId": "slow-task"}
+
+
+@pytest.mark.asyncio
+async def test_modern_tool_call_never_sends_removed_task_opt_in() -> None:
+    client = MCPClient(MCPServerConfig(name="modern", command="fake", args=[], env={}))
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {
+        "tools": {},
+        "extensions": {"io.modelcontextprotocol/tasks": {}},
+    }
+    request = AsyncMock(
+        return_value={"content": [{"type": "text", "text": "sync"}]}
+    )
+    client.request = request  # type: ignore[method-assign]
+
+    result = await client.call_tool("long", {}, as_task=True)
+
+    assert result["content"][0]["text"] == "sync"
+    assert request.await_args.args[:2] == ("tools/call", {"name": "long", "arguments": {}})
+
+
+@pytest.mark.asyncio
+async def test_modern_mrtr_can_transition_to_task_over_stdio() -> None:
+    server = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    params = message.get("params", {})
+    if method == "server/discover":
+        result = {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {
+                "tools": {},
+                "extensions": {"io.modelcontextprotocol/tasks": {}},
+            },
+        }
+    elif method == "tools/call":
+        if "inputResponses" not in params:
+            result = {
+                "resultType": "input_required",
+                "inputRequests": {
+                    "confirm": {
+                        "method": "elicitation/create",
+                        "params": {
+                            "mode": "form",
+                            "message": "Continue into task?",
+                            "requestedSchema": {
+                                "type": "object",
+                                "properties": {"ok": {"type": "boolean"}},
+                                "required": ["ok"],
+                            },
+                        },
+                    }
+                },
+                "requestState": "before-task",
+            }
+        else:
+            assert params["requestState"] == "before-task"
+            result = {
+                "resultType": "task",
+                "taskId": "stdio-task",
+                "status": "working",
+                "createdAt": "2026-09-20T00:00:00Z",
+                "lastUpdatedAt": "2026-09-20T00:00:01Z",
+                "ttlMs": 60000,
+                "pollIntervalMs": 0,
+            }
+    elif method == "tasks/get":
+        assert params["taskId"] == "stdio-task"
+        result = {
+            "resultType": "complete",
+            "taskId": "stdio-task",
+            "status": "completed",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:02Z",
+            "ttlMs": 60000,
+            "result": {
+                "content": [{"type": "text", "text": "task complete"}],
+                "isError": False,
+            },
+        }
+    else:
+        result = {"resultType": "complete"}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"""
+
+    async def elicit(params: dict) -> dict:
+        assert params["message"] == "Continue into task?"
+        return {"action": "accept", "content": {"ok": True}}
+
+    client = MCPClient(
+        MCPServerConfig(
+            name="modern-task", command=sys.executable, args=["-u", "-c", server], env={}
+        ),
+        elicitation_handler=elicit,
+    )
+    await client.connect()
+    try:
+        result = await client.call_tool("long", {})
+        assert result["content"][0]["text"] == "task complete"
+    finally:
+        await client.disconnect()
 
 
 @pytest.mark.asyncio

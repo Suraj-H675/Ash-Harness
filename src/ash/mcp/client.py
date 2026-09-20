@@ -39,6 +39,7 @@ from ash.sandbox.process_utils import (
 
 LATEST_PROTOCOL_VERSION = "2025-11-25"
 MODERN_PROTOCOL_VERSION = "2026-07-28"
+MODERN_TASKS_EXTENSION = "io.modelcontextprotocol/tasks"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset(
     {LATEST_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"}
 )
@@ -304,7 +305,9 @@ class MCPClient:
     def modern_client_capabilities(self) -> dict[str, Any]:
         """Capabilities safe to advertise in the 2026-07-28 request envelope."""
 
-        return self._base_client_capabilities()
+        capabilities = self._base_client_capabilities()
+        capabilities["extensions"] = {MODERN_TASKS_EXTENSION: {}}
+        return capabilities
 
     def _base_client_capabilities(self) -> dict[str, Any]:
         capabilities: dict[str, Any] = {}
@@ -321,6 +324,12 @@ class MCPClient:
 
     def supports_server_capability(self, name: str) -> bool:
         return isinstance(self.server_capabilities.get(name), dict)
+
+    def _supports_modern_tasks(self) -> bool:
+        extensions = self.server_capabilities.get("extensions")
+        return isinstance(extensions, dict) and isinstance(
+            extensions.get(MODERN_TASKS_EXTENSION), dict
+        )
 
     @property
     def watched_resources(self) -> tuple[str, ...]:
@@ -1679,6 +1688,17 @@ class MCPClient:
             completed = dict(result)
             completed.pop("resultType", None)
             return completed
+        if result_type == "task":
+            if method != "tools/call":
+                raise MCPProtocolError(
+                    f"{method} cannot return a task in MCP {MODERN_PROTOCOL_VERSION}"
+                )
+            if not self._supports_modern_tasks():
+                raise MCPProtocolError(
+                    "MCP server returned a task without advertising the "
+                    f"{MODERN_TASKS_EXTENSION} extension"
+                )
+            return dict(result)
         if result_type != "input_required":
             raise MCPProtocolError(
                 f"{method} returned unsupported resultType {result_type!r}"
@@ -1925,10 +1945,13 @@ class MCPClient:
         if isinstance(params, dict):
             name = params.get("name")
             uri = params.get("uri")
+            task_id = params.get("taskId")
             if isinstance(name, str):
                 headers["Mcp-Name"] = self._safe_header_value(name)
             elif isinstance(uri, str):
                 headers["Mcp-Name"] = self._safe_header_value(uri)
+            elif isinstance(task_id, str):
+                headers["Mcp-Name"] = self._safe_header_value(task_id)
             arguments = params.get("arguments")
             if not isinstance(arguments, dict):
                 arguments = {}
@@ -2335,10 +2358,24 @@ class MCPClient:
         header_annotations: list[tuple[tuple[str, ...], str]] | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"name": name, "arguments": arguments}
-        if as_task and self.protocol_version == MODERN_PROTOCOL_VERSION:
-            raise MCPProtocolError(
-                "MCP 2026-07-28 Tasks require the io.modelcontextprotocol/tasks "
-                "extension, which is not enabled by this client yet"
+        if self.protocol_version == MODERN_PROTOCOL_VERSION:
+            if task_ttl_ms is not None:
+                raise ValueError(
+                    "MCP 2026-07-28 task TTL is server-controlled and cannot be requested"
+                )
+            result = await self.request(
+                "tools/call",
+                params,
+                _expected_tool_contract=(name, expected_contract)
+                if expected_contract is not None
+                else None,
+                _header_annotations=header_annotations or [],
+            )
+            if result.get("resultType") != "task":
+                return result
+            return await self._await_modern_tool_task(
+                result,
+                timeout=task_timeout if task_timeout is not None else self.timeout,
             )
         if not as_task:
             return await self.request(
@@ -2493,6 +2530,139 @@ class MCPClient:
             if self._task_waiters.get(task_id) is waiter:
                 self._task_waiters.pop(task_id, None)
 
+    async def _await_modern_tool_task(
+        self,
+        initial: dict[str, Any],
+        *,
+        timeout: float,
+    ) -> dict[str, Any]:
+        """Drive one server-directed 2026-07-28 task to a terminal result."""
+
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("MCP task timeout must be positive")
+        task = self._validate_modern_task_state(initial, method="tools/call")
+        task_id = task["taskId"]
+        answered_inputs: dict[str, str] = {}
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        try:
+            while task["status"] in {"working", "input_required"}:
+                if task["status"] == "input_required":
+                    raw_requests = task.get("inputRequests")
+                    if not isinstance(raw_requests, dict):
+                        raise MCPProtocolError(
+                            "MCP tasks/get input_required task is missing inputRequests"
+                        )
+                    pending: dict[str, Any] = {}
+                    for key, embedded in raw_requests.items():
+                        if not isinstance(key, str) or not key:
+                            raise MCPProtocolError(
+                                "MCP task inputRequests keys must be non-empty strings"
+                            )
+                        try:
+                            fingerprint = json.dumps(
+                                embedded,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                allow_nan=False,
+                            )
+                        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+                            raise MCPProtocolError(
+                                f"MCP task inputRequests entry {key!r} is not valid JSON"
+                            ) from exc
+                        previous = answered_inputs.get(key)
+                        if previous is not None:
+                            if previous != fingerprint:
+                                raise MCPProtocolError(
+                                    f"MCP task reused inputRequests key {key!r} with different content"
+                                )
+                            continue
+                        pending[key] = embedded
+                    if pending:
+                        responses = await self._fulfill_modern_input_requests(pending)
+                        await self.request(
+                            "tasks/update",
+                            {"taskId": task_id, "inputResponses": responses},
+                            _allow_session_recovery=False,
+                        )
+                        for key in pending:
+                            answered_inputs[key] = json.dumps(
+                                pending[key],
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                allow_nan=False,
+                            )
+
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                delay = min(self._modern_task_poll_delay(task), remaining)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if loop.time() >= deadline:
+                    raise asyncio.TimeoutError
+                task = self._validate_modern_task_state(
+                    await self.request(
+                        "tasks/get",
+                        {"taskId": task_id},
+                        _allow_session_recovery=False,
+                    ),
+                    method="tasks/get",
+                )
+                if task["taskId"] != task_id:
+                    raise MCPProtocolError("MCP tasks/get returned another taskId")
+
+            if task["status"] == "completed":
+                result = task.get("result")
+                if not isinstance(result, dict):
+                    raise MCPProtocolError(
+                        "MCP completed task returned no valid tool result"
+                    )
+                return result
+            if task["status"] == "failed":
+                error = task.get("error")
+                if not isinstance(error, dict):
+                    raise MCPProtocolError("MCP failed task returned no valid error")
+                code = error.get("code")
+                message = error.get("message")
+                if isinstance(code, bool) or not isinstance(code, int) or not isinstance(
+                    message, str
+                ):
+                    raise MCPProtocolError("MCP failed task returned an invalid error")
+                data = error.get("data", _MISSING)
+                raise MCPProtocolError(
+                    f"MCP tool task failed ({code}): {message}",
+                    code=code,
+                    data=data,
+                )
+            detail = f": {task['statusMessage']}" if task.get("statusMessage") else ""
+            raise MCPProtocolError(f"MCP tool task {task['status']}{detail}")
+        except asyncio.TimeoutError as exc:
+            await self._cancel_mcp_task(task_id)
+            raise MCPTaskTimeout(
+                f"MCP tool task timed out after {timeout} seconds"
+            ) from exc
+        except asyncio.CancelledError as cancellation:
+            cancel_task = asyncio.create_task(
+                self._cancel_mcp_task(task_id),
+                name=f"ash-mcp-cancel-modern-task-{task_id}",
+            )
+            cancel_error, cancel_interrupted = (
+                await _settle_task_after_cancellation(cancel_task)
+            )
+            if cancel_error is not None:
+                cancellation.add_note("MCP task cancellation could not be sent")
+            if cancel_interrupted:
+                cancellation.add_note("MCP task cancellation was interrupted")
+            raise
+
     async def _cancel_mcp_task(self, task_id: str) -> None:
         try:
             await self.request(
@@ -2504,6 +2674,17 @@ class MCPClient:
     async def cancel_mcp_task(self, task_id: str) -> dict[str, Any]:
         if not isinstance(task_id, str) or not task_id:
             raise ValueError("MCP taskId is required")
+        if self.protocol_version == MODERN_PROTOCOL_VERSION:
+            if not self._supports_modern_tasks():
+                raise MCPProtocolError(
+                    f"MCP server does not advertise the {MODERN_TASKS_EXTENSION} extension"
+                )
+            await self.request(
+                "tasks/cancel",
+                {"taskId": task_id},
+                _allow_session_recovery=False,
+            )
+            return {"taskId": task_id, "acknowledged": True}
         if not self._supports_tasks_cancel():
             raise MCPProtocolError(
                 "MCP server does not advertise support for tasks/cancel"
@@ -2574,6 +2755,53 @@ class MCPClient:
         capability = self.server_capabilities.get("tasks")
         return isinstance(capability, dict) and isinstance(
             capability.get("cancel"), dict
+        )
+
+    @staticmethod
+    def _validate_modern_task_state(task: Any, *, method: str) -> dict[str, Any]:
+        if not isinstance(task, dict):
+            raise MCPProtocolError(f"{method} returned an invalid task")
+        task_id = task.get("taskId")
+        status = task.get("status")
+        if not isinstance(task_id, str) or not task_id:
+            raise MCPProtocolError(f"{method} returned an invalid taskId")
+        if status not in TASK_STATUSES:
+            raise MCPProtocolError(f"{method} returned invalid task status {status!r}")
+        for field in ("createdAt", "lastUpdatedAt"):
+            if not isinstance(task.get(field), str) or not task[field]:
+                raise MCPProtocolError(f"{method} returned an invalid {field}")
+        ttl = task.get("ttlMs")
+        if ttl is not None and (
+            isinstance(ttl, bool) or not isinstance(ttl, int) or ttl < 0
+        ):
+            raise MCPProtocolError(f"{method} returned an invalid ttlMs")
+        poll_interval = task.get("pollIntervalMs")
+        if poll_interval is not None and (
+            isinstance(poll_interval, bool)
+            or not isinstance(poll_interval, int)
+            or poll_interval < 0
+        ):
+            raise MCPProtocolError(f"{method} returned an invalid pollIntervalMs")
+        if status == "input_required" and not isinstance(
+            task.get("inputRequests"), dict
+        ):
+            raise MCPProtocolError(
+                f"{method} returned input_required without valid inputRequests"
+            )
+        if status == "completed" and not isinstance(task.get("result"), dict):
+            raise MCPProtocolError(f"{method} returned completed without valid result")
+        if status == "failed" and not isinstance(task.get("error"), dict):
+            raise MCPProtocolError(f"{method} returned failed without valid error")
+        return dict(task)
+
+    @staticmethod
+    def _modern_task_poll_delay(task: dict[str, Any]) -> float:
+        interval = task.get("pollIntervalMs")
+        if interval is None:
+            return 1.0
+        return min(
+            max(interval / 1000.0, MIN_TASK_POLL_INTERVAL_SECONDS),
+            MAX_TASK_POLL_INTERVAL_SECONDS,
         )
 
     def _resolve_task_status_notification(self, params: Any) -> None:

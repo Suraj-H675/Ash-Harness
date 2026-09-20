@@ -8,6 +8,7 @@ import pytest
 
 from ash.cli import (
     PluginReloadResult,
+    _mcp_task_cancel_message,
     _repl,
     _mcp_reload_message,
     _print_mcp_reload_errors,
@@ -55,6 +56,20 @@ def test_mcp_reload_error_server_names_are_redacted(capsys) -> None:
     rendered = capsys.readouterr().err
     assert marker not in rendered
     assert 'password="[REDACTED]"' in rendered
+
+
+def test_mcp_task_cancel_message_distinguishes_modern_ack_from_legacy_status() -> None:
+    assert _mcp_task_cancel_message(
+        {"server": "modern", "taskId": "task-1", "acknowledged": True}
+    ) == "modern: task-1 cancellation acknowledged"
+    assert _mcp_task_cancel_message(
+        {
+            "server": "legacy",
+            "taskId": "task-2",
+            "status": "cancelled",
+            "statusMessage": "stopped",
+        }
+    ) == "legacy: task-2 cancelled: stopped"
 
 
 @pytest.mark.asyncio

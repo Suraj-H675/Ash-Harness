@@ -84,6 +84,16 @@ def _mcp_reload_message(result: PluginReloadResult) -> str:
     return "MCP configuration reloaded with errors."
 
 
+def _mcp_task_cancel_message(task: dict[str, Any]) -> str:
+    server = safe_mcp_diagnostic(task["server"])
+    task_id = safe_mcp_diagnostic(task["taskId"])
+    if task.get("acknowledged") is True and "status" not in task:
+        return f"{server}: {task_id} cancellation acknowledged"
+    message = task.get("statusMessage")
+    suffix = f": {safe_mcp_diagnostic(message)}" if message else ""
+    return f"{server}: {task_id} {task['status']}{suffix}"
+
+
 def _emit_config_diagnostics(config: AshConfig) -> None:
     for diagnostic in config.config_diagnostics:
         print(f"Warning: {diagnostic}", file=sys.stderr)
@@ -1928,15 +1938,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
                         )
                         continue
-                    message = task.get("statusMessage")
-                    suffix = (
-                        f": {safe_mcp_diagnostic(message)}" if message else ""
-                    )
-                    print(
-                        f"{safe_mcp_diagnostic(task['server'])}: "
-                        f"{safe_mcp_diagnostic(task['taskId'])} "
-                        f"{task['status']}{suffix}"
-                    )
+                    print(_mcp_task_cancel_message(task))
                 else:
                     items = (
                         await runtime.list_resources()
