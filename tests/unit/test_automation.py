@@ -29,6 +29,7 @@ from ash.automation.runner import (
 from ash.automation.store import (
     AUTOMATION_SCHEMA_VERSION,
     AutomationError,
+    AutomationRestartRequired,
     AutomationStore,
 )
 from ash.automation.worker import AutomationWorkerService
@@ -220,6 +221,35 @@ async def test_automation_subprocess_runner_uses_isolated_python(
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
 @pytest.mark.asyncio
+async def test_automation_subprocess_refuses_workspace_replaced_before_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.automation.worker import _SubprocessAutomationClient
+
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    client = _SubprocessAutomationClient(
+        AshConfig(workspace_root=workspace),
+        workspace,
+    )
+    workspace.rename(saved)
+    workspace.mkdir()
+    create = AsyncMock(side_effect=AssertionError("automation must not launch"))
+    monkeypatch.setattr(
+        "ash.automation.worker.asyncio.create_subprocess_exec",
+        create,
+    )
+
+    with pytest.raises(AutomationError, match="working directory identity changed"):
+        await client.prompt("run")
+
+    create.assert_not_awaited()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
 async def test_automation_subprocess_cwd_swap_cannot_escape_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -279,6 +309,24 @@ async def test_automation_subprocess_cwd_swap_cannot_escape_workspace(
     assert Path(launch["cwd"]).resolve() == saved.resolve()
     assert launch["workspace"] == "."
     assert launch["config_workspace"] == "."
+
+
+def test_automation_worker_requires_restart_after_workspace_identity_change(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    workspace.mkdir()
+    store = AutomationStore(tmp_path / "automation.db")
+    worker = AutomationWorkerService(store, workspace)
+    workspace.rename(saved)
+    workspace.mkdir()
+
+    with pytest.raises(
+        AutomationRestartRequired,
+        match="workspace identity changed",
+    ):
+        worker._validate_workspace()
 
 
 @pytest.mark.asyncio

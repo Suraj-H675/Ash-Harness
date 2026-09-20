@@ -88,16 +88,35 @@ async def _default_client_factory(
     return _SubprocessAutomationClient(config, workspace)
 
 
+def _directory_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        metadata = os.stat(path)
+    except OSError:
+        return None
+    return (metadata.st_dev, metadata.st_ino)
+
+
 class _SubprocessAutomationClient:
     """Run one unattended turn in a killable process group."""
 
     _RESULT_PREFIX = "ASH_AUTOMATION_RESULT="
     _MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 
-    def __init__(self, config: AshConfig, workspace: Path) -> None:
+    def __init__(
+        self,
+        config: AshConfig,
+        workspace: Path,
+        *,
+        expected_workspace_identity: tuple[int, int] | None = None,
+    ) -> None:
         self._config = config
         self._guard = SafetyGuard(workspace)
         self._workspace = self._guard.project_root
+        self._workspace_identity = (
+            expected_workspace_identity
+            if expected_workspace_identity is not None
+            else _directory_identity(self._workspace)
+        )
         self._process: asyncio.subprocess.Process | None = None
         self._process_tree_plan: ProcessTreePlan | None = None
 
@@ -127,6 +146,7 @@ class _SubprocessAutomationClient:
                 cwd=self._workspace,
                 guard=self._guard,
                 search_path=environment.get("PATH"),
+                expected_cwd_identity=self._workspace_identity,
             ) as launch:
                 try:
                     process_tree_plan = prepare_process_tree(
@@ -255,6 +275,7 @@ class AutomationWorkerService:
     ) -> None:
         self.store = store
         self.workspace = Path(workspace).expanduser().resolve()
+        self._workspace_identity = _directory_identity(self.workspace)
         self.worker_id = worker_id or f"worker-{uuid.uuid4()}"
         if not 1 <= max_concurrent_runs <= 32:
             raise ValueError("max_concurrent_runs must be between 1 and 32")
@@ -401,7 +422,15 @@ class AutomationWorkerService:
             self._validate_job_runtime(claim)
             config = self._load_runtime_config()
             config = _apply_token_budget(config, claim.job.token_budget)
-            candidate = await self._client_factory(config, self.workspace)
+            candidate: AutomationClient
+            if self._client_factory is _default_client_factory:
+                candidate = _SubprocessAutomationClient(
+                    config,
+                    self.workspace,
+                    expected_workspace_identity=self._workspace_identity,
+                )
+            else:
+                candidate = await self._client_factory(config, self.workspace)
             client = candidate
             client_holder.append(candidate)
             if cancellation_requested:
@@ -676,6 +705,12 @@ class AutomationWorkerService:
     def _validate_workspace(self) -> None:
         if not self.workspace.is_dir():
             raise AutomationError(f"automation workspace is missing: {self.workspace}")
+        if self._workspace_identity is not None:
+            current_identity = _directory_identity(self.workspace)
+            if current_identity != self._workspace_identity:
+                raise AutomationRestartRequired(
+                    "automation workspace identity changed; restart the worker"
+                )
         if not is_workspace_trusted(self.workspace):
             raise AutomationError(
                 "automation workspace is not trusted; run `ash trust add` before retrying"
