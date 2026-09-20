@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import platform
 import re
 from pathlib import Path
@@ -26,6 +27,14 @@ from ash.sandbox.process_utils import (
     terminate_process_tree,
 )
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
+
+
+def _directory_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        metadata = os.stat(path)
+    except OSError:
+        return None
+    return (metadata.st_dev, metadata.st_ino)
 
 
 DEFAULT_TIMEOUT_SECONDS = 300
@@ -184,6 +193,11 @@ class RunCommandTool(BaseTool):
         self.project_root = (
             project_root if project_root is not None else safety_guard.project_root
         )
+        self._project_root_identity = (
+            _directory_identity(Path(self.project_root))
+            if self.project_root is not None
+            else None
+        )
         self.sandbox_manager = sandbox_manager
         self.environment_allowlist = tuple(environment_allowlist)
 
@@ -192,7 +206,16 @@ class RunCommandTool(BaseTool):
         self.safety_guard.validate_command(args.command_line)
         self._validate_powershell_literal_paths(args.command_line)
 
+        if self.project_root is not None and self._project_root_identity is not None:
+            if _directory_identity(Path(self.project_root)) != self._project_root_identity:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error="Error: command was not started: working directory identity changed",
+                )
+
         cwd = None
+        expected_cwd_identity: tuple[int, int] | None = None
         if args.cwd is not None:
             cwd_path = self.safety_guard.validate_path(args.cwd)
             if not cwd_path.is_dir():
@@ -202,8 +225,10 @@ class RunCommandTool(BaseTool):
                     error=f"Error: cwd is not a directory: {args.cwd}",
                 )
             cwd = str(cwd_path)
+            expected_cwd_identity = _directory_identity(cwd_path)
         elif self.project_root is not None:
             cwd = str(self.project_root)
+            expected_cwd_identity = self._project_root_identity
 
         # Tier 2+ (bwrap / docker) wants a real argv so the sandbox
         # binary can exec it directly. Tier 1 (scoped) keeps the
@@ -227,6 +252,7 @@ class RunCommandTool(BaseTool):
                     ),
                     passthrough_env_names=self.environment_allowlist,
                     stream_callback=streamer,
+                    expected_cwd_identity=expected_cwd_identity,
                 )
 
             return await self._run_scoped(
@@ -237,6 +263,7 @@ class RunCommandTool(BaseTool):
                     self.project_root, self.environment_allowlist
                 ),
                 stream_callback=streamer,
+                expected_cwd_identity=expected_cwd_identity,
             )
         finally:
             streamer.finish()
@@ -250,6 +277,7 @@ class RunCommandTool(BaseTool):
         env: dict[str, str],
         passthrough_env_names: tuple[str, ...],
         stream_callback: "_CommandEventStreamer",
+        expected_cwd_identity: tuple[int, int] | None,
     ) -> ToolResult:
         assert self.sandbox_manager is not None
         from pathlib import Path
@@ -263,6 +291,7 @@ class RunCommandTool(BaseTool):
                 env=env,
                 passthrough_env_names=passthrough_env_names,
                 stream_callback=stream_callback,
+                expected_cwd_identity=expected_cwd_identity,
             )
         except SandboxBackendUnavailable as exc:
             return ToolResult(
@@ -313,6 +342,7 @@ class RunCommandTool(BaseTool):
         *,
         env: dict[str, str],
         stream_callback: "_CommandEventStreamer",
+        expected_cwd_identity: tuple[int, int] | None,
     ) -> ToolResult:
         try:
             workspace = self.project_root or (
@@ -361,6 +391,7 @@ class RunCommandTool(BaseTool):
                         cwd=cwd_target,
                         guard=self.safety_guard,
                         search_path=env.get("PATH"),
+                        expected_cwd_identity=expected_cwd_identity,
                     ) as launch:
                         process = await asyncio.create_subprocess_exec(
                             *launch.argv,

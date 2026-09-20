@@ -81,6 +81,39 @@ def test_resolve_host_executable_skips_workspace_shadow(
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")
 @pytest.mark.asyncio
+async def test_manager_run_honors_explicit_expected_cwd_identity(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cwd = workspace / "work"
+    saved = workspace / "work-saved"
+    replacement = workspace / "replacement"
+    cwd.mkdir()
+    replacement.mkdir()
+    metadata = cwd.stat()
+    expected = (metadata.st_dev, metadata.st_ino)
+    manager = SandboxManager(workspace_root=workspace, backend_preference="direct")
+    cwd.rename(saved)
+    replacement.rename(cwd)
+
+    with pytest.raises(
+        SandboxBackendUnavailable,
+        match="working directory identity changed",
+    ):
+        await manager.run(
+            ["/bin/sh", "-c", "printf unsafe > marker.txt"],
+            cwd=cwd,
+            timeout=5,
+            expected_cwd_identity=expected,
+        )
+
+    assert not (saved / "marker.txt").exists()
+    assert not (cwd / "marker.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")
+@pytest.mark.asyncio
 async def test_manager_run_refuses_replaced_workspace_root(
     tmp_path: Path,
 ) -> None:

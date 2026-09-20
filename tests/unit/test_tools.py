@@ -942,6 +942,28 @@ async def test_run_command_blocks_wrapped_dynamic_executable_before_launch(
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX cwd race regression")
 @pytest.mark.asyncio
+async def test_run_command_refuses_workspace_replaced_after_tool_creation(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    replacement = tmp_path / "replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+    tool = RunCommandTool(SafetyGuard(workspace), project_root=workspace)
+    workspace.rename(saved)
+    replacement.rename(workspace)
+
+    result = await tool.run(command_line="printf unsafe > marker.txt")
+
+    assert result.success is False
+    assert "working directory identity changed" in (result.error or "")
+    assert not (saved / "marker.txt").exists()
+    assert not (workspace / "marker.txt").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
 async def test_run_command_cwd_swap_cannot_escape_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -340,6 +340,33 @@ async def test_background_process_pins_bwrap_workspace_across_path_swap(
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX cwd race regression")
 @pytest.mark.asyncio
+async def test_background_process_refuses_workspace_replaced_after_tool_creation(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    replacement = tmp_path / "replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+    tool = BackgroundProcessTool(SafetyGuard(workspace))
+    workspace.rename(saved)
+    replacement.rename(workspace)
+
+    result = await tool.run(
+        action="start",
+        command="printf unsafe > marker.txt",
+    )
+
+    assert result.success is False
+    assert "working directory identity changed" in (result.error or "")
+    assert not (saved / "marker.txt").exists()
+    assert not (workspace / "marker.txt").exists()
+    assert not tool.jobs
+    await tool.aclose()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
 async def test_background_process_cwd_swap_cannot_escape_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

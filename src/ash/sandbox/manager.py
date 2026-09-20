@@ -351,6 +351,7 @@ class SandboxManager:
         env: dict[str, str] | None = None,
         passthrough_env_names: Sequence[str] = (),
         stream_callback: ProcessStreamCallback | None = None,
+        expected_cwd_identity: tuple[int, int] | None = None,
     ) -> SandboxResult:
         """
         Run ``command`` (argv list) under the active sandbox.
@@ -364,14 +365,14 @@ class SandboxManager:
             raise ValueError("command must be a non-empty sequence")
 
         deadline = timeout if timeout is not None else self.timeout_seconds
-        expected_cwd_identity: tuple[int, int] | None = None
         if cwd is not None:
-            try:
-                metadata = os.stat(cwd)
-            except OSError:
-                pass
-            else:
-                expected_cwd_identity = (metadata.st_dev, metadata.st_ino)
+            if expected_cwd_identity is None:
+                try:
+                    metadata = os.stat(cwd)
+                except OSError:
+                    pass
+                else:
+                    expected_cwd_identity = (metadata.st_dev, metadata.st_ino)
             if self.workspace_root is not None:
                 lexical_cwd = Path(os.path.abspath(Path(cwd).expanduser()))
                 if (

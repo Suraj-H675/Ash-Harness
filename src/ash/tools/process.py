@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import platform
 import uuid
 from collections.abc import Awaitable
@@ -37,6 +38,14 @@ from ash.sandbox import (
 )
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.tools.command import build_scrubbed_command_env
+
+
+def _directory_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        metadata = os.stat(path)
+    except OSError:
+        return None
+    return (metadata.st_dev, metadata.st_ino)
 
 
 MAX_BACKGROUND_OUTPUT_CHARS = 100_000
@@ -111,6 +120,9 @@ class BackgroundProcessTool(BaseTool):
     ) -> None:
         super().__init__(safety_guard)
         self.jobs: dict[str, Job] = {}
+        self._project_root_identity = _directory_identity(
+            self.safety_guard.project_root
+        )
         self.sandbox_manager = sandbox_manager
         self.environment_allowlist = tuple(environment_allowlist)
 
@@ -191,9 +203,20 @@ class BackgroundProcessTool(BaseTool):
             )
         self._prune_terminal_history()
         self.safety_guard.validate_command(args.command)
+        if (
+            self._project_root_identity is not None
+            and _directory_identity(self.safety_guard.project_root)
+            != self._project_root_identity
+        ):
+            return ToolResult(
+                success=False,
+                output="",
+                error="Command was not started: working directory identity changed",
+            )
         cwd = self.safety_guard.validate_path(
             args.cwd or self.safety_guard.project_root
         )
+        expected_cwd_identity = _directory_identity(cwd)
         environment = build_scrubbed_command_env(
             self.safety_guard.project_root, self.environment_allowlist
         )
@@ -256,6 +279,7 @@ class BackgroundProcessTool(BaseTool):
                         cwd=invocation.cwd,
                         guard=self.safety_guard,
                         search_path=environment.get("PATH"),
+                        expected_cwd_identity=expected_cwd_identity,
                     ) as launch:
                         inherited_fds = tuple(
                             dict.fromkeys((*invocation.pass_fds, *launch.pass_fds))
