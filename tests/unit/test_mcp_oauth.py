@@ -1211,12 +1211,14 @@ async def test_oauth_login_rejects_mismatched_authorization_response_issuer_befo
 
 
 @pytest.mark.asyncio
-async def test_explicit_step_up_scope_overrides_initial_challenge(
+async def test_explicit_step_up_scope_accumulates_existing_grant(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     resource = "https://mcp.example.test/rpc"
     observed: dict[str, Any] = {}
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource))
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url == httpx.URL(resource):
@@ -1311,18 +1313,21 @@ async def test_explicit_step_up_scope_overrides_initial_challenge(
         "remote",
         resource,
         oauth_config={
-            "client_id": "registered",
+            "client_id": "client-id",
             "issuer": "https://auth.example.test",
         },
-        store=MCPOAuthTokenStore("remote", tmp_path / "tokens"),
+        store=store,
         http_client=http,
         open_browser=opener,
         announce=lambda message: None,
         timeout_seconds=5,
-        requested_scope="files:read offline_access files:write",
+        requested_scope="files:write offline_access",
     )
 
     assert observed["scope"] == ["files:read files:write"]
+    persisted = store.load(resource)
+    assert persisted is not None
+    assert persisted.tokens.scope == "files:read files:write"
     await http.aclose()
 
 
@@ -1711,7 +1716,8 @@ async def test_mcp_client_reports_insufficient_scope_without_interaction() -> No
         oauth_session=FakeOAuth(),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(MCPAuthorizationRequired, match="files:read files:write"):
+    with pytest.raises(MCPAuthorizationRequired, match="files:read files:write") as exc_info:
         await client.connect()
+    assert "previously granted scopes will be retained" in str(exc_info.value)
     await client.disconnect()
     await http.aclose()

@@ -2413,7 +2413,8 @@ class MCPClient:
                 raise MCPAuthorizationRequired(
                     f"MCP server {self.config.name!r} requires additional OAuth "
                     f"scope{guidance}; rerun `ash mcp login {self.config.name}` "
-                    "with --scope set to the server-required scopes"
+                    "with --scope set to the server-required scopes; previously "
+                    "granted scopes will be retained"
                 )
         if response.status_code == 404 and sent_session_id:
             raise MCPSessionExpired(sent_session_id, sent_generation)

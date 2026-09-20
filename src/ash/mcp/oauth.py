@@ -471,7 +471,21 @@ async def authorize_mcp_server(
                 )
         verifier = _b64url(secrets.token_bytes(64))
         challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
-        scope_parts = (explicit_scope or " ".join(discovery.scopes)).split()
+        if explicit_scope:
+            prior_bundle = existing_bundle
+            if prior_bundle is None:
+                prior_bundle = token_store.load(resource)
+            prior_scope = (
+                prior_bundle.tokens.scope
+                if prior_bundle is not None
+                and prior_bundle.discovery.issuer == discovery.issuer
+                else ""
+            )
+            scope_parts = list(
+                dict.fromkeys([*prior_scope.split(), *explicit_scope.split()])
+            )
+        else:
+            scope_parts = list(discovery.scopes)
         offline_access_supported = (
             "offline_access" in discovery.authorization_server_scopes
         )
