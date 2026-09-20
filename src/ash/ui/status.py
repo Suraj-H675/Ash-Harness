@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ash.safety.environment import resolve_host_executable
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.sandbox.process_utils import (
+    ProcessTreeUnavailable,
+    prepare_scoped_process_launch,
+)
 from ash.ui.safe_text import terminal_safe_text
 
 if TYPE_CHECKING:
@@ -62,13 +68,14 @@ class StatusLine:
         if not self.sandbox.is_fully_isolated():
             sandbox_label += "!"
         display_model = terminal_safe_text(self.config.model, single_line=True)
+        display_root = terminal_safe_text(str(self.loop.project_root), single_line=True)
         self._cached = (
             f" {display_model} | {self.loop.permission_policy.mode.value} | "
             f"git:{git_branch(self.loop.project_root)} | "
             f"ctx ~{self.loop._last_context_tokens}/{maximum} | "
             f"cache:{cache_read}r/{cache_write}w | "
             f"{'~' if estimated_cost > 0 else ''}${cost:.4f} | sb:{sandbox_label} | "
-            f"s:{session_id} | {self.loop.project_root} "
+            f"s:{session_id} | {display_root} "
         )
         return self._cached
 
@@ -77,28 +84,70 @@ def git_branch(root: Path) -> str:
     """Return branch or detached commit without invoking a shell or pager."""
 
     try:
+        opened = os.stat(root)
+        expected_identity = (opened.st_dev, opened.st_ino)
+        guard = SafetyGuard(root)
         git = resolve_host_executable("git", workspace_root=root, cwd=root)
         if git is None:
             return "none"
-        result = subprocess.run(
+        result = _run_git_probe(
             [git, "symbolic-ref", "--quiet", "--short", "HEAD"],
-            cwd=root,
+            root=root,
+            guard=guard,
+            expected_identity=expected_identity,
+        )
+        branch = result.stdout.strip()
+        if branch:
+            return terminal_safe_text(branch, single_line=True)
+        detached = _run_git_probe(
+            [git, "rev-parse", "--short", "HEAD"],
+            root=root,
+            guard=guard,
+            expected_identity=expected_identity,
+        ).stdout.strip()
+        return (
+            f"@{terminal_safe_text(detached, single_line=True)}"
+            if detached
+            else "none"
+        )
+    except (
+        OSError,
+        ValueError,
+        SafetyViolation,
+        ProcessTreeUnavailable,
+        subprocess.SubprocessError,
+    ):
+        return "none"
+
+
+def _run_git_probe(
+    command: list[str],
+    *,
+    root: Path,
+    guard: SafetyGuard,
+    expected_identity: tuple[int, int],
+) -> subprocess.CompletedProcess[str]:
+    with prepare_scoped_process_launch(
+        command,
+        cwd=root,
+        guard=guard,
+        expected_cwd_identity=expected_identity,
+    ) as launch:
+        if launch.pass_fds:
+            return subprocess.run(
+                list(launch.argv),
+                cwd=launch.cwd,
+                pass_fds=launch.pass_fds,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=0.25,
+            )
+        return subprocess.run(
+            list(launch.argv),
+            cwd=launch.cwd,
             check=False,
             capture_output=True,
             text=True,
             timeout=0.25,
         )
-        branch = result.stdout.strip()
-        if branch:
-            return branch
-        detached = subprocess.run(
-            [git, "rev-parse", "--short", "HEAD"],
-            cwd=root,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=0.25,
-        ).stdout.strip()
-        return f"@{detached}" if detached else "none"
-    except (OSError, subprocess.SubprocessError):
-        return "none"
