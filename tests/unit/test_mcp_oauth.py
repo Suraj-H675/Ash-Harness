@@ -467,6 +467,7 @@ def test_oauth_store_loads_pre_cimd_version_one_record(tmp_path: Path) -> None:
     record = json.loads(store.path.read_text(encoding="utf-8"))
     record["discovery"].pop("client_id_metadata_document_supported")
     record["discovery"].pop("authorization_server_scopes")
+    record["discovery"].pop("authorization_response_iss_parameter_supported")
     record["client"].pop("grant_types")
     store.path.write_text(json.dumps(record), encoding="utf-8")
 
@@ -475,6 +476,7 @@ def test_oauth_store_loads_pre_cimd_version_one_record(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.discovery.client_id_metadata_document_supported is False
     assert loaded.discovery.authorization_server_scopes == ()
+    assert loaded.discovery.authorization_response_iss_parameter_supported is False
     assert loaded.client.grant_types == ()
 
 
@@ -972,6 +974,7 @@ async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
                     "registration_endpoint": "https://auth.example.test/register",
                     "code_challenge_methods_supported": ["S256"],
                     "scopes_supported": ["challenge:read", "offline_access"],
+                    "authorization_response_iss_parameter_supported": True,
                 },
             )
         if request.url == httpx.URL("https://auth.example.test/register"):
@@ -1036,7 +1039,13 @@ async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
             target = (
                 redirect.path
                 + "?"
-                + urlencode({"code": "authorization-code", "state": query["state"][0]})
+                + urlencode(
+                    {
+                        "code": "authorization-code",
+                        "state": query["state"][0],
+                        "iss": "https://auth.example.test",
+                    }
+                )
             )
             reader.feed_data(
                 f"GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".encode()
@@ -1089,12 +1098,26 @@ async def test_full_oauth_flow_discovers_registers_uses_pkce_and_persists(
     assert persisted.tokens.access_token == "access-token"
     assert persisted.client.grant_types == ("authorization_code", "refresh_token")
     assert "offline_access" in persisted.discovery.authorization_server_scopes
+    assert persisted.discovery.authorization_response_iss_parameter_supported is True
 
 
 @pytest.mark.asyncio
-async def test_oauth_login_rejects_mismatched_authorization_response_issuer_before_token_exchange(
+@pytest.mark.parametrize(
+    ("response_issuer", "advertise_issuer", "response_error", "expected_match"),
+    [
+        ("https://attacker.example.test", False, "", "issuer"),
+        ("", True, "", "issuer"),
+        ("https://attacker.example.test", True, "access_denied", "issuer"),
+        ("https://auth.example.test", True, "access_denied", "access_denied"),
+    ],
+)
+async def test_oauth_login_validates_authorization_response_issuer_before_token_exchange(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    response_issuer: str,
+    advertise_issuer: bool,
+    response_error: str,
+    expected_match: str,
 ) -> None:
     resource = "https://mcp.example.test/rpc"
     token_requests = 0
@@ -1122,14 +1145,17 @@ async def test_oauth_login_rejects_mismatched_authorization_response_issuer_befo
         if request.url == httpx.URL(
             "https://auth.example.test/.well-known/oauth-authorization-server"
         ):
+            metadata = {
+                "issuer": "https://auth.example.test",
+                "authorization_endpoint": "https://auth.example.test/authorize",
+                "token_endpoint": "https://auth.example.test/token",
+                "code_challenge_methods_supported": ["S256"],
+            }
+            if advertise_issuer:
+                metadata["authorization_response_iss_parameter_supported"] = True
             return httpx.Response(
                 200,
-                json={
-                    "issuer": "https://auth.example.test",
-                    "authorization_endpoint": "https://auth.example.test/authorize",
-                    "token_endpoint": "https://auth.example.test/token",
-                    "code_challenge_methods_supported": ["S256"],
-                },
+                json=metadata,
             )
         if request.url == httpx.URL("https://auth.example.test/token"):
             token_requests += 1
@@ -1165,13 +1191,14 @@ async def test_oauth_login_rejects_mismatched_authorization_response_issuer_befo
 
         async def callback() -> None:
             reader = asyncio.StreamReader()
-            target = "/callback?" + urlencode(
-                {
-                    "code": "authorization-code",
-                    "state": query["state"][0],
-                    "iss": "https://attacker.example.test",
-                }
-            )
+            callback_query = {"state": query["state"][0]}
+            if response_error:
+                callback_query["error"] = response_error
+            else:
+                callback_query["code"] = "authorization-code"
+            if response_issuer:
+                callback_query["iss"] = response_issuer
+            target = "/callback?" + urlencode(callback_query)
             reader.feed_data(f"GET {target} HTTP/1.1\r\n\r\n".encode())
             reader.feed_eof()
             writer = type(
@@ -1191,7 +1218,7 @@ async def test_oauth_login_rejects_mismatched_authorization_response_issuer_befo
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     try:
-        with pytest.raises(MCPOAuthError, match="issuer"):
+        with pytest.raises(MCPOAuthError, match=expected_match):
             await authorize_mcp_server(
                 "remote",
                 resource,

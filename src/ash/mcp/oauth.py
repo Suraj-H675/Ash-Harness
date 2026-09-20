@@ -63,6 +63,7 @@ class OAuthDiscovery:
     registration_endpoint: str = ""
     client_id_metadata_document_supported: bool = False
     authorization_server_scopes: tuple[str, ...] = ()
+    authorization_response_iss_parameter_supported: bool = False
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,12 @@ class MCPOAuthTokenStore:
                 isinstance(item, str) for item in authorization_scopes_raw
             ):
                 raise ValueError("authorization server scopes must be strings")
+            response_issuer_supported_raw = discovery_raw.get(
+                "authorization_response_iss_parameter_supported",
+                False,
+            )
+            if not isinstance(response_issuer_supported_raw, bool):
+                raise ValueError("authorization response issuer support flag must be boolean")
             discovery = OAuthDiscovery(
                 resource=_required_text(discovery_raw, "resource"),
                 scopes=tuple(scopes_raw),
@@ -180,6 +187,9 @@ class MCPOAuthTokenStore:
                 ),
                 client_id_metadata_document_supported=cimd_supported_raw,
                 authorization_server_scopes=tuple(authorization_scopes_raw),
+                authorization_response_iss_parameter_supported=(
+                    response_issuer_supported_raw
+                ),
             )
             grant_types_raw = client_raw.get("grant_types", [])
             if not isinstance(grant_types_raw, list) or not all(
@@ -226,6 +236,9 @@ class MCPOAuthTokenStore:
                 ),
                 "authorization_server_scopes": list(
                     bundle.discovery.authorization_server_scopes
+                ),
+                "authorization_response_iss_parameter_supported": (
+                    bundle.discovery.authorization_response_iss_parameter_supported
                 ),
             },
             "client": {
@@ -407,7 +420,7 @@ async def authorize_mcp_server(
     owns_client = client is None
     if client is None:
         client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-    callback_future: asyncio.Future[tuple[str, str, str]] = (
+    callback_future: asyncio.Future[tuple[str, str, str, str]] = (
         asyncio.get_running_loop().create_future()
     )
     state = secrets.token_urlsafe(32)
@@ -534,15 +547,25 @@ async def authorize_mcp_server(
                 expected_state=state,
                 announce=announce,
             )
-        code, returned_state, returned_issuer = await asyncio.wait_for(
+        code, returned_state, returned_issuer, returned_error = await asyncio.wait_for(
             callback_future, timeout=timeout_seconds
         )
         if not secrets.compare_digest(returned_state, state):
             raise MCPOAuthError("OAuth callback state did not match")
+        if (
+            discovery.authorization_response_iss_parameter_supported
+            and not returned_issuer
+        ):
+            raise MCPOAuthError(
+                "OAuth authorization response omitted required issuer"
+            )
         if returned_issuer and returned_issuer != discovery.issuer:
             raise MCPOAuthError(
                 "OAuth authorization response issuer did not match discovery issuer"
             )
+        if returned_error:
+            safe_error = re.sub(r"[^A-Za-z0-9_.-]", "_", returned_error)[:100]
+            raise MCPOAuthError(f"authorization server returned {safe_error}")
         data = {
             "grant_type": "authorization_code",
             "code": code,
@@ -632,7 +655,15 @@ async def discover_oauth(
         break
     if protected is None:
         raise MCPOAuthError("MCP server did not provide protected resource metadata")
-    discovered_server: tuple[str, str, str, str, bool, tuple[str, ...]] | None = None
+    discovered_server: tuple[
+        str,
+        str,
+        str,
+        str,
+        bool,
+        tuple[str, ...],
+        bool,
+    ] | None = None
     for url in authorization_metadata_urls(issuer_hint):
         try:
             metadata = await _request_json(
@@ -685,6 +716,14 @@ async def discover_oauth(
                     "authorization server scopes_supported is invalid"
                 )
             authorization_scopes = tuple(authorization_scopes_raw)
+            response_issuer_supported = metadata.get(
+                "authorization_response_iss_parameter_supported",
+                False,
+            )
+            if not isinstance(response_issuer_supported, bool):
+                raise MCPOAuthError(
+                    "authorization server response issuer support flag is invalid"
+                )
         except (httpx.HTTPError, MCPOAuthError):
             continue
         discovered_server = (
@@ -694,6 +733,7 @@ async def discover_oauth(
             registration_endpoint,
             cimd_supported,
             authorization_scopes,
+            response_issuer_supported,
         )
         break
     if discovered_server is None:
@@ -705,6 +745,7 @@ async def discover_oauth(
         registration_endpoint,
         cimd_supported,
         authorization_scopes,
+        response_issuer_supported,
     ) = discovered_server
     challenge_scope = bearer_challenge_parameters(challenge_header).get("scope", "")
     selected_scope = normalize_oauth_scope(
@@ -733,6 +774,7 @@ async def discover_oauth(
         registration_endpoint,
         cimd_supported,
         authorization_scopes,
+        response_issuer_supported,
     )
 
 
@@ -963,6 +1005,11 @@ def _validate_bundle(bundle: OAuthBundle) -> None:
         _validate_oauth_url(bundle.discovery.registration_endpoint)
     if not isinstance(bundle.discovery.client_id_metadata_document_supported, bool):
         raise MCPOAuthError("OAuth client metadata support flag is invalid")
+    if not isinstance(
+        bundle.discovery.authorization_response_iss_parameter_supported,
+        bool,
+    ):
+        raise MCPOAuthError("OAuth authorization response issuer support flag is invalid")
     if not all(
         isinstance(scope, str) for scope in bundle.discovery.authorization_server_scopes
     ):
@@ -1031,7 +1078,7 @@ def _configured_client_metadata_url(config: dict[str, Any]) -> str:
 async def _handle_callback(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
-    future: asyncio.Future[tuple[str, str, str]],
+    future: asyncio.Future[tuple[str, str, str, str]],
     *,
     expected_state: str,
 ) -> None:
@@ -1049,23 +1096,13 @@ async def _handle_callback(
         error = query.get("error", [""])[0]
         if (
             parsed.path == "/callback"
-            and error
+            and (code or error)
             and secrets.compare_digest(state, expected_state)
         ):
             if not future.done():
-                safe_error = re.sub(r"[^A-Za-z0-9_.-]", "_", error)[:100]
-                future.set_exception(
-                    MCPOAuthError(f"authorization server returned {safe_error}")
-                )
-        elif (
-            parsed.path == "/callback"
-            and code
-            and secrets.compare_digest(state, expected_state)
-        ):
-            if not future.done():
-                future.set_result((code, state, issuer))
+                future.set_result((code, state, issuer, error))
             status = "200 OK"
-            message = "Authorization complete. You may close this window."
+            message = "Authorization response received. You may close this window."
     except (asyncio.TimeoutError, OSError, ValueError):
         pass
     payload = message.encode("utf-8")
@@ -1112,7 +1149,7 @@ def normalize_oauth_scope(value: str, label: str = "OAuth scope") -> str:
 
 
 def _start_manual_callback_reader(
-    future: asyncio.Future[tuple[str, str, str]],
+    future: asyncio.Future[tuple[str, str, str, str]],
     *,
     expected_state: str,
     announce: Callable[[str], None],
@@ -1138,9 +1175,10 @@ def _start_manual_callback_reader(
             code = query.get("code", [""])[0]
             state = query.get("state", [""])[0]
             issuer = query.get("iss", [""])[0]
+            error = query.get("error", [""])[0]
             if (
                 parsed.path != "/callback"
-                or not code
+                or not (code or error)
                 or not secrets.compare_digest(state, expected_state)
             ):
                 announce("The pasted redirect URL was invalid or had the wrong state.")
@@ -1148,7 +1186,7 @@ def _start_manual_callback_reader(
 
             def accept() -> None:
                 if not future.done():
-                    future.set_result((code, state, issuer))
+                    future.set_result((code, state, issuer, error))
 
             loop.call_soon_threadsafe(accept)
             return
