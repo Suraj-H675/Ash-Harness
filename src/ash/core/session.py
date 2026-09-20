@@ -2422,7 +2422,7 @@ class SessionStore:
         now = _serialize_datetime(_utc_now())
         with closing(get_db_connection(self.db_path)) as conn, conn:
             existing = conn.execute(
-                "SELECT session_id, call_id FROM mcp_tasks "
+                "SELECT session_id, call_id, server_fingerprint FROM mcp_tasks "
                 "WHERE server_name = ? AND task_id = ?",
                 (server_name, task_id),
             ).fetchone()
@@ -2433,6 +2433,8 @@ class SessionStore:
                 raise ValueError(
                     "MCP server reused a durable taskId for another Ash tool call"
                 )
+            if existing is not None and str(existing["server_fingerprint"]) != server_fingerprint:
+                raise ValueError("MCP durable task server identity changed")
             conn.execute(
                 """
                 INSERT INTO mcp_tasks (
@@ -2449,7 +2451,6 @@ class SessionStore:
                     server_name = excluded.server_name,
                     remote_tool_name = excluded.remote_tool_name,
                     contract_fingerprint = excluded.contract_fingerprint,
-                    server_fingerprint = excluded.server_fingerprint,
                     protocol_version = excluded.protocol_version,
                     status = excluded.status,
                     task_json = excluded.task_json,

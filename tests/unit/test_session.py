@@ -227,6 +227,24 @@ def test_mcp_task_ids_are_namespaced_by_server_and_cannot_be_reassigned(
             answered_inputs={},
         )
 
+    with pytest.raises(ValueError, match="server identity"):
+        store.save_mcp_task(
+            task_id="shared-id",
+            session_id=first.session_id,
+            turn_id="turn-call-a",
+            call_id="call-a",
+            server_name="alpha",
+            remote_tool_name="slow",
+            contract_fingerprint="contract",
+            server_fingerprint="replacement-fingerprint",
+            protocol_version="2026-07-28",
+            task=task,
+            answered_inputs={},
+        )
+
+    row = store.list_mcp_tasks(first.session_id)[0]
+    assert row["server_fingerprint"] == "fingerprint-alpha"
+
 
 def test_v12_migration_adds_mcp_task_table_with_backup(tmp_path: Path) -> None:
     db_path = tmp_path / "v11.db"
