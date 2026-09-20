@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,12 @@ class WorktreeManager:
 
     def __init__(self, repository: Path, storage_root: Path) -> None:
         self.repository = repository.expanduser().resolve()
+        try:
+            metadata = os.stat(self.repository)
+        except OSError:
+            self._repository_identity: tuple[int, int] | None = None
+        else:
+            self._repository_identity = (metadata.st_dev, metadata.st_ino)
         self.storage_root = self._validate_storage_root(storage_root)
 
     async def create(self, agent_id: str) -> WorktreeLease:
@@ -413,7 +420,12 @@ class WorktreeManager:
         *args: str,
         check: bool = True,
     ) -> "GitResult":
-        return await _run_git(self.repository, args, check=check)
+        return await _run_git(
+            self.repository,
+            args,
+            check=check,
+            expected_cwd_identity=self._repository_identity,
+        )
 
     async def _git_at(
         self,
@@ -436,7 +448,15 @@ async def _run_git(
     args: Sequence[str],
     *,
     check: bool,
+    expected_cwd_identity: tuple[int, int] | None = None,
 ) -> GitResult:
+    if expected_cwd_identity is None:
+        try:
+            metadata = os.stat(cwd)
+        except OSError:
+            pass
+        else:
+            expected_cwd_identity = (metadata.st_dev, metadata.st_ino)
     git = resolve_host_executable("git", workspace_root=cwd, cwd=cwd)
     if git is None:
         result = GitResult(127, "", "git is unavailable outside the workspace")
@@ -450,6 +470,7 @@ async def _run_git(
             command,
             cwd=cwd,
             guard=cwd_guard,
+            expected_cwd_identity=expected_cwd_identity,
         ) as launch:
             try:
                 process_tree_plan = prepare_process_tree(

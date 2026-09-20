@@ -63,6 +63,90 @@ def test_worktree_agent_commits_branch_without_mutating_lead(
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
 @pytest.mark.asyncio
+async def test_worktree_manager_refuses_replaced_repository_before_branch_delete(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    saved = tmp_path / "repository-saved"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    _git(replacement, "init", "-q")
+    (replacement / "file.txt").write_text("replacement\n", encoding="utf-8")
+    _git(replacement, "add", "file.txt")
+    _git(
+        replacement,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "replacement",
+    )
+    _git(replacement, "branch", "ash-agent/victim")
+    manager = WorktreeManager(repository, tmp_path / "agents")
+    repository.rename(saved)
+    replacement.rename(repository)
+
+    with pytest.raises(WorktreeError, match="working directory identity changed"):
+        await manager.discard_branch("ash-agent/victim")
+
+    assert (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", "refs/heads/ash-agent/victim"],
+            cwd=repository,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_worktree_git_refuses_swap_during_executable_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.worktree as worktree_module
+
+    repository = tmp_path / "repository"
+    saved = tmp_path / "repository-saved"
+    replacement = tmp_path / "replacement"
+    repository.mkdir()
+    replacement.mkdir()
+    _git(repository, "init", "-q")
+    _git(replacement, "init", "-q")
+    real_resolve = worktree_module.resolve_host_executable
+    swapped = False
+
+    def resolve_then_swap(name: str, *, workspace_root: Path, cwd: Path):
+        nonlocal swapped
+        resolved = real_resolve(name, workspace_root=workspace_root, cwd=cwd)
+        if not swapped:
+            swapped = True
+            repository.rename(saved)
+            replacement.rename(repository)
+        return resolved
+
+    monkeypatch.setattr(
+        worktree_module,
+        "resolve_host_executable",
+        resolve_then_swap,
+    )
+
+    result = await _run_git(
+        repository,
+        ("rev-parse", "--show-toplevel"),
+        check=False,
+    )
+
+    assert swapped is True
+    assert result.returncode == 126
+    assert "working directory identity changed" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
 async def test_worktree_git_cwd_swap_cannot_escape_repository(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
