@@ -2,6 +2,7 @@ import asyncio
 import json
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -52,6 +53,49 @@ async def test_spawn_agent_uses_provider_and_persists_report(tmp_path) -> None:
     ]
     assert all(event["task_id"] == durable[0].task_id for event in emitted)
     await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_worker_fences_recovery_before_first_provider_request(tmp_path) -> None:
+    state = SharedState(tmp_path / "agents.db")
+
+    class FenceObservingProvider(FakeProvider):
+        @staticmethod
+        def _assert_fenced() -> None:
+            tasks = state.tasks.list_tasks()
+            assert len(tasks) == 1
+            events = state.tasks.list_events(task_id=tasks[0].task_id)
+            assert any(
+                event.event["type"] == "agent.task.recovery_fenced"
+                for event in events
+            )
+
+        async def detect_capabilities(self) -> ProviderCapabilities:
+            self._assert_fenced()
+            return ProviderCapabilities(native_tools=True)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self._assert_fenced()
+            yield StreamChunk(content="fence observed", is_done=True)
+
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        FenceObservingProvider,
+        config=AshConfig(workspace_root=tmp_path, memory_backend="off"),
+    )
+    try:
+        result = await tool.run(
+            role="reviewer",
+            task="inspect fence ordering",
+            agent_id="fence-observer",
+            isolation="shared",
+        )
+
+        assert result.success is True
+        assert result.output == "fence observed"
+    finally:
+        await tool.aclose()
 
 
 @pytest.mark.asyncio
@@ -981,6 +1025,67 @@ async def test_subprocess_dispatcher_reserves_task_before_child_claim(
         assert state.tasks.get_task(durable.task_id).state == "cancelled"
     finally:
         release.set()
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_does_not_replay_expired_recovery_fenced_task(
+    tmp_path, monkeypatch
+) -> None:
+    clock = [time.time()]
+    monkeypatch.setattr("ash.agents.tasks.time.time", lambda: clock[0])
+    db_path = tmp_path / "agents.db"
+    state = SharedState(db_path)
+    durable = state.tasks.create_task(
+        "do not replay",
+        role="reviewer",
+        task_id="ambiguous-restart",
+        max_attempts=3,
+        metadata={
+            "agent_id": "ambiguous-worker",
+            "dispatchable": True,
+            "isolation": "shared",
+            "workspace": str(tmp_path.resolve()),
+        },
+    )
+    lease = state.tasks.claim_task(
+        "ambiguous-worker-a1",
+        task_id=durable.task_id,
+        lease_seconds=1,
+    )
+    assert lease is not None
+    state.tasks.start_task(durable.task_id, lease.token)
+    state.tasks.mark_recovery_unsafe(durable.task_id, lease.token)
+    state.close()
+    clock[0] += 2
+
+    provider_calls = 0
+
+    def provider_factory() -> ProviderABC:
+        nonlocal provider_calls
+        provider_calls += 1
+        return FakeProvider()
+
+    restarted_state = SharedState(db_path)
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        restarted_state,
+        provider_factory,
+        config=AshConfig(workspace_root=tmp_path, memory_backend="off"),
+    )
+    try:
+        terminal = await asyncio.wait_for(
+            tool.wait_for_tasks([durable.task_id]),
+            timeout=2,
+        )
+
+        assert terminal[0].state == "failed"
+        assert (
+            terminal[0].error
+            == "worker lease expired after execution began; automatic retry suppressed"
+        )
+        assert provider_calls == 0
+    finally:
         await tool.aclose()
 
 

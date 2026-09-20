@@ -1544,6 +1544,10 @@ class SpawnAgentTool(BaseTool):
         inbox: asyncio.Task[None] | None = None
         loop_closed = False
         try:
+            self._shared_state.tasks.mark_recovery_unsafe(
+                durable_task_id,
+                durable_lease_token,
+            )
             await loop.start_session()
             turn = asyncio.create_task(loop.run_turn(task))
             inbox = asyncio.create_task(

@@ -183,6 +183,103 @@ def test_stale_lease_is_requeued_then_exhausted(
     assert exhausted.error == "worker lease expired"
 
 
+def test_stale_recovery_fenced_lease_fails_without_automatic_retry(
+    state: SharedState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [time.time()]
+    monkeypatch.setattr("ash.agents.tasks.time.time", lambda: clock[0])
+    state.tasks.create_task("unsafe", task_id="unsafe", max_attempts=3)
+    lease = state.tasks.claim_task("worker-a", task_id="unsafe", lease_seconds=1)
+    assert lease is not None
+    state.tasks.start_task("unsafe", lease.token)
+    state.tasks.mark_recovery_unsafe("unsafe", lease.token)
+    clock[0] += 2
+
+    assert state.tasks.recover_expired() == ["unsafe"]
+    failed = state.tasks.get_task("unsafe")
+    assert failed is not None
+    assert failed.state == "failed"
+    assert failed.attempt == 1
+    assert (
+        failed.error
+        == "worker lease expired after execution began; automatic retry suppressed"
+    )
+    events = [item.event for item in state.tasks.list_events(task_id="unsafe")]
+    assert "agent.task.recovery_fenced" in {
+        str(event["type"]) for event in events
+    }
+    terminal = events[-1]
+    assert terminal["type"] == "agent.task.failed"
+    assert terminal["retryable"] is False
+    assert terminal["reason"] == failed.error
+
+
+def test_explicit_retryable_failure_remains_retryable_after_recovery_fence(
+    state: SharedState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [time.time()]
+    monkeypatch.setattr("ash.agents.tasks.time.time", lambda: clock[0])
+    state.tasks.create_task("known failure", task_id="known", max_attempts=3)
+    first = state.tasks.claim_task("worker-a", task_id="known", lease_seconds=1)
+    assert first is not None
+    state.tasks.start_task("known", first.token)
+    state.tasks.mark_recovery_unsafe("known", first.token)
+
+    retrying = state.tasks.fail_task(
+        "known",
+        first.token,
+        "known transient failure",
+        retryable=True,
+    )
+    assert retrying.state == "queued"
+
+    second = state.tasks.claim_task("worker-b", task_id="known", lease_seconds=1)
+    assert second is not None
+    assert second.task.attempt == 2
+    state.tasks.start_task("known", second.token)
+    clock[0] += 2
+
+    assert state.tasks.recover_expired() == ["known"]
+    recovered = state.tasks.get_task("known")
+    assert recovered is not None
+    assert recovered.state == "queued"
+    assert recovered.attempt == 2
+
+
+def test_recovery_safe_migration_marks_existing_active_task_unsafe(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    db_path = tmp_path / "agents.db"
+    state = SharedState(db_path)
+    state.tasks.create_task("legacy running", task_id="legacy", max_attempts=3)
+    lease = state.tasks.claim_task("legacy-worker", task_id="legacy", lease_seconds=30)
+    assert lease is not None
+    state.tasks.start_task("legacy", lease.token)
+    state.close()
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("ALTER TABLE agent_tasks DROP COLUMN recovery_safe")
+        connection.execute(
+            "UPDATE agent_tasks SET lease_expires_at = 0 WHERE task_id = 'legacy'"
+        )
+        connection.commit()
+
+    reopened = SharedState(db_path)
+    try:
+        assert reopened.tasks.recover_expired() == ["legacy"]
+        failed = reopened.tasks.get_task("legacy")
+        assert failed is not None
+        assert failed.state == "failed"
+        assert (
+            failed.error
+            == "worker lease expired after execution began; automatic retry suppressed"
+        )
+    finally:
+        reopened.close()
+
+
 def test_stale_or_wrong_owner_cannot_complete(state: SharedState) -> None:
     state.tasks.create_task("owned", task_id="owned")
     lease = state.tasks.claim_task("worker", task_id="owned")

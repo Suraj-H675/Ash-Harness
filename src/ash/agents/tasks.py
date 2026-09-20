@@ -187,6 +187,8 @@ class AgentTaskStore:
                     token_budget INTEGER NOT NULL CHECK(token_budget > 0),
                     used_tokens INTEGER NOT NULL DEFAULT 0 CHECK(used_tokens >= 0),
                     used_cost_usd REAL NOT NULL DEFAULT 0 CHECK(used_cost_usd >= 0),
+                    recovery_safe INTEGER NOT NULL DEFAULT 0
+                        CHECK(recovery_safe IN (0, 1)),
                     time_budget_seconds REAL NOT NULL CHECK(time_budget_seconds > 0),
                     result_json TEXT,
                     error TEXT,
@@ -253,6 +255,10 @@ class AgentTaskStore:
                 "graph_cost_budget_usd",
                 "REAL CHECK(graph_cost_budget_usd IS NULL OR "
                 "graph_cost_budget_usd > 0)",
+            ),
+            (
+                "recovery_safe",
+                "INTEGER NOT NULL DEFAULT 0 CHECK(recovery_safe IN (0, 1))",
             ),
         )
         for name, definition in upgrades:
@@ -446,7 +452,8 @@ class AgentTaskStore:
                 """
                 UPDATE agent_tasks
                 SET state = 'leased', owner_agent_id = ?, lease_token_hash = ?,
-                    lease_expires_at = ?, attempt = attempt + 1, updated_at = ?
+                    lease_expires_at = ?, attempt = attempt + 1,
+                    recovery_safe = 1, updated_at = ?
                 WHERE task_id = ? AND state = 'queued'
                 """,
                 (owner, token_hash, expires, now, row["task_id"]),
@@ -491,6 +498,37 @@ class AgentTaskStore:
                 "UPDATE agent_tasks SET lease_expires_at = ?, updated_at = ? WHERE task_id = ?",
                 (now + float(lease_seconds), now, identifier),
             )
+        return self._required_task(identifier)
+
+    def mark_recovery_unsafe(self, task_id: str, token: str) -> AgentTask:
+        """Fence automatic lease-expiry replay once execution may have side effects."""
+
+        identifier = _identifier(task_id, "task id")
+        now = time.time()
+        with self._transaction():
+            row = self._owned_row(identifier, token, now)
+            if row["state"] != "running":
+                raise AgentTaskError(
+                    f"task {identifier!r} is {row['state']}, expected running"
+                )
+            if int(row["recovery_safe"]) != 0:
+                self._conn.execute(
+                    """
+                    UPDATE agent_tasks
+                    SET recovery_safe = 0, updated_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (now, identifier),
+                )
+                self._record_event_locked(
+                    identifier,
+                    "agent.task.recovery_fenced",
+                    now,
+                    state="running",
+                    owner_agent_id=str(row["owner_agent_id"]),
+                    attempt=int(row["attempt"]),
+                    reason="execution began",
+                )
         return self._required_task(identifier)
 
     def record_tokens(self, task_id: str, token: str, token_count: int) -> AgentTask:
@@ -1206,14 +1244,26 @@ class AgentTaskStore:
     def _recover_expired_locked(self, now: float) -> list[str]:
         rows = self._conn.execute(
             """
-            SELECT task_id, attempt, max_attempts FROM agent_tasks
+            SELECT task_id, attempt, max_attempts, recovery_safe FROM agent_tasks
             WHERE state IN ('leased','running') AND lease_expires_at <= ?
             """,
             (now,),
         ).fetchall()
         recovered: list[str] = []
         for row in rows:
-            retry = int(row["attempt"]) < int(row["max_attempts"])
+            recovery_safe = bool(int(row["recovery_safe"]))
+            retry = (
+                recovery_safe
+                and int(row["attempt"]) < int(row["max_attempts"])
+            )
+            expiry_error = (
+                "worker lease expired"
+                if recovery_safe
+                else (
+                    "worker lease expired after execution began; "
+                    "automatic retry suppressed"
+                )
+            )
             self._conn.execute(
                 """
                 UPDATE agent_tasks SET state = ?, owner_agent_id = NULL,
@@ -1222,7 +1272,7 @@ class AgentTaskStore:
                 """,
                 (
                     "queued" if retry else "failed",
-                    None if retry else "worker lease expired",
+                    None if retry else expiry_error,
                     now,
                     row["task_id"],
                 ),
@@ -1234,7 +1284,7 @@ class AgentTaskStore:
                 state="queued" if retry else "failed",
                 attempt=int(row["attempt"]),
                 retryable=retry,
-                reason="worker lease expired",
+                reason=expiry_error,
             )
             recovered.append(str(row["task_id"]))
         return recovered
