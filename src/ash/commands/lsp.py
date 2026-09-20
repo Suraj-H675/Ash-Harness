@@ -25,6 +25,9 @@ async def inspect_lsp(
     end_line: int | None = None,
     end_character: int | None = None,
     code_action_kind: str = "",
+    server: str = "",
+    tab_size: int | None = None,
+    insert_spaces: bool | None = None,
 ) -> dict[str, Any]:
     workspace = config.workspace_root.resolve()
     trusted = is_workspace_trusted(workspace)
@@ -55,6 +58,9 @@ async def inspect_lsp(
             end_line=end_line,
             end_character=end_character,
             code_action_kind=code_action_kind,
+            server=server,
+            tab_size=tab_size,
+            insert_spaces=insert_spaces,
         )
     finally:
         await manager.aclose()

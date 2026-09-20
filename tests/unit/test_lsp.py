@@ -662,6 +662,7 @@ def test_lsp_refactor_client_capabilities_and_argument_ownership() -> None:
     capabilities = client_capabilities["textDocument"]
     assert capabilities["rename"]["prepareSupport"] is True
     assert capabilities["codeAction"]["isPreferredSupport"] is True
+    assert capabilities["formatting"]["dynamicRegistration"] is False
     assert client_capabilities["workspace"]["applyEdit"] is False
     assert client_capabilities["workspace"]["workspaceEdit"] == {
         "documentChanges": True,
@@ -685,6 +686,135 @@ def test_lsp_refactor_client_capabilities_and_argument_ownership() -> None:
             file_path="example.py",
             code_action_kind="quickfix",
         )
+    with pytest.raises(ValueError, match="only valid for formatting"):
+        LSPQueryArgs(
+            operation="definition",
+            file_path="example.py",
+            server="fake",
+        )
+
+
+@pytest.mark.asyncio
+async def test_lsp_formatting_returns_advisory_edits_without_modifying_file(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "example.py"
+    source.write_text("x=1\n", encoding="utf-8")
+    log_path = tmp_path / "lsp.jsonl"
+    manager = LanguageServerManager(tmp_path, {"fake": fake_config(log_path)})
+    try:
+        proposal = await manager.formatting_for(
+            "example.py",
+            tab_size=2,
+            insert_spaces=False,
+        )
+    finally:
+        await manager.aclose()
+
+    assert proposal.server == "fake"
+    assert proposal.position_encoding == "utf-8"
+    assert proposal.document_text == "x=1\n"
+    assert proposal.edits == (
+        {
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 3},
+            },
+            "newText": "x = 1",
+        },
+    )
+    assert source.read_text(encoding="utf-8") == "x=1\n"
+
+    events = [json.loads(line) for line in log_path.read_text().splitlines()]
+    request = next(
+        event for event in events if event.get("method") == "textDocument/formatting"
+    )
+    assert request["params"]["options"] == {
+        "tabSize": 2,
+        "insertSpaces": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_lsp_tool_exposes_bounded_advisory_formatting(tmp_path: Path) -> None:
+    source = tmp_path / "example.py"
+    source.write_text("x=1\n", encoding="utf-8")
+    manager = LanguageServerManager(
+        tmp_path, {"fake": fake_config(tmp_path / "lsp.jsonl")}
+    )
+    tool = LSPTool(SafetyGuard(tmp_path), manager)
+    try:
+        result = await tool.run(
+            operation="formatting",
+            file_path="example.py",
+            server="fake",
+            tab_size=2,
+            insert_spaces=False,
+        )
+    finally:
+        await tool.aclose()
+
+    assert result.success is True
+    payload = json.loads(result.output)
+    assert payload == [
+        {
+            "server": "fake",
+            "position_encoding": "utf-8",
+            "edits": [
+                {
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 3},
+                    },
+                    "newText": "x = 1",
+                }
+            ],
+        }
+    ]
+    assert "document_text" not in result.output
+    assert source.read_text(encoding="utf-8") == "x=1\n"
+
+
+@pytest.mark.asyncio
+async def test_lsp_formatting_requires_server_selection_when_multiple_support_it(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "example.py"
+    source.write_text("x=1\n", encoding="utf-8")
+    first = replace(fake_config(tmp_path / "first-ambiguous.jsonl"), name="first")
+    second = replace(fake_config(tmp_path / "second-ambiguous.jsonl"), name="second")
+    manager = LanguageServerManager(tmp_path, {"first": first, "second": second})
+    try:
+        with pytest.raises(LSPError, match="multiple language servers advertise formatting"):
+            await manager.formatting_for("example.py")
+    finally:
+        await manager.aclose()
+
+    first = replace(fake_config(tmp_path / "first-selected.jsonl"), name="first")
+    second = replace(fake_config(tmp_path / "second-selected.jsonl"), name="second")
+    manager = LanguageServerManager(tmp_path, {"first": first, "second": second})
+    try:
+        proposal = await manager.formatting_for("example.py", server="second")
+    finally:
+        await manager.aclose()
+
+    assert proposal.server == "second"
+    assert not (tmp_path / "first-selected.jsonl").exists()
+    assert (tmp_path / "second-selected.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_lsp_formatting_rejects_invalid_server_result(tmp_path: Path) -> None:
+    source = tmp_path / "example.py"
+    source.write_text("x=1\n", encoding="utf-8")
+    config = fake_config(tmp_path / "lsp.jsonl")
+    config = replace(config, env={**config.env, "FAKE_LSP_BAD_FORMATTING": "1"})
+    manager = LanguageServerManager(tmp_path, {"fake": config})
+    try:
+        with pytest.raises(LSPError, match="invalid formatting edits"):
+            await manager.formatting_for("example.py")
+    finally:
+        await manager.aclose()
 
 
 @pytest.mark.asyncio
@@ -772,6 +902,29 @@ def test_lsp_cli_routes_refactor_arguments_and_rejects_cross_operation_flags(
     assert observed["code_action_kind"] == "quickfix"
     assert '"operation": "codeAction"' in capsys.readouterr().out
 
+    observed.clear()
+    assert (
+        ash_cli.main(
+            [
+                "lsp",
+                "query",
+                "formatting",
+                "example.py",
+                "--server",
+                "fake",
+                "--tab-size",
+                "2",
+                "--no-insert-spaces",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    assert observed["server"] == "fake"
+    assert observed["tab_size"] == 2
+    assert observed["insert_spaces"] is False
+    assert '"operation": "formatting"' in capsys.readouterr().out
+
     with pytest.raises(SystemExit):
         ash_cli.main(
             [
@@ -781,6 +934,30 @@ def test_lsp_cli_routes_refactor_arguments_and_rejects_cross_operation_flags(
                 "example.py",
                 "--new-name",
                 "not-allowed",
+            ]
+        )
+
+    with pytest.raises(SystemExit):
+        ash_cli.main(
+            [
+                "lsp",
+                "query",
+                "definition",
+                "example.py",
+                "--server",
+                "fake",
+            ]
+        )
+
+    with pytest.raises(SystemExit):
+        ash_cli.main(
+            [
+                "lsp",
+                "query",
+                "formatting",
+                "example.py",
+                "--tab-size",
+                "0",
             ]
         )
 

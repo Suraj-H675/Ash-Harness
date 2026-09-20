@@ -25,6 +25,7 @@ LSPOperation = Literal[
     "prepareRename",
     "rename",
     "codeAction",
+    "formatting",
     "prepareCallHierarchy",
     "incomingCalls",
     "outgoingCalls",
@@ -41,6 +42,9 @@ class LSPQueryArgs(BaseModel):
     end_line: int | None = Field(default=None, ge=1, le=10_000_000)
     end_character: int | None = Field(default=None, ge=1, le=10_000_000)
     code_action_kind: str = Field(default="", max_length=256)
+    server: str = Field(default="", max_length=256)
+    tab_size: int | None = Field(default=None, ge=1, le=1024)
+    insert_spaces: bool | None = None
 
     @model_validator(mode="after")
     def validate_operation_fields(self) -> "LSPQueryArgs":
@@ -58,6 +62,15 @@ class LSPQueryArgs(BaseModel):
             or self.code_action_kind
         ):
             raise ValueError("code-action range and kind are only valid for codeAction")
+        formatting_options_used = (
+            bool(self.server)
+            or self.tab_size is not None
+            or self.insert_spaces is not None
+        )
+        if self.operation != "formatting" and formatting_options_used:
+            raise ValueError(
+                "server and formatting options are only valid for formatting"
+            )
         return self
 
 
@@ -65,8 +78,9 @@ class LSPTool(BaseTool):
     name = "lsp"
     description = (
         "Query installed language servers for diagnostics, hover, definitions, "
-        "references, implementations, symbols, advisory rename/code actions, and "
-        "call hierarchy. LSP edits and commands are never executed directly. "
+        "references, implementations, symbols, advisory rename/code actions, "
+        "formatting, and call hierarchy. LSP edits and commands are never "
+        "executed directly. "
         "Coordinates are 1-based as shown in editors."
     )
     args_schema = LSPQueryArgs
@@ -91,6 +105,9 @@ class LSPTool(BaseTool):
                 end_line=args.end_line,
                 end_character=args.end_character,
                 code_action_kind=args.code_action_kind,
+                server=args.server,
+                tab_size=args.tab_size,
+                insert_spaces=args.insert_spaces,
             )
         except (LSPError, OSError, ValueError) as exc:
             return ToolResult(success=False, output="", error=str(exc))

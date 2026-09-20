@@ -123,6 +123,7 @@ def main() -> int:
                         "callHierarchyProvider": True,
                         "renameProvider": {"prepareProvider": True},
                         "codeActionProvider": True,
+                        "documentFormattingProvider": True,
                     }
                 },
             )
@@ -276,6 +277,23 @@ def main() -> int:
                     },
                 ],
             )
+        elif method == "textDocument/formatting":
+            if os.environ.get("FAKE_LSP_BAD_FORMATTING") == "1":
+                respond(sink, request_id, {"unexpected": True})
+            else:
+                respond(
+                    sink,
+                    request_id,
+                    [
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 3},
+                            },
+                            "newText": "x = 1",
+                        }
+                    ],
+                )
         elif method in {"textDocument/definition", "textDocument/references"}:
             respond(
                 sink,

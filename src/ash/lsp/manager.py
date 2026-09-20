@@ -40,6 +40,14 @@ class LSPFailure:
     retry_at: float
 
 
+@dataclass(frozen=True)
+class LSPFormattingProposal:
+    server: str
+    position_encoding: str
+    document_text: str
+    edits: tuple[dict[str, Any], ...]
+
+
 class _UnsafeWorkspaceEdit(LSPError):
     """A server proposed an edit outside Ash's advisory safety contract."""
 
@@ -75,6 +83,9 @@ class LanguageServerManager:
         end_line: int | None = None,
         end_character: int | None = None,
         code_action_kind: str = "",
+        server: str = "",
+        tab_size: int | None = None,
+        insert_spaces: bool | None = None,
     ) -> Any:
         if operation == "status":
             return [status.__dict__ for status in self.status()]
@@ -90,6 +101,28 @@ class LanguageServerManager:
                 raise ValueError("end_line and end_character must be provided together")
         elif end_line is not None or end_character is not None or code_action_kind:
             raise ValueError("code-action range and kind are only valid for codeAction")
+        formatting_options_used = bool(server) or tab_size is not None or insert_spaces is not None
+        if operation != "formatting" and formatting_options_used:
+            raise ValueError(
+                "server and formatting options are only valid for formatting"
+            )
+        if operation == "formatting":
+            selected_tab_size = 4 if tab_size is None else tab_size
+            if selected_tab_size < 1:
+                raise ValueError("tab_size must be positive")
+            proposal = await self.formatting_for(
+                file_path,
+                server=server,
+                tab_size=selected_tab_size,
+                insert_spaces=True if insert_spaces is None else insert_spaces,
+            )
+            return [
+                {
+                    "server": proposal.server,
+                    "position_encoding": proposal.position_encoding,
+                    "edits": list(proposal.edits),
+                }
+            ]
         path = self.resolve_file(file_path)
         if operation == "diagnostics":
             return await self.diagnostics_for(path)
@@ -300,6 +333,77 @@ class LanguageServerManager:
                 if len(combined) >= MAX_DIAGNOSTICS_PER_FILE:
                     return combined
         return combined
+
+    async def formatting_for(
+        self,
+        file_path: str,
+        *,
+        server: str = "",
+        tab_size: int = 4,
+        insert_spaces: bool = True,
+    ) -> LSPFormattingProposal:
+        path = self.resolve_file(file_path)
+        if server:
+            config = self.configs.get(server)
+            if config is None:
+                raise LSPError(f"LSP server {server!r} is not configured")
+            language_id = config.extensions.get(path.suffix.casefold())
+            if language_id is None:
+                raise LSPError(
+                    f"LSP server {server!r} is not available for "
+                    f"{path.suffix or path.name}"
+                )
+            client = await self._get_client(config, self._root_for(path, config))
+            clients = [(client, language_id)]
+        else:
+            clients = await self.clients_for(path)
+        supported = [
+            (client, language_id)
+            for client, language_id in clients
+            if _has_capability(client, "formatting")
+        ]
+        if server and not supported:
+            raise LSPError(
+                f"LSP server {server!r} is not available with formatting support "
+                f"for {path.name}"
+            )
+        elif len(supported) > 1:
+            names = ", ".join(client.config.name for client, _ in supported)
+            raise LSPError(
+                "multiple language servers advertise formatting for this file; "
+                f"specify server explicitly ({names})"
+            )
+        if not supported:
+            raise LSPError(
+                f"no configured LSP server advertises formatting for "
+                f"{path.suffix or path.name}"
+            )
+        client, language_id = supported[0]
+        await client.sync_document(path, language_id)
+        uri = path.as_uri()
+        value = await client.request(
+            "textDocument/formatting",
+            {
+                "textDocument": {"uri": uri},
+                "options": {
+                    "tabSize": tab_size,
+                    "insertSpaces": insert_spaces,
+                },
+            },
+        )
+        if value is None:
+            edits: list[dict[str, Any]] = []
+        else:
+            normalized_edits = _normalize_formatting_edits(value)
+            if normalized_edits is None:
+                raise LSPError("language server returned invalid formatting edits")
+            edits = normalized_edits
+        return LSPFormattingProposal(
+            server=client.config.name,
+            position_encoding=client.position_encoding,
+            document_text=client.document_text(uri),
+            edits=tuple(edits),
+        )
 
     async def clients_for(self, path: Path) -> list[tuple[LSPClient, str]]:
         resolved = self.resolve_file(str(path))
@@ -602,6 +706,7 @@ def _has_capability(client: LSPClient, operation: str) -> bool:
         "hover": "hoverProvider",
         "definition": "definitionProvider",
         "references": "referencesProvider",
+        "formatting": "documentFormattingProvider",
         "implementation": "implementationProvider",
         "documentSymbol": "documentSymbolProvider",
         "workspaceSymbol": "workspaceSymbolProvider",
@@ -766,6 +871,19 @@ def _normalize_text_edits(value: Any) -> list[dict[str, Any]] | None:
         if edit is None:
             return None
         edits.append(edit)
+    return edits
+
+
+def _normalize_formatting_edits(value: Any) -> list[dict[str, Any]] | None:
+    edits = _normalize_text_edits(value)
+    if edits is None:
+        return None
+    for edit in edits:
+        if "range" not in edit or "insert" in edit or "replace" in edit:
+            return None
+        edit.pop("annotationId", None)
+    if len(json.dumps(edits, ensure_ascii=True).encode("utf-8")) > MAX_LSP_RESULT_BYTES:
+        return None
     return edits
 
 

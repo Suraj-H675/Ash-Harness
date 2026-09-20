@@ -2727,6 +2727,7 @@ def main(argv: list[str] | None = None) -> int:
             "prepareRename",
             "rename",
             "codeAction",
+            "formatting",
             "prepareCallHierarchy",
             "incomingCalls",
             "outgoingCalls",
@@ -2740,6 +2741,13 @@ def main(argv: list[str] | None = None) -> int:
     lsp_query.add_argument("--end-line", type=int)
     lsp_query.add_argument("--end-character", type=int)
     lsp_query.add_argument("--code-action-kind", default="")
+    lsp_query.add_argument("--server", default="")
+    lsp_query.add_argument("--tab-size", type=int)
+    lsp_query.add_argument(
+        "--insert-spaces",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     lsp_query.add_argument("--json", action="store_true")
     mcp_subparser = subparsers.add_parser("mcp")
     mcp_action_subparsers = mcp_subparser.add_subparsers(dest="action", required=True)
@@ -3011,6 +3019,20 @@ def main(argv: list[str] | None = None) -> int:
                 args.end_line is not None or args.code_action_kind
             ):
                 parser.error("code-action range and kind are only valid for codeAction")
+            formatting_options_used = (
+                bool(args.server)
+                or args.tab_size is not None
+                or args.insert_spaces is not None
+            )
+            if args.operation != "formatting" and formatting_options_used:
+                parser.error(
+                    "--server, --tab-size, and --insert-spaces/--no-insert-spaces "
+                    "are only valid for formatting"
+                )
+            if args.operation == "formatting" and (
+                args.tab_size is not None and args.tab_size < 1
+            ):
+                parser.error("--tab-size must be positive")
         try:
             payload = asyncio.run(
                 inspect_lsp(
@@ -3025,6 +3047,9 @@ def main(argv: list[str] | None = None) -> int:
                     end_line=getattr(args, "end_line", None),
                     end_character=getattr(args, "end_character", None),
                     code_action_kind=getattr(args, "code_action_kind", ""),
+                    server=getattr(args, "server", ""),
+                    tab_size=getattr(args, "tab_size", None),
+                    insert_spaces=getattr(args, "insert_spaces", None),
                 )
             )
         except (OSError, RuntimeError, ValueError) as exc:

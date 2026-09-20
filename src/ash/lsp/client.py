@@ -320,6 +320,12 @@ class LSPClient:
             raise LSPError("document must be synchronized before requesting a position")
         return _lsp_position(document[1], line, character, self.position_encoding)
 
+    def document_text(self, uri: str) -> str:
+        document = self._documents.get(uri) or self._pending_documents.get(uri)
+        if document is None:
+            raise LSPError("document must be synchronized before reading its text")
+        return document[1]
+
     async def pull_document_diagnostics(
         self, uri: str, previous_result_id: str | None = None
     ) -> DocumentDiagnosticReport:
@@ -778,6 +784,7 @@ def _client_capabilities() -> dict[str, Any]:
             "definition": {"linkSupport": True},
             "implementation": {"linkSupport": True},
             "references": {"dynamicRegistration": False},
+            "formatting": {"dynamicRegistration": False},
             "rename": {"dynamicRegistration": False, "prepareSupport": True},
             "codeAction": {
                 "dynamicRegistration": False,
