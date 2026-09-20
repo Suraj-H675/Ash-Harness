@@ -250,9 +250,11 @@ def test_oauth_store_save_stays_on_open_directory_after_visible_swap(
 
     assert outside_record.read_bytes() == b"outside-record-must-not-change"
     displaced_record = tmp_path / "tokens-displaced" / store.path.name
-    assert json.loads(displaced_record.read_text(encoding="utf-8"))["tokens"][
-        "access_token"
-    ] == "old-access"
+    displaced_payload = json.loads(displaced_record.read_text(encoding="utf-8"))
+    displaced_active = displaced_payload["active_issuer"]
+    assert displaced_payload["bundles"][displaced_active]["tokens"]["access_token"] == (
+        "old-access"
+    )
 
 
 def test_oauth_store_load_stays_on_open_directory_after_visible_swap(
@@ -442,9 +444,145 @@ def test_oauth_credential_state_reports_health_without_secrets(tmp_path: Path) -
     assert store.credential_state(resource) == "usable"
 
     record = json.loads(store.path.read_text(encoding="utf-8"))
-    record["tokens"]["access_token"] = 123
+    active_issuer = record["active_issuer"]
+    record["bundles"][active_issuer]["tokens"]["access_token"] = 123
     store.path.write_text(json.dumps(record), encoding="utf-8")
     assert store.credential_state(resource) == "invalid"
+
+
+@pytest.mark.asyncio
+async def test_oauth_store_keeps_credentials_separate_per_issuer(tmp_path: Path) -> None:
+    resource = "https://mcp.example.test/rpc"
+    canonical = canonical_resource_uri(resource)
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    bundle_a = OAuthBundle(
+        canonical,
+        OAuthDiscovery(
+            canonical,
+            (),
+            "https://auth-a.example.test",
+            "https://auth-a.example.test/authorize",
+            "https://auth-a.example.test/token",
+        ),
+        OAuthClient("client-a", "secret-a"),
+        OAuthTokens("token-a", token_type="Bearer"),
+    )
+    bundle_b = OAuthBundle(
+        canonical,
+        OAuthDiscovery(
+            canonical,
+            (),
+            "https://auth-b.example.test",
+            "https://auth-b.example.test/authorize",
+            "https://auth-b.example.test/token",
+        ),
+        OAuthClient("client-b", "secret-b"),
+        OAuthTokens("token-b", token_type="Bearer"),
+    )
+
+    store.save(bundle_a)
+    store.save(bundle_b)
+
+    session_a = MCPOAuthSession(
+        "remote",
+        resource,
+        oauth_config={
+            "client_id": "client-a",
+            "client_secret": "secret-a",
+            "issuer": "https://auth-a.example.test",
+        },
+        store=store,
+    )
+    session_b = MCPOAuthSession(
+        "remote",
+        resource,
+        oauth_config={
+            "client_id": "client-b",
+            "client_secret": "secret-b",
+            "issuer": "https://auth-b.example.test",
+        },
+        store=store,
+    )
+
+    assert await session_a.authorization_header() == "Bearer token-a"
+    assert await session_b.authorization_header() == "Bearer token-b"
+    assert store.load(canonical) == bundle_b
+
+
+def test_oauth_store_migrates_v1_without_dropping_existing_issuer(tmp_path: Path) -> None:
+    resource = "https://mcp.example.test/rpc"
+    canonical = canonical_resource_uri(resource)
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    legacy = _bundle(resource)
+    store.save(legacy)
+    version_two = json.loads(store.path.read_text(encoding="utf-8"))
+    legacy_issuer = version_two["active_issuer"]
+    legacy_record = {
+        "version": 1,
+        "resource": canonical,
+        **version_two["bundles"][legacy_issuer],
+    }
+    store.path.write_text(json.dumps(legacy_record), encoding="utf-8")
+
+    replacement = OAuthBundle(
+        canonical,
+        OAuthDiscovery(
+            canonical,
+            (),
+            "https://auth-b.example.test",
+            "https://auth-b.example.test/authorize",
+            "https://auth-b.example.test/token",
+        ),
+        OAuthClient("client-b"),
+        OAuthTokens("token-b", token_type="Bearer"),
+    )
+    store.save(replacement)
+
+    assert store.load(canonical, issuer=legacy.discovery.issuer) == legacy
+    assert store.load(canonical, issuer=replacement.discovery.issuer) == replacement
+    assert store.load(canonical) == replacement
+    migrated = json.loads(store.path.read_text(encoding="utf-8"))
+    assert migrated["version"] == 2
+    assert set(migrated["bundles"]) == {
+        legacy.discovery.issuer,
+        replacement.discovery.issuer,
+    }
+
+
+def test_oauth_credential_state_is_issuer_specific(tmp_path: Path) -> None:
+    resource = "https://mcp.example.test/rpc"
+    canonical = canonical_resource_uri(resource)
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    expired = OAuthBundle(
+        canonical,
+        OAuthDiscovery(
+            canonical,
+            (),
+            "https://auth-a.example.test",
+            "https://auth-a.example.test/authorize",
+            "https://auth-a.example.test/token",
+        ),
+        OAuthClient("client-a"),
+        OAuthTokens("token-a", token_type="Bearer", expires_at=1.0),
+    )
+    usable = OAuthBundle(
+        canonical,
+        OAuthDiscovery(
+            canonical,
+            (),
+            "https://auth-b.example.test",
+            "https://auth-b.example.test/authorize",
+            "https://auth-b.example.test/token",
+        ),
+        OAuthClient("client-b"),
+        OAuthTokens("token-b", token_type="Bearer"),
+    )
+    store.save(expired)
+    store.save(usable)
+
+    assert store.credential_state(canonical, issuer=expired.discovery.issuer) == "expired"
+    assert store.credential_state(canonical, issuer=usable.discovery.issuer) == "usable"
+    assert store.credential_state(canonical) == "usable"
 
 
 def test_oauth_store_rejects_coerced_credential_types(tmp_path: Path) -> None:
@@ -452,7 +590,8 @@ def test_oauth_store_rejects_coerced_credential_types(tmp_path: Path) -> None:
     store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
     store.save(_bundle(resource))
     record = json.loads(store.path.read_text(encoding="utf-8"))
-    record["tokens"]["access_token"] = 123
+    active_issuer = record["active_issuer"]
+    record["bundles"][active_issuer]["tokens"]["access_token"] = 123
     store.path.write_text(json.dumps(record), encoding="utf-8")
 
     with pytest.raises(MCPOAuthError, match="invalid OAuth credential record"):
@@ -464,7 +603,13 @@ def test_oauth_store_loads_pre_cimd_version_one_record(tmp_path: Path) -> None:
     store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
     bundle = _bundle(resource)
     store.save(bundle)
-    record = json.loads(store.path.read_text(encoding="utf-8"))
+    version_two = json.loads(store.path.read_text(encoding="utf-8"))
+    active_issuer = version_two["active_issuer"]
+    record = {
+        "version": 1,
+        "resource": resource,
+        **version_two["bundles"][active_issuer],
+    }
     record["discovery"].pop("client_id_metadata_document_supported")
     record["discovery"].pop("authorization_server_scopes")
     record["discovery"].pop("authorization_response_iss_parameter_supported")
@@ -490,6 +635,22 @@ def test_oauth_store_rejects_duplicate_json_keys(tmp_path: Path) -> None:
         '"access_token":"first","access_token":"old-access"',
     )
     store.path.write_text(raw, encoding="utf-8")
+
+    with pytest.raises(MCPOAuthError, match="invalid OAuth credential record"):
+        store.load(resource)
+
+
+def test_oauth_store_rejects_mismatched_v2_issuer_key(tmp_path: Path) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource))
+    record = json.loads(store.path.read_text(encoding="utf-8"))
+    active_issuer = record["active_issuer"]
+    record["bundles"]["https://attacker.example.test"] = record["bundles"].pop(
+        active_issuer
+    )
+    record["active_issuer"] = "https://attacker.example.test"
+    store.path.write_text(json.dumps(record), encoding="utf-8")
 
     with pytest.raises(MCPOAuthError, match="invalid OAuth credential record"):
         store.load(resource)

@@ -53,7 +53,8 @@ def _oauth_credential_state(config: MCPServerConfig) -> str | None:
         return None
     try:
         store = MCPOAuthTokenStore(config.name)
-        return store.credential_state(config.resolved_url)
+        issuer = str((config.oauth or {}).get("issuer", ""))
+        return store.credential_state(config.resolved_url, issuer=issuer)
     except ValueError as exc:
         return f"invalid configuration: {exc}"
 

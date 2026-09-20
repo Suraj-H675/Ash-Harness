@@ -121,7 +121,7 @@ class MCPOAuthTokenStore:
         self.directory = self._private_store.directory
         self.path = self.directory / f"{self.server_name}.json"
 
-    def load(self, resource: str) -> OAuthBundle | None:
+    def _read_record(self) -> dict[str, Any] | None:
         try:
             record = self._private_store.read(
                 self.path.name,
@@ -133,81 +133,27 @@ class MCPOAuthTokenStore:
             raise MCPOAuthError(str(exc)) from exc
         if record is None:
             return None
+        return self._parse_record(record)
+
+    def _parse_record(self, record: bytes) -> dict[str, Any]:
         try:
             raw = strict_json_loads(record)
-            if (
-                not isinstance(raw, dict)
-                or isinstance(raw.get("version"), bool)
-                or raw.get("version") != 1
-            ):
-                raise ValueError("unsupported token record")
-            if raw.get("resource") != resource:
-                raise MCPOAuthError(
-                    f"stored OAuth credentials for {self.server_name!r} are bound "
-                    "to a different MCP resource; run `ash mcp login` again"
-                )
-            discovery_raw = _required_mapping(raw, "discovery")
-            client_raw = _required_mapping(raw, "client")
-            tokens_raw = _required_mapping(raw, "tokens")
-            scopes_raw = discovery_raw.get("scopes", [])
-            if not isinstance(scopes_raw, list) or not all(
-                isinstance(item, str) for item in scopes_raw
-            ):
-                raise ValueError("discovery scopes must be a list of strings")
-            cimd_supported_raw = discovery_raw.get(
-                "client_id_metadata_document_supported",
-                False,
-            )
-            if not isinstance(cimd_supported_raw, bool):
-                raise ValueError("client metadata support flag must be boolean")
-            authorization_scopes_raw = discovery_raw.get(
-                "authorization_server_scopes",
-                [],
-            )
-            if not isinstance(authorization_scopes_raw, list) or not all(
-                isinstance(item, str) for item in authorization_scopes_raw
-            ):
-                raise ValueError("authorization server scopes must be strings")
-            response_issuer_supported_raw = discovery_raw.get(
-                "authorization_response_iss_parameter_supported",
-                False,
-            )
-            if not isinstance(response_issuer_supported_raw, bool):
-                raise ValueError("authorization response issuer support flag must be boolean")
-            discovery = OAuthDiscovery(
-                resource=_required_text(discovery_raw, "resource"),
-                scopes=tuple(scopes_raw),
-                issuer=_required_text(discovery_raw, "issuer"),
-                authorization_endpoint=_required_text(
-                    discovery_raw, "authorization_endpoint"
-                ),
-                token_endpoint=_required_text(discovery_raw, "token_endpoint"),
-                registration_endpoint=_optional_text(
-                    discovery_raw, "registration_endpoint"
-                ),
-                client_id_metadata_document_supported=cimd_supported_raw,
-                authorization_server_scopes=tuple(authorization_scopes_raw),
-                authorization_response_iss_parameter_supported=(
-                    response_issuer_supported_raw
-                ),
-            )
-            grant_types_raw = client_raw.get("grant_types", [])
-            if not isinstance(grant_types_raw, list) or not all(
-                isinstance(item, str) for item in grant_types_raw
-            ):
-                raise ValueError("OAuth client grant_types must be strings")
-            client = OAuthClient(
-                client_id=_required_text(client_raw, "client_id"),
-                client_secret=_optional_text(client_raw, "client_secret"),
-                grant_types=tuple(grant_types_raw),
-            )
-            tokens = OAuthTokens(
-                access_token=_required_text(tokens_raw, "access_token"),
-                refresh_token=_optional_text(tokens_raw, "refresh_token"),
-                token_type=_required_text(tokens_raw, "token_type"),
-                scope=_optional_text(tokens_raw, "scope"),
-                expires_at=_optional_number(tokens_raw, "expires_at"),
-            )
+            if not isinstance(raw, dict):
+                raise ValueError("token record must be an object")
+            return raw
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise MCPOAuthError(
+                f"invalid OAuth credential record for {self.server_name!r}; "
+                "remove it with `ash mcp logout` and authorize again"
+            ) from exc
+
+    def _decode_record(
+        self,
+        raw: dict[str, Any],
+        resource: str,
+    ) -> tuple[str, dict[str, OAuthBundle]]:
+        try:
+            return _decode_oauth_store_record(raw, resource, self.server_name)
         except MCPOAuthError:
             raise
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
@@ -215,50 +161,59 @@ class MCPOAuthTokenStore:
                 f"invalid OAuth credential record for {self.server_name!r}; "
                 "remove it with `ash mcp logout` and authorize again"
             ) from exc
-        bundle = OAuthBundle(resource, discovery, client, tokens)
-        _validate_bundle(bundle)
+
+    def load(self, resource: str, *, issuer: str = "") -> OAuthBundle | None:
+        raw = self._read_record()
+        if raw is None:
+            return None
+        active_issuer, bundles = self._decode_record(raw, resource)
+        selected_issuer = issuer or active_issuer
+        if not selected_issuer:
+            raise MCPOAuthError(
+                f"invalid OAuth credential record for {self.server_name!r}; "
+                "remove it with `ash mcp logout` and authorize again"
+            )
+        bundle = bundles.get(selected_issuer)
+        if bundle is None:
+            if issuer:
+                return None
+            raise MCPOAuthError(
+                f"invalid OAuth credential record for {self.server_name!r}; "
+                "remove it with `ash mcp logout` and authorize again"
+            )
         return bundle
 
     def save(self, bundle: OAuthBundle) -> None:
         _validate_bundle(bundle)
-        payload = {
-            "version": 1,
-            "resource": bundle.resource,
-            "discovery": {
-                "resource": bundle.discovery.resource,
-                "scopes": list(bundle.discovery.scopes),
-                "issuer": bundle.discovery.issuer,
-                "authorization_endpoint": bundle.discovery.authorization_endpoint,
-                "token_endpoint": bundle.discovery.token_endpoint,
-                "registration_endpoint": bundle.discovery.registration_endpoint,
-                "client_id_metadata_document_supported": (
-                    bundle.discovery.client_id_metadata_document_supported
-                ),
-                "authorization_server_scopes": list(
-                    bundle.discovery.authorization_server_scopes
-                ),
-                "authorization_response_iss_parameter_supported": (
-                    bundle.discovery.authorization_response_iss_parameter_supported
-                ),
-            },
-            "client": {
-                "client_id": bundle.client.client_id,
-                "client_secret": bundle.client.client_secret,
-                "grant_types": list(bundle.client.grant_types),
-            },
-            "tokens": {
-                "access_token": bundle.tokens.access_token,
-                "refresh_token": bundle.tokens.refresh_token,
-                "token_type": bundle.tokens.token_type,
-                "scope": bundle.tokens.scope,
-                "expires_at": bundle.tokens.expires_at,
-            },
-        }
-        payload_bytes = (
-            json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"
-        ).encode("utf-8")
+
+        def merge(record: bytes | None) -> bytes:
+            bundles: dict[str, OAuthBundle] = {}
+            if record is not None:
+                raw = self._parse_record(record)
+                _active_issuer, bundles = self._decode_record(raw, bundle.resource)
+            bundles[bundle.discovery.issuer] = bundle
+            payload = {
+                "version": 2,
+                "resource": bundle.resource,
+                "active_issuer": bundle.discovery.issuer,
+                "bundles": {
+                    issuer: _oauth_bundle_payload(stored_bundle)
+                    for issuer, stored_bundle in sorted(bundles.items())
+                },
+            }
+            payload_bytes = (
+                json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"
+            ).encode("utf-8")
+            if len(payload_bytes) > MAX_OAUTH_RECORD_BYTES:
+                raise MCPOAuthError("MCP OAuth token record exceeded 1 MB")
+            return payload_bytes
+
         try:
-            self._private_store.write(self.path.name, payload_bytes)
+            self._private_store.update(
+                self.path.name,
+                merge,
+                max_bytes=MAX_OAUTH_RECORD_BYTES,
+            )
         except PrivateStoreUnavailable as exc:
             raise MCPOAuthStoreUnavailable(str(exc)) from exc
         except PrivateStoreError as exc:
@@ -272,11 +227,11 @@ class MCPOAuthTokenStore:
         except PrivateStoreError as exc:
             raise MCPOAuthError(str(exc)) from exc
 
-    def credential_state(self, resource: str) -> str:
+    def credential_state(self, resource: str, *, issuer: str = "") -> str:
         """Report bounded, non-secret credential health for diagnostics."""
 
         try:
-            bundle = self.load(canonical_resource_uri(resource))
+            bundle = self.load(canonical_resource_uri(resource), issuer=issuer)
         except MCPOAuthStoreUnavailable:
             return "unavailable"
         except MCPOAuthError:
@@ -312,10 +267,19 @@ class MCPOAuthSession:
         rejected_access_token: str = "",
     ) -> str:
         async with self._lock:
-            bundle = self.store.load(self.resource)
-            if bundle is None:
-                raise MCPAuthorizationRequired(self._login_guidance())
             configured_issuer = _configured_issuer(self.oauth_config)
+            bundle = self.store.load(self.resource, issuer=configured_issuer)
+            if bundle is None:
+                if configured_issuer:
+                    active_bundle = self.store.load(self.resource)
+                    if (
+                        active_bundle is not None
+                        and active_bundle.discovery.issuer != configured_issuer
+                    ):
+                        raise MCPAuthorizationRequired(
+                            self._login_guidance("configured OAuth issuer changed")
+                        )
+                raise MCPAuthorizationRequired(self._login_guidance())
             if configured_issuer and bundle.discovery.issuer != configured_issuer:
                 raise MCPAuthorizationRequired(
                     self._login_guidance("configured OAuth issuer changed")
@@ -465,7 +429,10 @@ async def authorize_mcp_server(
                 "configured OAuth issuer did not match discovered authorization server"
             )
         if registered is None:
-            existing_bundle = existing_bundle or token_store.load(resource)
+            existing_bundle = existing_bundle or token_store.load(
+                resource,
+                issuer=discovery.issuer,
+            )
             if (
                 existing_bundle is not None
                 and existing_bundle.discovery.issuer == discovery.issuer
@@ -488,7 +455,7 @@ async def authorize_mcp_server(
         if explicit_scope:
             prior_bundle = existing_bundle
             if prior_bundle is None:
-                prior_bundle = token_store.load(resource)
+                prior_bundle = token_store.load(resource, issuer=discovery.issuer)
             prior_scope = (
                 prior_bundle.tokens.scope
                 if prior_bundle is not None
@@ -1045,6 +1012,139 @@ def _validate_bundle(bundle: OAuthBundle) -> None:
         raise MCPOAuthError("stored MCP OAuth token type is not Bearer")
     if not math.isfinite(bundle.tokens.expires_at) or bundle.tokens.expires_at < 0:
         raise MCPOAuthError("OAuth token expiry is invalid")
+
+
+def _oauth_bundle_payload(bundle: OAuthBundle) -> dict[str, Any]:
+    return {
+        "discovery": {
+            "resource": bundle.discovery.resource,
+            "scopes": list(bundle.discovery.scopes),
+            "issuer": bundle.discovery.issuer,
+            "authorization_endpoint": bundle.discovery.authorization_endpoint,
+            "token_endpoint": bundle.discovery.token_endpoint,
+            "registration_endpoint": bundle.discovery.registration_endpoint,
+            "client_id_metadata_document_supported": (
+                bundle.discovery.client_id_metadata_document_supported
+            ),
+            "authorization_server_scopes": list(
+                bundle.discovery.authorization_server_scopes
+            ),
+            "authorization_response_iss_parameter_supported": (
+                bundle.discovery.authorization_response_iss_parameter_supported
+            ),
+        },
+        "client": {
+            "client_id": bundle.client.client_id,
+            "client_secret": bundle.client.client_secret,
+            "grant_types": list(bundle.client.grant_types),
+        },
+        "tokens": {
+            "access_token": bundle.tokens.access_token,
+            "refresh_token": bundle.tokens.refresh_token,
+            "token_type": bundle.tokens.token_type,
+            "scope": bundle.tokens.scope,
+            "expires_at": bundle.tokens.expires_at,
+        },
+    }
+
+
+def _decode_oauth_bundle_payload(
+    resource: str,
+    raw: dict[str, Any],
+) -> OAuthBundle:
+    discovery_raw = _required_mapping(raw, "discovery")
+    client_raw = _required_mapping(raw, "client")
+    tokens_raw = _required_mapping(raw, "tokens")
+    scopes_raw = discovery_raw.get("scopes", [])
+    if not isinstance(scopes_raw, list) or not all(
+        isinstance(item, str) for item in scopes_raw
+    ):
+        raise ValueError("discovery scopes must be a list of strings")
+    cimd_supported_raw = discovery_raw.get(
+        "client_id_metadata_document_supported",
+        False,
+    )
+    if not isinstance(cimd_supported_raw, bool):
+        raise ValueError("client metadata support flag must be boolean")
+    authorization_scopes_raw = discovery_raw.get(
+        "authorization_server_scopes",
+        [],
+    )
+    if not isinstance(authorization_scopes_raw, list) or not all(
+        isinstance(item, str) for item in authorization_scopes_raw
+    ):
+        raise ValueError("authorization server scopes must be strings")
+    response_issuer_supported_raw = discovery_raw.get(
+        "authorization_response_iss_parameter_supported",
+        False,
+    )
+    if not isinstance(response_issuer_supported_raw, bool):
+        raise ValueError("authorization response issuer support flag must be boolean")
+    discovery = OAuthDiscovery(
+        resource=_required_text(discovery_raw, "resource"),
+        scopes=tuple(scopes_raw),
+        issuer=_required_text(discovery_raw, "issuer"),
+        authorization_endpoint=_required_text(discovery_raw, "authorization_endpoint"),
+        token_endpoint=_required_text(discovery_raw, "token_endpoint"),
+        registration_endpoint=_optional_text(discovery_raw, "registration_endpoint"),
+        client_id_metadata_document_supported=cimd_supported_raw,
+        authorization_server_scopes=tuple(authorization_scopes_raw),
+        authorization_response_iss_parameter_supported=response_issuer_supported_raw,
+    )
+    grant_types_raw = client_raw.get("grant_types", [])
+    if not isinstance(grant_types_raw, list) or not all(
+        isinstance(item, str) for item in grant_types_raw
+    ):
+        raise ValueError("OAuth client grant_types must be strings")
+    client = OAuthClient(
+        client_id=_required_text(client_raw, "client_id"),
+        client_secret=_optional_text(client_raw, "client_secret"),
+        grant_types=tuple(grant_types_raw),
+    )
+    tokens = OAuthTokens(
+        access_token=_required_text(tokens_raw, "access_token"),
+        refresh_token=_optional_text(tokens_raw, "refresh_token"),
+        token_type=_required_text(tokens_raw, "token_type"),
+        scope=_optional_text(tokens_raw, "scope"),
+        expires_at=_optional_number(tokens_raw, "expires_at"),
+    )
+    bundle = OAuthBundle(resource, discovery, client, tokens)
+    _validate_bundle(bundle)
+    return bundle
+
+
+def _decode_oauth_store_record(
+    raw: dict[str, Any],
+    resource: str,
+    server_name: str,
+) -> tuple[str, dict[str, OAuthBundle]]:
+    version = raw.get("version")
+    if isinstance(version, bool) or version not in {1, 2}:
+        raise ValueError("unsupported token record")
+    if raw.get("resource") != resource:
+        raise MCPOAuthError(
+            f"stored OAuth credentials for {server_name!r} are bound "
+            "to a different MCP resource; run `ash mcp login` again"
+        )
+    if version == 1:
+        bundle = _decode_oauth_bundle_payload(resource, raw)
+        return bundle.discovery.issuer, {bundle.discovery.issuer: bundle}
+
+    active_issuer = _required_text(raw, "active_issuer")
+    bundles_raw = _required_mapping(raw, "bundles")
+    if not bundles_raw:
+        raise ValueError("OAuth credential record has no issuer bundles")
+    bundles: dict[str, OAuthBundle] = {}
+    for issuer, bundle_raw in bundles_raw.items():
+        if not isinstance(issuer, str) or not issuer or not isinstance(bundle_raw, dict):
+            raise ValueError("OAuth issuer bundle is invalid")
+        bundle = _decode_oauth_bundle_payload(resource, bundle_raw)
+        if bundle.discovery.issuer != issuer:
+            raise ValueError("OAuth issuer bundle key does not match discovery issuer")
+        bundles[issuer] = bundle
+    if active_issuer not in bundles:
+        raise ValueError("OAuth active issuer is missing from stored bundles")
+    return active_issuer, bundles
 
 
 def _configured_client(config: dict[str, Any]) -> OAuthClient | None:

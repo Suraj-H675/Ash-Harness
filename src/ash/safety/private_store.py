@@ -8,7 +8,7 @@ import secrets
 import stat
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
@@ -158,46 +158,55 @@ class PrivateStore:
             raise TypeError("private-store payload must be bytes")
         try:
             with self.opened() as store_descriptor:
-                _require_regular_or_missing(store_descriptor, name)
-                temporary_name = f".{name}.{secrets.token_hex(16)}.tmp"
-                descriptor = -1
-                created = False
+                _atomic_replace(store_descriptor, name, payload)
+        except PrivateStoreError:
+            raise
+        except OSError as exc:
+            raise _operation_error(
+                "unable to write the secure MCP OAuth token record",
+                exc,
+            ) from exc
+
+    def update(
+        self,
+        name: str,
+        updater: Callable[[bytes | None], bytes],
+        *,
+        max_bytes: int,
+    ) -> None:
+        """Read-modify-replace one record under a single held directory."""
+
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be non-negative")
+        _validate_name(name)
+        try:
+            with self.opened() as store_descriptor:
+                current: bytes | None = None
+                flags = os.O_RDONLY | _close_on_exec_flag() | _nofollow_flag()
                 try:
-                    flags = (
-                        os.O_WRONLY
-                        | os.O_CREAT
-                        | os.O_EXCL
-                        | _close_on_exec_flag()
-                        | _nofollow_flag()
-                    )
-                    descriptor = os.open(
-                        temporary_name,
-                        flags,
-                        0o600,
-                        dir_fd=store_descriptor,
-                    )
-                    created = True
-                    _fchmod(descriptor, 0o600)
-                    _write_all(descriptor, payload)
-                    os.fsync(descriptor)
-                    os.close(descriptor)
-                    descriptor = -1
-                    _require_regular_or_missing(store_descriptor, name)
-                    os.rename(
-                        temporary_name,
-                        name,
-                        src_dir_fd=store_descriptor,
-                        dst_dir_fd=store_descriptor,
-                    )
-                    _sync_directory(store_descriptor)
-                finally:
-                    if descriptor >= 0:
+                    descriptor = os.open(name, flags, dir_fd=store_descriptor)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise _record_open_error(exc) from exc
+                else:
+                    try:
+                        metadata = os.fstat(descriptor)
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise PrivateStoreError(
+                                "MCP OAuth token record is not a regular file"
+                            )
+                        if metadata.st_size > max_bytes:
+                            raise PrivateStoreError(
+                                "MCP OAuth token record exceeded 1 MB"
+                            )
+                        current = _read_bounded(descriptor, max_bytes)
+                    finally:
                         os.close(descriptor)
-                    if created:
-                        try:
-                            os.unlink(temporary_name, dir_fd=store_descriptor)
-                        except FileNotFoundError:
-                            pass
+                payload = updater(current)
+                if not isinstance(payload, bytes):
+                    raise TypeError("private-store updater must return bytes")
+                _atomic_replace(store_descriptor, name, payload)
         except PrivateStoreError:
             raise
         except OSError as exc:
@@ -430,6 +439,49 @@ def _require_regular_or_missing(
     if not stat.S_ISREG(metadata.st_mode):
         raise PrivateStoreError("MCP OAuth token record is not a regular file")
     return metadata
+
+
+def _atomic_replace(store_descriptor: int, name: str, payload: bytes) -> None:
+    _require_regular_or_missing(store_descriptor, name)
+    temporary_name = f".{name}.{secrets.token_hex(16)}.tmp"
+    descriptor = -1
+    created = False
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | _close_on_exec_flag()
+            | _nofollow_flag()
+        )
+        descriptor = os.open(
+            temporary_name,
+            flags,
+            0o600,
+            dir_fd=store_descriptor,
+        )
+        created = True
+        _fchmod(descriptor, 0o600)
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        _require_regular_or_missing(store_descriptor, name)
+        os.rename(
+            temporary_name,
+            name,
+            src_dir_fd=store_descriptor,
+            dst_dir_fd=store_descriptor,
+        )
+        _sync_directory(store_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if created:
+            try:
+                os.unlink(temporary_name, dir_fd=store_descriptor)
+            except FileNotFoundError:
+                pass
 
 
 def _read_bounded(descriptor: int, max_bytes: int) -> bytes:
