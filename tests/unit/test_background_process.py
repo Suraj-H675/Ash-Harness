@@ -127,10 +127,10 @@ async def test_background_process_forwards_allowlisted_environment(
         await asyncio.sleep(0.02)
         polled = await tool.run(action="poll", job_id=job_id)
         output += polled.output
-        if "4312\nmissing" in output:
+        if "4312\nmissing" in output.replace("\r\n", "\n"):
             break
 
-    assert "4312\nmissing" in output
+    assert "4312\nmissing" in output.replace("\r\n", "\n")
     await tool.aclose()
 
 
