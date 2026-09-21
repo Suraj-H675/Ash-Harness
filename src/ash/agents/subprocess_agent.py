@@ -190,14 +190,15 @@ class SubprocessAgent:
 
     # --- in-process execution ------------------------------------------
 
-    async def run_in_process(self) -> AgentReport:
+    async def run_in_process(self, *, publish_report: bool = True) -> AgentReport:
         """
-        Execute the agent in the current process and publish a report.
+        Execute the agent in the current process and optionally publish its report.
 
         The agent's status is updated through ``idle`` → ``working``
         → ``completed``/``failed`` so the orchestrator can poll. The
-        final report is also pushed to the IPC channel addressed to
-        the lead agent (``"lead"`` by default).
+        final report is also pushed to the IPC channel addressed to the lead
+        agent unless publication is deferred until a caller-owned durable
+        transaction completes.
         """
 
         self.register()
@@ -221,9 +222,6 @@ class SubprocessAgent:
             )
             raise
         except Exception as exc:  # noqa: BLE001
-            self.shared_state.update_status(
-                self.agent_id, "failed", current_task=str(exc)
-            )
             report = AgentReport(
                 agent_id=self.agent_id,
                 role=self.role,
@@ -234,19 +232,25 @@ class SubprocessAgent:
             )
         else:
             report = _coerce_report(result, self)
-            status = "completed" if report.success else "failed"
-            self.shared_state.update_status(
-                self.agent_id, status, current_task=report.summary[:200]
-            )
+        if publish_report:
+            self.publish_report(report)
+        return report
 
-        # Push the report to the IPC channel.
+    def publish_report(self, report: AgentReport) -> None:
+        """Publish a finalized in-process report to status and IPC state."""
+
+        status = "completed" if report.success else "failed"
+        self.shared_state.update_status(
+            self.agent_id,
+            status,
+            current_task=report.summary[:200],
+        )
         self.shared_state.send_message(
             sender_id=self.agent_id,
             recipient_id="lead",
             message_type="agent_report",
             content=_report_to_payload(report),
         )
-        return report
 
     # --- subprocess execution -----------------------------------------
 

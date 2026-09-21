@@ -8,13 +8,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from ash.agents.shared_state import SharedState
+from ash.agents.tasks import AgentTaskError
 from ash.config import AshConfig
+from ash.core.loop import AshLoop
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.grants import PermissionRule, build_exact_scope_matchers
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy
-from ash.tools.agent import SpawnAgentTool
+from ash.tools.agent import SpawnAgentTool, _AgentLeaseHeartbeat
 from ash.tools.base import ToolResult
 
 
@@ -53,6 +55,192 @@ async def test_spawn_agent_uses_provider_and_persists_report(tmp_path) -> None:
     ]
     assert all(event["task_id"] == durable[0].task_id for event in emitted)
     await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_lease_survives_post_turn_cleanup(tmp_path, monkeypatch) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        FakeProvider,
+        config=AshConfig(workspace_root=tmp_path, memory_backend="off"),
+    )
+    tool._task_lease_seconds = 1.0
+    original_aclose = AshLoop.aclose
+
+    async def slow_aclose(loop: AshLoop) -> None:
+        await asyncio.sleep(1.2)
+        await original_aclose(loop)
+
+    monkeypatch.setattr(AshLoop, "aclose", slow_aclose)
+    try:
+        result = await tool.run(
+            role="reviewer",
+            task="inspect tests",
+            agent_id="slow-cleanup-worker",
+            isolation="shared",
+        )
+
+        assert result.success is True
+        durable = state.tasks.list_tasks()
+        assert len(durable) == 1
+        assert durable[0].state == "succeeded"
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_lease_heartbeat_survives_event_loop_stall(tmp_path) -> None:
+    class BlockingProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            assert messages[-1]["content"] == "inspect tests"
+            time.sleep(1.2)
+            yield StreamChunk(content="evidence: tests pass", is_done=True)
+
+    state = SharedState(tmp_path / "agents.db")
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        BlockingProvider,
+        config=AshConfig(workspace_root=tmp_path, memory_backend="off"),
+    )
+    tool._task_lease_seconds = 1.0
+    try:
+        result = await tool.run(
+            role="reviewer",
+            task="inspect tests",
+            agent_id="blocking-worker",
+            isolation="shared",
+        )
+
+        assert result.success is True
+        durable = state.tasks.list_tasks()
+        assert len(durable) == 1
+        assert durable[0].state == "succeeded"
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_lease_loss_cancels_without_publishing_report(
+    tmp_path, monkeypatch
+) -> None:
+    class WaitingProvider(FakeProvider):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.started.set()
+            await asyncio.sleep(10)
+            yield StreamChunk(content="late success", is_done=True)
+
+    provider = WaitingProvider()
+    state = SharedState(tmp_path / "agents.db")
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        lambda: provider,
+        config=AshConfig(workspace_root=tmp_path, memory_backend="off"),
+    )
+    tool._task_lease_seconds = 1.0
+    original_renew = state.tasks.renew_lease
+    renew_calls = 0
+
+    def lose_lease(*args, **kwargs):
+        nonlocal renew_calls
+        renew_calls += 1
+        if renew_calls > 1:
+            raise AgentTaskError("forced heartbeat lease loss")
+        return original_renew(*args, **kwargs)
+
+    monkeypatch.setattr(state.tasks, "renew_lease", lose_lease)
+    execution = asyncio.create_task(
+        tool.run(
+            role="reviewer",
+            task="inspect tests",
+            agent_id="lease-loss-worker",
+            isolation="shared",
+        )
+    )
+    try:
+        await asyncio.wait_for(provider.started.wait(), timeout=2)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(execution, timeout=2)
+
+        reports = [
+            message
+            for message in state.fetch_messages("lead", undelivered_only=False)
+            if message.message_type == "agent_report"
+        ]
+        assert reports == []
+
+        await asyncio.sleep(1.1)
+        state.tasks.recover_expired()
+        durable = state.tasks.list_tasks()[0]
+        assert durable.state == "failed"
+        assert (
+            durable.error
+            == "worker lease expired after execution began; automatic retry suppressed"
+        )
+    finally:
+        if not execution.done():
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_lease_terminalization_serializes_with_renewal(
+    tmp_path, monkeypatch
+) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    state.tasks.create_task("race", task_id="lease-race")
+    lease = state.tasks.claim_task("worker", task_id="lease-race", lease_seconds=1)
+    assert lease is not None
+    state.tasks.start_task("lease-race", lease.token)
+
+    original_renew = state.tasks.renew_lease
+    renewal_started = threading.Event()
+    release_renewal = threading.Event()
+    renew_calls = 0
+
+    def blocked_renew(*args, **kwargs):
+        nonlocal renew_calls
+        renew_calls += 1
+        if renew_calls > 1:
+            renewal_started.set()
+            assert release_renewal.wait(timeout=2)
+        return original_renew(*args, **kwargs)
+
+    monkeypatch.setattr(state.tasks, "renew_lease", blocked_renew)
+    heartbeat = _AgentLeaseHeartbeat(
+        state.tasks,
+        "lease-race",
+        lease.token,
+        lease_seconds=1,
+    )
+    heartbeat.start()
+    try:
+        assert await asyncio.to_thread(renewal_started.wait, 2)
+        terminal = asyncio.create_task(
+            asyncio.to_thread(
+                heartbeat.finalize,
+                lambda: state.tasks.complete_task("lease-race", lease.token, {}),
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert terminal.done() is False
+
+        release_renewal.set()
+        completed = await asyncio.wait_for(terminal, timeout=2)
+        assert completed.state == "succeeded"
+    finally:
+        release_renewal.set()
+        await heartbeat.aclose()
+
+    assert heartbeat.error is None
+    assert state.tasks.get_task("lease-race").state == "succeeded"
 
 
 @pytest.mark.asyncio

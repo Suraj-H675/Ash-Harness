@@ -409,8 +409,8 @@ class AgentTaskStore:
             raise ValueError("lease_seconds must be between 1 and 3600")
         token = secrets.token_urlsafe(32)
         token_hash = _token_hash(token)
-        now = time.time()
         with self._transaction():
+            now = time.time()
             self._recover_expired_locked(now)
             self._fail_dependency_blocked_locked(now)
             active = int(
@@ -491,8 +491,8 @@ class AgentTaskStore:
         ):
             raise ValueError("lease_seconds must be between 1 and 3600")
         identifier = _identifier(task_id, "task id")
-        now = time.time()
         with self._transaction():
+            now = time.time()
             self._owned_row(identifier, token, now)
             self._conn.execute(
                 "UPDATE agent_tasks SET lease_expires_at = ?, updated_at = ? WHERE task_id = ?",
@@ -504,8 +504,8 @@ class AgentTaskStore:
         """Fence automatic lease-expiry replay once execution may have side effects."""
 
         identifier = _identifier(task_id, "task id")
-        now = time.time()
         with self._transaction():
+            now = time.time()
             row = self._owned_row(identifier, token, now)
             if row["state"] != "running":
                 raise AgentTaskError(
@@ -584,9 +584,9 @@ class AgentTaskStore:
         cost_usd: float = 0.0,
     ) -> AgentTask:
         identifier = _identifier(task_id, "task id")
-        now = time.time()
         exceeded_error: str | None = None
         with self._transaction():
+            now = time.time()
             row = self._owned_row(identifier, token, now)
             used = int(row["used_tokens"]) + token_count
             used_cost = float(row["used_cost_usd"]) + cost_usd
@@ -846,6 +846,43 @@ class AgentTaskStore:
             error=error,
             retryable=retryable,
         )
+
+    def cancel_owned_task(
+        self,
+        task_id: str,
+        token: str,
+        *,
+        reason: str = "cancelled",
+    ) -> list[str]:
+        """Cancel one leased task graph only while this token still owns the root."""
+
+        identifier = _identifier(task_id, "task id")
+        reason = _bounded_text(reason, "cancellation reason", 4096)
+        with self._transaction():
+            now = time.time()
+            self._owned_row(identifier, token, now)
+            rows = self._conn.execute(
+                """
+                WITH RECURSIVE descendants(task_id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT dependency.task_id
+                    FROM agent_task_dependencies AS dependency
+                    JOIN descendants
+                      ON dependency.depends_on_task_id = descendants.task_id
+                )
+                SELECT task_id FROM descendants
+                """,
+                (identifier,),
+            ).fetchall()
+            task_ids = [str(row["task_id"]) for row in rows]
+            self._cancel_task_ids_locked(
+                task_ids,
+                reason,
+                now,
+                root_task_id=identifier,
+            )
+        return task_ids
 
     def cancel_task(self, task_id: str, *, reason: str = "cancelled") -> list[str]:
         identifier = _identifier(task_id, "task id")
@@ -1145,8 +1182,8 @@ class AgentTaskStore:
         self, task_id: str, token: str, source: TaskState, target: TaskState
     ) -> AgentTask:
         identifier = _identifier(task_id, "task id")
-        now = time.time()
         with self._transaction():
+            now = time.time()
             row = self._owned_row(identifier, token, now)
             if row["state"] != source:
                 raise AgentTaskError(
@@ -1179,8 +1216,8 @@ class AgentTaskStore:
         identifier = _identifier(task_id, "task id")
         result_json = _bounded_json(result or {}, "task result") if success else None
         error_text = _bounded_text(error or "task failed", "task error", 16_384)
-        now = time.time()
         with self._transaction():
+            now = time.time()
             row = self._owned_row(identifier, token, now)
             if row["state"] not in ACTIVE_TASK_STATES:
                 raise AgentTaskError(f"task {identifier!r} is not active")

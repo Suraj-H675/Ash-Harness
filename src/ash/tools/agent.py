@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import sys
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,12 @@ from ash.agents.approval_channel import (
     ApprovalRuleDelta,
     ForegroundApprovalServer,
 )
-from ash.agents.tasks import AgentTask, AgentTaskBudgetExceeded, AgentTaskError
+from ash.agents.tasks import (
+    AgentTask,
+    AgentTaskBudgetExceeded,
+    AgentTaskError,
+    AgentTaskStore,
+)
 from ash.agents.subprocess_agent import (
     AGENT_ROLES,
     AgentReport,
@@ -97,6 +103,146 @@ async def _settle_spawn_cleanup_task(
     except BaseException as exc:
         return exc, interrupted
     return None, interrupted
+
+
+class _AgentLeaseHeartbeat:
+    """Renew and finalize one durable agent lease outside the asyncio loop."""
+
+    def __init__(
+        self,
+        store: AgentTaskStore,
+        task_id: str,
+        token: str,
+        *,
+        lease_seconds: float,
+    ) -> None:
+        self._store = store
+        self._task_id = task_id
+        self._token = token
+        self._lease_seconds = lease_seconds
+        self._interval = min(max(lease_seconds / 3, 0.25), 20.0)
+        self._stop = threading.Event()
+        self._operation_lock = threading.Lock()
+        self._binding_lock = threading.Lock()
+        self._bound_task: asyncio.Task[Any] | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"ash-agent-lease-{task_id}",
+            daemon=True,
+        )
+        self._started = False
+        self._error: Exception | None = None
+        self._terminalized = False
+
+    def start(self) -> None:
+        with self._operation_lock:
+            self._store.renew_lease(
+                self._task_id,
+                self._token,
+                lease_seconds=self._lease_seconds,
+            )
+        self._thread.start()
+        self._started = True
+
+    def bind(self, task: asyncio.Task[Any]) -> None:
+        with self._binding_lock:
+            self._bound_task = task
+            lost = self._error is not None and not self._terminalized
+        if lost:
+            self._schedule_bound_cancellation()
+
+    def finalize(self, operation: Callable[[], Any]) -> Any:
+        """Serialize one token-fenced terminal write against lease renewal."""
+
+        with self._operation_lock:
+            if self._error is not None:
+                raise AgentTaskError("subagent lease heartbeat lost ownership") from (
+                    self._error
+                )
+            result = operation()
+            self._terminalized = True
+            self._stop.set()
+            return result
+
+    def operate(
+        self,
+        operation: Callable[[], Any],
+        *,
+        terminal_on: tuple[type[BaseException], ...] = (),
+    ) -> Any:
+        """Serialize an owned mutation and recognize terminalizing exceptions."""
+
+        with self._operation_lock:
+            if self._error is not None:
+                raise AgentTaskError("subagent lease heartbeat lost ownership") from (
+                    self._error
+                )
+            try:
+                return operation()
+            except BaseException as exc:
+                if terminal_on and isinstance(exc, terminal_on):
+                    self._terminalized = True
+                    self._stop.set()
+                raise
+
+    @property
+    def terminalized(self) -> bool:
+        with self._operation_lock:
+            return self._terminalized
+
+    @property
+    def error(self) -> Exception | None:
+        with self._operation_lock:
+            return self._error
+
+    async def aclose(self) -> None:
+        self._stop.set()
+        if not self._started:
+            return
+        join_task = asyncio.create_task(
+            asyncio.to_thread(self._thread.join),
+            name=f"ash-agent-lease-join-{self._task_id}",
+        )
+        error, interrupted = await _settle_spawn_cleanup_task(join_task)
+        if error is not None:
+            raise error
+        if interrupted:
+            raise asyncio.CancelledError
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            with self._operation_lock:
+                if self._stop.is_set() or self._terminalized:
+                    return
+                try:
+                    self._store.renew_lease(
+                        self._task_id,
+                        self._token,
+                        lease_seconds=self._lease_seconds,
+                    )
+                except Exception as exc:  # noqa: BLE001 - fenced below
+                    self._error = exc
+                    self._stop.set()
+                else:
+                    continue
+            self._schedule_bound_cancellation()
+            return
+
+    def _schedule_bound_cancellation(self) -> None:
+        with self._binding_lock:
+            task = self._bound_task
+        if task is None or task.done():
+            return
+        try:
+            task.get_loop().call_soon_threadsafe(self._cancel_current_binding)
+        except RuntimeError:
+            return
+
+    def _cancel_current_binding(self) -> None:
+        with self._binding_lock:
+            task = self._bound_task
+        if task is not None and not task.done():
+            task.cancel()
 
 
 class SpawnAgentArgs(BaseModel):
@@ -1051,6 +1197,17 @@ class SpawnAgentTool(BaseTool):
             owner_agent_id=agent_id,
             attempt=durable_lease.task.attempt,
         )
+        lease_heartbeat = _AgentLeaseHeartbeat(
+            self._shared_state.tasks,
+            durable_task.task_id,
+            durable_lease.token,
+            lease_seconds=self._task_lease_seconds,
+        )
+        supervisor_task = asyncio.current_task()
+        if supervisor_task is None:  # pragma: no cover - async runtime invariant
+            raise RuntimeError("subagent execution requires an asyncio task")
+        lease_heartbeat.bind(supervisor_task)
+        lease_heartbeat.start()
 
         isolation = args.isolation
         if isolation == "auto":
@@ -1088,18 +1245,30 @@ class SpawnAgentTool(BaseTool):
                         )
                     except WorktreeError:
                         pass
-                self._shared_state.tasks.cancel_task(
-                    durable_task.task_id,
-                    reason="subagent spawn cancelled during worktree creation",
-                )
-                self._emit_task_lifecycle(
-                    "agent.task.cancelled",
-                    durable_task.task_id,
-                    state="cancelled",
-                    reason="subagent spawn cancelled during worktree creation",
-                )
+                cancelled = False
+                try:
+                    lease_heartbeat.finalize(
+                        lambda: self._shared_state.tasks.cancel_owned_task(
+                            durable_task.task_id,
+                            durable_lease.token,
+                            reason="subagent spawn cancelled during worktree creation",
+                        )
+                    )
+                    cancelled = True
+                except AgentTaskError:
+                    pass
+                finally:
+                    await lease_heartbeat.aclose()
+                if cancelled:
+                    self._emit_task_lifecycle(
+                        "agent.task.cancelled",
+                        durable_task.task_id,
+                        state="cancelled",
+                        reason="subagent spawn cancelled during worktree creation",
+                    )
                 raise
             except WorktreeError as exc:
+                failure_reason = f"worktree preparation failed: {exc}"
                 if lease is not None:
                     try:
                         await worktree_manager.remove(
@@ -1109,12 +1278,17 @@ class SpawnAgentTool(BaseTool):
                         )
                     except WorktreeError:
                         pass
-                failed = self._shared_state.tasks.fail_task(
-                    durable_task.task_id,
-                    durable_lease.token,
-                    f"worktree preparation failed: {exc}",
-                    retryable=lease is None,
-                )
+                try:
+                    failed = lease_heartbeat.finalize(
+                        lambda: self._shared_state.tasks.fail_task(
+                            durable_task.task_id,
+                            durable_lease.token,
+                            failure_reason,
+                            retryable=lease is None,
+                        )
+                    )
+                finally:
+                    await lease_heartbeat.aclose()
                 self._emit_task_lifecycle(
                     (
                         "agent.task.retrying"
@@ -1123,7 +1297,7 @@ class SpawnAgentTool(BaseTool):
                     ),
                     durable_task.task_id,
                     state=failed.state,
-                    reason=f"worktree preparation failed: {exc}",
+                    reason=failure_reason,
                 )
                 return ToolResult(
                     success=False,
@@ -1169,6 +1343,7 @@ class SpawnAgentTool(BaseTool):
                     agent_id=context["agent_id"],
                     durable_task_id=durable_task.task_id,
                     durable_lease_token=durable_lease.token,
+                    lease_heartbeat=lease_heartbeat,
                     token_budget=task_token_budget,
                     time_budget_seconds=task_time_budget,
                     dependency_context=dependency_context,
@@ -1180,11 +1355,14 @@ class SpawnAgentTool(BaseTool):
                 artifacts["completion_tokens"] = completion_tokens
                 artifacts["cost_usd"] = task_cost_usd
                 try:
-                    self._shared_state.tasks.record_usage(
-                        durable_task.task_id,
-                        durable_lease.token,
-                        token_count=completion_tokens,
-                        cost_usd=task_cost_usd,
+                    lease_heartbeat.operate(
+                        lambda: self._shared_state.tasks.record_usage(
+                            durable_task.task_id,
+                            durable_lease.token,
+                            token_count=completion_tokens,
+                            cost_usd=task_cost_usd,
+                        ),
+                        terminal_on=(AgentTaskBudgetExceeded,),
                     )
                 except AgentTaskBudgetExceeded as exc:
                     summary = f"{summary}\n{exc}"
@@ -1267,23 +1445,34 @@ class SpawnAgentTool(BaseTool):
 
         async def execute_agent() -> AgentReport:
             try:
-                report = await agent.run_in_process()
-                current = self._shared_state.tasks.get_task(durable_task.task_id)
-                if current is not None and current.state in {"leased", "running"}:
-                    if report.success:
-                        self._shared_state.tasks.complete_task(
+                report = await agent.run_in_process(publish_report=False)
+                if lease_heartbeat.terminalized:
+                    terminal = self._shared_state.tasks.get_task(durable_task.task_id)
+                    if terminal is None or terminal.state not in {
+                        "succeeded",
+                        "failed",
+                        "cancelled",
+                    }:
+                        raise AgentTaskError(
+                            "subagent lease terminalized without a durable terminal task"
+                        )
+                elif report.success:
+                    lease_heartbeat.finalize(
+                        lambda: self._shared_state.tasks.complete_task(
                             durable_task.task_id,
                             durable_lease.token,
                             agent.report_to_payload(report),
                         )
-                        self._emit_task_lifecycle(
-                            "agent.task.succeeded",
-                            durable_task.task_id,
-                            state="succeeded",
-                            owner_agent_id=agent_id,
-                        )
-                    else:
-                        failed = self._shared_state.tasks.fail_task(
+                    )
+                    self._emit_task_lifecycle(
+                        "agent.task.succeeded",
+                        durable_task.task_id,
+                        state="succeeded",
+                        owner_agent_id=agent_id,
+                    )
+                else:
+                    failed = lease_heartbeat.finalize(
+                        lambda: self._shared_state.tasks.fail_task(
                             durable_task.task_id,
                             durable_lease.token,
                             report.summary,
@@ -1292,17 +1481,19 @@ class SpawnAgentTool(BaseTool):
                                 and not attempt_state["side_effect_dispatched"]
                             ),
                         )
-                        self._emit_task_lifecycle(
-                            (
-                                "agent.task.retrying"
-                                if failed.state == "queued"
-                                else "agent.task.failed"
-                            ),
-                            durable_task.task_id,
-                            state=failed.state,
-                            owner_agent_id=agent_id,
-                            reason=report.summary,
-                        )
+                    )
+                    self._emit_task_lifecycle(
+                        (
+                            "agent.task.retrying"
+                            if failed.state == "queued"
+                            else "agent.task.failed"
+                        ),
+                        durable_task.task_id,
+                        state=failed.state,
+                        owner_agent_id=agent_id,
+                        reason=report.summary,
+                    )
+                agent.publish_report(report)
                 branch = report.artifacts.get("branch")
                 commit = report.artifacts.get("commit")
                 if isinstance(branch, str) and isinstance(commit, str):
@@ -1331,40 +1522,58 @@ class SpawnAgentTool(BaseTool):
             except asyncio.CancelledError:
                 current_task = self._shared_state.tasks.get_task(durable_task.task_id)
                 cancellation_reason = (
-                    _PERSISTED_STOP_REASON
+                    str(current_task.error or "subagent execution cancelled")
                     if current_task is not None
                     and current_task.state == "cancelled"
-                    and current_task.error == _PERSISTED_STOP_REASON
+                    and current_task.attempt == durable_lease.task.attempt
                     else "subagent execution cancelled"
                 )
-                self._shared_state.tasks.cancel_task(
-                    durable_task.task_id,
-                    reason=cancellation_reason,
+                cancelled_here = False
+                if not lease_heartbeat.terminalized:
+                    try:
+                        lease_heartbeat.finalize(
+                            lambda: self._shared_state.tasks.cancel_owned_task(
+                                durable_task.task_id,
+                                durable_lease.token,
+                                reason=cancellation_reason,
+                            )
+                        )
+                        cancelled_here = True
+                    except AgentTaskError:
+                        pass
+                current_task = self._shared_state.tasks.get_task(durable_task.task_id)
+                same_attempt_cancelled = (
+                    current_task is not None
+                    and current_task.state == "cancelled"
+                    and current_task.attempt == durable_lease.task.attempt
                 )
-                self._emit_task_lifecycle(
-                    "agent.task.cancelled",
-                    durable_task.task_id,
-                    state="cancelled",
-                    reason=cancellation_reason,
-                )
-                self._shared_state.update_status(
-                    agent_id,
-                    "failed",
-                    current_task=cancellation_reason,
-                )
+                if cancelled_here or same_attempt_cancelled:
+                    self._emit_task_lifecycle(
+                        "agent.task.cancelled",
+                        durable_task.task_id,
+                        state="cancelled",
+                        reason=cancellation_reason,
+                    )
+                    self._shared_state.update_status(
+                        agent_id,
+                        "failed",
+                        current_task=cancellation_reason,
+                    )
                 raise
             except Exception as exc:
-                current = self._shared_state.tasks.get_task(durable_task.task_id)
-                if current is not None and current.state in {"leased", "running"}:
+                failure_reason = f"subagent execution failed: {exc}"
+                if not lease_heartbeat.terminalized:
                     try:
-                        failed = self._shared_state.tasks.fail_task(
-                            durable_task.task_id,
-                            durable_lease.token,
-                            f"subagent execution failed: {exc}",
-                            retryable=(
-                                branch_state["commit"] is None
-                                and not attempt_state["side_effect_dispatched"]
-                            ),
+                        failed = lease_heartbeat.finalize(
+                            lambda: self._shared_state.tasks.fail_task(
+                                durable_task.task_id,
+                                durable_lease.token,
+                                failure_reason,
+                                retryable=(
+                                    branch_state["commit"] is None
+                                    and not attempt_state["side_effect_dispatched"]
+                                ),
+                            )
                         )
                         self._emit_task_lifecycle(
                             (
@@ -1374,7 +1583,7 @@ class SpawnAgentTool(BaseTool):
                             ),
                             durable_task.task_id,
                             state=failed.state,
-                            reason=f"subagent execution failed: {exc}",
+                            reason=failure_reason,
                         )
                     except AgentTaskError:
                         pass
@@ -1395,6 +1604,7 @@ class SpawnAgentTool(BaseTool):
                         # Preserve the original worker failure/cancellation. The
                         # locked worktree remains visible to `git worktree list`.
                         pass
+                await lease_heartbeat.aclose()
 
         if args.background:
             if wait_background:
@@ -1411,6 +1621,7 @@ class SpawnAgentTool(BaseTool):
                     error=None if report.success else report.summary,
                 )
             task = asyncio.create_task(execute_agent())
+            lease_heartbeat.bind(task)
             self._tasks[agent_id] = task
 
             def finish_background(completed: asyncio.Task[AgentReport]) -> None:
@@ -1448,6 +1659,7 @@ class SpawnAgentTool(BaseTool):
         agent_id: str,
         durable_task_id: str,
         durable_lease_token: str,
+        lease_heartbeat: _AgentLeaseHeartbeat,
         token_budget: int,
         time_budget_seconds: float,
         dependency_context: str,
@@ -1633,6 +1845,7 @@ class SpawnAgentTool(BaseTool):
                     turn,
                     durable_task_id=durable_task_id,
                     durable_lease_token=durable_lease_token,
+                    lease_heartbeat=lease_heartbeat,
                 )
             )
             try:
@@ -1863,25 +2076,16 @@ class SpawnAgentTool(BaseTool):
         *,
         durable_task_id: str,
         durable_lease_token: str,
+        lease_heartbeat: _AgentLeaseHeartbeat,
     ) -> None:
-        next_renewal = 0.0
         while not turn.done():
+            if lease_heartbeat.error is not None:
+                turn.cancel()
+                return
             durable_task = self._shared_state.tasks.get_task(durable_task_id)
             if durable_task is None or durable_task.state not in {"leased", "running"}:
                 turn.cancel()
                 return
-            now = asyncio.get_running_loop().time()
-            if now >= next_renewal:
-                try:
-                    self._shared_state.tasks.renew_lease(
-                        durable_task_id,
-                        durable_lease_token,
-                        lease_seconds=self._task_lease_seconds,
-                    )
-                except AgentTaskError:
-                    turn.cancel()
-                    return
-                next_renewal = now + max(1.0, self._task_lease_seconds / 3)
             messages = self._shared_state.fetch_messages(
                 agent_id,
                 undelivered_only=True,
@@ -1890,10 +2094,17 @@ class SpawnAgentTool(BaseTool):
             delivered: list[int] = []
             for message in messages:
                 if message.message_type == "stop":
-                    self._shared_state.tasks.cancel_task(
-                        durable_task_id,
-                        reason=_PERSISTED_STOP_REASON,
-                    )
+                    try:
+                        lease_heartbeat.finalize(
+                            lambda: self._shared_state.tasks.cancel_owned_task(
+                                durable_task_id,
+                                durable_lease_token,
+                                reason=_PERSISTED_STOP_REASON,
+                            )
+                        )
+                    except AgentTaskError:
+                        turn.cancel()
+                        return
                     self._shared_state.update_status(
                         agent_id,
                         "failed",

@@ -294,7 +294,7 @@ def test_extensions_cli_installs_https_git_plugin(
                 str(source),
                 args[-1],
             ]
-            if Path(args[0]).name == "git" and args[1:2] == ["clone"]
+            if Path(args[0]).stem.casefold() == "git" and args[1:2] == ["clone"]
             else args,
             **kwargs,
         ),

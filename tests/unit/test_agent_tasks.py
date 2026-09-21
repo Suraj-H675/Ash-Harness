@@ -1,5 +1,6 @@
 import json
 import math
+import threading
 import time
 from pathlib import Path
 
@@ -291,6 +292,99 @@ def test_stale_or_wrong_owner_cannot_complete(state: SharedState) -> None:
     state.tasks.cancel_task("owned")
     with pytest.raises(AgentTaskError, match="not actively leased"):
         state.tasks.complete_task("owned", lease.token, {})
+
+
+def test_owned_cancel_rejects_expired_and_reclaimed_lease(
+    state: SharedState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [time.time()]
+    monkeypatch.setattr("ash.agents.tasks.time.time", lambda: clock[0])
+    state.tasks.create_task("parent", task_id="owned-cancel", max_attempts=2)
+    state.tasks.create_task(
+        "child",
+        task_id="owned-cancel-child",
+        dependencies=["owned-cancel"],
+    )
+    first = state.tasks.claim_task(
+        "worker-a",
+        task_id="owned-cancel",
+        lease_seconds=1,
+    )
+    assert first is not None
+    state.tasks.start_task("owned-cancel", first.token)
+    clock[0] += 2
+
+    with pytest.raises(AgentTaskError, match="lease has expired"):
+        state.tasks.cancel_owned_task(
+            "owned-cancel",
+            first.token,
+            reason="stale worker stopped",
+        )
+
+    assert state.tasks.recover_expired() == ["owned-cancel"]
+    second = state.tasks.claim_task(
+        "worker-b",
+        task_id="owned-cancel",
+        lease_seconds=1,
+    )
+    assert second is not None
+    state.tasks.start_task("owned-cancel", second.token)
+
+    with pytest.raises(AgentTaskError, match="another lease"):
+        state.tasks.cancel_owned_task(
+            "owned-cancel",
+            first.token,
+            reason="stale worker stopped",
+        )
+    assert state.tasks.get_task("owned-cancel").owner_agent_id == "worker-b"
+    assert state.tasks.get_task("owned-cancel-child").state == "queued"
+
+    cancelled = state.tasks.cancel_owned_task(
+        "owned-cancel",
+        second.token,
+        reason="current worker stopped",
+    )
+    assert set(cancelled) == {"owned-cancel", "owned-cancel-child"}
+    assert state.tasks.get_task("owned-cancel").state == "cancelled"
+    assert state.tasks.get_task("owned-cancel-child").state == "cancelled"
+
+
+def test_owned_terminal_check_samples_time_after_transaction_lock(
+    state: SharedState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [time.time()]
+    monkeypatch.setattr("ash.agents.tasks.time.time", lambda: clock[0])
+    state.tasks.create_task("owned", task_id="lock-expiry")
+    lease = state.tasks.claim_task("worker", task_id="lock-expiry", lease_seconds=1)
+    assert lease is not None
+    state.tasks.start_task("lock-expiry", lease.token)
+
+    started = threading.Event()
+    errors: list[BaseException] = []
+
+    def complete_after_lock() -> None:
+        started.set()
+        try:
+            state.tasks.complete_task("lock-expiry", lease.token, {})
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+
+    state.tasks._lock.acquire()
+    worker = threading.Thread(target=complete_after_lock)
+    try:
+        worker.start()
+        assert started.wait(timeout=1)
+        time.sleep(0.05)
+        clock[0] += 2
+    finally:
+        state.tasks._lock.release()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], AgentTaskError)
+    assert "lease has expired" in str(errors[0])
+    assert state.tasks.get_task("lock-expiry").state == "running"
 
 
 def test_token_budget_fails_task_and_revokes_lease(state: SharedState) -> None:
