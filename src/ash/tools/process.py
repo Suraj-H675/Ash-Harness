@@ -97,6 +97,31 @@ async def _allow_natural_process_exit(
         await asyncio.sleep(0.01)
 
 
+async def _terminate_background_jobs(jobs: tuple["Job", ...]) -> list[BaseException]:
+    """Terminate background jobs while avoiding concurrent Windows taskkill races."""
+
+    failures: list[BaseException] = []
+    windows_jobs = tuple(job for job in jobs if job.process_tree_plan.is_windows)
+    other_jobs = tuple(job for job in jobs if not job.process_tree_plan.is_windows)
+    if other_jobs:
+        results = await asyncio.gather(
+            *(
+                terminate_process_tree(job.process, plan=job.process_tree_plan)
+                for job in other_jobs
+            ),
+            return_exceptions=True,
+        )
+        failures.extend(
+            result for result in results if isinstance(result, BaseException)
+        )
+    for job in windows_jobs:
+        try:
+            await terminate_process_tree(job.process, plan=job.process_tree_plan)
+        except BaseException as exc:
+            failures.append(exc)
+    return failures
+
+
 @dataclass
 class Job:
     job_id: str
@@ -442,26 +467,13 @@ class BackgroundProcessTool(BaseTool):
         )
         active_jobs = tuple(job for job in jobs if job.process.returncode is None)
         cleanup_results, cleanup_error, cleanup_cancelled = await _settle_cleanup(
-            asyncio.gather(
-                *(
-                    terminate_process_tree(
-                        job.process,
-                        plan=job.process_tree_plan,
-                    )
-                    for job in active_jobs
-                ),
-                return_exceptions=True,
-            )
+            _terminate_background_jobs(active_jobs)
         )
         failures: list[BaseException] = []
         if cleanup_error is not None:
             failures.append(cleanup_error)
         elif isinstance(cleanup_results, list):
-            failures.extend(
-                result
-                for result in cleanup_results
-                if isinstance(result, BaseException)
-            )
+            failures.extend(cleanup_results)
         if failures:
             for job in jobs:
                 for reader in job.readers:

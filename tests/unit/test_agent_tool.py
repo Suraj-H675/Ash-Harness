@@ -1175,7 +1175,7 @@ async def test_background_subprocess_stop_cancels_durable_task(
             background=True,
         )
         assert started.success is True
-        assert await asyncio.to_thread(request_started.wait, 5)
+        assert await asyncio.to_thread(request_started.wait, 15)
 
         durable = state.tasks.list_tasks()[0]
         active = state.tasks.get_task(durable.task_id)

@@ -114,6 +114,43 @@ async def test_background_process_close_allows_native_exit_notification(
 
 
 @pytest.mark.asyncio
+async def test_background_process_serializes_windows_tree_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    plan = ProcessTreePlan({}, "taskkill.exe", tmp_path, "win32")
+    for index in range(3):
+        tool.jobs[str(index)] = Job(
+            str(index),
+            "sleeping command",
+            Mock(pid=1000 + index, returncode=None),
+            plan,
+        )
+
+    async def skip_natural_exit(process: object) -> None:
+        del process
+
+    active = 0
+    max_active = 0
+
+    async def terminate(process: object, *, plan: ProcessTreePlan) -> None:
+        nonlocal active, max_active
+        del process, plan
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0)
+        active -= 1
+
+    monkeypatch.setattr("ash.tools.process._allow_natural_process_exit", skip_natural_exit)
+    monkeypatch.setattr("ash.tools.process.terminate_process_tree", terminate)
+
+    await tool.aclose()
+
+    assert max_active == 1
+
+
+@pytest.mark.asyncio
 async def test_background_process_applies_windows_shell_safety(
     tmp_path: Path,
 ) -> None:
