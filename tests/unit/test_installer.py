@@ -26,6 +26,11 @@ def _completed(returncode: int = 0, *, stdout: str = "", stderr: str = ""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _generated_ash_launcher(directory: str) -> str:
+    name = "ash.exe" if os.name == "nt" else "ash"
+    return str(Path(directory) / name)
+
+
 def test_existing_pipx_install_is_rebuilt_without_exposing_uv_edge_cases() -> None:
     calls: list[tuple[list[str], dict[str, object]]] = []
     metadata = json.dumps(
@@ -65,7 +70,7 @@ def test_existing_pipx_install_is_rebuilt_without_exposing_uv_edge_cases() -> No
         runner=runner,
         which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
         environ={
-            "PATH": "/isolated/bin:/usr/bin",
+            "PATH": f"/isolated/bin{os.pathsep}/usr/bin",
             "PIPX_BIN_DIR": "/isolated/bin",
         },
     )
@@ -119,7 +124,7 @@ def test_existing_pypi_style_pipx_spec_preserves_capability_extras() -> None:
         runner=runner,
         which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
         environ={
-            "PATH": "/isolated/bin:/usr/bin",
+            "PATH": f"/isolated/bin{os.pathsep}/usr/bin",
             "PIPX_BIN_DIR": "/isolated/bin",
         },
     )
@@ -168,7 +173,10 @@ def test_explicit_pipx_extra_is_additive_to_existing_capability_packs() -> None:
         extras=["server"],
         runner=runner,
         which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
-        environ={"PATH": "/isolated/bin:/usr/bin", "PIPX_BIN_DIR": "/isolated/bin"},
+        environ={
+            "PATH": f"/isolated/bin{os.pathsep}/usr/bin",
+            "PIPX_BIN_DIR": "/isolated/bin",
+        },
     )
 
     assert [
@@ -182,6 +190,7 @@ def test_explicit_pipx_extra_is_additive_to_existing_capability_packs() -> None:
 def test_uv_is_a_supported_fallback_when_pipx_is_unavailable() -> None:
     calls: list[list[str]] = []
     installed = False
+    launcher = _generated_ash_launcher("/isolated/bin")
 
     def runner(command, **kwargs):
         nonlocal installed
@@ -199,14 +208,14 @@ def test_uv_is_a_supported_fallback_when_pipx_is_unavailable() -> None:
             return _completed()
         if command[1:] == ["tool", "dir", "--bin"]:
             return _completed(stdout="/isolated/bin\n")
-        if command == ["/isolated/bin/ash", "--version"]:
+        if command == [launcher, "--version"]:
             return _completed(stdout="ash 0.1.0\n")
         raise AssertionError(f"unexpected command: {command}")
 
     outcome = install(
         runner=runner,
         which=lambda name: "/usr/bin/uv" if name == "uv" else None,
-        environ={"PATH": "/isolated/bin:/usr/bin"},
+        environ={"PATH": f"/isolated/bin{os.pathsep}/usr/bin"},
     )
 
     assert calls[1] == [
@@ -218,7 +227,7 @@ def test_uv_is_a_supported_fallback_when_pipx_is_unavailable() -> None:
         "ash-ai @ git+https://github.com/Suraj-H675/Ash-Harness.git",
     ]
     assert outcome.manager == "uv"
-    assert outcome.executable == "/isolated/bin/ash"
+    assert outcome.executable == launcher
 
 
 def test_uv_install_rejects_empty_reported_launcher_directory() -> None:
@@ -251,7 +260,7 @@ def test_uv_install_rejects_empty_reported_launcher_directory() -> None:
         install(
             runner=runner,
             which=lambda name: "/usr/bin/uv" if name == "uv" else None,
-            environ={"PATH": "/tmp/older-ash:/usr/bin"},
+            environ={"PATH": f"/tmp/older-ash{os.pathsep}/usr/bin"},
         )
 
     assert ["ash", "--version"] not in calls
@@ -273,6 +282,8 @@ def test_public_installer_turns_manager_failures_into_one_clear_message() -> Non
 
 
 def test_broken_pipx_metadata_recovers_executable_from_pipx_bin_directory() -> None:
+    launcher = _generated_ash_launcher("/isolated/bin")
+
     def runner(command, **kwargs):
         if command[1:] == ["list", "--json"]:
             return _completed(
@@ -297,17 +308,17 @@ def test_broken_pipx_metadata_recovers_executable_from_pipx_bin_directory() -> N
             return _completed()
         if command[1:] == ["environment", "--value", "PIPX_BIN_DIR"]:
             return _completed(stdout="/isolated/bin\n")
-        if command == ["/isolated/bin/ash", "--version"]:
+        if command == [launcher, "--version"]:
             return _completed(stdout="ash 0.1.0\n")
         raise AssertionError(f"unexpected command: {command}")
 
     outcome = install(
         runner=runner,
         which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
-        environ={"PATH": "/isolated/bin:/usr/bin"},
+        environ={"PATH": f"/isolated/bin{os.pathsep}/usr/bin"},
     )
 
-    assert outcome.executable == "/isolated/bin/ash"
+    assert outcome.executable == launcher
 
 
 def test_public_installer_rejects_unsupported_python_before_running_tools() -> None:
@@ -363,7 +374,7 @@ def test_existing_uv_install_keeps_manager_and_capability_extras() -> None:
             "pipx": "/usr/bin/pipx",
             "uv": "/usr/bin/uv",
         }.get(name),
-        environ={"PATH": "/isolated/bin:/usr/bin"},
+        environ={"PATH": f"/isolated/bin{os.pathsep}/usr/bin"},
     )
 
     assert [
@@ -415,7 +426,7 @@ def test_uv_state_scopes_extras_and_executable_to_ash_tool() -> None:
             "pipx": "/usr/bin/pipx",
             "uv": "/usr/bin/uv",
         }.get(name),
-        environ={"PATH": "/isolated/bin:/usr/bin"},
+        environ={"PATH": f"/isolated/bin{os.pathsep}/usr/bin"},
     )
 
     assert [
@@ -468,7 +479,7 @@ def test_uv_install_rejects_success_without_resulting_ash_state() -> None:
                 "pipx": "/usr/bin/pipx",
                 "uv": "/usr/bin/uv",
             }.get(name),
-            environ={"PATH": "/tmp/older-ash/bin:/usr/bin"},
+            environ={"PATH": f"/tmp/older-ash/bin{os.pathsep}/usr/bin"},
         )
 
     assert list_calls == 2
@@ -490,6 +501,7 @@ def test_public_installer_contains_process_start_errors() -> None:
 
 def test_unusable_pipx_binary_falls_back_to_uv() -> None:
     installed = False
+    launcher = _generated_ash_launcher("/isolated/bin")
 
     def runner(command, **kwargs):
         nonlocal installed
@@ -508,7 +520,7 @@ def test_unusable_pipx_binary_falls_back_to_uv() -> None:
             return _completed()
         if command[1:] == ["tool", "dir", "--bin"]:
             return _completed(stdout="/isolated/bin\n")
-        if command == ["/isolated/bin/ash", "--version"]:
+        if command == [launcher, "--version"]:
             return _completed(stdout="ash 0.1.0\n")
         raise AssertionError(f"unexpected command: {command}")
 
@@ -518,7 +530,7 @@ def test_unusable_pipx_binary_falls_back_to_uv() -> None:
             "pipx": "/broken/pipx",
             "uv": "/usr/bin/uv",
         }.get(name),
-        environ={"PATH": "/isolated/bin:/usr/bin"},
+        environ={"PATH": f"/isolated/bin{os.pathsep}/usr/bin"},
     )
 
     assert outcome.manager == "uv"
@@ -600,7 +612,7 @@ def test_installer_uses_exposed_pipx_launcher_directory_for_path_check() -> None
         runner=runner,
         which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
         environ={
-            "PATH": "/tmp/ash-user-bin:/usr/bin:/bin",
+            "PATH": f"/tmp/ash-user-bin{os.pathsep}/usr/bin{os.pathsep}/bin",
             "PIPX_BIN_DIR": "/tmp/ash-user-bin",
         },
     )
@@ -624,6 +636,7 @@ def test_installer_prefers_its_exposed_launcher_over_global_ash() -> None:
         }
     )
     calls: list[list[str]] = []
+    launcher = _generated_ash_launcher("/tmp/ash-user-bin")
 
     def runner(command, **kwargs):
         calls.append(list(command))
@@ -631,7 +644,7 @@ def test_installer_prefers_its_exposed_launcher_over_global_ash() -> None:
             return _completed(stdout=metadata)
         if command[1:3] == ["install", "--force"]:
             return _completed()
-        if command == ["/tmp/ash-user-bin/ash", "--version"]:
+        if command == [launcher, "--version"]:
             return _completed(stdout="ash 0.1.0\n")
         raise AssertionError(f"unexpected command: {command}")
 
@@ -642,13 +655,13 @@ def test_installer_prefers_its_exposed_launcher_over_global_ash() -> None:
             "ash": "/tmp/older-ash/bin/ash",
         }.get(name),
         environ={
-            "PATH": "/tmp/ash-user-bin:/usr/bin:/bin",
+            "PATH": f"/tmp/ash-user-bin{os.pathsep}/usr/bin{os.pathsep}/bin",
             "PIPX_BIN_DIR": "/tmp/ash-user-bin",
         },
     )
 
-    assert outcome.executable == "/tmp/ash-user-bin/ash"
-    assert ["/tmp/ash-user-bin/ash", "--version"] in calls
+    assert outcome.executable == launcher
+    assert [launcher, "--version"] in calls
     assert ["/tmp/older-ash/bin/ash", "--version"] not in calls
 
 
@@ -690,7 +703,7 @@ def test_pipx_install_does_not_verify_unowned_global_ash() -> None:
                 "pipx": "/usr/bin/pipx",
                 "ash": "/tmp/older-ash/bin/ash",
             }.get(name),
-            environ={"PATH": "/tmp/older-ash/bin:/usr/bin"},
+            environ={"PATH": f"/tmp/older-ash/bin{os.pathsep}/usr/bin"},
         )
 
     assert ["/tmp/older-ash/bin/ash", "--version"] not in calls
