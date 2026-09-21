@@ -150,11 +150,11 @@ git revert HEAD and re-run the suite
         "JWT tokens expire after 1 hour",
         "All tests pass",
     )
-    assert [str(p) for p in contract.files_in_scope] == [
-        "auth/models.py",
-        "auth/views.py",
-    ]
-    assert [str(p) for p in contract.files_off_limits] == ["config/secrets.py"]
+    assert contract.files_in_scope == (
+        Path("auth/models.py"),
+        Path("auth/views.py"),
+    )
+    assert contract.files_off_limits == (Path("config/secrets.py"),)
     assert contract.test_command == "pytest tests/auth/"
     assert "git revert HEAD" in contract.rollback_plan
     assert exec.state == SprintState.PLANNING
