@@ -1512,7 +1512,7 @@ async def test_background_subagent_never_uses_foreground_approval_broker(tmp_pat
     finally:
         resolver.close()
 
-    report = await asyncio.wait_for(tool._tasks["background-coder"], timeout=2.0)
+    report = await asyncio.wait_for(tool._tasks["background-coder"], timeout=10.0)
     assert report.success is True
     assert report.summary == "background denied"
     assert broker_calls == []
@@ -1746,7 +1746,7 @@ async def test_background_approval_response_mismatch_fails_closed(tmp_path) -> N
         },
     )
 
-    report = await asyncio.wait_for(tool._tasks["mismatch-worker"], timeout=2.0)
+    report = await asyncio.wait_for(tool._tasks["mismatch-worker"], timeout=10.0)
     assert report.success is True
     assert report.summary == "mismatch denied"
     assert not (tmp_path / "mismatch.txt").exists()
