@@ -9,6 +9,9 @@ def test_windows_environment_names_are_case_insensitive() -> None:
             "Path": r"C:\\tools",
             "WINDIR": r"C:\\Windows",
             "ComSpec": r"C:\\Windows\\System32\\cmd.exe",
+            "UserProfile": r"C:\\Users\\tester",
+            "HomeDrive": "C:",
+            "HomePath": r"\\Users\\tester",
             "lc_all": "C",
             "MY_ALLOWED_TOKEN": "allowed",
             "UNRELATED_SECRET": "drop-me",
@@ -21,6 +24,9 @@ def test_windows_environment_names_are_case_insensitive() -> None:
     assert environment["Path"] == r"C:\\tools"
     assert environment["WINDIR"] == r"C:\\Windows"
     assert environment["ComSpec"].endswith("cmd.exe")
+    assert environment["UserProfile"] == r"C:\\Users\\tester"
+    assert environment["HomeDrive"] == "C:"
+    assert environment["HomePath"] == r"\\Users\\tester"
     assert environment["lc_all"] == "C"
     assert environment["MY_ALLOWED_TOKEN"] == "allowed"
     assert "UNRELATED_SECRET" not in environment

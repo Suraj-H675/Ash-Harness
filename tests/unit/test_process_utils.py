@@ -269,7 +269,7 @@ def test_windows_tree_preflight_retains_resolved_backend(
         patch("ash.sandbox.process_utils.sys.platform", "win32"),
         patch.object(subprocess, "CREATE_NEW_PROCESS_GROUP", 512, create=True),
         patch(
-            "ash.sandbox.process_utils.resolve_host_executable",
+            "ash.sandbox.process_utils._resolve_windows_taskkill",
             return_value="C:/Windows/System32/taskkill.exe",
         ),
     ):

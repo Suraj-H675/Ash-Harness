@@ -79,9 +79,7 @@ def prepare_process_tree(
     platform_name = sys.platform
     taskkill_path: str | None = None
     if platform_name == "win32":
-        taskkill_path = resolve_host_executable(
-            "taskkill", workspace_root=workspace, cwd=workspace
-        )
+        taskkill_path = _resolve_windows_taskkill(workspace)
         if taskkill_path is None:
             raise ProcessTreeUnavailable(
                 "reliable Windows descendant cleanup is unavailable: "
@@ -92,6 +90,36 @@ def prepare_process_tree(
         taskkill_path=taskkill_path,
         workspace_root=workspace,
         platform=platform_name,
+    )
+
+
+def _resolve_windows_taskkill(workspace: Path) -> str | None:
+    """Resolve the trusted Windows taskkill executable without workspace shadowing."""
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            win_dll: Any = getattr(ctypes, "WinDLL")
+            kernel32: Any = win_dll("kernel32", use_last_error=True)
+            get_system_directory: Any = kernel32.GetSystemDirectoryW
+            get_system_directory.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+            get_system_directory.restype = wintypes.UINT
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = int(get_system_directory(buffer, len(buffer)))
+            if 0 < length < len(buffer):
+                candidate = (Path(buffer.value) / "taskkill.exe").resolve()
+                if (
+                    candidate.is_file()
+                    and not is_relative_to(candidate, workspace)
+                ):
+                    return str(candidate)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    return resolve_host_executable(
+        "taskkill", workspace_root=workspace, cwd=workspace
     )
 
 
