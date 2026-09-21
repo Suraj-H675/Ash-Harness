@@ -273,7 +273,7 @@ async def test_run_git_uses_supplied_sandbox_manager(
     assert stderr == ""
     command = manager.run.await_args.args[0]
     if expected_executable is None:
-        assert Path(command[0]).name == "git"
+        assert Path(command[0]).stem.casefold() == "git"
         assert Path(command[0]).is_absolute()
     else:
         assert command[0] == expected_executable

@@ -330,6 +330,7 @@ async def test_foreground_read_only_agent_can_run_provider_in_subprocess(
         db_directory=tmp_path / "db",
         model="openai/child-model",
         agent_execution_mode="subprocess",
+        provider_max_attempts=1,
         memory_backend="off",
     )
     tool = SpawnAgentTool(
@@ -965,6 +966,7 @@ async def test_background_agent_runs_provider_in_subprocess(tmp_path, monkeypatc
         db_directory=tmp_path / "db",
         model="openai/background-model",
         agent_execution_mode="subprocess",
+        provider_max_attempts=1,
         memory_backend="off",
     )
     tool = SpawnAgentTool(

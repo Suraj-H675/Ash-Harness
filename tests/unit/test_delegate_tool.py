@@ -238,6 +238,7 @@ async def test_delegate_agents_runs_provider_in_subprocess(
         max_concurrent_agents=2,
         agent_token_budget=100,
         agent_time_budget_seconds=10,
+        provider_max_attempts=1,
         memory_backend="off",
     )
     db_path = config.db_directory / "agents.db"
