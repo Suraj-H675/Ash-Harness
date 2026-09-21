@@ -33,6 +33,56 @@ SAFE_ENV_KEYS = frozenset(
 SAFE_ENV_PREFIXES = ("LC_",)
 
 
+def _environment_name_key(name: str, *, platform_name: str) -> str:
+    return name.casefold() if platform_name == "nt" else name
+
+
+def _build_environment_mapping(
+    source: Mapping[str, str],
+    allowed_names: Iterable[str],
+    *,
+    overrides: Mapping[str, str] | None,
+    platform_name: str,
+) -> dict[str, str]:
+    allowed = {
+        _environment_name_key(name, platform_name=platform_name)
+        for name in allowed_names
+    }
+    safe_keys = {
+        _environment_name_key(name, platform_name=platform_name)
+        for name in SAFE_ENV_KEYS
+    }
+    safe_prefixes = tuple(
+        _environment_name_key(prefix, platform_name=platform_name)
+        for prefix in SAFE_ENV_PREFIXES
+    )
+    environment: dict[str, str] = {}
+    for key, value in source.items():
+        normalized = _environment_name_key(key, platform_name=platform_name)
+        if (
+            normalized in safe_keys
+            or any(normalized.startswith(prefix) for prefix in safe_prefixes)
+            or normalized in allowed
+        ):
+            environment[key] = value
+
+    path_key = _environment_name_key("PATH", platform_name=platform_name)
+    if not any(
+        _environment_name_key(key, platform_name=platform_name) == path_key
+        for key in environment
+    ):
+        environment["PATH"] = os.defpath
+
+    for key, value in (overrides or {}).items():
+        normalized = _environment_name_key(key, platform_name=platform_name)
+        if platform_name == "nt":
+            for existing in tuple(environment):
+                if _environment_name_key(existing, platform_name=platform_name) == normalized:
+                    environment.pop(existing)
+        environment[key] = value
+    return environment
+
+
 def build_scrubbed_environment(
     allowed_names: Iterable[str] = (),
     *,
@@ -40,18 +90,12 @@ def build_scrubbed_environment(
 ) -> dict[str, str]:
     """Return operational variables, explicit names, and explicit overrides."""
 
-    allowed = set(allowed_names)
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key in SAFE_ENV_KEYS
-        or any(key.startswith(prefix) for prefix in SAFE_ENV_PREFIXES)
-        or key in allowed
-    }
-    if "PATH" not in environment:
-        environment["PATH"] = os.defpath
-    environment.update(overrides or {})
-    return environment
+    return _build_environment_mapping(
+        os.environ,
+        allowed_names,
+        overrides=overrides,
+        platform_name=os.name,
+    )
 
 
 def resolve_host_executable(
