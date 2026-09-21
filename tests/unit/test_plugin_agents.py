@@ -12,6 +12,7 @@ from ash.plugins.agents import (
     AgentDefinition,
     AgentSource,
     parse_agent_definition,
+    parse_agent_definition_bytes,
 )
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
@@ -88,6 +89,18 @@ def test_agent_definition_rejects_conflicting_role_aliases(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="conflicting agent metadata keys"):
         parse_agent_definition(path)
+
+
+def test_agent_definition_parses_crlf_frontmatter() -> None:
+    definition = parse_agent_definition_bytes(
+        b"---\r\ndescription: Review changes\r\nbase-role: reviewer\r\n---\r\n"
+        b"Review correctness.\r\n",
+        Path("reviewer.md"),
+    )
+
+    assert definition.description == "Review changes"
+    assert definition.base_role == "reviewer"
+    assert definition.instructions == "Review correctness."
 
 
 def test_agent_catalog_bounds_recursive_discovery(tmp_path: Path, monkeypatch) -> None:

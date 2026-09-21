@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -7,6 +9,29 @@ import pytest
 from ash.cli import main
 from ash.config import AshConfig
 from ash.logging import configure_logging, get_logger
+
+
+def test_configure_logging_does_not_retain_replaced_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_stderr = sys.stderr
+    first = io.StringIO()
+    second = io.StringIO()
+    try:
+        monkeypatch.setattr(sys, "stderr", first)
+        configure_logging(no_color=True)
+        get_logger("logging-lifecycle").warning("first message")
+        first.close()
+
+        monkeypatch.setattr(sys, "stderr", second)
+        get_logger("logging-lifecycle").warning("second message")
+
+        captured = second.getvalue()
+        assert "second message" in captured
+        assert "Logging error" not in captured
+    finally:
+        monkeypatch.setattr(sys, "stderr", original_stderr)
+        configure_logging(no_color=True)
 
 
 def test_ci_mode_requires_noninteractive_work(capsys) -> None:

@@ -83,6 +83,7 @@ def parse_agent_definition_bytes(
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("agent definition is not valid UTF-8") from exc
+    text = text.replace("\r\n", "\n")
     metadata: dict[str, str] = {}
     body = text
     if text.startswith("---\n"):

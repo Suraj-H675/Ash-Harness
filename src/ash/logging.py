@@ -18,6 +18,13 @@ from loguru import logger as _loguru_logger
 _logger: Any = None
 
 
+def _write_stderr(message: Any) -> None:
+    """Write through the current stderr instead of retaining a replaced stream."""
+
+    sys.stderr.write(str(message))
+    sys.stderr.flush()
+
+
 def _configure(*, no_color: bool = False) -> Any:
     """Configure loguru with Ash's preferred defaults."""
 
@@ -26,7 +33,7 @@ def _configure(*, no_color: bool = False) -> Any:
     # Write to stderr, with a format that distinguishes levels and
     # timestamps.  Colour is left to the terminal's own colour support.
     _loguru_logger.add(
-        sys.stderr,
+        _write_stderr,
         format="<level>{time:YYYY-MM-DD HH:mm:ss}</level> | <level>{level: <8}</level> | <level>{name}</level>:<level>{function}</level> — <level>{message}</level>",
         level="INFO",
         colorize=not no_color,
