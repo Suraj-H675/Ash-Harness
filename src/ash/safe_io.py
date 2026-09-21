@@ -29,6 +29,63 @@ def _fchmod_descriptor(descriptor: int, mode: int) -> None:
     fchmod(descriptor, mode)
 
 
+def _open_windows_replaceable_regular_file(path: Path) -> int:
+    """Create one Windows file handle that remains renameable while held open."""
+
+    if os.name != "nt":
+        raise OSError("Windows replaceable file open is unavailable on this platform")
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    win_dll: Any = getattr(ctypes, "WinDLL")
+    get_last_error: Any = getattr(ctypes, "get_last_error")
+    format_error: Any = getattr(ctypes, "FormatError")
+    open_osfhandle: Any = getattr(msvcrt, "open_osfhandle")
+    kernel32: Any = win_dll("kernel32", use_last_error=True)
+    create_file: Any = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+
+    generic_read = 0x80000000
+    generic_write = 0x40000000
+    file_share_delete = 0x00000004
+    create_new = 1
+    file_attribute_normal = 0x00000080
+    file_flag_open_reparse_point = 0x00200000
+    invalid_handle = ctypes.c_void_p(-1).value
+
+    handle = create_file(
+        str(path),
+        generic_read | generic_write,
+        file_share_delete,
+        None,
+        create_new,
+        file_attribute_normal | file_flag_open_reparse_point,
+        None,
+    )
+    if handle == invalid_handle:
+        error_number = int(get_last_error())
+        raise OSError(error_number, str(format_error(error_number)), str(path))
+
+    flags = os.O_RDWR | int(getattr(os, "O_BINARY", 0))
+    try:
+        return int(open_osfhandle(int(handle), flags))
+    except BaseException:
+        close_handle: Any = kernel32.CloseHandle
+        close_handle(wintypes.HANDLE(handle))
+        raise
+
+
 def strict_json_loads(value: str | bytes | bytearray) -> Any:
     """Parse JSON while rejecting duplicate object keys and invalid constants."""
 
@@ -144,6 +201,9 @@ def create_unlinked_regular_file(
         )
         if parent_descriptor >= 0:
             descriptor = os.open(target.name, flags, mode, dir_fd=parent_descriptor)
+        elif os.name == "nt":
+            descriptor = _open_windows_replaceable_regular_file(target)
+            _verify_path_identity(target, descriptor, label=label)
         else:
             descriptor = os.open(target, flags, mode)
             _verify_path_identity(target, descriptor, label=label)

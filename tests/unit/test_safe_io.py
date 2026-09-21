@@ -152,6 +152,21 @@ def test_replace_open_file_refuses_source_replacement(tmp_path: Path) -> None:
     assert source.read_bytes() == b"attacker replacement"
 
 
+def test_atomic_write_replaces_existing_regular_file(tmp_path: Path) -> None:
+    target = tmp_path / "state.json"
+    target.write_bytes(b"old")
+
+    written = atomic_write_unlinked_bytes(
+        target,
+        b"new",
+        label="test state",
+    )
+
+    assert written == target
+    assert target.read_bytes() == b"new"
+    assert list(tmp_path.glob(".state.json.*.tmp")) == []
+
+
 def test_anchored_io_rejects_intermediate_symlink(tmp_path: Path) -> None:
     trusted_root = tmp_path / "home"
     trusted_root.mkdir()
