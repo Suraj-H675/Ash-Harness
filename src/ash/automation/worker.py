@@ -1219,7 +1219,7 @@ class AutomationWorkerService:
                 "automation maintenance failed: "
                 + redact_text(detail or f"exit status {process.returncode}")
             )
-        if b"ASH_AUTOMATION_MAINTENANCE_OK\n" not in stdout:
+        if stdout.splitlines() != [b"ASH_AUTOMATION_MAINTENANCE_OK"]:
             raise AutomationError("automation maintenance returned an invalid result")
         self._last_maintenance_at = now
 

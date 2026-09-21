@@ -627,7 +627,7 @@ async def test_automation_maintenance_uses_isolated_python(
 
     async def fake_communicate(*args, **kwargs):
         del args, kwargs
-        return b"ASH_AUTOMATION_MAINTENANCE_OK\n", b""
+        return b"ASH_AUTOMATION_MAINTENANCE_OK\r\n", b""
 
     monkeypatch.setattr(
         "ash.automation.worker.asyncio.create_subprocess_exec", fake_spawn
