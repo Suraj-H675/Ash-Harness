@@ -419,6 +419,7 @@ def set_plugin_enabled(
             AnchoredDirectory.open(state_path.parent, create=True) as directory,
             directory.lock(f".{state_path.name}.lock"),
         ):
+            directory.prepare_durable_mutation()
             state = _read_extension_state_at(directory, state_path)
             disabled = set(state.disabled_plugins)
             if enabled:
@@ -521,6 +522,7 @@ def install_local_plugin(
                 AnchoredDirectory.open(root, create=True) as root_directory,
                 root_directory.lock(".ash-lifecycle.lock"),
             ):
+                root_directory.prepare_durable_mutation()
                 install_records_before: dict[str, PluginInstallRecord] | None = None
                 if (
                     _install_record is not _INSTALL_RECORD_UNCHANGED
@@ -776,6 +778,7 @@ def uninstall_local_plugin(
             AnchoredDirectory.open(root, create=False) as root_directory,
             root_directory.lock(".ash-lifecycle.lock"),
         ):
+            root_directory.prepare_durable_mutation()
             install_records_before: dict[str, PluginInstallRecord] | None = None
             install_records_after: dict[str, PluginInstallRecord] | None = None
             if manage_install_record:
@@ -1699,6 +1702,7 @@ def _save_extension_state(state: ExtensionState, path: Path) -> None:
             AnchoredDirectory.open(path.parent, create=True) as directory,
             directory.lock(f".{path.name}.lock"),
         ):
+            directory.prepare_durable_mutation()
             _save_extension_state_at(directory, state, path)
     except PluginLifecycleError:
         raise

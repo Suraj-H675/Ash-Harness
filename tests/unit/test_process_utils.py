@@ -195,6 +195,66 @@ async def test_windows_termination_kills_entire_process_tree() -> None:
     process.wait.assert_awaited_once()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows process tree")
+@pytest.mark.asyncio
+async def test_windows_native_termination_reaps_real_descendant(tmp_path: Path) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    plan = prepare_process_tree(workspace_root=tmp_path)
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        (
+            "import subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+            "print(child.pid, flush=True); time.sleep(60)"
+        ),
+        stdout=asyncio.subprocess.PIPE,
+        **plan.spawn_options,
+    )
+    child_handle = None
+    try:
+        assert process.stdout is not None
+        child_pid = int(
+            (await asyncio.wait_for(process.stdout.readline(), timeout=5)).decode()
+        )
+
+        win_dll = getattr(ctypes, "WinDLL")
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        wait = kernel32.WaitForSingleObject
+        wait.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        wait.restype = wintypes.DWORD
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        terminate = kernel32.TerminateProcess
+        terminate.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        terminate.restype = wintypes.BOOL
+        synchronize = 0x00100000
+        process_terminate = 0x00000001
+        wait_object_0 = 0x00000000
+        wait_timeout = 0x00000102
+        child_handle = open_process(synchronize | process_terminate, False, child_pid)
+        assert child_handle
+
+        await terminate_process_tree(process, plan=plan)
+        assert process.returncode is not None
+        assert int(wait(child_handle, 5_000)) == wait_object_0
+    finally:
+        if child_handle:
+            if int(wait(child_handle, 0)) == wait_timeout:
+                terminate(child_handle, 1)
+                wait(child_handle, 5_000)
+            close_handle(child_handle)
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+
 @pytest.mark.asyncio
 async def test_windows_async_cleanup_requires_a_pinned_process_owner() -> None:
     process = Mock(pid=4321, returncode=None)

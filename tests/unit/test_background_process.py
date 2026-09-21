@@ -282,16 +282,21 @@ async def test_background_process_handles_long_lines_and_bounds_output(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_background_process_limits_running_job_count_and_argument_size(tmp_path) -> None:
+async def test_background_process_limits_running_job_count_and_argument_size(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert MAX_BACKGROUND_JOBS == 32
+    job_limit = 3
+    monkeypatch.setattr("ash.tools.process.MAX_BACKGROUND_JOBS", job_limit)
     tool = BackgroundProcessTool(SafetyGuard(tmp_path))
     command = _python_shell_command("import time; time.sleep(60)")
-    for _ in range(MAX_BACKGROUND_JOBS):
+    for _ in range(job_limit):
         started = await tool.run(action="start", command=command)
         assert started.success is True
 
     rejected = await tool.run(action="start", command=command)
     assert rejected.success is False
-    assert f"{MAX_BACKGROUND_JOBS} running background jobs" in (rejected.error or "")
+    assert f"{job_limit} running background jobs" in (rejected.error or "")
 
     with pytest.raises(ValueError):
         await tool.run(

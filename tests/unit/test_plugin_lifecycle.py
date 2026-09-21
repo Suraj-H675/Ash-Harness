@@ -886,6 +886,161 @@ def test_plugin_mutations_fail_closed_without_anchored_capability(
     assert state_path.read_bytes() == original_state
 
 
+def test_windows_sync_handle_reopens_same_identity_with_write_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    metadata = os.stat(root)
+    held_descriptor = 101
+    sync_descriptor = 202
+    opened: list[tuple[Path, bool, bool, bool]] = []
+
+    def open_for_sync(
+        path: Path,
+        *,
+        directory: bool,
+        readable: bool = True,
+        writable: bool = False,
+        create_new: bool = False,
+    ) -> int:
+        opened.append((path, directory, readable, writable))
+        assert create_new is False
+        return sync_descriptor
+
+    monkeypatch.setattr(anchored_fs, "_windows_open_entry", open_for_sync)
+    monkeypatch.setattr(
+        anchored_fs, "_windows_require_supported_filesystem", lambda path, fd: None
+    )
+    monkeypatch.setattr(anchored_fs.os, "fstat", lambda fd: metadata)
+
+    descriptor = anchored_fs._windows_open_sync_directory(root, held_descriptor)
+
+    assert descriptor == sync_descriptor
+    assert opened == [(root, True, False, True)]
+
+
+def test_windows_sync_handle_rejects_reopened_identity_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    other = tmp_path / "other"
+    root.mkdir()
+    other.mkdir()
+    held_metadata = os.stat(root)
+    replacement_metadata = os.stat(other)
+    held_descriptor = 101
+    replacement_descriptor = 202
+    closed: list[int] = []
+
+    monkeypatch.setattr(
+        anchored_fs,
+        "_windows_open_entry",
+        lambda *args, **kwargs: replacement_descriptor,
+    )
+    monkeypatch.setattr(
+        anchored_fs, "_windows_require_supported_filesystem", lambda path, fd: None
+    )
+    monkeypatch.setattr(
+        anchored_fs.os,
+        "fstat",
+        lambda fd: held_metadata if fd == held_descriptor else replacement_metadata,
+    )
+    monkeypatch.setattr(anchored_fs.os, "close", closed.append)
+
+    with pytest.raises(anchored_fs.AnchoredFilesystemError, match="changed"):
+        anchored_fs._windows_open_sync_directory(root, held_descriptor)
+
+    assert closed == [replacement_descriptor]
+
+
+def test_windows_durable_mutation_rejects_non_ntfs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        anchored_fs, "_windows_filesystem_name", lambda descriptor: "ReFS"
+    )
+
+    with pytest.raises(
+        anchored_fs.AnchoredFilesystemUnavailable,
+        match="requires local NTFS",
+    ):
+        anchored_fs._windows_require_supported_filesystem(Path("C:/root"), 101)
+
+
+def test_windows_durable_mutation_rejects_remote_ntfs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        anchored_fs, "_windows_filesystem_name", lambda descriptor: "NTFS"
+    )
+    monkeypatch.setattr(anchored_fs, "_windows_drive_type", lambda path: 4)
+
+    with pytest.raises(
+        anchored_fs.AnchoredFilesystemUnavailable,
+        match="requires local NTFS",
+    ):
+        anchored_fs._windows_require_supported_filesystem(Path("Z:/root"), 101)
+
+
+def test_windows_unsupported_filesystem_fails_before_directory_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[int] = []
+    created: list[Path] = []
+    monkeypatch.setattr(
+        anchored_fs, "_windows_open_entry", lambda *args, **kwargs: 101
+    )
+    monkeypatch.setattr(
+        anchored_fs,
+        "_windows_require_supported_filesystem",
+        lambda path, descriptor: (_ for _ in ()).throw(
+            anchored_fs.AnchoredFilesystemUnavailable("requires local NTFS")
+        ),
+    )
+    monkeypatch.setattr(anchored_fs.os, "close", closed.append)
+    monkeypatch.setattr(anchored_fs.os, "mkdir", lambda path: created.append(Path(path)))
+
+    with pytest.raises(
+        anchored_fs.AnchoredFilesystemUnavailable,
+        match="requires local NTFS",
+    ):
+        anchored_fs._windows_open_directory_path(
+            tmp_path / "missing" / "plugin-root",
+            create=True,
+        )
+
+    assert created == []
+    assert closed == [101]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows directory durability")
+def test_windows_ntfs_directory_durability_barrier(tmp_path: Path) -> None:
+    with AnchoredDirectory.open(tmp_path, create=False, private=False) as directory:
+        directory.prepare_durable_mutation()
+        directory.sync()
+
+
+def test_install_preflights_durability_before_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _plugin(tmp_path / "source")
+    destination_root = tmp_path / "installed"
+
+    monkeypatch.setattr(
+        AnchoredDirectory,
+        "prepare_durable_mutation",
+        lambda self: (_ for _ in ()).throw(
+            anchored_fs.AnchoredFilesystemUnavailable("durability unavailable")
+        ),
+    )
+
+    with pytest.raises(PluginLifecycleError, match="durability unavailable"):
+        install_local_plugin(source, destination_root=destination_root)
+
+    assert not (destination_root / "example").exists()
+
+
 def test_existing_directory_identity_is_verified_before_descriptor_acceptance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

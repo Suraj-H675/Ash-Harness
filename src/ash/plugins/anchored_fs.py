@@ -122,6 +122,8 @@ def _windows_open_entry(
     desired_access = file_read_attributes | synchronize
     if directory:
         desired_access |= file_list_directory
+        if writable:
+            desired_access |= generic_write
     else:
         if readable:
             desired_access |= generic_read
@@ -167,6 +169,122 @@ def _windows_open_entry(
         raise
 
 
+def _windows_filesystem_name(descriptor: int) -> str:
+    """Return the filesystem backing one held Windows directory descriptor."""
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    win_dll: Any = getattr(ctypes, "WinDLL")
+    get_last_error: Any = getattr(ctypes, "get_last_error")
+    format_error: Any = getattr(ctypes, "FormatError")
+    get_osfhandle: Any = getattr(msvcrt, "get_osfhandle")
+    kernel32: Any = win_dll("kernel32", use_last_error=True)
+    get_volume_info: Any = kernel32.GetVolumeInformationByHandleW
+    dword_pointer = ctypes.POINTER(wintypes.DWORD)
+    get_volume_info.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        dword_pointer,
+        dword_pointer,
+        dword_pointer,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    get_volume_info.restype = wintypes.BOOL
+    filesystem = ctypes.create_unicode_buffer(64)
+    handle = wintypes.HANDLE(int(get_osfhandle(descriptor)))
+    if not get_volume_info(
+        handle,
+        None,
+        0,
+        None,
+        None,
+        None,
+        filesystem,
+        len(filesystem),
+    ):
+        error_number = int(get_last_error())
+        raise OSError(error_number, str(format_error(error_number)))
+    return filesystem.value
+
+
+def _windows_drive_type(path: Path) -> int:
+    """Return the Win32 drive type for one anchored path."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    win_dll: Any = getattr(ctypes, "WinDLL")
+    kernel32: Any = win_dll("kernel32", use_last_error=True)
+    get_drive_type: Any = kernel32.GetDriveTypeW
+    get_drive_type.argtypes = [wintypes.LPCWSTR]
+    get_drive_type.restype = wintypes.UINT
+    root = path.anchor
+    if not root:
+        return 0
+    return int(get_drive_type(root))
+
+
+def _windows_require_supported_filesystem(path: Path, descriptor: int) -> None:
+    """Keep Windows anchored mutation on local fixed NTFS volumes."""
+
+    try:
+        filesystem = _windows_filesystem_name(descriptor)
+    except OSError as exc:
+        raise AnchoredFilesystemUnavailable(
+            "Windows anchored plugin mutation currently requires local NTFS"
+        ) from exc
+    if filesystem.upper() != "NTFS" or _windows_drive_type(path) != 3:
+        raise AnchoredFilesystemUnavailable(
+            "Windows anchored plugin mutation currently requires local NTFS; "
+            f"found {filesystem or 'unknown'}"
+        )
+
+
+def _windows_open_sync_directory(path: Path, expected_descriptor: int) -> int:
+    """Acquire and identity-check the write-capable handle used for durability."""
+
+    expected = os.fstat(expected_descriptor)
+    descriptor = _windows_open_entry(
+        path,
+        directory=True,
+        readable=False,
+        writable=True,
+    )
+    try:
+        _windows_require_supported_filesystem(path, descriptor)
+        opened = os.fstat(descriptor)
+        _require_directory_identity(opened, expected, path)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _windows_flush_descriptor(descriptor: int) -> None:
+    """Flush a write-capable Windows filesystem handle through Win32 directly."""
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    win_dll: Any = getattr(ctypes, "WinDLL")
+    get_last_error: Any = getattr(ctypes, "get_last_error")
+    format_error: Any = getattr(ctypes, "FormatError")
+    get_osfhandle: Any = getattr(msvcrt, "get_osfhandle")
+    kernel32: Any = win_dll("kernel32", use_last_error=True)
+    flush: Any = kernel32.FlushFileBuffers
+    flush.argtypes = [wintypes.HANDLE]
+    flush.restype = wintypes.BOOL
+    handle = wintypes.HANDLE(int(get_osfhandle(descriptor)))
+    if not flush(handle):
+        error_number = int(get_last_error())
+        raise OSError(error_number, str(format_error(error_number)))
+
+
 def _windows_open_directory_path(
     path: str | Path,
     *,
@@ -178,6 +296,7 @@ def _windows_open_directory_path(
     current = Path(absolute.anchor)
     descriptor = _windows_open_entry(current, directory=True)
     try:
+        _windows_require_supported_filesystem(current, descriptor)
         for component in components:
             next_path = current / component
             if not next_path.exists():
@@ -346,6 +465,7 @@ class AnchoredDirectory:
     def __init__(self, path: Path, descriptor: int) -> None:
         self.path = path
         self._descriptor = descriptor
+        self._sync_descriptor = -1
 
     @classmethod
     def open(
@@ -414,9 +534,26 @@ class AnchoredDirectory:
         return self._descriptor
 
     def close(self) -> None:
+        if self._sync_descriptor >= 0:
+            os.close(self._sync_descriptor)
+            self._sync_descriptor = -1
         if self._descriptor >= 0:
             os.close(self._descriptor)
             self._descriptor = -1
+
+    def prepare_durable_mutation(self) -> None:
+        """Preflight the durability barrier before mutating persistent state."""
+
+        if os.name != "nt" or self._sync_descriptor >= 0:
+            return
+        self._visible_path()
+        descriptor = _windows_open_sync_directory(self.path, self.descriptor)
+        try:
+            self._visible_path()
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self._sync_descriptor = descriptor
 
     def validation_path(self) -> Path:
         """Return the held directory's visible path for legacy validators.
@@ -985,6 +1122,15 @@ class AnchoredDirectory:
             os.close(descriptor)
 
     def sync(self) -> None:
+        if os.name == "nt":
+            if self._sync_descriptor < 0:
+                raise AnchoredFilesystemUnavailable(
+                    "Windows durable plugin mutation was not prepared before publication"
+                )
+            self._visible_path()
+            _windows_flush_descriptor(self._sync_descriptor)
+            self._visible_path()
+            return
         try:
             os.fsync(self.descriptor)
         except OSError as exc:
