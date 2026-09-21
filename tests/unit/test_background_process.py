@@ -28,10 +28,33 @@ from ash.tools.process import (
 )
 
 
+def _powershell_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _python_shell_command(script: str) -> str:
+    if sys.platform == "win32":
+        return (
+            f"& {_powershell_literal(sys.executable)} -c "
+            f"{_powershell_literal(script)}"
+        )
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+
+def _successful_shell_command(*, output: str | None = None) -> str:
+    if sys.platform == "win32":
+        return f"Write-Output {_powershell_literal(output or 'ok')}"
+    if output is not None:
+        return f"printf %s {shlex.quote(output)}"
+    return "true"
+
+
 @pytest.mark.asyncio
 async def test_background_process_start_poll_and_close(tmp_path) -> None:
     tool = BackgroundProcessTool(SafetyGuard(tmp_path))
-    started = await tool.run(action="start", command="printf hello")
+    started = await tool.run(
+        action="start", command=_successful_shell_command(output="hello")
+    )
     job_id = started.output.split()[1]
     await asyncio.sleep(0.05)
     polled = await tool.run(action="poll", job_id=job_id)
@@ -39,6 +62,46 @@ async def test_background_process_start_poll_and_close(tmp_path) -> None:
     listed = await tool.run(action="list")
     assert job_id in listed.output
     await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_process_close_does_not_reterminate_completed_job(
+    tmp_path: Path,
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    started = await tool.run(action="start", command=_successful_shell_command())
+    job = tool.jobs[started.output.split()[1]]
+    await job.process.wait()
+    await asyncio.gather(*job.readers)
+
+    with patch(
+        "ash.tools.process.terminate_process_tree",
+        new=AsyncMock(side_effect=AssertionError("completed job must not be terminated")),
+    ) as terminate:
+        await tool.aclose()
+
+    terminate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_background_process_applies_windows_shell_safety(
+    tmp_path: Path,
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    with (
+        patch("ash.tools.command.platform.system", return_value="Windows"),
+        pytest.raises(SafetyViolation, match="command chains"),
+    ):
+        await tool.run(
+            action="start",
+            command="Write-Output safe; Remove-Item marker.txt",
+        )
+
+    with (
+        patch("ash.tools.command.platform.system", return_value="Windows"),
+        pytest.raises(SafetyViolation, match="-LiteralPath"),
+    ):
+        await tool.run(action="start", command="Get-Content marker.txt")
 
 
 @pytest.mark.asyncio
@@ -52,7 +115,7 @@ async def test_background_process_forwards_allowlisted_environment(
         "print(os.getenv('DEV_SERVER_PORT', 'missing')); "
         "print(os.getenv('PRIVATE_TOKEN', 'missing'))"
     )
-    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    command = _python_shell_command(script)
     tool = BackgroundProcessTool(
         SafetyGuard(tmp_path), environment_allowlist=["DEV_SERVER_PORT"]
     )
@@ -83,7 +146,7 @@ async def test_background_process_stream_redacts_secret_split_across_polls(
         "time.sleep(0.4); "
         f"sys.stdout.write({second_fragment!r} + '\\n'); sys.stdout.flush()"
     )
-    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    command = _python_shell_command(script)
     tool = BackgroundProcessTool(SafetyGuard(tmp_path))
 
     started = await tool.run(action="start", command=command)
@@ -106,7 +169,7 @@ async def test_background_process_stream_redacts_secret_split_across_polls(
 @pytest.mark.asyncio
 async def test_background_process_redacts_secret_in_status_command(tmp_path) -> None:
     provider_key = "xai-" + "a" * 80
-    command = f"printf %s {shlex.quote(provider_key)}"
+    command = _python_shell_command(f"print({provider_key!r})")
     tool = BackgroundProcessTool(SafetyGuard(tmp_path))
 
     started = await tool.run(action="start", command=command)
@@ -129,7 +192,7 @@ async def test_background_process_handles_long_lines_and_bounds_output(tmp_path)
         "import sys; "
         f"sys.stdout.write('x' * {MAX_BACKGROUND_OUTPUT_CHARS + 1024})"
     )
-    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    command = _python_shell_command(script)
     tool = BackgroundProcessTool(SafetyGuard(tmp_path))
 
     started = await tool.run(action="start", command=command)
@@ -154,7 +217,7 @@ async def test_background_process_handles_long_lines_and_bounds_output(tmp_path)
 @pytest.mark.asyncio
 async def test_background_process_limits_running_job_count_and_argument_size(tmp_path) -> None:
     tool = BackgroundProcessTool(SafetyGuard(tmp_path))
-    command = f"{shlex.quote(sys.executable)} -c {shlex.quote('import time; time.sleep(60)')}"
+    command = _python_shell_command("import time; time.sleep(60)")
     for _ in range(MAX_BACKGROUND_JOBS):
         started = await tool.run(action="start", command=command)
         assert started.success is True
@@ -185,7 +248,7 @@ async def test_finished_background_jobs_remain_pollable_without_consuming_capaci
     tool = BackgroundProcessTool(SafetyGuard(tmp_path))
 
     for _ in range(2):
-        started = await tool.run(action="start", command="true")
+        started = await tool.run(action="start", command=_successful_shell_command())
         job = tool.jobs[started.output.split()[1]]
         await job.process.wait()
         await asyncio.gather(*job.readers)
@@ -195,7 +258,7 @@ async def test_finished_background_jobs_remain_pollable_without_consuming_capaci
     polled = await tool.run(action="poll", job_id=retained_ids[-1])
     assert "exited(0)" in polled.output
 
-    replacement = await tool.run(action="start", command="true")
+    replacement = await tool.run(action="start", command=_successful_shell_command())
     assert replacement.success is True
     assert retained_ids[-1] in tool.jobs
     await tool.aclose()
@@ -210,7 +273,7 @@ async def test_background_process_prunes_oldest_terminal_history(
     job_ids: list[str] = []
 
     for _ in range(3):
-        started = await tool.run(action="start", command="true")
+        started = await tool.run(action="start", command=_successful_shell_command())
         job_id = started.output.split()[1]
         job_ids.append(job_id)
         job = tool.jobs[job_id]
@@ -230,7 +293,7 @@ async def test_stopped_background_job_does_not_consume_running_capacity(
 ) -> None:
     monkeypatch.setattr("ash.tools.process.MAX_BACKGROUND_JOBS", 1)
     tool = BackgroundProcessTool(SafetyGuard(tmp_path))
-    command = f"{shlex.quote(sys.executable)} -c {shlex.quote('import time; time.sleep(60)')}"
+    command = _python_shell_command("import time; time.sleep(60)")
 
     started = await tool.run(action="start", command=command)
     job_id = started.output.split()[1]
@@ -244,6 +307,7 @@ async def test_stopped_background_job_does_not_consume_running_capacity(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="bwrap sandbox is POSIX-only")
 async def test_background_process_uses_sandbox_manager(tmp_path) -> None:
     manager = Mock()
     manager.tier = SANDBOX_TIER_BWRAP

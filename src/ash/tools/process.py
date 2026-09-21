@@ -37,7 +37,7 @@ from ash.sandbox import (
     SandboxManager,
 )
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
-from ash.tools.command import build_scrubbed_command_env
+from ash.tools.command import build_scrubbed_command_env, validate_windows_shell_command
 
 
 def _directory_identity(path: Path) -> tuple[int, int] | None:
@@ -203,6 +203,7 @@ class BackgroundProcessTool(BaseTool):
             )
         self._prune_terminal_history()
         self.safety_guard.validate_command(args.command)
+        validate_windows_shell_command(args.command)
         if (
             self._project_root_identity is not None
             and _directory_identity(self.safety_guard.project_root)
@@ -417,6 +418,7 @@ class BackgroundProcessTool(BaseTool):
 
     async def aclose(self) -> None:
         jobs = tuple(self.jobs.values())
+        active_jobs = tuple(job for job in jobs if job.process.returncode is None)
         cleanup_results, cleanup_error, cleanup_cancelled = await _settle_cleanup(
             asyncio.gather(
                 *(
@@ -424,7 +426,7 @@ class BackgroundProcessTool(BaseTool):
                         job.process,
                         plan=job.process_tree_plan,
                     )
-                    for job in jobs
+                    for job in active_jobs
                 ),
                 return_exceptions=True,
             )

@@ -204,7 +204,7 @@ class RunCommandTool(BaseTool):
     async def run(self, **kwargs: Any) -> ToolResult:
         args = RunCommandArgs(**kwargs)
         self.safety_guard.validate_command(args.command_line)
-        self._validate_powershell_literal_paths(args.command_line)
+        validate_windows_shell_command(args.command_line)
 
         if self.project_root is not None and self._project_root_identity is not None:
             if _directory_identity(Path(self.project_root)) != self._project_root_identity:
@@ -489,23 +489,6 @@ class RunCommandTool(BaseTool):
             diagnostic_summary=extract_diagnostic_summary(stdout, stderr),
         )
 
-    def _validate_powershell_literal_paths(self, command_line: str) -> None:
-        if platform.system() != "Windows":
-            return
-
-        lowered = command_line.casefold()
-        if contains_forbidden_windows_chain(command_line):
-            raise SafetyViolation(
-                "Windows command chains are forbidden for this command."
-            )
-        if not any(cmdlet in lowered for cmdlet in POWERSHELL_FILE_CMDLETS):
-            return
-        if "-literalpath" not in lowered:
-            raise SafetyViolation(
-                "PowerShell file cmdlets must use -LiteralPath for path arguments."
-            )
-
-
 async def run_command(safety_guard: SafetyGuard, **kwargs: Any) -> ToolResult:
     return await RunCommandTool(safety_guard).run(**kwargs)
 
@@ -628,6 +611,22 @@ def contains_forbidden_windows_chain(command_line: str) -> bool:
         _windows_segment_executable(segment) not in _WINDOWS_CHAIN_COMPILERS
         for segment in segments
     )
+
+
+def validate_windows_shell_command(command_line: str) -> None:
+    """Apply Windows PowerShell-specific safety checks to a shell command."""
+
+    if platform.system() != "Windows":
+        return
+    lowered = command_line.casefold()
+    if contains_forbidden_windows_chain(command_line):
+        raise SafetyViolation("Windows command chains are forbidden for this command.")
+    if not any(cmdlet in lowered for cmdlet in POWERSHELL_FILE_CMDLETS):
+        return
+    if "-literalpath" not in lowered:
+        raise SafetyViolation(
+            "PowerShell file cmdlets must use -LiteralPath for path arguments."
+        )
 
 
 def build_scrubbed_command_env(
