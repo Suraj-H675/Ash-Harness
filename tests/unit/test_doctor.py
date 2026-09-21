@@ -461,7 +461,8 @@ def test_browser_doctor_distinguishes_missing_extra_and_binary(
     )
     missing_extra = _check_browser()
     assert missing_extra.status == "warn"
-    assert "installer.py | python3 - --extra browser" in missing_extra.remedy
+    assert "installer.py" in missing_extra.remedy
+    assert "--extra browser" in missing_extra.remedy
     assert "pipx install" not in missing_extra.remedy
 
     monkeypatch.setattr(

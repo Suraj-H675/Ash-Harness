@@ -294,7 +294,9 @@ def _consolidate_results(
                 re.IGNORECASE,
             )
             if claim_match:
-                evidence_by_path.setdefault(str(Path(claim_match.group(1))), []).append(
+                evidence_by_path.setdefault(
+                    Path(claim_match.group(1)).as_posix(), []
+                ).append(
                     {
                         "task_key": spec.key,
                         "quote": redact_text(str(summary)[:500]),
@@ -304,7 +306,7 @@ def _consolidate_results(
             for raw_path in re.findall(
                 r"(?:^|\s)`?([\w./+-]+\.[A-Za-z0-9]{1,8})\b", str(summary)
             ):
-                normalized = str(Path(raw_path))
+                normalized = Path(raw_path).as_posix()
                 if normalized.startswith("/") or ".." in Path(normalized).parts:
                     continue
                 evidence_by_path.setdefault(normalized, []).append(
