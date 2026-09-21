@@ -39,7 +39,9 @@ from ash.safety.environment import build_scrubbed_environment
 from ash.safety.policy import PermissionPolicy, PolicyAction, READ_ONLY_TOOLS
 from ash.sandbox import SandboxManager
 from ash.sandbox.process_utils import (
+    ProcessOutputLimitExceeded,
     ProcessTreeError,
+    communicate_process,
     prepare_process_tree,
     terminate_process_tree,
 )
@@ -52,6 +54,20 @@ if TYPE_CHECKING:
 
 
 _PERSISTED_STOP_REASON = "stopped by persisted message"
+_SUBAGENT_STDERR_BYTES = 64 * 1024
+_SUBAGENT_DIAGNOSTIC_CHARS = 4_000
+
+
+def _subprocess_stderr_suffix(stderr: bytes) -> str:
+    if not stderr:
+        return ""
+    text = stderr.decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    safe = redact_text(text)
+    if len(safe) > _SUBAGENT_DIAGNOSTIC_CHARS:
+        safe = "…" + safe[-_SUBAGENT_DIAGNOSTIC_CHARS:]
+    return f"; stderr: {safe}"
 
 
 SubagentApprovalBroker = Callable[
@@ -471,7 +487,7 @@ class SpawnAgentTool(BaseTool):
                 "--spec-stdin",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
                 env=environment,
                 **plan.spawn_options,
             ),
@@ -542,8 +558,14 @@ class SpawnAgentTool(BaseTool):
 
         assert process is not None
         try:
+            stderr = b""
             try:
-                await process.communicate(encoded_spec)
+                _, stderr = await communicate_process(
+                    process,
+                    input_data=encoded_spec,
+                    max_output_bytes=_SUBAGENT_STDERR_BYTES,
+                    process_tree_plan=plan,
+                )
             except asyncio.CancelledError as cancellation:
                 try:
                     await terminate_process_tree(process, plan=plan)
@@ -557,16 +579,45 @@ class SpawnAgentTool(BaseTool):
                     reason="subagent subprocess cancelled",
                 )
                 raise
+            except ProcessOutputLimitExceeded as exc:
+                stderr = exc.stderr
+                current = self._shared_state.tasks.get_task(durable_task.task_id)
+                if current is not None and current.state not in {
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                }:
+                    self._cancel_active_subprocess_task(
+                        durable_task.task_id,
+                        reason="subagent subprocess exceeded its diagnostic output limit",
+                    )
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(
+                        "Subagent subprocess exceeded its diagnostic output limit"
+                        + _subprocess_stderr_suffix(stderr)
+                    ),
+                )
 
             current = self._shared_state.tasks.get_task(durable_task.task_id)
-            if (
-                process.returncode != 0
-                and current is not None
-                and current.state in {"leased", "running"}
+            child_died_before_claim = (
+                current is not None
+                and current.state == "queued"
+                and current.attempt == durable_task.attempt
+            )
+            child_died_while_owned = (
+                current is not None and current.state in {"leased", "running"}
+            )
+            if process.returncode != 0 and (
+                child_died_before_claim or child_died_while_owned
             ):
                 self._cancel_active_subprocess_task(
                     durable_task.task_id,
-                    reason=f"subagent subprocess exited with status {process.returncode}",
+                    reason=(
+                        f"subagent subprocess exited with status {process.returncode}"
+                        + _subprocess_stderr_suffix(stderr)
+                    ),
                 )
             return self._subprocess_task_result(durable_task.task_id)
         finally:

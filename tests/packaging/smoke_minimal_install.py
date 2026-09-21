@@ -434,7 +434,7 @@ def main() -> None:
             assert invalid.success is False
             assert client.calls == 0
             valid = await tool.run(mode="safe")
-            assert valid.success is True
+            assert valid.success is True, valid.error
             envelope = json.loads(valid.output)
             assert envelope["structuredContent"] == {"value": 2}
             assert envelope["_meta"] == {"source": "installed-wheel"}

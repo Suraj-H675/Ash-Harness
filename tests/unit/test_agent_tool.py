@@ -472,21 +472,26 @@ async def test_foreground_coder_subprocess_exact_scope_does_not_cross_call(
 async def test_live_approval_capability_is_not_in_subprocess_environment(
     tmp_path, monkeypatch
 ) -> None:
+    import ash.tools.agent as agent_module
+
     captured: dict[str, object] = {}
 
     class FakeProcess:
         returncode = 1
-
-        async def communicate(self, encoded_spec: bytes):
-            captured["spec"] = json.loads(encoded_spec)
-            return (b"", b"")
 
     async def fake_create_subprocess_exec(*args, **kwargs):
         captured["argv"] = args
         captured["env"] = dict(kwargs["env"])
         return FakeProcess()
 
+    async def fake_communicate_process(process, *, input_data, **_kwargs):
+        assert process is not None
+        assert input_data is not None
+        captured["spec"] = json.loads(input_data)
+        return (b"", b"child failed before lease with sk-test-redacted")
+
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(agent_module, "communicate_process", fake_communicate_process)
     monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
     state = SharedState(tmp_path / "cap-state" / "agents.db")
     config = AshConfig(
@@ -516,6 +521,9 @@ async def test_live_approval_capability_is_not_in_subprocess_environment(
         )
 
         assert result.success is False
+        assert "exited with status 1" in (result.error or "")
+        assert "child failed before lease" in (result.error or "")
+        assert "sk-test-redacted" not in (result.error or "")
         spec = captured["spec"]
         assert isinstance(spec, dict)
         channel = spec["approval_channel"]
@@ -533,6 +541,8 @@ async def test_live_approval_capability_is_not_in_subprocess_environment(
         assert token not in provider_env
         assert token not in provider_env.values()
         assert all("APPROVAL" not in key for key in provider_env)
+        durable_task = state.tasks.list_tasks()[0]
+        assert durable_task.state == "cancelled"
     finally:
         await tool.aclose()
 
