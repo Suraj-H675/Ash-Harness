@@ -17,6 +17,7 @@ _TEST_HOME: Path | None = None
 _ORIGINAL_GETADDRINFO = socket.getaddrinfo
 _ORIGINAL_CONNECT = socket.socket.connect
 _ORIGINAL_CONNECT_EX = socket.socket.connect_ex
+_ORIGINAL_PATH_HOME = Path.__dict__["home"]
 
 
 def _remember_and_set(name: str, value: str) -> None:
@@ -100,6 +101,16 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     }.items():
         _remember_and_set(name, str(value))
 
+    if os.name == "nt":
+
+        def test_home(cls: type[Path]) -> Path:
+            configured = os.environ.get("HOME")
+            if configured:
+                return cls(configured)
+            return _ORIGINAL_PATH_HOME.__get__(None, cls)()
+
+        Path.home = classmethod(test_home)  # type: ignore[method-assign]
+
     socket.getaddrinfo = _guarded_getaddrinfo  # type: ignore[assignment]
     socket.socket.connect = _guarded_connect  # type: ignore[method-assign]
     socket.socket.connect_ex = _guarded_connect_ex  # type: ignore[method-assign]
@@ -111,6 +122,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     socket.getaddrinfo = _ORIGINAL_GETADDRINFO  # type: ignore[assignment]
     socket.socket.connect = _ORIGINAL_CONNECT  # type: ignore[method-assign]
     socket.socket.connect_ex = _ORIGINAL_CONNECT_EX  # type: ignore[method-assign]
+    Path.home = _ORIGINAL_PATH_HOME  # type: ignore[method-assign]
     for name, previous in _ORIGINAL_ENV.items():
         if previous is None:
             os.environ.pop(name, None)

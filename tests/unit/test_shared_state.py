@@ -9,7 +9,11 @@ from pathlib import Path
 @pytest.fixture
 def state() -> SharedState:
     with tempfile.TemporaryDirectory() as tmpdir:
-        yield SharedState(Path(tmpdir) / "test.db")
+        shared = SharedState(Path(tmpdir) / "test.db")
+        try:
+            yield shared
+        finally:
+            shared.close()
 
 
 @pytest.mark.asyncio

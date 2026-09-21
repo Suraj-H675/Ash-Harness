@@ -17,7 +17,11 @@ from pathlib import Path
 @pytest.fixture
 def shared_state() -> SharedState:
     with tempfile.TemporaryDirectory() as tmpdir:
-        yield SharedState(Path(tmpdir) / "test.db")
+        state = SharedState(Path(tmpdir) / "test.db")
+        try:
+            yield state
+        finally:
+            state.close()
 
 
 def test_is_tool_allowed_respects_allowlist(shared_state):
