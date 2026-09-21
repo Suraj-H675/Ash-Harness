@@ -4,6 +4,7 @@ import pytest
 
 from ash.commands.serve import serve_http
 from ash.exceptions import AshError
+from ash.install import pipx_install_command
 
 
 def args(**overrides):
@@ -74,7 +75,7 @@ async def test_serve_reports_missing_optional_dependencies(monkeypatch) -> None:
         await serve_http(args())
 
     assert exc.value.exit_code == 2
-    assert "installer.py | python3 - --extra server" in exc.value.remedy
+    assert pipx_install_command("server") in exc.value.remedy
     assert "pipx install" not in exc.value.remedy
 
 
