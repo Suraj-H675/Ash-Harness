@@ -4,6 +4,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 from pathlib import Path
 import weakref
@@ -19,6 +20,8 @@ from ash.sandbox.process_utils import (
     ProcessTreeUnavailable,
     communicate_process,
     _descendant_pids,
+    _prepare_windows_cwd_launch,
+    _resolve_windows_launch_executable,
     prepare_process_tree,
     prepare_scoped_process_launch,
     process_group_options,
@@ -56,6 +59,287 @@ def test_process_group_options_can_inherit_automation_group(
 ) -> None:
     monkeypatch.setenv(INHERIT_PROCESS_GROUP_ENV, "1")
     assert process_group_options() == {}
+
+
+def test_prepare_windows_cwd_launch_wraps_command_with_expected_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    cwd = workspace / "work"
+    workspace.mkdir()
+    cwd.mkdir()
+    host_python = tmp_path / "host-python.exe"
+    resolved_tool = tmp_path / "resolved-tool.exe"
+    monkeypatch.setattr(
+        "ash.sandbox.process_utils._resolve_trusted_python_launcher",
+        lambda workspace_root, *, search_path: str(host_python),
+    )
+    monkeypatch.setattr(
+        "ash.sandbox.process_utils._resolve_windows_launch_executable",
+        lambda command, *, search_path: str(resolved_tool),
+    )
+
+    launch = _prepare_windows_cwd_launch(
+        cwd,
+        ["tool.exe", "--flag"],
+        guard=SafetyGuard(workspace),
+        search_path="ignored",
+        expected_identity=(12, 34),
+    )
+
+    assert launch.cwd == str(cwd)
+    assert launch.argv[:4] == (str(host_python), "-I", "-S", "-c")
+    assert launch.argv[-5:] == (
+        "12",
+        "34",
+        str(resolved_tool),
+        "tool.exe",
+        "--flag",
+    )
+
+
+def test_resolve_windows_launch_executable_uses_parent_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = tmp_path / "tool.exe"
+    calls: list[tuple[str, str | None]] = []
+
+    def which(command: str, *, path: str | None = None) -> str | None:
+        calls.append((command, path))
+        return str(resolved)
+
+    monkeypatch.setattr("ash.sandbox.process_utils.shutil.which", which)
+
+    result = _resolve_windows_launch_executable(
+        ["tool", "--flag"],
+        search_path="host-path",
+    )
+
+    assert result == os.path.abspath(resolved)
+    assert calls == [("tool", "host-path")]
+
+
+def test_resolve_windows_launch_executable_fails_before_trampoline_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ash.sandbox.process_utils.shutil.which",
+        lambda command, *, path=None: None,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        _resolve_windows_launch_executable(["missing-tool"], search_path="host-path")
+
+
+def test_windows_cwd_trampoline_runs_command_for_matching_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    cwd = workspace / "work"
+    workspace.mkdir()
+    cwd.mkdir()
+    expected = cwd.stat()
+    monkeypatch.setattr(
+        "ash.sandbox.process_utils._resolve_trusted_python_launcher",
+        lambda workspace_root, *, search_path: sys.executable,
+    )
+    monkeypatch.setattr(
+        "ash.sandbox.process_utils._resolve_windows_launch_executable",
+        lambda command, *, search_path: sys.executable,
+    )
+    launch = _prepare_windows_cwd_launch(
+        cwd,
+        ["shadowed-python", "-c", "print('verified-cwd')"],
+        guard=SafetyGuard(workspace),
+        search_path=None,
+        expected_identity=(expected.st_dev, expected.st_ino),
+    )
+
+    completed = subprocess.run(
+        launch.argv,
+        cwd=launch.cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout.strip() == "verified-cwd"
+
+
+def test_windows_cwd_trampoline_refuses_mismatched_actual_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    cwd = workspace / "work"
+    workspace.mkdir()
+    cwd.mkdir()
+    expected = cwd.stat()
+    marker = cwd / "marker"
+    monkeypatch.setattr(
+        "ash.sandbox.process_utils._resolve_trusted_python_launcher",
+        lambda workspace_root, *, search_path: sys.executable,
+    )
+    monkeypatch.setattr(
+        "ash.sandbox.process_utils._resolve_windows_launch_executable",
+        lambda command, *, search_path: sys.executable,
+    )
+    launch = _prepare_windows_cwd_launch(
+        cwd,
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('marker').write_text('executed')",
+        ],
+        guard=SafetyGuard(workspace),
+        search_path=None,
+        expected_identity=(expected.st_dev, expected.st_ino + 1),
+    )
+
+    completed = subprocess.run(
+        launch.argv,
+        cwd=launch.cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 126
+    assert completed.stderr.strip() == "working directory identity changed"
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows inherited cwd semantics")
+def test_windows_scoped_cwd_rejects_swapped_directory_before_user_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    cwd = workspace / "work"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    cwd.mkdir()
+    outside.mkdir()
+    expected = cwd.stat()
+    original = workspace / "work-original"
+    cwd.rename(original)
+    try:
+        cwd.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink creation is unavailable: {exc}")
+    monkeypatch.setattr(
+        "ash.sandbox.process_utils._resolve_trusted_python_launcher",
+        lambda workspace_root, *, search_path: sys.executable,
+    )
+    monkeypatch.setattr(
+        "ash.sandbox.process_utils._resolve_windows_launch_executable",
+        lambda command, *, search_path: sys.executable,
+    )
+    marker = outside / "marker"
+
+    with prepare_scoped_process_launch(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('marker').write_text('executed')",
+        ],
+        cwd=cwd,
+        guard=SafetyGuard(workspace),
+        expected_cwd_identity=(expected.st_dev, expected.st_ino),
+    ) as launch:
+        completed = subprocess.run(
+            launch.argv,
+            cwd=launch.cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert completed.returncode == 126
+    assert completed.stderr.strip() == "working directory identity changed"
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows inherited cwd semantics")
+def test_windows_current_directory_stays_bound_and_is_inherited_by_child(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "work"
+    moved = tmp_path / "moved"
+    ready = tmp_path / "ready"
+    proceed = tmp_path / "proceed"
+    child_identity = tmp_path / "child-identity"
+    cwd.mkdir()
+    expected = cwd.stat()
+    helper = """
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ready = Path(sys.argv[1])
+proceed = Path(sys.argv[2])
+child_identity = Path(sys.argv[3])
+observed = os.stat('.')
+ready.write_text(f'{observed.st_dev}:{observed.st_ino}', encoding='utf-8')
+deadline = time.monotonic() + 10
+while not proceed.exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit(124)
+    time.sleep(0.01)
+child_code = (
+    "import os,sys; from pathlib import Path; "
+    "st=os.stat('.'); "
+    "Path(sys.argv[1]).write_text(f'{st.st_dev}:{st.st_ino}', encoding='utf-8')"
+)
+raise SystemExit(
+    subprocess.run(
+        [sys.executable, '-I', '-S', '-c', child_code, str(child_identity)],
+        cwd=None,
+        check=False,
+    ).returncode
+)
+"""
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            helper,
+            str(ready),
+            str(proceed),
+            str(child_identity),
+        ],
+        cwd=cwd,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists():
+            if process.poll() is not None:
+                pytest.fail(f"cwd helper exited early with {process.returncode}")
+            if time.monotonic() >= deadline:
+                pytest.fail("cwd helper did not become ready")
+            time.sleep(0.01)
+
+        assert ready.read_text(encoding="utf-8") == f"{expected.st_dev}:{expected.st_ino}"
+        with pytest.raises(OSError):
+            cwd.rename(moved)
+        proceed.write_text("go", encoding="utf-8")
+        assert process.wait(timeout=10) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    assert child_identity.read_text(encoding="utf-8") == (
+        f"{expected.st_dev}:{expected.st_ino}"
+    )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -33,6 +35,34 @@ _FCHDIR_EXEC = (
     "os.close(fd);"
     "os.execvpe(argv[0],argv,os.environ)"
 )
+_WINDOWS_CWD_EXEC = """\
+import os
+import subprocess
+import sys
+
+expected_dev = int(sys.argv[1])
+expected_ino = int(sys.argv[2])
+executable = sys.argv[3]
+argv = sys.argv[4:]
+try:
+    observed = os.stat(".")
+except OSError:
+    sys.stderr.write("working directory identity changed\\n")
+    raise SystemExit(126)
+if (
+    expected_ino == 0
+    or observed.st_ino == 0
+    or (observed.st_dev, observed.st_ino) != (expected_dev, expected_ino)
+):
+    sys.stderr.write("working directory identity changed\\n")
+    raise SystemExit(126)
+try:
+    completed = subprocess.run(argv, executable=executable, check=False)
+except OSError as exc:
+    sys.stderr.write(f"{exc}\\n")
+    raise SystemExit(127)
+raise SystemExit(completed.returncode)
+"""
 
 
 class ProcessTreeError(RuntimeError):
@@ -161,15 +191,30 @@ def prepare_scoped_process_launch(
     search_path: str | None = None,
     expected_cwd_identity: tuple[int, int] | None = None,
 ) -> Iterator[ScopedProcessLaunch]:
-    """Prepare a subprocess launch whose POSIX cwd cannot be pathname-swapped."""
+    """Prepare a subprocess launch whose cwd identity is preserved."""
 
     if not command:
         raise ValueError("command must not be empty")
-    if cwd is None or os.name != "posix":
+    if cwd is None:
         yield ScopedProcessLaunch(
             tuple(command),
-            str(cwd) if cwd is not None else None,
+            None,
         )
+        return
+    if os.name == "nt":
+        if expected_cwd_identity is None:
+            yield ScopedProcessLaunch(tuple(command), str(cwd))
+            return
+        yield _prepare_windows_cwd_launch(
+            cwd,
+            command,
+            guard=guard,
+            search_path=search_path,
+            expected_identity=expected_cwd_identity,
+        )
+        return
+    if os.name != "posix":
+        yield ScopedProcessLaunch(tuple(command), str(cwd))
         return
     with open_scoped_directory(cwd, guard) as (_, directory_fd):
         opened = os.fstat(directory_fd)
@@ -184,6 +229,60 @@ def prepare_scoped_process_launch(
             guard=guard,
             search_path=search_path,
         )
+
+
+def _prepare_windows_cwd_launch(
+    cwd: str | Path,
+    command: Sequence[str],
+    *,
+    guard: SafetyGuard,
+    search_path: str | None,
+    expected_identity: tuple[int, int],
+) -> ScopedProcessLaunch:
+    """Verify the actual inherited Windows cwd before running user code."""
+
+    if expected_identity[1] == 0:
+        raise ProcessTreeUnavailable("working directory identity is unavailable")
+    python = _resolve_trusted_python_launcher(
+        guard.project_root,
+        search_path=search_path,
+    )
+    if python is None:
+        raise ProcessTreeUnavailable(
+            "race-resistant cwd launch requires a trusted host Python interpreter"
+        )
+    executable = _resolve_windows_launch_executable(command, search_path=search_path)
+    return ScopedProcessLaunch(
+        (
+            python,
+            "-I",
+            "-S",
+            "-c",
+            _WINDOWS_CWD_EXEC,
+            str(expected_identity[0]),
+            str(expected_identity[1]),
+            executable,
+            *command,
+        ),
+        str(cwd),
+    )
+
+
+def _resolve_windows_launch_executable(
+    command: Sequence[str],
+    *,
+    search_path: str | None,
+) -> str:
+    """Resolve argv[0] in Ash's parent context before the cwd trampoline runs."""
+
+    resolved = shutil.which(command[0], path=search_path)
+    if resolved is None:
+        raise FileNotFoundError(
+            errno.ENOENT,
+            os.strerror(errno.ENOENT),
+            command[0],
+        )
+    return os.path.abspath(resolved)
 
 
 def _prepare_posix_cwd_launch(
