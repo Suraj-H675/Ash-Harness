@@ -651,7 +651,11 @@ def _fallback_atomic_write(
             )
     temp = target.parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
     try:
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        fd = os.open(
+            temp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _flag("O_BINARY"),
+            0o666,
+        )
         try:
             if existing is not None and hasattr(os, "fchmod"):
                 os.fchmod(fd, stat.S_IMODE(existing.st_mode) & 0o777)
@@ -694,7 +698,11 @@ def _fallback_restore(
     )
     temp = target.parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
     try:
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(
+            temp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _flag("O_BINARY"),
+            0o600,
+        )
         try:
             effective_mode = mode
             if effective_mode is None and existing is not None:

@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,7 +100,8 @@ async def test_checkpoint_undo_removes_created_file_and_restores_mode(tmp_path) 
 
     assert set(restored) == {existing, created}
     assert existing.read_text(encoding="utf-8") == "before"
-    assert existing.stat().st_mode & 0o777 == 0o640
+    if os.name == "posix":
+        assert existing.stat().st_mode & 0o777 == 0o640
     assert not created.exists()
 
 
