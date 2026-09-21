@@ -522,14 +522,112 @@ def quote_powershell_literal_path(path: str) -> str:
     return f"-LiteralPath '{escaped}'"
 
 
+_WINDOWS_CHAIN_COMPILERS = frozenset(
+    {"cargo", "npm", "pnpm", "yarn", "uv", "python", "python3", "pytest", "go", "dotnet"}
+)
+
+
+def _split_top_level_windows_chain(
+    command_line: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split PowerShell command chaining without treating quoted text as syntax."""
+
+    segments: list[str] = []
+    operators: list[str] = []
+    start = 0
+    quote: str | None = None
+    index = 0
+    while index < len(command_line):
+        character = command_line[index]
+        if quote == "'":
+            if character == "'" and index + 1 < len(command_line):
+                if command_line[index + 1] == "'":
+                    index += 2
+                    continue
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if character == "`" and index + 1 < len(command_line):
+                index += 2
+                continue
+            if character == '"':
+                quote = None
+            index += 1
+            continue
+        if character == "`" and index + 1 < len(command_line):
+            index += 2
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            continue
+        operator = ""
+        if command_line.startswith("&&", index):
+            operator = "&&"
+        elif command_line.startswith("||", index):
+            operator = "||"
+        elif character == ";":
+            operator = ";"
+        if not operator:
+            index += 1
+            continue
+        segments.append(command_line[start:index].strip())
+        operators.append(operator)
+        index += len(operator)
+        start = index
+    segments.append(command_line[start:].strip())
+    return tuple(segments), tuple(operators)
+
+
+def _windows_segment_executable(segment: str) -> str | None:
+    """Return the first PowerShell command token for bounded chain classification."""
+
+    value = segment.lstrip()
+    if value.startswith("&"):
+        value = value[1:].lstrip()
+    if not value:
+        return None
+    if value[0] in {"'", '"'}:
+        quote = value[0]
+        index = 1
+        token: list[str] = []
+        while index < len(value):
+            character = value[index]
+            if quote == "'" and character == "'":
+                if index + 1 < len(value) and value[index + 1] == "'":
+                    token.append("'")
+                    index += 2
+                    continue
+                break
+            if quote == '"' and character == "`" and index + 1 < len(value):
+                token.append(value[index + 1])
+                index += 2
+                continue
+            if character == quote:
+                break
+            token.append(character)
+            index += 1
+        executable = "".join(token)
+    else:
+        executable = value.split(maxsplit=1)[0]
+    basename = re.split(r"[\\/]", executable)[-1].casefold()
+    if basename.endswith(".exe"):
+        basename = basename[:-4]
+    return basename or None
+
+
 def contains_forbidden_windows_chain(command_line: str) -> bool:
-    allowed_compiler_chain = re.compile(
-        r"\b(cargo|npm|pnpm|yarn|uv|python|pytest|go|dotnet)\b.*(&&|\|\|)",
-        re.IGNORECASE,
-    )
-    if allowed_compiler_chain.search(command_line):
+    segments, operators = _split_top_level_windows_chain(command_line)
+    if not operators:
         return False
-    return any(chain in command_line for chain in (";", "&&", "||"))
+    if any(operator == ";" for operator in operators):
+        return True
+    return any(
+        _windows_segment_executable(segment) not in _WINDOWS_CHAIN_COMPILERS
+        for segment in segments
+    )
 
 
 def build_scrubbed_command_env(

@@ -14,6 +14,7 @@ from ash.tools.command import (
     MAX_COMMAND_TIMEOUT_SECONDS,
     RunCommandArgs,
     RunCommandTool,
+    contains_forbidden_windows_chain,
     decode_stream,
     quote_powershell_literal_path,
 )
@@ -1127,6 +1128,37 @@ def test_decode_stream_falls_back_to_cp1252() -> None:
 def test_quote_powershell_literal_path_escapes_single_quotes() -> None:
     assert quote_powershell_literal_path("C:\\Users\\O'Brien\\file.txt") == (
         "-LiteralPath 'C:\\Users\\O''Brien\\file.txt'"
+    )
+
+
+def test_windows_chain_detection_ignores_quoted_separators() -> None:
+    assert (
+        contains_forbidden_windows_chain(
+            'python3 -c "import module; print(module.VALUE)"'
+        )
+        is False
+    )
+    assert contains_forbidden_windows_chain("python -c 'a && b || c; d'") is False
+    assert contains_forbidden_windows_chain('Write-Output "left;right"') is False
+
+
+def test_windows_chain_detection_blocks_unquoted_control_flow() -> None:
+    assert contains_forbidden_windows_chain("python -m pytest; Remove-Item marker") is True
+    assert (
+        contains_forbidden_windows_chain("python -m pytest && Remove-Item marker")
+        is True
+    )
+    assert contains_forbidden_windows_chain("echo first || echo second") is True
+
+
+def test_windows_chain_detection_limits_compiler_chain_exception() -> None:
+    assert contains_forbidden_windows_chain("python -m pytest && uv run ruff check") is False
+    assert contains_forbidden_windows_chain("npm test || pnpm test") is False
+    assert (
+        contains_forbidden_windows_chain(
+            "python -m pytest && uv run ruff check; Remove-Item marker"
+        )
+        is True
     )
 
 
