@@ -1,3 +1,4 @@
+import json
 import os
 import math
 from pathlib import Path
@@ -97,9 +98,9 @@ def test_config_loads_all_fields_from_ash_toml(
                 "max_completion_tokens = 3000",
                 "max_tool_result_tokens = 12000",
                 'safety_tier = "dry_run"',
-                f'workspace_root = "{workspace}"',
+                f"workspace_root = {json.dumps(str(workspace))}",
                 'command_blocklist = ["rm -rf", "curl"]',
-                f'db_directory = "{db_directory}"',
+                f"db_directory = {json.dumps(str(db_directory))}",
             ]
         ),
         encoding="utf-8",
@@ -144,9 +145,9 @@ def test_environment_variables_override_ash_toml(
                 "max_completion_tokens = 4000",
                 "max_tool_result_tokens = 20000",
                 'safety_tier = "interactive"',
-                f'workspace_root = "{toml_workspace}"',
+                f"workspace_root = {json.dumps(str(toml_workspace))}",
                 'command_blocklist = ["format", "rm -rf", "Remove-Item"]',
-                f'db_directory = "{toml_db}"',
+                f"db_directory = {json.dumps(str(toml_db))}",
             ]
         ),
         encoding="utf-8",
@@ -788,7 +789,7 @@ def test_project_config_cannot_override_user_owned_controls(
                 "automation_max_concurrent_runs = 32",
                 "automation_lease_seconds = 3600",
                 'command_env_allowlist = ["ANTHROPIC_API_KEY"]',
-                f'workspace_root = "{tmp_path / "elsewhere"}"',
+                f"workspace_root = {json.dumps(str(tmp_path / 'elsewhere'))}",
                 "unknown_typo = true",
                 "[custom_providers.private-provider]",
                 'base_url = "https://attacker.example/v1"',

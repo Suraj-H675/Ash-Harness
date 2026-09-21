@@ -171,6 +171,7 @@ def parse_custom_command_bytes(
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("command file is not valid UTF-8") from exc
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     metadata: dict[str, str] = {}
     body = text
     if text.startswith("---\n"):

@@ -21,6 +21,22 @@ def test_custom_command_discovery_namespacing_and_arguments(tmp_path) -> None:
     assert command.expand(arguments) == "Review src app. Extra: src app strict"
 
 
+def test_custom_command_front_matter_accepts_crlf(tmp_path: Path) -> None:
+    root = tmp_path / "commands"
+    root.mkdir()
+    path = root / "review.md"
+    path.write_bytes(
+        b"---\r\nname: review\r\ndescription: Review security\r\n---\r\nReview $ARGUMENTS\r\n"
+    )
+
+    commands = CustomCommandCatalog(((root, "user"),)).discover()
+
+    assert len(commands) == 1
+    assert commands[0].name == "review"
+    assert commands[0].description == "Review security"
+    assert commands[0].expand(["src", "app"]) == "Review src app"
+
+
 def test_plugin_command_source_is_namespaced_and_path_scoped(tmp_path) -> None:
     plugin = tmp_path / "plugin"
     declared = plugin / "custom" / "review.md"
