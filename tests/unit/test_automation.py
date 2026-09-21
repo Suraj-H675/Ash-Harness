@@ -2919,6 +2919,7 @@ def test_worker_config_loader_preserves_cli_overrides_and_refreshes_user_policy(
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     startup = AshConfig.load(
         _override_source="cli",
         _override_detail="test CLI",
@@ -2959,6 +2960,7 @@ def test_worker_config_loader_requires_restart_when_database_path_changes(
         f'db_directory = "{first_database}"\n', encoding="utf-8"
     )
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     startup = AshConfig.load(
         _override_source="cli",
         workspace_root=workspace,

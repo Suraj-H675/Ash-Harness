@@ -141,7 +141,7 @@ def resolve_host_executable(
             continue
         if workspace is not None and is_relative_to(directory, workspace):
             continue
-        resolved = shutil.which(str(directory / command))
+        resolved = shutil.which(command, path=str(directory))
         if resolved is None:
             continue
         try:

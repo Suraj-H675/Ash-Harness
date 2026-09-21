@@ -452,7 +452,11 @@ def test_orchestrator_messages_have_message_id_attribute(tmp_path: Path) -> None
 @pytest.fixture
 def shared_state() -> SharedState:
     with tempfile.TemporaryDirectory() as tmpdir:
-        yield SharedState(Path(tmpdir) / "test.db")
+        state = SharedState(Path(tmpdir) / "test.db")
+        try:
+            yield state
+        finally:
+            state.close()
 
 
 @pytest.mark.asyncio

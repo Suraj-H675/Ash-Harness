@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from ash.safety.environment import _build_environment_mapping
+from pathlib import Path
+from unittest.mock import patch
+
+from ash.safety.environment import _build_environment_mapping, resolve_host_executable
 
 
 def test_windows_environment_names_are_case_insensitive() -> None:
@@ -63,3 +66,30 @@ def test_posix_environment_names_remain_case_sensitive() -> None:
     assert "Path" not in environment
     assert "lc_all" not in environment
     assert "MY_ALLOWED_TOKEN" not in environment
+
+
+def test_host_executable_lookup_is_scoped_to_each_vetted_path_directory(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    host_bin = tmp_path / "host-bin"
+    workspace.mkdir()
+    host_bin.mkdir()
+    observed: list[tuple[str, str | None]] = []
+
+    def which(command: str, *, path: str | None = None) -> str | None:
+        observed.append((command, path))
+        if path == str(host_bin.resolve()):
+            return str(host_bin / "git.exe")
+        return None
+
+    with patch("ash.safety.environment.shutil.which", side_effect=which):
+        resolved = resolve_host_executable(
+            "git",
+            workspace_root=workspace,
+            cwd=workspace,
+            search_path=str(host_bin),
+        )
+
+    assert resolved == str((host_bin / "git.exe").resolve())
+    assert observed == [("git", str(host_bin.resolve()))]
