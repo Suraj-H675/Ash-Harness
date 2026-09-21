@@ -17,7 +17,7 @@ from typing import Any, Callable, Literal
 
 from packaging.version import InvalidVersion, parse as parse_version
 
-from ash.safe_io import strict_json_loads
+from ash.safe_io import read_bounded_open_file, strict_json_loads
 from ash.plugins.anchored_fs import (
     AnchoredDirectory,
     AnchoredFilesystemError,
@@ -352,6 +352,19 @@ def _transition_plugin_install_records_at(
 
 def load_extension_state(path: Path | None = None) -> ExtensionState:
     state_path = path or extension_state_path()
+    if not supports_anchored_mutation():
+        try:
+            raw = read_bounded_open_file(
+                state_path,
+                MAX_EXTENSION_STATE_BYTES,
+                label="extension state",
+            )
+        except FileNotFoundError:
+            return ExtensionState()
+        except (OSError, ValueError) as exc:
+            raise _lifecycle_error("extension state", exc) from exc
+        return _parse_extension_state(raw, state_path)
+
     _require_anchored_plugin_mutation()
     try:
         directory = AnchoredDirectory.open(

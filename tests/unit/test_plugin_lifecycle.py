@@ -1399,7 +1399,7 @@ def test_cleanup_failure_preserves_primary_error_and_closes_descriptors(
     assert any("cleanup failure" in note for note in error.value.__notes__)
 
 
-def test_extension_state_load_fails_closed_when_anchoring_is_unavailable(
+def test_extension_state_load_uses_portable_safe_reader_when_anchoring_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_path = tmp_path / "state" / "extensions.json"
@@ -1412,8 +1412,7 @@ def test_extension_state_load_fails_closed_when_anchoring_is_unavailable(
     monkeypatch.setattr(anchored_fs, "supports_anchored_mutation", lambda: False)
     monkeypatch.setattr(lifecycle, "supports_anchored_mutation", lambda: False)
 
-    with pytest.raises(PluginLifecycleError, match="unavailable"):
-        load_extension_state(state_path)
+    assert load_extension_state(state_path).disabled_plugins == frozenset({"safe"})
     assert state_path.read_bytes() == original
 
 
