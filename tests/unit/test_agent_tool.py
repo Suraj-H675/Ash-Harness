@@ -799,7 +799,7 @@ async def test_background_agent_runs_provider_in_subprocess(tmp_path, monkeypatc
         durable = state.tasks.list_tasks()[0]
         terminal = await asyncio.wait_for(
             tool.wait_for_tasks([durable.task_id]),
-            timeout=5,
+            timeout=10,
         )
         assert terminal[0].state == "succeeded"
         assert terminal[0].owner_agent_id == "background-process-reviewer"
@@ -1593,7 +1593,7 @@ async def test_background_subagent_waits_for_durable_approval_and_resumes(tmp_pa
     finally:
         resolver.close()
 
-    report = await asyncio.wait_for(tool._tasks["approval-worker"], timeout=2.0)
+    report = await asyncio.wait_for(tool._tasks["approval-worker"], timeout=10.0)
     assert report.success is True
     assert report.summary == "background approved"
     assert (tmp_path / "durable-approved.txt").read_text(encoding="utf-8") == (

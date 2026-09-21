@@ -412,8 +412,9 @@ class TestAtomicWrite:
         cli_config.save_env_value("ANTHROPIC_API_KEY", "sk-ant-test")
 
         env_file = tmp_path / ".ash" / ".env"
-        mode = env_file.stat().st_mode & 0o777
-        assert mode == 0o600
+        if os.name == "posix":
+            mode = env_file.stat().st_mode & 0o777
+            assert mode == 0o600
 
 
 class TestLoadEnv:
