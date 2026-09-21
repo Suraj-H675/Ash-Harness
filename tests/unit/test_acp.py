@@ -1525,22 +1525,34 @@ class WireClient(FakeACPConnection):
         self.connection = conn
 
 
-async def _pipe_reader(descriptor: int) -> asyncio.StreamReader:
+async def _loopback_stream_pair() -> tuple[
+    asyncio.StreamReader,
+    asyncio.StreamWriter,
+    asyncio.StreamReader,
+    asyncio.StreamWriter,
+    asyncio.Server,
+]:
     loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
-    protocol = asyncio.StreamReaderProtocol(reader)
-    pipe = os.fdopen(descriptor, "rb", buffering=0)
-    await loop.connect_read_pipe(lambda: protocol, pipe)
-    return reader
-
-
-async def _pipe_writer(descriptor: int) -> asyncio.StreamWriter:
-    loop = asyncio.get_running_loop()
-    pipe = os.fdopen(descriptor, "wb", buffering=0)
-    transport, protocol = await loop.connect_write_pipe(
-        lambda: asyncio.streams.FlowControlMixin(loop=loop), pipe
+    accepted: asyncio.Future[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = (
+        loop.create_future()
     )
-    return asyncio.StreamWriter(transport, protocol, None, loop)
+
+    def connected(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if not accepted.done():
+            accepted.set_result((reader, writer))
+
+    server = await asyncio.start_server(connected, "127.0.0.1", 0)
+    try:
+        socket = server.sockets[0]
+        host, port = socket.getsockname()[:2]
+        client_reader, client_writer = await asyncio.open_connection(host, port)
+        agent_reader, agent_writer = await asyncio.wait_for(accepted, timeout=2)
+    except BaseException:
+        server.close()
+        await server.wait_closed()
+        raise
+    server.close()
+    return agent_reader, agent_writer, client_reader, client_writer, server
 
 
 @pytest.mark.asyncio
@@ -1554,12 +1566,9 @@ async def test_acp_official_sdk_wire_round_trip(tmp_path: Path) -> None:
         return FakeAshClient(session_id or "wire-session", _events(), approval_callback)
 
     agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
-    client_to_agent_read, client_to_agent_write = os.pipe()
-    agent_to_client_read, agent_to_client_write = os.pipe()
-    agent_reader = await _pipe_reader(client_to_agent_read)
-    agent_writer = await _pipe_writer(agent_to_client_write)
-    client_reader = await _pipe_reader(agent_to_client_read)
-    client_writer = await _pipe_writer(client_to_agent_write)
+    agent_reader, agent_writer, client_reader, client_writer, server = (
+        await _loopback_stream_pair()
+    )
     agent_task = asyncio.create_task(
         run_agent(agent, input_stream=agent_writer, output_stream=agent_reader)
     )
@@ -1589,16 +1598,17 @@ async def test_acp_official_sdk_wire_round_trip(tmp_path: Path) -> None:
         )
     finally:
         client_writer.close()
-        await asyncio.sleep(0)
+        await client_writer.wait_closed()
         try:
             await asyncio.wait_for(agent_task, timeout=2)
         except (asyncio.TimeoutError, ConnectionError):
             agent_task.cancel()
             await asyncio.gather(agent_task, return_exceptions=True)
         agent_writer.close()
-        await asyncio.sleep(0)
+        await agent_writer.wait_closed()
         await connection.close()
         await agent.aclose()
+        await server.wait_closed()
 
 
 @pytest.mark.asyncio
