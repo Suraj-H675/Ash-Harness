@@ -55,6 +55,7 @@ MAX_BACKGROUND_COMMAND_CHARS = 100_000
 MAX_BACKGROUND_INPUT_CHARS = 1_000_000
 MAX_BACKGROUND_JOB_ID_CHARS = 128
 MAX_BACKGROUND_CWD_CHARS = 4_096
+BACKGROUND_CLOSE_REAP_GRACE_SECONDS = 0.5
 BACKGROUND_OUTPUT_TRUNCATION_MARKER = (
     "\n[background process output truncated after "
     f"{MAX_BACKGROUND_OUTPUT_CHARS} characters]\n"
@@ -80,6 +81,20 @@ async def _settle_cleanup(
         return task.result(), None, cancelled
     except BaseException as exc:
         return None, exc, cancelled
+
+
+async def _allow_natural_process_exit(
+    process: asyncio.subprocess.Process,
+    *,
+    timeout: float = BACKGROUND_CLOSE_REAP_GRACE_SECONDS,
+) -> None:
+    """Give native exit notifications a bounded chance to update ``returncode``."""
+
+    if process.returncode is not None:
+        return
+    deadline = asyncio.get_running_loop().time() + timeout
+    while process.returncode is None and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
 
 
 @dataclass
@@ -418,6 +433,13 @@ class BackgroundProcessTool(BaseTool):
 
     async def aclose(self) -> None:
         jobs = tuple(self.jobs.values())
+        await asyncio.gather(
+            *(
+                _allow_natural_process_exit(job.process)
+                for job in jobs
+                if job.process.returncode is None
+            )
+        )
         active_jobs = tuple(job for job in jobs if job.process.returncode is None)
         cleanup_results, cleanup_error, cleanup_cancelled = await _settle_cleanup(
             asyncio.gather(

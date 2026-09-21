@@ -17,6 +17,7 @@ from ash.sandbox import (
     SandboxManager,
     has_bwrap,
 )
+from ash.sandbox.process_utils import ProcessTreePlan
 from ash.core.redaction import LONG_TOKEN_WITHHELD_MARKER
 from ash.tools.process import (
     BACKGROUND_OUTPUT_TRUNCATION_MARKER,
@@ -25,6 +26,7 @@ from ash.tools.process import (
     MAX_BACKGROUND_JOBS,
     MAX_BACKGROUND_OUTPUT_CHARS,
     BackgroundProcessTool,
+    Job,
 )
 
 
@@ -79,6 +81,34 @@ async def test_background_process_close_does_not_reterminate_completed_job(
         new=AsyncMock(side_effect=AssertionError("completed job must not be terminated")),
     ) as terminate:
         await tool.aclose()
+
+    terminate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_background_process_close_allows_native_exit_notification(
+    tmp_path: Path,
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    process = Mock(pid=1234, returncode=None)
+    tool.jobs["natural-exit"] = Job(
+        "natural-exit",
+        "completed command",
+        process,
+        ProcessTreePlan({}, None, tmp_path, "linux"),
+    )
+
+    async def publish_exit() -> None:
+        await asyncio.sleep(0.02)
+        process.returncode = 0
+
+    exit_notification = asyncio.create_task(publish_exit())
+    with patch(
+        "ash.tools.process.terminate_process_tree",
+        new=AsyncMock(side_effect=AssertionError("naturally exited job must not be killed")),
+    ) as terminate:
+        await tool.aclose()
+    await exit_notification
 
     terminate.assert_not_awaited()
 
