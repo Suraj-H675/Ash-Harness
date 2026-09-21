@@ -56,6 +56,51 @@ def _windows_path_is_reparse(path: Path) -> bool:
     return attributes != invalid and bool(attributes & reparse)
 
 
+def _windows_retry_readonly_unlink(
+    path: Path,
+    expected: os.stat_result,
+    original_error: PermissionError,
+) -> None:
+    """Retry deletion only for the same Windows regular file's read-only bit."""
+
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError:
+        raise original_error
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or not _same_identity(current, expected)
+        or _windows_path_is_reparse(path)
+    ):
+        raise AnchoredFilesystemError(
+            f"anchored entry changed before read-only unlink retry: {path}"
+        ) from original_error
+    original_mode = stat.S_IMODE(current.st_mode)
+    if original_mode & stat.S_IWRITE:
+        raise original_error
+
+    os.chmod(path, original_mode | stat.S_IWRITE)
+    try:
+        writable = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(writable.st_mode)
+            or not _same_identity(writable, expected)
+            or _windows_path_is_reparse(path)
+        ):
+            raise AnchoredFilesystemError(
+                f"anchored entry changed during read-only unlink retry: {path}"
+            )
+        os.unlink(path)
+    except BaseException:
+        try:
+            remaining = os.stat(path, follow_symlinks=False)
+            if _same_identity(remaining, expected) and not _windows_path_is_reparse(path):
+                os.chmod(path, original_mode)
+        except OSError:
+            pass
+        raise
+
+
 def _windows_open_entry(
     path: Path,
     *,
@@ -952,7 +997,11 @@ class AnchoredDirectory:
             )
         if os.name == "nt":
             self._visible_path()
-            os.unlink(self.path / name)
+            target = self.path / name
+            try:
+                os.unlink(target)
+            except PermissionError as exc:
+                _windows_retry_readonly_unlink(target, current, exc)
             self._visible_path()
             return
         os.unlink(name, dir_fd=self.descriptor)

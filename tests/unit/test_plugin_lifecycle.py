@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import stat
 import threading
 
 import pytest
@@ -1480,6 +1481,72 @@ def test_recursive_cleanup_leaves_replaced_regular_file_untouched(
     assert swapped
     assert displaced.read_text(encoding="utf-8") == "original"
     assert victim.read_text(encoding="utf-8") == "attacker"
+
+
+def test_windows_readonly_unlink_retry_requires_same_readonly_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    victim = tmp_path / "readonly-object"
+    victim.write_bytes(b"git-object")
+    victim.chmod(0o444)
+    expected = victim.stat()
+    real_unlink = os.unlink
+    calls = 0
+
+    def unlink_after_retry(path: str | bytes | os.PathLike[str] | os.PathLike[bytes]) -> None:
+        nonlocal calls
+        calls += 1
+        real_unlink(path)
+
+    monkeypatch.setattr(anchored_fs.os, "unlink", unlink_after_retry)
+    anchored_fs._windows_retry_readonly_unlink(
+        victim,
+        expected,
+        PermissionError(13, "read-only file", str(victim)),
+    )
+
+    assert calls == 1
+    assert not victim.exists()
+
+
+def test_windows_readonly_unlink_retry_rejects_replaced_file(tmp_path: Path) -> None:
+    victim = tmp_path / "readonly-object"
+    victim.write_bytes(b"original")
+    victim.chmod(0o444)
+    expected = victim.stat()
+    displaced = tmp_path / "displaced-object"
+    victim.rename(displaced)
+    victim.write_bytes(b"replacement")
+    victim.chmod(0o444)
+
+    with pytest.raises(anchored_fs.AnchoredFilesystemError, match="changed"):
+        anchored_fs._windows_retry_readonly_unlink(
+            victim,
+            expected,
+            PermissionError(13, "read-only file", str(victim)),
+        )
+
+    assert victim.read_bytes() == b"replacement"
+    assert displaced.read_bytes() == b"original"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows read-only deletion semantics")
+def test_windows_recursive_cleanup_removes_readonly_regular_file(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    target = root / "tree"
+    target.mkdir(parents=True)
+    victim = target / "git-object"
+    victim.write_bytes(b"git-object")
+    os.chmod(victim, stat.S_IREAD)
+
+    with AnchoredDirectory.open(root, create=False, private=False) as directory:
+        with directory.child("tree") as held_tree:
+            directory.remove_tree(
+                "tree",
+                expected_descriptor=held_tree.descriptor,
+            )
+
+    assert not target.exists()
 
 
 def test_extension_state_cleanup_identity_check_preserves_replacement(

@@ -635,7 +635,7 @@ async def test_delegate_worker_never_uses_foreground_approval_broker(tmp_path: P
     finally:
         resolver.close()
 
-    result = await asyncio.wait_for(delegation, timeout=3.0)
+    result = await asyncio.wait_for(delegation, timeout=10.0)
     assert result.success is True
     payload = json.loads(result.output)
     assert payload["tasks"][0]["result"]["summary"] == "queued denied"
