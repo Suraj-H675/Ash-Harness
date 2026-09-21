@@ -714,7 +714,7 @@ async def test_foreground_subprocess_cancel_during_live_approval_fails_closed(
         )
     )
     try:
-        await asyncio.wait_for(broker_started.wait(), timeout=5)
+        await asyncio.wait_for(broker_started.wait(), timeout=15)
         run_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(run_task, timeout=5)

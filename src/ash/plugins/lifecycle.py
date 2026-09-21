@@ -1357,10 +1357,21 @@ def _tree_exceeds_bytes_at(directory: AnchoredDirectory, limit: int) -> bool:
             if metadata is None or stat.S_ISLNK(metadata.st_mode):
                 continue
             if stat.S_ISDIR(metadata.st_mode):
-                child = current.child(name, expected=metadata)
                 try:
-                    if walk(child):
-                        return True
+                    child = current.child(name, expected=metadata)
+                except FileNotFoundError:
+                    # Git mutates its checkout while the clone is still
+                    # running.  An entry that vanished after ``stat`` no
+                    # longer contributes to the live size budget.
+                    continue
+                try:
+                    try:
+                        if walk(child):
+                            return True
+                    except FileNotFoundError:
+                        # The held child can itself be removed before its
+                        # pathname-backed Windows traversal begins.
+                        continue
                 finally:
                     child.close()
                 continue

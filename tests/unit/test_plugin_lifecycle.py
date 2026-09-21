@@ -1703,6 +1703,42 @@ def test_git_tree_size_scan_closes_completed_directory_descriptors(
         assert not lifecycle._tree_exceeds_bytes_at(directory, 1)
 
 
+def test_git_tree_size_scan_tolerates_directory_disappearing_during_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_anchored_platform()
+    checkout = tmp_path / "checkout"
+    transient = checkout / ".git" / "hooks"
+    transient.mkdir(parents=True)
+    original_child = AnchoredDirectory.child
+    removed = False
+
+    def remove_before_open(
+        directory: AnchoredDirectory,
+        name: str,
+        *,
+        create: bool = False,
+        expected: os.stat_result | None = None,
+    ) -> AnchoredDirectory:
+        nonlocal removed
+        if directory.path.name == ".git" and name == "hooks" and not removed:
+            transient.rmdir()
+            removed = True
+            raise FileNotFoundError(transient)
+        return original_child(
+            directory,
+            name,
+            create=create,
+            expected=expected,
+        )
+
+    monkeypatch.setattr(AnchoredDirectory, "child", remove_before_open)
+    with AnchoredDirectory.open(checkout, create=False, private=False) as directory:
+        assert not lifecycle._tree_exceeds_bytes_at(directory, 1)
+
+    assert removed is True
+
+
 @pytest.mark.parametrize(
     ("attribute", "missing"),
     (
