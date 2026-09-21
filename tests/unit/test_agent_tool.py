@@ -935,7 +935,8 @@ async def test_background_coder_subprocess_keeps_durable_approval_path(
         assert started.success is True
 
         request = None
-        for _ in range(100):
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
             approvals = state.fetch_messages(
                 "lead",
                 undelivered_only=True,
@@ -952,8 +953,22 @@ async def test_background_coder_subprocess_keeps_durable_approval_path(
             )
             if request is not None:
                 break
+            durable = state.tasks.list_tasks()[0]
+            current = state.tasks.get_task(durable.task_id)
+            if current is not None and current.state in {
+                "succeeded",
+                "failed",
+                "cancelled",
+            }:
+                break
             await asyncio.sleep(0.02)
-        assert request is not None
+        durable = state.tasks.list_tasks()[0]
+        current = state.tasks.get_task(durable.task_id)
+        assert request is not None, (
+            "background durable approval request did not arrive; "
+            f"task_state={current.state if current is not None else 'missing'} "
+            f"task_error={current.error if current is not None else None!r}"
+        )
         assert live_broker_calls == 0
 
         resolved = state.resolve_approval_request(
@@ -962,7 +977,6 @@ async def test_background_coder_subprocess_keeps_durable_approval_path(
         )
         assert resolved["approved"] is True
 
-        durable = state.tasks.list_tasks()[0]
         terminal = await asyncio.wait_for(
             tool.wait_for_tasks([durable.task_id]),
             timeout=5,

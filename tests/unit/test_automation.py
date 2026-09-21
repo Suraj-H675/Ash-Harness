@@ -2957,7 +2957,7 @@ def test_worker_config_loader_requires_restart_when_database_path_changes(
     workspace.mkdir()
     user_config.parent.mkdir(parents=True)
     user_config.write_text(
-        f'db_directory = "{first_database}"\n', encoding="utf-8"
+        f"db_directory = {json.dumps(str(first_database))}\n", encoding="utf-8"
     )
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
@@ -2968,7 +2968,7 @@ def test_worker_config_loader_requires_restart_when_database_path_changes(
     load = automation_config_loader(startup)
 
     user_config.write_text(
-        f'db_directory = "{second_database}"\n', encoding="utf-8"
+        f"db_directory = {json.dumps(str(second_database))}\n", encoding="utf-8"
     )
 
     with pytest.raises(AutomationError, match="restart the worker"):
