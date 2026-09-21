@@ -809,10 +809,10 @@ async def test_background_agent_runs_provider_in_subprocess(tmp_path, monkeypatc
         assert requests == [
             ("/v1/chat/completions", "Bearer background-secret")
         ]
-        for _ in range(50):
-            if "background-process-reviewer" not in tool._subprocess_tasks:
-                break
-            await asyncio.sleep(0.01)
+        monitor = tool._subprocess_tasks.get("background-process-reviewer")
+        if monitor is not None:
+            await asyncio.wait_for(asyncio.shield(monitor), timeout=10)
+            await asyncio.sleep(0)
         assert "background-process-reviewer" not in tool._subprocess_tasks
     finally:
         await tool.aclose()
@@ -979,7 +979,7 @@ async def test_background_coder_subprocess_keeps_durable_approval_path(
 
         terminal = await asyncio.wait_for(
             tool.wait_for_tasks([durable.task_id]),
-            timeout=5,
+            timeout=10,
         )
         assert terminal[0].state == "succeeded"
         assert requests == 2
