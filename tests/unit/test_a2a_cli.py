@@ -64,6 +64,41 @@ def test_a2a_client_network_failure_has_stable_cli_error(monkeypatch, capsys) ->
     assert "A2A operation failed: connection refused" in captured.err
 
 
+def test_a2a_inspect_redacts_signed_url_from_agent_card(monkeypatch, capsys) -> None:
+    from ash.commands import a2a as a2a_commands
+
+    marker = "inspect-signed-marker"
+
+    class FakeResolver:
+        def __init__(self, http, url) -> None:
+            del http, url
+
+        async def get_agent_card(self):
+            return object()
+
+    monkeypatch.setattr(a2a_commands, "A2ACardResolver", FakeResolver)
+    monkeypatch.setattr(
+        a2a_commands,
+        "agent_card_to_dict",
+        lambda card: {
+            "name": "Remote",
+            "supportedInterfaces": [
+                {
+                    "url": (
+                        "https://agent.example/a2a?"
+                        f"X-Amz-Signature={marker}&view=full"
+                    )
+                }
+            ],
+        },
+    )
+
+    assert main(["a2a", "inspect", "https://agent.example.com"]) == 0
+    captured = capsys.readouterr()
+    assert marker not in captured.out
+    assert "X-Amz-Signature=[REDACTED]" in captured.out
+
+
 def test_a2a_cli_catches_and_redacts_standard_protocol_error(
     monkeypatch,
     capsys,

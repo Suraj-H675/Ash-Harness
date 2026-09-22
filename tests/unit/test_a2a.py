@@ -62,6 +62,7 @@ from ash.safety.guard import SafetyGuard
 from ash.server.a2a import (
     MAX_A2A_BODY_BYTES,
     MAX_A2A_INPUT_BYTES,
+    A2AAuthMiddleware,
     A2ASessionRegistry,
     AshA2AExecutor,
     _create_a2a_task_engine,
@@ -861,6 +862,66 @@ def test_a2a_request_text_stops_reading_parts_after_input_limit() -> None:
 
     assert _request_text(context) == ""
     assert accesses == 1
+
+
+def test_a2a_request_text_preserves_nonempty_whitespace() -> None:
+    context = SimpleNamespace(
+        message=Message(
+            message_id="whitespace-message",
+            role=Role.ROLE_USER,
+            parts=[Part(text="  leading and trailing  ")],
+        )
+    )
+
+    assert _request_text(context) == "  leading and trailing  "
+
+    whitespace_only = SimpleNamespace(
+        message=Message(
+            message_id="whitespace-only-message",
+            role=Role.ROLE_USER,
+            parts=[Part(text=" \t\n ")],
+        )
+    )
+    assert _request_text(whitespace_only) == ""
+
+
+@pytest.mark.asyncio
+async def test_a2a_auth_rejects_non_ascii_bearer_token_as_unauthorized() -> None:
+    app_called = False
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        del scope, receive, send
+        nonlocal app_called
+        app_called = True
+
+    middleware = A2AAuthMiddleware(
+        app,
+        bearer_token="0123456789abcdef",
+        requests_per_minute=100,
+    )
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    await middleware(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/a2a",
+            "headers": [(b"authorization", b"Bearer \xff")],
+            "client": ("127.0.0.1", 12345),
+        },
+        receive,
+        send,
+    )
+
+    assert app_called is False
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    assert start["status"] == 401
 
 
 @pytest.mark.asyncio

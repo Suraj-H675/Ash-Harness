@@ -101,7 +101,7 @@ async def inspect_a2a(args) -> int:
     url = _remote_url(args.url)
     async with _remote_http_client(args) as http:
         card = await A2ACardResolver(http, url).get_agent_card()
-        print(json.dumps(agent_card_to_dict(card), indent=2))
+        print(json.dumps(redact_value(agent_card_to_dict(card)), indent=2))
     return 0
 
 

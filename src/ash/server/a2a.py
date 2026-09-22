@@ -137,7 +137,7 @@ class A2AAuthMiddleware:
         if len(bearer_token) < 16:
             raise ValueError("A2A bearer token must contain at least 16 characters")
         self.app = app
-        self._token = bearer_token
+        self._token = bearer_token.encode("utf-8")
         self._limiter = _SlidingWindowLimiter(requests_per_minute)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -148,16 +148,16 @@ class A2AAuthMiddleware:
             await self.app(scope, receive, send)
             return
         authorization_values = [
-            value.decode("latin-1")
+            value
             for key, value in scope.get("headers", [])
-            if key.decode("latin-1").casefold() == "authorization"
+            if key.lower() == b"authorization"
         ]
         scheme, _, supplied = (
-            authorization_values[0] if len(authorization_values) == 1 else ""
-        ).partition(" ")
+            authorization_values[0] if len(authorization_values) == 1 else b""
+        ).partition(b" ")
         if (
             len(authorization_values) != 1
-            or scheme.casefold() != "bearer"
+            or scheme.lower() != b"bearer"
             or not hmac.compare_digest(supplied, self._token)
         ):
             response = JSONResponse(
@@ -625,7 +625,8 @@ def _request_text(context: RequestContext) -> str:
         if total_bytes > MAX_A2A_INPUT_BYTES:
             return ""
         chunks.append(value)
-    return "\n".join(chunks).strip()
+    text = "\n".join(chunks)
+    return text if text.strip() else ""
 
 
 def _agent_message(updater: TaskUpdater, text: str) -> Message:
