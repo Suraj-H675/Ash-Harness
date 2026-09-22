@@ -439,8 +439,9 @@ def _verified_catalogs(
     *,
     transport: Any | None = None,
 ) -> tuple[SignedCatalog, ...]:
-    expected_publishers: tuple[str | None, ...] | None = None
+    expected_publishers: tuple[str, ...] | None = None
     expected_key_ids: tuple[str | None, ...] | None = None
+    registered_sequences: dict[str, int] = {}
     sources: tuple[CatalogSource | None, ...]
     if isinstance(catalog, Mapping):
         expected_publishers = tuple(catalog.keys())
@@ -486,16 +487,21 @@ def _verified_catalogs(
                     f"registered marketplace @{expected} signing key changed from "
                     f"{expected_key_id!r} to {item.key_id!r}"
                 )
-    if len(verified) <= 1:
-        return verified
-    publishers = [item.publisher for item in verified]
-    if any(publisher is None for publisher in publishers):
-        raise PluginLifecycleError(
-            "multiple plugin catalogs require version 2 signed publisher identity"
-        )
-    publisher_names = [publisher for publisher in publishers if publisher is not None]
-    if len(set(publisher_names)) != len(publisher_names):
-        raise PluginLifecycleError("duplicate plugin catalog publisher in selection")
+            if expected_key_id is not None:
+                registered_sequences[expected] = item.sequence
+    if len(verified) > 1:
+        publishers = [item.publisher for item in verified]
+        if any(publisher is None for publisher in publishers):
+            raise PluginLifecycleError(
+                "multiple plugin catalogs require version 2 signed publisher identity"
+            )
+        publisher_names = [publisher for publisher in publishers if publisher is not None]
+        if len(set(publisher_names)) != len(publisher_names):
+            raise PluginLifecycleError("duplicate plugin catalog publisher in selection")
+    if registered_sequences:
+        from ash.commands.marketplace import accept_registered_marketplace_sequences
+
+        accept_registered_marketplace_sequences(registered_sequences)
     return verified
 
 

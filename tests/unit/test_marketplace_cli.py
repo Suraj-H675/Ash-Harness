@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -174,6 +175,363 @@ def test_registered_marketplace_rejects_publisher_signed_by_different_trusted_ke
     captured = capsys.readouterr()
     assert "signing key" in captured.err.casefold()
     assert captured.out == ""
+
+
+def test_registered_marketplace_rejects_replayed_older_signed_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(
+        tmp_path / "alpha.json",
+        private_key,
+        publisher="alpha",
+        sequence=1,
+    )
+    assert main(["marketplace", "add", str(catalog)]) == 0
+    capsys.readouterr()
+
+    _write_catalog(
+        catalog,
+        private_key,
+        publisher="alpha",
+        sequence=2,
+    )
+    assert main(["extensions", "search", "", "--json"]) == 0
+    observed = json.loads(capsys.readouterr().out)
+    assert observed["sequence"] == 2
+
+    _write_catalog(
+        catalog,
+        private_key,
+        publisher="alpha",
+        sequence=1,
+    )
+    assert main(["extensions", "search", "", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert "sequence" in captured.err.casefold()
+    assert "rollback" in captured.err.casefold()
+    assert captured.out == ""
+
+
+def test_marketplace_registration_seeds_sequence_watermark(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(
+        tmp_path / "alpha.json",
+        private_key,
+        publisher="alpha",
+        sequence=5,
+    )
+    assert main(["marketplace", "add", str(catalog)]) == 0
+    capsys.readouterr()
+
+    _write_catalog(
+        catalog,
+        private_key,
+        publisher="alpha",
+        sequence=4,
+    )
+    assert main(["extensions", "search", "", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert "sequence rollback" in captured.err.casefold()
+    assert captured.out == ""
+
+
+def test_marketplace_remove_readd_does_not_reset_sequence_watermark(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(
+        tmp_path / "alpha.json",
+        private_key,
+        publisher="alpha",
+        sequence=5,
+    )
+    assert main(["marketplace", "add", str(catalog)]) == 0
+    capsys.readouterr()
+    assert main(["marketplace", "remove", "alpha"]) == 0
+    capsys.readouterr()
+
+    _write_catalog(
+        catalog,
+        private_key,
+        publisher="alpha",
+        sequence=4,
+    )
+    assert main(["marketplace", "add", str(catalog)]) == 2
+    captured = capsys.readouterr()
+    assert "sequence rollback" in captured.err.casefold()
+
+    _write_catalog(
+        catalog,
+        private_key,
+        publisher="alpha",
+        sequence=6,
+    )
+    assert main(["marketplace", "add", str(catalog)]) == 0
+    capsys.readouterr()
+    assert main(["extensions", "search", "", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["sequence"] == 6
+
+
+def test_registered_marketplace_sequence_state_is_profile_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(
+        tmp_path / "alpha.json",
+        private_key,
+        publisher="alpha",
+        sequence=5,
+    )
+    assert main(["--profile", "work", "marketplace", "add", str(catalog)]) == 0
+    capsys.readouterr()
+
+    _write_catalog(
+        catalog,
+        private_key,
+        publisher="alpha",
+        sequence=1,
+    )
+    assert main(["--profile", "default", "marketplace", "add", str(catalog)]) == 0
+    capsys.readouterr()
+    assert main(["--profile", "default", "extensions", "search", "", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["sequence"] == 1
+
+    assert main(["--profile", "work", "extensions", "search", "", "--json"]) == 2
+    assert "sequence rollback" in capsys.readouterr().err.casefold()
+
+
+def test_registered_marketplace_sequence_advancement_does_not_rewrite_user_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands import config as cli_config
+
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(
+        tmp_path / "alpha.json",
+        private_key,
+        publisher="alpha",
+        sequence=1,
+    )
+    assert main(["marketplace", "add", str(catalog)]) == 0
+    capsys.readouterr()
+    before = cli_config.get_config_path().read_bytes()
+
+    _write_catalog(
+        catalog,
+        private_key,
+        publisher="alpha",
+        sequence=2,
+    )
+    assert main(["extensions", "search", "", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["sequence"] == 2
+    assert cli_config.get_config_path().read_bytes() == before
+
+
+def test_registered_marketplace_sequence_updates_preserve_concurrent_maximum(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.marketplace import accept_registered_marketplace_sequences
+
+    home = tmp_path / "concurrent-home"
+    monkeypatch.setenv("HOME", str(home))
+    errors: list[BaseException] = []
+    accept_registered_marketplace_sequences({"alpha": 1})
+
+    def accept(sequence: int) -> None:
+        try:
+            accept_registered_marketplace_sequences({"alpha": sequence})
+        except BaseException as exc:  # pragma: no cover - diagnostic assertion
+            errors.append(exc)
+
+    first = threading.Thread(target=accept, args=(2,))
+    second = threading.Thread(target=accept, args=(3,))
+    first.start()
+    second.start()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert all("sequence rollback" in str(exc) for exc in errors)
+    with pytest.raises(ValueError, match="sequence rollback"):
+        accept_registered_marketplace_sequences({"alpha": 2})
+
+
+def test_existing_bound_marketplace_first_use_seeds_sequence_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands import config as cli_config
+
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(
+        tmp_path / "alpha.json",
+        private_key,
+        publisher="alpha",
+        sequence=5,
+    )
+    cli_config.ensure_ash_dir()
+    cli_config.save_config(
+        {
+            "plugin_marketplaces": {"alpha": str(catalog.resolve())},
+            "plugin_marketplace_key_ids": {"alpha": "marketplace-key"},
+        }
+    )
+
+    assert main(["extensions", "search", "", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["sequence"] == 5
+
+    _write_catalog(
+        catalog,
+        private_key,
+        publisher="alpha",
+        sequence=4,
+    )
+    assert main(["extensions", "search", "", "--json"]) == 2
+    assert "sequence rollback" in capsys.readouterr().err.casefold()
+
+
+def test_registered_marketplace_sequence_batch_rejects_without_partial_advance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    alpha = _write_catalog(
+        tmp_path / "alpha.json",
+        private_key,
+        publisher="alpha",
+        sequence=1,
+    )
+    beta = _write_catalog(
+        tmp_path / "beta.json",
+        private_key,
+        publisher="beta",
+        name="other",
+        sequence=5,
+    )
+    assert main(["marketplace", "add", str(alpha)]) == 0
+    capsys.readouterr()
+    assert main(["marketplace", "add", str(beta)]) == 0
+    capsys.readouterr()
+
+    _write_catalog(
+        alpha,
+        private_key,
+        publisher="alpha",
+        sequence=2,
+    )
+    _write_catalog(
+        beta,
+        private_key,
+        publisher="beta",
+        name="other",
+        sequence=4,
+    )
+    assert main(["extensions", "search", "", "--json"]) == 2
+    assert "@beta" in capsys.readouterr().err
+
+    _write_catalog(
+        alpha,
+        private_key,
+        publisher="alpha",
+        sequence=1,
+    )
+    _write_catalog(
+        beta,
+        private_key,
+        publisher="beta",
+        name="other",
+        sequence=5,
+    )
+    assert main(["extensions", "search", "", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["catalogs"] == [
+        {"publisher": "alpha", "sequence": 1},
+        {"publisher": "beta", "sequence": 5},
+    ]
+
+
+def test_registered_marketplace_malformed_sequence_state_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(tmp_path / "alpha.json", private_key, publisher="alpha")
+    assert main(["marketplace", "add", str(catalog)]) == 0
+    capsys.readouterr()
+    state_path = Path.home() / ".ash" / ".marketplace-trust.json"
+    state_path.write_text(
+        '{"version":1,"publishers":{"alpha":0}}\n',
+        encoding="utf-8",
+    )
+
+    assert main(["extensions", "search", "", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert "invalid plugin marketplace trust state" in captured.err.casefold()
+    assert captured.out == ""
+
+
+def test_explicit_catalog_is_not_bound_to_registered_sequence_watermark(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(
+        tmp_path / "alpha.json",
+        private_key,
+        publisher="alpha",
+        sequence=5,
+    )
+    assert main(["marketplace", "add", str(catalog)]) == 0
+    capsys.readouterr()
+
+    _write_catalog(
+        catalog,
+        private_key,
+        publisher="alpha",
+        sequence=1,
+    )
+    assert (
+        main(
+            [
+                "extensions",
+                "search",
+                "",
+                "--catalog",
+                str(catalog),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["sequence"] == 1
 
 
 def test_marketplace_signer_rotation_requires_explicit_replace(

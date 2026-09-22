@@ -22,8 +22,178 @@ from ash.plugins.catalog import (
     trusted_catalog_keys_path,
     validate_catalog_publisher,
 )
+from ash.plugins.anchored_fs import (
+    AnchoredDirectory,
+    AnchoredFilesystemError,
+    AnchoredFilesystemUnavailable,
+)
 from ash.plugins.lifecycle import PluginLifecycleError
+from ash.profiles import active_profile_name, profile_directory
+from ash.safe_io import strict_json_loads
 from ash.ui.safe_text import terminal_safe_text
+
+
+MARKETPLACE_TRUST_STATE_VERSION = 1
+MARKETPLACE_TRUST_STATE_FILENAME = ".marketplace-trust.json"
+MAX_MARKETPLACE_TRUST_STATE_BYTES = 1024 * 1024
+MAX_MARKETPLACE_TRUST_PUBLISHERS = 10_000
+
+
+def _marketplace_trust_state_path() -> Path:
+    state_root = Path.home() / ".ash"
+    profile = active_profile_name(ash_dir=state_root)
+    return profile_directory(profile, ash_dir=state_root) / MARKETPLACE_TRUST_STATE_FILENAME
+
+
+def _parse_marketplace_trust_state(raw: bytes) -> dict[str, int]:
+    try:
+        payload = strict_json_loads(raw)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise PluginLifecycleError(
+            f"invalid plugin marketplace trust state: {exc}"
+        ) from exc
+    if not isinstance(payload, dict) or set(payload) != {"version", "publishers"}:
+        raise PluginLifecycleError("invalid plugin marketplace trust state")
+    if payload["version"] != MARKETPLACE_TRUST_STATE_VERSION:
+        raise PluginLifecycleError("unsupported plugin marketplace trust state")
+    publishers = payload["publishers"]
+    if not isinstance(publishers, dict) or len(publishers) > MAX_MARKETPLACE_TRUST_PUBLISHERS:
+        raise PluginLifecycleError("invalid plugin marketplace trust state")
+    parsed: dict[str, int] = {}
+    for raw_publisher, raw_sequence in publishers.items():
+        if not isinstance(raw_publisher, str):
+            raise PluginLifecycleError("invalid plugin marketplace trust state")
+        publisher = validate_catalog_publisher(raw_publisher)
+        if (
+            isinstance(raw_sequence, bool)
+            or not isinstance(raw_sequence, int)
+            or raw_sequence < 1
+        ):
+            raise PluginLifecycleError("invalid plugin marketplace trust state")
+        parsed[publisher] = raw_sequence
+    return parsed
+
+
+def _read_marketplace_trust_state_at(directory: AnchoredDirectory) -> dict[str, int]:
+    raw = directory.read_file(
+        MARKETPLACE_TRUST_STATE_FILENAME,
+        max_bytes=MAX_MARKETPLACE_TRUST_STATE_BYTES,
+    )
+    if raw is None:
+        return {}
+    return _parse_marketplace_trust_state(raw)
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(descriptor, data[offset:])
+        if written <= 0:
+            raise OSError("could not write plugin marketplace trust state")
+        offset += written
+
+
+def _save_marketplace_trust_state_at(
+    directory: AnchoredDirectory,
+    publishers: dict[str, int],
+) -> None:
+    if len(publishers) > MAX_MARKETPLACE_TRUST_PUBLISHERS:
+        raise PluginLifecycleError("plugin marketplace trust state is full")
+    payload = {
+        "version": MARKETPLACE_TRUST_STATE_VERSION,
+        "publishers": dict(sorted(publishers.items())),
+    }
+    data = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    if len(data) > MAX_MARKETPLACE_TRUST_STATE_BYTES:
+        raise PluginLifecycleError("plugin marketplace trust state is too large")
+
+    temporary = directory.unique_name(".marketplace-trust-", ".tmp")
+    descriptor = -1
+    temporary_identity = None
+    try:
+        descriptor = directory.create_file(temporary, mode=0o600)
+        temporary_identity = os.fstat(descriptor)
+        _write_all(descriptor, data)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        directory.rename(
+            temporary,
+            MARKETPLACE_TRUST_STATE_FILENAME,
+            expected_source=temporary_identity,
+        )
+        temporary = ""
+        directory.sync()
+    except BaseException as primary:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except BaseException as cleanup:
+                primary.add_note(f"marketplace trust descriptor close failed: {cleanup}")
+            descriptor = -1
+        if temporary:
+            try:
+                directory.unlink(
+                    temporary,
+                    expected=temporary_identity,
+                    missing_ok=True,
+                )
+            except BaseException as cleanup:
+                primary.add_note(f"marketplace trust temporary cleanup failed: {cleanup}")
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def accept_registered_marketplace_sequences(candidates: dict[str, int]) -> None:
+    """Atomically reject rollbacks and advance registered marketplace watermarks."""
+
+    if not candidates:
+        return
+    normalized: dict[str, int] = {}
+    for raw_publisher, raw_sequence in candidates.items():
+        publisher = validate_catalog_publisher(raw_publisher)
+        if (
+            isinstance(raw_sequence, bool)
+            or not isinstance(raw_sequence, int)
+            or raw_sequence < 1
+        ):
+            raise PluginLifecycleError("invalid plugin marketplace catalog sequence")
+        normalized[publisher] = raw_sequence
+
+    state_path = _marketplace_trust_state_path()
+    try:
+        with (
+            AnchoredDirectory.open(state_path.parent, create=True) as directory,
+            directory.lock(".marketplace-trust.lock"),
+        ):
+            directory.prepare_durable_mutation()
+            current = _read_marketplace_trust_state_at(directory)
+            for publisher, sequence in normalized.items():
+                highest = current.get(publisher)
+                if highest is not None and sequence < highest:
+                    raise PluginLifecycleError(
+                        f"registered marketplace @{publisher} catalog sequence rollback: "
+                        f"received {sequence}, highest accepted is {highest}"
+                    )
+            updated = dict(current)
+            changed = False
+            for publisher, sequence in normalized.items():
+                highest = updated.get(publisher)
+                if highest is None or sequence > highest:
+                    updated[publisher] = sequence
+                    changed = True
+            if changed:
+                _save_marketplace_trust_state_at(directory, updated)
+    except PluginLifecycleError:
+        raise
+    except (AnchoredFilesystemError, AnchoredFilesystemUnavailable, OSError) as exc:
+        raise PluginLifecycleError(
+            f"cannot update plugin marketplace trust state: {exc}"
+        ) from exc
 
 
 def _normalized_source(source: str) -> str:
@@ -120,6 +290,7 @@ def add_marketplace(source: str, *, replace: bool = False) -> dict[str, Any]:
         raise ValueError(
             f"plugin_marketplaces supports at most {MAX_PLUGIN_MARKETPLACES} entries"
         )
+    accept_registered_marketplace_sequences({publisher: verified.sequence})
     marketplaces[publisher] = normalized_source
     key_ids[publisher] = verified.key_id
     user_config["plugin_marketplaces"] = marketplaces
