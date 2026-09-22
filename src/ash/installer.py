@@ -574,7 +574,6 @@ def _quarantine_pipx_metadata_owned_windows(
             try:
                 _windows_rename_open_file(
                     descriptor,
-                    parent_handle=parent_handle,
                     destination_name=quarantine_name,
                 )
             except FileExistsError:
@@ -891,7 +890,6 @@ def _windows_handle_is_reparse(handle: int) -> bool:
 def _windows_rename_open_file(
     descriptor: int,
     *,
-    parent_handle: int,
     destination_name: str,
 ) -> None:
     import ctypes
@@ -908,7 +906,9 @@ def _windows_rename_open_file(
 
     info = FileRenameInfo()
     info.ReplaceIfExists = 0
-    info.RootDirectory = wintypes.HANDLE(parent_handle)
+    # A simple name renames the already-open file within its current directory.
+    # Windows requires RootDirectory to be NULL for that form.
+    info.RootDirectory = None
     info.FileNameLength = len(destination_name.encode("utf-16-le"))
     info.FileName = destination_name
     win_dll: Any = getattr(ctypes, "WinDLL")
