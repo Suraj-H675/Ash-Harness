@@ -561,7 +561,10 @@ def _quarantine_pipx_metadata_owned_fallback(
 def _quarantine_pipx_metadata_owned_windows(
     metadata: _OwnedMetadataFile,
 ) -> _OwnedMetadataFile:
-    parent_handle = _windows_open_installer_directory(metadata.path.parent)
+    parent_handle = _windows_open_installer_directory(
+        metadata.path.parent,
+        for_rename=True,
+    )
     descriptor = -1
     try:
         descriptor = _windows_open_owned_metadata(
@@ -574,6 +577,7 @@ def _quarantine_pipx_metadata_owned_windows(
             try:
                 _windows_rename_open_file(
                     descriptor,
+                    parent_handle=parent_handle,
                     destination_name=quarantine_name,
                 )
             except FileExistsError:
@@ -650,7 +654,7 @@ def _remove_owned_quarantine_windows(quarantine: _OwnedMetadataFile) -> None:
         _windows_close_handle(parent_handle)
 
 
-def _windows_open_installer_directory(path: Path) -> int:
+def _windows_open_installer_directory(path: Path, *, for_rename: bool = False) -> int:
     import ctypes
     from ctypes import wintypes
 
@@ -670,6 +674,8 @@ def _windows_open_installer_directory(path: Path) -> int:
     ]
     create_file.restype = wintypes.HANDLE
     file_read_attributes = 0x00000080
+    file_add_file = 0x00000002
+    synchronize = 0x00100000
     share_read = 0x00000001
     share_write = 0x00000002
     share_delete = 0x00000004
@@ -677,9 +683,12 @@ def _windows_open_installer_directory(path: Path) -> int:
     flag_backup_semantics = 0x02000000
     flag_open_reparse_point = 0x00200000
     invalid_handle = ctypes.c_void_p(-1).value
+    desired_access = file_read_attributes
+    if for_rename:
+        desired_access |= file_add_file | synchronize
     handle = create_file(
         str(path),
-        file_read_attributes,
+        desired_access,
         share_read | share_write | share_delete,
         None,
         open_existing,
@@ -898,6 +907,7 @@ def _windows_handle_is_reparse(handle: int) -> bool:
 def _windows_rename_open_file(
     descriptor: int,
     *,
+    parent_handle: int,
     destination_name: str,
 ) -> None:
     import ctypes
@@ -912,44 +922,56 @@ def _windows_rename_open_file(
             ("FileName", ctypes.c_wchar * (len(destination_name) + 1)),
         ]
 
+    class IoStatusUnion(ctypes.Union):
+        _fields_ = [
+            ("Status", ctypes.c_long),
+            ("Pointer", ctypes.c_void_p),
+        ]
+
+    class IoStatusBlock(ctypes.Structure):
+        _anonymous_ = ("result",)
+        _fields_ = [
+            ("result", IoStatusUnion),
+            ("Information", ctypes.c_size_t),
+        ]
+
     info = FileRenameInfo()
     info.ReplaceIfExists = 0
-    # A simple name renames the already-open file within its current directory.
-    # Windows requires RootDirectory to be NULL for that form.
-    info.RootDirectory = None
+    info.RootDirectory = wintypes.HANDLE(parent_handle)
     info.FileNameLength = len(destination_name.encode("utf-16-le"))
     info.FileName = destination_name
     win_dll: Any = getattr(ctypes, "WinDLL")
-    get_last_error: Any = getattr(ctypes, "get_last_error")
-    format_error: Any = getattr(ctypes, "FormatError")
     get_osfhandle: Any = getattr(msvcrt, "get_osfhandle")
-    kernel32: Any = win_dll("kernel32", use_last_error=True)
-    set_info: Any = kernel32.SetFileInformationByHandle
+    ntdll: Any = win_dll("ntdll")
+    set_info: Any = ntdll.NtSetInformationFile
     set_info.argtypes = [
         wintypes.HANDLE,
-        ctypes.c_int,
+        ctypes.POINTER(IoStatusBlock),
         ctypes.c_void_p,
         wintypes.DWORD,
+        ctypes.c_int,
     ]
-    set_info.restype = wintypes.BOOL
+    set_info.restype = ctypes.c_long
     handle = int(get_osfhandle(descriptor))
-    if not set_info(
-        wintypes.HANDLE(handle),
-        3,
-        ctypes.byref(info),
-        ctypes.sizeof(info),
-    ):
-        error_number = int(get_last_error())
-        if error_number in {80, 183}:
-            raise FileExistsError(
-                error_number,
-                format_error(error_number),
-                destination_name,
-            )
-        raise InstallError(
-            "could not safely rename pipx metadata into quarantine: "
-            f"{format_error(error_number)}"
+    io_status = IoStatusBlock()
+    status = int(
+        set_info(
+            wintypes.HANDLE(handle),
+            ctypes.byref(io_status),
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            10,  # FileRenameInformation
         )
+    )
+    if status >= 0:
+        return
+    status_code = status & 0xFFFFFFFF
+    if status_code == 0xC0000035:  # STATUS_OBJECT_NAME_COLLISION
+        raise FileExistsError(17, "pipx metadata quarantine already exists", destination_name)
+    raise InstallError(
+        "could not safely rename pipx metadata into quarantine: "
+        f"NTSTATUS 0x{status_code:08x}"
+    )
 
 
 def _windows_delete_open_file(descriptor: int) -> None:
