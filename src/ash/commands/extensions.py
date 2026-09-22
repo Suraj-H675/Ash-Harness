@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from ash.core.redaction import redact_text
+from ash.core.redaction import redact_text, redact_urls_in_text
 from ash.mcp.server import load_mcp_servers, parse_mcp_servers_payload
 from ash.plugins.agents import (
     AgentCatalog,
@@ -68,6 +68,7 @@ from ash.ui.safe_text import terminal_safe_text
 
 ExtensionKind = Literal["all", "skills", "agents", "plugins", "hooks"]
 PluginAction = Literal["install", "enable", "disable", "uninstall"]
+MAX_PLUGIN_DIAGNOSTIC_CHARS = 512
 CatalogSource = Path | str
 CatalogSelection = (
     CatalogSource
@@ -88,6 +89,22 @@ ExtensionAction = Literal[
     "disable",
     "uninstall",
 ]
+
+
+def safe_plugin_diagnostic(
+    value: object,
+    *,
+    max_chars: int = MAX_PLUGIN_DIAGNOSTIC_CHARS,
+) -> str:
+    """Render one plugin/catalog diagnostic without leaking URL secrets or controls."""
+
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
+    rendered = redact_urls_in_text(str(value)).strip() or type(value).__name__
+    rendered = terminal_safe_text(rendered, single_line=True)
+    if len(rendered) > max_chars:
+        return rendered[: max_chars - 3] + "..."
+    return rendered
 
 
 @dataclass(frozen=True)

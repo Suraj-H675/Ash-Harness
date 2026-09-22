@@ -1305,6 +1305,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     manage_local_plugin,
                     render_plugin_action,
                     render_plugin_update_all,
+                    safe_plugin_diagnostic,
                     update_all_local_plugins,
                     update_local_plugin,
                 )
@@ -1388,9 +1389,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             else None
                         )
                     except (OSError, PluginLifecycleError, ValueError) as exc:
-                        print(
-                            f"Error: {safe_mcp_diagnostic(exc)}", file=sys.stderr
-                        )
+                        print(f"Error: {safe_plugin_diagnostic(exc)}", file=sys.stderr)
                         continue
                     print(
                         render_plugin_update_all(plugin_result, json_output=False)
@@ -4025,6 +4024,7 @@ def main(argv: list[str] | None = None) -> int:
             discover_extensions,
             manage_local_plugin,
             render_plugin_update_all,
+            safe_plugin_diagnostic,
             update_all_local_plugins,
             update_local_plugin,
             render_extension_inventory,
@@ -4113,7 +4113,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     print(render_plugin_action(result, json_output=args.json))
             except (OSError, PluginLifecycleError) as exc:
-                print(f"Error: {exc}", file=sys.stderr)
+                print(f"Error: {safe_plugin_diagnostic(exc)}", file=sys.stderr)
                 return 2
         else:
             if (

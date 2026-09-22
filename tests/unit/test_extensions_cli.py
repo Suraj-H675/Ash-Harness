@@ -438,6 +438,62 @@ def test_extensions_cli_rejects_irrelevant_arguments(arguments, capsys) -> None:
     assert "Error:" in capsys.readouterr().err
 
 
+def test_extensions_single_plugin_error_redacts_signed_url_and_terminal_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.plugins.lifecycle import PluginLifecycleError
+
+    marker = "plugin-signed-secret"
+    osc = "\x1b]52;c;YXR0YWNrZXI=\x07"
+
+    def fail(*args, **kwargs):
+        del args, kwargs
+        raise PluginLifecycleError(
+            "could not clone plugin source: fatal: "
+            "https://plugins.example/demo.git?"
+            f"X-Amz-Signature={marker}&view=full {osc}"
+        )
+
+    monkeypatch.setattr("ash.commands.extensions.manage_local_plugin", fail)
+
+    assert main(["extensions", "install", "demo"]) == 2
+    captured = capsys.readouterr()
+    assert marker not in captured.err
+    assert osc not in captured.err
+    assert "X-Amz-Signature=[REDACTED]" in captured.err
+    assert "\\x1b" in captured.err
+    assert captured.out == ""
+
+
+def test_extensions_catalog_error_redacts_signed_url_and_terminal_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.plugins.lifecycle import PluginLifecycleError
+
+    marker = "catalog-signed-secret"
+    osc = "\x1b]52;c;YXR0YWNrZXI=\x07"
+
+    def fail(*args, **kwargs):
+        del args, kwargs
+        raise PluginLifecycleError(
+            "could not fetch plugin catalog: "
+            "https://catalog.example/plugins.json?"
+            f"X-Amz-Signature={marker}&view=full {osc}"
+        )
+
+    monkeypatch.setattr("ash.commands.extensions.search_catalog_plugins", fail)
+
+    assert main(["extensions", "search", "demo", "--catalog", "catalog.json"]) == 2
+    captured = capsys.readouterr()
+    assert marker not in captured.err
+    assert osc not in captured.err
+    assert "X-Amz-Signature=[REDACTED]" in captured.err
+    assert "\\x1b" in captured.err
+    assert captured.out == ""
+
+
 def _write_signed_catalog(
     root: Path,
     *,
