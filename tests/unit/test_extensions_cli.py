@@ -503,6 +503,8 @@ def _write_publisher_catalog(
     private_key: Ed25519PrivateKey,
     key_id: str = "publisher-key",
     sequence: int = 1,
+    version: str = "1.0.0",
+    ref: str = "v1.0.0",
 ) -> Path:
     encoded_private = (
         base64.urlsafe_b64encode(private_key.private_bytes_raw()).rstrip(b"=").decode()
@@ -514,9 +516,9 @@ def _write_publisher_catalog(
         "entries": [
             {
                 "name": name,
-                "version": "1.0.0",
+                "version": version,
                 "source": source,
-                "ref": "v1.0.0",
+                "ref": ref,
                 "digest": digest,
             }
         ],
@@ -533,6 +535,52 @@ def _write_publisher_catalog(
         )
     )
     return path
+
+
+def test_catalog_search_human_output_sanitizes_signed_terminal_controls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    keys = _write_publisher_key(tmp_path, private_key)
+    marker = "\x1b]52;c;YXR0YWNrZXI=\x07"
+    catalog = _write_publisher_catalog(
+        tmp_path,
+        filename="control-catalog.json",
+        publisher="alpha",
+        name="demo",
+        source=f"https://plugins.example/demo.git{marker}",
+        digest="a" * 64,
+        private_key=private_key,
+        version=f"1.0.0{marker}",
+        ref=f"v1.0.0{marker}",
+    )
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(keys))
+
+    assert main(["extensions", "search", "demo", "--catalog", str(catalog)]) == 0
+    human = capsys.readouterr().out
+    assert marker not in human
+    assert "\\x1b]52" in human
+
+    assert (
+        main(
+            [
+                "extensions",
+                "search",
+                "demo",
+                "--catalog",
+                str(catalog),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    plugin = payload["plugins"][0]
+    assert marker in plugin["version"]
+    assert marker in plugin["source"]
+    assert marker in plugin["ref"]
 
 
 def _write_publisher_key(

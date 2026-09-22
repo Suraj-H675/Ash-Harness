@@ -68,6 +68,34 @@ def _write_keys(root: Path, private_key: Ed25519PrivateKey) -> Path:
     return path
 
 
+def _write_keyring(
+    root: Path,
+    entries: list[tuple[str, Ed25519PrivateKey]],
+) -> Path:
+    path = root / "keys.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "keys": [
+                    {
+                        "keyId": key_id,
+                        "algorithm": "ed25519",
+                        "publicKey": base64.urlsafe_b64encode(
+                            private_key.public_key().public_bytes_raw()
+                        )
+                        .rstrip(b"=")
+                        .decode(),
+                    }
+                    for key_id, private_key in entries
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _write_catalog(
     path: Path,
     private_key: Ed25519PrivateKey,
@@ -75,6 +103,7 @@ def _write_catalog(
     publisher: str | None,
     name: str = "demo",
     sequence: int = 1,
+    key_id: str = "marketplace-key",
 ) -> Path:
     encoded_private = (
         base64.urlsafe_b64encode(private_key.private_bytes_raw()).rstrip(b"=").decode()
@@ -98,7 +127,7 @@ def _write_catalog(
         json.dumps(
             {
                 "catalog": payload,
-                "keyId": "marketplace-key",
+                "keyId": key_id,
                 "algorithm": "ed25519",
                 "signature": sign_catalog(payload, encoded_private),
             }
@@ -106,6 +135,118 @@ def _write_catalog(
         encoding="utf-8",
     )
     return path
+
+
+def test_registered_marketplace_rejects_publisher_signed_by_different_trusted_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    first_key = Ed25519PrivateKey.generate()
+    second_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv(
+        "ASH_CATALOG_KEYS",
+        str(
+            _write_keyring(
+                tmp_path,
+                [("key-a", first_key), ("key-b", second_key)],
+            )
+        ),
+    )
+    catalog = _write_catalog(
+        tmp_path / "alpha.json",
+        first_key,
+        publisher="alpha",
+        key_id="key-a",
+    )
+
+    assert main(["marketplace", "add", str(catalog)]) == 0
+    capsys.readouterr()
+
+    _write_catalog(
+        catalog,
+        second_key,
+        publisher="alpha",
+        sequence=2,
+        key_id="key-b",
+    )
+    assert main(["extensions", "search", "", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert "signing key" in captured.err.casefold()
+    assert captured.out == ""
+
+
+def test_marketplace_signer_rotation_requires_explicit_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands import config as cli_config
+
+    first_key = Ed25519PrivateKey.generate()
+    second_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv(
+        "ASH_CATALOG_KEYS",
+        str(
+            _write_keyring(
+                tmp_path,
+                [("key-a", first_key), ("key-b", second_key)],
+            )
+        ),
+    )
+    catalog = _write_catalog(
+        tmp_path / "alpha.json",
+        first_key,
+        publisher="alpha",
+        key_id="key-a",
+    )
+    assert main(["marketplace", "add", str(catalog)]) == 0
+    capsys.readouterr()
+
+    _write_catalog(
+        catalog,
+        second_key,
+        publisher="alpha",
+        sequence=2,
+        key_id="key-b",
+    )
+    assert main(["marketplace", "add", str(catalog)]) == 2
+    assert "--replace" in capsys.readouterr().err
+    assert cli_config.load_config(strict=True)["plugin_marketplace_key_ids"] == {
+        "alpha": "key-a"
+    }
+
+    assert main(["marketplace", "add", str(catalog), "--replace"]) == 0
+    capsys.readouterr()
+    assert cli_config.load_config(strict=True)["plugin_marketplace_key_ids"] == {
+        "alpha": "key-b"
+    }
+    assert main(["extensions", "search", "", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["publisher"] == "alpha"
+    assert result["sequence"] == 2
+
+
+def test_legacy_registered_marketplace_without_signer_binding_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands import config as cli_config
+
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(tmp_path / "alpha.json", private_key, publisher="alpha")
+    cli_config.ensure_ash_dir()
+    cli_config.save_config(
+        {"plugin_marketplaces": {"alpha": str(catalog.resolve())}}
+    )
+
+    assert main(["extensions", "search", "", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert "signer binding" in captured.err.casefold()
+    assert "re-register" in captured.err.casefold()
+    assert captured.out == ""
 
 
 def test_marketplace_add_persists_verified_v2_publisher_and_lists_it(
@@ -128,6 +269,9 @@ def test_marketplace_add_persists_verified_v2_publisher_and_lists_it(
     }
     assert cli_config.load_config(strict=True)["plugin_marketplaces"] == {
         "alpha": str(catalog.resolve())
+    }
+    assert cli_config.load_config(strict=True)["plugin_marketplace_key_ids"] == {
+        "alpha": "marketplace-key"
     }
 
     assert main(["marketplace", "list", "--json"]) == 0

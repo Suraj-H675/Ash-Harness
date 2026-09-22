@@ -10,16 +10,19 @@ from typing import Any
 from ash.commands.config import load_config, save_config
 from ash.config import (
     MAX_PLUGIN_MARKETPLACES,
+    validate_plugin_marketplace_key_ids,
     validate_plugin_marketplace_source,
     validate_plugin_marketplaces,
 )
 from ash.plugins.catalog import (
     PluginCatalogError,
+    RegisteredCatalogSource,
     fetch_catalog,
     parse_and_verify_catalog,
     trusted_catalog_keys_path,
     validate_catalog_publisher,
 )
+from ash.plugins.lifecycle import PluginLifecycleError
 from ash.ui.safe_text import terminal_safe_text
 
 
@@ -50,6 +53,32 @@ def registered_marketplaces() -> dict[str, str]:
     return validate_plugin_marketplaces(raw.get("plugin_marketplaces", {}))
 
 
+def registered_marketplace_selection() -> dict[str, RegisteredCatalogSource]:
+    """Return registered sources bound to the signing keys accepted at registration."""
+
+    raw = load_config(strict=True)
+    if not isinstance(raw, dict):
+        raise ValueError("user configuration must contain a TOML table")
+    marketplaces = validate_plugin_marketplaces(raw.get("plugin_marketplaces", {}))
+    key_ids = validate_plugin_marketplace_key_ids(
+        raw.get("plugin_marketplace_key_ids", {})
+    )
+    missing = sorted(set(marketplaces) - set(key_ids))
+    if missing:
+        publisher = missing[0]
+        raise PluginLifecycleError(
+            f"registered marketplace @{publisher} has no signer binding; "
+            "re-register it with `ash marketplace add` before use"
+        )
+    return {
+        publisher: RegisteredCatalogSource(
+            source=source,
+            key_id=key_ids[publisher],
+        )
+        for publisher, source in marketplaces.items()
+    }
+
+
 def add_marketplace(source: str, *, replace: bool = False) -> dict[str, Any]:
     """Verify a signed v2 catalog and persist its signed publisher identity."""
 
@@ -67,18 +96,34 @@ def add_marketplace(source: str, *, replace: bool = False) -> dict[str, Any]:
     marketplaces = validate_plugin_marketplaces(
         user_config.get("plugin_marketplaces", {})
     )
+    key_ids = validate_plugin_marketplace_key_ids(
+        user_config.get("plugin_marketplace_key_ids", {})
+    )
     existing = marketplaces.get(publisher)
+    existing_key_id = key_ids.get(publisher)
     if existing is not None and existing != normalized_source and not replace:
         raise ValueError(
             f"marketplace @{publisher} is already registered from {existing}; "
             "pass --replace to change its source"
+        )
+    if (
+        existing is not None
+        and existing_key_id is not None
+        and existing_key_id != verified.key_id
+        and not replace
+    ):
+        raise ValueError(
+            f"marketplace @{publisher} signing key changed from {existing_key_id!r} "
+            f"to {verified.key_id!r}; pass --replace to accept the new signer"
         )
     if publisher not in marketplaces and len(marketplaces) >= MAX_PLUGIN_MARKETPLACES:
         raise ValueError(
             f"plugin_marketplaces supports at most {MAX_PLUGIN_MARKETPLACES} entries"
         )
     marketplaces[publisher] = normalized_source
+    key_ids[publisher] = verified.key_id
     user_config["plugin_marketplaces"] = marketplaces
+    user_config["plugin_marketplace_key_ids"] = key_ids
     save_config(user_config)
     return {
         "action": "add",
@@ -97,11 +142,19 @@ def remove_marketplace(publisher: str) -> dict[str, Any]:
     marketplaces = validate_plugin_marketplaces(
         user_config.get("plugin_marketplaces", {})
     )
+    key_ids = validate_plugin_marketplace_key_ids(
+        user_config.get("plugin_marketplace_key_ids", {})
+    )
     removed = marketplaces.pop(normalized, None) is not None
+    key_ids.pop(normalized, None)
     if marketplaces:
         user_config["plugin_marketplaces"] = marketplaces
     else:
         user_config.pop("plugin_marketplaces", None)
+    if key_ids:
+        user_config["plugin_marketplace_key_ids"] = key_ids
+    else:
+        user_config.pop("plugin_marketplace_key_ids", None)
     save_config(user_config)
     return {"action": "remove", "publisher": normalized, "removed": removed}
 

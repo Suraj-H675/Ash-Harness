@@ -29,6 +29,7 @@ from ash.hooks.config import (
 )
 from ash.plugins.catalog import (
     CatalogEntry,
+    RegisteredCatalogSource,
     SignedCatalog,
     fetch_catalog,
     default_catalog_path,
@@ -69,7 +70,10 @@ ExtensionKind = Literal["all", "skills", "agents", "plugins", "hooks"]
 PluginAction = Literal["install", "enable", "disable", "uninstall"]
 CatalogSource = Path | str
 CatalogSelection = (
-    CatalogSource | Sequence[CatalogSource] | Mapping[str, CatalogSource] | None
+    CatalogSource
+    | Sequence[CatalogSource]
+    | Mapping[str, CatalogSource | RegisteredCatalogSource]
+    | None
 )
 ExtensionAction = Literal[
     "all",
@@ -436,13 +440,25 @@ def _verified_catalogs(
     transport: Any | None = None,
 ) -> tuple[SignedCatalog, ...]:
     expected_publishers: tuple[str | None, ...] | None = None
+    expected_key_ids: tuple[str | None, ...] | None = None
     sources: tuple[CatalogSource | None, ...]
     if isinstance(catalog, Mapping):
         expected_publishers = tuple(catalog.keys())
-        sources = tuple(catalog.values())
+        bound_sources: list[CatalogSource | None] = []
+        bound_key_ids: list[str | None] = []
+        for value in catalog.values():
+            if isinstance(value, RegisteredCatalogSource):
+                bound_sources.append(value.source)
+                bound_key_ids.append(value.key_id)
+            else:
+                bound_sources.append(value)
+                bound_key_ids.append(None)
+        sources = tuple(bound_sources)
+        expected_key_ids = tuple(bound_key_ids)
         if not sources:
             sources = (None,)
             expected_publishers = None
+            expected_key_ids = None
     elif isinstance(catalog, Path | str) or catalog is None:
         sources = (catalog,)
     else:
@@ -453,11 +469,22 @@ def _verified_catalogs(
         _verified_catalog(source, transport=transport) for source in sources
     )
     if expected_publishers is not None:
-        for expected, item in zip(expected_publishers, verified, strict=True):
+        assert expected_key_ids is not None
+        for expected, expected_key_id, item in zip(
+            expected_publishers,
+            expected_key_ids,
+            verified,
+            strict=True,
+        ):
             if item.publisher != expected:
                 actual = item.publisher or "legacy-v1"
                 raise PluginLifecycleError(
                     f"registered marketplace @{expected} returned publisher {actual!r}"
+                )
+            if expected_key_id is not None and item.key_id != expected_key_id:
+                raise PluginLifecycleError(
+                    f"registered marketplace @{expected} signing key changed from "
+                    f"{expected_key_id!r} to {item.key_id!r}"
                 )
     if len(verified) <= 1:
         return verified
@@ -551,15 +578,21 @@ def render_catalog_search(
             f"  @{item.publisher} sequence {item.sequence}" for item in catalogs
         )
         lines.append("Plugins:")
-    lines.extend(
-        (
-            f"  @{entry.publisher}/{entry.name} {entry.version} "
-            f"[{entry.source}@{entry.ref}]"
+    for entry in entries:
+        publisher = (
+            terminal_safe_text(entry.publisher, single_line=True)
             if entry.publisher is not None
-            else f"  {entry.name} {entry.version} [{entry.source}@{entry.ref}]"
+            else None
         )
-        for entry in entries
-    )
+        name = terminal_safe_text(entry.name, single_line=True)
+        version = terminal_safe_text(entry.version, single_line=True)
+        source = terminal_safe_text(entry.source, single_line=True)
+        ref = terminal_safe_text(entry.ref, single_line=True)
+        lines.append(
+            f"  @{publisher}/{name} {version} [{source}@{ref}]"
+            if publisher is not None
+            else f"  {name} {version} [{source}@{ref}]"
+        )
     if not entries:
         lines.append("  (none)")
     return "\n".join(lines)

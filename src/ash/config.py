@@ -99,6 +99,28 @@ def validate_plugin_marketplaces(value: Any) -> dict[str, str]:
     return normalized
 
 
+def validate_plugin_marketplace_key_ids(value: Any) -> dict[str, str]:
+    """Validate user-owned marketplace publisher-to-signing-key bindings."""
+
+    from ash.plugins.catalog import validate_catalog_key_id, validate_catalog_publisher
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("plugin_marketplace_key_ids must be a publisher-to-key table")
+    if len(value) > MAX_PLUGIN_MARKETPLACES:
+        raise ValueError(
+            f"plugin_marketplace_key_ids supports at most {MAX_PLUGIN_MARKETPLACES} entries"
+        )
+    normalized: dict[str, str] = {}
+    for raw_publisher, raw_key_id in value.items():
+        if not isinstance(raw_publisher, str):
+            raise ValueError("plugin marketplace publisher must be a string")
+        publisher = validate_catalog_publisher(raw_publisher)
+        normalized[publisher] = validate_catalog_key_id(raw_key_id)
+    return normalized
+
+
 def _publish_dotenv_runtime_values(
     values: dict[str, str], setting_env_keys: set[str]
 ) -> None:
@@ -697,6 +719,13 @@ class AshConfig(BaseSettings):
             "or HTTPS catalog URL. Project config cannot set this field."
         ),
     )
+    plugin_marketplace_key_ids: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "User-owned signing-key bindings for registered plugin marketplace "
+            "publishers. Project config cannot set this field."
+        ),
+    )
 
     db_directory: Path = Field(
         default=Path.home() / ".ash" / "db",
@@ -1021,6 +1050,11 @@ class AshConfig(BaseSettings):
     @classmethod
     def validate_plugin_marketplaces_field(cls, value: Any) -> dict[str, str]:
         return validate_plugin_marketplaces(value)
+
+    @field_validator("plugin_marketplace_key_ids", mode="before")
+    @classmethod
+    def validate_plugin_marketplace_key_ids_field(cls, value: Any) -> dict[str, str]:
+        return validate_plugin_marketplace_key_ids(value)
 
     @field_validator("browser_cdp_url")
     @classmethod

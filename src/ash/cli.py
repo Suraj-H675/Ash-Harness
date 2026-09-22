@@ -1337,9 +1337,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     )
                     catalog: CatalogSelection = default_catalog_path()
                     if action in {"install", "update"} and catalog is None:
-                        from ash.commands.marketplace import registered_marketplaces
+                        from ash.commands.marketplace import (
+                            registered_marketplace_selection,
+                        )
 
-                        marketplaces = registered_marketplaces()
+                        marketplaces = registered_marketplace_selection()
                         if marketplaces:
                             catalog = marketplaces
                     allowed_flags = (
@@ -4069,9 +4071,11 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 catalog_selection = args.catalog
                 if action in {"search", "install", "update"} and not catalog_selection:
-                    from ash.commands.marketplace import registered_marketplaces
+                    from ash.commands.marketplace import (
+                        registered_marketplace_selection,
+                    )
 
-                    configured_marketplaces = registered_marketplaces()
+                    configured_marketplaces = registered_marketplace_selection()
                     if configured_marketplaces:
                         catalog_selection = configured_marketplaces
                 if action == "search":

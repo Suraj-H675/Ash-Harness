@@ -43,6 +43,14 @@ class PluginCatalogError(ValueError):
     """Raised when a signed catalog is malformed or untrusted."""
 
 
+def validate_catalog_key_id(value: str) -> str:
+    """Validate one signed catalog key identifier."""
+
+    if not isinstance(value, str) or not _KEY_ID.fullmatch(value):
+        raise PluginCatalogError("invalid plugin catalog key id")
+    return value
+
+
 def validate_catalog_publisher(value: str) -> str:
     """Validate one signed catalog publisher namespace."""
 
@@ -202,7 +210,14 @@ class CatalogEntry:
 class SignedCatalog:
     sequence: int
     entries: dict[str, CatalogEntry]
+    key_id: str
     publisher: str | None = None
+
+
+@dataclass(frozen=True)
+class RegisteredCatalogSource:
+    source: str
+    key_id: str
 
 
 def load_trusted_keys(path: Path) -> dict[str, bytes]:
@@ -298,9 +313,7 @@ def parse_and_verify_catalog(
         "signature",
     }:
         raise PluginCatalogError("invalid signed plugin catalog envelope")
-    key_id = envelope["keyId"]
-    if not isinstance(key_id, str) or not _KEY_ID.fullmatch(key_id):
-        raise PluginCatalogError("invalid plugin catalog key id")
+    key_id = validate_catalog_key_id(envelope["keyId"])
     if envelope["algorithm"] != SIGNATURE_ALGORITHM:
         raise PluginCatalogError("unsupported plugin catalog signature algorithm")
     signature = _decode_base64url(envelope["signature"], expected=64)
@@ -317,11 +330,11 @@ def parse_and_verify_catalog(
         )
     except (InvalidSignature, TypeError, ValueError) as exc:
         raise PluginCatalogError("plugin catalog signature is invalid") from exc
-    parsed = _validate_catalog(catalog)
+    parsed = _validate_catalog(catalog, key_id=key_id)
     return parsed
 
 
-def _validate_catalog(catalog: Mapping[str, Any]) -> SignedCatalog:
+def _validate_catalog(catalog: Mapping[str, Any], *, key_id: str) -> SignedCatalog:
     version = catalog.get("version")
     publisher: str | None
     if version == LEGACY_CATALOG_VERSION:
@@ -348,7 +361,12 @@ def _validate_catalog(catalog: Mapping[str, Any]) -> SignedCatalog:
         if entry.name in entries:
             raise PluginCatalogError(f"duplicate plugin catalog entry {entry.name!r}")
         entries[entry.name] = entry
-    return SignedCatalog(sequence=sequence, entries=entries, publisher=publisher)
+    return SignedCatalog(
+        sequence=sequence,
+        entries=entries,
+        key_id=key_id,
+        publisher=publisher,
+    )
 
 
 def _validate_entry(item: Any, *, publisher: str | None = None) -> CatalogEntry:
