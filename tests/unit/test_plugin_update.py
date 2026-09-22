@@ -246,6 +246,25 @@ def test_extensions_update_direct_git_unchanged_is_true_noop(
     assert load_plugin_install_records()["demo"] == before_record
 
 
+def test_extensions_update_direct_git_unchanged_rejects_tampered_installed_tree(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, branch, _digest = _git_plugin(tmp_path / "repo")
+    install_git_plugin(source, ref=branch)
+    root = user_plugin_root() / "demo"
+    record = load_plugin_install_records()["demo"]
+    (root / "README.md").write_text("locally tampered\n", encoding="utf-8")
+
+    assert main(["extensions", "update", "demo"]) == 2
+    captured = capsys.readouterr()
+
+    assert "differs from trusted source" in captured.err
+    assert (root / "README.md").read_text(encoding="utf-8") == "locally tampered\n"
+    assert load_plugin_install_records()["demo"] == record
+
+
 def test_extensions_update_changed_commit_rejects_stale_provenance_race(
     tmp_path: Path,
     isolated_home: Path,
@@ -664,6 +683,53 @@ def test_extensions_update_catalog_noop_rejects_stale_provenance_race(
         "version"
     ] == "9.0.0"
     assert load_plugin_install_records() == {}
+
+
+def test_extensions_update_catalog_noop_rejects_tampered_installed_tree(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, _branch, digest = _git_plugin(tmp_path / "repo", tag="v1.0.0")
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(
+        tmp_path / "catalog.json",
+        private_key,
+        publisher="alpha",
+        source=source,
+        version="1.0.0",
+        ref="v1.0.0",
+        digest=digest,
+        sequence=1,
+    )
+    assert (
+        main(["extensions", "install", "@alpha/demo", "--catalog", str(catalog)])
+        == 0
+    )
+    capsys.readouterr()
+    root = user_plugin_root() / "demo"
+    record = load_plugin_install_records()["demo"]
+    (root / "README.md").write_text("locally tampered\n", encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "extensions",
+                "update",
+                "demo",
+                "--catalog",
+                str(catalog),
+            ]
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+
+    assert "differs from trusted source" in captured.err
+    assert (root / "README.md").read_text(encoding="utf-8") == "locally tampered\n"
+    assert load_plugin_install_records()["demo"] == record
 
 
 def test_extensions_update_publisherless_signed_v1_catalog_stays_verified(

@@ -45,7 +45,6 @@ from ash.plugins.lifecycle import (
     install_local_plugin,
     load_extension_state,
     load_plugin_install_records,
-    require_plugin_install_record_current,
     set_plugin_enabled,
     uninstall_local_plugin,
     user_plugin_root,
@@ -846,23 +845,31 @@ def update_local_plugin(
             and expected.publisher == record.publisher
         )
         if unchanged:
-            require_plugin_install_record_current(record)
-            return _plugin_update_result(
-                target,
-                plugin.root,
-                before=record,
-                after=record,
-                status="unchanged",
+            install_git_plugin(
+                expected.source,
+                ref=expected.ref,
+                replace=True,
+                validator=validate_update,
+                _validator_at=validate_update_at,
+                expected=expected,
+                _skip_if_digest=record.digest,
+                _unchanged=InstalledPlugin(
+                    plugin.manifest.name,
+                    plugin.manifest.version,
+                    plugin.root,
+                ),
+                _expected_previous_record=record,
             )
-        install_git_plugin(
-            expected.source,
-            ref=expected.ref,
-            replace=True,
-            validator=validate_update,
-            _validator_at=validate_update_at,
-            expected=expected,
-            _expected_previous_record=record,
-        )
+        else:
+            install_git_plugin(
+                expected.source,
+                ref=expected.ref,
+                replace=True,
+                validator=validate_update,
+                _validator_at=validate_update_at,
+                expected=expected,
+                _expected_previous_record=record,
+            )
     else:
         install_git_plugin(
             record.source,

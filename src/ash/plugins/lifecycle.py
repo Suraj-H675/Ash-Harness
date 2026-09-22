@@ -151,6 +151,56 @@ def require_plugin_install_record_current(record: PluginInstallRecord) -> None:
         raise _lifecycle_error("plugin install records", exc) from exc
 
 
+def require_plugin_install_tree_current(
+    record: PluginInstallRecord,
+    snapshot: PluginSnapshot,
+) -> None:
+    """Fail if managed provenance or installed bytes differ from a trusted snapshot."""
+
+    root = user_plugin_root().expanduser()
+    _require_anchored_plugin_mutation()
+    try:
+        with (
+            AnchoredDirectory.open(root, create=False) as directory,
+            directory.lock(".ash-lifecycle.lock"),
+        ):
+            current = _read_plugin_install_records_at(directory, root).get(record.name)
+            if current != record:
+                raise PluginLifecycleError(
+                    f"plugin {record.name!r} changed while update was in progress"
+                )
+            metadata = directory.stat(record.name)
+            if (
+                metadata is None
+                or stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+            ):
+                raise PluginLifecycleError(
+                    f"installed plugin {record.name!r} differs from trusted source; "
+                    "reinstall it before updating"
+                )
+            with directory.child(record.name, expected=metadata) as plugin_directory:
+                try:
+                    snapshot.verify_materialized(plugin_directory)
+                except (PluginSnapshotError, AnchoredFilesystemError, OSError) as exc:
+                    raise PluginLifecycleError(
+                        f"installed plugin {record.name!r} differs from trusted source; "
+                        "reinstall it before updating"
+                    ) from exc
+                if not directory.same_entry(record.name, plugin_directory.descriptor):
+                    raise PluginLifecycleError(
+                        f"plugin {record.name!r} changed while update was in progress"
+                    )
+    except FileNotFoundError as exc:
+        raise PluginLifecycleError(
+            f"plugin {record.name!r} changed while update was in progress"
+        ) from exc
+    except PluginLifecycleError:
+        raise
+    except (AnchoredFilesystemError, OSError) as exc:
+        raise _lifecycle_error("installed plugin integrity", exc) from exc
+
+
 def _validate_plugin_install_record(record: PluginInstallRecord) -> None:
     _validate_plugin_name(record.name)
     try:
@@ -1114,12 +1164,12 @@ def install_git_plugin(
     if len(source) > 2048:
         raise PluginLifecycleError("plugin Git source URL is too long")
     if _skip_if_digest is not None:
-        if expected is not None:
-            raise PluginLifecycleError(
-                "digest-based update no-op cannot bypass signed catalog verification"
-            )
         if not _GIT_DIGEST.fullmatch(_skip_if_digest) or _unchanged is None:
             raise PluginLifecycleError("invalid tracked plugin update digest")
+        if expected is not None and expected.digest != _skip_if_digest:
+            raise PluginLifecycleError(
+                "tracked plugin digest does not match signed catalog digest"
+            )
 
     workspace = Path.cwd().resolve()
     git_path = resolve_host_executable("git", workspace_root=workspace, cwd=workspace)
@@ -1237,11 +1287,6 @@ def install_git_plugin(
                 + (f": {detail_text}" if detail_text else "")
             )
         resolved_digest = _resolve_git_revision(checkout_directory, git_path)
-        if _skip_if_digest == resolved_digest:
-            assert _unchanged is not None
-            if _expected_previous_record is not None:
-                require_plugin_install_record_current(_expected_previous_record)
-            return _unchanged
         snapshot = PluginSnapshot.capture(
             checkout_directory,
             max_files=MAX_PLUGIN_FILES,
@@ -1260,6 +1305,14 @@ def install_git_plugin(
                 checkout_directory=checkout_directory,
                 snapshot=snapshot,
             )
+        if _skip_if_digest == resolved_digest:
+            assert _unchanged is not None
+            if _expected_previous_record is not None:
+                require_plugin_install_tree_current(
+                    _expected_previous_record,
+                    snapshot,
+                )
+            return _unchanged
         record_manifest = _load_manifest_snapshot(snapshot)
         _validate_manifest_snapshot(record_manifest, snapshot)
         install_record: PluginInstallRecord | object = _INSTALL_RECORD_UNCHANGED
