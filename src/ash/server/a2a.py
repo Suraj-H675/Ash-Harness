@@ -57,7 +57,7 @@ from starlette.types import ASGIApp, Message as ASGIMessage, Receive, Scope, Sen
 from ash.sdk import AshClient
 from ash.safe_io import validate_unlinked_file_path
 from ash.config import AshConfig
-from ash.core.redaction import redact_text
+from ash.core.redaction import redact_urls_in_text
 from ash.core.session import normalize_project_path
 
 
@@ -426,7 +426,9 @@ class AshA2AExecutor(AgentExecutor):
                 elif event.type == "turn.completed":
                     fallback = str(event.data.get("response", ""))
                 elif event.type == "turn.error":
-                    failure = redact_text(str(event.data.get("error", "turn failed")))
+                    failure = redact_urls_in_text(
+                        str(event.data.get("error", "turn failed"))
+                    )
                 elif event.type == "turn.cancelled":
                     cancelled = True
             if not pending and not emitted:
@@ -450,7 +452,10 @@ class AshA2AExecutor(AgentExecutor):
             raise
         except Exception as exc:  # noqa: BLE001 - stable remote failure boundary
             await updater.failed(
-                _agent_message(updater, redact_text(str(exc) or "Ash task failed"))
+                _agent_message(
+                    updater,
+                    redact_urls_in_text(str(exc) or "Ash task failed"),
+                )
             )
         finally:
             if client is not None:

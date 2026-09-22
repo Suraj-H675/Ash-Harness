@@ -4171,7 +4171,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from a2a.client.errors import A2AClientError
             from a2a.utils.constants import PROTOCOL_VERSION_1_0
+            from a2a.utils.errors import A2AError
             from ash.commands.a2a import inspect_a2a, send_a2a, serve_a2a
+            from ash.core.redaction import redact_urls_in_text
             from httpx import HTTPError
         except ModuleNotFoundError as exc:
             if exc.name == "a2a" or (exc.name or "").startswith("a2a."):
@@ -4195,8 +4197,18 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(operation(args))
         except KeyboardInterrupt:
             return 130
-        except (A2AClientError, HTTPError, OSError, RuntimeError, ValueError) as exc:
-            print(f"Error: A2A operation failed: {exc}", file=sys.stderr)
+        except (
+            A2AClientError,
+            A2AError,
+            HTTPError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            print(
+                f"Error: A2A operation failed: {redact_urls_in_text(str(exc))}",
+                file=sys.stderr,
+            )
             return 2
 
     if args.command == "serve":

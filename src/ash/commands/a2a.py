@@ -27,6 +27,7 @@ from google.protobuf.json_format import MessageToDict
 
 from ash.config import AshConfig
 from ash.agents.a2a_remote import _validate_remote_url, validate_agent_card_origins
+from ash.core.redaction import redact_urls_in_text, redact_value
 from ash.safe_io import read_bounded_text
 from ash.server.a2a import create_a2a_app
 
@@ -135,7 +136,8 @@ async def send_a2a(args) -> int:
         task_id = ""
         events: list[dict[str, Any]] = []
         event_count = 0
-        event_bytes = 0
+        event_raw_bytes = 0
+        event_rendered_bytes = 0
         final_state: int | None = None
         immediate_message = False
         rendered_text = False
@@ -155,10 +157,11 @@ async def send_a2a(args) -> int:
                 if event_count > MAX_A2A_CLIENT_EVENTS:
                     raise RuntimeError("A2A response exceeded 10,000 events")
                 if args.json:
-                    event_bytes = _append_json_event(
+                    event_raw_bytes, event_rendered_bytes = _append_json_event(
                         events,
                         MessageToDict(event),
-                        event_bytes,
+                        event_raw_bytes,
+                        event_rendered_bytes,
                     )
                 if event.HasField("task"):
                     task_id = event.task.id
@@ -243,16 +246,29 @@ def _local_public_url(host: str, port: int, *, secure: bool = False) -> str:
 def _append_json_event(
     events: list[dict[str, Any]],
     event: dict[str, Any],
-    current_bytes: int,
-) -> int:
-    encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode(
+    current_raw_bytes: int,
+    current_rendered_bytes: int,
+) -> tuple[int, int]:
+    raw_encoded = json.dumps(
+        event, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    raw_contribution = len(raw_encoded) + (1 if events else 0)
+    next_raw_bytes = current_raw_bytes + raw_contribution
+    if next_raw_bytes > MAX_A2A_CLIENT_OUTPUT_BYTES:
+        raise RuntimeError(f"A2A response exceeded {MAX_A2A_CLIENT_OUTPUT_BYTES} bytes")
+
+    redacted_event = redact_value(event)
+    encoded = json.dumps(
+        redacted_event, ensure_ascii=False, separators=(",", ":")
+    ).encode(
         "utf-8"
     )
-    contribution = len(encoded) + (1 if events else 0)
-    if current_bytes + contribution > MAX_A2A_CLIENT_OUTPUT_BYTES:
+    rendered_contribution = len(encoded) + (1 if events else 0)
+    next_rendered_bytes = current_rendered_bytes + rendered_contribution
+    if next_rendered_bytes > MAX_A2A_CLIENT_OUTPUT_BYTES:
         raise RuntimeError(f"A2A response exceeded {MAX_A2A_CLIENT_OUTPUT_BYTES} bytes")
-    events.append(event)
-    return current_bytes + contribution
+    events.append(redacted_event)
+    return next_raw_bytes, next_rendered_bytes
 
 
 def _write_bounded_text(text: str, current_bytes: int) -> int:
@@ -266,6 +282,7 @@ def _write_bounded_text(text: str, current_bytes: int) -> int:
 def _bounded_text_parts(parts: Any, max_bytes: int, label: str) -> str:
     chunks: list[str] = []
     current_bytes = 0
+    rendered_bytes = 0
     for part in parts:
         if part.WhichOneof("content") != "text":
             continue
@@ -273,8 +290,13 @@ def _bounded_text_parts(parts: Any, max_bytes: int, label: str) -> str:
         encoded_bytes = len(text.encode("utf-8"))
         if current_bytes + encoded_bytes > max_bytes:
             raise RuntimeError(f"{label} exceeded {max_bytes} bytes")
-        chunks.append(text)
         current_bytes += encoded_bytes
+        redacted = redact_urls_in_text(text)
+        redacted_bytes = len(redacted.encode("utf-8"))
+        if rendered_bytes + redacted_bytes > max_bytes:
+            raise RuntimeError(f"{label} exceeded {max_bytes} bytes")
+        chunks.append(redacted)
+        rendered_bytes += redacted_bytes
     return "".join(chunks)
 
 

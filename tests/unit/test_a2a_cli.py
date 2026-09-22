@@ -4,6 +4,7 @@ import sys
 
 import httpx
 import pytest
+from a2a.utils.errors import InternalError
 
 from ash.commands.a2a import _local_public_url, _remote_url
 
@@ -63,6 +64,28 @@ def test_a2a_client_network_failure_has_stable_cli_error(monkeypatch, capsys) ->
     assert "A2A operation failed: connection refused" in captured.err
 
 
+def test_a2a_cli_catches_and_redacts_standard_protocol_error(
+    monkeypatch,
+    capsys,
+) -> None:
+    marker = "actual-sdk-signed-marker"
+
+    async def fail(args) -> int:
+        del args
+        raise InternalError(
+            "remote failed at https://agent.example/cb?"
+            f"X-Amz-Signature={marker}&view=full"
+        )
+
+    monkeypatch.setattr("ash.commands.a2a.send_a2a", fail)
+
+    assert main(["a2a", "send", "https://agent.example.com", "hello"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert marker not in captured.err
+    assert "X-Amz-Signature=[REDACTED]" in captured.err
+
+
 def test_a2a_stdin_prompt_is_bounded_before_network_use(monkeypatch) -> None:
     from ash.commands.a2a import MAX_A2A_CLIENT_INPUT_BYTES, send_a2a
 
@@ -107,6 +130,87 @@ def test_a2a_json_event_accumulator_rejects_large_payload() -> None:
     events: list[dict] = []
 
     with pytest.raises(RuntimeError, match="A2A response exceeded"):
-        _append_json_event(events, {"text": "x" * 1_000_001}, 0)
+        _append_json_event(events, {"text": "x" * 1_000_001}, 0, 0)
 
     assert events == []
+
+
+def test_a2a_json_event_accumulator_redacts_signed_url() -> None:
+    from ash.commands.a2a import _append_json_event
+
+    marker = "cli-json-signature-marker"
+    events: list[dict] = []
+    event = {
+        "statusUpdate": {
+            "status": {
+                "message": {
+                    "parts": [
+                        {
+                            "text": (
+                                "failed at https://agent.example/cb?"
+                                f"X-Amz-Signature={marker}&view=full"
+                            )
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+    _append_json_event(events, event, 0, 0)
+
+    rendered = str(events)
+    assert marker not in rendered
+    assert "X-Amz-Signature=[REDACTED]" in rendered
+
+
+def test_a2a_json_event_accumulator_tracks_cumulative_raw_bytes(
+    monkeypatch,
+) -> None:
+    from ash.commands import a2a as a2a_commands
+
+    monkeypatch.setattr(a2a_commands, "MAX_A2A_CLIENT_OUTPUT_BYTES", 1_000)
+    events: list[dict] = []
+    current_raw = 0
+    current_rendered = 0
+    current_raw, current_rendered = a2a_commands._append_json_event(
+        events,
+        {
+            "text": (
+                "https://agent.example/cb?X-Amz-Signature=" + "a" * 600
+            )
+        },
+        current_raw,
+        current_rendered,
+    )
+
+    with pytest.raises(RuntimeError, match="A2A response exceeded"):
+        a2a_commands._append_json_event(
+            events,
+            {"text": "b" * 500},
+            current_raw,
+            current_rendered,
+        )
+
+
+def test_a2a_status_text_redacts_signed_url() -> None:
+    from a2a.types.a2a_pb2 import Part
+
+    from ash.commands.a2a import _bounded_text_parts
+
+    marker = "cli-status-signature-marker"
+    text = _bounded_text_parts(
+        [
+            Part(
+                text=(
+                    "failed at https://agent.example/cb?"
+                    f"X-Amz-Signature={marker}&view=full"
+                )
+            )
+        ],
+        64 * 1024,
+        "A2A status message",
+    )
+
+    assert marker not in text
+    assert "X-Amz-Signature=[REDACTED]" in text

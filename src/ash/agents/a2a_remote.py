@@ -18,7 +18,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from ash.agents.a2a_tasks import RemoteTaskStore
-from ash.core.redaction import redact_text
+from ash.core.redaction import redact_urls_in_text
 from ash.safe_io import strict_json_loads
 from ash.safety.guard import SafetyGuard
 from ash.safe_io import read_bounded_bytes
@@ -316,7 +316,7 @@ class DelegateRemoteAgentTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_text(str(exc)),
+                error=redact_urls_in_text(str(exc)),
             )
         except Exception as exc:
             from a2a.utils.errors import A2AError
@@ -326,7 +326,7 @@ class DelegateRemoteAgentTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_text(str(exc)),
+                error=redact_urls_in_text(str(exc)),
             )
         payload = json.dumps(
             {
@@ -387,7 +387,7 @@ class RemoteAgentTaskStatusTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_text(str(exc)),
+                error=redact_urls_in_text(str(exc)),
             )
         except Exception as exc:
             from a2a.utils.errors import A2AError
@@ -397,7 +397,7 @@ class RemoteAgentTaskStatusTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_text(str(exc)),
+                error=redact_urls_in_text(str(exc)),
             )
         payload = json.dumps(
             {
@@ -456,7 +456,7 @@ class RemoteAgentTaskCancelTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_text(str(exc)),
+                error=redact_urls_in_text(str(exc)),
             )
         except Exception as exc:
             from a2a.utils.errors import A2AError
@@ -466,7 +466,7 @@ class RemoteAgentTaskCancelTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_text(str(exc)),
+                error=redact_urls_in_text(str(exc)),
             )
         payload = json.dumps(
             {
@@ -512,7 +512,7 @@ class ListRemoteAgentTasksTool(_RemoteTaskStoreTool):
                 return ToolResult(
                     success=False,
                     output="",
-                    error=redact_text(
+                    error=redact_urls_in_text(
                         f"could not read durable A2A remote task state: {exc}"
                     ),
                 )
@@ -616,7 +616,7 @@ class RecoverRemoteAgentTaskTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_text(str(exc)),
+                error=redact_urls_in_text(str(exc)),
             )
         except Exception as exc:
             from a2a.utils.errors import A2AError
@@ -626,7 +626,7 @@ class RecoverRemoteAgentTaskTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_text(str(exc)),
+                error=redact_urls_in_text(str(exc)),
             )
         payload = json.dumps(
             {

@@ -1218,6 +1218,124 @@ async def test_remote_task_tools_return_protocol_errors_as_tool_failures(
     assert cancelled.error == "remote task not found"
 
 
+@pytest.mark.asyncio
+async def test_remote_task_tool_redacts_signed_url_from_protocol_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "a2a-remote-signature-marker"
+    config = RemoteAgentConfig(name="local", url="https://agent.example.com")
+
+    async def signed_error(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise RuntimeError(
+            "remote failure at https://agent.example.com/callback?"
+            f"X-Amz-Signature={marker}&view=full"
+        )
+
+    monkeypatch.setattr("ash.agents.a2a_remote.get_remote_agent_task", signed_error)
+    tool = RemoteAgentTaskStatusTool(
+        SafetyGuard(tmp_path),
+        {"local": config},
+    )
+
+    result = await tool.run(agent="local", task_id="task-1")
+
+    assert result.success is False
+    assert marker not in (result.error or "")
+    assert "X-Amz-Signature=[REDACTED]" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_a2a_server_redacts_signed_url_from_failed_task_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    marker = "a2a-server-signature-marker"
+
+    class FailingAshClient:
+        loop = SimpleNamespace(
+            current_session=SimpleNamespace(session_id="failing-session")
+        )
+
+        async def stream_prompt(
+            self, *args: Any, **kwargs: Any
+        ) -> AsyncIterator[AshEvent]:
+            del args, kwargs
+            yield AshEvent(
+                "turn.error",
+                {
+                    "error": (
+                        "provider failed at https://provider.example/callback?"
+                        f"X-Amz-Signature={marker}&view=full"
+                    )
+                },
+            )
+
+        async def close(self) -> None:
+            return None
+
+    async def create_client(**kwargs: Any) -> FailingAshClient:
+        del kwargs
+        return FailingAshClient()
+
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
+    app = create_a2a_app(
+        config,
+        public_url="https://testserver",
+        bearer_token="0123456789abcdef",
+        requests_per_minute=100,
+        task_store=InMemoryTaskStore(),
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="https://testserver",
+            headers={"Authorization": "Bearer 0123456789abcdef"},
+        ) as http:
+            client = await ClientFactory(
+                ClientConfig(
+                    httpx_client=http,
+                    streaming=True,
+                    supported_protocol_bindings=[TransportProtocol.JSONRPC],
+                    accepted_output_modes=["text/plain"],
+                )
+            ).create_from_url("https://testserver")
+            events = [
+                event
+                async for event in client.send_message(
+                    SendMessageRequest(
+                        message=Message(
+                            message_id="failure-message",
+                            role=Role.ROLE_USER,
+                            parts=[Part(text="fail safely")],
+                        )
+                    )
+                )
+            ]
+            await client.close()
+
+    failed = next(
+        event.status_update
+        for event in events
+        if event.HasField("status_update")
+        and event.status_update.status.state == TaskState.TASK_STATE_FAILED
+    )
+    text = "\n".join(part.text for part in failed.status.message.parts)
+    assert marker not in text
+    assert "X-Amz-Signature=[REDACTED]" in text
+
+
 def test_a2a_remote_config_respects_trust_and_rejects_duplicates(
     tmp_path: Path, monkeypatch
 ) -> None:
