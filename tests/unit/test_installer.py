@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -1093,7 +1094,8 @@ def test_windows_quarantine_cleanup_closes_parent_on_validation_failure(
         lambda path: parent_handle,
     )
 
-    def changed_metadata(metadata, *, parent_handle):
+    def changed_metadata(metadata, *, parent_handle, write_attributes=False):
+        assert write_attributes is True
         raise InstallError("pipx metadata quarantine changed before cleanup")
 
     monkeypatch.setattr(
@@ -1111,6 +1113,32 @@ def test_windows_quarantine_cleanup_closes_parent_on_validation_failure(
         installer_module._remove_owned_quarantine_windows(quarantine)
 
     assert closed == [parent_handle]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows file semantics")
+def test_windows_quarantine_cleanup_removes_readonly_metadata(tmp_path) -> None:
+    import ash.installer as installer_module
+
+    pipx_home = tmp_path / "pipx-home"
+    metadata_directory = pipx_home / "venvs" / "ash-ai"
+    metadata_directory.mkdir(parents=True)
+    metadata_path = metadata_directory / "pipx_metadata.json"
+    metadata_path.write_text("{", encoding="utf-8")
+    os.chmod(metadata_path, stat.S_IREAD)
+
+    try:
+        detected = installer_module._corrupt_ash_metadata(str(pipx_home))
+        assert detected is not None
+        quarantine = installer_module._quarantine_pipx_metadata_owned(detected)
+        assert not metadata_path.exists()
+        assert quarantine.path.exists()
+
+        installer_module._remove_owned_quarantine(quarantine)
+
+        assert not quarantine.path.exists()
+    finally:
+        for leftover in metadata_directory.glob("pipx_metadata.json*"):
+            os.chmod(leftover, stat.S_IREAD | stat.S_IWRITE)
 
 
 def test_failed_repair_preserves_owned_quarantine(

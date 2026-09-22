@@ -638,6 +638,7 @@ def _remove_owned_quarantine_windows(quarantine: _OwnedMetadataFile) -> None:
             descriptor = _windows_open_owned_metadata(
                 quarantine,
                 parent_handle=parent_handle,
+                write_attributes=True,
             )
         except FileNotFoundError:
             return
@@ -704,6 +705,7 @@ def _windows_open_owned_metadata(
     metadata: _OwnedMetadataFile,
     *,
     parent_handle: int,
+    write_attributes: bool = False,
 ) -> int:
     import ctypes
     import msvcrt
@@ -755,6 +757,7 @@ def _windows_open_owned_metadata(
 
     file_read_data = 0x00000001
     file_read_attributes = 0x00000080
+    file_write_attributes = 0x00000100
     delete_access = 0x00010000
     synchronize = 0x00100000
     share_read = 0x00000001
@@ -781,13 +784,18 @@ def _windows_open_owned_metadata(
     )
     io_status = IoStatusBlock()
     handle = wintypes.HANDLE()
+    desired_access = (
+        file_read_data
+        | file_read_attributes
+        | delete_access
+        | synchronize
+    )
+    if write_attributes:
+        desired_access |= file_write_attributes
     status = int(
         nt_open_file(
             ctypes.byref(handle),
-            file_read_data
-            | file_read_attributes
-            | delete_access
-            | synchronize,
+            desired_access,
             ctypes.byref(attributes),
             ctypes.byref(io_status),
             share_read,
@@ -949,11 +957,12 @@ def _windows_delete_open_file(descriptor: int) -> None:
     import msvcrt
     from ctypes import wintypes
 
+    class FileDispositionInfoEx(ctypes.Structure):
+        _fields_ = [("Flags", wintypes.DWORD)]
+
     class FileDispositionInfo(ctypes.Structure):
         _fields_ = [("DeleteFile", ctypes.c_ubyte)]
 
-    info = FileDispositionInfo()
-    info.DeleteFile = 1
     win_dll: Any = getattr(ctypes, "WinDLL")
     get_last_error: Any = getattr(ctypes, "get_last_error")
     format_error: Any = getattr(ctypes, "FormatError")
@@ -968,6 +977,30 @@ def _windows_delete_open_file(descriptor: int) -> None:
     ]
     set_info.restype = wintypes.BOOL
     handle = int(get_osfhandle(descriptor))
+
+    # Prefer the extended disposition API so a user-owned read-only pipx
+    # metadata file can still be removed after a successful repair. The
+    # legacy API rejects read-only files. Fall back for older filesystems or
+    # Windows versions that do not support FileDispositionInfoEx.
+    extended = FileDispositionInfoEx()
+    extended.Flags = 0x00000001 | 0x00000010  # DELETE | IGNORE_READONLY_ATTRIBUTE
+    if set_info(
+        wintypes.HANDLE(handle),
+        21,  # FileDispositionInfoEx
+        ctypes.byref(extended),
+        ctypes.sizeof(extended),
+    ):
+        return
+    extended_error = int(get_last_error())
+    if extended_error not in {1, 50, 87}:
+        # ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED / ERROR_INVALID_PARAMETER
+        raise InstallError(
+            "could not safely remove pipx metadata quarantine: "
+            f"{format_error(extended_error)}"
+        )
+
+    info = FileDispositionInfo()
+    info.DeleteFile = 1
     if not set_info(
         wintypes.HANDLE(handle),
         4,
