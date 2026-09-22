@@ -332,6 +332,123 @@ async def test_browser_session_tab_handles_are_stable_and_selection_is_explicit(
 
 
 @pytest.mark.asyncio
+async def test_browser_concurrent_snapshots_share_one_current_ref_generation() -> None:
+    title_started = asyncio.Event()
+    release_title = asyncio.Event()
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://example.com/"
+            self.title_calls = 0
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def title(self) -> str:
+            self.title_calls += 1
+            title_started.set()
+            await release_title.wait()
+            return "Example"
+
+        async def eval_on_selector_all(
+            self, selector: str, _script: str, options: Any = None
+        ) -> list[Any]:
+            if selector.startswith('input[type="password"]'):
+                return []
+            return [
+                {
+                    "ref": f"{options['refPrefix']}:e1",
+                    "role": "button",
+                    "text": "Go",
+                    "disabled": False,
+                }
+            ]
+
+        async def aria_snapshot(self, **_kwargs: Any) -> str:
+            return '- button "Go"'
+
+    page = FakePage()
+
+    class FakeContext:
+        pages = [page]
+
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "deadbeef"
+    session._context = FakeContext()
+    session._page = page
+
+    first_task = asyncio.create_task(session.snapshot())
+    await title_started.wait()
+    second_task = asyncio.create_task(session.snapshot())
+    await asyncio.sleep(0)
+    release_title.set()
+    first, second = await asyncio.gather(first_task, second_task)
+
+    assert first == second
+    assert page.title_calls == 1
+    assert "[tdeadbeef-1:s1:e1]" in first
+    assert session._snapshot_versions == {"tdeadbeef-1": 1}
+
+
+@pytest.mark.asyncio
+async def test_browser_snapshot_caller_cancellation_keeps_shared_snapshot_alive() -> None:
+    title_started = asyncio.Event()
+    release_title = asyncio.Event()
+
+    class FakePage:
+        url = "https://example.com/"
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def title(self) -> str:
+            title_started.set()
+            await release_title.wait()
+            return "Example"
+
+        async def eval_on_selector_all(
+            self, selector: str, _script: str, options: Any = None
+        ) -> list[Any]:
+            if selector.startswith('input[type="password"]'):
+                return []
+            return [
+                {
+                    "ref": f"{options['refPrefix']}:e1",
+                    "role": "button",
+                    "text": "Go",
+                    "disabled": False,
+                }
+            ]
+
+        async def aria_snapshot(self, **_kwargs: Any) -> str:
+            return '- button "Go"'
+
+    page = FakePage()
+
+    class FakeContext:
+        pages = [page]
+
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "deadbeef"
+    session._context = FakeContext()
+    session._page = page
+
+    cancelled = asyncio.create_task(session.snapshot())
+    await title_started.wait()
+    survivor = asyncio.create_task(session.snapshot())
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    release_title.set()
+
+    snapshot = await survivor
+
+    assert "[tdeadbeef-1:s1:e1]" in snapshot
+    assert session._snapshot_versions == {"tdeadbeef-1": 1}
+
+
+@pytest.mark.asyncio
 async def test_browser_open_tab_failure_restores_previous_tab(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -806,7 +923,7 @@ async def test_browser_snapshot_redacts_page_title(
             return "main"
 
     monkeypatch.setattr(
-        "ash.tools.browser.redact_text",
+        "ash.core.redaction.redact_text",
         lambda value: value.replace("title-secret", "[REDACTED]"),
     )
     page = FakePage()
@@ -819,6 +936,85 @@ async def test_browser_snapshot_redacts_page_title(
 
     assert "title-secret" not in snapshot
     assert "Page: Dashboard [REDACTED]" in snapshot
+
+
+@pytest.mark.asyncio
+async def test_browser_snapshot_redacts_signed_urls_in_page_content() -> None:
+    marker = "signed-content-marker"
+    signed_url = (
+        "https://storage.example/object?"
+        f"X-Amz-Signature={marker}&sig={marker}&view=complete"
+    )
+
+    class FakePage:
+        url = signed_url
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def title(self) -> str:
+            return f"Download {signed_url}"
+
+        async def eval_on_selector_all(
+            self,
+            selector: str,
+            *_args: Any,
+        ) -> list[Any]:
+            if selector == 'input[type="password"]':
+                return []
+            return [
+                {
+                    "ref": "tdeadbeef-1:s1:e1",
+                    "role": "link",
+                    "text": signed_url,
+                    "disabled": False,
+                }
+            ]
+
+        async def aria_snapshot(self, **_kwargs: Any) -> str:
+            return f"link: {signed_url}"
+
+    page = FakePage()
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "deadbeef"
+    session._context = type("Context", (), {"pages": [page]})()
+    session._page = page
+
+    snapshot = await session.snapshot()
+
+    assert marker not in snapshot
+    assert snapshot.count("[REDACTED]") >= 4
+    assert "view=complete" in snapshot
+
+
+@pytest.mark.asyncio
+async def test_browser_tab_titles_redact_signed_urls() -> None:
+    marker = "tab-title-marker"
+    signed_url = (
+        "https://storage.example/object?"
+        f"X-Goog-Credential={marker}&X-Goog-Signature={marker}&view=complete"
+    )
+
+    class FakePage:
+        url = "https://example.com/"
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def title(self) -> str:
+            return f"Download {signed_url}"
+
+    page = FakePage()
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "deadbeef"
+    session._context = type("Context", (), {"pages": [page]})()
+    session._page = page
+
+    output = await session.list_tabs()
+
+    assert marker not in output
+    assert "[REDACTED]" in output
+    assert "view=complete" in output
 
 
 @pytest.mark.asyncio
@@ -1235,6 +1431,86 @@ def test_browser_url_output_redacts_oauth_query_and_fragment_credentials() -> No
     assert "apikey=[REDACTED]" in camel_case
     assert "APIKey=[REDACTED]" in camel_case
     assert "view=complete" in camel_case
+
+    signed_url = _redact_browser_url(
+        "https://storage.example/object?"
+        "X-Amz-Credential=aws-credential&X-Amz-Signature=aws-signature&"
+        "X-Goog-Credential=google-credential&X-Goog-Signature=google-signature&"
+        "sig=azure-signature&view=complete"
+    )
+    for secret in (
+        "aws-credential",
+        "aws-signature",
+        "google-credential",
+        "google-signature",
+        "azure-signature",
+    ):
+        assert secret not in signed_url
+    assert "X-Amz-Credential=[REDACTED]" in signed_url
+    assert "X-Amz-Signature=[REDACTED]" in signed_url
+    assert "X-Goog-Credential=[REDACTED]" in signed_url
+    assert "X-Goog-Signature=[REDACTED]" in signed_url
+    assert "sig=[REDACTED]" in signed_url
+    assert "view=complete" in signed_url
+
+
+@pytest.mark.asyncio
+async def test_browser_tool_errors_redact_signed_url_credentials(tmp_path) -> None:
+    class FailingBrowserSession(FakeBrowserSession):
+        async def navigate(self, url: str, wait_until: str) -> str:
+            raise RuntimeError(
+                "navigation failed at "
+                "https://storage.example/object?"
+                "X-Amz-Credential=aws-credential&"
+                "X-Amz-Signature=aws-signature&"
+                "sig=azure-signature&view=complete; redirect Location: "
+                "//example.test/cb?code=redirect-code&sig=redirect-signature; "
+                "fallback HTTPS://example.test/cb?sig=uppercase-signature"
+            )
+
+    tool = BrowserNavigateTool(SafetyGuard(tmp_path), FailingBrowserSession())  # type: ignore[arg-type]
+    result = await tool.run(url="https://example.com", wait_until="load")
+
+    assert result.success is False
+    assert result.error is not None
+    for secret in (
+        "aws-credential",
+        "aws-signature",
+        "azure-signature",
+        "redirect-code",
+        "redirect-signature",
+        "uppercase-signature",
+    ):
+        assert secret not in result.error
+    assert "X-Amz-Credential=[REDACTED]" in result.error
+    assert "X-Amz-Signature=[REDACTED]" in result.error
+    assert "sig=[REDACTED]" in result.error
+    assert "view=complete" in result.error
+
+
+@pytest.mark.asyncio
+async def test_browser_screenshot_errors_redact_signed_url_credentials(tmp_path) -> None:
+    class FailingScreenshotSession(FakeBrowserSession):
+        async def screenshot(self, *, max_bytes: int):
+            raise RuntimeError(
+                "capture failed for "
+                "https://storage.example/object?X-Goog-Signature=google-signature&"
+                "X-Goog-Credential=google-credential&view=complete"
+            )
+
+    tool = BrowserScreenshotTool(
+        SafetyGuard(tmp_path),
+        FailingScreenshotSession(),  # type: ignore[arg-type]
+    )
+    result = await tool.run(max_bytes=1_000_000)
+
+    assert result.success is False
+    assert result.error is not None
+    assert "google-signature" not in result.error
+    assert "google-credential" not in result.error
+    assert "X-Goog-Signature=[REDACTED]" in result.error
+    assert "X-Goog-Credential=[REDACTED]" in result.error
+    assert "view=complete" in result.error
 
 
 def test_browser_tools_share_one_lazy_session_and_permissions(tmp_path) -> None:
@@ -1664,7 +1940,7 @@ async def test_browser_session_startup_cancellation_closes_started_proxy() -> No
 
 
 @pytest.mark.asyncio
-async def test_browser_session_retires_proxy_before_restarting_after_page_closes() -> None:
+async def test_browser_snapshot_retires_proxy_before_restarting_after_page_closes() -> None:
     class FakeProxy:
         instances: list["FakeProxy"] = []
 
@@ -1685,9 +1961,19 @@ async def test_browser_session_retires_proxy_before_restarting_after_page_closes
     class FakePage:
         def __init__(self) -> None:
             self.closed = False
+            self.url = "https://example.com/"
 
         def is_closed(self) -> bool:
             return self.closed
+
+        async def title(self) -> str:
+            return "Example"
+
+        async def eval_on_selector_all(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+            return []
+
+        async def aria_snapshot(self, **_kwargs: Any) -> str:
+            return "main"
 
     class FakeContext:
         def __init__(self, page: FakePage) -> None:
@@ -1729,11 +2015,13 @@ async def test_browser_session_retires_proxy_before_restarting_after_page_closes
         with patch("playwright.async_api.async_playwright", return_value=playwright_factory):
             first_page = await session.ensure_started()
             page_one.closed = True
-            second_page = await session.ensure_started()
+            snapshot = await asyncio.wait_for(session.snapshot(), timeout=0.5)
+            second_page = session._page
             await session.close()
 
     assert first_page is page_one
     assert second_page is page_two
+    assert "Page: Example" in snapshot
     assert FakeProxy.instances[0].closed is True
     assert len(FakeProxy.instances) == 2
     assert context_one.close_calls == 1

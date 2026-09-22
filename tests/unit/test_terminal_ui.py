@@ -144,6 +144,31 @@ def test_terminal_ui_auto_approve_allows_all():
     assert approved is True
 
 
+def test_terminal_ui_approval_redacts_signed_url_arguments() -> None:
+    output = StringIO()
+    marker = "approval-signature-marker"
+    ui = TerminalUI(
+        safety_tier="auto_approve",
+        console=Console(file=output, force_terminal=False, width=120),
+    )
+
+    approved = ui.request_tool_approval(
+        "browser_navigate",
+        {
+            "url": (
+                "https://storage.example/object?"
+                f"X-Amz-Signature={marker}&view=complete"
+            )
+        },
+    )
+
+    rendered = output.getvalue()
+    assert approved is True
+    assert marker not in rendered
+    assert "[REDACTED]" in rendered
+    assert "view=complete" in rendered
+
+
 def test_terminal_ui_can_approve_tool_for_session():
     stream = StringIO("a\n")
     ui = TerminalUI(safety_tier="interactive", input_stream=stream)

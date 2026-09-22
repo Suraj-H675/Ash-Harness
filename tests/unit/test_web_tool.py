@@ -75,6 +75,102 @@ async def test_web_fetch_validates_redirect_targets(monkeypatch, guard) -> None:
 
 
 @pytest.mark.asyncio
+async def test_web_fetch_redacts_signed_redirect_url_from_output_and_citation(
+    monkeypatch,
+    guard,
+) -> None:
+    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
+    marker = "redirect-signature-marker"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/start":
+            return httpx.Response(
+                302,
+                headers={
+                    "location": (
+                        "https://example.com/final?"
+                        f"X-Amz-Signature={marker}&view=complete"
+                    )
+                },
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            text="done",
+        )
+
+    tool = WebFetchTool(guard, transport=httpx.MockTransport(handler))
+    result = await tool.run(url="https://example.com/start")
+
+    assert result.success is True
+    assert marker not in result.output
+    assert "URL (sanitized):" in result.output
+    assert "X-Amz-Signature=[REDACTED]" in result.output
+    assert "view=complete" in result.output
+    assert result.citations is not None
+    assert marker not in result.citations[0]["url"]
+    assert "X-Amz-Signature=[REDACTED]" in result.citations[0]["url"]
+    assert result.citations[0]["url_is_sanitized"] is True
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_marks_redacted_citation_url_as_sanitized(
+    monkeypatch,
+    guard,
+) -> None:
+    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            text="done",
+        )
+
+    tool = WebFetchTool(guard, transport=httpx.MockTransport(handler))
+    result = await tool.run(url="https://example.com/?code=200&view=complete")
+
+    assert result.success is True
+    assert "URL (sanitized):" in result.output
+    assert "code=[REDACTED]" in result.output
+    assert result.citations[0]["url_is_sanitized"] is True
+    assert result.citations[0]["url"].endswith(
+        "?code=[REDACTED]&view=complete"
+    )
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_redacts_signed_url_from_http_error(monkeypatch, guard) -> None:
+    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
+    marker = "error-signature-marker"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/start":
+            return httpx.Response(
+                302,
+                headers={
+                    "location": (
+                        "https://example.com/final?"
+                        f"sig={marker}&view=complete"
+                    )
+                },
+            )
+        return httpx.Response(
+            500,
+            headers={"content-type": "text/plain"},
+            text="failed",
+        )
+
+    tool = WebFetchTool(guard, transport=httpx.MockTransport(handler))
+    result = await tool.run(url="https://example.com/start")
+
+    assert result.success is False
+    assert result.error is not None
+    assert marker not in result.error
+    assert "sig=[REDACTED]" in result.error
+
+
+@pytest.mark.asyncio
 async def test_web_fetch_enforces_allowed_domains(monkeypatch, guard) -> None:
     monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
 

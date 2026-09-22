@@ -13,6 +13,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from pydantic import BaseModel, Field
 
+from ash.core.redaction import redact_url, redact_urls_in_text
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 
 
@@ -66,14 +67,24 @@ class WebFetchTool(BaseTool):
                 allowed_domains=self._allowed_domains,
             )
         except (ValueError, httpx.HTTPError) as exc:
-            return ToolResult(success=False, output="", error=str(exc))
+            return ToolResult(
+                success=False,
+                output="",
+                error=redact_urls_in_text(str(exc)),
+            )
+        redacted_final_url = redact_url(final_url)
+        final_url_sanitized = redacted_final_url != final_url
         text = _html_to_text(body) if "html" in content_type else body
         truncated = len(text) > args.max_chars
         if truncated:
             text = text[: args.max_chars] + "\n[web_fetch output truncated]"
         output = "\n".join(
             (
-                f"URL: {final_url}",
+                (
+                    f"URL (sanitized): {redacted_final_url}"
+                    if final_url_sanitized
+                    else f"URL: {redacted_final_url}"
+                ),
                 f"Status: {status_code}",
                 f"Content-Type: {content_type or 'unknown'}",
                 "",
@@ -88,7 +99,8 @@ class WebFetchTool(BaseTool):
             citations=[
                 {
                     "title": "",
-                    "url": final_url,
+                    "url": redacted_final_url,
+                    **({"url_is_sanitized": True} if final_url_sanitized else {}),
                     "status_code": status_code,
                     "content_type": content_type or "unknown",
                 }

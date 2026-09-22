@@ -2855,6 +2855,65 @@ async def test_unknown_tool_outcome_is_a_durable_ambiguous_failure(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_browser_url_arguments_are_redacted_in_records_but_dispatched_raw(
+    tmp_path,
+) -> None:
+    dispatched: dict[str, object] = {}
+
+    class CaptureBrowserTool(BaseTool):
+        name = "browser_navigate"
+        args_schema = None
+
+        async def run(self, **kwargs):
+            dispatched.update(kwargs)
+            return ToolResult(success=True, output="navigated")
+
+    marker = "durable-signature-marker"
+    raw_url = (
+        "https://storage.example/object?"
+        f"X-Amz-Signature={marker}&view=complete"
+    )
+    guard = SafetyGuard(project_root=tmp_path)
+    store = SessionStore(tmp_path / "browser-redaction.db")
+    ui = EventUI(safety_tier="auto_approve")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={"browser_navigate": CaptureBrowserTool(guard)},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+
+    result = await loop._execute_tool_calls(
+        [
+            {
+                "call_id": "browser-signed-url",
+                "name": "browser_navigate",
+                "arguments": {"url": raw_url, "wait_until": "load"},
+            }
+        ],
+        session,
+    )
+
+    assert result[0]["success"] is True
+    assert dispatched["url"] == raw_url
+    record = store.load_session(session.session_id).tool_calls[-1]
+    assert marker not in str(record.arguments)
+    assert record.arguments["url"].endswith(
+        "X-Amz-Signature=[REDACTED]&view=complete"
+    )
+    argument_events = [event for event in ui.events if "arguments" in event]
+    assert argument_events
+    assert all(marker not in str(event["arguments"]) for event in argument_events)
+    audit_logs = store.list_audit_logs(session.session_id)
+    assert audit_logs
+    assert all(marker not in str(entry.details) for entry in audit_logs)
+
+
+@pytest.mark.asyncio
 async def test_invalid_execution_contract_is_rejected_before_dispatch(tmp_path):
     calls = 0
 

@@ -6,6 +6,7 @@ from ash.core.redaction import (
     StreamingRedactor,
     find_secret_candidates,
     redact_text,
+    redact_url,
     redact_value,
 )
 from ash.core.secret_middleware import SecretRedactionMiddleware
@@ -181,6 +182,165 @@ def test_structured_redaction_preserves_usage_types_and_redacts_credentials() ->
         "password": "[REDACTED]",
         "description": "api_key=[REDACTED]",
     }
+
+
+def test_structured_redaction_redacts_signed_url_credentials() -> None:
+    value = {
+        "url": (
+            "https://storage.example/object?"
+            "X-Amz-Credential=aws-credential&X-Amz-Signature=aws-signature&"
+            "X-Goog-Credential=google-credential&X-Goog-Signature=google-signature&"
+            "sig=azure-signature&view=complete"
+        )
+    }
+
+    rendered = redact_value(value)
+    rendered_url = rendered["url"]
+
+    for secret in (
+        "aws-credential",
+        "aws-signature",
+        "google-credential",
+        "google-signature",
+        "azure-signature",
+    ):
+        assert secret not in rendered_url
+    assert "X-Amz-Credential=[REDACTED]" in rendered_url
+    assert "X-Amz-Signature=[REDACTED]" in rendered_url
+    assert "X-Goog-Credential=[REDACTED]" in rendered_url
+    assert "X-Goog-Signature=[REDACTED]" in rendered_url
+    assert "sig=[REDACTED]" in rendered_url
+    assert "view=complete" in rendered_url
+
+
+def test_url_redaction_handles_literal_semicolon_without_decoding_delimiters() -> None:
+    literal = redact_url(
+        "https://storage.example/object?view=complete;sig=semicolon-marker"
+    )
+    encoded = redact_url(
+        "https://storage.example/object?view=complete%3Bsig%3Dencoded-marker"
+    )
+
+    assert "semicolon-marker" not in literal
+    assert "sig=[REDACTED]" in literal
+    assert "view=complete" in literal
+    assert "encoded-marker" in encoded
+    assert "sig=[REDACTED]" not in encoded
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.test/?pass=pass-secret",
+        "https://example.test/?passwd=passwd-secret",
+        "https://example.test/?private_key=private-key-secret",
+        "https://example.test/?client%5Fse%E2%80%8Bcret=zero-width-secret",
+        "https://example.test/?client_se+cret=plus-secret",
+    ],
+)
+def test_url_redaction_normalizes_sensitive_query_field_names(url: str) -> None:
+    rendered = redact_url(url)
+
+    assert "secret" not in rendered
+    assert "[REDACTED]" in rendered
+
+
+def test_url_redaction_handles_encoded_oauth_fragment() -> None:
+    rendered = redact_url(
+        "https://example.test/#"
+        "access_token%3Dencoded-fragment-secret%26state%3Dstate-secret"
+    )
+
+    assert "encoded-fragment-secret" not in rendered
+    assert "state-secret" not in rendered
+    assert "access_token=[REDACTED]" in rendered
+    assert "state=[REDACTED]" in rendered
+
+
+def test_url_redaction_redacts_nested_signed_url_query_value() -> None:
+    rendered = redact_url(
+        "https://example.test/?redirect="
+        "https%3A%2F%2Fstorage.example%2F%3F"
+        "X-Amz-Signature%3Dnested-signature-marker"
+    )
+
+    assert "nested-signature-marker" not in rendered
+    assert "X-Amz-Signature%3D[REDACTED]" in rendered
+
+
+def test_url_redaction_handles_double_encoded_oauth_fragment() -> None:
+    rendered = redact_url(
+        "https://example.test/#access_token%253Ddouble-fragment-marker"
+    )
+
+    assert "double-fragment-marker" not in rendered
+    assert "access_token=[REDACTED]" in rendered
+
+
+def test_url_redaction_fails_closed_for_malformed_signed_url() -> None:
+    rendered = redact_url(
+        "https://[bad/?X-Amz-Signature=malformed-signature-marker&view=complete"
+    )
+
+    assert "malformed-signature-marker" not in rendered
+    assert "X-Amz-Signature=[REDACTED]" in rendered
+    assert "view=complete" in rendered
+
+
+def test_text_redaction_fails_closed_for_malformed_signed_url() -> None:
+    rendered = redaction_module.redact_urls_in_text(
+        "request failed at "
+        "https://[bad/?sig=malformed-text-marker&view=complete"
+    )
+
+    assert "malformed-text-marker" not in rendered
+    assert "sig=[REDACTED]" in rendered
+    assert "view=complete" in rendered
+
+
+def test_structured_redaction_handles_protocol_relative_url_userinfo() -> None:
+    rendered = redact_value(
+        {"url": "//user:password@example.test/cb?code=oauth-code&view=complete"}
+    )
+
+    assert rendered == {
+        "url": "//example.test/cb?code=[REDACTED]&view=complete"
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        " https://example.test/?sig=leading-marker",
+        '"https://example.test/?sig=quoted-marker"',
+    ],
+)
+def test_structured_redaction_finds_urls_with_surrounding_text(value: str) -> None:
+    rendered = redact_value({"value": value})["value"]
+
+    assert "marker" not in rendered
+    assert "sig=[REDACTED]" in rendered
+
+
+def test_text_redaction_handles_json_escaped_url() -> None:
+    rendered = redaction_module.redact_urls_in_text(
+        r'failed for https:\/\/example.test\/?sig=escaped-marker'
+    )
+
+    assert "escaped-marker" not in rendered
+    assert r"sig=[REDACTED]" in rendered
+    assert r"https:\/\/example.test\/" in rendered
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["sig[]", "sig[0]", "sig.v4", "signature.v2"],
+)
+def test_url_redaction_handles_structural_sensitive_field_suffixes(field: str) -> None:
+    rendered = redact_url(f"https://example.test/?{field}=suffix-marker")
+
+    assert "suffix-marker" not in rendered
+    assert "[REDACTED]" in rendered
 
 
 @pytest.mark.parametrize(

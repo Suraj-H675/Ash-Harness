@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 
 _SECRET_VALUE_ASSIGNMENT = re.compile(
@@ -96,6 +98,52 @@ _SECRET_ASSIGNMENT = re.compile(
 )
 LONG_TOKEN_WITHHELD_MARKER = "[long unbroken output token withheld]"
 
+_SENSITIVE_URL_FIELDS = frozenset(
+    {
+        "access_token",
+        "apikey",
+        "api_key",
+        "auth",
+        "authorization",
+        "authorization_code",
+        "client_secret",
+        "code",
+        "code_verifier",
+        "credential",
+        "credentials",
+        "id_token",
+        "jwt",
+        "key",
+        "oauth_code",
+        "pass",
+        "passwd",
+        "password",
+        "private_key",
+        "privatekey",
+        "refresh_token",
+        "saml_response",
+        "secret",
+        "session",
+        "session_id",
+        "sig",
+        "signature",
+        "state",
+        "ticket",
+        "token",
+    }
+)
+_URL_IN_TEXT = re.compile(
+    r"(?i)(?:(?:https?|wss?)://|(?<!:)//)[^\s<>\"']+"
+)
+_JSON_ESCAPED_URL_IN_TEXT = re.compile(
+    r"(?i)(?:https?|wss?):\\/\\/[^\s<>\"']+"
+)
+_MALFORMED_URL_FIELD_ASSIGNMENT = re.compile(
+    r"(?P<prefix>[?&#;])(?P<name>[^?&#;=\s]+)=(?P<value>[^&#;\s]*)"
+)
+_MAX_URL_REDACTION_DEPTH = 3
+_MAX_URL_DECODE_ROUNDS = 3
+
 _PLACEHOLDER_TERMS = (
     "changeme",
     "dummy",
@@ -128,6 +176,173 @@ def redact_text(value: str) -> str:
     for pattern in _SECRET_PATTERNS[1:]:
         redacted = pattern.sub("[REDACTED]", redacted)
     return redacted
+
+
+def _normalize_url_field_name(name: str) -> str:
+    normalized = re.sub(
+        r"(?<=[a-z0-9])(?=[A-Z])",
+        "_",
+        unquote(name).replace("+", " "),
+    ).casefold().replace("-", "_")
+    normalized = "".join(
+        character
+        for character in normalized
+        if not character.isspace()
+        and unicodedata.category(character) not in {"Cc", "Cf"}
+    )
+    normalized = re.sub(r"\[(?:\d*)\]$", "", normalized)
+    return re.sub(r"\.v\d+$", "", normalized)
+
+
+def _is_sensitive_url_field(name: str) -> bool:
+    normalized = _normalize_url_field_name(name)
+    return (
+        normalized in _SENSITIVE_URL_FIELDS
+        or normalized.endswith("_token")
+        or normalized.endswith("_secret")
+        or normalized.endswith("_password")
+        or normalized.endswith("_api_key")
+        or normalized.endswith("_credential")
+        or normalized.endswith("_signature")
+    )
+
+
+def _redact_malformed_url(value: str) -> str:
+    redacted = redact_text(value)
+    scheme_separator = redacted.find("://")
+    if scheme_separator >= 0:
+        authority_start = scheme_separator + 3
+        authority_end = len(redacted)
+        for separator in "/?#":
+            position = redacted.find(separator, authority_start)
+            if position >= 0:
+                authority_end = min(authority_end, position)
+        userinfo_end = redacted.rfind("@", authority_start, authority_end)
+        if userinfo_end >= 0:
+            redacted = redacted[:authority_start] + redacted[userinfo_end + 1 :]
+
+    def replace_assignment(match: re.Match[str]) -> str:
+        name = match.group("name")
+        field_value = match.group("value")
+        replacement = (
+            "[REDACTED]"
+            if _is_sensitive_url_field(name) and field_value
+            else redact_text(field_value)
+        )
+        return f"{match.group('prefix')}{name}={replacement}"
+
+    return _MALFORMED_URL_FIELD_ASSIGNMENT.sub(replace_assignment, redacted)
+
+
+def redact_url(value: str, *, _depth: int = 0) -> str:
+    """Redact credentials from one HTTP(S)/WebSocket URL without changing dispatch input."""
+
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return _redact_malformed_url(value)
+    scheme = parsed.scheme.casefold()
+    protocol_relative = not scheme and bool(parsed.netloc) and value.startswith("//")
+    if scheme not in {"http", "https", "ws", "wss"} and not protocol_relative:
+        return redact_text(value)
+
+    def redact_component(component: str) -> str:
+        if not component or "=" not in component:
+            return redact_text(component)
+        pairs: list[tuple[str, str]] = []
+        for segment in re.split(r"[&;]", component):
+            pairs.extend(parse_qsl(segment, keep_blank_values=True))
+        redacted_pairs: list[tuple[str, str]] = []
+        for name, field_value in pairs:
+            redacted_field_value = redact_text(field_value)
+            if not _is_sensitive_url_field(name):
+                candidate = field_value
+                for _ in range(_MAX_URL_DECODE_ROUNDS + 1):
+                    if _URL_IN_TEXT.search(candidate) or _JSON_ESCAPED_URL_IN_TEXT.search(
+                        candidate
+                    ):
+                        redacted_field_value = (
+                            "[REDACTED]"
+                            if _depth >= _MAX_URL_REDACTION_DEPTH
+                            else redact_urls_in_text(candidate, _depth=_depth + 1)
+                        )
+                        break
+                    decoded = unquote(candidate)
+                    if decoded == candidate:
+                        break
+                    candidate = decoded
+            redacted_pairs.append(
+                (
+                    name,
+                    "[REDACTED]"
+                    if _is_sensitive_url_field(name) and field_value
+                    else redacted_field_value,
+                )
+            )
+        return urlencode(redacted_pairs, safe="[]")
+
+    netloc = parsed.netloc
+    if parsed.username is not None or parsed.password is not None:
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        netloc = host
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if port is not None:
+            netloc = f"{netloc}:{port}"
+
+    fragment = parsed.fragment
+    if "?" in fragment:
+        fragment_path, fragment_query = fragment.split("?", 1)
+        fragment = f"{redact_text(fragment_path)}?{redact_component(fragment_query)}"
+    else:
+        decoded_fragment = fragment
+        exhausted_decode_budget = False
+        if "=" not in decoded_fragment:
+            for _ in range(_MAX_URL_DECODE_ROUNDS):
+                decoded = unquote(decoded_fragment)
+                if decoded == decoded_fragment:
+                    break
+                decoded_fragment = decoded
+                if "=" in decoded_fragment:
+                    break
+            else:
+                exhausted_decode_budget = unquote(decoded_fragment) != decoded_fragment
+        if exhausted_decode_budget:
+            fragment = "[REDACTED]"
+        elif "=" not in fragment and decoded_fragment != fragment and "=" in decoded_fragment:
+            fragment = redact_component(decoded_fragment)
+        else:
+            fragment = redact_component(fragment)
+    return urlunparse(
+        parsed._replace(
+            netloc=netloc,
+            path=redact_text(parsed.path),
+            params=redact_text(parsed.params),
+            query=redact_component(parsed.query),
+            fragment=fragment,
+        )
+    )
+
+
+def redact_urls_in_text(value: str, *, _depth: int = 0) -> str:
+    """Redact secret-bearing absolute or protocol-relative URLs inside text."""
+
+    redacted = redact_text(value)
+    redacted = _URL_IN_TEXT.sub(
+        lambda match: redact_url(match.group(0), _depth=_depth),
+        redacted,
+    )
+    return _JSON_ESCAPED_URL_IN_TEXT.sub(
+        lambda match: redact_url(
+            match.group(0).replace("\\/", "/"),
+            _depth=_depth,
+        ).replace("/", "\\/"),
+        redacted,
+    )
 
 
 def _redact_sensitive_header(match: re.Match[str]) -> str:
@@ -436,7 +651,7 @@ def _looks_like_placeholder(value: str) -> bool:
 
 def redact_value(value: Any) -> Any:
     if isinstance(value, str):
-        return redact_text(value)
+        return redact_urls_in_text(value)
     if isinstance(value, dict):
         return {
             key: "[REDACTED]"

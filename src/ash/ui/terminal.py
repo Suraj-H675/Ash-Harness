@@ -31,6 +31,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 from rich.text import Text
 
+from ash.core.redaction import redact_value
 from ash.safe_io import read_bounded_bytes
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.transcript import Transcript
@@ -712,7 +713,9 @@ class TerminalUI:
         display_tool_name = terminal_safe_text(tool_name, single_line=True)
         body.append(display_tool_name, style=self.theme.prompt)
         body.append("\nArgs:\n")
-        for key, value in arguments.items():
+        display_arguments = redact_value(arguments)
+        assert isinstance(display_arguments, dict)
+        for key, value in display_arguments.items():
             body.append(
                 f"  {terminal_safe_text(str(key), single_line=True)} = ",
                 style="dim",

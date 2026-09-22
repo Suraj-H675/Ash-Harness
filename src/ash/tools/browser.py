@@ -14,11 +14,11 @@ import secrets
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 
 from pydantic import BaseModel, Field, field_validator
 
-from ash.core.redaction import redact_text
+from ash.core.redaction import redact_url, redact_urls_in_text
 from ash.safe_io import validate_unlinked_directory_path
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
@@ -55,34 +55,6 @@ ELEMENT_REF = re.compile(
     r"e[1-9][0-9]{0,3}$"
 )
 TAB_ID = re.compile(rf"^{TAB_ID_PATTERN}$")
-SENSITIVE_BROWSER_URL_FIELDS = frozenset(
-    {
-        "access_token",
-        "apikey",
-        "api_key",
-        "auth",
-        "authorization",
-        "authorization_code",
-        "client_secret",
-        "code",
-        "code_verifier",
-        "credential",
-        "credentials",
-        "id_token",
-        "jwt",
-        "key",
-        "oauth_code",
-        "password",
-        "refresh_token",
-        "saml_response",
-        "secret",
-        "session",
-        "session_id",
-        "state",
-        "ticket",
-        "token",
-    }
-)
 INTERACTIVE_SELECTOR = ",".join(
     (
         "a[href]",
@@ -156,6 +128,7 @@ class BrowserSession:
         self._page: Any | None = None
         self._tab_pages: dict[str, Any] = {}
         self._snapshot_versions: dict[str, int] = {}
+        self._snapshot_task: asyncio.Task[str] | None = None
         self._session_token = secrets.token_hex(4)
         self._next_tab_id = 1
         self._page_tasks: set[asyncio.Task[None]] = set()
@@ -198,7 +171,7 @@ class BrowserSession:
                     )
                 ):
                     cleanup_task = asyncio.create_task(
-                        self._close_unlocked(),
+                        self._close_unlocked(cancel_snapshot=False),
                         name="ash-browser-startup-cleanup",
                     )
                     await _settle_browser_cleanup_task(cleanup_task)
@@ -307,18 +280,18 @@ class BrowserSession:
                 return self._page
             except asyncio.CancelledError:
                 cleanup_task = asyncio.create_task(
-                    self._close_unlocked(),
+                    self._close_unlocked(cancel_snapshot=False),
                     name="ash-browser-startup-cleanup",
                 )
                 await _settle_browser_cleanup_task(cleanup_task)
                 raise
             except Exception as exc:
                 cleanup_task = asyncio.create_task(
-                    self._close_unlocked(),
+                    self._close_unlocked(cancel_snapshot=False),
                     name="ash-browser-startup-cleanup",
                 )
                 await _settle_browser_cleanup_task(cleanup_task)
-                message = redact_text(str(exc))[:500]
+                message = _redact_browser_text(str(exc))[:500]
                 if "Executable doesn't exist" in message:
                     raise BrowserUnavailableError(
                         "Chromium is not installed; run `ash setup browser`."
@@ -356,12 +329,26 @@ class BrowserSession:
         return await self.snapshot()
 
     async def snapshot(self) -> str:
+        task = self._snapshot_task
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._snapshot_once(),
+                name="ash-browser-snapshot",
+            )
+            self._snapshot_task = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if self._snapshot_task is task and task.done():
+                self._snapshot_task = None
+
+    async def _snapshot_once(self) -> str:
         page = await self.ensure_started()
         tab_id = self._remember_tab(page)
         snapshot_version = self._snapshot_versions.get(tab_id, 0) + 1
         self._snapshot_versions[tab_id] = snapshot_version
         ref_prefix = f"{tab_id}:s{snapshot_version}"
-        title = redact_text(_single_line(str(await page.title())))[:200]
+        title = _redact_browser_text(_single_line(str(await page.title())))[:200]
         elements = await page.eval_on_selector_all(
             INTERACTIVE_SELECTOR,
             """(nodes, options) => {
@@ -390,7 +377,7 @@ class BrowserSession:
             'input[type="password"]',
             """nodes => nodes.slice(0, 100).map(node => String(node.value || '').slice(0, 10000)).filter(Boolean)""",
         )
-        aria = _redact_literals(aria, password_values)
+        aria = _redact_browser_text(_redact_literals(aria, password_values))
         lines = [
             f"Tab: {tab_id}",
             f"Page: {title}",
@@ -399,7 +386,9 @@ class BrowserSession:
             "Interactive elements:",
         ]
         for item in elements:
-            label = _single_line(str(item.get("text", "")))[:200]
+            label = _redact_browser_text(
+                _single_line(str(item.get("text", "")))
+            )[:200]
             disabled = " disabled" if item.get("disabled") else ""
             lines.append(
                 f"[{item.get('ref', '')}] {item.get('role', 'element')}{disabled} "
@@ -571,7 +560,9 @@ class BrowserSession:
         for page in pages:
             tab_id = self._remember_tab(page)
             try:
-                title = _single_line(str(await page.title()))[:200]
+                title = _redact_browser_text(
+                    _single_line(str(await page.title()))
+                )[:200]
             except Exception:
                 if page.is_closed():
                     continue
@@ -580,7 +571,7 @@ class BrowserSession:
                 {
                     "tab_id": tab_id,
                     "active": page is self._page,
-                    "title": redact_text(title),
+                    "title": title,
                     "url": _redact_browser_url(str(page.url))[:2048],
                 }
             )
@@ -907,7 +898,20 @@ class BrowserSession:
             if interrupted:
                 raise asyncio.CancelledError
 
-    async def _close_unlocked(self) -> None:
+    async def _close_unlocked(self, *, cancel_snapshot: bool = True) -> None:
+        snapshot_task = self._snapshot_task
+        current_task = asyncio.current_task()
+        if (
+            cancel_snapshot
+            and
+            snapshot_task is not None
+            and snapshot_task is not current_task
+            and not snapshot_task.done()
+        ):
+            snapshot_task.cancel()
+            await asyncio.gather(snapshot_task, return_exceptions=True)
+        if cancel_snapshot and snapshot_task is not current_task:
+            self._snapshot_task = None
         page_tasks = list(self._page_tasks)
         for task in page_tasks:
             task.cancel()
@@ -1043,63 +1047,13 @@ def _validate_browser_url(url: str, allowed_domains: tuple[str, ...]) -> str:
 
 
 def _redact_browser_url(url: str) -> str:
-    parsed = urlparse(url)
+    return redact_url(url)
 
-    def redact_component(value: str) -> str:
-        if not value or "=" not in value:
-            return redact_text(value)
-        pairs = parse_qsl(value, keep_blank_values=True)
-        redacted_pairs = []
-        for name, field_value in pairs:
-            normalized = re.sub(
-                r"(?<=[a-z0-9])(?=[A-Z])",
-                "_",
-                name,
-            ).casefold().replace("-", "_")
-            sensitive = (
-                normalized in SENSITIVE_BROWSER_URL_FIELDS
-                or normalized.endswith("_token")
-                or normalized.endswith("_secret")
-                or normalized.endswith("_password")
-                or normalized.endswith("_api_key")
-            )
-            redacted_pairs.append(
-                (
-                    name,
-                    (
-                        "[REDACTED]"
-                        if sensitive and field_value
-                        else redact_text(field_value)
-                    ),
-                )
-            )
-        return urlencode(redacted_pairs, safe="[]")
 
-    netloc = parsed.netloc
-    if parsed.username is not None or parsed.password is not None:
-        host = parsed.hostname or ""
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        netloc = host
-        if parsed.port is not None:
-            netloc = f"{netloc}:{parsed.port}"
-    fragment = parsed.fragment
-    if "?" in fragment:
-        fragment_path, fragment_query = fragment.split("?", 1)
-        fragment = (
-            f"{redact_text(fragment_path)}?{redact_component(fragment_query)}"
-        )
-    else:
-        fragment = redact_component(fragment)
-    return urlunparse(
-        parsed._replace(
-            netloc=netloc,
-            path=redact_text(parsed.path),
-            params=redact_text(parsed.params),
-            query=redact_component(parsed.query),
-            fragment=fragment,
-        )
-    )
+def _redact_browser_text(value: str) -> str:
+    """Redact generic secrets plus secret-bearing browser URL fields."""
+
+    return redact_urls_in_text(value)
 
 
 def _single_line(value: str) -> str:
@@ -1234,12 +1188,16 @@ class _BrowserTool(BaseTool):
         try:
             output = await operation
         except (BrowserUnavailableError, ValueError) as exc:
-            return ToolResult(success=False, output="", error=redact_text(str(exc)))
+            return ToolResult(
+                success=False,
+                output="",
+                error=_redact_browser_text(str(exc)),
+            )
         except Exception as exc:
             return ToolResult(
                 success=False,
                 output="",
-                error="browser action failed: " + redact_text(str(exc))[:500],
+                error="browser action failed: " + _redact_browser_text(str(exc))[:500],
             )
         return ToolResult(
             success=True,
@@ -1391,12 +1349,19 @@ class BrowserScreenshotTool(_BrowserTool):
                 f'media_type="{image.media_type}" sha256="{image.sha256}" />'
             )
         except (BrowserUnavailableError, ValueError) as exc:
-            return ToolResult(success=False, output="", error=redact_text(str(exc)))
+            return ToolResult(
+                success=False,
+                output="",
+                error=_redact_browser_text(str(exc)),
+            )
         except Exception as exc:
             return ToolResult(
                 success=False,
                 output="",
-                error="browser screenshot failed: " + redact_text(str(exc))[:500],
+                error=(
+                    "browser screenshot failed: "
+                    + _redact_browser_text(str(exc))[:500]
+                ),
             )
         return ToolResult(
             success=True,
