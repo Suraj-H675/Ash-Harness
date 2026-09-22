@@ -436,6 +436,8 @@ def _quarantine_pipx_metadata_owned(
     metadata: _OwnedMetadataFile,
 ) -> _OwnedMetadataFile:
     if not _installer_supports_dir_fd():
+        if os.name == "nt":
+            return _quarantine_pipx_metadata_owned_windows(metadata)
         return _quarantine_pipx_metadata_owned_fallback(metadata)
 
     try:
@@ -556,7 +558,45 @@ def _quarantine_pipx_metadata_owned_fallback(
     )
 
 
+def _quarantine_pipx_metadata_owned_windows(
+    metadata: _OwnedMetadataFile,
+) -> _OwnedMetadataFile:
+    parent_handle = _windows_open_installer_directory(metadata.path.parent)
+    descriptor = -1
+    try:
+        descriptor = _windows_open_owned_metadata(
+            metadata,
+            parent_handle=parent_handle,
+        )
+        for _ in range(32):
+            quarantine_name = f"{metadata.path.name}.corrupt-{uuid.uuid4().hex}"
+            quarantine_path = metadata.path.with_name(quarantine_name)
+            try:
+                _windows_rename_open_file(
+                    descriptor,
+                    parent_handle=parent_handle,
+                    destination_name=quarantine_name,
+                )
+            except FileExistsError:
+                continue
+            quarantined = os.fstat(descriptor)
+            return _OwnedMetadataFile(
+                path=quarantine_path,
+                device=quarantined.st_dev,
+                inode=quarantined.st_ino,
+                sha256=metadata.sha256,
+            )
+        raise InstallError("could not allocate a unique pipx metadata quarantine name")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        _windows_close_handle(parent_handle)
+
+
 def _remove_owned_quarantine(quarantine: _OwnedMetadataFile) -> None:
+    if os.name == "nt" and not _installer_supports_dir_fd():
+        _remove_owned_quarantine_windows(quarantine)
+        return
     try:
         contents, metadata = _read_bounded_file_with_identity(
             quarantine.path,
@@ -590,6 +630,365 @@ def _remove_owned_quarantine(quarantine: _OwnedMetadataFile) -> None:
         os.unlink(quarantine.path.name, dir_fd=parent_descriptor)
     finally:
         os.close(parent_descriptor)
+
+
+def _remove_owned_quarantine_windows(quarantine: _OwnedMetadataFile) -> None:
+    parent_handle = _windows_open_installer_directory(quarantine.path.parent)
+    try:
+        try:
+            descriptor = _windows_open_owned_metadata(
+                quarantine,
+                parent_handle=parent_handle,
+            )
+        except FileNotFoundError:
+            return
+        try:
+            _windows_delete_open_file(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        _windows_close_handle(parent_handle)
+
+
+def _windows_open_installer_directory(path: Path) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    win_dll: Any = getattr(ctypes, "WinDLL")
+    get_last_error: Any = getattr(ctypes, "get_last_error")
+    format_error: Any = getattr(ctypes, "FormatError")
+    kernel32: Any = win_dll("kernel32", use_last_error=True)
+    create_file: Any = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    file_read_attributes = 0x00000080
+    share_read = 0x00000001
+    share_write = 0x00000002
+    share_delete = 0x00000004
+    open_existing = 3
+    flag_backup_semantics = 0x02000000
+    flag_open_reparse_point = 0x00200000
+    invalid_handle = ctypes.c_void_p(-1).value
+    handle = create_file(
+        str(path),
+        file_read_attributes,
+        share_read | share_write | share_delete,
+        None,
+        open_existing,
+        flag_backup_semantics | flag_open_reparse_point,
+        None,
+    )
+    if handle == invalid_handle:
+        error_number = int(get_last_error())
+        raise InstallError(
+            "could not safely open pipx metadata directory: "
+            f"{format_error(error_number)}"
+        )
+    try:
+        if _windows_handle_is_reparse(handle):
+            raise InstallError("pipx metadata directory is a reparse point")
+        return int(handle)
+    except Exception:
+        _windows_close_handle(int(handle))
+        raise
+
+
+def _windows_open_owned_metadata(
+    metadata: _OwnedMetadataFile,
+    *,
+    parent_handle: int,
+) -> int:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", wintypes.LPWSTR),
+        ]
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.ULONG),
+            ("RootDirectory", wintypes.HANDLE),
+            ("ObjectName", ctypes.POINTER(UnicodeString)),
+            ("Attributes", wintypes.ULONG),
+            ("SecurityDescriptor", ctypes.c_void_p),
+            ("SecurityQualityOfService", ctypes.c_void_p),
+        ]
+
+    class IoStatusUnion(ctypes.Union):
+        _fields_ = [
+            ("Status", ctypes.c_long),
+            ("Pointer", ctypes.c_void_p),
+        ]
+
+    class IoStatusBlock(ctypes.Structure):
+        _anonymous_ = ("result",)
+        _fields_ = [
+            ("result", IoStatusUnion),
+            ("Information", ctypes.c_size_t),
+        ]
+
+    win_dll: Any = getattr(ctypes, "WinDLL")
+    open_osfhandle: Any = getattr(msvcrt, "open_osfhandle")
+    ntdll: Any = win_dll("ntdll")
+    nt_open_file: Any = ntdll.NtOpenFile
+    nt_open_file.argtypes = [
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(ObjectAttributes),
+        ctypes.POINTER(IoStatusBlock),
+        wintypes.ULONG,
+        wintypes.ULONG,
+    ]
+    nt_open_file.restype = ctypes.c_long
+
+    file_read_data = 0x00000001
+    file_read_attributes = 0x00000080
+    delete_access = 0x00010000
+    synchronize = 0x00100000
+    share_read = 0x00000001
+    file_synchronous_io_nonalert = 0x00000020
+    file_non_directory_file = 0x00000040
+    file_open_reparse_point = 0x00200000
+    obj_case_insensitive = 0x00000040
+    missing_statuses = {0xC0000034, 0xC000003A}
+
+    name_buffer = ctypes.create_unicode_buffer(metadata.path.name)
+    name_length = len(metadata.path.name.encode("utf-16-le"))
+    name = UnicodeString(
+        Length=name_length,
+        MaximumLength=name_length + ctypes.sizeof(ctypes.c_wchar),
+        Buffer=ctypes.cast(name_buffer, wintypes.LPWSTR),
+    )
+    attributes = ObjectAttributes(
+        Length=ctypes.sizeof(ObjectAttributes),
+        RootDirectory=wintypes.HANDLE(parent_handle),
+        ObjectName=ctypes.pointer(name),
+        Attributes=obj_case_insensitive,
+        SecurityDescriptor=None,
+        SecurityQualityOfService=None,
+    )
+    io_status = IoStatusBlock()
+    handle = wintypes.HANDLE()
+    status = int(
+        nt_open_file(
+            ctypes.byref(handle),
+            file_read_data
+            | file_read_attributes
+            | delete_access
+            | synchronize,
+            ctypes.byref(attributes),
+            ctypes.byref(io_status),
+            share_read,
+            file_synchronous_io_nonalert
+            | file_non_directory_file
+            | file_open_reparse_point,
+        )
+    )
+    if status < 0:
+        status_code = status & 0xFFFFFFFF
+        if status_code in missing_statuses:
+            raise FileNotFoundError(
+                2,
+                "pipx metadata was not found",
+                metadata.path,
+            )
+        raise InstallError(
+            "could not safely open pipx metadata relative to its directory: "
+            f"NTSTATUS 0x{status_code:08x}"
+        )
+    handle_value = handle.value
+    if handle_value is None:
+        raise InstallError("NtOpenFile returned an invalid pipx metadata handle")
+    raw_handle = int(handle_value)
+    descriptor = -1
+    try:
+        if _windows_handle_is_reparse(raw_handle):
+            raise InstallError("pipx metadata is no longer a regular file")
+        descriptor = int(
+            open_osfhandle(
+                raw_handle,
+                os.O_RDONLY
+                | int(getattr(os, "O_BINARY", 0))
+                | int(getattr(os, "O_NOINHERIT", 0)),
+            )
+        )
+        if descriptor < 0:
+            raise OSError("could not adopt the pipx metadata handle")
+        raw_handle = -1
+        current = os.fstat(descriptor)
+        if metadata.inode == 0 or current.st_ino == 0:
+            raise InstallError("pipx metadata identity is unavailable")
+        if (current.st_dev, current.st_ino) != (metadata.device, metadata.inode):
+            raise InstallError("pipx metadata changed before it could be quarantined")
+        if not stat.S_ISREG(current.st_mode):
+            raise InstallError("pipx metadata is no longer a regular file")
+        contents = _read_bounded_descriptor(
+            descriptor,
+            max_bytes=_MAX_METADATA_BYTES,
+            path=metadata.path,
+        )
+        if hashlib.sha256(contents).hexdigest() != metadata.sha256:
+            raise InstallError("pipx metadata contents changed before quarantine")
+        return descriptor
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        elif raw_handle >= 0:
+            _windows_close_handle(raw_handle)
+        raise
+
+
+def _windows_handle_is_reparse(handle: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("FileAttributes", wintypes.DWORD),
+            ("ReparseTag", wintypes.DWORD),
+        ]
+
+    win_dll: Any = getattr(ctypes, "WinDLL")
+    get_last_error: Any = getattr(ctypes, "get_last_error")
+    format_error: Any = getattr(ctypes, "FormatError")
+    kernel32: Any = win_dll("kernel32", use_last_error=True)
+    get_info: Any = kernel32.GetFileInformationByHandleEx
+    get_info.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    get_info.restype = wintypes.BOOL
+    info = FileAttributeTagInfo()
+    if not get_info(
+        wintypes.HANDLE(handle),
+        9,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        error_number = int(get_last_error())
+        raise InstallError(
+            "could not inspect pipx metadata handle: "
+            f"{format_error(error_number)}"
+        )
+    return bool(int(info.FileAttributes) & 0x00000400)
+
+
+def _windows_rename_open_file(
+    descriptor: int,
+    *,
+    parent_handle: int,
+    destination_name: str,
+) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", ctypes.c_ubyte),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", ctypes.c_wchar * (len(destination_name) + 1)),
+        ]
+
+    info = FileRenameInfo()
+    info.ReplaceIfExists = 0
+    info.RootDirectory = wintypes.HANDLE(parent_handle)
+    info.FileNameLength = len(destination_name.encode("utf-16-le"))
+    info.FileName = destination_name
+    win_dll: Any = getattr(ctypes, "WinDLL")
+    get_last_error: Any = getattr(ctypes, "get_last_error")
+    format_error: Any = getattr(ctypes, "FormatError")
+    get_osfhandle: Any = getattr(msvcrt, "get_osfhandle")
+    kernel32: Any = win_dll("kernel32", use_last_error=True)
+    set_info: Any = kernel32.SetFileInformationByHandle
+    set_info.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    set_info.restype = wintypes.BOOL
+    handle = int(get_osfhandle(descriptor))
+    if not set_info(
+        wintypes.HANDLE(handle),
+        3,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        error_number = int(get_last_error())
+        if error_number in {80, 183}:
+            raise FileExistsError(
+                error_number,
+                format_error(error_number),
+                destination_name,
+            )
+        raise InstallError(
+            "could not safely rename pipx metadata into quarantine: "
+            f"{format_error(error_number)}"
+        )
+
+
+def _windows_delete_open_file(descriptor: int) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("DeleteFile", ctypes.c_ubyte)]
+
+    info = FileDispositionInfo()
+    info.DeleteFile = 1
+    win_dll: Any = getattr(ctypes, "WinDLL")
+    get_last_error: Any = getattr(ctypes, "get_last_error")
+    format_error: Any = getattr(ctypes, "FormatError")
+    get_osfhandle: Any = getattr(msvcrt, "get_osfhandle")
+    kernel32: Any = win_dll("kernel32", use_last_error=True)
+    set_info: Any = kernel32.SetFileInformationByHandle
+    set_info.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    set_info.restype = wintypes.BOOL
+    handle = int(get_osfhandle(descriptor))
+    if not set_info(
+        wintypes.HANDLE(handle),
+        4,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        error_number = int(get_last_error())
+        raise InstallError(
+            "could not safely remove pipx metadata quarantine: "
+            f"{format_error(error_number)}"
+        )
+
+
+def _windows_close_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    win_dll: Any = getattr(ctypes, "WinDLL")
+    kernel32: Any = win_dll("kernel32", use_last_error=True)
+    close_handle: Any = kernel32.CloseHandle
+    close_handle(wintypes.HANDLE(handle))
 
 
 def _open_installer_directory(path: Path) -> int:

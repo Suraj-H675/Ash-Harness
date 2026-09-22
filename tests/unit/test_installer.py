@@ -936,6 +936,7 @@ def test_quarantine_pipx_metadata_does_not_overwrite_existing_destination(
     assert second.read_text(encoding="utf-8") == "corrupt"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd quarantine race")
 def test_quarantine_pipx_metadata_does_not_overwrite_racing_destination(
     tmp_path,
     monkeypatch,
@@ -1072,6 +1073,46 @@ def test_successful_repair_does_not_delete_replaced_quarantine(
     assert "ownership changed" in capsys.readouterr().err
 
 
+def test_windows_quarantine_cleanup_closes_parent_on_validation_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import ash.installer as installer_module
+
+    quarantine = installer_module._OwnedMetadataFile(
+        path=tmp_path / "pipx_metadata.json.corrupt-owned",
+        device=1,
+        inode=2,
+        sha256="0" * 64,
+    )
+    parent_handle = 12345
+    closed: list[int] = []
+    monkeypatch.setattr(
+        installer_module,
+        "_windows_open_installer_directory",
+        lambda path: parent_handle,
+    )
+
+    def changed_metadata(metadata, *, parent_handle):
+        raise InstallError("pipx metadata quarantine changed before cleanup")
+
+    monkeypatch.setattr(
+        installer_module,
+        "_windows_open_owned_metadata",
+        changed_metadata,
+    )
+    monkeypatch.setattr(
+        installer_module,
+        "_windows_close_handle",
+        closed.append,
+    )
+
+    with pytest.raises(InstallError, match="changed before cleanup"):
+        installer_module._remove_owned_quarantine_windows(quarantine)
+
+    assert closed == [parent_handle]
+
+
 def test_failed_repair_preserves_owned_quarantine(
     tmp_path,
     monkeypatch,
@@ -1116,6 +1157,7 @@ def test_failed_repair_preserves_owned_quarantine(
     assert quarantine.read_text(encoding="utf-8") == "{"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses handle-based quarantine")
 def test_corrupt_metadata_repair_fails_closed_without_dir_fd_support(
     tmp_path,
     monkeypatch,
