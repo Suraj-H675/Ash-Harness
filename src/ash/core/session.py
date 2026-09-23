@@ -7,8 +7,9 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import threading
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
@@ -23,6 +24,11 @@ from ash.safe_io import (
     validate_unlinked_file_path,
     verify_open_file_identity,
 )
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - POSIX CI/runtime exercises flock support.
+    fcntl = None  # type: ignore[assignment]
 
 
 Role = Literal["system", "user", "assistant", "tool"]
@@ -44,6 +50,159 @@ class SessionStorageError(RuntimeError):
 
 class SessionResolutionError(ValueError):
     """A human session reference cannot be resolved unambiguously."""
+
+
+class _DatabaseCoordinationState:
+    """Process-local reader/writer state paired with a cross-process flock."""
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.readers = 0
+        self.writer = False
+        self.waiting_writers = 0
+
+
+_db_coordination_states_guard = threading.Lock()
+_db_coordination_states: dict[str, _DatabaseCoordinationState] = {}
+
+
+def _database_coordination_state(db_path: str) -> _DatabaseCoordinationState:
+    with _db_coordination_states_guard:
+        return _db_coordination_states.setdefault(db_path, _DatabaseCoordinationState())
+
+
+def _database_coordination_lock_path(db_path: str) -> Path:
+    path = Path(db_path)
+    return path.with_name(f".{path.name}.ash-lock")
+
+
+def _open_database_coordination_file(db_path: str) -> int | None:
+    if os.name != "posix" or fcntl is None:
+        return None
+    path = _database_coordination_lock_path(db_path)
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise SessionStorageError(
+            f"Could not open session database coordination lock {path}: {exc}"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SessionStorageError(
+                f"Session database coordination lock is not a regular file: {path}"
+            )
+        os.fchmod(descriptor, 0o600)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _acquire_database_coordination(
+    db_path: str,
+    *,
+    exclusive: bool,
+) -> Any:
+    state = _database_coordination_state(db_path)
+    with state.condition:
+        if exclusive:
+            state.waiting_writers += 1
+            try:
+                while state.writer or state.readers:
+                    state.condition.wait()
+                state.writer = True
+            finally:
+                state.waiting_writers -= 1
+        else:
+            while state.writer or state.waiting_writers:
+                state.condition.wait()
+            state.readers += 1
+
+    descriptor: int | None = None
+    try:
+        descriptor = _open_database_coordination_file(db_path)
+        if descriptor is not None:
+            assert fcntl is not None
+            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(descriptor, operation)
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        with state.condition:
+            if exclusive:
+                state.writer = False
+            else:
+                state.readers -= 1
+            state.condition.notify_all()
+        raise
+
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if released:
+            return
+        released = True
+        release_error: BaseException | None = None
+        if descriptor is not None:
+            try:
+                assert fcntl is not None
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except BaseException as exc:  # pragma: no cover - OS-level failure.
+                release_error = exc
+            finally:
+                os.close(descriptor)
+        with state.condition:
+            if exclusive:
+                state.writer = False
+            else:
+                state.readers -= 1
+            state.condition.notify_all()
+        if release_error is not None:
+            raise SessionStorageError(
+                f"Could not release session database coordination lock: {release_error}"
+            ) from release_error
+
+    return release
+
+
+@contextmanager
+def exclusive_database_access(db_path: str | Path):
+    """Quiesce Ash database connections while a storage-level mutation runs."""
+
+    normalized_path = Path(_normalize_db_path(db_path))
+    normalized_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized = _normalize_db_path(normalized_path)
+    release = _acquire_database_coordination(normalized, exclusive=True)
+    try:
+        yield Path(normalized)
+    finally:
+        release()
+
+
+class _CoordinatedConnection(sqlite3.Connection):
+    """SQLite connection that releases its Ash coordination lease on close."""
+
+    _ash_coordination_release: Any = None
+
+    def close(self) -> None:
+        release = self._ash_coordination_release
+        self._ash_coordination_release = None
+        try:
+            super().close()
+        finally:
+            if release is not None:
+                release()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
 
 
 class Message(BaseModel):
@@ -355,13 +514,22 @@ def get_db_connection(db_path: str | Path) -> sqlite3.Connection:
     normalized_path = Path(_normalize_db_path(db_path))
     normalized_path.parent.mkdir(parents=True, exist_ok=True)
     normalized_path = Path(_normalize_db_path(normalized_path))
-
-    conn = sqlite3.connect(normalized_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
+    release = _acquire_database_coordination(str(normalized_path), exclusive=False)
+    try:
+        conn = sqlite3.connect(
+            normalized_path,
+            check_same_thread=False,
+            factory=_CoordinatedConnection,
+        )
+        conn._ash_coordination_release = release  # type: ignore[attr-defined]
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        return conn
+    except BaseException:
+        release()
+        raise
 
 
 @asynccontextmanager

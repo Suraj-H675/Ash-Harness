@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import os
 import shutil
 import subprocess
+import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -299,6 +303,150 @@ def test_restore_rejects_sidecar_created_after_snapshot(
 
     assert created is True
     assert wal.read_bytes() == sentinel
+
+
+def test_restore_quiesces_concurrent_session_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.commands.storage as storage_module
+
+    database = tmp_path / "sessions.db"
+    store = SessionStore(database)
+    original = store.create_session("/original")
+    backup = backup_database(database, tmp_path / "known-good.db")
+    store.create_session("/after-backup")
+
+    replace_entered = threading.Event()
+    writer_done = threading.Event()
+    writer_started = threading.Event()
+    writer_session_id: list[str] = []
+    writer_errors: list[BaseException] = []
+    completed_before_replace: list[bool] = []
+    real_replace = storage_module.replace_anchored_open_file
+
+    def writer() -> None:
+        assert replace_entered.wait(5)
+        writer_started.set()
+        try:
+            session = store.create_session("/during-restore")
+            writer_session_id.append(session.session_id)
+        except BaseException as exc:
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    def observe_before_replace(*args, **kwargs):
+        replace_entered.set()
+        assert writer_started.wait(5)
+        completed_before_replace.append(writer_done.wait(1))
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(
+        storage_module,
+        "replace_anchored_open_file",
+        observe_before_replace,
+    )
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        restore_database(database, backup, confirmed=True)
+        thread.join(5)
+    finally:
+        replace_entered.set()
+        thread.join(5)
+
+    assert not thread.is_alive()
+    assert completed_before_replace == [False]
+    assert writer_errors == []
+    assert len(writer_session_id) == 1
+    session_ids = {
+        item.session_id for item in SessionStore(database).list_sessions(limit=10)
+    }
+    assert original.session_id in session_ids
+    assert writer_session_id[0] in session_ids
+
+
+@pytest.mark.skipif(os.name != "posix", reason="cross-process flock is POSIX-only")
+def test_restore_quiesces_cross_process_session_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.commands.storage as storage_module
+
+    database = tmp_path / "sessions.db"
+    store = SessionStore(database)
+    original = store.create_session("/original")
+    backup = backup_database(database, tmp_path / "known-good.db")
+    store.create_session("/after-backup")
+    started = tmp_path / "writer-started"
+    result = tmp_path / "writer-result"
+    child: subprocess.Popen[str] | None = None
+    completed_before_replace: list[bool] = []
+    real_replace = storage_module.replace_anchored_open_file
+
+    child_code = """
+from pathlib import Path
+import sys
+from ash.core.session import SessionStore
+
+database = Path(sys.argv[1])
+started = Path(sys.argv[2])
+result = Path(sys.argv[3])
+started.write_text("started", encoding="utf-8")
+try:
+    session = SessionStore(database).create_session("/cross-process-during-restore")
+except BaseException as exc:
+    result.write_text("error:" + repr(exc), encoding="utf-8")
+    raise
+else:
+    result.write_text("ok:" + session.session_id, encoding="utf-8")
+"""
+
+    def observe_before_replace(*args, **kwargs):
+        nonlocal child
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                child_code,
+                str(database),
+                str(started),
+                str(result),
+            ],
+            text=True,
+        )
+        deadline = time.monotonic() + 5
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert started.exists()
+        time.sleep(0.25)
+        completed_before_replace.append(result.exists())
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(
+        storage_module,
+        "replace_anchored_open_file",
+        observe_before_replace,
+    )
+    try:
+        restore_database(database, backup, confirmed=True)
+        assert child is not None
+        assert child.wait(timeout=5) == 0
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+    assert completed_before_replace == [False]
+    payload = result.read_text(encoding="utf-8")
+    assert payload.startswith("ok:")
+    child_session_id = payload.removeprefix("ok:")
+    session_ids = {
+        item.session_id for item in SessionStore(database).list_sessions(limit=10)
+    }
+    assert original.session_id in session_ids
+    assert child_session_id in session_ids
 
 
 def test_backup_rejects_symlinked_destination(tmp_path: Path) -> None:
