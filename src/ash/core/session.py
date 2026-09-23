@@ -35,7 +35,7 @@ AuditAction = Literal[
     "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 13
+CURRENT_SCHEMA_VERSION = 14
 
 
 class SessionStorageError(RuntimeError):
@@ -262,6 +262,37 @@ def _validate_fork_boundary(messages: list[Message], count: int) -> None:
         raise ValueError("message_count splits an assistant/tool-call pair")
 
 
+def _validate_imported_provider_message(message: Message) -> None:
+    """Reject imported transcripts that cannot be replayed to providers safely."""
+
+    from ash.providers.messages import CanonicalMessage
+
+    content: Any = message.content
+    content_blocks = message.metadata.get("content_blocks")
+    if message.role == "user" and isinstance(content_blocks, list):
+        content = content_blocks
+    else:
+        image_blocks = message.metadata.get("image_blocks")
+        if message.role == "user" and isinstance(image_blocks, list):
+            content = [
+                {"type": "text", "text": message.content},
+                *image_blocks,
+            ]
+
+    payload: dict[str, Any] = {
+        "role": message.role,
+        "content": content,
+    }
+    if message.role == "assistant" and "tool_calls" in message.metadata:
+        payload["tool_calls"] = message.metadata["tool_calls"]
+    if message.role == "tool" and message.metadata.get("call_id"):
+        payload["tool_call_id"] = message.metadata["call_id"]
+    try:
+        CanonicalMessage.model_validate(payload)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("imported message is not a valid provider message") from exc
+
+
 def _normalize_branch_metadata(name: str, summary: str) -> tuple[str, str]:
     from ash.core.redaction import redact_text
 
@@ -426,6 +457,8 @@ class SessionStore:
                 self._migrate_v12(conn)
             if from_version < 13:
                 self._migrate_v13(conn)
+            if from_version < 14:
+                self._migrate_v14(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -767,6 +800,80 @@ class SessionStore:
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
             "VALUES (?, ?)",
             (13, _serialize_datetime(_utc_now())),
+        )
+
+    def _migrate_v14(self, conn: sqlite3.Connection) -> None:
+        """Scope durable tool-call and runtime-event identities to sessions."""
+
+        conn.executescript(
+            """
+            CREATE TABLE tool_calls_v14 (
+                call_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                approved INTEGER CHECK(approved IN (0, 1)) DEFAULT 0,
+                executed INTEGER CHECK(executed IN (0, 1)) DEFAULT 0,
+                dispatched INTEGER CHECK(dispatched IN (0, 1)) DEFAULT 0,
+                result TEXT,
+                error TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                turn_id TEXT,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+                PRIMARY KEY(session_id, call_id)
+            );
+
+            INSERT INTO tool_calls_v14 (
+                call_id, session_id, tool_name, arguments_json, approved,
+                executed, dispatched, result, error, timestamp, turn_id
+            )
+            SELECT call_id, session_id, tool_name, arguments_json, approved,
+                   executed, dispatched, result, error, timestamp, turn_id
+            FROM tool_calls;
+
+            DROP TABLE tool_calls;
+            ALTER TABLE tool_calls_v14 RENAME TO tool_calls;
+
+            CREATE INDEX idx_tool_calls_session
+                ON tool_calls(session_id);
+            CREATE INDEX idx_tool_calls_session_turn
+                ON tool_calls(session_id, turn_id);
+
+            CREATE TABLE runtime_events_v14 (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT,
+                operation_id TEXT,
+                event_type TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
+                event_json TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+                UNIQUE(session_id, event_id)
+            );
+
+            INSERT INTO runtime_events_v14 (
+                sequence, event_id, session_id, turn_id, operation_id,
+                event_type, schema_version, timestamp, event_json
+            )
+            SELECT sequence, event_id, session_id, turn_id, operation_id,
+                   event_type, schema_version, timestamp, event_json
+            FROM runtime_events ORDER BY sequence;
+
+            DROP TABLE runtime_events;
+            ALTER TABLE runtime_events_v14 RENAME TO runtime_events;
+
+            CREATE INDEX idx_runtime_events_session_sequence
+                ON runtime_events(session_id, sequence);
+            CREATE INDEX idx_runtime_events_turn_sequence
+                ON runtime_events(session_id, turn_id, sequence);
+            """
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (14, _serialize_datetime(_utc_now())),
         )
 
     def backup(
@@ -2236,37 +2343,58 @@ class SessionStore:
         if not records or not isinstance(records[0], dict):
             raise ValueError("session JSONL is empty")
         header = records[0]
-        if header.get("schema_version") != 1 or header.get("type") != "session":
+        if (
+            type(header.get("schema_version")) is not int
+            or header.get("schema_version") != 1
+            or header.get("type") != "session"
+        ):
             raise ValueError("unsupported session export schema")
-        title = str(header.get("title", "")).strip()
+        raw_title = header.get("title", "")
+        raw_model = header.get("model", "")
+        if not isinstance(raw_title, str):
+            raise ValueError("imported session title must be a string")
+        if not isinstance(raw_model, str):
+            raise ValueError("imported session model must be a string")
+        title = raw_title.strip()
         imported_messages: list[Message] = []
         for record in records[1:]:
             if not isinstance(record, dict) or record.get("type") != "message":
                 raise ValueError("session export contains an invalid record")
+            if (
+                type(record.get("schema_version")) is not int
+                or record.get("schema_version") != 1
+            ):
+                raise ValueError("unsupported imported message schema")
             role = record.get("role")
             if role not in {"system", "user", "assistant", "tool"}:
                 raise ValueError(f"invalid imported message role: {role!r}")
+            message_content = record.get("content")
+            if not isinstance(message_content, str):
+                raise ValueError("imported message content must be a string")
+            raw_timestamp = record.get("timestamp")
+            if not isinstance(raw_timestamp, str):
+                raise ValueError("imported message timestamp must be a string")
             try:
-                timestamp = _deserialize_datetime(str(record["timestamp"]))
-            except (KeyError, ValueError) as exc:
+                timestamp = _deserialize_datetime(raw_timestamp)
+            except ValueError as exc:
                 raise ValueError("imported message has an invalid timestamp") from exc
             metadata = record.get("metadata", {})
             if not isinstance(metadata, dict):
                 raise ValueError("imported message metadata must be an object")
-            imported_messages.append(
-                Message(
-                    role=role,
-                    content=str(record.get("content", "")),
-                    timestamp=timestamp,
-                    metadata=metadata,
-                )
+            message = Message(
+                role=role,
+                content=message_content,
+                timestamp=timestamp,
+                metadata=metadata,
             )
+            _validate_imported_provider_message(message)
+            imported_messages.append(message)
 
         with closing(get_db_connection(self.db_path)) as conn, conn:
             session = self._create_session_record(
                 conn,
                 project_path,
-                model=str(header.get("model", "")),
+                model=raw_model,
             )
             if title:
                 conn.execute(
@@ -2366,8 +2494,7 @@ class SessionStore:
                     turn_id
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(call_id) DO UPDATE SET
-                    session_id = excluded.session_id,
+                ON CONFLICT(session_id, call_id) DO UPDATE SET
                     tool_name = excluded.tool_name,
                     arguments_json = excluded.arguments_json,
                     approved = excluded.approved,

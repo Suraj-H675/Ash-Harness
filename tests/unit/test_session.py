@@ -61,7 +61,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
     with get_db_connection(db_path) as conn:
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 13
+            == 14
         )
         assert "mcp_tasks" in table_names
         assert {
@@ -255,11 +255,11 @@ def test_v12_migration_adds_mcp_task_table_with_backup(tmp_path: Path) -> None:
 
     SessionStore(db_path)
 
-    assert len(list(tmp_path.glob("v11.db.before-v13-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v11.db.before-v14-migration.*.backup"))) == 1
     with get_db_connection(db_path) as conn:
         assert conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 13
+        ).fetchone()[0] == 14
         assert conn.execute(
             "SELECT COUNT(*) FROM sqlite_master "
             "WHERE type = 'table' AND name = 'mcp_tasks'"
@@ -301,7 +301,7 @@ def test_v13_migration_binds_existing_mcp_task_table_to_server_identity(
 
     SessionStore(db_path)
 
-    assert len(list(tmp_path.glob("v12.db.before-v13-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v12.db.before-v14-migration.*.backup"))) == 1
     with get_db_connection(db_path) as conn:
         columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(mcp_tasks)")
@@ -309,7 +309,137 @@ def test_v13_migration_binds_existing_mcp_task_table_to_server_identity(
         assert "server_fingerprint" in columns
         assert conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 13
+        ).fetchone()[0] == 14
+
+
+def test_v14_migration_scopes_tool_call_and_event_ids_to_sessions(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "v13.db"
+    store = SessionStore(db_path)
+    first = store.create_session(project_path="/workspace/first")
+    second = store.create_session(project_path="/workspace/second")
+    with get_db_connection(db_path) as conn, conn:
+        conn.execute("DROP TABLE tool_calls")
+        conn.execute("DROP TABLE runtime_events")
+        conn.executescript(
+            """
+            CREATE TABLE tool_calls (
+                call_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                approved INTEGER CHECK(approved IN (0, 1)) DEFAULT 0,
+                executed INTEGER CHECK(executed IN (0, 1)) DEFAULT 0,
+                dispatched INTEGER CHECK(dispatched IN (0, 1)) DEFAULT 0,
+                result TEXT,
+                error TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                turn_id TEXT,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+            );
+            CREATE TABLE runtime_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL,
+                turn_id TEXT,
+                operation_id TEXT,
+                event_type TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
+                event_json TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO tool_calls (
+                call_id, session_id, tool_name, arguments_json, approved,
+                executed, dispatched, timestamp, turn_id
+            ) VALUES (?, ?, ?, ?, 1, 0, 1, ?, ?)
+            """,
+            (
+                "shared-call-id",
+                first.session_id,
+                "write_file",
+                '{"path":"first.txt"}',
+                "2026-06-02T11:00:00+00:00",
+                "turn-first",
+            ),
+        )
+        first_event = {
+            "schema_version": 1,
+            "event_id": "shared-event-id",
+            "timestamp": "2026-07-10T00:00:00+00:00",
+            "source": {"type": "runtime", "id": "ash"},
+            "session_id": first.session_id,
+            "turn_id": "turn-first",
+            "operation_id": None,
+            "parent_event_id": None,
+            "type": "turn.started",
+        }
+        conn.execute(
+            """
+            INSERT INTO runtime_events (
+                event_id, session_id, turn_id, operation_id, event_type,
+                schema_version, timestamp, event_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "shared-event-id",
+                first.session_id,
+                "turn-first",
+                None,
+                "turn.started",
+                1,
+                "2026-07-10T00:00:00+00:00",
+                json.dumps(first_event, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 14")
+
+    migrated = SessionStore(db_path)
+
+    assert len(list(tmp_path.glob("v13.db.before-v14-migration.*.backup"))) == 1
+    with get_db_connection(db_path) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 14
+    assert migrated.load_session(first.session_id).tool_calls[0].call_id == (
+        "shared-call-id"
+    )
+    assert migrated.list_runtime_events(first.session_id)[0].event["event_id"] == (
+        "shared-event-id"
+    )
+
+    migrated.save_tool_call(
+        second.session_id,
+        ToolCallRecord(
+            call_id="shared-call-id",
+            tool_name="read_file",
+            arguments={"file_path": "second.txt"},
+            approved=False,
+            executed=False,
+            timestamp=datetime(2026, 6, 2, 11, 1, tzinfo=timezone.utc),
+        ),
+        turn_id="turn-second",
+    )
+    assert migrated.save_runtime_events(
+        [
+            {
+                **first_event,
+                "session_id": second.session_id,
+                "turn_id": "turn-second",
+                "type": "turn.completed",
+            }
+        ]
+    ) == 1
+    assert migrated.load_session(first.session_id).tool_calls[0].tool_name == "write_file"
+    assert migrated.load_session(second.session_id).tool_calls[0].tool_name == "read_file"
+    assert [
+        item.event["type"] for item in migrated.list_runtime_events(second.session_id)
+    ] == ["turn.completed"]
 
 
 def test_session_store_rejects_linked_database_file_and_parent(tmp_path: Path) -> None:
@@ -362,7 +492,7 @@ def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     store = SessionStore(db_path)
 
     assert store.load_session("legacy").session_id == "legacy"
-    backups = list(tmp_path.glob("legacy.db.before-v13-migration.*.backup"))
+    backups = list(tmp_path.glob("legacy.db.before-v14-migration.*.backup"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as conn:
         assert conn.execute("SELECT session_id FROM sessions").fetchone()[0] == "legacy"
@@ -420,7 +550,7 @@ def test_v7_migration_preserves_checkpoints_and_adds_call_granularity(
         call_id="call-2",
     )
     assert len(migrated.file_checkpoints_for_turns(session.session_id, ["turn-1"])) == 2
-    assert len(list(tmp_path.glob("v6.db.before-v13-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v6.db.before-v14-migration.*.backup"))) == 1
 
 
 def test_session_forks_form_a_durable_redacted_tree(tmp_path: Path) -> None:
@@ -705,6 +835,40 @@ def test_runtime_event_log_is_ordered_idempotent_and_redacted(tmp_path: Path) ->
     assert "REDACTED" in remainder[0].event["output"]
 
 
+def test_runtime_event_ids_are_scoped_per_session(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "events.db")
+    first = store.create_session(str(tmp_path / "first"))
+    second = store.create_session(str(tmp_path / "second"))
+
+    def event(session_id: str, event_type: str) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "event_id": "shared-event-id",
+            "timestamp": "2026-07-10T00:00:00+00:00",
+            "source": {"type": "runtime", "id": "ash"},
+            "session_id": session_id,
+            "turn_id": "turn-1",
+            "operation_id": None,
+            "parent_event_id": None,
+            "type": event_type,
+        }
+
+    first_event = event(first.session_id, "turn.started")
+    second_event = event(second.session_id, "turn.completed")
+
+    assert store.save_runtime_events([first_event]) == 1
+    assert store.save_runtime_events([second_event]) == 1
+    assert store.save_runtime_events([first_event]) == 0
+    assert store.save_runtime_events([second_event]) == 0
+
+    assert [item.event["type"] for item in store.list_runtime_events(first.session_id)] == [
+        "turn.started"
+    ]
+    assert [item.event["type"] for item in store.list_runtime_events(second.session_id)] == [
+        "turn.completed"
+    ]
+
+
 def test_runtime_event_replay_validates_cursor_and_limit(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "events.db")
 
@@ -847,6 +1011,53 @@ def test_tool_call_storage_inserts_and_updates_records(tmp_path: Path) -> None:
     loaded = store.load_session(session.session_id)
 
     assert loaded.tool_calls == [updated]
+
+
+def test_tool_call_ids_are_scoped_per_session(tmp_path: Path) -> None:
+    db_path = tmp_path / "session_store.db"
+    store = SessionStore(db_path)
+    first = store.create_session(project_path="/workspace/first")
+    second = store.create_session(project_path="/workspace/second")
+    first_record = ToolCallRecord(
+        call_id="shared-call-id",
+        tool_name="write_file",
+        arguments={"path": "first.txt"},
+        approved=True,
+        executed=False,
+        dispatched=True,
+        timestamp=datetime(2026, 6, 2, 11, 0, tzinfo=timezone.utc),
+    )
+    second_record = ToolCallRecord(
+        call_id="shared-call-id",
+        tool_name="read_file",
+        arguments={"file_path": "second.txt"},
+        approved=False,
+        executed=False,
+        dispatched=False,
+        timestamp=datetime(2026, 6, 2, 11, 1, tzinfo=timezone.utc),
+    )
+
+    store.save_tool_call(first.session_id, first_record, turn_id="turn-first")
+    store.save_tool_call(second.session_id, second_record, turn_id="turn-second")
+
+    assert store.load_session(first.session_id).tool_calls == [first_record]
+    assert store.load_session(second.session_id).tool_calls == [second_record]
+    assert (
+        store.tool_call_for_recovery(
+            first.session_id,
+            "turn-first",
+            "shared-call-id",
+        )["tool_name"]
+        == "write_file"
+    )
+    assert (
+        store.tool_call_for_recovery(
+            second.session_id,
+            "turn-second",
+            "shared-call-id",
+        )["tool_name"]
+        == "read_file"
+    )
 
 
 def test_audit_log_hash_chain_detects_tampering(tmp_path: Path) -> None:
