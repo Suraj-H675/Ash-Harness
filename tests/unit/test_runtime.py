@@ -1,12 +1,14 @@
 import asyncio
+import hashlib
 import io
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from ash.context.instructions import MAX_INSTRUCTION_FILE_BYTES
-from ash.runtime import build_runtime, build_tools
+from ash.runtime import _memory_persist_directory, build_runtime, build_tools
 from ash.context.turn import TurnContext
 from ash.config import AshConfig
 from ash.mcp.server import MCPServerConfig
@@ -704,6 +706,237 @@ def test_runtime_anchors_relative_memory_storage_to_workspace(tmp_path, monkeypa
         assert not (launcher / ".ash" / "memory-fts5.db").exists()
     finally:
         asyncio.run(runtime.loop.aclose())
+
+
+def test_runtime_namespaces_absolute_memory_storage_per_workspace(tmp_path) -> None:
+    shared = tmp_path / "shared" / "chroma"
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+
+    config_a = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace_a,
+        db_directory=tmp_path / "db-a",
+        memory_backend="fts5",
+        chroma_persist_dir=shared,
+        repo_map_enabled=False,
+    )
+    config_b = config_a.model_copy(
+        update={
+            "workspace_root": workspace_b,
+            "db_directory": tmp_path / "db-b",
+        }
+    )
+
+    resolved_a = _memory_persist_directory(config_a)
+    resolved_b = _memory_persist_directory(config_b)
+    digest_a = hashlib.sha256(
+        os.fsencode(os.path.normcase(str(workspace_a.resolve())))
+    ).hexdigest()
+    digest_b = hashlib.sha256(
+        os.fsencode(os.path.normcase(str(workspace_b.resolve())))
+    ).hexdigest()
+
+    assert resolved_a == shared.parent / ".ash-workspaces" / f"v1-{digest_a}" / "chroma"
+    assert resolved_b == shared.parent / ".ash-workspaces" / f"v1-{digest_b}" / "chroma"
+    assert resolved_a != resolved_b
+    assert str(workspace_a.resolve()) not in str(resolved_a)
+    assert str(workspace_b.resolve()) not in str(resolved_b)
+
+    runtime_a = build_runtime(
+        config_a,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+    runtime_b = build_runtime(
+        config_b,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+    try:
+        lexical_a = runtime_a.loop._vector_pipeline.lexical_index
+        lexical_b = runtime_b.loop._vector_pipeline.lexical_index
+        assert lexical_a is not None
+        assert lexical_b is not None
+        assert Path(lexical_a._index.db_path) == resolved_a.parent / "memory-fts5.db"
+        assert Path(lexical_b._index.db_path) == resolved_b.parent / "memory-fts5.db"
+        assert lexical_a._index.db_path != lexical_b._index.db_path
+    finally:
+        asyncio.run(runtime_a.loop.aclose())
+        asyncio.run(runtime_b.loop.aclose())
+
+
+def test_runtime_normalizes_absolute_memory_parent_segments(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    configured = tmp_path / "shared" / "chroma" / ".."
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="fts5",
+        chroma_persist_dir=configured,
+        repo_map_enabled=False,
+    )
+
+    resolved = _memory_persist_directory(config)
+    digest = hashlib.sha256(
+        os.fsencode(os.path.normcase(str(workspace.resolve())))
+    ).hexdigest()
+    expected = tmp_path / ".ash-workspaces" / f"v1-{digest}" / "shared"
+    assert resolved == expected
+
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+    try:
+        lexical = runtime.loop._vector_pipeline.lexical_index
+        assert lexical is not None
+        assert Path(lexical._index.db_path) == expected.parent / "memory-fts5.db"
+    finally:
+        asyncio.run(runtime.loop.aclose())
+
+
+def test_runtime_rejects_memory_paths_that_escape_or_collapse_to_root(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    relative_escape = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db-relative",
+        chroma_persist_dir=Path("../shared/chroma"),
+        repo_map_enabled=False,
+    )
+    root_target = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db-root",
+        chroma_persist_dir=Path(workspace.anchor),
+        repo_map_enabled=False,
+    )
+
+    with pytest.raises(ValueError, match="escapes the workspace"):
+        _memory_persist_directory(relative_escape)
+    with pytest.raises(ValueError, match="below the filesystem root"):
+        _memory_persist_directory(root_target)
+
+
+def test_runtime_rejects_relative_memory_symlink_escape(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    alias = workspace / "alias"
+    try:
+        alias.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        chroma_persist_dir=Path("alias/deep/chroma"),
+        repo_map_enabled=False,
+    )
+
+    with pytest.raises(ValueError, match="escapes the workspace"):
+        _memory_persist_directory(config)
+    assert not (outside / "deep" / "chroma").exists()
+
+
+def test_runtime_rejects_absolute_memory_symlink_ancestor(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    linked = tmp_path / "linked"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        chroma_persist_dir=linked / "deep" / "chroma",
+        repo_map_enabled=False,
+    )
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        _memory_persist_directory(config)
+    assert not (outside / "deep" / ".ash-workspaces").exists()
+
+
+def test_absolute_memory_store_isolates_same_named_workspace_documents(tmp_path) -> None:
+    shared = tmp_path / "shared" / "chroma"
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    file_a = workspace_a / "same.py"
+    file_b = workspace_b / "same.py"
+    file_a.write_text("workspace_alpha_memory_marker\n", encoding="utf-8")
+    file_b.write_text("workspace_beta_memory_marker\n", encoding="utf-8")
+
+    def config(workspace: Path, db_name: str) -> AshConfig:
+        return AshConfig(
+            model="ollama/runtime-model",
+            workspace_root=workspace,
+            db_directory=tmp_path / db_name,
+            memory_backend="fts5",
+            chroma_persist_dir=shared,
+            repo_map_enabled=False,
+        )
+
+    runtime_a = build_runtime(
+        config(workspace_a, "db-a"),
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+    runtime_b = build_runtime(
+        config(workspace_b, "db-b"),
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+
+    async def exercise() -> None:
+        try:
+            assert await runtime_a.loop.index_project_memory(max_files=10) == 1
+            assert await runtime_b.loop.index_project_memory(max_files=10) == 1
+
+            alpha_a = await runtime_a.loop.semantic_search("workspace_alpha_memory_marker")
+            alpha_b = await runtime_b.loop.semantic_search("workspace_alpha_memory_marker")
+            beta_a = await runtime_a.loop.semantic_search("workspace_beta_memory_marker")
+            beta_b = await runtime_b.loop.semantic_search("workspace_beta_memory_marker")
+            assert alpha_a and alpha_a[0].file_path == "same.py"
+            assert alpha_b == []
+            assert beta_a == []
+            assert beta_b and beta_b[0].file_path == "same.py"
+
+            file_a.unlink()
+            assert await runtime_a.loop.index_project_memory(max_files=10) == 0
+            assert await runtime_b.loop.semantic_search("workspace_beta_memory_marker")
+        finally:
+            await runtime_a.loop.aclose()
+            await runtime_b.loop.aclose()
+
+    asyncio.run(exercise())
 
 
 def test_runtime_defers_auto_memory_index_until_async_session_start(tmp_path) -> None:

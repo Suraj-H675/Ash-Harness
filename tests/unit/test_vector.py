@@ -306,6 +306,85 @@ def test_chroma_delete_document_uses_file_path_metadata_filter(tmp_path: Path) -
     ]
 
 
+def test_chroma_failed_replacement_keeps_existing_document(tmp_path: Path) -> None:
+    class FakeCollection:
+        def __init__(self) -> None:
+            self.delete_calls = []
+
+        def get(self, **_kwargs):
+            return {"ids": ["old:1"]}
+
+        def upsert(self, **_kwargs):
+            raise RuntimeError("simulated Chroma upsert failure")
+
+        def delete(self, **kwargs):
+            self.delete_calls.append(kwargs)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.collection = FakeCollection()
+
+        def get_or_create_collection(self, _name):
+            return self.collection
+
+    client = FakeClient()
+    index = ChromaIndex(tmp_path / "unused", client=client)
+
+    with pytest.raises(RuntimeError, match="simulated Chroma upsert failure"):
+        index.replace_document(
+            "a.py",
+            ids=["new:1"],
+            embeddings=[[1.0, 0.0]],
+            documents=["new content"],
+            metadatas=[{"file_path": "a.py", "chunk_key": "new:1"}],
+        )
+
+    assert client.collection.delete_calls == []
+
+
+def test_chroma_replacement_deletes_only_stale_ids_after_upsert(tmp_path: Path) -> None:
+    class FakeCollection:
+        def __init__(self) -> None:
+            self.events = []
+
+        def get(self, **_kwargs):
+            return {"ids": ["keep:1", "stale:2"]}
+
+        def upsert(self, **kwargs):
+            self.events.append(("upsert", kwargs["ids"]))
+
+        def delete(self, **kwargs):
+            self.events.append(("delete", kwargs))
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.collection = FakeCollection()
+
+        def get_or_create_collection(self, _name):
+            return self.collection
+
+    client = FakeClient()
+    index = ChromaIndex(tmp_path / "unused", client=client)
+
+    assert (
+        index.replace_document(
+            "a.py",
+            ids=["keep:1", "new:3"],
+            embeddings=[[1.0, 0.0], [0.0, 1.0]],
+            documents=["kept", "new"],
+            metadatas=[
+                {"file_path": "a.py", "chunk_key": "keep:1"},
+                {"file_path": "a.py", "chunk_key": "new:3"},
+            ],
+        )
+        == 2
+    )
+    assert client.collection.events == [
+        ("upsert", ["keep:1", "new:3"]),
+        ("delete", {"ids": ["stale:2"]}),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # FTS5 fallback
 # ---------------------------------------------------------------------------

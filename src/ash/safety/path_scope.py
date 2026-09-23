@@ -4,6 +4,37 @@ import os
 from pathlib import Path
 
 
+def _windows_path_is_reparse(path: Path) -> bool:
+    """Return whether ``path`` is a Windows reparse point on supported Pythons."""
+
+    if os.name != "nt":
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    win_dll = getattr(ctypes, "WinDLL")
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    get_attributes = kernel32.GetFileAttributesW
+    get_attributes.argtypes = [wintypes.LPCWSTR]
+    get_attributes.restype = wintypes.DWORD
+    invalid = 0xFFFFFFFF
+    reparse = 0x00000400
+    attributes = int(get_attributes(str(path)))
+    return attributes != invalid and bool(attributes & reparse)
+
+
+def _path_is_linklike(path: Path) -> bool:
+    """Detect symlinks/junctions, including Python 3.11 Windows junctions."""
+
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction) and is_junction():
+        return True
+    return _windows_path_is_reparse(path)
+
+
 def normalize_project_root(project_root: str | Path) -> Path:
     """Return the canonical project root path."""
 
@@ -49,11 +80,10 @@ def path_has_link_component(path: Path, project_root: Path) -> Path | None:
     for part in relative.parts:
         current = current / part
         try:
-            is_link = current.is_symlink()
-            is_junction = hasattr(current, "is_junction") and current.is_junction()
+            is_linklike = _path_is_linklike(current)
         except OSError:
             continue
-        if is_link or is_junction:
+        if is_linklike:
             return current
     return None
 

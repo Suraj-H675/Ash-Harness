@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.path_scope import path_has_link_component
 
 
 def test_validate_path_allows_paths_inside_project_root(tmp_path: Path) -> None:
@@ -69,6 +70,27 @@ def test_validate_mutation_path_rejects_in_scope_symlink(tmp_path: Path) -> None
     assert guard.validate_path("linked/file.txt") == target / "file.txt"
     with pytest.raises(SafetyViolation, match="symlink or junction"):
         guard.validate_mutation_path("linked/file.txt")
+
+
+def test_path_scope_uses_windows_reparse_fallback_for_junctions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.safety.path_scope as path_scope
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    junction = project_root / "junction"
+    junction.mkdir()
+    target = junction / "nested" / "file.txt"
+
+    monkeypatch.setattr(
+        path_scope,
+        "_windows_path_is_reparse",
+        lambda path: path == junction,
+    )
+
+    assert path_has_link_component(target, project_root) == junction
 
 
 def test_validate_mutation_path_allows_new_nested_path(tmp_path: Path) -> None:

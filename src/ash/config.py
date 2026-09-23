@@ -848,7 +848,10 @@ class AshConfig(BaseSettings):
     )
     chroma_persist_dir: Path = Field(
         Path(".ash/chroma"),
-        description="Directory for ChromaDB persistent storage",
+        description=(
+            "Directory for semantic-memory persistence. Relative paths are anchored "
+            "to the workspace; absolute paths use a per-workspace namespace."
+        ),
     )
     embedding_provider: str = Field(
         "auto",

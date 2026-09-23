@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
@@ -28,6 +30,7 @@ from ash.plugins.lifecycle import load_extension_state
 from ash.plugins.registry import DiscoveredPlugin, PluginCatalog
 from ash.providers.base import ProviderABC
 from ash.providers.registry import get_provider_registry
+from ash.safe_io import validate_unlinked_path
 from ash.safety.grants import (
     PermissionRule,
     load_managed_permission_rules,
@@ -360,9 +363,33 @@ def _memory_persist_directory(config: AshConfig) -> Path:
     """Anchor relative semantic-memory persistence to the selected workspace."""
 
     path = config.chroma_persist_dir.expanduser()
-    if path.is_absolute():
-        return path
-    return config.workspace_root.expanduser().resolve() / path
+    workspace = config.workspace_root.expanduser().resolve()
+    if not path.is_absolute():
+        target = Path(os.path.abspath(workspace / path)).resolve(strict=False)
+        try:
+            target.relative_to(workspace)
+        except ValueError as exc:
+            raise ValueError(
+                "relative semantic-memory persistence path escapes the workspace"
+            ) from exc
+        return target
+
+    path = Path(os.path.abspath(path))
+    if path.parent == path or not path.name:
+        raise ValueError(
+            "absolute semantic-memory persistence path must name a directory "
+            "below the filesystem root"
+        )
+    path = validate_unlinked_path(
+        path,
+        trusted_root=Path(path.anchor),
+        label="semantic-memory persistence path",
+    )
+    identity = hashlib.sha256(
+        os.fsencode(os.path.normcase(str(workspace)))
+    ).hexdigest()
+    namespace = path.parent / ".ash-workspaces" / f"v1-{identity}"
+    return namespace / path.name
 
 
 def build_runtime(

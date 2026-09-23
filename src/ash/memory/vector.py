@@ -336,6 +336,21 @@ class VectorIndex(ABC):
 
         raise NotImplementedError
 
+    def replace_document(
+        self,
+        file_path: str,
+        ids: Sequence[str],
+        embeddings: Sequence[Sequence[float]],
+        documents: Sequence[str],
+        metadatas: Sequence[dict[str, Any]] | None = None,
+    ) -> int:
+        """Replace one document, returning the number of previous records."""
+
+        deleted = self.delete_document(file_path)
+        if ids:
+            self.add(ids, embeddings, documents, metadatas)
+        return deleted
+
     @abstractmethod
     def query(
         self,
@@ -402,6 +417,48 @@ class InMemoryVectorIndex(VectorIndex):
                     break
             else:
                 self._records.append(record)
+
+    def replace_document(
+        self,
+        file_path: str,
+        ids: Sequence[str],
+        embeddings: Sequence[Sequence[float]],
+        documents: Sequence[str],
+        metadatas: Sequence[dict[str, Any]] | None = None,
+    ) -> int:
+        if not (len(ids) == len(embeddings) == len(documents)):
+            raise ValueError("ids, embeddings, and documents must be the same length")
+        meta_list = list(metadatas) if metadatas is not None else [{} for _ in ids]
+        if len(meta_list) != len(ids):
+            raise ValueError("metadatas must match ids length")
+
+        replacement: list[dict[str, Any]] = []
+        for chunk_id, emb, doc, meta in zip(
+            ids, embeddings, documents, meta_list, strict=True
+        ):
+            replacement.append(
+                {
+                    "id": chunk_id,
+                    "embedding": [float(x) for x in emb],
+                    "document": doc,
+                    "metadata": dict(meta),
+                }
+            )
+
+        replacement_ids = {record["id"] for record in replacement}
+        previous = [
+            record
+            for record in self._records
+            if str(record.get("metadata", {}).get("file_path", "")) == file_path
+        ]
+        self._records = [
+            record
+            for record in self._records
+            if str(record.get("metadata", {}).get("file_path", "")) != file_path
+            and record.get("id") not in replacement_ids
+        ]
+        self._records.extend(replacement)
+        return len(previous)
 
     def query(
         self,
@@ -524,6 +581,32 @@ class ChromaIndex(VectorIndex):
             documents=list(documents),
             metadatas=clean_meta,
         )
+
+    def replace_document(
+        self,
+        file_path: str,
+        ids: Sequence[str],
+        embeddings: Sequence[Sequence[float]],
+        documents: Sequence[str],
+        metadatas: Sequence[dict[str, Any]] | None = None,
+    ) -> int:
+        """Publish replacements before deleting stale Chroma records."""
+
+        self._ensure_ready()
+        existing = self._collection.get(where={"file_path": file_path}, include=[])
+        existing_ids = [str(value) for value in (existing.get("ids") or [])]
+        if ids:
+            self.add(ids, embeddings, documents, metadatas)
+        else:
+            if existing_ids:
+                self._collection.delete(where={"file_path": file_path})
+            return len(existing_ids)
+
+        replacement_ids = {str(value) for value in ids}
+        stale_ids = [value for value in existing_ids if value not in replacement_ids]
+        if stale_ids:
+            self._collection.delete(ids=stale_ids)
+        return len(existing_ids)
 
     def query(
         self,
@@ -770,35 +853,31 @@ class VectorSearchPipeline:
             if not self._vector_enabled:
                 continue
 
-            for _, file_path in batch:
-                self._vector_index.delete_document(file_path)
-            if not batch_chunks:
-                continue
-
-            ids: list[str] = []
-            metadatas: list[dict[str, Any]] = []
-            file_paths_for_chunks = [
-                file_path for chunks, file_path in batch for _ in chunks
-            ]
-            for chunk, file_path in zip(
-                batch_chunks, file_paths_for_chunks, strict=True
-            ):
-                chunk_key = chunk.chunk_key
-                ids.append(chunk_key)
-                metadatas.append(
+            embedding_offset = 0
+            for chunks, file_path in batch:
+                chunk_count = len(chunks)
+                chunk_embeddings = embeddings[
+                    embedding_offset : embedding_offset + chunk_count
+                ]
+                embedding_offset += chunk_count
+                ids = [chunk.chunk_key for chunk in chunks]
+                chunk_texts = [chunk.content for chunk in chunks]
+                metadatas = [
                     {
-                        "chunk_key": chunk_key,
+                        "chunk_key": chunk.chunk_key,
                         "file_path": file_path,
                         "start_line": chunk.start_line,
                         "end_line": chunk.end_line,
                     }
+                    for chunk in chunks
+                ]
+                self._vector_index.replace_document(
+                    file_path=file_path,
+                    ids=ids,
+                    embeddings=chunk_embeddings,
+                    documents=chunk_texts,
+                    metadatas=metadatas,
                 )
-            self._vector_index.add(
-                ids=ids,
-                embeddings=embeddings,
-                documents=texts,
-                metadatas=metadatas,
-            )
         return indexed_chunks
 
     def delete_document(self, file_path: str) -> int:
