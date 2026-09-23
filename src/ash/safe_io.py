@@ -162,7 +162,12 @@ def open_unlinked_regular_file(
     descriptor = -1
     try:
         parent_descriptor = _open_parent_directory(target)
-        flags = os.O_RDONLY | _close_on_exec_flag() | _nofollow_flag()
+        flags = (
+            os.O_RDONLY
+            | int(getattr(os, "O_BINARY", 0))
+            | _close_on_exec_flag()
+            | _nofollow_flag()
+        )
         if parent_descriptor >= 0:
             descriptor = os.open(target.name, flags, dir_fd=parent_descriptor)
         else:

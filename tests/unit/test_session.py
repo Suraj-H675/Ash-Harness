@@ -1,6 +1,12 @@
 import asyncio
 import json
+import os
 import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -249,7 +255,7 @@ def test_mcp_task_ids_are_namespaced_by_server_and_cannot_be_reassigned(
 def test_v12_migration_adds_mcp_task_table_with_backup(tmp_path: Path) -> None:
     db_path = tmp_path / "v11.db"
     SessionStore(db_path)
-    with get_db_connection(db_path) as conn, conn:
+    with closing(get_db_connection(db_path)) as conn, conn:
         conn.execute("DROP TABLE mcp_tasks")
         conn.execute("DELETE FROM schema_migrations WHERE version >= 12")
 
@@ -274,7 +280,7 @@ def test_v13_migration_binds_existing_mcp_task_table_to_server_identity(
 ) -> None:
     db_path = tmp_path / "v12.db"
     SessionStore(db_path)
-    with get_db_connection(db_path) as conn, conn:
+    with closing(get_db_connection(db_path)) as conn, conn:
         conn.execute("DROP TABLE mcp_tasks")
         conn.executescript(
             """
@@ -319,7 +325,7 @@ def test_v14_migration_scopes_tool_call_and_event_ids_to_sessions(
     store = SessionStore(db_path)
     first = store.create_session(project_path="/workspace/first")
     second = store.create_session(project_path="/workspace/second")
-    with get_db_connection(db_path) as conn, conn:
+    with closing(get_db_connection(db_path)) as conn, conn:
         conn.execute("DROP TABLE tool_calls")
         conn.execute("DROP TABLE runtime_events")
         conn.executescript(
@@ -504,7 +510,7 @@ def test_v7_migration_preserves_checkpoints_and_adds_call_granularity(
     db_path = tmp_path / "v6.db"
     store = SessionStore(db_path)
     session = store.create_session(str(tmp_path))
-    with get_db_connection(db_path) as conn, conn:
+    with closing(get_db_connection(db_path)) as conn, conn:
         conn.execute("DROP INDEX IF EXISTS idx_file_checkpoints_call")
         conn.execute("DROP TABLE file_checkpoints")
         conn.executescript(
@@ -971,28 +977,71 @@ def test_manual_backup_does_not_follow_source_swapped_to_symlink(
     replacement_store = SessionStore(replacement)
     replacement_session = replacement_store.create_session("/replacement")
     destination = tmp_path / "manual.backup"
-    real_connect = sqlite3.connect
+    real_open = session_module.open_unlinked_regular_file
     swapped = False
 
-    def swap_source_before_connect(database, *args, **kwargs):
+    @contextmanager
+    def swap_source_before_open(path, *, label):
         nonlocal swapped
-        database_text = str(database)
-        if (
-            not swapped
-            and (
-                Path(database_text) == source
-                or database_text.startswith("file:/dev/fd/")
-            )
-        ):
+        if not swapped and label == "session database":
             swapped = True
             source.unlink()
             try:
                 source.symlink_to(replacement)
             except OSError as exc:
                 pytest.skip(f"symlinks are unavailable: {exc}")
-        return real_connect(database, *args, **kwargs)
+        with real_open(path, label=label) as descriptor:
+            yield descriptor
 
-    monkeypatch.setattr(session_module.sqlite3, "connect", swap_source_before_connect)
+    monkeypatch.setattr(
+        session_module,
+        "open_unlinked_regular_file",
+        swap_source_before_open,
+    )
+
+    with pytest.raises(SessionStorageError):
+        store.backup(destination)
+
+    assert swapped is True
+    assert not destination.exists()
+    assert SessionStore(replacement).load_session(replacement_session.session_id).session_id == (
+        replacement_session.session_id
+    )
+    assert source_session.session_id != replacement_session.session_id
+
+
+def test_manual_backup_never_copies_replacement_during_regular_file_aba_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.session as session_module
+
+    source = tmp_path / "sessions.db"
+    store = SessionStore(source)
+    source_session = store.create_session("/source")
+    replacement = tmp_path / "replacement.db"
+    replacement_store = SessionStore(replacement)
+    replacement_session = replacement_store.create_session("/replacement")
+    destination = tmp_path / "manual.backup"
+    original_hold = tmp_path / "original-held.db"
+    real_copy = session_module._copy_descriptor
+    swapped = False
+
+    def swap_away_and_back(source_descriptor, destination_descriptor):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            source.replace(original_hold)
+            replacement.replace(source)
+            try:
+                real_copy(source_descriptor, destination_descriptor)
+            finally:
+                source.replace(replacement)
+                original_hold.replace(source)
+            return
+        real_copy(source_descriptor, destination_descriptor)
+
+    monkeypatch.setattr(session_module, "_copy_descriptor", swap_away_and_back)
 
     try:
         created = store.backup(destination)
@@ -1004,19 +1053,25 @@ def test_manual_backup_does_not_follow_source_swapped_to_symlink(
         }
         assert source_session.session_id in backup_ids
         assert replacement_session.session_id not in backup_ids
+
     assert swapped is True
+    assert SessionStore(source).load_session(source_session.session_id).session_id == (
+        source_session.session_id
+    )
     assert SessionStore(replacement).load_session(replacement_session.session_id).session_id == (
         replacement_session.session_id
     )
-    assert source_session.session_id != replacement_session.session_id
 
 
-def test_manual_backup_includes_committed_live_wal_contents(tmp_path: Path) -> None:
+def test_manual_backup_rejects_live_uncoordinated_wal_then_succeeds_after_close(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "sessions.db"
     store = SessionStore(source)
     destination = tmp_path / "manual.backup"
 
-    with get_db_connection(source) as writer:
+    writer = sqlite3.connect(source)
+    try:
         writer.execute("PRAGMA wal_autocheckpoint=0")
         session_id = "wal-session"
         writer.execute(
@@ -1037,12 +1092,248 @@ def test_manual_backup_includes_committed_live_wal_contents(tmp_path: Path) -> N
         writer.commit()
         assert Path(f"{source}-wal").exists()
 
-        assert store.backup(destination) == destination
+        with pytest.raises(SessionStorageError, match="WAL sidecar"):
+            store.backup(destination)
+        assert not destination.exists()
+    finally:
+        writer.close()
 
+    assert store.backup(destination) == destination
     assert SessionStore(destination).load_session(session_id).title == "from wal"
 
 
-def test_manual_backup_fails_closed_without_secure_source_descriptor_path(
+def test_manual_backup_quiesces_concurrent_session_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.session as session_module
+
+    source = tmp_path / "sessions.db"
+    store = SessionStore(source)
+    original = store.create_session("/before-backup")
+    destination = tmp_path / "manual.backup"
+    copy_entered = threading.Event()
+    writer_started = threading.Event()
+    writer_done = threading.Event()
+    writer_reached_acquire = threading.Event()
+    writer_session_id: list[str] = []
+    writer_errors: list[BaseException] = []
+    completed_during_copy: list[bool] = []
+    real_copy = session_module._copy_descriptor
+    real_acquire = session_module._acquire_database_coordination
+
+    def observe_acquire(db_path, *, exclusive):
+        if threading.current_thread().name == "backup-writer" and not exclusive:
+            writer_reached_acquire.set()
+        return real_acquire(db_path, exclusive=exclusive)
+
+    def writer() -> None:
+        assert copy_entered.wait(5)
+        writer_started.set()
+        try:
+            session = store.create_session("/during-backup")
+            writer_session_id.append(session.session_id)
+        except BaseException as exc:
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    def observe_copy(*args, **kwargs):
+        copy_entered.set()
+        assert writer_started.wait(5)
+        assert writer_reached_acquire.wait(5)
+        completed_during_copy.append(writer_done.wait(0.25))
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(
+        session_module,
+        "_acquire_database_coordination",
+        observe_acquire,
+    )
+    monkeypatch.setattr(session_module, "_copy_descriptor", observe_copy)
+    writer_thread = threading.Thread(target=writer, name="backup-writer")
+    writer_thread.start()
+    try:
+        assert store.backup(destination) == destination
+        writer_thread.join(5)
+    finally:
+        copy_entered.set()
+        writer_thread.join(5)
+
+    assert not writer_thread.is_alive()
+    assert completed_during_copy == [False]
+    assert writer_errors == []
+    assert len(writer_session_id) == 1
+    backup_ids = {
+        item.session_id for item in SessionStore(destination).list_sessions(limit=10)
+    }
+    live_ids = {item.session_id for item in SessionStore(source).list_sessions(limit=10)}
+    assert original.session_id in backup_ids
+    assert writer_session_id[0] not in backup_ids
+    assert writer_session_id[0] in live_ids
+
+
+@pytest.mark.skipif(os.name != "posix", reason="cross-process flock is POSIX-only")
+def test_manual_backup_quiesces_cross_process_session_connection(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sessions.db"
+    store = SessionStore(source)
+    original = store.create_session("/before-backup")
+    destination = tmp_path / "manual.backup"
+    attempt = tmp_path / "backup-attempt"
+    result = tmp_path / "backup-result"
+    held_connection = get_db_connection(source)
+    child: subprocess.Popen[str] | None = None
+
+    child_code = """
+from pathlib import Path
+import sys
+import ash.core.session as session_module
+from ash.core.session import SessionStore
+
+database = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+attempt = Path(sys.argv[3])
+result = Path(sys.argv[4])
+real_acquire = session_module._acquire_database_coordination
+
+def marked_acquire(db_path, *, exclusive):
+    if exclusive:
+        attempt.write_text("waiting", encoding="utf-8")
+    return real_acquire(db_path, exclusive=exclusive)
+
+session_module._acquire_database_coordination = marked_acquire
+store = SessionStore(database)
+try:
+    store.backup(destination)
+except BaseException as exc:
+    result.write_text("error:" + repr(exc), encoding="utf-8")
+    raise
+else:
+    result.write_text("ok", encoding="utf-8")
+"""
+
+    try:
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                child_code,
+                str(source),
+                str(destination),
+                str(attempt),
+                str(result),
+            ],
+            text=True,
+        )
+        deadline = time.monotonic() + 5
+        while not attempt.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert attempt.exists()
+        time.sleep(0.25)
+        assert child.poll() is None
+        assert not result.exists()
+    finally:
+        held_connection.close()
+
+    assert child is not None
+    child.wait(timeout=5)
+    assert child.returncode == 0
+    assert result.read_text(encoding="utf-8") == "ok"
+    backup_ids = {
+        item.session_id for item in SessionStore(destination).list_sessions(limit=10)
+    }
+    assert original.session_id in backup_ids
+
+
+def test_manual_backup_rejects_reentrant_open_connection(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sessions.db"
+    store = SessionStore(source)
+    store.create_session("/workspace")
+    destination = tmp_path / "manual.backup"
+
+    with get_db_connection(source):
+        with pytest.raises(SessionStorageError, match="current thread holds"):
+            store.backup(destination)
+
+    assert not destination.exists()
+
+
+def test_nested_database_read_completes_while_writer_is_queued(tmp_path: Path) -> None:
+    import ash.core.session as session_module
+
+    source = tmp_path / "sessions.db"
+    store = SessionStore(source)
+    first_opened = threading.Event()
+    attempt_nested = threading.Event()
+    nested_done = threading.Event()
+    release_first = threading.Event()
+    writer_done = threading.Event()
+    errors: list[BaseException] = []
+
+    def reader() -> None:
+        first = None
+        try:
+            first = get_db_connection(source)
+            first_opened.set()
+            assert attempt_nested.wait(5)
+            with closing(get_db_connection(source)) as second:
+                assert second.execute("SELECT 1").fetchone()[0] == 1
+            nested_done.set()
+            assert release_first.wait(5)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            if first is not None:
+                first.close()
+
+    def writer() -> None:
+        try:
+            with session_module.exclusive_database_access(source):
+                pass
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            writer_done.set()
+
+    reader_thread = threading.Thread(target=reader)
+    reader_thread.start()
+    assert first_opened.wait(5)
+
+    writer_thread = threading.Thread(target=writer)
+    writer_thread.start()
+    state = session_module._database_coordination_state(store.db_path)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with state.condition:
+            if state.waiting_writers:
+                break
+        time.sleep(0.005)
+    else:
+        release_first.set()
+        reader_thread.join(5)
+        writer_thread.join(5)
+        pytest.fail("writer never entered the coordination queue")
+
+    attempt_nested.set()
+    try:
+        assert nested_done.wait(2), "nested reader blocked behind the queued writer"
+        assert not writer_done.is_set()
+    finally:
+        release_first.set()
+        reader_thread.join(5)
+        writer_thread.join(5)
+
+    assert not reader_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert writer_done.is_set()
+    assert errors == []
+
+
+def test_manual_backup_fails_closed_without_descriptor_validation_support(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1051,11 +1342,23 @@ def test_manual_backup_fails_closed_without_secure_source_descriptor_path(
     store = SessionStore(tmp_path / "sessions.db")
     store.create_session("/workspace")
     destination = tmp_path / "manual.backup"
-    monkeypatch.setattr(session_module, "descriptor_path", lambda descriptor: None)
+
+    real_connect = session_module.sqlite3.connect
+
+    class ConnectionWithoutDeserialize:
+        def close(self) -> None:
+            return None
+
+    def connect_without_deserialize(database, *args, **kwargs):
+        if database == ":memory:":
+            return ConnectionWithoutDeserialize()
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(session_module.sqlite3, "connect", connect_without_deserialize)
 
     with pytest.raises(
         SessionStorageError,
-        match="Secure session backup source opening is unavailable",
+        match="Secure session backup validation is unavailable",
     ):
         store.backup(destination)
 

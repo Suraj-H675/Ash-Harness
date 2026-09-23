@@ -11,6 +11,7 @@ from ash.safe_io import (
     create_anchored_regular_file,
     create_unlinked_regular_file,
     ensure_anchored_directory,
+    open_unlinked_regular_file,
     read_bounded_open_file,
     read_bounded_text,
     remove_anchored_directory_tree,
@@ -130,6 +131,33 @@ def test_created_file_identity_check_rejects_replaced_visible_entry(
             verify_open_file_identity(path, descriptor, label="test state")
 
     assert path.read_bytes() == b"attacker replacement"
+
+
+def test_open_unlinked_regular_file_requests_binary_mode_when_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.safe_io as safe_io
+
+    target = tmp_path / "payload.bin"
+    target.write_bytes(b"line-one\r\n\x1aline-two\n")
+    fake_binary_flag = 1 << 29
+    real_open = safe_io.os.open
+    target_flags: list[int] = []
+
+    def recording_open(path, flags, *args, **kwargs):
+        if Path(path).name == target.name:
+            target_flags.append(flags)
+        return real_open(path, flags & ~fake_binary_flag, *args, **kwargs)
+
+    monkeypatch.setattr(safe_io.os, "O_BINARY", fake_binary_flag, raising=False)
+    monkeypatch.setattr(safe_io.os, "open", recording_open)
+
+    with open_unlinked_regular_file(target, label="binary payload") as descriptor:
+        assert os.read(descriptor, 64) == b"line-one\r\n\x1aline-two\n"
+
+    assert target_flags
+    assert target_flags[-1] & fake_binary_flag
 
 
 def test_replace_open_file_refuses_source_replacement(tmp_path: Path) -> None:

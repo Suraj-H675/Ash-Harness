@@ -19,7 +19,6 @@ from pydantic import BaseModel, Field
 
 from ash.safe_io import (
     create_unlinked_regular_file,
-    descriptor_path,
     open_unlinked_regular_file,
     strict_json_loads,
     validate_unlinked_file_path,
@@ -59,7 +58,9 @@ class _DatabaseCoordinationState:
     def __init__(self) -> None:
         self.condition = threading.Condition()
         self.readers = 0
+        self.reader_threads: dict[int, int] = {}
         self.writer = False
+        self.writer_thread: int | None = None
         self.waiting_writers = 0
 
 
@@ -109,19 +110,37 @@ def _acquire_database_coordination(
     exclusive: bool,
 ) -> Any:
     state = _database_coordination_state(db_path)
+    thread_id = threading.get_ident()
     with state.condition:
         if exclusive:
+            if state.writer and state.writer_thread == thread_id:
+                raise SessionStorageError(
+                    "Cannot acquire exclusive session database access recursively"
+                )
+            if state.reader_threads.get(thread_id, 0):
+                raise SessionStorageError(
+                    "Cannot acquire exclusive session database access while the current "
+                    "thread holds an open database connection"
+                )
             state.waiting_writers += 1
             try:
                 while state.writer or state.readers:
                     state.condition.wait()
                 state.writer = True
+                state.writer_thread = thread_id
             finally:
                 state.waiting_writers -= 1
         else:
-            while state.writer or state.waiting_writers:
+            if state.writer and state.writer_thread == thread_id:
+                raise SessionStorageError(
+                    "Cannot open a session database connection while holding exclusive "
+                    "database access"
+                )
+            current_thread_readers = state.reader_threads.get(thread_id, 0)
+            while state.writer or (state.waiting_writers and not current_thread_readers):
                 state.condition.wait()
             state.readers += 1
+            state.reader_threads[thread_id] = current_thread_readers + 1
 
     descriptor: int | None = None
     try:
@@ -136,8 +155,14 @@ def _acquire_database_coordination(
         with state.condition:
             if exclusive:
                 state.writer = False
+                state.writer_thread = None
             else:
                 state.readers -= 1
+                remaining = state.reader_threads.get(thread_id, 0) - 1
+                if remaining > 0:
+                    state.reader_threads[thread_id] = remaining
+                else:
+                    state.reader_threads.pop(thread_id, None)
             state.condition.notify_all()
         raise
 
@@ -160,8 +185,14 @@ def _acquire_database_coordination(
         with state.condition:
             if exclusive:
                 state.writer = False
+                state.writer_thread = None
             else:
                 state.readers -= 1
+                remaining = state.reader_threads.get(thread_id, 0) - 1
+                if remaining > 0:
+                    state.reader_threads[thread_id] = remaining
+                else:
+                    state.reader_threads.pop(thread_id, None)
             state.condition.notify_all()
         if release_error is not None:
             raise SessionStorageError(
@@ -476,37 +507,27 @@ def _restrict_file_permissions(path: Path) -> None:
         path.chmod(0o600)
 
 
-def _write_descriptor(descriptor: int, payload: bytes) -> None:
-    os.ftruncate(descriptor, 0)
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    view = memoryview(payload)
-    while view:
-        written = os.write(descriptor, view)
-        if written <= 0:
-            raise OSError("short write while creating session backup")
-        view = view[written:]
+def _copy_descriptor(source: int, destination: int) -> None:
+    """Copy one held regular file into another held descriptor."""
 
-
-def _backup_connection_to_descriptor(
-    source: sqlite3.Connection,
-    descriptor: int,
-) -> None:
-    stable_path = descriptor_path(descriptor)
-    if stable_path is not None:
-        with closing(sqlite3.connect(stable_path)) as target:
-            target.execute("PRAGMA journal_mode=OFF;")
-            source.backup(target)
-        return
-
-    with closing(sqlite3.connect(":memory:")) as target:
-        source.backup(target)
-        serialize = getattr(target, "serialize", None)
-        if not callable(serialize):
-            raise SessionStorageError(
-                "Secure session backup is unavailable on this platform/build"
-            )
-        payload = serialize()
-    _write_descriptor(descriptor, payload)
+    source_position = os.lseek(source, 0, os.SEEK_CUR)
+    try:
+        os.lseek(source, 0, os.SEEK_SET)
+        os.ftruncate(destination, 0)
+        os.lseek(destination, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(source, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination, view)
+                if written <= 0:
+                    raise OSError("short write while creating session backup")
+                view = view[written:]
+        os.fsync(destination)
+    finally:
+        os.lseek(source, source_position, os.SEEK_SET)
 
 
 def _validate_backup_source_connection(source: sqlite3.Connection) -> None:
@@ -542,6 +563,78 @@ def _validate_backup_source_connection(source: sqlite3.Connection) -> None:
                 f"Session database schema {version} is newer than this Ash version "
                 f"supports ({CURRENT_SCHEMA_VERSION})"
             )
+
+
+def _validate_backup_descriptor(descriptor: int) -> None:
+    """Validate the exact bytes held by a completed backup descriptor."""
+
+    position = os.lseek(descriptor, 0, os.SEEK_CUR)
+    payload = bytearray()
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            payload.extend(chunk)
+    finally:
+        os.lseek(descriptor, position, os.SEEK_SET)
+
+    if len(payload) >= 20 and payload[18:20] == b"\x02\x02":
+        payload[18:20] = b"\x01\x01"
+
+    with closing(sqlite3.connect(":memory:")) as connection:
+        deserialize = getattr(connection, "deserialize", None)
+        if not callable(deserialize):
+            raise SessionStorageError(
+                "Secure session backup validation is unavailable on this platform/build"
+            )
+        try:
+            deserialize(payload)
+        except sqlite3.DatabaseError as exc:
+            raise SessionStorageError(
+                f"Refusing to back up an unhealthy database: {exc}"
+            ) from exc
+        _validate_backup_source_connection(connection)
+
+
+def _require_quiescent_backup_source(source_path: Path) -> None:
+    """Reject sidecar state that may contain committed bytes missing from the main DB."""
+
+    wal = Path(f"{source_path}-wal")
+    if os.path.lexists(wal):
+        wal_stat = os.lstat(wal)
+        if stat.S_ISLNK(wal_stat.st_mode) or not stat.S_ISREG(wal_stat.st_mode):
+            raise SessionStorageError(
+                f"Refusing to back up session database with unsafe WAL sidecar: {wal}"
+            )
+        if wal_stat.st_size:
+            raise SessionStorageError(
+                "Refusing to back up session database while a SQLite WAL sidecar "
+                f"contains data: {wal}"
+            )
+
+    shm = Path(f"{source_path}-shm")
+    if os.path.lexists(shm):
+        shm_stat = os.lstat(shm)
+        if stat.S_ISLNK(shm_stat.st_mode) or not stat.S_ISREG(shm_stat.st_mode):
+            raise SessionStorageError(
+                "Refusing to back up session database with unsafe shared-memory "
+                f"sidecar: {shm}"
+            )
+
+    journal = Path(f"{source_path}-journal")
+    if os.path.lexists(journal):
+        journal_stat = os.lstat(journal)
+        if stat.S_ISLNK(journal_stat.st_mode) or not stat.S_ISREG(journal_stat.st_mode):
+            raise SessionStorageError(
+                "Refusing to back up session database with unsafe rollback journal: "
+                f"{journal}"
+            )
+        raise SessionStorageError(
+            "Refusing to back up session database while a SQLite rollback journal "
+            f"exists: {journal}"
+        )
 
 
 def get_db_connection(db_path: str | Path) -> sqlite3.Connection:
@@ -1121,32 +1214,42 @@ class SessionStore:
                 label="session backup",
                 mode=0o600,
             ) as descriptor:
-                release = _acquire_database_coordination(self.db_path, exclusive=False)
-                try:
+                with exclusive_database_access(source_path) as locked_source:
+                    _require_quiescent_backup_source(locked_source)
                     with open_unlinked_regular_file(
-                        source_path,
+                        locked_source,
                         label="session database",
                     ) as source_descriptor:
-                        stable_source = descriptor_path(source_descriptor)
-                        if stable_source is None:
+                        verify_open_file_identity(
+                            locked_source,
+                            source_descriptor,
+                            label="session database",
+                        )
+                        before = os.fstat(source_descriptor)
+                        _require_quiescent_backup_source(locked_source)
+                        _copy_descriptor(source_descriptor, descriptor)
+                        after = os.fstat(source_descriptor)
+                        if (
+                            before.st_size,
+                            before.st_mtime_ns,
+                            before.st_ctime_ns,
+                            before.st_nlink,
+                        ) != (
+                            after.st_size,
+                            after.st_mtime_ns,
+                            after.st_ctime_ns,
+                            after.st_nlink,
+                        ):
                             raise SessionStorageError(
-                                "Secure session backup source opening is unavailable "
-                                "on this platform/build"
+                                "Session database changed while secure backup was in progress"
                             )
-                        source_uri = f"file:{stable_source}?mode=ro"
-                        with closing(
-                            sqlite3.connect(
-                                source_uri,
-                                uri=True,
-                                check_same_thread=False,
-                            )
-                        ) as source:
-                            source.execute("PRAGMA query_only=ON;")
-                            _validate_backup_source_connection(source)
-                            _backup_connection_to_descriptor(source, descriptor)
-                finally:
-                    release()
-                os.fsync(descriptor)
+                        _require_quiescent_backup_source(locked_source)
+                        verify_open_file_identity(
+                            locked_source,
+                            source_descriptor,
+                            label="session database",
+                        )
+                    _validate_backup_descriptor(descriptor)
                 verify_open_file_identity(
                     destination_path,
                     descriptor,
@@ -1157,6 +1260,10 @@ class SessionStore:
                 f"Backup destination already exists: {destination_path}"
             ) from exc
         except sqlite3.DatabaseError as exc:
+            raise SessionStorageError(
+                f"Could not securely back up session database: {exc}"
+            ) from exc
+        except OSError as exc:
             raise SessionStorageError(
                 f"Could not securely back up session database: {exc}"
             ) from exc
