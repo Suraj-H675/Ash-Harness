@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from ash.safe_io import (
     create_unlinked_regular_file,
     descriptor_path,
+    open_unlinked_regular_file,
     strict_json_loads,
     validate_unlinked_file_path,
     verify_open_file_identity,
@@ -506,6 +507,41 @@ def _backup_connection_to_descriptor(
             )
         payload = serialize()
     _write_descriptor(descriptor, payload)
+
+
+def _validate_backup_source_connection(source: sqlite3.Connection) -> None:
+    """Require the exact SQLite connection being backed up to be healthy."""
+
+    integrity_rows = source.execute("PRAGMA integrity_check").fetchall()
+    integrity_errors = [str(row[0]) for row in integrity_rows if row[0] != "ok"]
+    if integrity_errors:
+        raise SessionStorageError(
+            "Refusing to back up an unhealthy database: "
+            + "; ".join(integrity_errors)
+        )
+    foreign_rows = source.execute("PRAGMA foreign_key_check").fetchall()
+    if foreign_rows:
+        details = [
+            "foreign key violation: " + ", ".join(str(value) for value in row)
+            for row in foreign_rows
+        ]
+        raise SessionStorageError(
+            "Refusing to back up an unhealthy database: " + "; ".join(details)
+        )
+    table = source.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    ).fetchone()
+    if table is not None:
+        version = int(
+            source.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+            ).fetchone()[0]
+        )
+        if version > CURRENT_SCHEMA_VERSION:
+            raise SessionStorageError(
+                f"Session database schema {version} is newer than this Ash version "
+                f"supports ({CURRENT_SCHEMA_VERSION})"
+            )
 
 
 def get_db_connection(db_path: str | Path) -> sqlite3.Connection:
@@ -1085,8 +1121,31 @@ class SessionStore:
                 label="session backup",
                 mode=0o600,
             ) as descriptor:
-                with closing(get_db_connection(source_path)) as source:
-                    _backup_connection_to_descriptor(source, descriptor)
+                release = _acquire_database_coordination(self.db_path, exclusive=False)
+                try:
+                    with open_unlinked_regular_file(
+                        source_path,
+                        label="session database",
+                    ) as source_descriptor:
+                        stable_source = descriptor_path(source_descriptor)
+                        if stable_source is None:
+                            raise SessionStorageError(
+                                "Secure session backup source opening is unavailable "
+                                "on this platform/build"
+                            )
+                        source_uri = f"file:{stable_source}?mode=ro"
+                        with closing(
+                            sqlite3.connect(
+                                source_uri,
+                                uri=True,
+                                check_same_thread=False,
+                            )
+                        ) as source:
+                            source.execute("PRAGMA query_only=ON;")
+                            _validate_backup_source_connection(source)
+                            _backup_connection_to_descriptor(source, descriptor)
+                finally:
+                    release()
                 os.fsync(descriptor)
                 verify_open_file_identity(
                     destination_path,
@@ -1096,6 +1155,10 @@ class SessionStore:
         except FileExistsError as exc:
             raise SessionStorageError(
                 f"Backup destination already exists: {destination_path}"
+            ) from exc
+        except sqlite3.DatabaseError as exc:
+            raise SessionStorageError(
+                f"Could not securely back up session database: {exc}"
             ) from exc
         except ValueError as exc:
             raise SessionStorageError(str(exc)) from exc

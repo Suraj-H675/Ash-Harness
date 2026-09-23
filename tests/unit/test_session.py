@@ -958,6 +958,110 @@ def test_manual_backup_does_not_follow_destination_swapped_to_symlink(
     }
 
 
+def test_manual_backup_does_not_follow_source_swapped_to_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.session as session_module
+
+    source = tmp_path / "sessions.db"
+    store = SessionStore(source)
+    source_session = store.create_session("/source")
+    replacement = tmp_path / "replacement.db"
+    replacement_store = SessionStore(replacement)
+    replacement_session = replacement_store.create_session("/replacement")
+    destination = tmp_path / "manual.backup"
+    real_connect = sqlite3.connect
+    swapped = False
+
+    def swap_source_before_connect(database, *args, **kwargs):
+        nonlocal swapped
+        database_text = str(database)
+        if (
+            not swapped
+            and (
+                Path(database_text) == source
+                or database_text.startswith("file:/dev/fd/")
+            )
+        ):
+            swapped = True
+            source.unlink()
+            try:
+                source.symlink_to(replacement)
+            except OSError as exc:
+                pytest.skip(f"symlinks are unavailable: {exc}")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(session_module.sqlite3, "connect", swap_source_before_connect)
+
+    try:
+        created = store.backup(destination)
+    except SessionStorageError:
+        assert not destination.exists()
+    else:
+        backup_ids = {
+            item.session_id for item in SessionStore(created).list_sessions(limit=10)
+        }
+        assert source_session.session_id in backup_ids
+        assert replacement_session.session_id not in backup_ids
+    assert swapped is True
+    assert SessionStore(replacement).load_session(replacement_session.session_id).session_id == (
+        replacement_session.session_id
+    )
+    assert source_session.session_id != replacement_session.session_id
+
+
+def test_manual_backup_includes_committed_live_wal_contents(tmp_path: Path) -> None:
+    source = tmp_path / "sessions.db"
+    store = SessionStore(source)
+    destination = tmp_path / "manual.backup"
+
+    with get_db_connection(source) as writer:
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        session_id = "wal-session"
+        writer.execute(
+            """
+            INSERT INTO sessions (
+                session_id, project_path, created_at, title, updated_at, model
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                "/wal",
+                "2026-09-23T00:00:00+00:00",
+                "from wal",
+                "2026-09-23T00:00:00+00:00",
+                "provider/model",
+            ),
+        )
+        writer.commit()
+        assert Path(f"{source}-wal").exists()
+
+        assert store.backup(destination) == destination
+
+    assert SessionStore(destination).load_session(session_id).title == "from wal"
+
+
+def test_manual_backup_fails_closed_without_secure_source_descriptor_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.session as session_module
+
+    store = SessionStore(tmp_path / "sessions.db")
+    store.create_session("/workspace")
+    destination = tmp_path / "manual.backup"
+    monkeypatch.setattr(session_module, "descriptor_path", lambda descriptor: None)
+
+    with pytest.raises(
+        SessionStorageError,
+        match="Secure session backup source opening is unavailable",
+    ):
+        store.backup(destination)
+
+    assert not destination.exists()
+
+
 def test_message_storage_round_trips_in_insert_order(tmp_path: Path) -> None:
     db_path = tmp_path / "session_store.db"
     store = SessionStore(db_path)
