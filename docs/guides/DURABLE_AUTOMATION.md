@@ -108,8 +108,11 @@ ash cron worker
 ```
 
 For an existing system scheduler, `ash cron worker --once` claims one due batch,
-waits for it, and exits. Atomic claims make overlapping worker processes safe;
-one job never has two live runs. Different jobs can run concurrently up to
+waits for it, and exits. Atomic claims make overlapping worker processes safe at
+the durable lease layer: one job has at most one run record in the `running`
+state at a time. An expired lease is recovered as `interrupted` rather than
+replaying that same occurrence; a later scheduled occurrence may then be
+claimed. Different jobs can run concurrently up to
 `automation_max_concurrent_runs` per worker. The command exits `1` if any
 claimed run fails or becomes interrupted, and its `--json` summary reports each
 terminal status. A continuous worker writes every terminal run to standard
@@ -176,9 +179,19 @@ sandbox, network, plugin, provider, or environment settings therefore applies
 without restarting the service. A continuous worker removes its heartbeat and
 pauses while automation is disabled or workspace trust is absent, then resumes
 when the condition is corrected. Changing `db_directory` requires restarting
-the worker so one process never splits state across databases. Each production
-turn runs in a separate process group so timeout, cancellation, and shutdown
-can terminate the model runtime and its child commands.
+the worker so one process never splits state across databases. On POSIX, each
+production turn runs in an isolated process group and carries a worker lifeline:
+if a live runner observes abrupt worker death, Ash hard-stops that runner group.
+Ordinary child commands that inherit the group are therefore covered by timeout,
+cancellation, shutdown, and the abrupt-worker lifeline.
+
+That process-group boundary is not a portable container. A permitted command
+that deliberately daemonizes, creates a new session/process group (for example
+via `setsid()`), or starts an independently managed service can outlive the run.
+Lease expiry also proves that durable ownership expired, not that every external
+side effect stopped. Do not use unattended automation to launch detached
+services unless their lifecycle and idempotency are managed separately. Ash
+does not claim crash-safe non-overlap for arbitrary external side effects.
 
 Automation settings are user-owned. A repository `.ash/config.toml` cannot
 enable automation, increase worker concurrency or leases, choose persistence

@@ -191,6 +191,55 @@ _AUTOMATION_CHILD_CAPABILITY_ENV_NAMES = frozenset(
         "TAVILY_API_KEY",
     }
 )
+_AUTOMATION_PARENT_LIFELINE_FD_ENV = "ASH_INTERNAL_AUTOMATION_PARENT_LIFELINE_FD"
+
+
+def _move_lifeline_fd_above_stdio(descriptor: int) -> int:
+    """Keep internal lifeline descriptors away from subprocess stdio remapping."""
+
+    if descriptor >= 3:
+        return descriptor
+    try:
+        import fcntl
+
+        duplicate_command = getattr(fcntl, "F_DUPFD_CLOEXEC", None)
+        if duplicate_command is None:
+            raise AutomationError(
+                "automation parent lifeline requires close-on-exec descriptor duplication"
+            )
+        duplicate = int(fcntl.fcntl(descriptor, duplicate_command, 3))
+    except (ImportError, OSError) as exc:
+        raise AutomationError(
+            "automation parent lifeline descriptor could not be isolated from stdio"
+        ) from exc
+    try:
+        os.close(descriptor)
+    except OSError as exc:
+        try:
+            os.close(duplicate)
+        except OSError:
+            pass
+        raise AutomationError(
+            "automation parent lifeline descriptor could not be isolated from stdio"
+        ) from exc
+    return duplicate
+
+
+def _create_parent_lifeline_pipe() -> tuple[int, int]:
+    """Create a POSIX worker→runner lifeline whose descriptors are private."""
+
+    read_fd, write_fd = os.pipe()
+    try:
+        read_fd = _move_lifeline_fd_above_stdio(read_fd)
+        write_fd = _move_lifeline_fd_above_stdio(write_fd)
+    except BaseException:
+        for descriptor in (read_fd, write_fd):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    return read_fd, write_fd
 
 
 def _environment_name_key(name: str, *, platform_name: str | None = None) -> str:
@@ -304,88 +353,131 @@ class _SubprocessAutomationClient:
         environment: dict[str, str],
     ) -> AshResult:
         command = [sys.executable, "-I", "-m", "ash.automation.runner"]
+        lifeline_read_fd = -1
+        lifeline_write_fd = -1
+        environment.pop(_AUTOMATION_PARENT_LIFELINE_FD_ENV, None)
+        if os.name == "posix":
+            lifeline_read_fd, lifeline_write_fd = _create_parent_lifeline_pipe()
+            environment[_AUTOMATION_PARENT_LIFELINE_FD_ENV] = str(lifeline_read_fd)
         try:
-            with prepare_scoped_process_launch(
-                command,
-                cwd=self._workspace,
-                guard=self._guard,
-                search_path=environment.get("PATH"),
-                expected_cwd_identity=self._workspace_identity,
-            ) as launch:
-                try:
-                    process_tree_plan = prepare_process_tree(
-                        workspace_root=self._guard.project_root
+            try:
+                with prepare_scoped_process_launch(
+                    command,
+                    cwd=self._workspace,
+                    guard=self._guard,
+                    search_path=environment.get("PATH"),
+                    expected_cwd_identity=self._workspace_identity,
+                ) as launch:
+                    try:
+                        process_tree_plan = prepare_process_tree(
+                            workspace_root=self._guard.project_root
+                        )
+                    except ProcessTreeUnavailable as exc:
+                        raise AutomationError(
+                            f"automation subprocess was not started: {exc}"
+                        ) from exc
+                    if os.name == "posix" and not bool(
+                        process_tree_plan.spawn_options.get("start_new_session")
+                    ):
+                        raise AutomationError(
+                            "automation subprocess requires an isolated POSIX process group; "
+                            "restart the worker outside an inherited Ash process group"
+                        )
+                    spawn_options = dict(process_tree_plan.spawn_options)
+                    inherited_fds = tuple(
+                        dict.fromkeys(
+                            (
+                                *launch.pass_fds,
+                                *((lifeline_read_fd,) if lifeline_read_fd >= 0 else ()),
+                            )
+                        )
                     )
-                except ProcessTreeUnavailable as exc:
-                    raise AutomationError(
-                        f"automation subprocess was not started: {exc}"
-                    ) from exc
-                spawn_options = dict(process_tree_plan.spawn_options)
-                if launch.pass_fds:
-                    spawn_options["pass_fds"] = launch.pass_fds
-                process = await asyncio.create_subprocess_exec(
-                    *launch.argv,
-                    cwd=launch.cwd,
-                    env=environment,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    **spawn_options,
-                )
+                    if inherited_fds:
+                        spawn_options["pass_fds"] = inherited_fds
+                    process = await asyncio.create_subprocess_exec(
+                        *launch.argv,
+                        cwd=launch.cwd,
+                        env=environment,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        **spawn_options,
+                    )
+            finally:
+                if lifeline_read_fd >= 0:
+                    os.close(lifeline_read_fd)
+                    lifeline_read_fd = -1
         except (ProcessTreeUnavailable, SafetyViolation, ScopedIOError) as exc:
+            environment.pop(_AUTOMATION_PARENT_LIFELINE_FD_ENV, None)
+            if lifeline_write_fd >= 0:
+                os.close(lifeline_write_fd)
+                lifeline_write_fd = -1
             raise AutomationError(
                 f"automation subprocess was not started: {exc}"
             ) from exc
-        self._process = process
-        self._process_tree_plan = process_tree_plan
-        cleanup_error: ProcessTreeError | None = None
+        except BaseException:
+            environment.pop(_AUTOMATION_PARENT_LIFELINE_FD_ENV, None)
+            if lifeline_write_fd >= 0:
+                os.close(lifeline_write_fd)
+                lifeline_write_fd = -1
+            raise
         try:
-            stdout, stderr = await communicate_process(
-                process,
-                input_data=json.dumps(request, allow_nan=False).encode("utf-8"),
-                max_output_bytes=self._MAX_OUTPUT_BYTES,
-                process_tree_plan=process_tree_plan,
-            )
-        except ProcessOutputLimitExceeded as primary:
-            cleanup_error = primary.cleanup_error
-            raise
-        except asyncio.CancelledError as cancellation:
-            cleanup_error, cleanup_cancelled = (
-                await settle_process_tree_after_cancellation(
-                    process, plan=process_tree_plan
+            self._process = process
+            self._process_tree_plan = process_tree_plan
+            cleanup_error: ProcessTreeError | None = None
+            try:
+                stdout, stderr = await communicate_process(
+                    process,
+                    input_data=json.dumps(request, allow_nan=False).encode("utf-8"),
+                    max_output_bytes=self._MAX_OUTPUT_BYTES,
+                    process_tree_plan=process_tree_plan,
                 )
-            )
-            if cleanup_error is not None:
-                cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
-            if cleanup_cancelled:
-                cancellation.add_note("Process-tree cleanup was cancelled")
-            raise
-        except BaseException as primary:
-            cleanup_error, cleanup_cancelled = (
-                await settle_process_tree_after_cancellation(
-                    process, plan=process_tree_plan
+            except ProcessOutputLimitExceeded as primary:
+                cleanup_error = primary.cleanup_error
+                raise
+            except asyncio.CancelledError as cancellation:
+                cleanup_error, cleanup_cancelled = (
+                    await settle_process_tree_after_cancellation(
+                        process, plan=process_tree_plan
+                    )
                 )
-            )
-            if cleanup_error is not None:
-                primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
-            if cleanup_cancelled:
-                primary.add_note("Process-tree cleanup was cancelled")
-            raise
-        finally:
-            if cleanup_error is None:
-                self._process = None
-                self._process_tree_plan = None
+                if cleanup_error is not None:
+                    cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+                if cleanup_cancelled:
+                    cancellation.add_note("Process-tree cleanup was cancelled")
+                raise
+            except BaseException as primary:
+                cleanup_error, cleanup_cancelled = (
+                    await settle_process_tree_after_cancellation(
+                        process, plan=process_tree_plan
+                    )
+                )
+                if cleanup_error is not None:
+                    primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+                if cleanup_cancelled:
+                    primary.add_note("Process-tree cleanup was cancelled")
+                raise
+            finally:
+                if cleanup_error is None:
+                    self._process = None
+                    self._process_tree_plan = None
 
-        payload = self._parse_payload(stdout)
-        if process.returncode != 0 or not payload.get("ok"):
-            error = payload.get("error")
-            if not isinstance(error, str) or not error.strip():
-                error = stderr.decode("utf-8", errors="replace")[-4000:].strip()
-            raise RuntimeError(redact_text(error or "automation subprocess failed"))
-        result = payload.get("result")
-        if not isinstance(result, dict):
-            raise RuntimeError("automation subprocess returned an invalid result")
-        return AshResult(**result)
+            payload = self._parse_payload(stdout)
+            if process.returncode != 0 or not payload.get("ok"):
+                error = payload.get("error")
+                if not isinstance(error, str) or not error.strip():
+                    error = stderr.decode("utf-8", errors="replace")[-4000:].strip()
+                raise RuntimeError(redact_text(error or "automation subprocess failed"))
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("automation subprocess returned an invalid result")
+            return AshResult(**result)
+        finally:
+            environment.pop(_AUTOMATION_PARENT_LIFELINE_FD_ENV, None)
+            if lifeline_read_fd >= 0:
+                os.close(lifeline_read_fd)
+            if lifeline_write_fd >= 0:
+                os.close(lifeline_write_fd)
 
     async def close(self) -> None:
         process = self._process

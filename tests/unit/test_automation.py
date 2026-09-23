@@ -6,10 +6,12 @@ import hmac
 import io
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import stat
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -251,6 +253,261 @@ async def test_automation_subprocess_runner_uses_isolated_python(
         "-m",
         "ash.automation.runner",
     )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX lifeline descriptor regression")
+@pytest.mark.asyncio
+async def test_automation_subprocess_closes_lifeline_fds_when_spawn_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.automation.worker as worker_module
+    from ash.automation.worker import _SubprocessAutomationClient
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    real_pipe = worker_module.os.pipe
+    created_fds: list[int] = []
+
+    def recording_pipe() -> tuple[int, int]:
+        read_fd, write_fd = real_pipe()
+        created_fds.extend((read_fd, write_fd))
+        return read_fd, write_fd
+
+    monkeypatch.setattr(worker_module.os, "pipe", recording_pipe)
+    monkeypatch.setattr(
+        worker_module.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=OSError("spawn failed")),
+    )
+    client = _SubprocessAutomationClient(
+        AshConfig(workspace_root=workspace),
+        workspace,
+    )
+
+    with pytest.raises(OSError, match="spawn failed"):
+        await client.prompt("run")
+
+    assert len(created_fds) == 2
+    for descriptor in created_fds:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX lifeline descriptor regression")
+@pytest.mark.parametrize("closed_descriptor", [0, 1, 2])
+def test_automation_lifeline_descriptors_never_reuse_standard_streams(
+    tmp_path: Path,
+    closed_descriptor: int,
+) -> None:
+    result_path = tmp_path / f"lifeline-fds-{closed_descriptor}.txt"
+    probe = (
+        "import os,sys\n"
+        "from pathlib import Path\n"
+        "from ash.automation.worker import _create_parent_lifeline_pipe\n"
+        "closed=int(sys.argv[1])\n"
+        "target=Path(sys.argv[2])\n"
+        "os.close(closed)\n"
+        "read_fd=write_fd=-1\n"
+        "try:\n"
+        " read_fd,write_fd=_create_parent_lifeline_pipe()\n"
+        " target.write_text(f'{read_fd},{write_fd}', encoding='utf-8')\n"
+        "finally:\n"
+        " for descriptor in (read_fd,write_fd):\n"
+        "  if descriptor >= 0:\n"
+        "   try: os.close(descriptor)\n"
+        "   except OSError: pass\n"
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            probe,
+            str(closed_descriptor),
+            str(result_path),
+        ],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    read_fd, write_fd = (
+        int(value) for value in result_path.read_text(encoding="utf-8").split(",")
+    )
+    assert read_fd >= 3
+    assert write_fd >= 3
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX isolated runner regression")
+@pytest.mark.asyncio
+async def test_automation_subprocess_fails_closed_when_worker_inherits_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.automation.worker as worker_module
+    from ash.automation.worker import _SubprocessAutomationClient
+    from ash.sandbox.process_utils import INHERIT_PROCESS_GROUP_ENV
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv(INHERIT_PROCESS_GROUP_ENV, "1")
+    create = AsyncMock(side_effect=AssertionError("automation must not launch"))
+    monkeypatch.setattr(worker_module.asyncio, "create_subprocess_exec", create)
+    client = _SubprocessAutomationClient(
+        AshConfig(workspace_root=workspace),
+        workspace,
+    )
+
+    with pytest.raises(AutomationError, match="isolated POSIX process group"):
+        await client.prompt("run")
+
+    create.assert_not_awaited()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX parent lifeline regression")
+def test_automation_runner_rejects_invalid_parent_lifeline_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.automation.runner import _PARENT_LIFELINE_FD_ENV, _arm_parent_lifeline
+
+    monkeypatch.setenv(_PARENT_LIFELINE_FD_ENV, "not-a-descriptor")
+
+    with pytest.raises(RuntimeError, match="descriptor is invalid"):
+        _arm_parent_lifeline()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX parent lifeline regression")
+def test_automation_runner_rejects_unavailable_parent_lifeline_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.automation.runner import _PARENT_LIFELINE_FD_ENV, _arm_parent_lifeline
+
+    monkeypatch.setenv(_PARENT_LIFELINE_FD_ENV, "2147483647")
+
+    with pytest.raises(RuntimeError, match="descriptor is unavailable"):
+        _arm_parent_lifeline()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group lifeline regression")
+def test_automation_subprocess_dies_with_abrupt_worker_parent(
+    tmp_path: Path,
+) -> None:
+    def process_is_running(pid: int) -> bool:
+        completed = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        state = completed.stdout.strip()
+        return completed.returncode == 0 and bool(state) and not state.startswith("Z")
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    wrapper = tmp_path / "automation-runner-wrapper"
+    runner_pid_path = tmp_path / "runner.pid"
+    child_pid_path = tmp_path / "child.pid"
+    heartbeat_path = tmp_path / "heartbeat.txt"
+    helper = tmp_path / "worker-helper.py"
+
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "from ash.automation.runner import _arm_parent_lifeline\n"
+        "_arm_parent_lifeline()\n"
+        "root = Path(os.environ['ASH_AUTOMATION_LIFELINE_TEST_DIR'])\n"
+        "heartbeat = root / 'heartbeat.txt'\n"
+        "child_code = (\n"
+        "    'import sys,time\\n'\n"
+        "    'from pathlib import Path\\n'\n"
+        "    'path=Path(sys.argv[1])\\n'\n"
+        "    'counter=0\\n'\n"
+        "    'while True:\\n'\n"
+        "    ' counter += 1\\n'\n"
+        "    ' path.write_text(str(counter), encoding=\\\"utf-8\\\")\\n'\n"
+        "    ' time.sleep(0.05)\\n'\n"
+        ")\n"
+        "child = subprocess.Popen([sys.executable, '-c', child_code, str(heartbeat)])\n"
+        "(root / 'runner.pid').write_text(str(os.getpid()), encoding='utf-8')\n"
+        "(root / 'child.pid').write_text(str(child.pid), encoding='utf-8')\n"
+        "while True:\n"
+        "    time.sleep(1)\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    helper.write_text(
+        "import asyncio\n"
+        "from pathlib import Path\n"
+        "from types import SimpleNamespace\n"
+        "import ash.automation.worker as worker_module\n"
+        "from ash.automation.worker import _SubprocessAutomationClient\n"
+        "from ash.config import AshConfig\n"
+        "wrapper = Path(__import__('sys').argv[1])\n"
+        "workspace = Path(__import__('sys').argv[2])\n"
+        "worker_module.sys = SimpleNamespace(executable=str(wrapper))\n"
+        "client = _SubprocessAutomationClient(AshConfig(workspace_root=workspace), workspace)\n"
+        "asyncio.run(client.prompt('run'))\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["ASH_AUTOMATION_LIFELINE_TEST_DIR"] = str(tmp_path)
+    worker = subprocess.Popen(
+        [sys.executable, str(helper), str(wrapper), str(workspace)],
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    runner_pid = child_pid = None
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if runner_pid_path.exists() and child_pid_path.exists() and heartbeat_path.exists():
+                runner_pid = int(runner_pid_path.read_text(encoding="utf-8"))
+                child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                break
+            if worker.poll() is not None:
+                stderr = worker.stderr.read() if worker.stderr is not None else ""
+                pytest.fail(f"automation helper exited before launch: {stderr}")
+            time.sleep(0.01)
+        else:
+            pytest.fail("automation runner and descendant did not start")
+
+        assert process_is_running(runner_pid)
+        assert process_is_running(child_pid)
+        before = int(heartbeat_path.read_text(encoding="utf-8"))
+        os.kill(worker.pid, signal.SIGKILL)
+        worker.wait(timeout=5)
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not process_is_running(runner_pid) and not process_is_running(child_pid):
+                break
+            time.sleep(0.05)
+        assert not process_is_running(runner_pid)
+        assert not process_is_running(child_pid)
+        after = int(heartbeat_path.read_text(encoding="utf-8"))
+        time.sleep(0.15)
+        assert int(heartbeat_path.read_text(encoding="utf-8")) == after
+        assert after >= before
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=5)
+        if runner_pid is not None:
+            try:
+                os.killpg(runner_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 @pytest.mark.skipif(

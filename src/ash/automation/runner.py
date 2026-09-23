@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import sys
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -17,8 +20,64 @@ from ash.safe_io import read_bounded_text
 
 
 _RESULT_PREFIX = "ASH_AUTOMATION_RESULT="
+_PARENT_LIFELINE_FD_ENV = "ASH_INTERNAL_AUTOMATION_PARENT_LIFELINE_FD"
 MAX_AUTOMATION_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_AUTOMATION_PROMPT_BYTES = 64 * 1024
+
+
+def _arm_parent_lifeline() -> None:
+    """Hard-stop this isolated POSIX process group if its worker disappears."""
+
+    raw_descriptor = os.environ.pop(_PARENT_LIFELINE_FD_ENV, None)
+    if raw_descriptor is None:
+        return
+    if os.name != "posix":
+        raise RuntimeError("automation parent lifeline is unsupported on this platform")
+    try:
+        descriptor = int(raw_descriptor)
+    except ValueError as exc:
+        raise RuntimeError("automation parent lifeline descriptor is invalid") from exc
+    if descriptor < 0:
+        raise RuntimeError("automation parent lifeline descriptor is invalid")
+    try:
+        os.fstat(descriptor)
+        os.set_inheritable(descriptor, False)
+    except OSError as exc:
+        raise RuntimeError("automation parent lifeline descriptor is unavailable") from exc
+    getpgrp = getattr(os, "getpgrp", None)
+    killpg = getattr(os, "killpg", None)
+    if not callable(getpgrp) or not callable(killpg):
+        raise RuntimeError("automation parent lifeline requires POSIX process groups")
+    process_group = int(getpgrp())
+    if process_group != os.getpid():
+        raise RuntimeError("automation runner is not isolated in its own process group")
+
+    def watch() -> None:
+        try:
+            while True:
+                try:
+                    chunk = os.read(descriptor, 1)
+                except InterruptedError:
+                    continue
+                if not chunk:
+                    break
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            killpg(process_group, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            os._exit(125)
+
+    threading.Thread(
+        target=watch,
+        name="ash-automation-parent-lifeline",
+        daemon=True,
+    ).start()
 
 
 async def _execute(request: dict[str, Any]) -> dict[str, Any]:
@@ -61,6 +120,7 @@ async def _execute(request: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     try:
+        _arm_parent_lifeline()
         request = json.loads(
             read_bounded_text(
                 sys.stdin,
