@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
+import stat
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +29,51 @@ class FTS5Index:
         self.db_path = str(
             validate_unlinked_file_path(db_path, label="FTS5 memory database")
         )
+        self._restrict_storage_permissions()
         self._init_db()
+        self._restrict_storage_permissions()
+
+    def _restrict_storage_permissions(self) -> None:
+        """Keep persisted lexical memory private on POSIX hosts."""
+
+        if os.name == "nt":
+            return
+        database = Path(self.db_path)
+        database.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= int(getattr(os, "O_CLOEXEC", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(database, flags, 0o600)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"FTS5 memory database is not a regular file: {database}")
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{database}{suffix}")
+            sidecar_descriptor = -1
+            try:
+                sidecar_descriptor = os.open(
+                    sidecar,
+                    os.O_RDONLY
+                    | int(getattr(os, "O_CLOEXEC", 0))
+                    | int(getattr(os, "O_NOFOLLOW", 0))
+                    | int(getattr(os, "O_NONBLOCK", 0)),
+                )
+                metadata = os.fstat(sidecar_descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError(
+                        f"FTS5 memory sidecar is not a regular file: {sidecar}"
+                    )
+                os.fchmod(sidecar_descriptor, 0o600)
+            except FileNotFoundError:
+                continue
+            finally:
+                if sidecar_descriptor >= 0:
+                    os.close(sidecar_descriptor)
 
     def _init_db(self) -> None:
         """Create the FTS5 virtual table and document metadata table if missing."""
@@ -65,14 +111,17 @@ class FTS5Index:
         anchor in ``document_metadata``), or 0 when ``chunks`` is empty.
         """
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
-            return self._index_document(
-                conn,
-                file_path,
-                chunks,
-                symbol_tags=symbol_tags,
-                sha256=sha256,
-            )
+        try:
+            with closing(get_db_connection(self.db_path)) as conn, conn:
+                return self._index_document(
+                    conn,
+                    file_path,
+                    chunks,
+                    symbol_tags=symbol_tags,
+                    sha256=sha256,
+                )
+        finally:
+            self._restrict_storage_permissions()
 
     def index_documents(
         self,
@@ -88,16 +137,19 @@ class FTS5Index:
         """
 
         indexed = 0
-        with closing(get_db_connection(self.db_path)) as conn, conn:
-            for file_path, chunks, sha256 in documents:
-                self._index_document(
-                    conn,
-                    file_path,
-                    chunks,
-                    symbol_tags=symbol_tags,
-                    sha256=sha256,
-                )
-                indexed += 1
+        try:
+            with closing(get_db_connection(self.db_path)) as conn, conn:
+                for file_path, chunks, sha256 in documents:
+                    self._index_document(
+                        conn,
+                        file_path,
+                        chunks,
+                        symbol_tags=symbol_tags,
+                        sha256=sha256,
+                    )
+                    indexed += 1
+        finally:
+            self._restrict_storage_permissions()
         return indexed
 
     @staticmethod
@@ -152,50 +204,62 @@ class FTS5Index:
     def delete_document(self, file_path: str) -> int:
         """Remove all indexed chunks and metadata for ``file_path``."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
-            fts_cursor = conn.execute(
-                "DELETE FROM fts_index WHERE file_path = ?",
-                (file_path,),
-            )
-            conn.execute(
-                "DELETE FROM document_metadata WHERE file_path = ?",
-                (file_path,),
-            )
-            return fts_cursor.rowcount
+        try:
+            with closing(get_db_connection(self.db_path)) as conn, conn:
+                fts_cursor = conn.execute(
+                    "DELETE FROM fts_index WHERE file_path = ?",
+                    (file_path,),
+                )
+                conn.execute(
+                    "DELETE FROM document_metadata WHERE file_path = ?",
+                    (file_path,),
+                )
+                return fts_cursor.rowcount
+        finally:
+            self._restrict_storage_permissions()
 
     def query(
         self, query_str: str, limit: int = DEFAULT_QUERY_LIMIT
     ) -> list[dict[str, Any]]:
         """Run a BM25-ranked FTS5 query and return matching chunks as dicts."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
-            return query_lexical_fallback(conn, query_str, limit=limit)
+        try:
+            with closing(get_db_connection(self.db_path)) as conn:
+                return query_lexical_fallback(conn, query_str, limit=limit)
+        finally:
+            self._restrict_storage_permissions()
 
     def document_paths(self, *, limit: int = 10_000) -> set[str]:
         """Return a bounded inventory of indexed document identities."""
 
         if limit < 1 or limit > 10_000:
             raise ValueError("limit must be between 1 and 10000")
-        with closing(get_db_connection(self.db_path)) as conn:
-            count = int(
-                conn.execute(
-                    "SELECT COUNT(DISTINCT file_path) FROM fts_index"
-                ).fetchone()[0]
-            )
-            if count > limit:
-                raise ValueError(
-                    f"memory index contains {count} documents; inventory limit is {limit}"
+        try:
+            with closing(get_db_connection(self.db_path)) as conn:
+                count = int(
+                    conn.execute(
+                        "SELECT COUNT(DISTINCT file_path) FROM fts_index"
+                    ).fetchone()[0]
                 )
-            rows = conn.execute(
-                "SELECT DISTINCT file_path FROM fts_index ORDER BY file_path LIMIT ?",
-                (limit,),
-            ).fetchall()
+                if count > limit:
+                    raise ValueError(
+                        f"memory index contains {count} documents; inventory limit is {limit}"
+                    )
+                rows = conn.execute(
+                    "SELECT DISTINCT file_path FROM fts_index ORDER BY file_path LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        finally:
+            self._restrict_storage_permissions()
         return {str(row[0]) for row in rows}
 
     def clear(self) -> None:
-        with closing(get_db_connection(self.db_path)) as conn, conn:
-            conn.execute("DELETE FROM fts_index")
-            conn.execute("DELETE FROM document_metadata")
+        try:
+            with closing(get_db_connection(self.db_path)) as conn, conn:
+                conn.execute("DELETE FROM fts_index")
+                conn.execute("DELETE FROM document_metadata")
+        finally:
+            self._restrict_storage_permissions()
 
 
 def query_lexical_fallback(

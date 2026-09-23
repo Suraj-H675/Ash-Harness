@@ -69,7 +69,7 @@ from ash.providers.retry import (
     retry_delay,
 )
 from ash.repo.repomap import RepoMap
-from ash.safety.guard import SafetyGuard
+from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.policy import PermissionPolicy, PolicyAction, READ_ONLY_TOOLS
 from ash.safety.scoped_io import read_scoped_bytes, snapshot_scoped_file
 from ash.tools.base import (
@@ -161,8 +161,17 @@ MAX_MEMORY_SCAN_DEPTH = 32
 MAX_AUTO_COMMIT_SNAPSHOT_BYTES = 20 * 1024 * 1024
 
 
-def _iter_project_paths(root: Path, *, max_depth: int) -> Iterator[Path]:
+def _iter_project_paths(
+    root: Path,
+    *,
+    max_depth: int,
+    on_error: Callable[[], None] | None = None,
+) -> Iterator[Path]:
     """Yield workspace entries lazily without descending through links."""
+
+    def mark_incomplete() -> None:
+        if on_error is not None:
+            on_error()
 
     def walk(directory: Path, depth: int) -> Iterator[Path]:
         if depth >= max_depth:
@@ -177,10 +186,12 @@ def _iter_project_paths(root: Path, *, max_depth: int) -> Iterator[Path]:
                     is_link = path.is_symlink()
                     is_directory = path.is_dir()
                 except OSError:
+                    mark_incomplete()
                     continue
                 if is_directory and not is_link:
                     yield from walk(path, depth + 1)
         except OSError:
+            mark_incomplete()
             return
 
     yield from walk(root, 0)
@@ -3588,12 +3599,18 @@ class AshLoop:
             raise ValueError("memory indexing limits must be positive")
 
         try:
-            chunks = self._chunk_file(file_path, max_bytes_per_file)
+            validated_path = self.safety_guard.validate_mutation_path(file_path)
+            chunks = self._chunk_file(validated_path, max_bytes_per_file)
         except (OSError, UnicodeError):
             return 0
         if not chunks:
             return 0
-        await self._vector_pipeline.index_chunks(chunks, str(file_path))
+        root = self.project_root.expanduser().resolve()
+        try:
+            document_path = validated_path.relative_to(root).as_posix()
+        except ValueError:
+            document_path = str(validated_path)
+        await self._vector_pipeline.index_chunks(chunks, document_path)
         return 1
 
     async def semantic_search(self, query: str, top_k: int = 5) -> list["VectorHit"]:
@@ -3622,17 +3639,26 @@ class AshLoop:
         )
         candidates: list[Path] = []
         scanned = 0
+        scan_complete = True
+
+        def mark_scan_incomplete() -> None:
+            nonlocal scan_complete
+            scan_complete = False
+
         for path in _iter_project_paths(
             self.project_root,
             max_depth=MAX_MEMORY_SCAN_DEPTH,
+            on_error=mark_scan_incomplete,
         ):
             scanned += 1
             if scanned > MAX_MEMORY_SCAN_ENTRIES:
+                scan_complete = False
                 break
             try:
                 if path.is_symlink() or not path.is_file():
                     continue
             except OSError:
+                scan_complete = False
                 continue
             if path.suffix.lower() not in {
                 ".c",
@@ -3662,28 +3688,38 @@ class AshLoop:
             if any(fnmatch.fnmatch(text, pattern) for pattern in patterns):
                 continue
             try:
-                if path.stat().st_size > max_bytes_per_file:
+                size = path.stat().st_size
+                if size == 0 or size > max_bytes_per_file:
                     continue
             except OSError:
+                scan_complete = False
                 continue
             candidates.append(path)
 
+        retained_paths = {
+            path.relative_to(self.project_root).as_posix() for path in candidates
+        }
         documents: list[tuple[list["Chunk"], str]] = []
         for path in sorted(candidates)[:max_files]:
+            document_path = path.relative_to(self.project_root).as_posix()
             try:
                 chunks = self._chunk_file(path, max_bytes_per_file)
             except (OSError, UnicodeError):
+                # A transient read failure is not evidence that a previously
+                # indexed, still-eligible file should be forgotten.
                 continue
             if chunks:
-                documents.append(
-                    (chunks, path.relative_to(self.project_root).as_posix())
-                )
-        self._prune_missing_memory_documents()
+                documents.append((chunks, document_path))
+            else:
+                # An empty file was read successfully and has no memory content.
+                retained_paths.discard(document_path)
         await self._vector_pipeline.index_documents(documents)
+        if scan_complete:
+            self._reconcile_workspace_memory_documents(retained_paths)
         return len(documents)
 
-    def _prune_missing_memory_documents(self) -> int:
-        """Forget indexed files that no longer resolve to live workspace files."""
+    def _reconcile_workspace_memory_documents(self, active_paths: set[str]) -> int:
+        """Forget stale workspace memory while preserving live external files."""
 
         if self._vector_pipeline is None:
             return 0
@@ -3691,17 +3727,30 @@ class AshLoop:
         deleted = 0
         for stored_path in self._vector_pipeline.document_paths(limit=10_000):
             raw = Path(stored_path).expanduser()
-            candidate = raw if raw.is_absolute() else root / raw
+            if not raw.is_absolute():
+                if stored_path not in active_paths:
+                    deleted += self._vector_pipeline.delete_document(stored_path)
+                continue
+
             try:
-                resolved = candidate.resolve(strict=False)
-                live = (
-                    resolved.is_relative_to(root)
-                    and not candidate.is_symlink()
-                    and candidate.is_file()
-                )
-            except OSError:
-                live = False
-            if not live:
+                validated = self.safety_guard.validate_mutation_path(raw)
+            except (OSError, SafetyViolation):
+                deleted += self._vector_pipeline.delete_document(stored_path)
+                continue
+
+            try:
+                validated.relative_to(root)
+            except ValueError:
+                try:
+                    live_external = validated.is_file()
+                except OSError:
+                    live_external = False
+                if not live_external:
+                    deleted += self._vector_pipeline.delete_document(stored_path)
+            else:
+                # Older Ash versions could store a manually indexed workspace
+                # file under an absolute identity. Workspace indexing owns that
+                # file under the canonical relative identity now.
                 deleted += self._vector_pipeline.delete_document(stored_path)
         return deleted
 

@@ -2,7 +2,11 @@
 
 from contextlib import closing
 from datetime import datetime, timezone
+import os
 from pathlib import Path
+import stat
+import subprocess
+import sys
 
 import pytest
 
@@ -158,6 +162,65 @@ def test_fts5_init_creates_virtual_and_metadata_tables(tmp_path: Path) -> None:
 
     assert "fts_index" in table_names
     assert "document_metadata" in table_names
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are unavailable")
+def test_fts5_storage_is_private_and_repairs_existing_mode(tmp_path: Path) -> None:
+    db_path = tmp_path / "memory" / "fts5.db"
+    db_path.parent.mkdir()
+    db_path.touch(mode=0o644)
+    db_path.chmod(0o644)
+    previous_umask = os.umask(0o022)
+    try:
+        index = FTS5Index(db_path)
+        index.index_document(
+            "secret.py",
+            _chunks("secret.py", "private_memory_marker"),
+        )
+        with closing(get_db_connection(db_path)) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS permission_probe(value INTEGER)"
+            )
+            connection.execute("INSERT INTO permission_probe VALUES (1)")
+            connection.commit()
+            sidecars = [Path(f"{db_path}{suffix}") for suffix in ("-wal", "-shm")]
+            assert all(sidecar.exists() for sidecar in sidecars)
+            for sidecar in sidecars:
+                sidecar.chmod(0o644)
+            index._restrict_storage_permissions()
+            assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+            assert all(
+                stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+                for sidecar in sidecars
+            )
+    finally:
+        os.umask(previous_umask)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX FIFO regression")
+def test_fts5_rejects_fifo_sidecar_without_blocking(tmp_path: Path) -> None:
+    db_path = tmp_path / "fts5.db"
+    os.mkfifo(f"{db_path}-wal")
+    probe = (
+        "from ash.memory.fts5 import FTS5Index\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        "try:\n"
+        " FTS5Index(Path(sys.argv[1]))\n"
+        "except ValueError as exc:\n"
+        " sys.exit(0 if 'sidecar is not a regular file' in str(exc) else 3)\n"
+        "sys.exit(2)\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", probe, str(db_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_fts5_index_rejects_linked_database_file_and_parent(tmp_path: Path) -> None:

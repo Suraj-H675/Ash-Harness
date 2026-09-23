@@ -871,15 +871,15 @@ class VectorSearchPipeline:
             vector_records = [
                 {
                     "source": "vector",
-                    "chunk_key": str(
-                        record.get("metadata", {}).get("chunk_key", record["id"])
+                    "chunk_key": redact_text(
+                        str(record.get("metadata", {}).get("chunk_key", record["id"]))
                     ),
                     "file_path": redact_text(
                         str(record.get("metadata", {}).get("file_path", ""))
                     ),
                     "content": redact_text(str(record["document"])[:4_000]),
                     "metadata": {
-                        key: value
+                        key: redact_text(value) if isinstance(value, str) else value
                         for key, value in record.get("metadata", {}).items()
                         if isinstance(value, (str, int, float, bool))
                     },
@@ -908,7 +908,9 @@ class VectorSearchPipeline:
                 vector_records.extend(
                     {
                         "source": "lexical",
-                        "chunk_key": f"{row['file_path']}:{index + 1}",
+                        "chunk_key": redact_text(
+                            f"{row['file_path']}:{index + 1}"
+                        ),
                         "file_path": redact_text(row["file_path"]),
                         "content": redact_text(row["content"][:4_000]),
                         "symbol_tags": redact_text(row["symbol_tags"]),
