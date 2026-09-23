@@ -1,8 +1,10 @@
 from pathlib import Path
+import ctypes
 
 import pytest
 
 from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety import path_scope
 from ash.safety.path_scope import path_has_link_component
 
 
@@ -32,6 +34,64 @@ def test_validate_path_blocks_traversal_escape(tmp_path: Path) -> None:
 
     with pytest.raises(SafetyViolation, match="outside project scope"):
         guard.validate_path(outside)
+
+
+def test_path_scope_uses_windows_reparse_fallback_for_junction_like_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    candidate = root / "junction" / "file.txt"
+    (root / "junction").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        path_scope,
+        "_windows_path_is_reparse",
+        lambda path: path == root / "junction",
+    )
+
+    assert path_has_link_component(candidate, root) == root / "junction"
+
+
+def test_windows_reparse_fallback_detects_reparse_attribute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeGetAttributes:
+        argtypes = None
+        restype = None
+
+        def __call__(self, _value):
+            return 0x00000400
+
+    class FakeKernel32:
+        GetFileAttributesW = FakeGetAttributes()
+
+    monkeypatch.setattr(path_scope.os, "name", "nt")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: FakeKernel32(), raising=False)
+
+    assert path_scope._windows_path_is_reparse(tmp_path / "junction") is True
+
+
+def test_windows_reparse_fallback_fails_closed_on_attribute_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeGetAttributes:
+        argtypes = None
+        restype = None
+
+        def __call__(self, _value):
+            return 0xFFFFFFFF
+
+    class FakeKernel32:
+        GetFileAttributesW = FakeGetAttributes()
+
+    monkeypatch.setattr(path_scope.os, "name", "nt")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: FakeKernel32(), raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+
+    assert path_scope._windows_path_is_reparse(tmp_path / "junction") is True
 
 
 def test_validate_path_blocks_symlink_escape(tmp_path: Path) -> None:

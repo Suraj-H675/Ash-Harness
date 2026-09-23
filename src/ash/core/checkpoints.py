@@ -117,18 +117,27 @@ class FileCheckpointMiddleware(ToolMiddleware):
         self, tool_name: str, arguments: dict[str, Any], result: ToolResult
     ) -> None:
         context = self.context_provider()
-        if context is None or tool_name not in EDIT_TOOLS or not result.success:
+        if context is None or tool_name not in EDIT_TOOLS:
             return
-        session_id, turn_id, call_id = _checkpoint_context(context)
-        for path in self._paths(tool_name, arguments):
-            digest = _digest(path, self.guard)
-            self.store.finish_file_checkpoint(
-                session_id,
-                turn_id,
-                str(path),
-                digest,
-                call_id=call_id,
-            )
+        try:
+            session_id, turn_id, call_id = _checkpoint_context(context)
+            for path in self._paths(tool_name, arguments):
+                digest = _digest(path, self.guard)
+                self.store.finish_file_checkpoint(
+                    session_id,
+                    turn_id,
+                    str(path),
+                    digest,
+                    call_id=call_id,
+                )
+        except Exception as exc:
+            if result.success:
+                raise
+            original = (result.error or "tool failed").strip()
+            detail = str(exc).strip() or type(exc).__name__
+            raise RuntimeError(
+                f"{original}; checkpoint finalization failed: {detail}"
+            ) from exc
 
     def _paths(self, tool_name: str, arguments: dict[str, Any]) -> list[Path]:
         if tool_name == "apply_patch":
@@ -425,8 +434,14 @@ def _restore_checkpoint_rows(
     originals = _capture_file_states((path for _, path in rows), guard)
     try:
         _apply_checkpoint_rows(rows, guard, originals)
-    except Exception:
-        _rollback_file_states(originals, guard)
+    except Exception as primary:
+        try:
+            _rollback_file_states(originals, guard)
+        except RuntimeError as rollback_error:
+            raise RuntimeError(
+                "Checkpoint restore failed "
+                f"({primary}) and file rollback was incomplete: {rollback_error}"
+            ) from rollback_error
         raise
 
 
@@ -495,7 +510,7 @@ def _rollback_file_states(
                     expected_sha256=current.sha256,
                     max_bytes=MAX_CHECKPOINT_BYTES,
                 )
-        except (OSError, SafetyViolation) as exc:
+        except (OSError, SafetyViolation, ScopedIOError, ValueError) as exc:
             rollback_errors.append(f"{path}: {exc}")
     if rollback_errors:
         raise RuntimeError(
@@ -516,8 +531,19 @@ def undo_latest_checkpoint(
             "Undo refused because files changed after Ash's edit: "
             + ", ".join(conflicts)
         )
-    _restore_checkpoint_rows(list(zip(rows, paths, strict=True)), guard)
-    store.mark_file_checkpoints_restored(session_id, rows[0]["turn_id"])
+    originals = _capture_file_states(paths, guard)
+    try:
+        _apply_checkpoint_rows(list(zip(rows, paths, strict=True)), guard, originals)
+        store.mark_file_checkpoints_restored(session_id, rows[0]["turn_id"])
+    except Exception as primary:
+        try:
+            _rollback_file_states(originals, guard)
+        except RuntimeError as rollback_error:
+            raise RuntimeError(
+                f"Undo failed ({primary}) and file rollback was incomplete: "
+                + str(rollback_error)
+            ) from rollback_error
+        raise
     return list(dict.fromkeys(paths))
 
 
@@ -567,12 +593,12 @@ def rewind_session_with_files(
             message_count,
             restored_checkpoint_turn_ids=turn_ids,
         )
-    except Exception:
+    except Exception as primary:
         try:
             _rollback_file_states(originals, guard)
         except RuntimeError as rollback_error:
             raise RuntimeError(
-                "Combined rewind failed and file rollback was incomplete: "
+                f"Combined rewind failed ({primary}) and file rollback was incomplete: "
                 + str(rollback_error)
             ) from rollback_error
         raise

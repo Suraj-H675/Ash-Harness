@@ -76,6 +76,88 @@ async def test_checkpoint_undo_and_conflict_detection(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_partial_edit_does_not_poison_later_turn_checkpoint_undo(
+    tmp_path,
+) -> None:
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    a.write_text("before-a", encoding="utf-8")
+    b.write_text("before-b", encoding="utf-8")
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    guard = SafetyGuard(tmp_path)
+    call_id = "call-a"
+
+    def context():
+        return session.session_id, "turn-1", call_id
+
+    middleware = FileCheckpointMiddleware(store, guard, context)
+    tool = WholeEditTool(guard)
+
+    failed_arguments = {"file_path": "a.txt", "content": "partial-a"}
+    await middleware.before_tool("whole_edit", failed_arguments, tool)
+    a.write_text("partial-a", encoding="utf-8")
+    await middleware.after_tool(
+        "whole_edit",
+        failed_arguments,
+        ToolResult(success=False, output="", error="simulated tool failure"),
+    )
+
+    call_id = "call-b"
+    successful_arguments = {"file_path": "b.txt", "content": "after-b"}
+    await middleware.before_tool("whole_edit", successful_arguments, tool)
+    result = await tool.run(**successful_arguments)
+    await middleware.after_tool("whole_edit", successful_arguments, result)
+
+    rows = store.latest_file_checkpoints(session.session_id)
+    assert len(rows) == 2
+    assert all(row["after_sha256"] is not None for row in rows)
+    assert set(undo_latest_checkpoint(store, guard, session.session_id)) == {a, b}
+    assert a.read_text(encoding="utf-8") == "before-a"
+    assert b.read_text(encoding="utf-8") == "before-b"
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_checkpoint_finalization_error_preserves_original_context(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.checkpoints as checkpoints
+
+    path = tmp_path / "a.txt"
+    path.write_text("before", encoding="utf-8")
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    guard = SafetyGuard(tmp_path)
+    middleware = FileCheckpointMiddleware(
+        store,
+        guard,
+        lambda: (session.session_id, "turn-1", "call-a"),
+    )
+    arguments = {"file_path": "a.txt", "content": "after"}
+    await middleware.before_tool("whole_edit", arguments, WholeEditTool(guard))
+
+    def fail_digest(_path, _guard):
+        raise OSError("simulated checkpoint digest failure")
+
+    monkeypatch.setattr(checkpoints, "_digest", fail_digest)
+    result = ToolResult(success=False, output="", error="original tool failure")
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "original tool failure; checkpoint finalization failed: "
+            "simulated checkpoint digest failure"
+        ),
+    ):
+        await middleware.after_tool("whole_edit", arguments, result)
+
+    rows = store.file_checkpoints_for_call(session.session_id, "turn-1", "call-a")
+    assert len(rows) == 1
+    assert rows[0]["after_sha256"] is None
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_undo_removes_created_file_and_restores_mode(tmp_path) -> None:
     existing = tmp_path / "existing.txt"
     existing.write_text("before", encoding="utf-8")
@@ -146,6 +228,94 @@ async def test_checkpoint_undo_rolls_files_forward_when_restore_fails(
     assert (tmp_path / "a.txt").read_text() == "after-a.txt"
     assert (tmp_path / "b.txt").read_text() == "after-b.txt"
     assert len(store.latest_file_checkpoints(session.session_id)) == 2
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_undo_rolls_files_forward_when_database_mark_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "file.txt"
+    path.write_text("before", encoding="utf-8")
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    guard = SafetyGuard(tmp_path)
+    middleware = FileCheckpointMiddleware(
+        store,
+        guard,
+        lambda: (session.session_id, "turn-1", "call-1"),
+    )
+    arguments = {"file_path": "file.txt", "content": "after"}
+    tool = WholeEditTool(guard)
+    await middleware.before_tool("whole_edit", arguments, tool)
+    result = await tool.run(**arguments)
+    await middleware.after_tool("whole_edit", arguments, result)
+    assert path.read_text(encoding="utf-8") == "after"
+
+    def fail_mark(*args, **kwargs):
+        raise RuntimeError("checkpoint database unavailable")
+
+    monkeypatch.setattr(store, "mark_file_checkpoints_restored", fail_mark)
+
+    with pytest.raises(RuntimeError, match="checkpoint database unavailable"):
+        undo_latest_checkpoint(store, guard, session.session_id)
+
+    assert path.read_text(encoding="utf-8") == "after"
+    assert store.latest_file_checkpoints(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_undo_reports_primary_and_scoped_rollback_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.checkpoints as checkpoints
+    from ash.safety.scoped_io import ScopedIOError
+
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    guard = SafetyGuard(tmp_path)
+    tool = WholeEditTool(guard)
+    for name in ("a.txt", "b.txt"):
+        path = tmp_path / name
+        path.write_text(f"before-{name}", encoding="utf-8")
+        middleware = FileCheckpointMiddleware(
+            store,
+            guard,
+            lambda name=name: (session.session_id, "turn-1", f"call-{name}"),
+        )
+        arguments = {"file_path": name, "content": f"after-{name}"}
+        await middleware.before_tool("whole_edit", arguments, tool)
+        result = await tool.run(**arguments)
+        await middleware.after_tool("whole_edit", arguments, result)
+
+    original_restore = checkpoints.restore_scoped_file
+    restore_calls = 0
+
+    def fail_primary_then_rollback(path, content, guard, **kwargs):
+        nonlocal restore_calls
+        restore_calls += 1
+        if restore_calls == 2:
+            raise OSError("primary restore failure")
+        if restore_calls == 3:
+            raise ScopedIOError("rollback scoped failure")
+        return original_restore(path, content, guard, **kwargs)
+
+    monkeypatch.setattr(
+        checkpoints,
+        "restore_scoped_file",
+        fail_primary_then_rollback,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "Undo failed \\(primary restore failure\\) and file rollback was incomplete:"
+        ),
+    ) as exc_info:
+        undo_latest_checkpoint(store, guard, session.session_id)
+
+    assert "rollback scoped failure" in str(exc_info.value)
 
 
 @pytest.mark.asyncio

@@ -21,7 +21,15 @@ def _windows_path_is_reparse(path: Path) -> bool:
     invalid = 0xFFFFFFFF
     reparse = 0x00000400
     attributes = int(get_attributes(str(path)))
-    return attributes != invalid and bool(attributes & reparse)
+    if attributes == invalid:
+        get_last_error = getattr(ctypes, "get_last_error", None)
+        error_number = int(get_last_error()) if callable(get_last_error) else 0
+        if error_number in {2, 3}:  # file/path not found
+            return False
+        # Any other attribute lookup failure is ambiguous (for example access
+        # denied). Fail closed rather than allowing a potentially linked path.
+        return True
+    return bool(attributes & reparse)
 
 
 def _path_is_linklike(path: Path) -> bool:
