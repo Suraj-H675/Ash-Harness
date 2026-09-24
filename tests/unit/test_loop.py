@@ -367,6 +367,73 @@ class DuplicateNativeToolIdProvider(ProviderABC):
             yield StreamChunk(content="done", is_done=True)
 
 
+class ReusedNativeToolIdProvider(ProviderABC):
+    model_name = "reused-native-tool-id"
+    _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+    def __init__(self):
+        self.calls = 0
+
+    def count_tokens(self, text):
+        return len(text)
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        self.calls += 1
+        if self.calls == 1:
+            yield StreamChunk(
+                is_done=True,
+                native_tool_calls=[
+                    {
+                        "id": "reused-call",
+                        "name": "capture",
+                        "arguments": {"text": "first"},
+                    }
+                ],
+            )
+        elif self.calls == 2:
+            yield StreamChunk(
+                is_done=True,
+                native_tool_calls=[
+                    {
+                        "id": "reused-call",
+                        "name": "capture",
+                        "arguments": {"text": "second"},
+                    }
+                ],
+            )
+        else:
+            yield StreamChunk(content="done", is_done=True)
+
+
+class ReusedNativeToolIdAcrossTurnsProvider(ProviderABC):
+    model_name = "reused-native-tool-id-across-turns"
+    _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+    def __init__(self):
+        self.calls = 0
+
+    def count_tokens(self, text):
+        return len(text)
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        self.calls += 1
+        if self.calls in {1, 3}:
+            yield StreamChunk(
+                is_done=True,
+                native_tool_calls=[
+                    {
+                        "id": "session-reused-call",
+                        "name": "capture",
+                        "arguments": {
+                            "text": "first" if self.calls == 1 else "second"
+                        },
+                    }
+                ],
+            )
+        else:
+            yield StreamChunk(content="done", is_done=True)
+
+
 class NativePlainTextProvider(ProviderABC):
     model_name = "native-plain-text"
     _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
@@ -1942,6 +2009,304 @@ async def test_duplicate_native_tool_call_ids_fail_before_tool_dispatch(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_native_tool_call_id_reuse_across_completions_is_rejected(tmp_path):
+    provider = ReusedNativeToolIdProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    store = SessionStore(tmp_path / "reused-native.db")
+    loop = AshLoop(
+        store,
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+    )
+
+    with pytest.raises(ProviderCompletionError, match="reused tool call ID"):
+        await loop.run_turn("use capture twice")
+
+    assert tool.arguments == {"text": "first"}
+    assert loop.current_session is not None
+    loaded = store.load_session(loop.current_session.session_id)
+    assert len(loaded.tool_calls) == 1
+    assert loaded.tool_calls[0].call_id == "reused-call"
+    assert loaded.tool_calls[0].arguments == {"text": "first"}
+
+
+@pytest.mark.asyncio
+async def test_native_tool_call_id_reuse_across_turns_is_rejected(tmp_path):
+    provider = ReusedNativeToolIdAcrossTurnsProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    store = SessionStore(tmp_path / "reused-native-across-turns.db")
+    loop = AshLoop(
+        store,
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+    )
+
+    assert await loop.run_turn("first turn") == "done"
+    assert tool.arguments == {"text": "first"}
+
+    with pytest.raises(ProviderCompletionError, match="reused tool call ID"):
+        await loop.run_turn("second turn")
+
+    assert tool.arguments == {"text": "first"}
+    assert loop.current_session is not None
+    loaded = store.load_session(loop.current_session.session_id)
+    assert len(loaded.tool_calls) == 1
+    assert loaded.tool_calls[0].call_id == "session-reused-call"
+    assert loaded.tool_calls[0].arguments == {"text": "first"}
+
+
+@pytest.mark.asyncio
+async def test_approval_callback_cannot_mutate_dispatched_arguments(tmp_path):
+    provider = NativeToolProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    store = SessionStore(tmp_path / "approval-argument-snapshot.db")
+
+    async def mutate_then_approve(_tool_name, arguments):
+        arguments["text"] = "mutated"
+        return True
+
+    loop = AshLoop(
+        store,
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+        on_tool_approval=mutate_then_approve,
+    )
+
+    response = await loop.run_turn("use capture")
+
+    assert response == "done"
+    assert tool.arguments == {"text": "hello"}
+    assert loop.current_session is not None
+    loaded = store.load_session(loop.current_session.session_id)
+    assert loaded.tool_calls[0].arguments == {"text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_before_middleware_cannot_mutate_dispatched_arguments(tmp_path):
+    class MutatingMiddleware(ToolMiddleware):
+        async def before_tool(self, _tool_name, arguments, _tool):
+            arguments["text"] = "mutated"
+
+    provider = NativeToolProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    store = SessionStore(tmp_path / "middleware-argument-snapshot.db")
+    loop = AshLoop(
+        store,
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+        tool_middlewares=[MutatingMiddleware()],
+    )
+
+    response = await loop.run_turn("use capture")
+
+    assert response == "done"
+    assert tool.arguments == {"text": "hello"}
+    assert loop.current_session is not None
+    loaded = store.load_session(loop.current_session.session_id)
+    assert loaded.tool_calls[0].arguments == {"text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_tool_result_message_failure_rolls_back_terminal_tool_state(tmp_path):
+    provider = NativeToolProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    store = SessionStore(tmp_path / "atomic-tool-result.db")
+    loop = AshLoop(
+        store,
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+    )
+    session = await loop.start_session()
+    with get_db_connection(store.db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TRIGGER fail_tool_result_message
+            BEFORE INSERT ON messages
+            WHEN NEW.role = 'tool'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected tool-result message failure');
+            END;
+            """
+        )
+
+    with pytest.raises(Exception, match="injected tool-result message failure"):
+        await loop.run_turn("use capture")
+
+    assert tool.arguments == {"text": "hello"}
+    loaded = store.load_session(session.session_id)
+    assert len(loaded.tool_calls) == 1
+    record = loaded.tool_calls[0]
+    assert record.dispatched is True
+    assert record.executed is False
+    assert record.result is None
+    assert record.error is None
+    assert not any(message.role == "tool" for message in loaded.messages)
+    assert store.recoverable_turns(session.session_id)
+
+    with get_db_connection(store.db_path) as connection:
+        connection.execute("DROP TRIGGER fail_tool_result_message")
+
+    from ash.core.checkpoints import recover_interrupted_turns
+
+    summary = recover_interrupted_turns(
+        store, tool.safety_guard, session.session_id
+    )
+    assert summary.interrupted_turns == 1
+    assert summary.unknown_calls == ("capture (call-native-1)",)
+    recovered = store.load_session(session.session_id)
+    tool_messages = [message for message in recovered.messages if message.role == "tool"]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].metadata["call_id"] == "call-native-1"
+    assert '"replayed": false' in tool_messages[0].content
+    assert "outcome is unknown" in tool_messages[0].content
+    assert store.recoverable_turns(session.session_id) == []
+
+
+@pytest.mark.asyncio
+async def test_denied_tool_result_failure_recovers_orphan_without_execution(tmp_path):
+    provider = NativeToolProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    store = SessionStore(tmp_path / "denied-atomic-tool-result.db")
+
+    async def deny_tool(_tool_name, _arguments):
+        return False
+
+    loop = AshLoop(
+        store,
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+        on_tool_approval=deny_tool,
+    )
+    session = await loop.start_session()
+    with get_db_connection(store.db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TRIGGER fail_denied_tool_result_message
+            BEFORE INSERT ON messages
+            WHEN NEW.role = 'tool'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected denied tool-result message failure');
+            END;
+            """
+        )
+
+    with pytest.raises(Exception, match="injected denied tool-result message failure"):
+        await loop.run_turn("use capture")
+
+    assert tool.arguments is None
+    failed = store.load_session(session.session_id)
+    assert failed.tool_calls == []
+    assert not any(message.role == "tool" for message in failed.messages)
+
+    with get_db_connection(store.db_path) as connection:
+        connection.execute("DROP TRIGGER fail_denied_tool_result_message")
+
+    restarted_tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    restarted = AshLoop(
+        store,
+        NativeToolProvider(),
+        restarted_tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={restarted_tool.name: restarted_tool},
+    )
+    recovered = await restarted.start_session(session.session_id)
+
+    assert restarted_tool.arguments is None
+    assert restarted.recovered_turns == 1
+    assert len(recovered.tool_calls) == 1
+    recovered_call = recovered.tool_calls[0]
+    assert recovered_call.call_id == "call-native-1"
+    assert recovered_call.approved is False
+    assert recovered_call.executed is False
+    assert recovered_call.dispatched is False
+    assert "it was not run" in (recovered_call.error or "")
+    tool_messages = [message for message in recovered.messages if message.role == "tool"]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].metadata["call_id"] == "call-native-1"
+    assert '"replayed": false' in tool_messages[0].content
+    assert "it was not run" in tool_messages[0].content
+    assert store.recoverable_turns(session.session_id) == []
+
+
+@pytest.mark.asyncio
+async def test_failed_denial_finalization_recovers_before_same_loop_next_turn(
+    tmp_path,
+) -> None:
+    provider = ReusedNativeToolIdProvider()
+    tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    store = SessionStore(tmp_path / "same-loop-denied-recovery.db")
+
+    async def deny_tool(_tool_name, _arguments):
+        return False
+
+    loop = AshLoop(
+        store,
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+        on_tool_approval=deny_tool,
+    )
+    session = await loop.start_session()
+    with get_db_connection(store.db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TRIGGER fail_same_loop_denied_tool_result_message
+            BEFORE INSERT ON messages
+            WHEN NEW.role = 'tool'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected same-loop denied result failure');
+            END;
+            """
+        )
+
+    with pytest.raises(Exception, match="injected same-loop denied result failure"):
+        await loop.run_turn("first turn")
+
+    assert tool.arguments is None
+    with get_db_connection(store.db_path) as connection:
+        connection.execute("DROP TRIGGER fail_same_loop_denied_tool_result_message")
+
+    with pytest.raises(ProviderCompletionError, match="reused tool call ID"):
+        await loop.run_turn("second turn")
+
+    assert tool.arguments is None
+    loaded = store.load_session(session.session_id)
+    assert len(loaded.tool_calls) == 1
+    recovered = loaded.tool_calls[0]
+    assert recovered.call_id == "reused-call"
+    assert recovered.arguments == {"text": "first"}
+    assert recovered.approved is False
+    assert recovered.executed is False
+    assert recovered.dispatched is False
+    assert "it was not run" in (recovered.error or "")
+    tool_messages = [message for message in loaded.messages if message.role == "tool"]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].metadata["call_id"] == "reused-call"
+    assert provider.calls == 2
+
+
+@pytest.mark.asyncio
 async def test_turn_token_budget_stops_before_tool_side_effects(tmp_path):
     provider = BudgetExhaustingToolProvider()
     tool = CaptureTool(SafetyGuard(project_root=tmp_path))
@@ -1971,6 +2336,20 @@ async def test_turn_token_budget_stops_before_tool_side_effects(tmp_path):
     assert provider.calls == 1
     assert loop._last_turn_budget_exhausted is True
     assert loop._last_turn_prompt_tokens + loop._last_turn_completion_tokens == 20
+    assert loop.current_session is not None
+    loaded = loop.session_store.load_session(loop.current_session.session_id)
+    assert len(loaded.tool_calls) == 1
+    record = loaded.tool_calls[0]
+    assert record.call_id == "call-budget-1"
+    assert record.approved is False
+    assert record.executed is False
+    assert record.dispatched is False
+    assert "budget was exhausted" in (record.error or "")
+    tool_messages = [message for message in loaded.messages if message.role == "tool"]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].metadata["call_id"] == "call-budget-1"
+    assert "budget was exhausted" in tool_messages[0].content
+    assert "it was not run" in tool_messages[0].content
 
 
 @pytest.mark.asyncio

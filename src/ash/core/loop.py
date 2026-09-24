@@ -18,6 +18,7 @@ emits new tool calls. A :class:`CircuitBreaker` halts the loop after
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import fnmatch
 import json
 from collections import deque
@@ -1762,6 +1763,8 @@ class AshLoop:
         previous_turn_id = self.turn_context.turn_id if self.turn_context else None
         self._turn_running = True
         try:
+            if self.current_session is not None:
+                await self._recover_current_session_before_turn()
             await self._negotiate_provider_capabilities()
             if (
                 _metadata_has_image_blocks(user_metadata)
@@ -1832,6 +1835,37 @@ class AshLoop:
             self._active_turn_user_message = None
             self._turn_running = False
             await self._close_retired_mcp_runtimes()
+
+    async def _recover_current_session_before_turn(self) -> None:
+        """Repair interrupted durable state before issuing another model request."""
+
+        if self.current_session is None:
+            return
+        session_id = self.current_session.session_id
+        from ash.core.checkpoints import recover_interrupted_turns
+
+        deferred_mcp_calls = await self._recover_persisted_mcp_tasks(session_id)
+        self.recovery_summary = recover_interrupted_turns(
+            self.session_store,
+            self.safety_guard,
+            session_id,
+            deferred_call_ids=deferred_mcp_calls,
+        )
+        if deferred_mcp_calls:
+            raise RuntimeError(
+                "Session resume is waiting for durable MCP task recovery; "
+                "the task handle was preserved and no tool call was replayed."
+            )
+        self.current_session = self.session_store.load_session(session_id)
+        self.recovered_turns = self.recovery_summary.interrupted_turns
+        if self.recovered_turns:
+            self._emit_recovered_tool_events(self.recovery_summary)
+            self._emit_event(
+                {
+                    "type": "session.recovery",
+                    **self.recovery_summary.to_dict(),
+                }
+            )
 
     async def _run_turn(
         self,
@@ -1977,6 +2011,7 @@ class AshLoop:
         iteration = 0
         iteration_budget = self.max_turn_iterations
         maximum_iteration_budget = self.max_turn_iterations + self.max_steering_messages
+        seen_tool_call_ids = self.session_store.tool_call_ids(session.session_id)
         while iteration < iteration_budget:
             iteration += 1
             self._drain_steering_messages(session)
@@ -2078,7 +2113,9 @@ class AshLoop:
             )
             try:
                 model_completion = await self._stream_one_completion(
-                    messages, provider_tools=iteration_tools
+                    messages,
+                    provider_tools=iteration_tools,
+                    seen_tool_call_ids=seen_tool_call_ids,
                 )
             except asyncio.CancelledError:
                 await self._fire_hook_lifecycle(
@@ -2179,6 +2216,36 @@ class AshLoop:
                 or (bool(tool_calls) and used_tokens >= turn_token_budget)
             ):
                 turn_budget_exhausted = True
+                if tool_calls:
+                    budget_error = (
+                        "Turn token budget was exhausted before this tool call could "
+                        "be approved or dispatched; it was not run."
+                    )
+                    for call in tool_calls:
+                        record = ToolCallRecord(
+                            call_id=call["call_id"],
+                            tool_name=call["name"],
+                            arguments=redact_value(call["arguments"]),
+                            approved=False,
+                            executed=False,
+                            dispatched=False,
+                            error=budget_error,
+                            timestamp=_utc_now(),
+                        )
+                        result_payload = self._tool_result_payload(
+                            {
+                                "success": False,
+                                "output": "",
+                                "error": budget_error,
+                            },
+                            record,
+                            defer_terminal_persistence=True,
+                        )
+                        self._persist_deferred_tool_result(
+                            session=session,
+                            call=call,
+                            result=result_payload,
+                        )
                 tool_notice = (
                     " Pending tool calls were not executed." if tool_calls else ""
                 )
@@ -2220,7 +2287,10 @@ class AshLoop:
             # calls retain deterministic sequential side-effect ordering.
             try:
                 results = await self._execute_tool_calls(
-                    tool_calls, session, tools_snapshot=iteration_tools
+                    tool_calls,
+                    session,
+                    tools_snapshot=iteration_tools,
+                    persist_tool_messages=True,
                 )
             except CircuitBreakerError:
                 _log.warning("circuit breaker tripped — halting turn")
@@ -2230,30 +2300,6 @@ class AshLoop:
                 ).strip()
                 break
             self._record_instruction_scope_activity(tool_calls, results)
-
-            # Persist tool results as user-role messages so the model sees
-            # them on the next iteration.
-            for call, result in zip(tool_calls, results, strict=True):
-                tool_message = Message(
-                    role="tool",
-                    content=_render_tool_response(
-                        call_id=call["call_id"],
-                        tool_name=call["name"],
-                        result=result,
-                    ),
-                    timestamp=_utc_now(),
-                    metadata={"call_id": call["call_id"]},
-                )
-                self.session_store.save_message(
-                    session.session_id,
-                    tool_message,
-                    turn_id=self.turn_context.turn_id,
-                )
-                self.session_store.delete_mcp_task_for_call(
-                    session.session_id,
-                    call["call_id"],
-                )
-                session.messages.append(tool_message)
 
             if self._steering_messages and iteration >= iteration_budget:
                 iteration_budget = min(
@@ -2648,6 +2694,7 @@ class AshLoop:
         messages: list[dict[str, Any]],
         *,
         provider_tools: dict[str, BaseTool] | None = None,
+        seen_tool_call_ids: set[str] | None = None,
     ) -> CompletionOutcome:
         """Stream one completion with normalized token and cache usage."""
 
@@ -2889,6 +2936,14 @@ class AshLoop:
                     raise ProviderCompletionError(
                         "provider returned duplicate tool call IDs in one completion"
                     )
+                if seen_tool_call_ids is not None:
+                    reused = sorted(set(call_ids).intersection(seen_tool_call_ids))
+                    if reused:
+                        raise ProviderCompletionError(
+                            "provider reused tool call ID within one session: "
+                            f"{reused[0]}"
+                        )
+                    seen_tool_call_ids.update(call_ids)
                 self.provider_circuit_breaker.record_success(self._provider_circuit_key)
         finally:
             self.ui.finalize_turn()
@@ -3006,6 +3061,8 @@ class AshLoop:
         session: Session,
         *,
         tools_snapshot: dict[str, BaseTool] | None = None,
+        persist_tool_messages: bool = False,
+        _defer_terminal_persistence: bool = False,
     ) -> list[dict[str, Any]]:
         """Execute approved tool calls, gating each on the safety guard."""
 
@@ -3015,17 +3072,33 @@ class AshLoop:
             grouped = await asyncio.gather(
                 *(
                     self._execute_tool_calls(
-                        [call], session, tools_snapshot=tools_snapshot
+                        [call],
+                        session,
+                        tools_snapshot=tools_snapshot,
+                        _defer_terminal_persistence=(
+                            persist_tool_messages or _defer_terminal_persistence
+                        ),
                     )
                     for call in tool_calls
                 )
             )
-            return [result for group in grouped for result in group]
+            flattened = [result for group in grouped for result in group]
+            if persist_tool_messages:
+                for call, result in zip(tool_calls, flattened, strict=True):
+                    self._persist_deferred_tool_result(
+                        session=session,
+                        call=call,
+                        result=result,
+                    )
+            return flattened
 
+        defer_terminal_persistence = (
+            persist_tool_messages or _defer_terminal_persistence
+        )
         results: list[dict[str, Any]] = []
         for call in tool_calls:
             tool_name = call["name"]
-            arguments = call["arguments"]
+            arguments = deepcopy(call["arguments"])
             _log.debug(
                 "executing tool {!r} with argument keys {}",
                 tool_name,
@@ -3046,12 +3119,16 @@ class AshLoop:
             }
             self._emit_event({"type": "tool.requested", **event_base})
 
-            decision = self.permission_policy.evaluate(tool_name, arguments)
+            decision = self.permission_policy.evaluate(
+                tool_name, deepcopy(arguments)
+            )
             denial_feedback = ""
             if decision.action == PolicyAction.DENY:
                 approved = False
             elif self.on_tool_approval is not None:
-                decision_result = await self.on_tool_approval(tool_name, arguments)
+                decision_result = await self.on_tool_approval(
+                    tool_name, deepcopy(arguments)
+                )
                 if isinstance(decision_result, str):
                     approved = False
                     denial_feedback = decision_result.strip()
@@ -3065,14 +3142,18 @@ class AshLoop:
                 else:
                     approved = bool(decision_result)
             elif self.ui.has_approval_callback:
-                approved = self.ui.request_tool_approval(tool_name, arguments)
+                approved = self.ui.request_tool_approval(
+                    tool_name, deepcopy(arguments)
+                )
                 if isinstance(approved, str):
                     denial_feedback = approved.strip()
                     approved = False
             elif decision.action == PolicyAction.ALLOW:
                 approved = True
             else:
-                approved = self.ui.request_tool_approval(tool_name, arguments)
+                approved = self.ui.request_tool_approval(
+                    tool_name, deepcopy(arguments)
+                )
             record.approved = bool(approved)
             if approved:
                 self._append_tool_audit(
@@ -3098,11 +3179,14 @@ class AshLoop:
                         if decision.action == PolicyAction.DENY
                         else "Denied by user"
                     )
-                self.session_store.save_tool_call(
-                    session.session_id,
-                    record,
-                    turn_id=self.turn_context.turn_id if self.turn_context else None,
-                )
+                if not defer_terminal_persistence:
+                    self.session_store.save_tool_call(
+                        session.session_id,
+                        record,
+                        turn_id=(
+                            self.turn_context.turn_id if self.turn_context else None
+                        ),
+                    )
                 self._append_tool_audit(
                     session,
                     action_type=(
@@ -3131,13 +3215,22 @@ class AshLoop:
                         "reason": record.error,
                     }
                 )
-                results.append(
+                result_payload = self._tool_result_payload(
                     {
                         "success": False,
                         "output": "",
                         "error": record.error,
-                    }
+                    },
+                    record,
+                    defer_terminal_persistence=defer_terminal_persistence,
                 )
+                if persist_tool_messages:
+                    self._persist_deferred_tool_result(
+                        session=session,
+                        call=call,
+                        result=result_payload,
+                    )
+                results.append(result_payload)
                 continue
 
             # Persist approved intent before execution so a fresh process can
@@ -3151,11 +3244,14 @@ class AshLoop:
             tool = active_tools.get(tool_name)
             if tool is None:
                 record.error = f"Unknown tool: {tool_name}"
-                self.session_store.save_tool_call(
-                    session.session_id,
-                    record,
-                    turn_id=self.turn_context.turn_id if self.turn_context else None,
-                )
+                if not defer_terminal_persistence:
+                    self.session_store.save_tool_call(
+                        session.session_id,
+                        record,
+                        turn_id=(
+                            self.turn_context.turn_id if self.turn_context else None
+                        ),
+                    )
                 self._append_tool_audit(
                     session,
                     action_type="tool_call",
@@ -3178,13 +3274,22 @@ class AshLoop:
                     arguments=arguments,
                     error=record.error,
                 )
-                results.append(
+                result_payload = self._tool_result_payload(
                     {
                         "success": False,
                         "output": "",
                         "error": f"Unknown tool: {tool_name}",
-                    }
+                    },
+                    record,
+                    defer_terminal_persistence=defer_terminal_persistence,
                 )
+                if persist_tool_messages:
+                    self._persist_deferred_tool_result(
+                        session=session,
+                        call=call,
+                        result=result_payload,
+                    )
+                results.append(result_payload)
                 continue
 
             dispatched = False
@@ -3197,8 +3302,10 @@ class AshLoop:
                 try:
                     hooks = self._active_hooks()
                     if hooks is not None:
-                        await hooks.fire_pre_tool(tool_name, arguments)
-                    await self._apply_middlewares_before(tool_name, arguments, tool)
+                        await hooks.fire_pre_tool(tool_name, deepcopy(arguments))
+                    await self._apply_middlewares_before(
+                        tool_name, deepcopy(arguments), tool
+                    )
                 except ToolMiddlewareSkip:
                     tool_result = ToolResult(
                         success=True, output="skipped by middleware", error=None
@@ -3218,7 +3325,9 @@ class AshLoop:
                     self._emit_event({"type": "tool.started", **event_base})
                     with tool.event_context(event_base):
                         dispatched = True
-                        result_dict = await _execute_tool_once(tool, arguments)
+                        result_dict = await _execute_tool_once(
+                            tool, deepcopy(arguments)
+                        )
                     tool_result = ToolResult(
                         success=result_dict["success"],
                         output=result_dict["output"],
@@ -3230,9 +3339,11 @@ class AshLoop:
                         ),
                     )
                     if hooks is not None:
-                        await hooks.fire_post_tool(tool_name, arguments, tool_result)
+                        await hooks.fire_post_tool(
+                            tool_name, deepcopy(arguments), tool_result
+                        )
                     tool_result = await self._apply_middlewares_after(
-                        tool_name, arguments, tool_result
+                        tool_name, deepcopy(arguments), tool_result
                     )
                     if tool_result.outcome is ToolExecutionOutcome.UNKNOWN:
                         raw_error = tool_result.error or "the result was lost"
@@ -3264,11 +3375,14 @@ class AshLoop:
                 )
                 record.executed = dispatched
                 record.error = error
-                self.session_store.save_tool_call(
-                    session.session_id,
-                    record,
-                    turn_id=self.turn_context.turn_id if self.turn_context else None,
-                )
+                if not defer_terminal_persistence:
+                    self.session_store.save_tool_call(
+                        session.session_id,
+                        record,
+                        turn_id=(
+                            self.turn_context.turn_id if self.turn_context else None
+                        ),
+                    )
                 self._append_tool_audit(
                     session,
                     action_type=_audit_action_for_tool(tool_name),
@@ -3303,24 +3417,34 @@ class AshLoop:
                     arguments=arguments,
                     error=error,
                 )
-                results.append(
+                result_payload = self._tool_result_payload(
                     {
                         "success": False,
                         "output": "",
                         "error": error,
-                    }
+                    },
+                    record,
+                    defer_terminal_persistence=defer_terminal_persistence,
                 )
+                if persist_tool_messages:
+                    self._persist_deferred_tool_result(
+                        session=session,
+                        call=call,
+                        result=result_payload,
+                    )
+                results.append(result_payload)
                 continue
 
             record.executed = dispatched
             record.result = tool_result.output
             record.error = tool_result.error
             ambiguous = tool_result.outcome is ToolExecutionOutcome.UNKNOWN
-            self.session_store.save_tool_call(
-                session.session_id,
-                record,
-                turn_id=self.turn_context.turn_id if self.turn_context else None,
-            )
+            if not defer_terminal_persistence:
+                self.session_store.save_tool_call(
+                    session.session_id,
+                    record,
+                    turn_id=self.turn_context.turn_id if self.turn_context else None,
+                )
             self._append_tool_audit(
                 session,
                 action_type=_audit_action_for_tool(tool_name),
@@ -3368,7 +3492,7 @@ class AshLoop:
                     error=tool_result.error or "tool reported failure",
                 )
 
-            results.append(
+            result_payload = self._tool_result_payload(
                 {
                     "success": tool_result.success,
                     "output": tool_result.output,
@@ -3391,8 +3515,17 @@ class AshLoop:
                     ),
                     **({"images": tool_result.images} if tool_result.images else {}),
                     "token_count": tool_result.token_count,
-                }
+                },
+                record,
+                defer_terminal_persistence=defer_terminal_persistence,
             )
+            if persist_tool_messages:
+                self._persist_deferred_tool_result(
+                    session=session,
+                    call=call,
+                    result=result_payload,
+                )
+            results.append(result_payload)
             if not dispatched:
                 continue
             self._record_repo_map_activity(tool_name, arguments, tool_result)
@@ -3424,6 +3557,49 @@ class AshLoop:
                     self._iterations_since_skill_use = 0
 
         return results
+
+    @staticmethod
+    def _tool_result_payload(
+        payload: dict[str, Any],
+        record: ToolCallRecord,
+        *,
+        defer_terminal_persistence: bool,
+    ) -> dict[str, Any]:
+        if defer_terminal_persistence:
+            payload["_terminal_record"] = record.model_copy(deep=True)
+        return payload
+
+    def _persist_deferred_tool_result(
+        self,
+        *,
+        session: Session,
+        call: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        record = result.get("_terminal_record")
+        if not isinstance(record, ToolCallRecord):
+            raise RuntimeError("deferred tool result is missing terminal record")
+        visible_result = {
+            key: value for key, value in result.items() if key != "_terminal_record"
+        }
+        tool_message = Message(
+            role="tool",
+            content=_render_tool_response(
+                call_id=call["call_id"],
+                tool_name=call["name"],
+                result=visible_result,
+            ),
+            timestamp=_utc_now(),
+            metadata={"call_id": call["call_id"]},
+        )
+        self.session_store.finalize_tool_call_with_message(
+            session.session_id,
+            record,
+            tool_message,
+            turn_id=self.turn_context.turn_id if self.turn_context else None,
+        )
+        result.pop("_terminal_record", None)
+        session.messages.append(tool_message)
 
     def _remember_repo_file(self, path: Path) -> None:
         """Keep a bounded least-recently-used list of files relevant to context."""

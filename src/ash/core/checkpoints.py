@@ -44,6 +44,9 @@ class RecoveredToolCall:
     error: str
     dispatched: bool
     ambiguous: bool
+    success: bool = False
+    output: str = ""
+    arguments: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -356,6 +359,94 @@ def recover_interrupted_turns(
                     error=call_errors[call_id],
                     dispatched=True,
                     ambiguous=False,
+                )
+            )
+
+        for missing in store.assistant_tool_calls_missing_results(session_id, turn_id):
+            call_id = str(missing["call_id"])
+            if call_id in deferred_call_ids or call_id in pending_ids:
+                continue
+            durable = missing.get("durable")
+            if not isinstance(durable, dict):
+                tool_name = str(missing["tool_name"])
+                error = (
+                    "Ash stopped before this tool call was durably recorded or "
+                    "dispatched; it was not run."
+                )
+                call_errors[call_id] = error
+                turn_recovered.append(
+                    RecoveredToolCall(
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        turn_id=turn_id,
+                        error=error,
+                        dispatched=False,
+                        ambiguous=False,
+                        arguments=dict(missing.get("arguments") or {}),
+                    )
+                )
+                continue
+
+            tool_name = str(durable.get("tool_name") or missing["tool_name"])
+            dispatched = bool(durable.get("dispatched"))
+            raw_result = durable.get("result")
+            raw_error = durable.get("error")
+            arguments = durable.get("arguments")
+            if raw_result is None and raw_error is None:
+                if dispatched:
+                    error = (
+                        "Ash stopped while this tool was running; its outcome is "
+                        "unknown. Inspect the workspace before continuing."
+                    )
+                    unknown_calls.append(f"{tool_name} ({call_id})")
+                    turn_unknown.append({"call_id": call_id, "tool": tool_name})
+                    ambiguous = True
+                else:
+                    error = (
+                        "Ash stopped before this tool was dispatched; it was not run."
+                    )
+                    ambiguous = False
+                call_errors[call_id] = error
+                turn_recovered.append(
+                    RecoveredToolCall(
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        turn_id=turn_id,
+                        error=error,
+                        dispatched=dispatched,
+                        ambiguous=ambiguous,
+                        arguments=(
+                            dict(arguments) if isinstance(arguments, dict) else {}
+                        ),
+                    )
+                )
+                continue
+
+            error = str(raw_error or "")
+            output = str(raw_result or "")
+            success = raw_error is None
+            unknown_marker = error.startswith("Tool outcome is ambiguous;")
+            ambiguous = bool(
+                dispatched
+                and (
+                    unknown_marker
+                    or (raw_error is not None and raw_result is None)
+                )
+            )
+            if ambiguous:
+                unknown_calls.append(f"{tool_name} ({call_id})")
+                turn_unknown.append({"call_id": call_id, "tool": tool_name})
+            turn_recovered.append(
+                RecoveredToolCall(
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    turn_id=turn_id,
+                    error=error,
+                    dispatched=dispatched,
+                    ambiguous=ambiguous,
+                    success=success,
+                    output=output,
+                    arguments=(dict(arguments) if isinstance(arguments, dict) else {}),
                 )
             )
 

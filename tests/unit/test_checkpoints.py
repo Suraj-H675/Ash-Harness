@@ -949,3 +949,153 @@ def test_recovery_processes_interrupted_turn_with_incomplete_checkpoint_only(
         ).interrupted_turns
         == 0
     )
+
+
+def test_recovery_reconstructs_missing_terminal_tool_result_message(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-terminal-missing-result"
+    call_id = "call-terminal"
+    store.start_turn(session.session_id, turn_id, "run command")
+    store.save_message(
+        session.session_id,
+        Message(
+            role="assistant",
+            content="",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "tool_calls": [
+                    {
+                        "call_id": call_id,
+                        "name": "run_command",
+                        "arguments": {"command_line": "build"},
+                    }
+                ]
+            },
+        ),
+        turn_id=turn_id,
+    )
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id=call_id,
+            tool_name="run_command",
+            arguments={"command_line": "build"},
+            approved=True,
+            executed=True,
+            dispatched=True,
+            result="build complete",
+            error=None,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+    store.interrupt_turn(turn_id)
+
+    assert [
+        str(row["turn_id"]) for row in store.recoverable_turns(session.session_id)
+    ] == [turn_id]
+
+    summary = recover_interrupted_turns(
+        store, SafetyGuard(tmp_path), session.session_id
+    )
+
+    assert summary.interrupted_turns == 1
+    assert len(summary.recovered_calls) == 1
+    recovered_call = summary.recovered_calls[0]
+    assert recovered_call.call_id == call_id
+    assert recovered_call.success is True
+    assert recovered_call.output == "build complete"
+    assert recovered_call.dispatched is True
+    assert recovered_call.ambiguous is False
+    loaded = store.load_session(session.session_id)
+    durable = loaded.tool_calls[0]
+    assert durable.executed is True
+    assert durable.dispatched is True
+    assert durable.result == "build complete"
+    assert durable.error is None
+    tool_messages = [message for message in loaded.messages if message.role == "tool"]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].metadata["call_id"] == call_id
+    assert '"success": true' in tool_messages[0].content
+    assert '"output": "build complete"' in tool_messages[0].content
+    assert '"replayed": false' in tool_messages[0].content
+    audit = store.list_audit_logs(session.session_id)[-1]
+    assert audit.details["success"] is True
+    assert audit.details["output"] == "build complete"
+    assert (
+        recover_interrupted_turns(
+            store, SafetyGuard(tmp_path), session.session_id
+        ).interrupted_turns
+        == 0
+    )
+
+
+def test_recovery_preserves_terminal_unknown_outcome_classification(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-terminal-unknown"
+    call_id = "call-unknown"
+    store.start_turn(session.session_id, turn_id, "run command")
+    store.save_message(
+        session.session_id,
+        Message(
+            role="assistant",
+            content="",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "tool_calls": [
+                    {
+                        "call_id": call_id,
+                        "name": "run_command",
+                        "arguments": {"command_line": "build"},
+                    }
+                ]
+            },
+        ),
+        turn_id=turn_id,
+    )
+    ambiguous_error = (
+        "Tool outcome is ambiguous; its side effect may have occurred. "
+        "Ash did not retry the operation: transport lost terminal acknowledgement"
+    )
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id=call_id,
+            tool_name="run_command",
+            arguments={"command_line": "build"},
+            approved=True,
+            executed=True,
+            dispatched=True,
+            result="",
+            error=ambiguous_error,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+    store.interrupt_turn(turn_id)
+
+    summary = recover_interrupted_turns(
+        store, SafetyGuard(tmp_path), session.session_id
+    )
+
+    assert summary.interrupted_turns == 1
+    assert summary.needs_attention is True
+    assert summary.unknown_calls == ("run_command (call-unknown)",)
+    assert len(summary.recovered_calls) == 1
+    recovered = summary.recovered_calls[0]
+    assert recovered.ambiguous is True
+    assert recovered.dispatched is True
+    assert recovered.success is False
+    assert recovered.output == ""
+    loaded = store.load_session(session.session_id)
+    durable = loaded.tool_calls[0]
+    assert durable.result == ""
+    assert durable.error == ambiguous_error
+    tool_messages = [message for message in loaded.messages if message.role == "tool"]
+    assert len(tool_messages) == 1
+    assert '"ambiguous": true' in tool_messages[0].content
+    assert '"replayed": false' in tool_messages[0].content
+    reports = store.interrupted_recovery_reports(session.session_id)
+    assert reports[0]["status"] == "needs_attention"

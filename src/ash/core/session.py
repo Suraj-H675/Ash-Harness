@@ -1936,27 +1936,130 @@ class SessionStore:
         """Return turns that still require crash-consistency recovery."""
 
         with closing(get_db_connection(self.db_path)) as conn:
-            return conn.execute(
-                "SELECT tj.* FROM turn_journal AS tj "
-                "WHERE tj.session_id = ? AND ("
-                "tj.status = 'started' OR ("
-                "tj.status = 'interrupted' "
-                "AND COALESCE(tj.recovery_json, '{}') = '{}' "
-                "AND (EXISTS ("
-                "SELECT 1 FROM tool_calls AS tc "
-                "WHERE tc.session_id = tj.session_id "
-                "AND tc.turn_id = tj.turn_id "
-                "AND tc.approved = 1 AND tc.executed = 0 "
-                "AND tc.result IS NULL AND tc.error IS NULL"
-                ") OR EXISTS ("
-                "SELECT 1 FROM file_checkpoints AS fc "
-                "WHERE fc.session_id = tj.session_id "
-                "AND fc.turn_id = tj.turn_id "
-                "AND fc.restored = 0 AND fc.after_sha256 IS NULL"
-                "))"
-                ")) ORDER BY tj.started_at DESC, tj.turn_id DESC",
+            rows = conn.execute(
+                "SELECT * FROM turn_journal WHERE session_id = ? "
+                "AND (status = 'started' OR (status = 'interrupted' "
+                "AND COALESCE(recovery_json, '{}') = '{}')) "
+                "ORDER BY started_at DESC, turn_id DESC",
                 (session_id,),
             ).fetchall()
+            recoverable: list[sqlite3.Row] = []
+            for row in rows:
+                if str(row["status"]) == "started":
+                    recoverable.append(row)
+                    continue
+                turn_id = str(row["turn_id"])
+                pending = conn.execute(
+                    "SELECT 1 FROM tool_calls WHERE session_id = ? AND turn_id = ? "
+                    "AND approved = 1 AND executed = 0 "
+                    "AND result IS NULL AND error IS NULL LIMIT 1",
+                    (session_id, turn_id),
+                ).fetchone()
+                incomplete_checkpoint = conn.execute(
+                    "SELECT 1 FROM file_checkpoints WHERE session_id = ? "
+                    "AND turn_id = ? AND restored = 0 AND after_sha256 IS NULL "
+                    "LIMIT 1",
+                    (session_id, turn_id),
+                ).fetchone()
+                if (
+                    pending is not None
+                    or incomplete_checkpoint is not None
+                    or self._assistant_tool_calls_missing_results_in_connection(
+                        conn, session_id, turn_id
+                    )
+                ):
+                    recoverable.append(row)
+            return recoverable
+
+    def assistant_tool_calls_missing_results(
+        self, session_id: str, turn_id: str
+    ) -> list[dict[str, Any]]:
+        """Return assistant tool calls that lack a matching model-visible result."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            return self._assistant_tool_calls_missing_results_in_connection(
+                conn, session_id, turn_id
+            )
+
+    @staticmethod
+    def _assistant_tool_calls_missing_results_in_connection(
+        conn: sqlite3.Connection,
+        session_id: str,
+        turn_id: str,
+    ) -> list[dict[str, Any]]:
+        durable_rows = conn.execute(
+            "SELECT call_id, tool_name, arguments_json, approved, executed, dispatched, "
+            "result, error FROM tool_calls WHERE session_id = ? AND turn_id = ?",
+            (session_id, turn_id),
+        ).fetchall()
+        durable_by_id = {str(row["call_id"]): row for row in durable_rows}
+        result_ids: set[str] = set()
+        for row in conn.execute(
+            "SELECT metadata_json FROM messages WHERE session_id = ? "
+            "AND turn_id = ? AND role = 'tool'",
+            (session_id, turn_id),
+        ).fetchall():
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(metadata, dict) and metadata.get("call_id"):
+                result_ids.add(str(metadata["call_id"]))
+
+        missing: dict[str, dict[str, Any]] = {}
+        rows = conn.execute(
+            "SELECT metadata_json FROM messages WHERE session_id = ? "
+            "AND turn_id = ? AND role = 'assistant' ORDER BY message_id",
+            (session_id, turn_id),
+        ).fetchall()
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            raw_calls = metadata.get("tool_calls") if isinstance(metadata, dict) else None
+            if not isinstance(raw_calls, list):
+                continue
+            for raw_call in raw_calls:
+                if not isinstance(raw_call, dict):
+                    continue
+                call_id = str(raw_call.get("call_id", "")).strip()
+                tool_name = str(raw_call.get("name", "")).strip()
+                if (
+                    not call_id
+                    or not tool_name
+                    or call_id in result_ids
+                    or call_id in missing
+                ):
+                    continue
+                arguments = raw_call.get("arguments")
+                durable = durable_by_id.get(call_id)
+                durable_payload: dict[str, Any] | None = None
+                if durable is not None:
+                    try:
+                        durable_arguments = json.loads(durable["arguments_json"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        durable_arguments = {}
+                    durable_payload = {
+                        "tool_name": str(durable["tool_name"]),
+                        "arguments": (
+                            dict(durable_arguments)
+                            if isinstance(durable_arguments, dict)
+                            else {}
+                        ),
+                        "approved": bool(durable["approved"]),
+                        "executed": bool(durable["executed"]),
+                        "dispatched": bool(durable["dispatched"]),
+                        "result": durable["result"],
+                        "error": durable["error"],
+                    }
+                missing[call_id] = {
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "arguments": dict(arguments) if isinstance(arguments, dict) else {},
+                    "durable": durable_payload,
+                }
+        return list(missing.values())
 
     def pending_tool_calls(self, session_id: str, turn_id: str) -> list[sqlite3.Row]:
         """Return approved calls that never persisted an execution outcome."""
@@ -1969,6 +2072,16 @@ class SessionStore:
                 "ORDER BY timestamp, call_id",
                 (session_id, turn_id),
             ).fetchall()
+
+    def tool_call_ids(self, session_id: str) -> set[str]:
+        """Return durable provider/tool call IDs already used by one session."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT call_id FROM tool_calls WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        return {str(row["call_id"]) for row in rows}
 
     def file_checkpoints_for_call(
         self, session_id: str, turn_id: str, call_id: str
@@ -2015,11 +2128,13 @@ class SessionStore:
     ) -> None:
         """Atomically persist one startup recovery decision."""
 
+        from ash.core.redaction import redact_text
+
         with closing(get_db_connection(self.db_path)) as conn, conn:
             recovered_by_id = {str(call.call_id): call for call in recovered_calls}
             for call_id, error in call_errors.items():
                 call = recovered_by_id[call_id]
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE tool_calls SET executed = ?, error = ? "
                     "WHERE session_id = ? AND turn_id = ? AND call_id = ?",
                     (
@@ -2030,8 +2145,34 @@ class SessionStore:
                         call_id,
                     ),
                 )
+                if cursor.rowcount == 0:
+                    arguments = getattr(call, "arguments", None)
+                    conn.execute(
+                        """
+                        INSERT INTO tool_calls (
+                            call_id, session_id, tool_name, arguments_json,
+                            approved, executed, dispatched, result, error,
+                            timestamp, turn_id
+                        ) VALUES (?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?)
+                        """,
+                        (
+                            call_id,
+                            session_id,
+                            str(call.tool_name),
+                            json.dumps(
+                                dict(arguments) if isinstance(arguments, dict) else {}
+                            ),
+                            int(bool(call.dispatched)),
+                            int(bool(call.dispatched)),
+                            error,
+                            _serialize_datetime(_utc_now()),
+                            turn_id,
+                        ),
+                    )
             for call in recovered_calls:
                 tool_name = str(call.tool_name)
+                recovered_success = bool(getattr(call, "success", False))
+                recovered_output = str(getattr(call, "output", "") or "")
                 action_type: AuditAction = (
                     "command_run"
                     if tool_name == "run_command"
@@ -2059,8 +2200,67 @@ class SessionStore:
                         "replayed": False,
                         "recovered": True,
                         "replay_policy": "never",
+                        "success": recovered_success,
+                        "output": redact_text(recovered_output),
                     },
-                    result="FAILURE",
+                    result=(
+                        "SUCCESS"
+                        if recovered_success
+                        else "FAILURE"
+                    ),
+                )
+            message_rows = conn.execute(
+                "SELECT metadata_json FROM messages WHERE session_id = ? "
+                "AND turn_id = ? AND role = 'tool' ORDER BY message_id",
+                (session_id, turn_id),
+            ).fetchall()
+            recovery_message_timestamp: datetime | None = None
+            for call in recovered_calls:
+                call_id = str(call.call_id)
+                if _tool_result_message_exists(message_rows, call_id):
+                    continue
+                recovery_message_timestamp = _utc_now()
+                success = bool(getattr(call, "success", False))
+                output = str(getattr(call, "output", "") or "")
+                recovery_error: str | None = (
+                    str(call.error) if str(call.error) else None
+                )
+                content = json.dumps(
+                    {
+                        "success": success,
+                        "output": output,
+                        "error": recovery_error,
+                        "provenance": "ash_startup_recovery",
+                        "dispatched": bool(call.dispatched),
+                        "ambiguous": bool(call.ambiguous),
+                        "replayed": False,
+                        "policy_note": (
+                            "Ash reconstructed this model-visible result during "
+                            "startup recovery and did not replay the tool call."
+                        ),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO messages (
+                        session_id, role, content, timestamp, metadata_json,
+                        token_count, prompt_tokens, completion_tokens, turn_id
+                    ) VALUES (?, 'tool', ?, ?, ?, 0, 0, 0, ?)
+                    """,
+                    (
+                        session_id,
+                        content,
+                        _serialize_datetime(recovery_message_timestamp),
+                        json.dumps({"call_id": call_id}),
+                        turn_id,
+                    ),
+                )
+            if recovery_message_timestamp is not None:
+                conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                    (_serialize_datetime(recovery_message_timestamp), session_id),
                 )
             if restored_checkpoint_ids:
                 placeholders = ",".join("?" for _ in restored_checkpoint_ids)
@@ -2885,6 +3085,84 @@ class SessionStore:
                     _serialize_datetime(record.timestamp),
                     turn_id,
                 ),
+            )
+
+    def finalize_tool_call_with_message(
+        self,
+        session_id: str,
+        record: ToolCallRecord,
+        message: Message,
+        *,
+        turn_id: str | None = None,
+    ) -> None:
+        """Atomically persist a terminal tool outcome and model-visible result."""
+
+        with closing(get_db_connection(self.db_path)) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO tool_calls (
+                    call_id,
+                    session_id,
+                    tool_name,
+                    arguments_json,
+                    approved,
+                    executed,
+                    dispatched,
+                    result,
+                    error,
+                    timestamp,
+                    turn_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, call_id) DO UPDATE SET
+                    tool_name = excluded.tool_name,
+                    arguments_json = excluded.arguments_json,
+                    approved = excluded.approved,
+                    executed = excluded.executed,
+                    dispatched = excluded.dispatched,
+                    result = excluded.result,
+                    error = excluded.error,
+                    timestamp = excluded.timestamp,
+                    turn_id = COALESCE(excluded.turn_id, tool_calls.turn_id)
+                """,
+                (
+                    record.call_id,
+                    session_id,
+                    record.tool_name,
+                    json.dumps(record.arguments),
+                    int(record.approved),
+                    int(record.executed),
+                    int(record.dispatched),
+                    record.result,
+                    record.error,
+                    _serialize_datetime(record.timestamp),
+                    turn_id,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    session_id, role, content, timestamp, metadata_json,
+                    token_count, prompt_tokens, completion_tokens, turn_id
+                )
+                VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)
+                """,
+                (
+                    session_id,
+                    message.role,
+                    message.content,
+                    _serialize_datetime(message.timestamp),
+                    json.dumps(message.metadata),
+                    turn_id,
+                ),
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                (_serialize_datetime(message.timestamp), session_id),
+            )
+            conn.execute(
+                "DELETE FROM mcp_tasks WHERE session_id = ? AND call_id = ?",
+                (session_id, record.call_id),
             )
 
     def save_mcp_task(
