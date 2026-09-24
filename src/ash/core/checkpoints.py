@@ -165,7 +165,7 @@ def recover_interrupted_turns(
     """Compensate provably interrupted direct edits and flag unknown effects."""
 
     deferred_call_ids = deferred_call_ids or set()
-    turns = store.started_turns(session_id)
+    turns = store.recoverable_turns(session_id)
     compensated_calls: list[str] = []
     compensated_files: list[Path] = []
     unknown_calls: list[str] = []

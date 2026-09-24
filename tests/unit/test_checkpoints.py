@@ -800,3 +800,152 @@ def test_recovery_marks_an_unstarted_approved_intent_as_not_run(tmp_path) -> Non
         ).interrupted_turns
         == 0
     )
+
+
+def test_recovery_ignores_terminal_middleware_skipped_call(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "turn-1", "skip tool")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id="call-skipped",
+            tool_name="run_command",
+            arguments={"command_line": "build"},
+            approved=True,
+            executed=False,
+            dispatched=False,
+            result="skipped by middleware",
+            error=None,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id="turn-1",
+    )
+
+    assert store.pending_tool_calls(session.session_id, "turn-1") == []
+
+    summary = recover_interrupted_turns(
+        store, SafetyGuard(tmp_path), session.session_id
+    )
+
+    assert summary.recovered_calls == ()
+    recovered = store.load_session(session.session_id).tool_calls[0]
+    assert recovered.executed is False
+    assert recovered.dispatched is False
+    assert recovered.result == "skipped by middleware"
+    assert recovered.error is None
+
+
+def test_recovery_processes_interrupted_turn_with_pending_dispatched_call(
+    tmp_path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-interrupted-after-dispatch"
+    store.start_turn(session.session_id, turn_id, "run command")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id="call-command",
+            tool_name="run_command",
+            arguments={"command_line": "build"},
+            approved=True,
+            executed=False,
+            dispatched=True,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+    store.interrupt_turn(turn_id)
+
+    summary = recover_interrupted_turns(
+        store, SafetyGuard(tmp_path), session.session_id
+    )
+
+    assert summary.interrupted_turns == 1
+    assert summary.needs_attention is True
+    assert summary.unknown_calls == ("run_command (call-command)",)
+    recovered = store.load_session(session.session_id).tool_calls[0]
+    assert recovered.executed is True
+    assert recovered.dispatched is True
+    assert "outcome is unknown" in (recovered.error or "")
+    reports = store.interrupted_recovery_reports(session.session_id)
+    assert reports[0]["turn_id"] == turn_id
+    assert reports[0]["status"] == "needs_attention"
+    assert (
+        recover_interrupted_turns(
+            store, SafetyGuard(tmp_path), session.session_id
+        ).interrupted_turns
+        == 0
+    )
+
+
+def test_recovery_ignores_interrupted_turn_without_pending_work(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-cleanly-interrupted"
+    store.start_turn(session.session_id, turn_id, "failed before tools")
+    store.interrupt_turn(turn_id)
+
+    summary = recover_interrupted_turns(
+        store, SafetyGuard(tmp_path), session.session_id
+    )
+
+    assert summary.interrupted_turns == 0
+    assert summary.recovered_calls == ()
+    assert store.interrupted_recovery_reports(session.session_id) == []
+
+
+def test_recovery_processes_interrupted_turn_with_incomplete_checkpoint_only(
+    tmp_path,
+) -> None:
+    path = tmp_path / "file.txt"
+    path.write_text("before", encoding="utf-8")
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-interrupted-checkpoint-only"
+    call_id = "call-edit"
+    store.start_turn(session.session_id, turn_id, "edit file")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id=call_id,
+            tool_name="whole_edit",
+            arguments={"file_path": "file.txt", "content": "after"},
+            approved=True,
+            executed=True,
+            dispatched=True,
+            result="tool failed after dispatch",
+            error="checkpoint finalization failed",
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+    store.save_file_checkpoint(
+        session.session_id,
+        turn_id,
+        "whole_edit",
+        str(path),
+        existed=True,
+        before_content=b"before",
+        before_mode=path.stat().st_mode,
+        call_id=call_id,
+    )
+    store.interrupt_turn(turn_id)
+
+    summary = recover_interrupted_turns(
+        store, SafetyGuard(tmp_path), session.session_id
+    )
+
+    assert summary.interrupted_turns == 1
+    checkpoints = store.file_checkpoints_for_turns(session.session_id, [turn_id])
+    assert checkpoints == []
+    reports = store.interrupted_recovery_reports(session.session_id)
+    assert reports[0]["turn_id"] == turn_id
+    assert reports[0]["status"] == "compensated"
+    assert (
+        recover_interrupted_turns(
+            store, SafetyGuard(tmp_path), session.session_id
+        ).interrupted_turns
+        == 0
+    )

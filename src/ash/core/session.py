@@ -1932,13 +1932,40 @@ class SessionStore:
                 (session_id,),
             ).fetchall()
 
+    def recoverable_turns(self, session_id: str) -> list[sqlite3.Row]:
+        """Return turns that still require crash-consistency recovery."""
+
+        with closing(get_db_connection(self.db_path)) as conn:
+            return conn.execute(
+                "SELECT tj.* FROM turn_journal AS tj "
+                "WHERE tj.session_id = ? AND ("
+                "tj.status = 'started' OR ("
+                "tj.status = 'interrupted' "
+                "AND COALESCE(tj.recovery_json, '{}') = '{}' "
+                "AND (EXISTS ("
+                "SELECT 1 FROM tool_calls AS tc "
+                "WHERE tc.session_id = tj.session_id "
+                "AND tc.turn_id = tj.turn_id "
+                "AND tc.approved = 1 AND tc.executed = 0 "
+                "AND tc.result IS NULL AND tc.error IS NULL"
+                ") OR EXISTS ("
+                "SELECT 1 FROM file_checkpoints AS fc "
+                "WHERE fc.session_id = tj.session_id "
+                "AND fc.turn_id = tj.turn_id "
+                "AND fc.restored = 0 AND fc.after_sha256 IS NULL"
+                "))"
+                ")) ORDER BY tj.started_at DESC, tj.turn_id DESC",
+                (session_id,),
+            ).fetchall()
+
     def pending_tool_calls(self, session_id: str, turn_id: str) -> list[sqlite3.Row]:
         """Return approved calls that never persisted an execution outcome."""
 
         with closing(get_db_connection(self.db_path)) as conn:
             return conn.execute(
                 "SELECT * FROM tool_calls WHERE session_id = ? AND turn_id = ? "
-                "AND approved = 1 AND executed = 0 AND error IS NULL "
+                "AND approved = 1 AND executed = 0 "
+                "AND result IS NULL AND error IS NULL "
                 "ORDER BY timestamp, call_id",
                 (session_id, turn_id),
             ).fetchall()
@@ -2045,7 +2072,9 @@ class SessionStore:
             conn.execute(
                 "UPDATE turn_journal SET status = 'interrupted', completed_at = ?, "
                 "recovery_json = ? WHERE session_id = ? AND turn_id = ? "
-                "AND status = 'started'",
+                "AND (status = 'started' OR ("
+                "status = 'interrupted' AND COALESCE(recovery_json, '{}') = '{}'"
+                "))",
                 (
                     _serialize_datetime(_utc_now()),
                     json.dumps(recovery, sort_keys=True),
