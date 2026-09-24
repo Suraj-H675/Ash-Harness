@@ -276,6 +276,229 @@ async def test_ollama_forwards_tools_and_emits_native_tool_calls() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ollama_rejects_duplicate_native_tool_call_ids() -> None:
+    client = _FakeOllamaClient(
+        json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "duplicate-call",
+                            "function": {"name": "first", "arguments": {}},
+                        },
+                        {
+                            "id": "duplicate-call",
+                            "function": {"name": "second", "arguments": {}},
+                        },
+                    ],
+                },
+                "done": True,
+                "done_reason": "stop",
+            }
+        ).encode()
+    )
+    provider = OllamaProvider(model_name="tool-model", client=client)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="duplicate tool call ID: duplicate-call"):
+        _ = [chunk async for chunk in provider.stream_chat([])]
+
+
+@pytest.mark.asyncio
+async def test_ollama_assigns_unique_ids_to_idless_calls_across_chunks() -> None:
+    first = json.dumps(
+        {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "first", "arguments": {}}}
+                ],
+            },
+            "done": False,
+        }
+    ).encode()
+    second = json.dumps(
+        {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "second", "arguments": {}}}
+                ],
+            },
+            "done": True,
+            "done_reason": "stop",
+        }
+    ).encode()
+    provider = OllamaProvider(
+        model_name="tool-model",
+        client=_FakeOllamaClient(b"", chunks=[first + b"\n", second + b"\n"]),  # type: ignore[arg-type]
+    )
+
+    chunks = [chunk async for chunk in provider.stream_chat([])]
+
+    assert chunks[-1].native_tool_calls is not None
+    assert [call.call_id for call in chunks[-1].native_tool_calls] == [
+        "call_0",
+        "call_1",
+    ]
+    assert [call.name for call in chunks[-1].native_tool_calls] == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_ollama_generated_id_avoids_prior_explicit_id() -> None:
+    first = json.dumps(
+        {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "explicit", "arguments": {}},
+                    }
+                ],
+            },
+            "done": False,
+        }
+    ).encode()
+    second = json.dumps(
+        {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "generated", "arguments": {}}}
+                ],
+            },
+            "done": True,
+            "done_reason": "stop",
+        }
+    ).encode()
+    provider = OllamaProvider(
+        model_name="tool-model",
+        client=_FakeOllamaClient(b"", chunks=[first + b"\n", second + b"\n"]),  # type: ignore[arg-type]
+    )
+
+    chunks = [chunk async for chunk in provider.stream_chat([])]
+
+    assert chunks[-1].native_tool_calls is not None
+    assert [call.call_id for call in chunks[-1].native_tool_calls] == [
+        "call_1",
+        "call_2",
+    ]
+    assert [call.name for call in chunks[-1].native_tool_calls] == [
+        "explicit",
+        "generated",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ollama_later_explicit_id_reassigns_generated_collision() -> None:
+    first = json.dumps(
+        {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "generated", "arguments": {}}}
+                ],
+            },
+            "done": False,
+        }
+    ).encode()
+    second = json.dumps(
+        {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "function": {"name": "explicit", "arguments": {}},
+                    }
+                ],
+            },
+            "done": True,
+            "done_reason": "stop",
+        }
+    ).encode()
+    provider = OllamaProvider(
+        model_name="tool-model",
+        client=_FakeOllamaClient(b"", chunks=[first + b"\n", second + b"\n"]),  # type: ignore[arg-type]
+    )
+
+    chunks = [chunk async for chunk in provider.stream_chat([])]
+
+    assert chunks[-1].native_tool_calls is not None
+    assert [call.call_id for call in chunks[-1].native_tool_calls] == [
+        "call_2",
+        "call_0",
+    ]
+    assert [call.name for call in chunks[-1].native_tool_calls] == [
+        "generated",
+        "explicit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ollama_accumulates_distinct_tool_calls_across_stream_messages() -> None:
+    chunks = [
+        (
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-one",
+                                "function": {"name": "first", "arguments": {}},
+                            }
+                        ],
+                    },
+                    "done": False,
+                }
+            )
+            + "\n"
+        ).encode(),
+        (
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-two",
+                                "function": {"name": "second", "arguments": {}},
+                            }
+                        ],
+                    },
+                    "done": True,
+                    "done_reason": "tool_calls",
+                }
+            )
+            + "\n"
+        ).encode(),
+    ]
+    provider = OllamaProvider(
+        model_name="tool-model",
+        client=_FakeOllamaClient(b"", chunks=chunks),  # type: ignore[arg-type]
+    )
+
+    streamed = [chunk async for chunk in provider.stream_chat([])]
+
+    assert streamed[-1].native_tool_calls is not None
+    assert [call.call_id for call in streamed[-1].native_tool_calls] == [
+        "call-one",
+        "call-two",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_ollama_rejects_an_oversized_stream_line(monkeypatch) -> None:
     monkeypatch.setattr("ash.providers.ollama.MAX_OLLAMA_STREAM_LINE_BYTES", 8)
     provider = OllamaProvider(

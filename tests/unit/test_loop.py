@@ -6,7 +6,7 @@ import sys
 import pytest
 from unittest.mock import patch
 from datetime import datetime, timezone
-from ash.core.loop import AshLoop
+from ash.core.loop import AshLoop, DEFAULT_MODEL_PRICING_USD_PER_MILLION
 from ash.tools.base import (
     BaseTool,
     ToolExecutionOutcome,
@@ -20,6 +20,7 @@ from ash.core.session import Message, SessionStore, ToolCallRecord, get_db_conne
 from ash.hooks.registry import HookRegistry, LifecycleHook, SessionStartHook
 from ash.providers.base import ProviderABC, ProviderCompletionError, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
+from ash.providers.failover import FailoverProvider
 from ash.providers.retry import ProviderCircuitBreaker, ProviderCircuitOpen
 from ash.safety.grants import PermissionRule, RuleEffect
 from ash.safety.guard import SafetyGuard
@@ -563,6 +564,124 @@ async def test_provider_eof_never_releases_pending_tool_calls(
         await loop.run_turn("do not execute incomplete output")
 
     assert tool.arguments is None
+
+
+@pytest.mark.asyncio
+async def test_empty_provider_eof_retries_before_output(tmp_path) -> None:
+    class RecoveringEOFProvider(ProviderABC):
+        model_name = "recovering-eof"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.calls < 3:
+                if False:  # pragma: no cover - keep this an async generator
+                    yield StreamChunk()
+                return
+            yield StreamChunk(content="recovered", is_done=True, stop_reason="stop")
+
+    provider = RecoveringEOFProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "recovering-eof.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="openai/test",
+            provider_max_attempts=3,
+            provider_retry_base_delay=0,
+            provider_retry_max_delay=0,
+        ),
+    )
+
+    outcome = await loop._stream_one_completion([])
+
+    assert outcome.text == "recovered"
+    assert provider.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_exhausted_empty_provider_eof_records_circuit_failure(tmp_path) -> None:
+    class EmptyEOFProvider(ProviderABC):
+        model_name = "empty-eof"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if False:  # pragma: no cover - keep this an async generator
+                yield StreamChunk()
+
+    provider = EmptyEOFProvider()
+    circuit = ProviderCircuitBreaker(failure_threshold=2)
+    loop = AshLoop(
+        SessionStore(tmp_path / "empty-eof-circuit.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        provider_circuit_breaker=circuit,
+        config=AshConfig(
+            model="openai/test",
+            provider_max_attempts=1,
+            provider_retry_base_delay=0,
+            provider_retry_max_delay=0,
+        ),
+    )
+
+    with pytest.raises(ProviderCompletionError, match="before a terminal chunk"):
+        await loop._stream_one_completion([])
+    assert provider.calls == 1
+    assert circuit.snapshot(loop._provider_circuit_key)["failures"] == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_eof_after_output_is_never_replayed(tmp_path) -> None:
+    class PartialEOFProvider(ProviderABC):
+        model_name = "partial-eof"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            yield StreamChunk(content="partial")
+
+    provider = PartialEOFProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "partial-eof.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="openai/test",
+            provider_max_attempts=3,
+            provider_retry_base_delay=0,
+            provider_retry_max_delay=0,
+        ),
+    )
+
+    with pytest.raises(ProviderCompletionError, match="before a terminal chunk"):
+        await loop._stream_one_completion([])
+
+    assert provider.calls == 1
 
 
 @pytest.mark.asyncio
@@ -2334,6 +2453,245 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
             (loop.turn_context.turn_id,),
         ).fetchone()
     assert '"prompt_tokens": 100' in persisted_turn["usage_json"]
+
+
+@pytest.mark.asyncio
+async def test_failover_turn_prices_each_completion_by_serving_model(tmp_path) -> None:
+    class PrimaryProvider(ProviderABC):
+        model_name = "primary-model"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionError("primary unavailable")
+            yield StreamChunk(
+                content="done",
+                is_done=True,
+                stop_reason="stop",
+                prompt_tokens=20,
+                completion_tokens=3,
+                usage_source="provider",
+                model=self.model_name,
+            )
+
+    class BackupProvider(ProviderABC):
+        model_name = "backup-model"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(
+                is_done=True,
+                stop_reason="tool_calls",
+                prompt_tokens=10,
+                completion_tokens=2,
+                usage_source="provider",
+                model=self.model_name,
+                native_tool_calls=[
+                    {
+                        "call_id": "priced-call",
+                        "name": "capture",
+                        "arguments": {"text": "priced"},
+                    }
+                ],
+            )
+
+    primary = PrimaryProvider()
+    provider = FailoverProvider([primary, BackupProvider()])
+    guard = SafetyGuard(project_root=tmp_path)
+    tool = CaptureTool(guard)
+    config = AshConfig(
+        model="custom/primary-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        model_pricing_usd_per_million={
+            "backup-model": {"input": 1.0, "output": 1.0},
+            "primary-model": {"input": 100.0, "output": 100.0},
+        },
+    )
+    store = SessionStore(tmp_path / "failover-pricing.db")
+    loop = AshLoop(
+        store,
+        provider,
+        guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+        config=config,
+    )
+
+    session = await loop.start_session()
+    assert await loop.run_turn("price both model requests") == "done"
+
+    expected = ((10 + 2) * 1.0 + (20 + 3) * 100.0) / 1_000_000
+    assert primary.calls == 2
+    assert tool.arguments == {"text": "priced"}
+    assert loop._last_turn_prompt_tokens == 30
+    assert loop._last_turn_completion_tokens == 5
+    assert loop._last_turn_cost_usd == pytest.approx(expected)
+    assert store.get_session_usage(session.session_id).cost_usd == pytest.approx(expected)
+
+
+def test_empty_model_pricing_entry_falls_back_to_provider_family(tmp_path) -> None:
+    class FamilyProvider(ProviderABC):
+        model_name = "test"
+        provider_family = "openai"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="done", is_done=True)
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "family-pricing.db"),
+        FamilyProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="openai/test",
+            model_pricing_usd_per_million={
+                "openai/test": {},
+                "openai": {"input": 2.0, "output": 5.0},
+            },
+        ),
+    )
+
+    assert loop._active_model_pricing() == {"input": 2.0, "output": 5.0}
+
+
+def test_failover_default_pricing_uses_active_backup_model(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PrimaryProvider(ProviderABC):
+        model_name = "primary"
+        provider_family = "anthropic"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="primary", is_done=True)
+
+    class BackupProvider(ProviderABC):
+        model_name = "backup"
+        provider_family = "openai"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="backup", is_done=True)
+
+    monkeypatch.setitem(
+        DEFAULT_MODEL_PRICING_USD_PER_MILLION,
+        "anthropic/primary",
+        {"input": 100.0, "output": 100.0},
+    )
+    monkeypatch.setitem(
+        DEFAULT_MODEL_PRICING_USD_PER_MILLION,
+        "openai/backup",
+        {"input": 2.0, "output": 5.0},
+    )
+    provider = FailoverProvider([PrimaryProvider(), BackupProvider()])
+    provider.active_index = 1
+    provider.provider_family = "openai"
+    loop = AshLoop(
+        SessionStore(tmp_path / "failover-default-pricing.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(model="anthropic/primary"),
+    )
+
+    assert loop._active_model_pricing() == {"input": 2.0, "output": 5.0}
+
+
+def test_failover_configured_model_match_requires_same_provider_family(
+    tmp_path,
+) -> None:
+    class PrimaryProvider(ProviderABC):
+        model_name = "claude-sonnet-4-6"
+        provider_family = "openai"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="primary", is_done=True)
+
+    class BackupProvider(ProviderABC):
+        model_name = "claude-sonnet-4-6"
+        provider_family = "anthropic"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="backup", is_done=True)
+
+    provider = FailoverProvider([PrimaryProvider(), BackupProvider()])
+    provider.active_index = 1
+    provider.provider_family = "anthropic"
+    loop = AshLoop(
+        SessionStore(tmp_path / "failover-family-pricing.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="openai/claude-sonnet-4-6",
+            model_pricing_usd_per_million={
+                "openai/claude-sonnet-4-6": {"input": 100.0, "output": 100.0},
+                "anthropic": {"input": 2.0, "output": 5.0},
+            },
+        ),
+    )
+
+    assert loop._active_model_pricing() == {"input": 2.0, "output": 5.0}
+
+
+def test_configured_provider_family_pricing_overrides_builtin_model_default(
+    tmp_path,
+) -> None:
+    class AnthropicProvider(ProviderABC):
+        model_name = "claude-sonnet-4-6"
+        provider_family = "anthropic"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="done", is_done=True)
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "family-overrides-default.db"),
+        AnthropicProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="anthropic/claude-sonnet-4-6",
+            model_pricing_usd_per_million={
+                "anthropic": {"input": 2.0, "output": 5.0},
+            },
+        ),
+    )
+
+    assert loop._active_model_pricing() == {"input": 2.0, "output": 5.0}
 
 
 @pytest.mark.asyncio

@@ -55,6 +55,12 @@ class ProviderCompletionError(RuntimeError):
     """Raised when a provider stream cannot produce a safe terminal outcome."""
 
 
+class ProviderIncompleteStreamError(ProviderCompletionError):
+    """Provider stream ended before a terminal chunk and is safe to retry."""
+
+    retriable = True
+
+
 class CompletionOutcome(BaseModel):
     """Validated provider-neutral result of one complete model request."""
 

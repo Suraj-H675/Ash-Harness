@@ -56,10 +56,12 @@ from ash.providers.base import (
     ProviderABC,
     ProviderCapabilityError,
     ProviderCompletionError,
+    ProviderIncompleteStreamError,
     ProviderTerminalError,
     TokenCounterLike,
     completion_stop_category,
 )
+from ash.providers.failover import FailoverProvider
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.identifiers import parse_model_string
 from ash.providers.messages import CanonicalToolCall, normalize_messages
@@ -1962,6 +1964,8 @@ class AshLoop:
         total_cache_write_tokens = 0
         total_estimated_prompt_tokens = 0
         total_estimated_completion_tokens = 0
+        total_turn_cost_usd = 0.0
+        total_estimated_cost_usd = 0.0
         turn_budget_exhausted = False
         usage_sources: set[str] = set()
         turn_token_budget = int(getattr(self._config, "max_turn_total_tokens", 0))
@@ -2085,6 +2089,22 @@ class AshLoop:
             turn_cache_read_tokens = model_completion.cache_read_tokens
             turn_cache_write_tokens = model_completion.cache_write_tokens
             turn_usage_source = model_completion.usage_source
+            completion_pricing = self._active_model_pricing()
+            total_turn_cost_usd += _calculate_turn_cost(
+                prompt_tokens=turn_prompt_tokens,
+                completion_tokens=turn_completion_tokens,
+                cache_read_tokens=turn_cache_read_tokens,
+                cache_write_tokens=turn_cache_write_tokens,
+                pricing=completion_pricing,
+            )
+            if turn_usage_source == "estimated":
+                total_estimated_cost_usd += _calculate_turn_cost(
+                    prompt_tokens=turn_prompt_tokens,
+                    completion_tokens=turn_completion_tokens,
+                    cache_read_tokens=0,
+                    cache_write_tokens=0,
+                    pricing=completion_pricing,
+                )
             await self._fire_hook_lifecycle(
                 "post_model",
                 {
@@ -2254,49 +2274,8 @@ class AshLoop:
             usage_source = next(iter(usage_sources))
         else:
             usage_source = "mixed"
-        config_pricing = (
-            self._config.model_pricing_usd_per_million if self._config else {}
-        )
-        provider_model = self.active_model_id
-        configured_model = (
-            self._config.model
-            if self._config is not None
-            else f"custom/{self.provider.model_name}"
-        )
-        for key in (
-            provider_model,
-            self.provider.model_name,
-            configured_model,
-        ):
-            pricing = config_pricing.get(key)
-            if pricing is not None:
-                break
-        else:
-            for key in (configured_model, provider_model, self.provider.model_name):
-                pricing = DEFAULT_MODEL_PRICING_USD_PER_MILLION.get(key)
-                if pricing is not None:
-                    break
-            else:
-                pricing = {}
-        if not pricing:
-            provider_family = getattr(self.provider, "provider_family", "")
-            if provider_family:
-                pricing = config_pricing.get(provider_family, {})
-        assert pricing is not None
-        turn_cost_usd = _calculate_turn_cost(
-            prompt_tokens=prompt,
-            completion_tokens=completion,
-            cache_read_tokens=cache_read,
-            cache_write_tokens=cache_write,
-            pricing=pricing,
-        )
-        estimated_cost_usd = _calculate_turn_cost(
-            prompt_tokens=estimated_prompt,
-            completion_tokens=estimated_completion,
-            cache_read_tokens=0,
-            cache_write_tokens=0,
-            pricing=pricing,
-        )
+        turn_cost_usd = total_turn_cost_usd
+        estimated_cost_usd = total_estimated_cost_usd
         self._last_turn_prompt_tokens = prompt
         self._last_turn_completion_tokens = completion
         self._last_turn_budget_exhausted = turn_budget_exhausted
@@ -2452,6 +2431,68 @@ class AshLoop:
     def active_model_id(self) -> str:
         configured_model = self._config.model if self._config is not None else None
         return _provider_model_id(self.provider, configured_model)
+
+    def _active_model_pricing(self) -> dict[str, float]:
+        """Resolve pricing for the provider/model serving the current completion."""
+
+        config_pricing = (
+            self._config.model_pricing_usd_per_million if self._config else {}
+        )
+        provider_model = self.active_model_id
+        configured_model = (
+            self._config.model
+            if self._config is not None
+            else f"custom/{self.provider.model_name}"
+        )
+        configured_model_matches_active = not isinstance(
+            self.provider, FailoverProvider
+        )
+        try:
+            configured_family, configured_model_name = parse_model_string(
+                configured_model
+            )
+        except ValueError:
+            configured_family = ""
+            configured_model_name = ""
+        else:
+            if isinstance(self.provider, FailoverProvider):
+                configured_model_matches_active = (
+                    configured_model_name == self.provider.model_name
+                    and configured_family
+                    == str(getattr(self.provider, "provider_family", "") or "")
+                )
+        pricing: dict[str, float] | None = None
+        configured_lookup_keys = (
+            (configured_model,) if configured_model_matches_active else ()
+        )
+        for key in (
+            provider_model,
+            self.provider.model_name,
+            *configured_lookup_keys,
+        ):
+            configured = config_pricing.get(key)
+            if configured is not None:
+                pricing = configured
+                break
+        if not pricing:
+            provider_family = str(
+                getattr(self.provider, "provider_family", "") or ""
+            )
+            if provider_family:
+                family_pricing = config_pricing.get(provider_family)
+                if family_pricing is not None:
+                    pricing = family_pricing
+        if not pricing:
+            for key in (
+                provider_model,
+                self.provider.model_name,
+                *configured_lookup_keys,
+            ):
+                default = DEFAULT_MODEL_PRICING_USD_PER_MILLION.get(key)
+                if default is not None:
+                    pricing = default
+                    break
+        return pricing or {}
 
     @property
     def pending_steering_count(self) -> int:
@@ -2730,6 +2771,10 @@ class AshLoop:
                                             f"finalize: {detail} (error)"
                                         )
                                     raise ProviderTerminalError(terminal_stop_reason)
+                        if not saw_terminal:
+                            raise ProviderIncompleteStreamError(
+                                "provider stream ended before a terminal chunk"
+                            )
                         break
                     except asyncio.CancelledError:
                         raise
@@ -2796,10 +2841,6 @@ class AshLoop:
                         usage_source = "unavailable"
                         reasoning_blocks.clear()
                         attempt += 1
-                if not saw_terminal:
-                    raise ProviderCompletionError(
-                        "provider stream ended before a terminal chunk"
-                    )
                 stop_category = completion_stop_category(terminal_stop_reason)
                 if stop_category != CompletionStopCategory.COMPLETE:
                     detail = terminal_stop_reason or stop_category.value

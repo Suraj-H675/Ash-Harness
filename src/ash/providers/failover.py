@@ -9,7 +9,7 @@ from ash.providers.base import (
     CompletionStopCategory,
     ProviderABC,
     ProviderCapabilityError,
-    ProviderCompletionError,
+    ProviderIncompleteStreamError,
     ProviderTerminalError,
     StreamChunk,
     completion_stop_category,
@@ -143,7 +143,7 @@ class FailoverProvider(ProviderABC):
                     self.provider_family = provider.provider_family
                     yield chunk
                 if not saw_terminal:
-                    raise ProviderCompletionError(
+                    raise ProviderIncompleteStreamError(
                         f"provider {provider.model_name!r} ended before a terminal chunk"
                     )
                 self.failures = failures

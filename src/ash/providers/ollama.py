@@ -145,7 +145,9 @@ class OllamaProvider(ProviderABC):
         if tools:
             payload["tools"] = tools
 
-        pending_tool_calls: dict[str, CanonicalToolCall] = {}
+        pending_tool_calls: list[tuple[CanonicalToolCall, bool]] = []
+        explicit_tool_call_ids: set[str] = set()
+        tool_call_sequence = 0
         try:
             async with self._client.stream(
                 "POST", f"{self._base_url}/api/chat", json=payload
@@ -177,8 +179,48 @@ class OllamaProvider(ProviderABC):
                         raise RuntimeError(
                             "Ollama stream contained a non-boolean done flag"
                         )
-                    for tool_call in _parse_native_tool_calls(message):
-                        pending_tool_calls[tool_call.call_id] = tool_call
+                    parsed_tool_calls = _parse_native_tool_calls(
+                        message,
+                        generated_id_offset=tool_call_sequence,
+                    )
+                    tool_call_sequence += len(parsed_tool_calls)
+                    for tool_call, has_explicit_id in parsed_tool_calls:
+                        if has_explicit_id and tool_call.call_id in explicit_tool_call_ids:
+                            raise RuntimeError(
+                                "Ollama stream contained duplicate tool call ID: "
+                                f"{tool_call.call_id}"
+                            )
+                        used_ids = {
+                            pending.call_id for pending, _ in pending_tool_calls
+                        } | explicit_tool_call_ids
+                        if has_explicit_id:
+                            for index, (pending, pending_is_explicit) in enumerate(
+                                pending_tool_calls
+                            ):
+                                if pending_is_explicit or pending.call_id != tool_call.call_id:
+                                    continue
+                                replacement, tool_call_sequence = (
+                                    _next_generated_tool_call_id(
+                                        used_ids | {tool_call.call_id},
+                                        tool_call_sequence,
+                                    )
+                                )
+                                pending_tool_calls[index] = (
+                                    pending.model_copy(update={"call_id": replacement}),
+                                    False,
+                                )
+                                used_ids.discard(pending.call_id)
+                                used_ids.add(replacement)
+                            explicit_tool_call_ids.add(tool_call.call_id)
+                        elif tool_call.call_id in used_ids:
+                            replacement, tool_call_sequence = _next_generated_tool_call_id(
+                                used_ids,
+                                tool_call_sequence,
+                            )
+                            tool_call = tool_call.model_copy(
+                                update={"call_id": replacement}
+                            )
+                        pending_tool_calls.append((tool_call, has_explicit_id))
                     # Extract token usage from final chunk.
                     prompt_tokens = 0
                     completion_tokens = 0
@@ -205,7 +247,9 @@ class OllamaProvider(ProviderABC):
                         ),
                         stop_reason=stop_reason,
                         native_tool_calls=(
-                            list(pending_tool_calls.values()) if is_done else None
+                            [call for call, _ in pending_tool_calls]
+                            if is_done
+                            else None
                         ),
                     )
         except httpx.HTTPError as exc:
@@ -301,34 +345,54 @@ def _parse_stream_message(line: str) -> dict[str, Any]:
     return data
 
 
-def _parse_native_tool_calls(message: dict[str, Any]) -> list[CanonicalToolCall]:
+def _parse_native_tool_calls(
+    message: dict[str, Any],
+    *,
+    generated_id_offset: int = 0,
+) -> list[tuple[CanonicalToolCall, bool]]:
     raw_tool_calls = message.get("tool_calls", [])
     if raw_tool_calls is None:
         return []
     if not isinstance(raw_tool_calls, list):
         raise RuntimeError("Ollama stream contained invalid tool_calls")
 
-    parsed: list[CanonicalToolCall] = []
+    parsed: list[tuple[CanonicalToolCall, bool]] = []
     for index, raw_call in enumerate(raw_tool_calls):
         if not isinstance(raw_call, dict):
             raise RuntimeError("Ollama stream contained an invalid tool call")
         function = raw_call.get("function")
         if not isinstance(function, dict):
             raise RuntimeError("Ollama stream contained an invalid tool function")
-        call_id = raw_call.get("id") or raw_call.get("call_id") or f"call_{index}"
+        explicit_call_id = raw_call.get("id") or raw_call.get("call_id")
+        call_id = explicit_call_id or f"call_{generated_id_offset + index}"
         try:
             parsed.append(
-                CanonicalToolCall.model_validate(
-                    {
-                        "call_id": call_id,
-                        "name": function.get("name"),
-                        "arguments": function.get("arguments", {}),
-                    }
+                (
+                    CanonicalToolCall.model_validate(
+                        {
+                            "call_id": call_id,
+                            "name": function.get("name"),
+                            "arguments": function.get("arguments", {}),
+                        }
+                    ),
+                    explicit_call_id is not None,
                 )
             )
         except (TypeError, ValueError) as exc:
             raise RuntimeError("Ollama stream contained an invalid tool call") from exc
     return parsed
+
+
+def _next_generated_tool_call_id(
+    used_ids: set[str],
+    start: int,
+) -> tuple[str, int]:
+    index = max(0, start)
+    while True:
+        candidate = f"call_{index}"
+        index += 1
+        if candidate not in used_ids:
+            return candidate, index
 
 
 def _usage_count(value: object) -> int:
