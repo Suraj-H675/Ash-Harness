@@ -85,6 +85,35 @@ class CompactionResult:
     pruned_tool_outputs: int = 0
 
 
+class ContextBudgetExceededError(RuntimeError):
+    """Raised when protected current-turn context cannot fit the input budget."""
+
+    def __init__(
+        self,
+        required_tokens: int,
+        limit: int,
+        *,
+        protected_current_turn: bool,
+    ) -> None:
+        self.required_tokens = required_tokens
+        self.limit = limit
+        self.protected_current_turn = protected_current_turn
+        scope = (
+            "current conversation state"
+            if protected_current_turn
+            else "compacted conversation"
+        )
+        suffix = (
+            "; shorten the current request or reduce current-turn tool output"
+            if protected_current_turn
+            else ""
+        )
+        super().__init__(
+            f"{scope} exceeds the provider input budget: "
+            f"requires approximately {required_tokens} tokens, limit is {limit}{suffix}"
+        )
+
+
 class ContextBudgetAllocator:
     """Allocate and enforce deterministic input budgets across context sections."""
 
@@ -289,6 +318,7 @@ class HistoryCompactor:
         count_tokens: Callable[[str], int],
         previous_summary: str = "",
         force: bool = False,
+        protected_from_index: int | None = None,
     ) -> CompactionResult:
         prepared, pruned = self._prune_tool_outputs(messages)
         estimated = self._count(prepared, count_tokens)
@@ -301,7 +331,7 @@ class HistoryCompactor:
                 pruned_tool_outputs=pruned,
             )
         messages = prepared
-        if len(messages) <= 2:
+        if not messages:
             return CompactionResult(
                 messages,
                 previous_summary,
@@ -309,58 +339,166 @@ class HistoryCompactor:
                 estimated,
                 pruned_tool_outputs=pruned,
             )
+        if protected_from_index is not None and not (
+            0 <= protected_from_index < len(messages)
+        ):
+            raise ValueError("protected_from_index is outside the message list")
 
         system = messages[0] if messages[0].get("role") == "system" else None
         body_start = 1 if system is not None else 0
         cutoff = max(body_start, len(messages) - self.recent_messages)
+        if protected_from_index is not None:
+            cutoff = min(cutoff, protected_from_index)
         while cutoff > body_start and messages[cutoff].get("role") == "tool":
             cutoff -= 1
 
-        removed = messages[body_start:cutoff]
-        recent = messages[cutoff:]
-        if not removed:
-            return CompactionResult(
-                messages,
-                previous_summary,
-                bool(pruned),
-                estimated,
-                pruned_tool_outputs=pruned,
-            )
-
-        summary = self._summarize(removed, previous_summary)
-        summary_message = {
-            "role": "system",
-            "content": "## Compacted conversation summary\n" + summary,
-        }
-        compacted = (
-            ([system] if system is not None else []) + [summary_message] + recent
+        removed = list(messages[body_start:cutoff])
+        recent = list(messages[cutoff:])
+        prefix = [system] if system is not None else []
+        protected_recent_index = (
+            protected_from_index - cutoff
+            if protected_from_index is not None
+            else None
         )
 
-        # If the recent tail itself is still too large, drop oldest complete
-        # entries until it fits. Never drop the current user message.
-        while (
-            len(compacted) > 3
-            and self._count(compacted, count_tokens) > self.input_limit
-        ):
-            drop_at = 2 if system is not None else 1
-            candidate = compacted[drop_at]
-            if candidate.get("role") == "tool":
-                break
-            if candidate.get("role") == "assistant" and candidate.get("tool_calls"):
-                # A tool result is meaningful only with its originating call.
-                # Keep the newest pair intact even if the estimate remains high.
-                break
-            del compacted[drop_at]
+        # Fit protected current-turn state first. Older recent history may be
+        # removed, but assistant tool calls and their contiguous tool results
+        # move as one protocol unit. The last user message and everything after
+        # it belong to the active turn and are never discarded here.
+        while self._count(prefix + recent, count_tokens) > self.input_limit:
+            span = self._oldest_removable_span(
+                recent,
+                protected_from_index=protected_recent_index,
+            )
+            if span is None:
+                protected_tokens = self._count(prefix + recent, count_tokens)
+                raise ContextBudgetExceededError(
+                    protected_tokens,
+                    self.input_limit,
+                    protected_current_turn=True,
+                )
+            start, end = span
+            removed.extend(recent[start:end])
+            del recent[start:end]
+            if protected_recent_index is not None and start < protected_recent_index:
+                protected_recent_index -= end - start
 
+        summary = (
+            self._summarize(removed, previous_summary)
+            if removed
+            else previous_summary
+        )
+        summary_message = (
+            self._fit_summary_message(
+                summary,
+                prefix=prefix,
+                recent=recent,
+                count_tokens=count_tokens,
+            )
+            if removed and summary
+            else None
+        )
+        compacted = prefix + ([summary_message] if summary_message is not None else []) + recent
         final_estimate = self._count(compacted, count_tokens)
+        if final_estimate > self.input_limit:
+            raise ContextBudgetExceededError(
+                final_estimate,
+                self.input_limit,
+                protected_current_turn=False,
+            )
         return CompactionResult(
             messages=compacted,
             summary=summary,
-            compacted=True,
+            compacted=bool(removed or pruned),
             estimated_tokens=final_estimate,
             removed_messages=len(removed),
             pruned_tool_outputs=pruned,
         )
+
+    def _fit_summary_message(
+        self,
+        summary: str,
+        *,
+        prefix: list[dict[str, Any]],
+        recent: list[dict[str, Any]],
+        count_tokens: Callable[[str], int],
+    ) -> dict[str, Any] | None:
+        """Fit a provider-visible summary without shrinking persisted state."""
+
+        header = "## Compacted conversation summary\n"
+
+        def candidate(char_limit: int) -> dict[str, Any]:
+            return {
+                "role": "system",
+                "content": header + _preserve_ends(summary, char_limit),
+            }
+
+        full = {"role": "system", "content": header + summary}
+        if self._count(prefix + [full] + recent, count_tokens) <= self.input_limit:
+            return full
+
+        low = 0
+        high = len(summary)
+        best: dict[str, Any] | None = None
+        while low <= high:
+            mid = (low + high) // 2
+            attempt = candidate(mid)
+            if self._count(prefix + [attempt] + recent, count_tokens) <= self.input_limit:
+                best = attempt
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best
+
+    @staticmethod
+    def _oldest_removable_span(
+        messages: list[dict[str, Any]],
+        *,
+        protected_from_index: int | None,
+    ) -> tuple[int, int] | None:
+        """Return the oldest safely removable pre-current-turn protocol unit."""
+
+        if not messages:
+            return None
+        if protected_from_index is not None and protected_from_index <= 0:
+            return None
+
+        candidate = messages[0]
+        role = candidate.get("role")
+        if role == "tool":
+            return None
+        tool_calls = candidate.get("tool_calls") if role == "assistant" else None
+        if not tool_calls:
+            return (0, 1)
+        if not isinstance(tool_calls, list):
+            return None
+
+        call_ids = {
+            str(call.get("call_id") or call.get("id") or "")
+            for call in tool_calls
+            if isinstance(call, dict)
+        }
+        call_ids.discard("")
+        if not call_ids:
+            return None
+
+        observed: set[str] = set()
+        end = 1
+        while end < len(messages) and messages[end].get("role") == "tool":
+            tool_id = str(
+                messages[end].get("tool_call_id")
+                or messages[end].get("call_id")
+                or ""
+            )
+            if not tool_id or tool_id not in call_ids:
+                return None
+            observed.add(tool_id)
+            end += 1
+        if observed != call_ids or (
+            protected_from_index is not None and end > protected_from_index
+        ):
+            return None
+        return (0, end)
 
     def _prune_tool_outputs(
         self, messages: list[dict[str, Any]]

@@ -3,6 +3,7 @@ import math
 import pytest
 
 from ash.context.history import (
+    ContextBudgetExceededError,
     IMAGE_TOKEN_ESTIMATE,
     ContextBudgetAllocator,
     ContextFragmentKind,
@@ -280,3 +281,181 @@ def test_compaction_preserves_task_paths_actions_and_prior_summary_ends() -> Non
     assert "Referenced path: src/payments.py" in result.summary
     assert "Tool action: write_file" in result.summary
     assert "Assistant outcome: I will keep the public API stable" in result.summary
+
+
+def test_compaction_drops_old_multi_tool_group_atomically_to_hard_limit() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request " + "old " * 80},
+        {"role": "assistant", "content": "old answer"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "c1", "name": "read_file", "arguments": {}},
+                {"call_id": "c2", "name": "read_file", "arguments": {}},
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "tool one " + "one " * 100,
+            "tool_call_id": "c1",
+        },
+        {
+            "role": "tool",
+            "content": "tool two " + "two " * 100,
+            "tool_call_id": "c2",
+        },
+        {"role": "user", "content": "newer request " + "new " * 40},
+        {"role": "assistant", "content": "newer answer " + "answer " * 40},
+        {"role": "user", "content": "current request"},
+    ]
+    compactor = HistoryCompactor(
+        max_context_tokens=120,
+        completion_reserve=20,
+        threshold=0.8,
+        recent_messages=6,
+        max_tool_output_chars=10_000,
+    )
+
+    result = compactor.compact(
+        messages,
+        count_tokens=count_words,
+        protected_from_index=len(messages) - 1,
+    )
+
+    assert result.estimated_tokens <= compactor.input_limit
+    assert any(message.get("content") == "current request" for message in result.messages)
+    assert not any(message.get("tool_call_id") in {"c1", "c2"} for message in result.messages)
+    assert not any(
+        call.get("call_id") in {"c1", "c2"}
+        for message in result.messages
+        for call in message.get("tool_calls") or []
+    )
+
+
+def test_compaction_preserves_current_user_before_active_tool_chain() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request " + "old " * 80},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "CURRENT_USER_REQUEST " + "current " * 20},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "active-call", "name": "read_file", "arguments": {}}
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "active result " + "result " * 20,
+            "tool_call_id": "active-call",
+        },
+    ]
+    compactor = HistoryCompactor(
+        max_context_tokens=220,
+        completion_reserve=20,
+        threshold=0.8,
+        recent_messages=2,
+    )
+
+    result = compactor.compact(
+        messages,
+        count_tokens=count_words,
+        force=True,
+        protected_from_index=3,
+    )
+
+    assert result.estimated_tokens <= compactor.input_limit
+    contents = [str(message.get("content", "")) for message in result.messages]
+    assert any("CURRENT_USER_REQUEST" in content for content in contents)
+    assert any(
+        message.get("tool_call_id") == "active-call" for message in result.messages
+    )
+    assert any(
+        any(call.get("call_id") == "active-call" for call in message.get("tool_calls") or [])
+        for message in result.messages
+    )
+
+
+def test_compaction_fits_provider_visible_summary_to_hard_limit() -> None:
+    previous = "ORIGINAL GOAL " + ("prior " * 1000) + "LATEST DECISION"
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request " + "old " * 100},
+        {"role": "assistant", "content": "old answer " + "answer " * 100},
+        {"role": "user", "content": "current request"},
+    ]
+    compactor = HistoryCompactor(
+        max_context_tokens=120,
+        completion_reserve=20,
+        threshold=0.8,
+        recent_messages=1,
+        summary_char_limit=12_000,
+    )
+
+    result = compactor.compact(
+        messages,
+        count_tokens=count_words,
+        previous_summary=previous,
+        force=True,
+        protected_from_index=3,
+    )
+
+    assert result.estimated_tokens <= compactor.input_limit
+    assert "ORIGINAL GOAL" in result.summary
+    assert "LATEST DECISION" in result.summary
+    visible_summaries = [
+        str(message.get("content", ""))
+        for message in result.messages
+        if str(message.get("content", "")).startswith(
+            "## Compacted conversation summary"
+        )
+    ]
+    if visible_summaries:
+        assert len(visible_summaries[0]) < len(result.summary) + 40
+
+
+def test_compaction_rejects_oversized_protected_current_request() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "current " + "word " * 500},
+    ]
+    compactor = HistoryCompactor(
+        max_context_tokens=120,
+        completion_reserve=20,
+        threshold=0.8,
+    )
+
+    with pytest.raises(
+        ContextBudgetExceededError,
+        match="current conversation state exceeds the provider input budget",
+    ):
+        compactor.compact(
+            messages,
+            count_tokens=count_words,
+            protected_from_index=1,
+        )
+
+
+def test_compaction_never_drops_protected_user_after_trimming_old_history() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request " + "old " * 40},
+        {"role": "assistant", "content": "old answer " + "answer " * 40},
+        {"role": "user", "content": "PROTECTED_CURRENT " + "current " * 200},
+    ]
+    compactor = HistoryCompactor(
+        max_context_tokens=120,
+        completion_reserve=20,
+        threshold=0.8,
+        recent_messages=2,
+    )
+
+    with pytest.raises(ContextBudgetExceededError):
+        compactor.compact(
+            messages,
+            count_tokens=count_words,
+            protected_from_index=3,
+        )

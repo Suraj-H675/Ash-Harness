@@ -575,6 +575,7 @@ class AshLoop:
         self.max_steering_messages = max_steering_messages
         self._steering_messages: deque[str] = deque()
         self._turn_running = False
+        self._active_turn_user_message: Message | None = None
         self.repo_map = repo_map
         self.auto_commit = auto_commit
         self.auto_commit_paths = list(auto_commit_paths or [])
@@ -1828,6 +1829,7 @@ class AshLoop:
             raise
         finally:
             self._flush_runtime_events()
+            self._active_turn_user_message = None
             self._turn_running = False
             await self._close_retired_mcp_runtimes()
 
@@ -1939,6 +1941,7 @@ class AshLoop:
             timestamp=_utc_now(),
             metadata=dict(user_metadata or {}),
         )
+        self._active_turn_user_message = user_message
         persisted_metadata = dict(user_message.metadata)
         persisted_metadata.pop("image_blocks", None)
         persisted_metadata.pop("content_blocks", None)
@@ -1969,6 +1972,8 @@ class AshLoop:
         turn_budget_exhausted = False
         usage_sources: set[str] = set()
         turn_token_budget = int(getattr(self._config, "max_turn_total_tokens", 0))
+        from ash.context.history import ContextBudgetExceededError
+
         iteration = 0
         iteration_budget = self.max_turn_iterations
         maximum_iteration_budget = self.max_turn_iterations + self.max_steering_messages
@@ -2017,7 +2022,25 @@ class AshLoop:
                     self._pending_memory_context = "\n\n".join(
                         f"// From {hit.file_path}:\n{hit.content[:500]}" for hit in hits
                     )
-            messages = self._build_messages(session)
+            try:
+                messages = self._build_messages(session)
+            except ContextBudgetExceededError as exc:
+                used_before_request = total_prompt_tokens + total_completion_tokens
+                remaining = turn_token_budget - used_before_request
+                if (
+                    turn_token_budget > 0
+                    and used_before_request > 0
+                    and remaining <= exc.required_tokens
+                ):
+                    turn_budget_exhausted = True
+                    final_text = (
+                        f"{final_text}\n\n"
+                        "[Turn token budget exhausted before another model request: "
+                        f"used {used_before_request}, next input requires approximately "
+                        f"{exc.required_tokens}, budget {turn_token_budget}.]"
+                    ).strip()
+                    break
+                raise
             if turn_token_budget > 0:
                 used_before_request = total_prompt_tokens + total_completion_tokens
                 remaining = turn_token_budget - used_before_request
@@ -3889,6 +3912,7 @@ class AshLoop:
         if self._config is not None:
             from ash.context.history import (
                 ContextBudgetAllocator,
+                ContextBudgetExceededError,
                 ContextFragmentKind,
                 ContextTrust,
                 HistoryCompactor,
@@ -3910,6 +3934,12 @@ class AshLoop:
             truncated: set[str] = set()
 
             tool_schema_tokens = self._estimate_tool_schema_tokens()
+            if tool_schema_tokens >= allocator.input_limit:
+                raise ContextBudgetExceededError(
+                    tool_schema_tokens + 1,
+                    allocator.input_limit,
+                    protected_current_turn=True,
+                )
             budget_usage["tools"] = tool_schema_tokens
             tool_schema_content = json.dumps(
                 self._tool_schema_payload(), sort_keys=True, default=str
@@ -3959,6 +3989,7 @@ class AshLoop:
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_content}
             ]
+            protected_history_index: int | None = None
             for message in session.messages:
                 msg_dict: dict[str, Any] = {
                     "role": message.role,
@@ -3970,13 +4001,18 @@ class AshLoop:
                 if message.role == "tool" and message.metadata.get("call_id"):
                     msg_dict["tool_call_id"] = message.metadata["call_id"]
                 messages.append(msg_dict)
+                if (
+                    self._turn_running
+                    and message is self._active_turn_user_message
+                ):
+                    protected_history_index = len(messages) - 1
 
             reserved_message_tokens = (
                 budget_usage["system"]
                 + budget_usage["repo_map"]
                 + budget_usage["memory"]
             )
-            provider_input_limit = max(1, allocator.input_limit - tool_schema_tokens)
+            provider_input_limit = allocator.input_limit - tool_schema_tokens
             compactor = HistoryCompactor(
                 max_context_tokens=maximum_context,
                 completion_reserve=self._config.max_completion_tokens,
@@ -3990,14 +4026,21 @@ class AshLoop:
                 count_tokens=self.provider.count_tokens,
                 previous_summary=session.context_summary,
                 force=force_compaction,
+                protected_from_index=protected_history_index,
             )
             self._last_context_tokens = result.estimated_tokens + tool_schema_tokens
+            maximum_input = max(1, maximum_context - self._config.max_completion_tokens)
+            if self._last_context_tokens > maximum_input:
+                raise ContextBudgetExceededError(
+                    self._last_context_tokens,
+                    maximum_input,
+                    protected_current_turn=True,
+                )
             budget_usage["history"] = max(
                 0, result.estimated_tokens - reserved_message_tokens
             )
             if budget_usage["history"] > budget_limits["history"]:
                 truncated.add("history")
-            maximum_input = max(1, maximum_context - self._config.max_completion_tokens)
             self._emit_event(
                 {
                     "type": "context.usage",

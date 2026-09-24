@@ -15,6 +15,7 @@ from ash.tools.base import (
     ToolResult,
 )
 from ash.config import AshConfig
+from ash.context.history import ContextBudgetExceededError
 from ash.context.turn import TurnContext
 from ash.core.session import Message, SessionStore, ToolCallRecord, get_db_connection
 from ash.hooks.registry import HookRegistry, LifecycleHook, SessionStartHook
@@ -1501,6 +1502,81 @@ async def test_queued_steering_is_persisted_and_applied_to_running_turn(tmp_path
     assert steering.content == "use the safer approach instead"
 
 
+def test_compaction_pressure_keeps_original_turn_request_after_steering(tmp_path):
+    provider = SteeringProvider()
+    store = SessionStore(tmp_path / "steering-context-pressure.db")
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        system_prompt="system",
+        tools={},
+        config=AshConfig(
+            model="custom/steering-test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+            max_context_tokens=220,
+            max_completion_tokens=20,
+            context_recent_messages=3,
+        ),
+    )
+    session = store.create_session(str(tmp_path))
+    loop.current_session = session
+    for role, content in (
+        ("user", "old request " + "old " * 80),
+        ("assistant", "old answer " + "answer " * 80),
+    ):
+        message = Message(
+            role=role,
+            content=content,
+            timestamp=datetime.now(timezone.utc),
+        )
+        store.save_message(session.session_id, message)
+        session.messages.append(message)
+
+    original_text = "ORIGINAL_REQUEST " + "important " * 40
+    original = Message(
+        role="user",
+        content=original_text,
+        timestamp=datetime.now(timezone.utc),
+    )
+    store.save_message(session.session_id, original, turn_id="turn-active")
+    session.messages.append(original)
+    first_answer = Message(
+        role="assistant",
+        content="initial answer",
+        timestamp=datetime.now(timezone.utc),
+    )
+    store.save_message(session.session_id, first_answer, turn_id="turn-active")
+    session.messages.append(first_answer)
+
+    loop._turn_running = True
+    loop._active_turn_user_message = original
+    loop.turn_context = TurnContext(session_id=session.session_id, turn_id="turn-active")
+    loop.queue_steering("use the safer approach instead")
+    assert loop._drain_steering_messages(session) == 1
+
+    messages = loop._build_messages(session)
+
+    assert any(
+        message.get("role") == "user" and message.get("content") == original_text
+        for message in messages
+    )
+    assert any(
+        message.get("role") == "user"
+        and message.get("content") == "use the safer approach instead"
+        for message in messages
+    )
+    assert not any(
+        message.get("role") == "user"
+        and str(message.get("content", "")).startswith("old request")
+        for message in messages
+    )
+
+
 def test_steering_queue_validates_messages_and_capacity(tmp_path):
     loop = AshLoop(
         SessionStore(tmp_path / "steering-limit.db"),
@@ -1556,6 +1632,155 @@ async def test_persisted_compaction_summary_is_redacted(tmp_path):
     assert changed is True
     assert secret not in persisted
     assert "REDACTED" in persisted
+
+
+@pytest.mark.asyncio
+async def test_oversized_current_request_fails_before_provider_dispatch(tmp_path) -> None:
+    class NeverCalledProvider(ProviderABC):
+        model_name = "context-budget-test"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            yield StreamChunk(content="unexpected", is_done=True, stop_reason="stop")
+
+    provider = NeverCalledProvider()
+    store = SessionStore(tmp_path / "context-budget.db")
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={},
+        config=AshConfig(
+            model="custom/context-budget-test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+            max_context_tokens=120,
+            max_completion_tokens=20,
+        ),
+    )
+    session = await loop.start_session()
+
+    with pytest.raises(
+        ContextBudgetExceededError,
+        match="current conversation state exceeds the provider input budget",
+    ):
+        await loop.run_turn("current " + "word " * 500)
+
+    assert provider.calls == 0
+    assert loop.is_turn_running is False
+    assert store.reconcile_interrupted_turns(session.session_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_oversized_current_image_fails_before_provider_dispatch(tmp_path) -> None:
+    class NeverCalledVisionProvider(ProviderABC):
+        model_name = "context-image-test"
+        _ash_declared_capabilities = ProviderCapabilities(vision=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            yield StreamChunk(content="unexpected", is_done=True, stop_reason="stop")
+
+    provider = NeverCalledVisionProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "context-image.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={},
+        config=AshConfig(
+            model="custom/context-image-test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+            max_context_tokens=512,
+            max_completion_tokens=64,
+        ),
+    )
+    await loop.start_session()
+
+    with pytest.raises(ContextBudgetExceededError):
+        await loop.run_turn(
+            "inspect this image",
+            user_metadata={
+                "content_blocks": [
+                    {"type": "text", "text": "inspect this image"},
+                    {
+                        "type": "image",
+                        "media_type": "image/png",
+                        "data": "AAAA",
+                    },
+                ]
+            },
+        )
+
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_oversized_tool_schema_fails_before_provider_dispatch(tmp_path) -> None:
+    class NeverCalledProvider(ProviderABC):
+        model_name = "context-schema-test"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            yield StreamChunk(content="unexpected", is_done=True, stop_reason="stop")
+
+    class HugeSchemaTool(BaseTool):
+        name = "huge_schema"
+        description = "schema " * 2_000
+        args_schema = None
+
+        async def run(self, **kwargs):
+            return ToolResult(success=True, output="unused")
+
+    provider = NeverCalledProvider()
+    guard = SafetyGuard(project_root=tmp_path)
+    loop = AshLoop(
+        SessionStore(tmp_path / "context-schema.db"),
+        provider,
+        guard,
+        EventUI(),
+        tmp_path,
+        tools={"huge_schema": HugeSchemaTool(guard)},
+        config=AshConfig(
+            model="custom/context-schema-test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+            max_context_tokens=256,
+            max_completion_tokens=32,
+        ),
+    )
+    await loop.start_session()
+    assert loop._estimate_tool_schema_tokens() >= 224
+
+    with pytest.raises(ContextBudgetExceededError):
+        await loop.run_turn("small request")
+
+    assert provider.calls == 0
 
 
 @pytest.mark.asyncio
