@@ -3293,12 +3293,28 @@ class AshLoop:
                 continue
 
             dispatched = False
+            tool_started = False
+            post_processing_failed = False
             replay_policy = "invalid"
             try:
                 contract = _validated_tool_execution_contract(tool)
                 replay_policy = contract.replay_policy.value
                 if self.turn_context is not None:
                     self.turn_context.set("tool_call_id", record.call_id)
+
+                # Pre-tool hooks and middleware are extension points and may
+                # themselves perform external effects.  Persist the conservative
+                # effect boundary before invoking them so cancellation/crash
+                # recovery never claims that nothing could have happened.
+                record.dispatched = True
+                self.session_store.save_tool_call(
+                    session.session_id,
+                    record,
+                    turn_id=(
+                        self.turn_context.turn_id if self.turn_context else None
+                    ),
+                )
+                dispatched = True
                 try:
                     hooks = self._active_hooks()
                     if hooks is not None:
@@ -3311,20 +3327,9 @@ class AshLoop:
                         success=True, output="skipped by middleware", error=None
                     )
                 else:
-                    # This is the last point at which no external effect can have
-                    # occurred. Persisted intent above makes an interruption after
-                    # this boundary recoverable as an ambiguous, non-replayed call.
-                    record.dispatched = True
-                    self.session_store.save_tool_call(
-                        session.session_id,
-                        record,
-                        turn_id=(
-                            self.turn_context.turn_id if self.turn_context else None
-                        ),
-                    )
                     self._emit_event({"type": "tool.started", **event_base})
                     with tool.event_context(event_base):
-                        dispatched = True
+                        tool_started = True
                         result_dict = await _execute_tool_once(
                             tool, deepcopy(arguments)
                         )
@@ -3338,13 +3343,28 @@ class AshLoop:
                             "outcome", ToolExecutionOutcome.COMPLETED
                         ),
                     )
-                    if hooks is not None:
-                        await hooks.fire_post_tool(
+                    try:
+                        if hooks is not None:
+                            await hooks.fire_post_tool(
+                                tool_name, deepcopy(arguments), tool_result
+                            )
+                        tool_result = await self._apply_middlewares_after(
                             tool_name, deepcopy(arguments), tool_result
                         )
-                    tool_result = await self._apply_middlewares_after(
-                        tool_name, deepcopy(arguments), tool_result
-                    )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        post_processing_failed = True
+                        raw_post_error = str(exc).strip() or type(exc).__name__
+                        post_error = (
+                            "Tool completed, but post-processing failed: "
+                            f"{raw_post_error}"
+                        )
+                        if tool_result.error:
+                            post_error = f"{tool_result.error}; {post_error}"
+                        tool_result = tool_result.model_copy(
+                            update={"success": False, "error": post_error}
+                        )
                     if tool_result.outcome is ToolExecutionOutcome.UNKNOWN:
                         raw_error = tool_result.error or "the result was lost"
                         tool_result = tool_result.model_copy(
@@ -3373,7 +3393,7 @@ class AshLoop:
                     if dispatched
                     else raw_error
                 )
-                record.executed = dispatched
+                record.executed = tool_started
                 record.error = error
                 if not defer_terminal_persistence:
                     self.session_store.save_tool_call(
@@ -3435,7 +3455,7 @@ class AshLoop:
                 results.append(result_payload)
                 continue
 
-            record.executed = dispatched
+            record.executed = tool_started
             record.result = tool_result.output
             record.error = tool_result.error
             ambiguous = tool_result.outcome is ToolExecutionOutcome.UNKNOWN
@@ -3467,9 +3487,9 @@ class AshLoop:
                 {
                     "type": (
                         "tool.skipped"
-                        if not dispatched
+                        if not tool_started
                         else "tool.error"
-                        if ambiguous
+                        if ambiguous or post_processing_failed
                         else "tool.completed"
                     ),
                     **event_base,
@@ -3526,7 +3546,7 @@ class AshLoop:
                     result=result_payload,
                 )
             results.append(result_payload)
-            if not dispatched:
+            if not tool_started:
                 continue
             self._record_repo_map_activity(tool_name, arguments, tool_result)
             self._record_turn_file_mutation(tool_name, arguments, tool_result)

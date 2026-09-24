@@ -1928,6 +1928,103 @@ async def test_approved_tool_intent_is_durable_before_execution_finishes(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_cancellation_after_pre_middleware_effect_recovers_as_ambiguous(
+    tmp_path,
+) -> None:
+    class SideEffectBlockingMiddleware(ToolMiddleware):
+        def __init__(self, marker: Path) -> None:
+            self.marker = marker
+            self.started = asyncio.Event()
+
+        async def before_tool(self, _tool_name, _arguments, _tool):
+            self.marker.write_text("effect", encoding="utf-8")
+            self.started.set()
+            await asyncio.Event().wait()
+
+    provider = NativeToolProvider()
+    tool = CaptureTool(SafetyGuard(tmp_path))
+    store = SessionStore(tmp_path / "pre-middleware-cancel.db")
+    middleware = SideEffectBlockingMiddleware(tmp_path / "pre-effect.txt")
+    loop = AshLoop(
+        store,
+        provider,
+        tool.safety_guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+        tool_middlewares=[middleware],
+    )
+
+    turn = asyncio.create_task(loop.run_turn("use the capture tool"))
+    await middleware.started.wait()
+    assert (tmp_path / "pre-effect.txt").read_text(encoding="utf-8") == "effect"
+    assert tool.arguments is None
+
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert loop.current_session is not None
+    recovered = store.load_session(loop.current_session.session_id).tool_calls[0]
+    assert recovered.dispatched is True
+    assert recovered.executed is True
+    assert "outcome is unknown" in (recovered.error or "")
+    assert loop.recovery_summary is not None
+    assert loop.recovery_summary.needs_attention is True
+    assert loop.recovery_summary.unknown_calls == ("capture (call-native-1)",)
+
+
+@pytest.mark.asyncio
+async def test_after_middleware_failure_preserves_known_tool_result(tmp_path) -> None:
+    class RaiseAfterMiddleware(ToolMiddleware):
+        async def after_tool(self, _tool_name, _arguments, _result):
+            raise RuntimeError("after middleware exploded")
+
+    guard = SafetyGuard(tmp_path)
+    tool = CaptureTool(guard)
+    store = SessionStore(tmp_path / "after-middleware-result.db")
+    ui = EventUI()
+    loop = AshLoop(
+        store,
+        NativeToolProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={tool.name: tool},
+        tool_middlewares=[RaiseAfterMiddleware()],
+    )
+    session = await loop.start_session()
+
+    results = await loop._execute_tool_calls(
+        [
+            {
+                "call_id": "call-known-result",
+                "name": "capture",
+                "arguments": {"text": "hello"},
+            }
+        ],
+        session,
+    )
+
+    assert tool.arguments == {"text": "hello"}
+    assert len(results) == 1
+    assert results[0]["success"] is False
+    assert results[0]["output"] == "hello"
+    assert "post-processing failed" in results[0]["error"]
+    assert "after middleware exploded" in results[0]["error"]
+    record = store.load_session(session.session_id).tool_calls[0]
+    assert record.executed is True
+    assert record.dispatched is True
+    assert record.result == "hello"
+    assert "post-processing failed" in (record.error or "")
+    assert "after middleware exploded" in (record.error or "")
+    errors = [event for event in ui.events if event["type"] == "tool.error"]
+    assert len(errors) == 1
+    assert errors[0]["ambiguous"] is False
+    assert errors[0]["output"] == "hello"
+
+
+@pytest.mark.asyncio
 async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
     provider = NativeToolProvider()
     tool = CaptureTool(SafetyGuard(project_root=tmp_path))
@@ -3510,6 +3607,56 @@ async def test_middleware_skip_aborts_tool(tmp_path):
         result = await loop.run_turn("test")
         # The turn should complete without the tool actually running
         assert "skipped by middleware" in result or result  # no error from skipped tool
+
+
+@pytest.mark.asyncio
+async def test_middleware_skip_persists_effect_boundary_without_tool_execution(
+    tmp_path,
+) -> None:
+    skip = SkipMiddleware()
+    store = SessionStore(tmp_path / "middleware-skip-boundary.db")
+    guard = SafetyGuard(project_root=tmp_path)
+    tool = MyTestTool(guard)
+    ui = EventUI()
+    loop = AshLoop(
+        store,
+        NativeToolProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={tool.name: tool},
+        tool_middlewares=[skip],
+    )
+    session = await loop.start_session()
+
+    results = await loop._execute_tool_calls(
+        [
+            {
+                "call_id": "call-skip-boundary",
+                "name": "my_tool",
+                "arguments": {},
+            }
+        ],
+        session,
+    )
+
+    assert results == [
+        {
+            "success": True,
+            "output": "skipped by middleware",
+            "error": None,
+            "truncated": False,
+            "token_count": 0,
+        }
+    ]
+    record = store.load_session(session.session_id).tool_calls[-1]
+    assert record.executed is False
+    assert record.dispatched is True
+    assert record.result == "skipped by middleware"
+    assert record.error is None
+    skipped = [event for event in ui.events if event["type"] == "tool.skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["dispatched"] is True
 
 
 @pytest.mark.asyncio
