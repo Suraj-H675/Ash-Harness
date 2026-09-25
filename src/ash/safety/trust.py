@@ -4,29 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 
-from ash.safe_io import (
-    atomic_write_unlinked_bytes,
-    chmod_unlinked_directory,
-    read_bounded_open_file,
-)
+from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 
 
 MAX_TRUST_STORE_BYTES = 1_000_000
 
 
-def _is_link(path: Path) -> bool:
-    return path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
-
-
 def trust_store_path() -> Path:
     return Path.home() / ".ash" / "trusted-workspaces.json"
-
-
-def _validate_trust_store_path(path: Path) -> None:
-    if _is_link(path) or _is_link(path.parent):
-        raise ValueError(f"refusing to use linked workspace trust state: {path}")
 
 
 def canonical_workspace(path: str | Path) -> str:
@@ -45,23 +33,32 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 def load_trusted_workspaces() -> set[str]:
     path = trust_store_path()
     try:
-        _validate_trust_store_path(path)
-    except ValueError:
+        with AnchoredDirectory.open(
+            path.parent,
+            create=False,
+            private=False,
+            pin_path=True,
+        ) as directory:
+            return _load_from_directory(directory, path.name)
+    except (
+        FileNotFoundError,
+        OSError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+        AnchoredFilesystemError,
+    ):
         return set()
-    if not path.exists():
+
+
+def _load_from_directory(directory: AnchoredDirectory, name: str) -> set[str]:
+    raw = directory.read_file(name, max_bytes=MAX_TRUST_STORE_BYTES)
+    if raw is None:
         return set()
-    try:
-        raw = read_bounded_open_file(
-            path,
-            MAX_TRUST_STORE_BYTES,
-            label="trusted workspace store",
-        )
-        payload = json.loads(
-            raw.decode("utf-8"),
-            object_pairs_hook=_unique_json_object,
-        )
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-        return set()
+    payload = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=_unique_json_object,
+    )
     if not isinstance(payload, dict) or payload.get("version") != 1:
         return set()
     entries = payload.get("workspaces")
@@ -78,27 +75,37 @@ def is_workspace_trusted(path: str | Path) -> bool:
 
 def set_workspace_trusted(path: str | Path, trusted: bool) -> bool:
     canonical = canonical_workspace(path)
-    entries = load_trusted_workspaces()
-    changed = canonical not in entries if trusted else canonical in entries
-    if trusted:
-        entries.add(canonical)
-    else:
-        entries.discard(canonical)
-    _save(entries)
-    return changed
+    state_path = trust_store_path()
+    try:
+        with AnchoredDirectory.open(
+            state_path.parent,
+            create=True,
+            private=False,
+            pin_path=True,
+        ) as directory:
+            if os.name != "nt":
+                directory.chmod(0o700)
+            entries = _load_from_directory(directory, state_path.name)
+            changed = canonical not in entries if trusted else canonical in entries
+            if trusted:
+                entries.add(canonical)
+            else:
+                entries.discard(canonical)
+            _save(directory, state_path.name, entries)
+            return changed
+    except AnchoredFilesystemError as exc:
+        if "link" in str(exc).casefold() or "reparse" in str(exc).casefold():
+            raise ValueError(
+                f"refusing to use linked workspace trust state: {state_path}"
+            ) from exc
+        raise ValueError(f"refusing to use workspace trust state: {state_path}: {exc}") from exc
 
 
-def _save(entries: set[str]) -> None:
-    path = trust_store_path()
-    _validate_trust_store_path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _validate_trust_store_path(path)
-    if os.name != "nt":
-        chmod_unlinked_directory(
-            path.parent,
-            0o700,
-            label="workspace trust state directory",
-        )
+def _save(
+    directory: AnchoredDirectory,
+    name: str,
+    entries: set[str],
+) -> None:
     payload = (
         json.dumps(
             {"version": 1, "workspaces": sorted(entries)},
@@ -106,9 +113,48 @@ def _save(entries: set[str]) -> None:
         )
         + "\n"
     ).encode("utf-8")
-    atomic_write_unlinked_bytes(
-        path,
-        payload,
-        label="workspace trust state",
-        mode=0o600,
-    )
+    existing = directory.stat(name)
+    if existing is not None:
+        if stat.S_ISLNK(existing.st_mode):
+            raise ValueError(
+                f"refusing to use linked workspace trust state: {directory.path / name}"
+            )
+        if not stat.S_ISREG(existing.st_mode):
+            raise ValueError(
+                f"refusing to use non-regular workspace trust state: {directory.path / name}"
+            )
+    temporary_name = directory.unique_name(f".{name}.", ".tmp")
+    descriptor = directory.create_file(temporary_name, mode=0o600)
+    renamed = False
+    completed = False
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write while writing workspace trust state")
+            view = view[written:]
+        os.fsync(descriptor)
+        directory.validation_path()
+        directory.rename(
+            temporary_name,
+            name,
+            expected_source_descriptor=descriptor,
+        )
+        renamed = True
+        directory.validation_path()
+        if os.name != "nt":
+            directory.sync()
+        completed = True
+    finally:
+        if not completed:
+            cleanup_name = name if renamed else temporary_name
+            try:
+                directory.unlink(
+                    cleanup_name,
+                    missing_ok=True,
+                    expected_descriptor=descriptor,
+                )
+            except BaseException:
+                pass
+        os.close(descriptor)

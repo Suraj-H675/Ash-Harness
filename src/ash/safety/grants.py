@@ -7,21 +7,19 @@ import json
 import os
 import re
 import shlex
+import stat
 import time
 from collections.abc import Callable, Iterable, Mapping
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.safety.trust import canonical_workspace
 from ash.safe_io import (
-    atomic_write_unlinked_bytes,
-    create_unlinked_regular_file,
-    open_unlinked_regular_file,
     read_bounded_open_file,
-    unlink_open_file,
     validate_unlinked_path,
 )
 
@@ -45,6 +43,14 @@ _BULK_ARGUMENTS = frozenset(
 
 class PermissionGrantError(ValueError):
     """Raised when persisted permission policy cannot be trusted."""
+
+
+def _permission_state_error(prefix: str, exc: BaseException) -> PermissionGrantError:
+    detail = str(exc)
+    lowered = detail.casefold()
+    if "link" in lowered or "reparse" in lowered:
+        detail = f"symlink or junction in permission rule state: {detail}"
+    return PermissionGrantError(f"{prefix}: {detail}")
 
 
 class RuleEffect(StrEnum):
@@ -596,18 +602,6 @@ def grants_path() -> Path:
     return Path.home() / ".ash" / "permission-grants.json"
 
 
-def _validated_grants_path() -> Path:
-    path = grants_path()
-    try:
-        return validate_unlinked_path(
-            path,
-            trusted_root=path.parent.parent,
-            label="permission rule state",
-        )
-    except ValueError as exc:
-        raise PermissionGrantError(str(exc)) from exc
-
-
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -634,15 +628,20 @@ def _read_payload(path: Path) -> dict[str, Any]:
             MAX_RULE_FILE_BYTES,
             label="permission rule file",
         )
+    except (OSError, ValueError) as exc:
+        if "exceeds" in str(exc):
+            raise PermissionGrantError("permission rule file exceeds 1 MB") from exc
+        raise PermissionGrantError(f"cannot read permission rule file: {exc}") from exc
+    return _decode_payload(raw)
+
+
+def _decode_payload(raw: bytes) -> dict[str, Any]:
+    try:
         payload = json.loads(
             raw.decode("utf-8"),
             object_pairs_hook=_unique_json_object,
         )
-    except PermissionGrantError:
-        raise
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
-        if "exceeds" in str(exc):
-            raise PermissionGrantError("permission rule file exceeds 1 MB") from exc
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
         raise PermissionGrantError(f"cannot read permission rule file: {exc}") from exc
     if not isinstance(payload, dict):
         raise PermissionGrantError("permission rule file root must be an object")
@@ -657,6 +656,18 @@ def _read_payload(path: Path) -> dict[str, Any]:
     if not isinstance(payload.get("workspaces", {}), dict):
         raise PermissionGrantError("permission rule workspaces must be an object")
     return payload
+
+
+def _read_user_payload(directory: AnchoredDirectory, name: str) -> dict[str, Any]:
+    try:
+        raw = directory.read_file(name, max_bytes=MAX_RULE_FILE_BYTES)
+    except (AnchoredFilesystemError, OSError) as exc:
+        if "exceeds" in str(exc):
+            raise PermissionGrantError("permission rule file exceeds 1 MB") from exc
+        raise PermissionGrantError(f"cannot read permission rule file: {exc}") from exc
+    if raw is None:
+        return {"version": CURRENT_PERMISSION_RULE_VERSION, "workspaces": {}}
+    return _decode_payload(raw)
 
 
 def _normalized_workspaces(
@@ -685,7 +696,21 @@ def _normalized_workspaces(
 
 
 def load_permission_rules(workspace: Path) -> list[PermissionRule]:
-    payload = _read_payload(grants_path())
+    path = grants_path()
+    try:
+        with AnchoredDirectory.open(
+            path.parent,
+            create=False,
+            private=False,
+            pin_path=True,
+        ) as directory:
+            directory.validation_path()
+            payload = _read_user_payload(directory, path.name)
+            directory.validation_path()
+    except FileNotFoundError:
+        payload = {"version": CURRENT_PERMISSION_RULE_VERSION, "workspaces": {}}
+    except AnchoredFilesystemError as exc:
+        raise _permission_state_error("cannot read permission rule file", exc) from exc
     workspaces = _normalized_workspaces(payload)
     return list(workspaces.get(canonical_workspace(workspace), ()))
 
@@ -759,68 +784,71 @@ def load_tool_grants(workspace: Path) -> set[str]:
 
 
 @contextmanager
-def _locked_rule_file(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_suffix(path.suffix + ".lock")
+def _locked_rule_entry(directory: AnchoredDirectory, name: str):
+    lock_name = f"{name}.lock"
     deadline = time.monotonic() + 3.0
     while True:
-        stack = ExitStack()
+        descriptor = -1
         try:
-            descriptor = stack.enter_context(
-                create_unlinked_regular_file(
-                    lock_path,
-                    label="permission rule lock",
-                    mode=0o600,
-                )
-            )
+            descriptor = directory.create_file(lock_name, mode=0o600)
         except FileExistsError:
-            stack.close()
+            existing_descriptor = -1
             try:
-                with open_unlinked_regular_file(
-                    lock_path,
-                    label="permission rule lock",
-                ) as existing_descriptor:
-                    stale = time.time() - os.fstat(existing_descriptor).st_mtime > 30
-                    if stale:
-                        unlink_open_file(
-                            lock_path,
-                            existing_descriptor,
-                            label="permission rule lock",
-                        )
+                existing = directory.stat(lock_name)
+                if existing is None:
+                    continue
+                if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+                    raise PermissionGrantError("permission rule lock is not a regular file")
+                existing_descriptor = directory.open_file(
+                    lock_name,
+                    os.O_RDONLY,
+                    expected=existing,
+                    expected_type=stat.S_IFREG,
+                )
+                stale = time.time() - os.fstat(existing_descriptor).st_mtime > 30
+                if stale:
+                    directory.unlink(
+                        lock_name,
+                        expected_descriptor=existing_descriptor,
+                    )
             except FileNotFoundError:
                 continue
-            except (OSError, ValueError) as exc:
+            except (AnchoredFilesystemError, OSError, ValueError) as exc:
                 raise PermissionGrantError(
                     f"cannot inspect permission rule lock: {exc}"
                 ) from exc
+            finally:
+                if existing_descriptor >= 0:
+                    os.close(existing_descriptor)
             if stale:
                 continue
             if time.monotonic() >= deadline:
                 raise PermissionGrantError("timed out waiting for permission rule lock")
             time.sleep(0.025)
-        except (OSError, ValueError) as exc:
-            stack.close()
+        except (AnchoredFilesystemError, OSError, ValueError) as exc:
             raise PermissionGrantError(
                 f"cannot create permission rule lock: {exc}"
             ) from exc
         else:
-            with stack:
+            try:
+                yield
+            finally:
                 try:
-                    yield
-                finally:
-                    try:
-                        unlink_open_file(
-                            lock_path,
-                            descriptor,
-                            label="permission rule lock",
-                        )
-                    except (FileNotFoundError, OSError, ValueError):
-                        pass
+                    directory.unlink(
+                        lock_name,
+                        missing_ok=True,
+                        expected_descriptor=descriptor,
+                    )
+                except (AnchoredFilesystemError, FileNotFoundError, OSError, ValueError):
+                    pass
+                os.close(descriptor)
             return
 
 
 def _write_workspaces(
-    path: Path, workspaces: Mapping[str, list[PermissionRule]]
+    directory: AnchoredDirectory,
+    name: str,
+    workspaces: Mapping[str, list[PermissionRule]],
 ) -> None:
     payload = {
         "version": CURRENT_PERMISSION_RULE_VERSION,
@@ -830,18 +858,52 @@ def _write_workspaces(
             if rules
         },
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         serialized = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode(
             "utf-8"
         )
-        atomic_write_unlinked_bytes(
-            path,
-            serialized,
-            label="permission rule state",
-            mode=0o600,
-        )
-    except (OSError, ValueError) as exc:
+        existing = directory.stat(name)
+        if existing is not None:
+            if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+                raise PermissionGrantError("permission rule state is not a regular file")
+        temporary_name = directory.unique_name(f".{name}.", ".tmp")
+        descriptor = directory.create_file(temporary_name, mode=0o600)
+        renamed = False
+        completed = False
+        try:
+            view = memoryview(serialized)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short write while writing permission rule state")
+                view = view[written:]
+            os.fsync(descriptor)
+            directory.validation_path()
+            directory.rename(
+                temporary_name,
+                name,
+                expected_source_descriptor=descriptor,
+            )
+            renamed = True
+            directory.validation_path()
+            if os.name != "nt":
+                directory.sync()
+            completed = True
+        finally:
+            if not completed:
+                cleanup_name = name if renamed else temporary_name
+                try:
+                    directory.unlink(
+                        cleanup_name,
+                        missing_ok=True,
+                        expected_descriptor=descriptor,
+                    )
+                except BaseException:
+                    pass
+            os.close(descriptor)
+    except PermissionGrantError:
+        raise
+    except (AnchoredFilesystemError, OSError, ValueError) as exc:
         raise PermissionGrantError(f"cannot write permission rule file: {exc}") from exc
 
 
@@ -849,19 +911,35 @@ def _update_rules(
     workspace: Path,
     update: Callable[[list[PermissionRule]], list[PermissionRule]],
 ) -> list[PermissionRule]:
-    path = _validated_grants_path()
-    with _locked_rule_file(path):
-        path = _validated_grants_path()
-        workspaces = _normalized_workspaces(_read_payload(path))
-        key = canonical_workspace(workspace)
-        rules = update(list(workspaces.get(key, ())))
-        if rules:
-            workspaces[key] = rules
-        else:
-            workspaces.pop(key, None)
-        path = _validated_grants_path()
-        _write_workspaces(path, workspaces)
-    return rules
+    path = grants_path()
+    try:
+        with AnchoredDirectory.open(
+            path.parent,
+            create=True,
+            private=False,
+            pin_path=True,
+        ) as directory:
+            directory.validation_path()
+            with _locked_rule_entry(directory, path.name):
+                directory.validation_path()
+                workspaces = _normalized_workspaces(
+                    _read_user_payload(directory, path.name)
+                )
+                key = canonical_workspace(workspace)
+                rules = update(list(workspaces.get(key, ())))
+                if rules:
+                    workspaces[key] = rules
+                else:
+                    workspaces.pop(key, None)
+                directory.validation_path()
+                _write_workspaces(directory, path.name, workspaces)
+                directory.validation_path()
+            directory.validation_path()
+            return rules
+    except PermissionGrantError:
+        raise
+    except (AnchoredFilesystemError, OSError, ValueError) as exc:
+        raise _permission_state_error("cannot update permission rule state", exc) from exc
 
 
 def add_permission_rule(workspace: Path, rule: PermissionRule) -> list[PermissionRule]:

@@ -91,6 +91,57 @@ def test_audit_export_rejects_symlinked_destination(
     assert outside_file.read_text(encoding="utf-8") == "ORIGINAL\n"
 
 
+def test_audit_export_rejects_plain_parent_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.commands.audit as audit_module
+
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session("/workspace")
+    store.append_audit_log(
+        session.session_id,
+        action_type="tool_call",
+        target_resource="read_file",
+        details={"path": "README.md"},
+        result="SUCCESS",
+    )
+    target_directory = tmp_path / "exports"
+    saved_directory = tmp_path / "exports-original"
+    replacement_directory = tmp_path / "replacement"
+    target_directory.mkdir()
+    replacement_directory.mkdir()
+    victim = replacement_directory / "audit.json"
+    victim.write_text("DO NOT REPLACE\n", encoding="utf-8")
+
+    real_open = audit_module.AnchoredDirectory.open
+    swapped = False
+
+    def open_then_swap(path, **kwargs):
+        nonlocal swapped
+        directory = real_open(path, **kwargs)
+        if Path(path) == target_directory and not swapped:
+            swapped = True
+            target_directory.rename(saved_directory)
+            replacement_directory.rename(target_directory)
+        return directory
+
+    monkeypatch.setattr(
+        audit_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
+
+    with pytest.raises(OSError):
+        export_audit_log(store, session.session_id, target_directory / "audit.json")
+
+    assert swapped is True
+    assert (target_directory / "audit.json").read_text(encoding="utf-8") == (
+        "DO NOT REPLACE\n"
+    )
+    assert not (saved_directory / "audit.json").exists()
+
+
 def test_audit_cli_honors_database_directory_override(
     tmp_path: Path,
     capsys,

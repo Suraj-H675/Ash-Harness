@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -318,26 +319,81 @@ def test_permission_rule_read_rejects_parent_swapped_after_validation(
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(home))
-    real_validate = grants_module.validate_unlinked_path
+    real_open = grants_module.AnchoredDirectory.open
     swapped = False
 
-    def validate_then_swap(*args, **kwargs):
+    def open_then_swap(path, **kwargs):
         nonlocal swapped
-        result = real_validate(*args, **kwargs)
-        if not swapped:
+        directory = real_open(path, **kwargs)
+        if Path(path) == state_dir and not swapped:
             swapped = True
             state_dir.rename(home / ".ash-real")
             try:
                 state_dir.symlink_to(outside, target_is_directory=True)
             except OSError as exc:
                 pytest.skip(f"symlink creation is unavailable: {exc}")
-        return result
+        return directory
 
-    monkeypatch.setattr(grants_module, "validate_unlinked_path", validate_then_swap)
+    monkeypatch.setattr(
+        grants_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
 
     with pytest.raises(PermissionGrantError):
         load_permission_rules(workspace)
     assert swapped is True
+
+
+def test_permission_rule_read_rejects_plain_parent_directory_swap(
+    tmp_path, monkeypatch
+) -> None:
+    import ash.safety.grants as grants_module
+
+    home = tmp_path / "home"
+    state_dir = home / ".ash"
+    saved_dir = home / ".ash-original"
+    replacement_dir = tmp_path / "replacement"
+    state_dir.mkdir(parents=True)
+    replacement_dir.mkdir()
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    forged = PermissionRule.create(RuleEffect.ALLOW, "run_command")
+    (replacement_dir / "permission-grants.json").write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "workspaces": {
+                    str(workspace.resolve()): [forged.as_payload()],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    real_open = grants_module.AnchoredDirectory.open
+    swapped = False
+
+    def open_then_swap(path, **kwargs):
+        nonlocal swapped
+        directory = real_open(path, **kwargs)
+        if Path(path) == state_dir and not swapped:
+            swapped = True
+            state_dir.rename(saved_dir)
+            replacement_dir.rename(state_dir)
+        return directory
+
+    monkeypatch.setattr(
+        grants_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
+
+    with pytest.raises(PermissionGrantError):
+        load_permission_rules(workspace)
+
+    assert swapped is True
+    assert not (saved_dir / "permission-grants.json").exists()
 
 
 def test_permission_rule_write_rejects_parent_swapped_after_validation(
@@ -355,29 +411,231 @@ def test_permission_rule_write_rejects_parent_swapped_after_validation(
     victim = outside / "permission-grants.json"
     victim.write_text("DO NOT TOUCH\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
-    real_validated = grants_module._validated_grants_path
-    validation_count = 0
+    real_open = grants_module.AnchoredDirectory.open
+    swapped = False
 
-    def validated_then_swap():
-        nonlocal validation_count
-        result = real_validated()
-        validation_count += 1
-        if validation_count == 3:
+    def open_then_swap(path, **kwargs):
+        nonlocal swapped
+        directory = real_open(path, **kwargs)
+        if Path(path) == state_dir and not swapped:
+            swapped = True
             state_dir.rename(home / ".ash-real")
             try:
                 state_dir.symlink_to(outside, target_is_directory=True)
             except OSError as exc:
                 pytest.skip(f"symlink creation is unavailable: {exc}")
-        return result
+        return directory
 
-    monkeypatch.setattr(grants_module, "_validated_grants_path", validated_then_swap)
+    monkeypatch.setattr(
+        grants_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
 
     with pytest.raises(PermissionGrantError):
         add_permission_rule(
             workspace,
             PermissionRule.create(RuleEffect.ALLOW, "run_command"),
         )
+    assert swapped is True
     assert victim.read_text(encoding="utf-8") == "DO NOT TOUCH\n"
+
+
+def test_permission_rule_write_rejects_plain_parent_directory_swap(
+    tmp_path, monkeypatch
+) -> None:
+    import ash.safety.grants as grants_module
+
+    home = tmp_path / "home"
+    state_dir = home / ".ash"
+    saved_dir = home / ".ash-original"
+    replacement_dir = tmp_path / "replacement"
+    state_dir.mkdir(parents=True)
+    replacement_dir.mkdir()
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (replacement_dir / "permission-grants.json").write_text(
+        json.dumps({"version": 3, "workspaces": {}}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    real_open = grants_module.AnchoredDirectory.open
+    swapped = False
+
+    def open_then_swap(path, **kwargs):
+        nonlocal swapped
+        directory = real_open(path, **kwargs)
+        if Path(path) == state_dir and not swapped:
+            swapped = True
+            state_dir.rename(saved_dir)
+            replacement_dir.rename(state_dir)
+        return directory
+
+    monkeypatch.setattr(
+        grants_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
+
+    with pytest.raises(PermissionGrantError):
+        add_permission_rule(
+            workspace,
+            PermissionRule.create(RuleEffect.ALLOW, "run_command"),
+        )
+
+    assert swapped is True
+    visible = json.loads(
+        (state_dir / "permission-grants.json").read_text(encoding="utf-8")
+    )
+    assert visible == {"version": 3, "workspaces": {}}
+    assert not (saved_dir / "permission-grants.json").exists()
+
+
+def test_permission_rule_write_rejects_parent_swap_before_publication(
+    tmp_path, monkeypatch
+) -> None:
+    import ash.safety.grants as grants_module
+
+    home = tmp_path / "home"
+    state_dir = home / ".ash"
+    saved_dir = home / ".ash-original"
+    replacement_dir = tmp_path / "replacement"
+    state_dir.mkdir(parents=True)
+    replacement_dir.mkdir()
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    victim = replacement_dir / "permission-grants.json"
+    victim.write_text(
+        json.dumps({"version": 3, "workspaces": {}}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    real_rename = grants_module.AnchoredDirectory.rename
+    swapped = False
+
+    def rename_then_swap(self, source, destination, **kwargs):
+        nonlocal swapped
+        if destination == "permission-grants.json" and not swapped:
+            swapped = True
+            state_dir.rename(saved_dir)
+            replacement_dir.rename(state_dir)
+        return real_rename(self, source, destination, **kwargs)
+
+    monkeypatch.setattr(
+        grants_module.AnchoredDirectory,
+        "rename",
+        rename_then_swap,
+    )
+
+    with pytest.raises(PermissionGrantError):
+        add_permission_rule(
+            workspace,
+            PermissionRule.create(RuleEffect.ALLOW, "run_command"),
+        )
+
+    assert swapped is True
+    assert json.loads(
+        (state_dir / "permission-grants.json").read_text(encoding="utf-8")
+    ) == {"version": 3, "workspaces": {}}
+    assert not (saved_dir / "permission-grants.json").exists()
+
+
+def test_permission_rule_concurrent_process_writers_preserve_both_updates(
+    tmp_path, monkeypatch
+) -> None:
+    import os
+    import subprocess
+    import sys
+    import time
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    ready = tmp_path / "writer-a-ready"
+    release = tmp_path / "writer-a-release"
+    writer_b_started = tmp_path / "writer-b-started"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    environment = dict(os.environ)
+
+    writer_a = "\n".join(
+        [
+            "import sys, time",
+            "from pathlib import Path",
+            "import ash.safety.grants as g",
+            "from ash.safety.grants import PermissionRule, RuleEffect",
+            "workspace, ready, release = map(Path, sys.argv[1:4])",
+            "original = g._read_user_payload",
+            "def blocked_read(directory, name):",
+            "    payload = original(directory, name)",
+            "    ready.write_text('ready', encoding='utf-8')",
+            "    deadline = time.time() + 10",
+            "    while not release.exists():",
+            "        if time.time() >= deadline:",
+            "            raise RuntimeError('timed out waiting to release writer A')",
+            "        time.sleep(0.01)",
+            "    return payload",
+            "g._read_user_payload = blocked_read",
+            "g.add_permission_rule(workspace, PermissionRule.create(RuleEffect.ALLOW, 'run_command'))",
+        ]
+    )
+    writer_b = "\n".join(
+        [
+            "import sys",
+            "from pathlib import Path",
+            "from ash.safety.grants import PermissionRule, RuleEffect, add_permission_rule",
+            "workspace, started = map(Path, sys.argv[1:3])",
+            "started.write_text('started', encoding='utf-8')",
+            "add_permission_rule(workspace, PermissionRule.create(RuleEffect.ALLOW, 'read_file'))",
+        ]
+    )
+
+    first = subprocess.Popen(
+        [sys.executable, "-c", writer_a, str(workspace), str(ready), str(release)],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    second = None
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            if first.poll() is not None:
+                break
+            time.sleep(0.01)
+        assert ready.exists(), first.communicate(timeout=1)
+
+        second = subprocess.Popen(
+            [sys.executable, "-c", writer_b, str(workspace), str(writer_b_started)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 5
+        while not writer_b_started.exists() and time.monotonic() < deadline:
+            if second.poll() is not None:
+                break
+            time.sleep(0.01)
+        assert writer_b_started.exists(), second.communicate(timeout=1)
+        assert second.poll() is None
+
+        release.write_text("release", encoding="utf-8")
+        first_stdout, first_stderr = first.communicate(timeout=10)
+        second_stdout, second_stderr = second.communicate(timeout=10)
+        assert first.returncode == 0, (first_stdout, first_stderr)
+        assert second.returncode == 0, (second_stdout, second_stderr)
+    finally:
+        release.write_text("release", encoding="utf-8")
+        for process in (first, second):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
+
+    assert {rule.tool_name for rule in load_permission_rules(workspace)} == {
+        "run_command",
+        "read_file",
+    }
 
 
 def test_permission_rule_stale_lock_cleanup_rejects_parent_swap(
@@ -436,9 +694,15 @@ def test_permission_rule_lock_does_not_consume_body_file_exists(
     path = grants_path()
     path.parent.mkdir(parents=True)
 
-    with pytest.raises(FileExistsError, match="body failure"):
-        with grants_module._locked_rule_file(path):
-            raise FileExistsError("body failure")
+    with grants_module.AnchoredDirectory.open(
+        path.parent,
+        create=False,
+        private=False,
+        pin_path=True,
+    ) as directory:
+        with pytest.raises(FileExistsError, match="body failure"):
+            with grants_module._locked_rule_entry(directory, path.name):
+                raise FileExistsError("body failure")
 
     assert not path.with_suffix(path.suffix + ".lock").exists()
 
