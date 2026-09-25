@@ -1311,9 +1311,24 @@ class AutomationStore:
         workspace: Path | str,
         older_than_days: int = 30,
     ) -> int:
+        return self._prune_runs_for_workspace_key(
+            workspace_key=_workspace(workspace),
+            older_than_days=older_than_days,
+        )
+
+    def _prune_runs_for_workspace_key(
+        self,
+        *,
+        workspace_key: str,
+        older_than_days: int = 30,
+    ) -> int:
+        """Prune runs for an already-canonical persisted workspace key."""
+
         if type(older_than_days) is not int or not 1 <= older_than_days <= 3650:
             raise ValueError("older_than_days must be between 1 and 3650")
-        root = _workspace(workspace)
+        if not isinstance(workspace_key, str) or not workspace_key:
+            raise ValueError("workspace_key must be a non-empty string")
+        root = workspace_key
         with self._transaction():
             cutoff = self._clock() - older_than_days * 86400
             # Keep lifecycle events as an audit ledger after bulky run output expires.

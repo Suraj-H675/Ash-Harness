@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import stat
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -47,6 +48,7 @@ from ash.automation.store import (
 from ash.automation.worker import AutomationWorkerService
 from ash.commands.automation import automation_config_loader
 from ash.config import AshConfig
+from ash.core.session import SessionStore, get_db_connection
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy, PolicyAction
 from ash.sdk import AshResult
@@ -832,6 +834,100 @@ def test_automation_worker_requires_restart_after_workspace_identity_change(
         worker._validate_workspace()
 
 
+def test_automation_worker_requires_restart_after_database_identity_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "automation.db"
+    replacement = tmp_path / "replacement.db"
+    store = AutomationStore(database)
+    with AutomationStore(replacement):
+        pass
+    worker = AutomationWorkerService(store, workspace)
+    monkeypatch.setattr("ash.automation.worker.is_workspace_trusted", lambda path: True)
+
+    try:
+        database.rename(tmp_path / "automation-original.db")
+        replacement.rename(database)
+    except OSError as exc:
+        store.close()
+        pytest.skip(f"open database replacement is unavailable: {exc}")
+
+    with pytest.raises(
+        AutomationRestartRequired,
+        match="automation database identity changed",
+    ):
+        worker._validate_workspace()
+
+    store.close()
+
+
+def test_automation_worker_requires_restart_when_database_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "automation.db"
+    store = AutomationStore(database)
+    worker = AutomationWorkerService(store, workspace)
+    monkeypatch.setattr("ash.automation.worker.is_workspace_trusted", lambda path: True)
+
+    try:
+        database.rename(tmp_path / "automation-original.db")
+    except OSError as exc:
+        store.close()
+        pytest.skip(f"open database rename is unavailable: {exc}")
+
+    with pytest.raises(
+        AutomationRestartRequired,
+        match="automation database identity changed",
+    ):
+        worker._validate_workspace()
+
+    store.close()
+
+
+def test_automation_worker_requires_restart_when_database_identity_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = AutomationStore(tmp_path / "automation.db")
+    worker = AutomationWorkerService(store, workspace)
+    monkeypatch.setattr("ash.automation.worker.is_workspace_trusted", lambda path: True)
+    monkeypatch.setattr("ash.automation.worker._regular_file_identity", lambda path: None)
+
+    with pytest.raises(
+        AutomationRestartRequired,
+        match="automation database identity changed",
+    ):
+        worker._validate_workspace()
+
+    store.close()
+
+
+def test_automation_worker_refuses_start_without_database_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = AutomationStore(tmp_path / "automation.db")
+    monkeypatch.setattr("ash.automation.worker._regular_file_identity", lambda path: None)
+
+    with pytest.raises(
+        AutomationRestartRequired,
+        match="automation database identity is unavailable",
+    ):
+        AutomationWorkerService(store, workspace)
+
+    store.close()
+
+
 @pytest.mark.asyncio
 async def test_automation_subprocess_fails_closed_without_stable_cwd(
     tmp_path: Path,
@@ -865,41 +961,193 @@ async def test_automation_subprocess_fails_closed_without_stable_cwd(
 
 
 @pytest.mark.asyncio
-async def test_automation_maintenance_uses_isolated_python(
+async def test_automation_maintenance_prunes_through_open_store_after_file_set_swap(
     tmp_path: Path,
-    store: AutomationStore,
+) -> None:
+    workspace = tmp_path / "workspace"
+    state = tmp_path / "state"
+    workspace.mkdir()
+    state.mkdir()
+    old = 1_700_000_000.0
+    clock = [old]
+    now = datetime.fromtimestamp(old, tz=timezone.utc)
+
+    store = AutomationStore(state / "automation.db", clock=lambda: clock[0])
+    try:
+        original_job = store.create_job(
+            name="original",
+            prompt="noop",
+            workspace=workspace,
+            schedule=build_schedule(every="1h", now=now),
+            enabled=False,
+        )
+        original_claim = store.claim_manual(
+            original_job.job_id,
+            workspace=workspace,
+            worker_id="original",
+        )
+        store.finish_run(
+            original_claim.run.run_id,
+            original_claim.token,
+            status="succeeded",
+        )
+
+        with AutomationStore(
+            state / "replacement.db", clock=lambda: clock[0]
+        ) as replacement_store:
+            replacement_job = replacement_store.create_job(
+                name="replacement",
+                prompt="noop",
+                workspace=workspace,
+                schedule=build_schedule(every="1h", now=now),
+                enabled=False,
+            )
+            replacement_claim = replacement_store.claim_manual(
+                replacement_job.job_id,
+                workspace=workspace,
+                worker_id="replacement",
+            )
+            replacement_store.finish_run(
+                replacement_claim.run.run_id,
+                replacement_claim.token,
+                status="succeeded",
+            )
+            replacement_run_id = replacement_claim.run.run_id
+
+        worker = AutomationWorkerService(
+            store,
+            workspace,
+            run_retention_days=1,
+            maintenance_interval_seconds=1,
+        )
+        clock[0] += 3 * 86400
+
+        original_map = {
+            "automation.db": "original-automation.db",
+            "automation.db-wal": "original-automation.db-wal",
+            "automation.db-shm": "original-automation.db-shm",
+            ".automation.db.ash-lock": ".original-automation.db.ash-lock",
+        }
+        replacement_map = {
+            "replacement.db": "automation.db",
+            "replacement.db-wal": "automation.db-wal",
+            "replacement.db-shm": "automation.db-shm",
+            ".replacement.db.ash-lock": ".automation.db.ash-lock",
+        }
+        try:
+            for source, destination in original_map.items():
+                path = state / source
+                if path.exists():
+                    path.rename(state / destination)
+        except OSError as exc:
+            pytest.skip(f"open database file-set replacement is unavailable: {exc}")
+        for source, destination in replacement_map.items():
+            path = state / source
+            if path.exists():
+                path.rename(state / destination)
+
+        await worker._run_maintenance()
+
+        assert store.get_run(original_claim.run.run_id) is None
+        with AutomationStore(
+            state / "automation.db", clock=lambda: clock[0]
+        ) as visible_store:
+            assert visible_store.get_run(replacement_run_id) is not None
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_automation_maintenance_preserves_sessions_when_retention_enabled(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workspace = tmp_path / "repo"
+    workspace = tmp_path / "workspace"
     workspace.mkdir()
-    captured: dict[str, object] = {}
+    automation_store = AutomationStore(tmp_path / "automation.db")
+    session_store = SessionStore(tmp_path / "sessions.db")
+    session = session_store.create_session(str(workspace))
+    with get_db_connection(session_store.db_path) as connection, connection:
+        old = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        connection.execute(
+            "UPDATE sessions SET created_at = ?, updated_at = ? WHERE session_id = ?",
+            (old, old, session.session_id),
+        )
 
-    class Process:
-        returncode = 0
-
-    async def fake_spawn(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return Process()
-
-    async def fake_communicate(*args, **kwargs):
-        del args, kwargs
-        return b"ASH_AUTOMATION_MAINTENANCE_OK\r\n", b""
-
+    warnings: list[str] = []
     monkeypatch.setattr(
-        "ash.automation.worker.asyncio.create_subprocess_exec", fake_spawn
+        "ash.automation.worker._log.warning",
+        lambda message, *args, **kwargs: warnings.append(str(message)),
     )
-    monkeypatch.setattr("ash.automation.worker.communicate_process", fake_communicate)
-    worker = AutomationWorkerService(store, workspace)
+    try:
+        worker = AutomationWorkerService(
+            automation_store,
+            workspace,
+            session_retention_days=1,
+            session_store_path=Path(session_store.db_path),
+            maintenance_interval_seconds=1,
+        )
 
-    await worker._run_maintenance()
+        await worker._run_maintenance()
+        worker._last_maintenance_at = float("-inf")
+        await worker._run_maintenance()
 
-    assert captured["args"][:4] == (
-        sys.executable,
-        "-I",
-        "-m",
-        "ash.automation.maintenance",
+        assert session_store.load_session(session.session_id).session_id == session.session_id
+        assert len(warnings) == 1
+        assert "skipped session retention" in warnings[0]
+    finally:
+        automation_store.close()
+
+
+@pytest.mark.asyncio
+async def test_automation_maintenance_cancellation_waits_for_prune_settlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = AutomationStore(tmp_path / "automation.db")
+    worker = AutomationWorkerService(
+        store,
+        workspace,
+        maintenance_interval_seconds=1,
     )
+    started = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    original_prune = store._prune_runs_for_workspace_key
+
+    def blocking_prune(*, workspace_key: str, older_than_days: int) -> int:
+        started.set()
+        assert release.wait(timeout=2)
+        try:
+            return original_prune(
+                workspace_key=workspace_key,
+                older_than_days=older_than_days,
+            )
+        finally:
+            completed.set()
+
+    monkeypatch.setattr(store, "_prune_runs_for_workspace_key", blocking_prune)
+    maintenance = asyncio.create_task(worker._run_maintenance())
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 1), timeout=2)
+        maintenance.cancel()
+        await asyncio.sleep(0)
+        assert not maintenance.done()
+        release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await maintenance
+
+        assert completed.is_set()
+    finally:
+        release.set()
+        if not maintenance.done():
+            maintenance.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await maintenance
+        store.close()
 
 
 def test_cron_trigger_handles_spring_forward_and_fall_back() -> None:

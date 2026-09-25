@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import stat
 import sys
 import time
 import threading
@@ -101,6 +102,16 @@ def _directory_identity(path: Path) -> tuple[int, int] | None:
     try:
         metadata = os.stat(path)
     except OSError:
+        return None
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def _regular_file_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_ino == 0:
         return None
     return (metadata.st_dev, metadata.st_ino)
 
@@ -532,6 +543,13 @@ class AutomationWorkerService:
         self.store = store
         self.workspace = Path(workspace).expanduser().resolve()
         self._workspace_identity = _directory_identity(self.workspace)
+        self._workspace_key = str(self.workspace)
+        self._database_path = Path(self.store.db_path)
+        self._database_identity = _regular_file_identity(self._database_path)
+        if self._database_identity is None:
+            raise AutomationRestartRequired(
+                "automation database identity is unavailable; restart the worker"
+            )
         self.worker_id = worker_id or f"worker-{uuid.uuid4()}"
         if not 1 <= max_concurrent_runs <= 32:
             raise ValueError("max_concurrent_runs must be between 1 and 32")
@@ -559,6 +577,7 @@ class AutomationWorkerService:
         self._run_retention_days = run_retention_days
         self._session_retention_days = session_retention_days
         self._session_store_path = session_store_path
+        self._session_retention_warning_emitted = False
         self._maintenance_interval_seconds = maintenance_interval_seconds
         self._last_maintenance_at = float("-inf")
         self._stop = asyncio.Event()
@@ -982,6 +1001,10 @@ class AutomationWorkerService:
                 raise AutomationRestartRequired(
                     "automation workspace identity changed; restart the worker"
                 )
+        if _regular_file_identity(self._database_path) != self._database_identity:
+            raise AutomationRestartRequired(
+                "automation database identity changed; restart the worker"
+            )
         if not is_workspace_trusted(self.workspace):
             raise AutomationError(
                 "automation workspace is not trusted; run `ash trust add` before retrying"
@@ -1243,76 +1266,40 @@ class AutomationWorkerService:
         now = time.monotonic()
         if now - self._last_maintenance_at < self._maintenance_interval_seconds:
             return
-        request = {
-            "automation_db_path": self.store.db_path,
-            "workspace": str(self.workspace),
-            "run_retention_days": self._run_retention_days,
-            "session_retention_days": self._session_retention_days,
-            "session_store_path": (
-                str(self._session_store_path)
-                if self._session_store_path is not None
-                else None
+        prune_task = asyncio.create_task(
+            asyncio.to_thread(
+                self.store._prune_runs_for_workspace_key,
+                workspace_key=self._workspace_key,
+                older_than_days=self._run_retention_days,
             ),
-            "now": self.store._clock(),
-        }
-        try:
-            process_tree_plan = prepare_process_tree(workspace_root=self.workspace)
-        except ProcessTreeUnavailable as exc:
-            raise AutomationError(
-                f"automation maintenance was not started: {exc}"
-            ) from exc
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-I",
-            "-m",
-            "ash.automation.maintenance",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **process_tree_plan.spawn_options,
+            name="ash-retention-prune",
         )
         try:
-            async with asyncio.timeout(600):
-                stdout, stderr = await communicate_process(
-                    process,
-                    input_data=json.dumps(request, allow_nan=False).encode("utf-8"),
-                    max_output_bytes=64 * 1024,
-                    process_tree_plan=process_tree_plan,
-                )
+            await asyncio.shield(prune_task)
         except asyncio.CancelledError as cancellation:
-            cleanup_error, cleanup_cancelled = (
-                await settle_process_tree_after_cancellation(
-                    process, plan=process_tree_plan
+            _, prune_error, cleanup_interrupted = (
+                await _settle_worker_task_after_cancellation(prune_task)
+            )
+            if prune_error is not None:
+                cancellation.add_note(
+                    f"automation retention prune failed during cancellation: {prune_error}"
                 )
-            )
-            if cleanup_error is not None:
-                cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
-            if cleanup_cancelled:
-                cancellation.add_note("Process-tree cleanup was cancelled")
-            raise
-        except ProcessOutputLimitExceeded:
-            # communicate_process already attempted managed-tree cleanup when
-            # it detected the output limit; do not target the root a second time.
-            raise
-        except BaseException as primary:
-            cleanup_error, cleanup_cancelled = (
-                await settle_process_tree_after_cancellation(
-                    process, plan=process_tree_plan
+            if cleanup_interrupted:
+                cancellation.add_note(
+                    "automation retention prune settlement was itself interrupted"
                 )
-            )
-            if cleanup_error is not None:
-                primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
-            if cleanup_cancelled:
-                primary.add_note("Process-tree cleanup was cancelled")
             raise
-        if process.returncode != 0:
-            detail = stderr.decode("utf-8", errors="replace")[-4000:].strip()
-            raise AutomationError(
-                "automation maintenance failed: "
-                + redact_text(detail or f"exit status {process.returncode}")
+        if (
+            self._session_retention_days > 0
+            and self._session_store_path is not None
+            and not self._session_retention_warning_emitted
+        ):
+            _log.warning(
+                "automation worker skipped session retention because safe destructive "
+                "maintenance requires a stable session database owner; normal Ash "
+                "runtime startup still applies session_retention_days"
             )
-        if stdout.splitlines() != [b"ASH_AUTOMATION_MAINTENANCE_OK"]:
-            raise AutomationError("automation maintenance returned an invalid result")
+            self._session_retention_warning_emitted = True
         self._last_maintenance_at = now
 
 

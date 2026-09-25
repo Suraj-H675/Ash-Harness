@@ -246,10 +246,21 @@ retention applies.
   process. Worker shutdown cancels and finalizes owned tasks before removing
   its heartbeat.
 - Terminal run rows expire according to `automation_run_retention_days` during
-  hourly maintenance while no runs are active. Maintenance executes in an
-  isolated, bounded process. When `session_retention_days` is enabled,
-  automation sessions for the worker workspace are pruned on the same cycle.
-  Lifecycle events remain as the audit ledger after bulky run output is pruned.
+  hourly maintenance while no runs are active. The worker prunes through its
+  already-open automation database connection instead of reopening
+  `automation.db` by pathname; the database operation runs off the event loop
+  and is settled before worker cancellation completes. Lifecycle events remain
+  as the audit ledger after bulky run output is pruned.
+- The worker records the visible main `automation.db` file identity at startup
+  and requires restart if a later loop observes that file missing, non-regular,
+  unavailable, or replaced. This is a fail-closed restart detector for a
+  persistent identity change, not a guarantee against a transient same-account
+  file swap that occurs entirely between validation checks.
+- `session_retention_days` remains enforced by normal Ash runtime/CLI startup.
+  The durable automation worker does not independently reopen `sessions.db` for
+  destructive retention because it does not own a stable session-database
+  connection; when session retention is enabled it preserves those sessions and
+  emits a one-time warning instead of risking cleanup against a replaced file.
 
 Because interrupted outcomes are deliberately not retried, inspect the
 workspace and any external system before manually running that job again.
