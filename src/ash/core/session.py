@@ -17,8 +17,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.safe_io import (
-    create_unlinked_regular_file,
     open_unlinked_regular_file,
     strict_json_loads,
     validate_unlinked_file_path,
@@ -78,7 +78,11 @@ def _database_coordination_lock_path(db_path: str) -> Path:
     return path.with_name(f".{path.name}.ash-lock")
 
 
-def _open_database_coordination_file(db_path: str) -> int | None:
+def _open_database_coordination_file(
+    db_path: str,
+    *,
+    parent_descriptor: int | None = None,
+) -> int | None:
     if os.name != "posix" or fcntl is None:
         return None
     path = _database_coordination_lock_path(db_path)
@@ -86,7 +90,19 @@ def _open_database_coordination_file(db_path: str) -> int | None:
     flags |= int(getattr(os, "O_CLOEXEC", 0))
     flags |= int(getattr(os, "O_NOFOLLOW", 0))
     try:
-        descriptor = os.open(path, flags, 0o600)
+        if parent_descriptor is None:
+            descriptor = os.open(path, flags, 0o600)
+        else:
+            if os.open not in getattr(os, "supports_dir_fd", ()):
+                raise SessionStorageError(
+                    "Secure session database coordination is unavailable on this platform"
+                )
+            descriptor = os.open(
+                path.name,
+                flags,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
     except OSError as exc:
         raise SessionStorageError(
             f"Could not open session database coordination lock {path}: {exc}"
@@ -108,6 +124,7 @@ def _acquire_database_coordination(
     db_path: str,
     *,
     exclusive: bool,
+    coordination_parent_descriptor: int | None = None,
 ) -> Any:
     state = _database_coordination_state(db_path)
     thread_id = threading.get_ident()
@@ -144,7 +161,10 @@ def _acquire_database_coordination(
 
     descriptor: int | None = None
     try:
-        descriptor = _open_database_coordination_file(db_path)
+        descriptor = _open_database_coordination_file(
+            db_path,
+            parent_descriptor=coordination_parent_descriptor,
+        )
         if descriptor is not None:
             assert fcntl is not None
             operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
@@ -203,13 +223,24 @@ def _acquire_database_coordination(
 
 
 @contextmanager
-def exclusive_database_access(db_path: str | Path):
+def exclusive_database_access(
+    db_path: str | Path,
+    *,
+    coordination_parent_descriptor: int | None = None,
+):
     """Quiesce Ash database connections while a storage-level mutation runs."""
 
     normalized_path = Path(_normalize_db_path(db_path))
     normalized_path.parent.mkdir(parents=True, exist_ok=True)
     normalized = _normalize_db_path(normalized_path)
-    release = _acquire_database_coordination(normalized, exclusive=True)
+    if coordination_parent_descriptor is None:
+        release = _acquire_database_coordination(normalized, exclusive=True)
+    else:
+        release = _acquire_database_coordination(
+            normalized,
+            exclusive=True,
+            coordination_parent_descriptor=coordination_parent_descriptor,
+        )
     try:
         yield Path(normalized)
     finally:
@@ -1187,78 +1218,96 @@ class SessionStore:
                 f"{source_path.name}.{reason}.{timestamp}.backup"
             )
         else:
-            try:
-                destination_path = validate_unlinked_file_path(
-                    destination, label="session backup"
-                )
-            except ValueError as exc:
-                raise SessionStorageError(str(exc)) from exc
+            destination_path = Path(
+                os.path.abspath(Path(destination).expanduser())
+            )
         if destination_path == source_path:
             raise SessionStorageError(
                 "Backup destination must differ from the database"
             )
-        if destination_path.exists():
-            raise SessionStorageError(
-                f"Backup destination already exists: {destination_path}"
-            )
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            destination_path = validate_unlinked_file_path(
-                destination_path, label="session backup"
-            )
-        except ValueError as exc:
-            raise SessionStorageError(str(exc)) from exc
-        try:
-            with create_unlinked_regular_file(
-                destination_path,
-                label="session backup",
-                mode=0o600,
-            ) as descriptor:
-                with exclusive_database_access(source_path) as locked_source:
-                    _require_quiescent_backup_source(locked_source)
-                    with open_unlinked_regular_file(
-                        locked_source,
-                        label="session database",
-                    ) as source_descriptor:
-                        verify_open_file_identity(
-                            locked_source,
-                            source_descriptor,
-                            label="session database",
-                        )
-                        before = os.fstat(source_descriptor)
-                        _require_quiescent_backup_source(locked_source)
-                        _copy_descriptor(source_descriptor, descriptor)
-                        after = os.fstat(source_descriptor)
-                        if (
-                            before.st_size,
-                            before.st_mtime_ns,
-                            before.st_ctime_ns,
-                            before.st_nlink,
-                        ) != (
-                            after.st_size,
-                            after.st_mtime_ns,
-                            after.st_ctime_ns,
-                            after.st_nlink,
-                        ):
-                            raise SessionStorageError(
-                                "Session database changed while secure backup was in progress"
-                            )
-                        _require_quiescent_backup_source(locked_source)
-                        verify_open_file_identity(
-                            locked_source,
-                            source_descriptor,
-                            label="session database",
-                        )
-                    _validate_backup_descriptor(descriptor)
-                verify_open_file_identity(
-                    destination_path,
-                    descriptor,
-                    label="session backup",
+            with AnchoredDirectory.open(
+                destination_path.parent,
+                create=True,
+                private=False,
+                pin_path=True,
+            ) as destination_directory:
+                destination_metadata = destination_directory.stat(destination_path.name)
+                if destination_metadata is not None and stat.S_ISLNK(
+                    destination_metadata.st_mode
+                ):
+                    raise SessionStorageError(
+                        "refusing to use session backup through a symlink or junction: "
+                        f"{destination_path}"
+                    )
+                if destination_metadata is not None:
+                    raise FileExistsError(destination_path)
+                descriptor = destination_directory.open_file(
+                    destination_path.name,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    expected_type=stat.S_IFREG,
                 )
+                if hasattr(os, "fchmod") and os.name != "nt":
+                    os.fchmod(descriptor, 0o600)
+                completed = False
+                try:
+                    with exclusive_database_access(source_path) as locked_source:
+                        _require_quiescent_backup_source(locked_source)
+                        with open_unlinked_regular_file(
+                            locked_source,
+                            label="session database",
+                        ) as source_descriptor:
+                            verify_open_file_identity(
+                                locked_source,
+                                source_descriptor,
+                                label="session database",
+                            )
+                            before = os.fstat(source_descriptor)
+                            _require_quiescent_backup_source(locked_source)
+                            _copy_descriptor(source_descriptor, descriptor)
+                            after = os.fstat(source_descriptor)
+                            if (
+                                before.st_size,
+                                before.st_mtime_ns,
+                                before.st_ctime_ns,
+                                before.st_nlink,
+                            ) != (
+                                after.st_size,
+                                after.st_mtime_ns,
+                                after.st_ctime_ns,
+                                after.st_nlink,
+                            ):
+                                raise SessionStorageError(
+                                    "Session database changed while secure backup was in progress"
+                                )
+                            _require_quiescent_backup_source(locked_source)
+                            verify_open_file_identity(
+                                locked_source,
+                                source_descriptor,
+                                label="session database",
+                            )
+                        _validate_backup_descriptor(descriptor)
+                    os.fsync(descriptor)
+                    destination_directory.validation_path()
+                    completed = True
+                finally:
+                    if not completed:
+                        try:
+                            destination_directory.unlink(
+                                destination_path.name,
+                                missing_ok=True,
+                                expected_descriptor=descriptor,
+                            )
+                        except BaseException:
+                            pass
+                    os.close(descriptor)
         except FileExistsError as exc:
             raise SessionStorageError(
                 f"Backup destination already exists: {destination_path}"
             ) from exc
+        except AnchoredFilesystemError as exc:
+            raise SessionStorageError(str(exc)) from exc
         except sqlite3.DatabaseError as exc:
             raise SessionStorageError(
                 f"Could not securely back up session database: {exc}"

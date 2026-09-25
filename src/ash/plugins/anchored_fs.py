@@ -108,6 +108,7 @@ def _windows_open_entry(
     readable: bool = True,
     writable: bool = False,
     create_new: bool = False,
+    share_delete: bool = True,
 ) -> int:
     """Open one Windows entry without following a reparse point."""
 
@@ -155,7 +156,7 @@ def _windows_open_entry(
     synchronize = 0x00100000
     share_read = 0x00000001
     share_write = 0x00000002
-    share_delete = 0x00000004
+    share_delete_flag = 0x00000004
     create_new_value = 1
     open_existing = 3
     attribute_normal = 0x00000080
@@ -182,7 +183,7 @@ def _windows_open_entry(
     handle = create_file(
         str(path),
         desired_access,
-        share_read | share_write | share_delete,
+        share_read | share_write | (share_delete_flag if share_delete else 0),
         None,
         create_new_value if create_new else open_existing,
         attributes,
@@ -335,11 +336,16 @@ def _windows_open_directory_path(
     *,
     create: bool,
     expected: os.stat_result | None = None,
+    pin_path: bool = False,
 ) -> tuple[Path, int]:
     absolute = _absolute_lexical_path(path)
     components = _path_components(absolute)
     current = Path(absolute.anchor)
-    descriptor = _windows_open_entry(current, directory=True)
+    descriptor = _windows_open_entry(
+        current,
+        directory=True,
+        share_delete=not pin_path,
+    )
     try:
         _windows_require_supported_filesystem(current, descriptor)
         for component in components:
@@ -353,7 +359,11 @@ def _windows_open_directory_path(
                     raise AnchoredFilesystemError(
                         "anchored directory appeared during secure creation"
                     ) from exc
-            next_descriptor = _windows_open_entry(next_path, directory=True)
+            next_descriptor = _windows_open_entry(
+                next_path,
+                directory=True,
+                share_delete=not pin_path,
+            )
             os.close(descriptor)
             descriptor = next_descriptor
             current = next_path
@@ -520,6 +530,7 @@ class AnchoredDirectory:
         create: bool,
         private: bool = True,
         expected: os.stat_result | None = None,
+        pin_path: bool = False,
     ) -> AnchoredDirectory:
         """Open a directory path without following replaceable components.
 
@@ -535,6 +546,7 @@ class AnchoredDirectory:
                 path,
                 create=create,
                 expected=expected,
+                pin_path=pin_path,
             )
             return cls(absolute, descriptor)
         absolute = _absolute_lexical_path(path)

@@ -7,6 +7,7 @@ import os
 import platform
 import subprocess
 import sqlite3
+import stat
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -20,16 +21,8 @@ from ash.core.session import (
     exclusive_database_access,
 )
 from ash.core.redaction import redact_text
-from ash.safe_io import (
-    create_anchored_regular_file,
-    descriptor_path,
-    open_anchored_regular_file,
-    open_unlinked_regular_file,
-    require_anchored_path_absent,
-    replace_anchored_open_file,
-    unlink_anchored_open_file,
-    validate_unlinked_file_path,
-)
+from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
+from ash.safe_io import descriptor_path, open_unlinked_regular_file
 from ash.safety.environment import resolve_host_executable
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.sandbox.process_utils import (
@@ -155,14 +148,6 @@ def _copy_descriptor(source: int, destination: int) -> None:
     os.fsync(destination)
 
 
-def _storage_trusted_root(path: Path) -> Path:
-    candidate = Path(os.path.abspath(path.expanduser()))
-    root = candidate.parent.parent
-    while not root.exists() and root != root.parent:
-        root = root.parent
-    return root
-
-
 def backup_database(path: str | Path, destination: str | Path | None = None) -> Path:
     check = check_database(path)
     if not check.ok:
@@ -182,14 +167,10 @@ def restore_database(
 
     if not confirmed:
         raise SessionStorageError("Restore requires explicit confirmation")
-    try:
-        database = validate_unlinked_file_path(path, label="session database")
-        backup_path = validate_unlinked_file_path(backup, label="session backup")
-    except ValueError as exc:
-        raise SessionStorageError(str(exc)) from exc
+    database = Path(os.path.abspath(Path(path).expanduser()))
+    backup_path = Path(os.path.abspath(Path(backup).expanduser()))
     if database == backup_path:
         raise SessionStorageError("Backup and destination must differ")
-    trusted_root = _storage_trusted_root(database)
     try:
         with open_unlinked_regular_file(
             backup_path,
@@ -204,103 +185,172 @@ def restore_database(
                     "Refusing to restore an unhealthy backup: "
                     + "; ".join(backup_check.messages)
                 )
-            database.parent.mkdir(parents=True, exist_ok=True)
-            with exclusive_database_access(database) as locked_database:
-                database = locked_database
-                try:
-                    database = validate_unlinked_file_path(
-                        database, label="session database"
-                    )
-                except ValueError as exc:
-                    raise SessionStorageError(str(exc)) from exc
-                timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-                temporary = database.with_name(
-                    f".{database.name}.restore-{uuid4().hex}.tmp"
-                )
-                preserved: list[Path] = []
-                with create_anchored_regular_file(
-                    temporary,
-                    trusted_root=trusted_root,
-                    label="session restore temporary",
-                    mode=0o600,
-                ) as temporary_descriptor:
-                    _copy_descriptor(backup_descriptor, temporary_descriptor)
-                    temporary_check = _check_database_descriptor(
-                        temporary_descriptor,
-                        display_path=temporary,
-                    )
-                    if not temporary_check.ok:
+            with AnchoredDirectory.open(
+                database.parent,
+                create=True,
+                private=False,
+                pin_path=True,
+            ) as directory:
+                main_metadata = directory.stat(database.name)
+                if main_metadata is not None:
+                    if stat.S_ISLNK(main_metadata.st_mode):
                         raise SessionStorageError(
-                            "Refusing to restore an unhealthy backup: "
-                            + "; ".join(temporary_check.messages)
+                            "refusing to use session database through a symlink or "
+                            f"junction: {database}"
                         )
-                    tracked = (
-                        database,
-                        Path(f"{database}-wal"),
-                        Path(f"{database}-shm"),
+                    if not stat.S_ISREG(main_metadata.st_mode):
+                        raise SessionStorageError(
+                            f"Refusing to restore non-regular session database: {database}"
+                        )
+                directory.validation_path()
+                with exclusive_database_access(
+                    database,
+                    coordination_parent_descriptor=(
+                        directory.descriptor if os.name == "posix" else None
+                    ),
+                ) as locked_database:
+                    if Path(locked_database) != database:
+                        raise SessionStorageError(
+                            "Session database coordination changed the restore path"
+                        )
+                    directory.validation_path()
+                    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                    temporary_name = f".{database.name}.restore-{uuid4().hex}.tmp"
+                    temporary_path = database.with_name(temporary_name)
+                    temporary_descriptor = directory.open_file(
+                        temporary_name,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        expected_type=stat.S_IFREG,
                     )
-                    with ExitStack() as current_stack:
-                        current_descriptors: dict[Path, int | None] = {}
-                        for current in tracked:
-                            try:
-                                current_descriptor = current_stack.enter_context(
-                                    open_anchored_regular_file(
-                                        current,
-                                        trusted_root=trusted_root,
-                                        label="session pre-restore source",
-                                    )
-                                )
-                            except FileNotFoundError:
-                                current_descriptors[current] = None
-                                continue
-                            current_descriptors[current] = current_descriptor
-                            preserved_path = database.with_name(
-                                f"{current.name}.pre-restore.{timestamp}.raw"
-                            )
-                            with create_anchored_regular_file(
-                                preserved_path,
-                                trusted_root=trusted_root,
-                                label="session pre-restore snapshot",
-                                mode=0o600,
-                            ) as preserved_descriptor:
-                                _copy_descriptor(
-                                    current_descriptor,
-                                    preserved_descriptor,
-                                )
-                            preserved.append(preserved_path)
-
-                        try:
-                            validate_unlinked_file_path(database, label="session database")
-                        except ValueError as exc:
-                            raise SessionStorageError(str(exc)) from exc
-
-                        for sidecar in tracked[1:]:
-                            sidecar_descriptor = current_descriptors[sidecar]
-                            if sidecar_descriptor is None:
-                                require_anchored_path_absent(
-                                    sidecar,
-                                    trusted_root=trusted_root,
-                                    label="session restore sidecar",
-                                )
-                            else:
-                                unlink_anchored_open_file(
-                                    sidecar,
-                                    sidecar_descriptor,
-                                    trusted_root=trusted_root,
-                                    label="session restore sidecar",
-                                )
-
-                        database_descriptor = current_descriptors[database]
-                        replace_anchored_open_file(
-                            temporary,
-                            database,
+                    if hasattr(os, "fchmod") and os.name != "nt":
+                        os.fchmod(temporary_descriptor, 0o600)
+                    temporary_published = False
+                    try:
+                        _copy_descriptor(backup_descriptor, temporary_descriptor)
+                        temporary_check = _check_database_descriptor(
                             temporary_descriptor,
-                            trusted_root=trusted_root,
-                            label="session restore temporary",
-                            expected_destination_descriptor=database_descriptor,
-                            require_destination_absent=database_descriptor is None,
+                            display_path=temporary_path,
                         )
-    except (OSError, ValueError) as exc:
+                        if not temporary_check.ok:
+                            raise SessionStorageError(
+                                "Refusing to restore an unhealthy backup: "
+                                + "; ".join(temporary_check.messages)
+                            )
+                        tracked = (
+                            database,
+                            Path(f"{database}-wal"),
+                            Path(f"{database}-shm"),
+                        )
+                        preserved: list[Path] = []
+                        with ExitStack() as current_stack:
+                            current_descriptors: dict[Path, int | None] = {}
+                            for current in tracked:
+                                metadata = directory.stat(current.name)
+                                if metadata is None:
+                                    current_descriptors[current] = None
+                                    continue
+                                if not stat.S_ISREG(metadata.st_mode):
+                                    raise SessionStorageError(
+                                        "Refusing to restore through non-regular session "
+                                        f"storage entry: {current}"
+                                    )
+                                current_descriptor = directory.open_file(
+                                    current.name,
+                                    os.O_RDONLY,
+                                    expected=metadata,
+                                    expected_type=stat.S_IFREG,
+                                )
+                                current_stack.callback(os.close, current_descriptor)
+                                current_descriptors[current] = current_descriptor
+                                preserved_path = database.with_name(
+                                    f"{current.name}.pre-restore.{timestamp}.raw"
+                                )
+                                preserved_metadata = directory.stat(preserved_path.name)
+                                if preserved_metadata is not None:
+                                    if stat.S_ISLNK(preserved_metadata.st_mode):
+                                        raise SessionStorageError(
+                                            "refusing to use session pre-restore snapshot "
+                                            "through a symlink or junction: "
+                                            f"{preserved_path}"
+                                        )
+                                    raise SessionStorageError(
+                                        "Session pre-restore snapshot already exists: "
+                                        f"{preserved_path}"
+                                    )
+                                preserved_descriptor = directory.create_file(
+                                    preserved_path.name,
+                                    mode=0o600,
+                                )
+                                preserved_completed = False
+                                try:
+                                    _copy_descriptor(
+                                        current_descriptor,
+                                        preserved_descriptor,
+                                    )
+                                    os.fsync(preserved_descriptor)
+                                    preserved_completed = True
+                                finally:
+                                    if not preserved_completed:
+                                        try:
+                                            directory.unlink(
+                                                preserved_path.name,
+                                                missing_ok=True,
+                                                expected_descriptor=preserved_descriptor,
+                                            )
+                                        except BaseException:
+                                            pass
+                                    os.close(preserved_descriptor)
+                                preserved.append(preserved_path)
+
+                            directory.validation_path()
+                            for sidecar in tracked[1:]:
+                                sidecar_descriptor = current_descriptors[sidecar]
+                                if sidecar_descriptor is None:
+                                    if directory.stat(sidecar.name) is not None:
+                                        raise SessionStorageError(
+                                            "Session restore sidecar appeared after snapshot: "
+                                            f"{sidecar}"
+                                        )
+                                else:
+                                    directory.unlink(
+                                        sidecar.name,
+                                        expected_descriptor=sidecar_descriptor,
+                                    )
+
+                            database_descriptor = current_descriptors[database]
+                            if database_descriptor is None:
+                                if directory.stat(database.name) is not None:
+                                    raise SessionStorageError(
+                                        "Session database appeared after restore snapshot"
+                                    )
+                            elif not directory.same_entry(
+                                database.name,
+                                database_descriptor,
+                            ):
+                                raise SessionStorageError(
+                                    "Session database changed before restore publication"
+                                )
+                            directory.validation_path()
+                            directory.rename(
+                                temporary_name,
+                                database.name,
+                                expected_source_descriptor=temporary_descriptor,
+                            )
+                            temporary_published = True
+                            directory.validation_path()
+                    finally:
+                        if not temporary_published:
+                            try:
+                                directory.unlink(
+                                    temporary_name,
+                                    missing_ok=True,
+                                    expected_descriptor=temporary_descriptor,
+                                )
+                            except BaseException:
+                                pass
+                        os.close(temporary_descriptor)
+    except (AnchoredFilesystemError, OSError, ValueError) as exc:
         raise SessionStorageError(str(exc)) from exc
     return database, tuple(preserved)
 
@@ -354,35 +404,63 @@ def create_debug_bundle(config, destination: str | Path | None = None) -> Path:
         else config.db_directory
         / f"debug-bundle-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.json"
     )
+    destination_path = Path(os.path.abspath(raw_destination))
     try:
-        destination_path = validate_unlinked_file_path(
-            raw_destination, label="debug bundle"
-        )
-    except ValueError as exc:
-        raise SessionStorageError(str(exc)) from exc
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        destination_path = validate_unlinked_file_path(
-            destination_path, label="debug bundle"
-        )
-    except ValueError as exc:
-        raise SessionStorageError(str(exc)) from exc
-    temporary = destination_path.with_name(
-        f".{destination_path.name}.{uuid4().hex}.tmp"
-    )
-    try:
-        with temporary.open("x", encoding="utf-8") as handle:
-            handle.write(serialized + "\n")
-        _restrict(temporary)
-        try:
-            destination_path = validate_unlinked_file_path(
-                destination_path, label="debug bundle"
+        with AnchoredDirectory.open(
+            destination_path.parent,
+            create=True,
+            private=False,
+            pin_path=True,
+        ) as directory:
+            existing = directory.stat(destination_path.name)
+            if existing is not None:
+                if stat.S_ISLNK(existing.st_mode):
+                    raise SessionStorageError(
+                        "refusing to use debug bundle through a symlink or junction: "
+                        f"{destination_path}"
+                    )
+                if not stat.S_ISREG(existing.st_mode):
+                    raise SessionStorageError(
+                        f"Refusing to replace non-regular debug bundle: {destination_path}"
+                    )
+            temporary_name = directory.unique_name(
+                f".{destination_path.name}.", ".tmp"
             )
-        except ValueError as exc:
-            raise SessionStorageError(str(exc)) from exc
-        os.replace(temporary, destination_path)
-    finally:
-        temporary.unlink(missing_ok=True)
+            descriptor = directory.create_file(temporary_name, mode=0o600)
+            renamed = False
+            completed = False
+            try:
+                encoded_payload = (serialized + "\n").encode("utf-8")
+                view = memoryview(encoded_payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("short write while writing debug bundle")
+                    view = view[written:]
+                os.fsync(descriptor)
+                directory.validation_path()
+                directory.rename(
+                    temporary_name,
+                    destination_path.name,
+                    expected_source_descriptor=descriptor,
+                )
+                renamed = True
+                directory.validation_path()
+                completed = True
+            finally:
+                if not completed:
+                    cleanup_name = destination_path.name if renamed else temporary_name
+                    try:
+                        directory.unlink(
+                            cleanup_name,
+                            missing_ok=True,
+                            expected_descriptor=descriptor,
+                        )
+                    except BaseException:
+                        pass
+                os.close(descriptor)
+    except (AnchoredFilesystemError, OSError, ValueError) as exc:
+        raise SessionStorageError(str(exc)) from exc
     return destination_path
 
 

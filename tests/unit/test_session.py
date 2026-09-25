@@ -915,6 +915,47 @@ def test_manual_backup_is_consistent_and_never_overwrites(tmp_path: Path) -> Non
         store.backup(destination)
 
 
+def test_manual_backup_rejects_plain_parent_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.session as session_module
+
+    source_directory = tmp_path / "db"
+    target_directory = tmp_path / "target"
+    saved_directory = tmp_path / "target-original"
+    replacement_directory = tmp_path / "replacement"
+    source_directory.mkdir()
+    target_directory.mkdir()
+    replacement_directory.mkdir()
+    store = SessionStore(source_directory / "sessions.db")
+    store.create_session("/workspace")
+    real_open = session_module.AnchoredDirectory.open
+    swapped = False
+
+    def open_then_swap(path, **kwargs):
+        nonlocal swapped
+        directory = real_open(path, **kwargs)
+        if Path(path) == target_directory and not swapped:
+            swapped = True
+            target_directory.rename(saved_directory)
+            replacement_directory.rename(target_directory)
+        return directory
+
+    monkeypatch.setattr(
+        session_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
+
+    with pytest.raises(SessionStorageError):
+        store.backup(target_directory / "manual.backup")
+
+    assert swapped is True
+    assert not (target_directory / "manual.backup").exists()
+    assert not (saved_directory / "manual.backup").exists()
+
+
 def test_manual_backup_does_not_follow_destination_swapped_to_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

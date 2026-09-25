@@ -192,31 +192,29 @@ def test_restore_rejects_database_directory_swapped_before_sidecar_cleanup(
     outside_shm = outside / "sessions.db-shm"
     outside_wal.write_bytes(b"DO NOT DELETE WAL\n")
     outside_shm.write_bytes(b"DO NOT DELETE SHM\n")
-    real_validate = storage_module.validate_unlinked_file_path
-    database_validations = 0
+    real_open = storage_module.AnchoredDirectory.open
     swapped = False
 
-    def validate_then_swap(path, *args, **kwargs):
-        nonlocal database_validations, swapped
-        result = real_validate(path, *args, **kwargs)
-        if kwargs.get("label") == "session database":
-            database_validations += 1
-            if database_validations == 3 and not swapped:
-                swapped = True
-                db_dir.rename(tmp_path / "db-real")
-                try:
-                    db_dir.symlink_to(outside, target_is_directory=True)
-                except OSError as exc:
-                    pytest.skip(f"symlink creation is unavailable: {exc}")
-        return result
+    def open_then_swap(path, **kwargs):
+        nonlocal swapped
+        directory = real_open(path, **kwargs)
+        if Path(path) == db_dir and not swapped:
+            swapped = True
+            db_dir.rename(tmp_path / "db-real")
+            try:
+                db_dir.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                directory.close()
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return directory
 
     monkeypatch.setattr(
-        storage_module,
-        "validate_unlinked_file_path",
-        validate_then_swap,
+        storage_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
     )
 
-    with pytest.raises(SessionStorageError, match="symlink or junction"):
+    with pytest.raises(SessionStorageError, match="no longer identifies the held directory"):
         restore_database(database, backup, confirmed=True)
 
     assert swapped is True
@@ -237,28 +235,26 @@ def test_restore_rejects_database_replaced_after_snapshot(
     backup = tmp_path / "backup.db"
     SessionStore(backup).create_session("/backup")
     replacement = b"UNRELATED REPLACEMENT\n"
-    real_validate = storage_module.validate_unlinked_file_path
-    database_validations = 0
+    real_validation_path = storage_module.AnchoredDirectory.validation_path
+    validation_calls = 0
     replaced = False
 
-    def validate_then_replace(path, *args, **kwargs):
-        nonlocal database_validations, replaced
-        result = real_validate(path, *args, **kwargs)
-        if kwargs.get("label") == "session database":
-            database_validations += 1
-            if database_validations == 3 and not replaced:
-                replaced = True
-                database.unlink()
-                database.write_bytes(replacement)
-        return result
+    def validate_then_replace(directory):
+        nonlocal validation_calls, replaced
+        validation_calls += 1
+        if validation_calls == 3 and not replaced:
+            replaced = True
+            database.unlink()
+            database.write_bytes(replacement)
+        return real_validation_path(directory)
 
     monkeypatch.setattr(
-        storage_module,
-        "validate_unlinked_file_path",
+        storage_module.AnchoredDirectory,
+        "validation_path",
         validate_then_replace,
     )
 
-    with pytest.raises(SessionStorageError, match="destination that changed"):
+    with pytest.raises(SessionStorageError, match="changed before restore publication"):
         restore_database(database, backup, confirmed=True)
 
     assert replaced is True
@@ -278,23 +274,21 @@ def test_restore_rejects_sidecar_created_after_snapshot(
     SessionStore(backup).create_session("/backup")
     wal = db_dir / "sessions.db-wal"
     sentinel = b"NEW CONCURRENT WAL\n"
-    real_validate = storage_module.validate_unlinked_file_path
-    database_validations = 0
+    real_validation_path = storage_module.AnchoredDirectory.validation_path
+    validation_calls = 0
     created = False
 
-    def validate_then_create(path, *args, **kwargs):
-        nonlocal database_validations, created
-        result = real_validate(path, *args, **kwargs)
-        if kwargs.get("label") == "session database":
-            database_validations += 1
-            if database_validations == 3 and not created:
-                created = True
-                wal.write_bytes(sentinel)
-        return result
+    def validate_then_create(directory):
+        nonlocal validation_calls, created
+        validation_calls += 1
+        if validation_calls == 3 and not created:
+            created = True
+            wal.write_bytes(sentinel)
+        return real_validation_path(directory)
 
     monkeypatch.setattr(
-        storage_module,
-        "validate_unlinked_file_path",
+        storage_module.AnchoredDirectory,
+        "validation_path",
         validate_then_create,
     )
 
@@ -323,7 +317,7 @@ def test_restore_quiesces_concurrent_session_writer(
     writer_session_id: list[str] = []
     writer_errors: list[BaseException] = []
     completed_before_replace: list[bool] = []
-    real_replace = storage_module.replace_anchored_open_file
+    real_rename = storage_module.AnchoredDirectory.rename
 
     def writer() -> None:
         assert replace_entered.wait(5)
@@ -336,15 +330,16 @@ def test_restore_quiesces_concurrent_session_writer(
         finally:
             writer_done.set()
 
-    def observe_before_replace(*args, **kwargs):
-        replace_entered.set()
-        assert writer_started.wait(5)
-        completed_before_replace.append(writer_done.wait(1))
-        return real_replace(*args, **kwargs)
+    def observe_before_replace(directory, source, destination, **kwargs):
+        if destination == database.name:
+            replace_entered.set()
+            assert writer_started.wait(5)
+            completed_before_replace.append(writer_done.wait(1))
+        return real_rename(directory, source, destination, **kwargs)
 
     monkeypatch.setattr(
-        storage_module,
-        "replace_anchored_open_file",
+        storage_module.AnchoredDirectory,
+        "rename",
         observe_before_replace,
     )
     thread = threading.Thread(target=writer)
@@ -383,7 +378,7 @@ def test_restore_quiesces_cross_process_session_writer(
     result = tmp_path / "writer-result"
     child: subprocess.Popen[str] | None = None
     completed_before_replace: list[bool] = []
-    real_replace = storage_module.replace_anchored_open_file
+    real_rename = storage_module.AnchoredDirectory.rename
 
     child_code = """
 from pathlib import Path
@@ -403,8 +398,10 @@ else:
     result.write_text("ok:" + session.session_id, encoding="utf-8")
 """
 
-    def observe_before_replace(*args, **kwargs):
+    def observe_before_replace(directory, source, destination, **kwargs):
         nonlocal child
+        if destination != database.name:
+            return real_rename(directory, source, destination, **kwargs)
         child = subprocess.Popen(
             [
                 sys.executable,
@@ -422,11 +419,11 @@ else:
         assert started.exists()
         time.sleep(0.25)
         completed_before_replace.append(result.exists())
-        return real_replace(*args, **kwargs)
+        return real_rename(directory, source, destination, **kwargs)
 
     monkeypatch.setattr(
-        storage_module,
-        "replace_anchored_open_file",
+        storage_module.AnchoredDirectory,
+        "rename",
         observe_before_replace,
     )
     try:
@@ -552,6 +549,176 @@ def test_debug_bundle_rejects_symlinked_destination(tmp_path: Path) -> None:
         create_debug_bundle(config, linked)
 
     assert victim.read_text(encoding="utf-8") == "keep"
+
+
+def test_debug_bundle_rejects_plain_parent_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.commands.storage as storage_module
+    from ash.commands.storage import create_debug_bundle
+    from ash.config import AshConfig
+
+    workspace = tmp_path / "repo"
+    target_directory = tmp_path / "target"
+    saved_directory = tmp_path / "target-original"
+    replacement_directory = tmp_path / "replacement"
+    workspace.mkdir()
+    target_directory.mkdir()
+    replacement_directory.mkdir()
+    victim = replacement_directory / "bundle.json"
+    victim.write_text("DO NOT REPLACE\n", encoding="utf-8")
+    config = AshConfig(
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    real_open = storage_module.AnchoredDirectory.open
+    swapped = False
+
+    def open_then_swap(path, **kwargs):
+        nonlocal swapped
+        directory = real_open(path, **kwargs)
+        if Path(path) == target_directory and not swapped:
+            swapped = True
+            target_directory.rename(saved_directory)
+            replacement_directory.rename(target_directory)
+        return directory
+
+    monkeypatch.setattr(
+        storage_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
+
+    with pytest.raises(SessionStorageError):
+        create_debug_bundle(config, target_directory / "bundle.json")
+
+    assert swapped is True
+    assert (target_directory / "bundle.json").read_text(encoding="utf-8") == (
+        "DO NOT REPLACE\n"
+    )
+    assert not (saved_directory / "bundle.json").exists()
+
+
+def test_restore_database_rejects_plain_parent_directory_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.commands.storage as storage_module
+    from ash.commands.storage import restore_database
+
+    database_directory = tmp_path / "db"
+    saved_directory = tmp_path / "db-original"
+    replacement_directory = tmp_path / "replacement"
+    backup_directory = tmp_path / "backup"
+    database_directory.mkdir()
+    replacement_directory.mkdir()
+    backup_directory.mkdir()
+
+    original_store = SessionStore(database_directory / "sessions.db")
+    original = original_store.create_session(str(tmp_path / "original-project"))
+    backup = original_store.backup(backup_directory / "sessions.backup.db")
+
+    replacement_store = SessionStore(replacement_directory / "sessions.db")
+    victim = replacement_store.create_session(str(tmp_path / "victim-project"))
+
+    real_open = storage_module.AnchoredDirectory.open
+    swapped = False
+
+    def open_then_swap(path, **kwargs):
+        nonlocal swapped
+        directory = real_open(path, **kwargs)
+        if Path(path) == database_directory and not swapped:
+            swapped = True
+            database_directory.rename(saved_directory)
+            replacement_directory.rename(database_directory)
+        return directory
+
+    monkeypatch.setattr(
+        storage_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
+
+    with pytest.raises(SessionStorageError):
+        restore_database(database_directory / "sessions.db", backup, confirmed=True)
+
+    assert swapped is True
+    visible_ids = {
+        item.session_id
+        for item in SessionStore(database_directory / "sessions.db").list_sessions(
+            limit=20
+        )
+    }
+    original_ids = {
+        item.session_id
+        for item in SessionStore(saved_directory / "sessions.db").list_sessions(limit=20)
+    }
+    assert victim.session_id in visible_ids
+    assert original.session_id in original_ids
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative flock is POSIX-only")
+def test_restore_coordination_lock_is_anchored_across_parent_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.session as session_module
+
+    database_directory = tmp_path / "db"
+    saved_directory = tmp_path / "db-original"
+    replacement_directory = tmp_path / "replacement"
+    database_directory.mkdir()
+    replacement_directory.mkdir()
+    database = database_directory / "sessions.db"
+    SessionStore(database).create_session("/current")
+    backup = backup_database(database, tmp_path / "known-good.db")
+    SessionStore(replacement_directory / "sessions.db").create_session("/replacement")
+
+    original_lock = database_directory / ".sessions.db.ash-lock"
+    replacement_lock = replacement_directory / ".sessions.db.ash-lock"
+    original_identity = (original_lock.stat().st_dev, original_lock.stat().st_ino)
+    replacement_identity = (
+        replacement_lock.stat().st_dev,
+        replacement_lock.stat().st_ino,
+    )
+    assert original_identity != replacement_identity
+
+    real_open = session_module._open_database_coordination_file
+    observed: list[tuple[int, int]] = []
+    swapped = False
+
+    def open_during_aba(db_path: str, *, parent_descriptor: int | None = None):
+        nonlocal swapped
+        if parent_descriptor is None or swapped:
+            return real_open(db_path, parent_descriptor=parent_descriptor)
+        swapped = True
+        database_directory.rename(saved_directory)
+        replacement_directory.rename(database_directory)
+        try:
+            descriptor = real_open(
+                db_path,
+                parent_descriptor=parent_descriptor,
+            )
+            assert descriptor is not None
+            metadata = os.fstat(descriptor)
+            observed.append((metadata.st_dev, metadata.st_ino))
+            return descriptor
+        finally:
+            database_directory.rename(replacement_directory)
+            saved_directory.rename(database_directory)
+
+    monkeypatch.setattr(
+        session_module,
+        "_open_database_coordination_file",
+        open_during_aba,
+    )
+
+    restore_database(database, backup, confirmed=True)
+
+    assert swapped is True
+    assert observed == [original_identity]
 
 
 def test_debug_bundle_refuses_workspace_swap_for_git_metadata(

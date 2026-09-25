@@ -1015,6 +1015,53 @@ def test_windows_unsupported_filesystem_fails_before_directory_creation(
     assert closed == [101]
 
 
+def test_windows_directory_path_pin_disables_delete_sharing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state" / "db"
+    root.mkdir(parents=True)
+    metadata = os.stat(root)
+    opened: list[bool] = []
+    descriptors = iter(range(101, 200))
+
+    def fake_open_entry(
+        path: Path,
+        *,
+        directory: bool,
+        readable: bool = True,
+        writable: bool = False,
+        create_new: bool = False,
+        share_delete: bool = True,
+    ) -> int:
+        del path, readable, writable, create_new
+        assert directory is True
+        opened.append(share_delete)
+        return next(descriptors)
+
+    monkeypatch.setattr(anchored_fs, "_windows_open_entry", fake_open_entry)
+    monkeypatch.setattr(
+        anchored_fs, "_windows_require_supported_filesystem", lambda path, fd: None
+    )
+    monkeypatch.setattr(anchored_fs.os, "fstat", lambda fd: metadata)
+    monkeypatch.setattr(anchored_fs.os, "close", lambda fd: None)
+
+    _, pinned_descriptor = anchored_fs._windows_open_directory_path(
+        root,
+        create=False,
+        pin_path=True,
+    )
+    pinned_count = len(opened)
+    assert pinned_count > 0
+    assert opened == [False] * pinned_count
+
+    _, default_descriptor = anchored_fs._windows_open_directory_path(
+        root,
+        create=False,
+    )
+    assert opened[pinned_count:] == [True] * pinned_count
+    assert pinned_descriptor != default_descriptor
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native Windows directory durability")
 def test_windows_ntfs_directory_durability_barrier(tmp_path: Path) -> None:
     with AnchoredDirectory.open(tmp_path, create=False, private=False) as directory:
