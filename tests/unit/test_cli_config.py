@@ -389,7 +389,7 @@ class TestAtomicWrite:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.setattr(
             cli_config,
-            "atomic_write_unlinked_bytes",
+            "_write_anchored_private_file",
             MagicMock(side_effect=OSError("disk")),
         )
 
@@ -548,6 +548,86 @@ class TestLoadEnv:
             cli_config.get_env_value("DUMMY_READ_KEY")
         assert swapped is True
 
+    def test_get_env_value_rejects_plain_state_root_swap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        state = tmp_path / ".ash"
+        saved = tmp_path / ".ash-original"
+        replacement = tmp_path / ".ash-replacement"
+        state.mkdir()
+        replacement.mkdir()
+        (state / ".env").write_text("DUMMY_READ_KEY=legitimate\n", encoding="utf-8")
+        (replacement / ".env").write_text(
+            "DUMMY_READ_KEY=attacker-controlled\n",
+            encoding="utf-8",
+        )
+        cli_config.ASH_DIR = state
+        cli_config.ENV_FILE = state / ".env"
+        cli_config.CONFIG_FILE = state / "ash.toml"
+        monkeypatch.delenv("DUMMY_READ_KEY", raising=False)
+        real_open = cli_config.AnchoredDirectory.open
+        swapped = False
+
+        def open_then_swap(path, **kwargs):
+            nonlocal swapped
+            directory = real_open(path, **kwargs)
+            if Path(path) == state and not swapped:
+                swapped = True
+                state.rename(saved)
+                replacement.rename(state)
+            return directory
+
+        monkeypatch.setattr(
+            cli_config.AnchoredDirectory,
+            "open",
+            staticmethod(open_then_swap),
+        )
+
+        with pytest.raises((OSError, ValueError)):
+            cli_config.get_env_value("DUMMY_READ_KEY")
+
+        assert swapped is True
+
+    def test_load_env_rejects_plain_state_root_swap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        state = tmp_path / ".ash"
+        saved = tmp_path / ".ash-original"
+        replacement = tmp_path / ".ash-replacement"
+        state.mkdir()
+        replacement.mkdir()
+        (state / ".env").write_text("SAFE=legitimate\n", encoding="utf-8")
+        (replacement / ".env").write_text("EVIL=attacker\n", encoding="utf-8")
+        cli_config.ASH_DIR = state
+        cli_config.ENV_FILE = state / ".env"
+        cli_config.CONFIG_FILE = state / "ash.toml"
+        real_open = cli_config.AnchoredDirectory.open
+        swapped = False
+
+        def open_then_swap(path, **kwargs):
+            nonlocal swapped
+            directory = real_open(path, **kwargs)
+            if Path(path) == state and not swapped:
+                swapped = True
+                state.rename(saved)
+                replacement.rename(state)
+            return directory
+
+        monkeypatch.setattr(
+            cli_config.AnchoredDirectory,
+            "open",
+            staticmethod(open_then_swap),
+        )
+
+        with pytest.raises((OSError, ValueError)):
+            cli_config.load_env()
+
+        assert swapped is True
+
 
 class TestTomlConfig:
     """Tests for save_config / load_config with TOML."""
@@ -653,6 +733,51 @@ class TestTomlConfig:
         assert swapped is True
         assert victim.read_text(encoding="utf-8") == 'marker = "do-not-touch"\n'
 
+    def test_save_config_rejects_plain_state_root_swap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        home = tmp_path / "home"
+        state = home / ".ash"
+        saved = home / ".ash-original"
+        replacement = tmp_path / "replacement"
+        state.mkdir(parents=True)
+        replacement.mkdir()
+        victim = replacement / "ash.toml"
+        victim.write_text('marker = "do-not-touch"\n', encoding="utf-8")
+        cli_config.ASH_DIR = state
+        cli_config.ENV_FILE = state / ".env"
+        cli_config.CONFIG_FILE = state / "ash.toml"
+        real_open = cli_config.AnchoredDirectory.open
+        swapped = False
+
+        def open_then_swap(path, **kwargs):
+            nonlocal swapped
+            directory = real_open(path, **kwargs)
+            if Path(path) == state and not swapped:
+                swapped = True
+                state.rename(saved)
+                replacement.rename(state)
+            return directory
+
+        monkeypatch.setattr(
+            cli_config.AnchoredDirectory,
+            "open",
+            staticmethod(open_then_swap),
+        )
+
+        with pytest.raises((OSError, ValueError)):
+            cli_config.save_config(
+                {"custom_providers": {"private": {"api_key": "SECRET"}}}
+            )
+
+        assert swapped is True
+        assert (state / "ash.toml").read_text(encoding="utf-8") == (
+            'marker = "do-not-touch"\n'
+        )
+        assert not (saved / "ash.toml").exists()
+
     def test_load_config_rejects_state_root_swapped_after_path_resolution(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -690,6 +815,49 @@ class TestTomlConfig:
 
         with pytest.raises((OSError, ValueError)):
             cli_config.load_config(strict=True)
+        assert swapped is True
+
+    def test_load_config_rejects_plain_state_root_swap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        home = tmp_path / "home"
+        state = home / ".ash"
+        saved = home / ".ash-original"
+        replacement = tmp_path / "replacement"
+        state.mkdir(parents=True)
+        replacement.mkdir()
+        (state / "ash.toml").write_text(
+            'model = "legitimate/model"\n', encoding="utf-8"
+        )
+        (replacement / "ash.toml").write_text(
+            'model = "attacker/model"\n', encoding="utf-8"
+        )
+        cli_config.ASH_DIR = state
+        cli_config.ENV_FILE = state / ".env"
+        cli_config.CONFIG_FILE = state / "ash.toml"
+        real_open = cli_config.AnchoredDirectory.open
+        swapped = False
+
+        def open_then_swap(path, **kwargs):
+            nonlocal swapped
+            directory = real_open(path, **kwargs)
+            if Path(path) == state and not swapped:
+                swapped = True
+                state.rename(saved)
+                replacement.rename(state)
+            return directory
+
+        monkeypatch.setattr(
+            cli_config.AnchoredDirectory,
+            "open",
+            staticmethod(open_then_swap),
+        )
+
+        with pytest.raises((OSError, ValueError)):
+            cli_config.load_config(strict=True)
+
         assert swapped is True
 
 

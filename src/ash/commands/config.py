@@ -6,6 +6,7 @@ import json
 import hashlib
 import os
 import re
+import stat
 import sys
 import tomllib
 from collections.abc import Mapping, Sequence
@@ -14,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.profiles import active_profile_name, profile_directory
 from ash.safe_io import (
     atomic_write_unlinked_bytes,
@@ -89,6 +91,79 @@ def ensure_ash_dir() -> Path:
         label="Ash state directory",
         mode=0o700,
     )
+
+
+def _write_anchored_private_file(
+    directory: AnchoredDirectory,
+    name: str,
+    payload: bytes,
+    *,
+    label: str,
+) -> None:
+    existing = directory.stat(name)
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise ValueError(f"refusing to replace non-regular {label}: {directory.path / name}")
+    temporary_name = directory.unique_name(f".{name}.", ".tmp")
+    descriptor = directory.create_file(temporary_name, mode=0o600)
+    renamed = False
+    completed = False
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError(f"short write while writing {label}")
+            view = view[written:]
+        os.fsync(descriptor)
+        directory.validation_path()
+        directory.rename(
+            temporary_name,
+            name,
+            expected_source_descriptor=descriptor,
+        )
+        renamed = True
+        directory.validation_path()
+        if os.name != "nt":
+            directory.sync()
+        completed = True
+    finally:
+        if not completed:
+            cleanup_name = name if renamed else temporary_name
+            try:
+                directory.unlink(
+                    cleanup_name,
+                    missing_ok=True,
+                    expected_descriptor=descriptor,
+                )
+            except BaseException:
+                pass
+        os.close(descriptor)
+
+
+def _read_anchored_private_file(
+    path: Path,
+    *,
+    max_bytes: int,
+    label: str,
+) -> bytes | None:
+    try:
+        with AnchoredDirectory.open(
+            path.parent,
+            create=False,
+            private=False,
+            pin_path=True,
+        ) as directory:
+            directory.validation_path()
+            raw = directory.read_file(path.name, max_bytes=max_bytes)
+            directory.validation_path()
+            return raw
+    except FileNotFoundError:
+        return None
+    except AnchoredFilesystemError as exc:
+        detail = str(exc)
+        if "exceeds" in detail.casefold():
+            raise ValueError(f"{label} exceeds {max_bytes} bytes: {path}") from exc
+        raise ValueError(f"cannot read {label} {path}: {exc}") from exc
 
 
 def get_env_path() -> Path:
@@ -273,42 +348,42 @@ def save_env_values(values: dict[str, str]) -> None:
                 f"environment value for {key} contains a forbidden newline or NUL"
             )
 
-    ash_dir = ensure_ash_dir()
-    trusted_root = _state_trusted_root(ash_dir)
+    ensure_ash_dir()
     env_file = get_env_path()
-    lines: list[str] = []
     try:
-        raw = read_bounded_open_file(
-            env_file,
-            MAX_ENV_FILE_BYTES,
-            label="dotenv file",
-            trusted_root=trusted_root,
-        )
-    except FileNotFoundError:
-        raw = None
-    if raw is not None:
-        for raw_line in raw.decode("utf-8").splitlines(keepends=True):
-            stripped = raw_line.strip()
-            if not stripped or stripped.startswith("#"):
-                lines.append(raw_line)
-                continue
-            if "=" in stripped:
-                existing_key = stripped.split("=", 1)[0]
-                if existing_key in values:
-                    continue
-            lines.append(raw_line)
+        with AnchoredDirectory.open(
+            env_file.parent,
+            create=True,
+            private=True,
+            pin_path=True,
+        ) as directory:
+            directory.validation_path()
+            raw = directory.read_file(env_file.name, max_bytes=MAX_ENV_FILE_BYTES)
+            lines: list[str] = []
+            if raw is not None:
+                for raw_line in raw.decode("utf-8").splitlines(keepends=True):
+                    stripped = raw_line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        lines.append(raw_line)
+                        continue
+                    if "=" in stripped:
+                        existing_key = stripped.split("=", 1)[0]
+                        if existing_key in values:
+                            continue
+                    lines.append(raw_line)
 
-    rendered = "".join(lines)
-    if rendered and not rendered.endswith("\n"):
-        rendered += "\n"
-    rendered += "".join(f"{key}={value}\n" for key, value in values.items())
-    atomic_write_unlinked_bytes(
-        env_file,
-        rendered.encode("utf-8"),
-        label="dotenv file",
-        mode=0o600,
-        trusted_root=trusted_root,
-    )
+            rendered = "".join(lines)
+            if rendered and not rendered.endswith("\n"):
+                rendered += "\n"
+            rendered += "".join(f"{key}={value}\n" for key, value in values.items())
+            _write_anchored_private_file(
+                directory,
+                env_file.name,
+                rendered.encode("utf-8"),
+                label="dotenv file",
+            )
+    except AnchoredFilesystemError as exc:
+        raise ValueError(f"cannot persist dotenv file {env_file}: {exc}") from exc
     os.environ.update(values)
     _FILE_BACKED_ENV_VALUES.update(
         {key: (str(env_file), value) for key, value in values.items()}
@@ -333,14 +408,12 @@ def get_env_value(key: str) -> str | None:
         return os.environ[key]
 
     env_file = get_env_path()
-    try:
-        raw = read_bounded_open_file(
-            env_file,
-            MAX_ENV_FILE_BYTES,
-            label="dotenv file",
-            trusted_root=_state_trusted_root(_paths()[0]),
-        )
-    except FileNotFoundError:
+    raw = _read_anchored_private_file(
+        env_file,
+        max_bytes=MAX_ENV_FILE_BYTES,
+        label="dotenv file",
+    )
+    if raw is None:
         return None
     for line in raw.decode("utf-8").splitlines():
         stripped = line.strip()
@@ -357,14 +430,12 @@ def load_env() -> dict[str, str]:
     """Load all key=value pairs from ~/.ash/.env (ignores comments/blank lines)."""
     env: dict[str, str] = {}
     env_file = get_env_path()
-    try:
-        raw = read_bounded_open_file(
-            env_file,
-            MAX_ENV_FILE_BYTES,
-            label="dotenv file",
-            trusted_root=_state_trusted_root(_paths()[0]),
-        )
-    except FileNotFoundError:
+    raw = _read_anchored_private_file(
+        env_file,
+        max_bytes=MAX_ENV_FILE_BYTES,
+        label="dotenv file",
+    )
+    if raw is None:
         return env
     for line in raw.decode("utf-8").splitlines():
         stripped = line.strip()
@@ -384,41 +455,49 @@ def load_env() -> dict[str, str]:
 def save_config(config: dict[str, Any]) -> None:
     """Save a dict (typically custom_providers) to ~/.ash/ash.toml.
     """
-    ash_dir = ensure_ash_dir()
-    trusted_root = _state_trusted_root(ash_dir)
+    ensure_ash_dir()
     config_file = get_config_path()
     import toml  # type: ignore[import-untyped]
 
     # Serialize to string via toml library
     toml_str = toml.dumps(config)
 
-    atomic_write_unlinked_bytes(
-        config_file,
-        toml_str.encode("utf-8"),
-        label="user TOML config",
-        mode=0o600,
-        trusted_root=trusted_root,
-    )
+    try:
+        with AnchoredDirectory.open(
+            config_file.parent,
+            create=True,
+            private=True,
+            pin_path=True,
+        ) as directory:
+            directory.validation_path()
+            _write_anchored_private_file(
+                directory,
+                config_file.name,
+                toml_str.encode("utf-8"),
+                label="user TOML config",
+            )
+            directory.validation_path()
+    except AnchoredFilesystemError as exc:
+        raise ValueError(f"cannot persist user TOML config {config_file}: {exc}") from exc
 
 
 def load_config(*, strict: bool = False) -> dict[str, Any]:
     """Load ~/.ash/ash.toml, optionally surfacing malformed input."""
     config_file = get_config_path()
     try:
-        raw = read_bounded_open_file(
+        raw = _read_anchored_private_file(
             config_file,
-            MAX_CONFIG_FILE_BYTES,
+            max_bytes=MAX_CONFIG_FILE_BYTES,
             label="user TOML config",
-            trusted_root=_state_trusted_root(_paths()[0]),
         )
+        if raw is None:
+            return {}
         if strict:
             value = tomllib.loads(raw.decode("utf-8"))
             return value if isinstance(value, dict) else {}
         import toml  # type: ignore[import-untyped]
 
         return toml.loads(raw.decode("utf-8"))
-    except FileNotFoundError:
-        return {}
     except Exception:
         if strict:
             raise

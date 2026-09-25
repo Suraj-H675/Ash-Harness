@@ -1066,6 +1066,47 @@ def test_setup_written_settings_keep_dotenv_provenance(
     )
 
 
+def test_save_env_values_rejects_plain_parent_directory_swap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands import config as cli_config
+
+    state_dir = cli_config.ASH_DIR
+    saved_dir = state_dir.with_name(f"{state_dir.name}-original")
+    replacement_dir = state_dir.with_name(f"{state_dir.name}-replacement")
+    state_dir.mkdir(parents=True)
+    replacement_dir.mkdir()
+    cli_config.ENV_FILE.write_text("EXISTING=original\n", encoding="utf-8")
+    victim = replacement_dir / ".env"
+    victim.write_text("VICTIM=keep\n", encoding="utf-8")
+    monkeypatch.delenv("ASH_TEST_SECRET", raising=False)
+    real_open = cli_config.AnchoredDirectory.open
+    swapped = False
+
+    def open_then_swap(path, **kwargs):
+        nonlocal swapped
+        directory = real_open(path, **kwargs)
+        if Path(path) == state_dir and not swapped:
+            swapped = True
+            state_dir.rename(saved_dir)
+            replacement_dir.rename(state_dir)
+        return directory
+
+    monkeypatch.setattr(
+        cli_config.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
+
+    with pytest.raises((OSError, ValueError)):
+        cli_config.save_env_values({"ASH_TEST_SECRET": "supersecret"})
+
+    assert swapped is True
+    assert (state_dir / ".env").read_text(encoding="utf-8") == "VICTIM=keep\n"
+    assert (saved_dir / ".env").read_text(encoding="utf-8") == "EXISTING=original\n"
+    assert "ASH_TEST_SECRET" not in os.environ
+
+
 def test_mcp_interaction_controls_are_user_owned_project_config() -> None:
     from ash.config import _filter_project_config
 

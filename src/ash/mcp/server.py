@@ -6,17 +6,15 @@ import json
 import hashlib
 import os
 import re
+import stat
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from ash.safe_io import (
-    atomic_write_unlinked_bytes,
-    read_bounded_open_file,
-    strict_json_loads,
-)
+from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
+from ash.safe_io import strict_json_loads
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import ScopedIOError
@@ -37,14 +35,18 @@ MCP_OAUTH_SCOPE = re.compile(
 )
 
 
-def _mcp_config_trusted_root(path: Path) -> Path:
-    """Return an existing ancestor that anchors MCP config parent traversal."""
-
-    absolute = Path(os.path.abspath(path.expanduser()))
-    candidate = absolute.parent.parent
-    while not candidate.exists() and candidate != candidate.parent:
-        candidate = candidate.parent
-    return candidate
+def _mcp_config_state_error(path: Path, exc: BaseException) -> ValueError:
+    detail = str(exc)
+    lowered = detail.casefold()
+    parent = path.parent
+    parent_is_link = parent.is_symlink() or (
+        hasattr(parent, "is_junction") and parent.is_junction()
+    )
+    if "link" in lowered or "reparse" in lowered or parent_is_link:
+        detail = f"symlink or junction in MCP config path: {detail}"
+    if "exceeds" in lowered:
+        return ValueError(f"MCP config exceeds 256 KiB: {path}")
+    return ValueError(f"MCP config is not readable: {path}: {detail}")
 
 
 class MCPServerLifecycleError(RuntimeError):
@@ -398,20 +400,31 @@ def load_mcp_servers(
     """Load MCP server definitions from .mcp.json."""
     if config_path is None:
         config_path = Path(".mcp.json")
-    trusted_root = _mcp_config_trusted_root(config_path)
     try:
-        raw_bytes = read_bounded_open_file(
-            config_path,
-            MAX_MCP_CONFIG_BYTES,
-            label="MCP config",
-            trusted_root=trusted_root,
-        )
+        with AnchoredDirectory.open(
+            config_path.parent,
+            create=False,
+            private=False,
+            pin_path=True,
+        ) as directory:
+            directory.validation_path()
+            metadata = directory.stat(config_path.name)
+            if metadata is None:
+                return {}
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(f"symlinked MCP config: {config_path}")
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"MCP config is not readable: {config_path}")
+            raw_bytes = directory.read_file(
+                config_path.name,
+                max_bytes=MAX_MCP_CONFIG_BYTES,
+            )
+            assert raw_bytes is not None
+            directory.validation_path()
     except FileNotFoundError:
         return {}
-    except ValueError as exc:
-        if "exceeds" in str(exc):
-            raise ValueError(f"MCP config exceeds 256 KiB: {config_path}") from exc
-        raise ValueError(f"MCP config is not readable: {config_path}: {exc}") from exc
+    except AnchoredFilesystemError as exc:
+        raise _mcp_config_state_error(config_path, exc) from exc
     raw: Any = strict_json_loads(raw_bytes)
     return parse_mcp_servers_payload(
         raw,
@@ -481,8 +494,6 @@ def save_mcp_servers(
     """Atomically persist MCP server definitions."""
 
     path = config_path or Path(".mcp.json")
-    trusted_root = _mcp_config_trusted_root(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         name: {
             "command": config.command,
@@ -498,13 +509,56 @@ def save_mcp_servers(
         for name, config in sorted(servers.items())
     }
     serialized = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    atomic_write_unlinked_bytes(
-        path,
-        serialized,
-        label="MCP config",
-        mode=0o600,
-        trusted_root=trusted_root,
-    )
+    try:
+        with AnchoredDirectory.open(
+            path.parent,
+            create=True,
+            private=False,
+            pin_path=True,
+        ) as directory:
+            existing = directory.stat(path.name)
+            if existing is not None:
+                if stat.S_ISLNK(existing.st_mode):
+                    raise ValueError(f"symlinked MCP config: {path}")
+                if not stat.S_ISREG(existing.st_mode):
+                    raise ValueError(f"MCP config is not writable: {path}")
+            temporary_name = directory.unique_name(f".{path.name}.", ".tmp")
+            descriptor = directory.create_file(temporary_name, mode=0o600)
+            renamed = False
+            completed = False
+            try:
+                view = memoryview(serialized)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("short write while writing MCP config")
+                    view = view[written:]
+                os.fsync(descriptor)
+                directory.validation_path()
+                directory.rename(
+                    temporary_name,
+                    path.name,
+                    expected_source_descriptor=descriptor,
+                )
+                renamed = True
+                directory.validation_path()
+                if os.name != "nt":
+                    directory.sync()
+                completed = True
+            finally:
+                if not completed:
+                    cleanup_name = path.name if renamed else temporary_name
+                    try:
+                        directory.unlink(
+                            cleanup_name,
+                            missing_ok=True,
+                            expected_descriptor=descriptor,
+                        )
+                    except BaseException:
+                        pass
+                os.close(descriptor)
+    except AnchoredFilesystemError as exc:
+        raise _mcp_config_state_error(path, exc) from exc
     return path
 
 

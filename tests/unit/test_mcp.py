@@ -173,21 +173,26 @@ def test_load_mcp_servers_rejects_parent_swapped_before_read(
         '{"evil":{"command":"echo","args":["attacker"]}}\n',
         encoding="utf-8",
     )
-    real_read = mcp_module.read_bounded_open_file
+    real_open = mcp_module.AnchoredDirectory.open
     swapped = False
 
-    def read_then_swap(*args, **kwargs):
+    def open_then_swap(directory_path, **kwargs):
         nonlocal swapped
-        if not swapped:
+        directory = real_open(directory_path, **kwargs)
+        if Path(directory_path) == project and not swapped:
             swapped = True
             project.rename(tmp_path / "project-real")
             try:
                 project.symlink_to(outside, target_is_directory=True)
             except OSError as exc:
                 pytest.skip(f"symlink creation is unavailable: {exc}")
-        return real_read(*args, **kwargs)
+        return directory
 
-    monkeypatch.setattr(mcp_module, "read_bounded_open_file", read_then_swap)
+    monkeypatch.setattr(
+        mcp_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
 
     with pytest.raises(ValueError, match="symlink or junction"):
         load_mcp_servers(path)
@@ -247,26 +252,121 @@ def test_save_mcp_servers_rejects_parent_swapped_before_write(
         args=["ok"],
         env={"DUMMY_TOKEN": "dummy-value"},
     )
-    real_write = mcp_module.atomic_write_unlinked_bytes
+    real_open = mcp_module.AnchoredDirectory.open
     swapped = False
 
-    def write_then_swap(*args, **kwargs):
+    def open_then_swap(directory_path, **kwargs):
         nonlocal swapped
-        if not swapped:
+        directory = real_open(directory_path, **kwargs)
+        if Path(directory_path) == project and not swapped:
             swapped = True
             project.rename(tmp_path / "project-real")
             try:
                 project.symlink_to(outside, target_is_directory=True)
             except OSError as exc:
                 pytest.skip(f"symlink creation is unavailable: {exc}")
-        return real_write(*args, **kwargs)
+        return directory
 
-    monkeypatch.setattr(mcp_module, "atomic_write_unlinked_bytes", write_then_swap)
+    monkeypatch.setattr(
+        mcp_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
 
     with pytest.raises(ValueError, match="symlink or junction"):
         save_mcp_servers({"local": config}, path)
     assert swapped is True
     assert victim.read_text(encoding="utf-8") == '{"marker":"do-not-touch"}\n'
+
+
+def test_save_mcp_servers_rejects_plain_parent_directory_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.mcp.server as mcp_module
+
+    project = tmp_path / "project"
+    saved = tmp_path / "project-original"
+    replacement = tmp_path / "replacement"
+    project.mkdir()
+    replacement.mkdir()
+    path = project / ".mcp.json"
+    victim = replacement / ".mcp.json"
+    victim.write_text('{"marker":"do-not-touch"}\n', encoding="utf-8")
+    config = MCPServerConfig(
+        name="local",
+        command="echo",
+        args=["ok"],
+        env={"TOKEN": "SECRET"},
+    )
+    real_open = mcp_module.AnchoredDirectory.open
+    swapped = False
+
+    def open_then_swap(directory_path, **kwargs):
+        nonlocal swapped
+        directory = real_open(directory_path, **kwargs)
+        if Path(directory_path) == project and not swapped:
+            swapped = True
+            project.rename(saved)
+            replacement.rename(project)
+        return directory
+
+    monkeypatch.setattr(
+        mcp_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
+
+    with pytest.raises(ValueError):
+        save_mcp_servers({"local": config}, path)
+
+    assert swapped is True
+    assert (project / ".mcp.json").read_text(encoding="utf-8") == (
+        '{"marker":"do-not-touch"}\n'
+    )
+    assert not (saved / ".mcp.json").exists()
+
+
+def test_load_mcp_servers_rejects_plain_parent_directory_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.mcp.server as mcp_module
+
+    project = tmp_path / "project"
+    saved = tmp_path / "project-original"
+    replacement = tmp_path / "replacement"
+    project.mkdir()
+    replacement.mkdir()
+    path = project / ".mcp.json"
+    path.write_text(
+        '{"safe":{"command":"echo","args":["safe"]}}\n',
+        encoding="utf-8",
+    )
+    (replacement / ".mcp.json").write_text(
+        '{"evil":{"command":"echo","args":["attacker"]}}\n',
+        encoding="utf-8",
+    )
+    real_open = mcp_module.AnchoredDirectory.open
+    swapped = False
+
+    def open_then_swap(directory_path, **kwargs):
+        nonlocal swapped
+        directory = real_open(directory_path, **kwargs)
+        if Path(directory_path) == project and not swapped:
+            swapped = True
+            project.rename(saved)
+            replacement.rename(project)
+        return directory
+
+    monkeypatch.setattr(
+        mcp_module.AnchoredDirectory,
+        "open",
+        staticmethod(open_then_swap),
+    )
+
+    with pytest.raises(ValueError):
+        load_mcp_servers(path)
+
+    assert swapped is True
 
 
 def test_save_mcp_oauth_server_round_trip_and_resolves_secret(
