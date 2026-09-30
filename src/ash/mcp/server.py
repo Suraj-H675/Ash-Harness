@@ -370,15 +370,20 @@ def resolve_mcp_stdio_launch(
     )
     if explicit_path:
         candidate = command_path if command_path.is_absolute() else base / command_path
+        launch_path = Path(os.path.abspath(candidate))
         try:
-            candidate = candidate.resolve(strict=True)
+            canonical = launch_path.resolve(strict=True)
         except OSError as exc:
             raise ValueError(
                 f"MCP stdio executable is unavailable: {raw_command!r}"
             ) from exc
-        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        if not canonical.is_file() or not os.access(launch_path, os.X_OK):
             raise ValueError(f"MCP stdio executable is unavailable: {raw_command!r}")
-        return str(candidate), launch_cwd, expected_identity
+        # Keep the configured lexical launcher path after validating its
+        # canonical target. Virtualenv interpreters and other launch shims may
+        # deliberately derive runtime state from argv[0]/their symlink path;
+        # replacing that path with the canonical target changes semantics.
+        return str(launch_path), launch_cwd, expected_identity
 
     executable = resolve_host_executable(
         raw_command,

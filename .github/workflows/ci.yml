@@ -193,6 +193,46 @@ jobs:
           ASH_RUN_NATIVE_SANDBOX_TESTS: "1"
         run: uv run --locked pytest -q tests/e2e/test_sandbox_native.py --timeout=120 --timeout-method=thread
 
+  lsp-conformance-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked --group dev
+      - name: Install pinned Pyright language server
+        run: npm install --prefix "$RUNNER_TEMP/ash-pyright" --no-audit --no-fund pyright@1.1.414
+      - name: Real Pyright LSP conformance
+        env:
+          ASH_PYRIGHT_LANGSERVER: ${{ runner.temp }}/ash-pyright/node_modules/.bin/pyright-langserver
+        run: uv run --locked pytest -q tests/e2e/test_lsp_pyright.py --timeout=120 --timeout-method=thread
+
+  mcp-conformance-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked --group dev
+      - name: Install pinned official MCP Python SDK
+        run: |
+          uv venv "$RUNNER_TEMP/ash-mcp-sdk" --python 3.12 --no-python-downloads
+          uv pip install --python "$RUNNER_TEMP/ash-mcp-sdk/bin/python" "mcp==2.2.0"
+      - name: Official MCP SDK stdio conformance
+        env:
+          ASH_MCP_SDK_PYTHON: ${{ runner.temp }}/ash-mcp-sdk/bin/python
+        run: uv run --locked pytest -q tests/e2e/test_mcp_official_sdk.py --timeout=120 --timeout-method=thread
+
   viewport-pty-e2e:
     strategy:
       fail-fast: false

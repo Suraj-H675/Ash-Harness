@@ -19,6 +19,7 @@ from ash.mcp.server import (
     expand_env_vars,
     load_mcp_server_sources,
     load_mcp_servers,
+    resolve_mcp_stdio_launch,
     save_mcp_servers,
 )
 
@@ -743,3 +744,31 @@ def test_mcp_config_snapshots_existing_cwd_identity(tmp_path: Path) -> None:
 
     assert existing.cwd_identity == (metadata.st_dev, metadata.st_ino)
     assert missing.cwd_identity is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink launcher semantics")
+def test_explicit_stdio_launcher_preserves_validated_symlink_path(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "python-real"
+    target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    target.chmod(0o755)
+    launcher = tmp_path / "venv" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(target)
+    config = MCPServerConfig(
+        name="venv-server",
+        command=str(launcher),
+        args=[],
+        env={},
+    )
+
+    executable, cwd, identity = resolve_mcp_stdio_launch(
+        config,
+        environment={"PATH": os.defpath},
+    )
+
+    assert executable == str(launcher.absolute())
+    assert Path(executable).resolve() == target.resolve()
+    assert cwd is None
+    assert identity is None
