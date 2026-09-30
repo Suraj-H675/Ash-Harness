@@ -24,6 +24,10 @@ def sandbox_status(config: AshConfig) -> dict[str, Any]:
         docker_image=config.sandbox_docker_image,
         docker_memory_mb=config.sandbox_docker_memory_mb,
         docker_cpus=config.sandbox_docker_cpus,
+        require_resource_containment=(
+            config.safety_tier == "auto_approve"
+            and not config.allow_unsafe_auto_approve
+        ),
     )
     return dict(manager.status())
 
@@ -40,6 +44,8 @@ def render_sandbox_status(status: dict[str, Any], *, json_output: bool = False) 
         f"Isolation: {'enabled' if status['isolated'] else 'disabled'}",
         f"Filesystem: {status['filesystem']}",
         f"Network: {status['network']}",
+        "Aggregate resource limits: "
+        + ("enabled" if status["aggregate_resource_limits"] else "disabled"),
         f"Fail closed: {'yes' if status['fail_closed'] else 'no'}",
         f"Available: {available}",
         str(status["detail"]),

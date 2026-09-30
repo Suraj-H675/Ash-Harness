@@ -668,7 +668,10 @@ class AshConfig(BaseSettings):
     )
     allow_unsafe_auto_approve: bool = Field(
         False,
-        description="Allow full auto mode without an OS-level sandbox.",
+        description=(
+            "Allow full auto mode without full OS isolation and aggregate "
+            "CPU/memory containment."
+        ),
     )
     allow_unsafe_plugin_runtime: bool = Field(
         False,

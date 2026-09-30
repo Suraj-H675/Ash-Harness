@@ -680,3 +680,29 @@ async def test_doctor_reports_invalid_extension_configs(
 
     assert by_name["extensions"].status == "fail"
     assert "pre_tool hooks must be a list" in by_name["extensions"].message
+
+
+@pytest.mark.asyncio
+async def test_doctor_warns_when_auto_approve_docker_limits_are_disabled(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(tmp_path / "db"))
+    monkeypatch.setenv("ASH_SAFETY_TIER", "auto_approve")
+    monkeypatch.setenv("ASH_SANDBOX_BACKEND", "docker")
+    monkeypatch.setenv("ASH_SANDBOX_DOCKER_MEMORY_MB", "0")
+    monkeypatch.setenv("ASH_SANDBOX_DOCKER_CPUS", "0")
+    monkeypatch.setattr(
+        "ash.sandbox.manager.has_docker",
+        lambda _image, *, workspace_root=None: True,
+    )
+
+    checks = await run_doctor(connect=False)
+    sandbox = {check.name: check for check in checks}["sandbox"]
+
+    assert sandbox.status == "warn"
+    assert "aggregate_resource_limits=false" in sandbox.message
+    assert "sandbox_docker_memory_mb" in sandbox.remedy

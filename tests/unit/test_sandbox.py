@@ -394,7 +394,10 @@ def test_manager_does_not_trust_workspace_shadowed_bwrap(
 
     assert manager.backend_name == "bubblewrap"
     assert manager.is_fully_isolated() is True
-    assert auto_approve_safety_error(manager, allow_unsafe=False) is None
+    assert manager.has_aggregate_resource_limits() is False
+    assert "aggregate CPU and memory containment" in (
+        auto_approve_safety_error(manager, allow_unsafe=False) or ""
+    )
     assert Path(invocation.argv[0]).resolve() == (host_bin / "bwrap").resolve()
 
 
@@ -425,6 +428,85 @@ def test_manager_prefers_native_backend_when_docker_is_also_available(
         mgr = SandboxManager(workspace_root=tmp_path)
         assert mgr.tier == SANDBOX_TIER_BWRAP
         assert mgr.backend_name == "bubblewrap"
+
+
+def test_manager_resource_containment_prefers_docker_over_native(
+    tmp_path: Path,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+        patch("ash.sandbox.manager.has_bwrap", return_value=True),
+    ):
+        mgr = SandboxManager(
+            workspace_root=tmp_path,
+            require_resource_containment=True,
+        )
+
+    assert mgr.tier == SANDBOX_TIER_DOCKER
+    assert mgr.backend_name == "docker"
+    assert mgr.is_fully_isolated() is True
+    assert mgr.has_aggregate_resource_limits() is True
+    assert auto_approve_safety_error(mgr, allow_unsafe=False) is None
+
+
+def test_manager_resource_containment_fails_closed_without_docker(
+    tmp_path: Path,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_docker", return_value=False),
+        patch("ash.sandbox.manager.has_bwrap", return_value=True),
+    ):
+        mgr = SandboxManager(
+            workspace_root=tmp_path,
+            require_resource_containment=True,
+        )
+
+    assert mgr.status()["backend"] == "unavailable"
+    assert "aggregate CPU and memory containment" in (
+        auto_approve_safety_error(mgr, allow_unsafe=False) or ""
+    )
+    with pytest.raises(SandboxBackendUnavailable, match="Aggregate CPU/memory"):
+        mgr.prepare(["true"], cwd=tmp_path)
+
+
+def test_manager_can_upgrade_native_selection_to_resource_bounded_docker(
+    tmp_path: Path,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=True),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        mgr = SandboxManager(workspace_root=tmp_path)
+        assert mgr.backend_name == "bubblewrap"
+
+        mgr.require_aggregate_resource_containment()
+
+    assert mgr.backend_name == "docker"
+    assert mgr.require_resource_containment is True
+    assert mgr.has_aggregate_resource_limits() is True
+
+
+def test_manager_failed_resource_upgrade_restores_native_selection(
+    tmp_path: Path,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=True),
+        patch("ash.sandbox.manager.has_docker", return_value=False),
+    ):
+        mgr = SandboxManager(workspace_root=tmp_path)
+        assert mgr.backend_name == "bubblewrap"
+
+        with pytest.raises(SandboxBackendUnavailable, match="Aggregate CPU/memory"):
+            mgr.require_aggregate_resource_containment()
+
+    assert mgr.backend_name == "bubblewrap"
+    assert mgr.require_resource_containment is False
+    assert mgr.is_fully_isolated() is True
+    assert mgr.has_aggregate_resource_limits() is False
 
 
 def test_manager_uses_sandbox_exec_on_macos(tmp_path: Path) -> None:
@@ -628,6 +710,29 @@ def test_manager_can_disable_docker_cpu_and_memory_limits(tmp_path: Path) -> Non
     assert backend.cpus is None
     assert "memory=unlimited" in status["detail"]
     assert "cpus=unlimited" in status["detail"]
+    assert manager.has_aggregate_resource_limits() is False
+    assert "aggregate CPU and memory containment" in (
+        auto_approve_safety_error(manager, allow_unsafe=False) or ""
+    )
+
+
+def test_resource_required_docker_reports_disabled_limit_remediation(
+    tmp_path: Path,
+) -> None:
+    with patch("ash.sandbox.manager.has_docker", return_value=True):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            docker_memory_mb=0,
+            docker_cpus=0,
+            require_resource_containment=True,
+        )
+
+    status = manager.status()
+    assert status["backend"] == "docker"
+    assert status["aggregate_resource_limits"] is False
+    assert "sandbox_docker_memory_mb" in status["remediation"]
+    assert "sandbox_docker_cpus" in status["remediation"]
 
 
 def test_manager_rejects_docker_memory_below_engine_minimum(tmp_path: Path) -> None:

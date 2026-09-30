@@ -20,7 +20,7 @@ from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.grants import PermissionRule, build_exact_scope_matchers
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy
-from ash.tools.agent import SpawnAgentTool, _AgentLeaseHeartbeat
+from ash.tools.agent import SpawnAgentTool, _AgentLeaseHeartbeat, _worker_tools
 from ash.tools.base import ToolResult
 
 
@@ -34,6 +34,39 @@ class FakeProvider(ProviderABC):
 
     def count_tokens(self, text: str) -> int:
         return len(text.split())
+
+
+def test_tester_worker_command_requires_resource_bounded_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox import SandboxManager
+
+    guard = SafetyGuard(tmp_path)
+    monkeypatch.setattr("ash.sandbox.manager.sys.platform", "linux")
+    monkeypatch.setattr("ash.sandbox.manager.has_bwrap", lambda _workspace=None: True)
+
+    monkeypatch.setattr(
+        "ash.sandbox.manager.has_docker",
+        lambda _image="ash-sandbox:latest", *, workspace_root=None: False,
+    )
+    unavailable = SandboxManager(
+        workspace_root=tmp_path,
+        require_resource_containment=True,
+    )
+    assert "run_command" not in _worker_tools("tester", guard, unavailable)
+
+    monkeypatch.setattr(
+        "ash.sandbox.manager.has_docker",
+        lambda _image="ash-sandbox:latest", *, workspace_root=None: True,
+    )
+    bounded = SandboxManager(
+        workspace_root=tmp_path,
+        require_resource_containment=True,
+    )
+    assert bounded.backend_name == "docker"
+    assert bounded.has_aggregate_resource_limits() is True
+    assert "run_command" in _worker_tools("tester", guard, bounded)
 
 
 @pytest.mark.asyncio

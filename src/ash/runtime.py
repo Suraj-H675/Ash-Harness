@@ -450,6 +450,10 @@ def build_runtime(
         docker_image=config.sandbox_docker_image,
         docker_memory_mb=config.sandbox_docker_memory_mb,
         docker_cpus=config.sandbox_docker_cpus,
+        require_resource_containment=(
+            config.safety_tier == "auto_approve"
+            and not config.allow_unsafe_auto_approve
+        ),
     )
     safety_error = auto_approve_safety_error(
         sandbox,

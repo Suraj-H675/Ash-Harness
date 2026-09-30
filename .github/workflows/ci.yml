@@ -137,6 +137,26 @@ jobs:
           ASH_RUN_BROWSER_TESTS: "1"
         run: uv run --locked pytest -q tests/e2e/test_browser_playwright.py --timeout=120 --timeout-method=thread
 
+  docker-sandbox-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked --group dev
+      - name: Build hardened sandbox image
+        run: uv run --locked ash sandbox build --image ash-sandbox:ci
+      - name: Real Docker cgroup enforcement
+        env:
+          ASH_RUN_DOCKER_TESTS: "1"
+          ASH_DOCKER_TEST_IMAGE: "ash-sandbox:ci"
+        run: uv run --locked pytest -q tests/e2e/test_sandbox_docker.py --timeout=120 --timeout-method=thread
+
   viewport-pty-e2e:
     strategy:
       fail-fast: false

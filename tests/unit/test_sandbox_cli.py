@@ -28,7 +28,27 @@ def test_sandbox_status_uses_user_configuration(tmp_path) -> None:
     assert status["requested_backend"] == "direct"
     assert status["backend"] == "scoped"
     assert status["isolated"] is False
+    assert status["aggregate_resource_limits"] is False
     assert status["remediation"] == ""
+
+
+def test_sandbox_status_auto_approve_uses_resource_bounded_backend(
+    tmp_path: Path,
+) -> None:
+    config = AshConfig(
+        workspace_root=tmp_path,
+        safety_tier="auto_approve",
+    )
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=True),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        status = sandbox_status(config)
+
+    assert status["backend"] == "docker"
+    assert status["isolated"] is True
+    assert status["aggregate_resource_limits"] is True
 
 
 def test_render_sandbox_status_supports_text_and_json() -> None:
@@ -39,6 +59,7 @@ def test_render_sandbox_status_supports_text_and_json() -> None:
         "isolated": False,
         "filesystem": "host",
         "network": "host",
+        "aggregate_resource_limits": False,
         "fail_closed": True,
         "available": {"scoped": True, "docker": False},
         "detail": "Direct execution.",
@@ -49,6 +70,7 @@ def test_render_sandbox_status_supports_text_and_json() -> None:
     payload = json.loads(render_sandbox_status(status, json_output=True))
 
     assert "Isolation: disabled" in rendered
+    assert "Aggregate resource limits: disabled" in rendered
     assert "Action: Install a sandbox." in rendered
     assert payload == status
 

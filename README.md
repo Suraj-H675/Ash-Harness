@@ -278,14 +278,18 @@ workspace-scoped filesystem access, bounded output, and process-tree cleanup.
 User-owned sandbox configuration cannot be weakened by project configuration.
 Git hooks, MCP stdio servers, and plugin runtimes use the same conservative
 environment boundary. Unsafe auto-approval is disabled unless an operator
-explicitly opts into the compatibility escape hatch.
+explicitly opts into the compatibility escape hatch. Safe `auto_approve`
+requires both full filesystem/network isolation and aggregate CPU/memory
+containment; with `sandbox_backend = "auto"`, Ash therefore selects Docker for
+autonomous execution and fails closed if that bounded backend is unavailable.
 
 Docker sandbox execution also defaults to a **4096 MiB RAM limit, 2 CPU cores,
 and 256 processes**. `sandbox_docker_memory_mb` and `sandbox_docker_cpus` are
 user-owned settings; setting either numeric limit to `0` disables that Docker
 limit. Docker's memory setting is a RAM cap; additional swap availability
 follows the Docker daemon/kernel policy. Bubblewrap and macOS `sandbox-exec` do
-not claim equivalent aggregate CPU/memory containment.
+not claim equivalent aggregate CPU/memory containment and remain appropriate
+for approval-gated interactive execution rather than safe autonomous mode.
 
 For ordinary mutable Docker command sessions, `/workspace` is a Docker-daemon
 host bind mount so edits flow back to the real repository. That boundary assumes

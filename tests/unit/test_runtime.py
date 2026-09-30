@@ -1693,13 +1693,54 @@ def test_runtime_rejects_macos_sandbox_exec_auto_approve(tmp_path, monkeypatch) 
         repo_map_enabled=False,
     )
 
-    with pytest.raises(SandboxBackendUnavailable, match="sandbox-exec"):
+    with pytest.raises(
+        SandboxBackendUnavailable,
+        match="aggregate CPU and memory containment",
+    ):
         build_runtime(
             config,
             HeadlessUI(output_format="text", stream=io.StringIO()),
             provider=RuntimeProvider(),
             run_maintenance=False,
         )
+
+
+def test_runtime_auto_approve_prefers_resource_bounded_docker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("ash.sandbox.manager.sys.platform", "linux")
+    monkeypatch.setattr(
+        "ash.sandbox.manager.has_bwrap",
+        lambda _workspace=None: True,
+    )
+    monkeypatch.setattr(
+        "ash.sandbox.manager.has_docker",
+        lambda _image, *, workspace_root=None: True,
+    )
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        safety_tier="auto_approve",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=False,
+        run_maintenance=False,
+    )
+    try:
+        assert runtime.sandbox_manager.backend_name == "docker"
+        assert runtime.sandbox_manager.has_aggregate_resource_limits() is True
+    finally:
+        asyncio.run(runtime.loop.aclose())
 
 
 def test_runtime_loads_project_mcp_only_when_trusted(tmp_path, monkeypatch) -> None:

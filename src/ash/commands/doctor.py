@@ -580,6 +580,10 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
             ),
         ]
     )
+    require_resource_containment = (
+        config.safety_tier == "auto_approve"
+        and not config.allow_unsafe_auto_approve
+    )
     sandbox = SandboxManager(
         workspace_root=config.workspace_root,
         network=config.sandbox_network,
@@ -587,16 +591,23 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
         docker_image=config.sandbox_docker_image,
         docker_memory_mb=config.sandbox_docker_memory_mb,
         docker_cpus=config.sandbox_docker_cpus,
+        require_resource_containment=require_resource_containment,
     )
     sandbox_status = sandbox.status()
+    sandbox_ready = sandbox_status["isolated"] and (
+        not require_resource_containment
+        or sandbox_status["aggregate_resource_limits"]
+    )
     checks.append(
         DoctorCheck(
             "sandbox",
-            "pass" if sandbox_status["isolated"] else "warn",
+            "pass" if sandbox_ready else "warn",
             (
                 f"{sandbox_status['backend']} (tier {sandbox_status['tier']}); "
                 f"filesystem={sandbox_status['filesystem']}; "
                 f"network={sandbox_status['network']}; "
+                "aggregate_resource_limits="
+                f"{str(sandbox_status['aggregate_resource_limits']).lower()}; "
                 f"fail_closed={str(sandbox_status['fail_closed']).lower()}"
             ),
             str(sandbox_status["remediation"]),

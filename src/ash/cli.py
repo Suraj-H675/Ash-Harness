@@ -1670,7 +1670,20 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     print(f"Error: mode must be one of: {allowed}", file=sys.stderr)
                     continue
                 if mode == PermissionMode.AUTO_APPROVE:
-                    from ash.sandbox import auto_approve_safety_error
+                    from ash.sandbox import (
+                        SandboxBackendUnavailable,
+                        auto_approve_safety_error,
+                    )
+
+                    if (
+                        not config.allow_unsafe_auto_approve
+                        and not sandbox_manager.has_aggregate_resource_limits()
+                    ):
+                        try:
+                            sandbox_manager.require_aggregate_resource_containment()
+                        except SandboxBackendUnavailable as exc:
+                            print(f"Error: {exc}", file=sys.stderr)
+                            continue
 
                     safety_error = auto_approve_safety_error(
                         sandbox_manager,

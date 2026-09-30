@@ -141,6 +141,7 @@ class SandboxStatus(TypedDict):
     isolated: bool
     filesystem: str
     network: str
+    aggregate_resource_limits: bool
     fail_closed: bool
     available: dict[str, bool]
     detail: str
@@ -187,8 +188,24 @@ def auto_approve_safety_error(
 ) -> str | None:
     """Explain why full-auto execution is unsafe, or return ``None``."""
 
-    if manager.is_fully_isolated() or allow_unsafe:
+    if allow_unsafe:
         return None
+    if manager.require_resource_containment and not manager.has_aggregate_resource_limits():
+        return (
+            "auto_approve requires aggregate CPU and memory containment; use the "
+            "Docker sandbox with non-zero memory/CPU limits, use interactive/auto_edit "
+            "mode, or explicitly set ASH_ALLOW_UNSAFE_AUTO_APPROVE=true."
+        )
+    if manager.is_fully_isolated() and manager.has_aggregate_resource_limits():
+        return None
+    if manager.is_fully_isolated():
+        return (
+            "auto_approve requires aggregate CPU and memory containment in addition "
+            f"to OS isolation; the active backend is {manager.backend_name}, which "
+            "does not enforce both limits. Use the Docker sandbox with non-zero "
+            "memory/CPU limits, use interactive/auto_edit mode, or explicitly set "
+            "ASH_ALLOW_UNSAFE_AUTO_APPROVE=true."
+        )
     return (
         "auto_approve requires an available OS sandbox; "
         f"the active backend is {manager.backend_name}, which does not isolate "
@@ -244,6 +261,7 @@ class SandboxManager:
     docker_image: str = DEFAULT_IMAGE
     docker_memory_mb: int = 4096
     docker_cpus: float = 2.0
+    require_resource_containment: bool = False
     _selected_backend: str = field(init=False, repr=False, default="scoped")
     _selection_error: str | None = field(init=False, repr=False, default=None)
     _workspace_identity: tuple[int, int] | None = field(
@@ -344,6 +362,7 @@ class SandboxManager:
         """Return stable, user-facing enforcement and backend diagnostics."""
 
         isolated = self.is_fully_isolated()
+        aggregate_resource_limits = self.has_aggregate_resource_limits()
         explicit_unavailable = self._selection_error is not None
         if explicit_unavailable and not self.allow_scoped_fallback:
             filesystem = "unavailable"
@@ -378,7 +397,7 @@ class SandboxManager:
                 detail = (
                     "Commands run inside Docker with host access restricted to the "
                     "workspace bind and temporary storage; network access is "
-                    f"{network}. Docker resources are bounded to memory={memory}, "
+                    f"{network}. Docker resource policy is memory={memory}, "
                     f"cpus={cpus}, and pids=256. The ordinary mutable workspace bind is resolved by "
                     "the Docker daemon from its host pathname, so this mode assumes "
                     "the local OS account and daemon host are not concurrently "
@@ -387,7 +406,8 @@ class SandboxManager:
             else:
                 detail = (
                     "Commands are isolated to the workspace and temporary storage; "
-                    f"network access is {network}."
+                    f"network access is {network}. This native backend does not "
+                    "enforce aggregate CPU or memory limits."
                 )
         elif self.backend_name == "sandbox-exec":
             filesystem = (
@@ -399,7 +419,8 @@ class SandboxManager:
             detail = (
                 "macOS sandbox-exec contains workspace writes and network access, "
                 "but host file reads remain available; full isolation and "
-                "auto-approval are disabled."
+                "aggregate CPU/memory containment are unavailable, so safe "
+                "auto-approval is disabled."
             )
         else:
             filesystem = "host"
@@ -419,19 +440,33 @@ class SandboxManager:
             "isolated": isolated,
             "filesystem": filesystem,
             "network": network,
+            "aggregate_resource_limits": aggregate_resource_limits,
             "fail_closed": not self.allow_scoped_fallback,
             "available": self.capabilities(),
             "detail": detail,
             "remediation": (
                 ""
-                if isolated or self.backend_preference == "direct"
+                if (
+                    (isolated and not self.require_resource_containment)
+                    or aggregate_resource_limits
+                    or self.backend_preference == "direct"
+                )
                 else (
-                    "Use Docker for full filesystem isolation; macOS sandbox-exec "
-                    "remains available for approval-gated partial containment."
-                    if self.backend_name == "sandbox-exec"
-                    else _sandbox_remediation(
-                        preference=self.backend_preference,
-                        docker_image=self.docker_image,
+                    (
+                        "Set sandbox_docker_memory_mb and sandbox_docker_cpus to "
+                        "non-zero values for safe auto-approval."
+                        if self.backend_name == "docker"
+                        else (
+                            "Use Docker with non-zero CPU and memory limits for safe "
+                            "auto-approval and full filesystem isolation; macOS "
+                            "sandbox-exec remains available for approval-gated "
+                            "partial containment."
+                            if self.backend_name == "sandbox-exec"
+                            else _sandbox_remediation(
+                                preference=self.backend_preference,
+                                docker_image=self.docker_image,
+                            )
+                        )
                     )
                 )
             ),
@@ -441,6 +476,50 @@ class SandboxManager:
         """Whether the active backend prevents arbitrary host file reads."""
 
         return self._selected_backend in _FULL_ISOLATION_BACKENDS
+
+    def has_aggregate_resource_limits(self) -> bool:
+        """Whether the active backend enforces aggregate CPU and memory limits."""
+
+        return (
+            self._selected_backend == "docker"
+            and self.docker_memory_mb > 0
+            and self.docker_cpus > 0
+        )
+
+    def require_aggregate_resource_containment(self) -> None:
+        """Upgrade this shared manager to a bounded backend or leave it unchanged."""
+
+        if self.has_aggregate_resource_limits():
+            self.require_resource_containment = True
+            return
+
+        previous = (
+            self.require_resource_containment,
+            self._selected_backend,
+            self._selection_error,
+            self._tier,
+            dict(self._available),
+        )
+        self.require_resource_containment = True
+        self._selected_backend = "scoped"
+        self._selection_error = None
+        self._available = {"scoped": True}
+        self._tier = self._detect_tier()
+        if self.has_aggregate_resource_limits():
+            return
+
+        error = self._selection_error or (
+            "aggregate CPU/memory containment is unavailable"
+        )
+        (
+            self.require_resource_containment,
+            self._selected_backend,
+            self._selection_error,
+            self._tier,
+            available,
+        ) = previous
+        self._available = available
+        raise SandboxBackendUnavailable(error)
 
     async def run(
         self,
@@ -785,7 +864,11 @@ class SandboxManager:
             return SANDBOX_TIER_SCOPED
         use_native = self.backend_preference in {"auto", "native"}
         use_docker = self.backend_preference in {"auto", "docker"}
-        if use_native and self.preferred_tier >= SANDBOX_TIER_BWRAP:
+        if (
+            use_native
+            and not self.require_resource_containment
+            and self.preferred_tier >= SANDBOX_TIER_BWRAP
+        ):
             if sys.platform.startswith("linux") and self._backend_available("bwrap"):
                 self._selected_backend = "bubblewrap"
                 return SANDBOX_TIER_BWRAP
@@ -803,15 +886,21 @@ class SandboxManager:
         ):
             self._selected_backend = "docker"
             return SANDBOX_TIER_DOCKER
+        if self.require_resource_containment:
+            self._selection_error = (
+                "Aggregate CPU/memory containment requires the Docker sandbox with "
+                "non-zero memory and CPU limits, but that backend is unavailable."
+            )
         if self.backend_preference in {"native", "docker"}:
             requested = self.backend_preference
-            self._selection_error = (
-                f"Requested {requested} sandbox backend is unavailable. "
-                + _sandbox_remediation(
-                    preference=requested,
-                    docker_image=self.docker_image,
+            if self._selection_error is None:
+                self._selection_error = (
+                    f"Requested {requested} sandbox backend is unavailable. "
+                    + _sandbox_remediation(
+                        preference=requested,
+                        docker_image=self.docker_image,
+                    )
                 )
-            )
         self._selected_backend = "scoped"
         return SANDBOX_TIER_SCOPED
 

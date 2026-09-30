@@ -1945,6 +1945,7 @@ class SpawnAgentTool(BaseTool):
             workspace,
             expected_project_root_identity=workspace_identity,
         )
+        worker_policy = self._worker_permission_policy()
         sandbox = SandboxManager(
             workspace_root=workspace,
             expected_workspace_identity=workspace_identity,
@@ -1967,6 +1968,14 @@ class SpawnAgentTool(BaseTool):
                 if self._config is not None
                 else 2.0
             ),
+            require_resource_containment=(
+                worker_policy.mode.value == "auto_approve"
+                and not (
+                    self._config.allow_unsafe_auto_approve
+                    if self._config is not None
+                    else False
+                )
+            ),
         )
         tools = _worker_tools(execution_role, guard, sandbox)
         if agent_definition is not None and agent_definition.allowed_tools:
@@ -1984,7 +1993,6 @@ class SpawnAgentTool(BaseTool):
         worker_store = SessionStore(
             Path(self._shared_state.db_path).with_name("agent-sessions.db")
         )
-        worker_policy = self._worker_permission_policy()
         worker_safety_tier = worker_policy.mode.value
         worker_config = (
             self._config.model_copy(
